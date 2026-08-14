@@ -2962,12 +2962,23 @@ function renderSettingsModal() {
                             const chevronTitle = hasQuery
                                 ? (expanded ? '搜索模式：点击退出搜索' : '搜索模式：点击退出搜索，回到折叠视图')
                                 : (expanded ? '收起，仅显示已勾选的模型' : (hiddenCount > 0 ? `展开查看全部 ${g.models.length} 个模型` : '展开 / 收起'));
+                            // 搜索态下 header 原本只写「搜索命中 N」，但 全选/全不选 走的是
+                            // setModelVisibilityBulk -> getModelCatalog(provider)，操作的是未过滤的
+                            // 全量目录，不是这里的搜索命中结果。header 若不带上全量的 已勾选/总数，
+                            // 用户在搜索态点一次全选，可见模型数会从个位数直接跳到四十多个，
+                            // 但 header 数字纹丝不动——所以这里额外算一份基于未过滤目录的勾选数/总数，
+                            // 判据必须和折叠行的判据（isPinnedModel || modelVisibility!==false）保持一致。
+                            const fullCatalog = hasQuery ? getModelCatalog(g.provider) : null;
+                            const fullCheckedCount = hasQuery
+                                ? fullCatalog.filter(m => isPinnedModel(g.provider, m) || AppState.modelVisibility[m.id] !== false).length
+                                : 0;
+                            const fullTotal = hasQuery ? fullCatalog.length : 0;
                             return `
                             <div class="mb-3">
                                 <div class="flex items-center justify-between px-1 mb-1.5">
                                     <span class="flex items-center gap-1.5 min-w-0">
-                                        <span class="text-[10px] font-bold text-slate-500 uppercase tracking-wide">${g.label} ${hasQuery ? `（搜索命中 ${g.models.length}）` : `(${checkedCount}/${g.models.length})`}</span>
-                                        ${g.models.length > 0 ? `
+                                        <span class="text-[10px] font-bold text-slate-500 uppercase tracking-wide">${g.label} ${hasQuery ? `（搜索命中 ${g.models.length} · 已勾选 ${fullCheckedCount}/${fullTotal}）` : `(${checkedCount}/${g.models.length})`}</span>
+                                        ${(g.models.length > 0 || hasQuery) ? `
                                         <button onclick="${chevronAction}" class="flex items-center gap-1 text-slate-400 hover:text-violet-600 transition-colors shrink-0" title="${escapeAttr(chevronTitle)}">
                                             <span class="inline-flex transition-transform duration-200 ${(expanded || hasQuery) ? 'rotate-180' : ''}">${Icons.ChevronDown}</span>
                                             ${!hasQuery && !expanded && hiddenCount > 0 ? `<span class="text-[9px] font-semibold text-slate-400">还有 ${hiddenCount} 个</span>` : ''}
