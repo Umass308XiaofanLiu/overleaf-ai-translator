@@ -2864,6 +2864,11 @@ function renderSettingsModal() {
             || String(m.name || '').toLowerCase().includes(modelQuery))
     }));
     const totalOnline = onlineGroups.reduce((n, g) => n + g.models.length, 0);
+    // modelGroupExpanded 理论上恒为 {gemini,openai,claude} 形状的对象（见 openSettings/openLocalSettings），
+    // 但防御性兜底：万一它是 null/undefined/非对象，下面按 g.provider 取值会直接抛错，而 renderApp()
+    // 是先把整段 innerHTML 拼完才赋值的，拼接期间抛错会让页面冻结在上一帧、之后每次点击都再抛一次，
+    // 不刷新页面救不回来。所以这里兜底成 {}，配合 toggleModelGroup 里的写兜底一起生效。
+    const gexp = (AppState.modelGroupExpanded && typeof AppState.modelGroupExpanded === 'object') ? AppState.modelGroupExpanded : {};
 
     // 拖拽中优先用「正在进行时」的宽度（避免拖拽途中被 toast/刷新等异步 setState 弹回上次已提交的值），
     // 否则用 AppState 里持久化的宽度；两者都经过夹紧，且渲染时再叠一层 CSS min(...,95vw) 防止在
@@ -2930,9 +2935,13 @@ function renderSettingsModal() {
                             // 展开时渲染全部。onlineGroups.models 本身已经按搜索词过滤过了（2862-2864），
                             // 所以有搜索词时这里的 hasQuery 分支会让整组直接等于 g.models —— 折叠形同虚设，
                             // 这正是「搜索必须能找到被折叠隐藏的模型」这条要求本身的自然结果。
-                            const expanded = !!AppState.modelGroupExpanded[g.provider];
+                            const expanded = !!gexp[g.provider];
                             const hasQuery = !!modelQuery;
-                            const checkedCount = g.models.filter(m => AppState.modelVisibility[m.id] !== false).length;
+                            // 必须和下面 rows 的行渲染判据保持同一个谓词（pinned OR 搜索命中 OR 展开 OR 已勾选），
+                            // 否则折叠态下 header 的 (checked/total) 分数会和屏幕上实际渲染的行数对不上——
+                            // 比如一个「当前选中但用户取消勾选」的钉住模型，行里会渲染成勾选+disabled，
+                            // 但旧写法不算它进 checkedCount，就会出现「header 写 0/44，下面却有一行勾选着」。
+                            const checkedCount = g.models.filter(m => isPinnedModel(g.provider, m) || AppState.modelVisibility[m.id] !== false).length;
                             const rows = g.models.filter(m =>
                                 isPinnedModel(g.provider, m)
                                 || hasQuery
@@ -2957,11 +2966,13 @@ function renderSettingsModal() {
                             <div class="mb-3">
                                 <div class="flex items-center justify-between px-1 mb-1.5">
                                     <span class="flex items-center gap-1.5 min-w-0">
-                                        <span class="text-[10px] font-bold text-slate-500 uppercase tracking-wide">${g.label} (${checkedCount}/${g.models.length})</span>
+                                        <span class="text-[10px] font-bold text-slate-500 uppercase tracking-wide">${g.label} ${hasQuery ? `（搜索命中 ${g.models.length}）` : `(${checkedCount}/${g.models.length})`}</span>
+                                        ${g.models.length > 0 ? `
                                         <button onclick="${chevronAction}" class="flex items-center gap-1 text-slate-400 hover:text-violet-600 transition-colors shrink-0" title="${escapeAttr(chevronTitle)}">
                                             <span class="inline-flex transition-transform duration-200 ${(expanded || hasQuery) ? 'rotate-180' : ''}">${Icons.ChevronDown}</span>
                                             ${!hasQuery && !expanded && hiddenCount > 0 ? `<span class="text-[9px] font-semibold text-slate-400">还有 ${hiddenCount} 个</span>` : ''}
                                         </button>
+                                        ` : ''}
                                     </span>
                                     <span class="flex items-center gap-2 shrink-0">
                                         <button onclick="setModelVisibilityBulk('${g.provider}', true)" class="text-[10px] text-slate-400 hover:text-violet-600">全选</button>
@@ -2973,7 +2984,7 @@ function renderSettingsModal() {
                                 ` : rows.length === 0 ? `
                                     <p class="text-[10px] text-slate-400 italic px-1 cursor-pointer hover:text-violet-600" onclick="toggleModelGroup('${g.provider}')">未勾选任何模型 · 点击展开选择</p>
                                 ` : `
-                                    ${searchRevealedCount > 0 ? `<p class="text-[9px] text-violet-500 italic px-1 mb-1">搜索命中 ${searchRevealedCount} 个平时折叠隐藏的未勾选模型，已临时显示</p>` : ''}
+                                    ${searchRevealedCount > 0 ? `<p class="text-[9px] text-violet-500 italic px-1 mb-1">搜索已临时显示 ${searchRevealedCount} 个折叠中的模型</p>` : ''}
                                     <div class="grid grid-cols-2 gap-2 ${rows.length > 8 ? 'max-h-80 overflow-y-auto custom-scrollbar pr-1' : ''}">
                                         ${rows.map(m => renderOnlineModelCheckbox(m)).join('')}
                                     </div>
@@ -3928,6 +3939,10 @@ function openSettings() {
 // Settings 弹窗里某一家的模型列表默认折叠：只显示已勾选的（+ 钉住项 + 搜索命中项），
 // 点这个 chevron 展开/收起看全部。折叠状态不落 localStorage，每次重新打开弹窗都会重置。
 function toggleModelGroup(provider) {
+    if (!MODEL_PROVIDERS.includes(provider)) return; // 未知 provider：忽略，不建垃圾 key
+    if (!AppState.modelGroupExpanded || typeof AppState.modelGroupExpanded !== 'object') {
+        AppState.modelGroupExpanded = {}; // 兜底重建，呼应 renderSettingsModal 里的读兜底
+    }
     AppState.modelGroupExpanded[provider] = !AppState.modelGroupExpanded[provider];
     renderApp();
 }
