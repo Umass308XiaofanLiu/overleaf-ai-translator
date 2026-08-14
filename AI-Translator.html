@@ -36,6 +36,39 @@ body { font-family: 'Inter', sans-serif; }
     content: "";
 }
 
+/* Settings 弹窗拖拽调宽手柄：常态半透明一条细线，hover/拖拽时高亮 */
+.settings-resize-handle {
+    background: transparent;
+    transition: background-color 0.15s ease;
+}
+.settings-resize-handle::after {
+    content: "";
+    position: absolute;
+    top: 50%;
+    right: 2px;
+    width: 2px;
+    height: 32px;
+    transform: translateY(-50%);
+    border-radius: 2px;
+    background: #cbd5e1;
+}
+.settings-resize-handle:hover,
+.settings-resize-handle:active {
+    background: rgba(99, 102, 241, 0.12);
+}
+.settings-resize-handle:hover::after,
+.settings-resize-handle:active::after {
+    background: #6366f1;
+}
+/* 拖拽过程中禁止选中文字，光标全局保持左右拖拽箭头 */
+body.is-resizing-settings-modal {
+    cursor: ew-resize !important;
+    user-select: none !important;
+}
+body.is-resizing-settings-modal * {
+    user-select: none !important;
+}
+
 </style>
 </head>
 <body class="bg-slate-50 text-slate-900">
@@ -45,6 +78,196 @@ body { font-family: 'Inter', sans-serif; }
 // ========================================
 // state.js - 全局状态管理
 // ========================================
+
+// ============= 在线模型目录：单一事实源 =============
+// 内置种子目录。它是「离线 / 未填 Key / 刷新失败」时的唯一兜底，永久保留，不要删。
+// 以后手动加模型只需改这一处；想跟上厂商更新，直接点 Settings 里的「更新」按钮从各家 API 拉取。
+// tier 只影响图标与配色（lite=Rocket / fast=Zap / pro=Cpu），不影响调用。
+// short 是顶栏按钮上的短标签，保留原来手写的字面量，保证重构后显示逐字不变。
+const DEFAULT_MODEL_CATALOG = [
+    { id: 'gemini-2.5-flash-lite',      name: 'Gemini 2.5 Flash Lite', sub: 'Fast & Cheap',         short: '2.5 Lite',   provider: 'gemini', tier: 'lite' },
+    { id: 'gemini-3-flash-preview',     name: 'Gemini 3 Flash',        sub: 'Speed + Intelligence', short: '3 Flash',    provider: 'gemini', tier: 'fast' },
+    // gemini-3-pro-preview 已被官方列入 Previous models「(Shut down)」（ai.google.dev/gemini-api/docs/models，
+    // 2026-08-14 核对），调用会失败且定价页已无对应行；当前在售的 Pro 档 preview 是 gemini-3.1-pro-preview。
+    { id: 'gemini-3.1-pro-preview',     name: 'Gemini 3.1 Pro',        sub: 'Best Quality',         short: '3.1 Pro',    provider: 'gemini', tier: 'pro'  },
+    { id: 'gpt-5-nano',                 name: 'GPT-5 Nano',            sub: 'Ultra Fast & Light',   short: 'GPT-5 Nano', provider: 'openai', tier: 'lite' },
+    { id: 'gpt-5-mini',                 name: 'GPT-5 Mini',            sub: 'Fast & Balanced',      short: 'GPT-5 Mini', provider: 'openai', tier: 'fast' },
+    { id: 'gpt-5.2',                    name: 'GPT-5.2',               sub: 'Best Quality',         short: 'GPT-5.2',    provider: 'openai', tier: 'pro'  },
+    { id: 'claude-haiku-4-5-20251001',  name: 'Claude Haiku 4.5',      sub: 'Fast & Efficient',     short: 'Haiku',      provider: 'claude', tier: 'lite' },
+    { id: 'claude-sonnet-4-5-20250929', name: 'Claude Sonnet 4.5',     sub: 'Balanced Performance', short: 'Sonnet 4.5', provider: 'claude', tier: 'fast' },
+    { id: 'claude-opus-4-5-20251101',   name: 'Claude Opus 4.5',       sub: 'Best Quality',         short: 'Opus 4.5',   provider: 'claude', tier: 'pro'  }
+];
+
+const MODEL_PROVIDERS = ['gemini', 'openai', 'claude'];
+const MODEL_PROVIDER_LABEL = { gemini: 'Google Gemini', openai: 'OpenAI', claude: 'Anthropic Claude' };
+
+// 缓存超过 7 天只改文案（提示「已过期」），绝不清空数据
+const MODEL_CATALOG_TTL = 7 * 24 * 60 * 60 * 1000;
+const MODEL_CATALOG_LS_KEY = 'onlineModelCatalog';
+const MODEL_CATALOG_SCHEMA_VERSION = 1;
+
+// 安全闸：只有匹配这个白名单的 id 才允许进入目录。
+// 原因：escapeHtml() 走 textContent→innerHTML，**不转义单引号**，而模型 id 会被插进
+// onclick="selectModel('openai','${id}')" 这种内联属性上下文。入口白名单 + 渲染处 escapeHtml 双保险。
+const SAFE_MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:\/-]{0,119}$/;
+
+// 模型 id 过白名单，非法直接丢弃（返回 null）
+// ⚠️ 阶段二（计划 步骤 8-15，计划书 843-846 行）里同名函数已在此提前落地，届时请勿重复插入。
+function sanitizeModelId(id) {
+    const s = String(id || '').trim();
+    return SAFE_MODEL_ID.test(s) ? s : null;
+}
+
+// Gemini：generateContent 不等于「能聊天」—— 图像生成 / TTS / live 也声明它，必须再按 id 做「白名单 + 黑名单」双重过滤。
+// 白名单：只收 gemini-<版本数字>-... 和官方 -latest 别名（gemini-flash-latest / gemini-pro-latest /
+//        gemini-flash-lite-latest）；这一条已经把 gemma-* / imagen-* / veo-* / lyria-* / learnlm-* /
+//        embedding-* 等非 gemini 前缀家族全部挡在外面，不必再单独列。
+// 黑名单：在白名单基础上，命中下列关键词的连字符分段一律排除（image/imagen/tts/audio/live/…），
+//        涵盖 nano banana 图像家族、TTS、live/realtime、embedding、robotics、computer-use 等。
+//        (?:^|-)...(?:-|$) 是分段匹配，避免误伤未来某个合法模型名里恰好包含这些词根的子串。
+const GEMINI_TEXT_ALLOW = /^gemini-\d/;
+const GEMINI_TEXT_ALLOW_ALIAS = /^gemini-(?:pro|flash)(?:-lite)?-latest$/;
+const GEMINI_NON_TEXT_DENY = /(?:^|-)(?:image|imagen|tts|audio|speech|voice|live|realtime|bidi|dialog|embedding|embed|gecko|robotics|robot|omni|veo|video|vision|computer|cua|lyria|music|rerank|ranker|guard|safety|aqa)(?:-|$)/i;
+
+// Gemini 专用：id 是否是「纯文本对话」模型。fetchGeminiModelList（实时拉取）和 loadOnlineCatalog
+// （localStorage 缓存回放）必须共用同一个判定，否则旧缓存里的图像模型 id 会在刷新前一直显示。
+function isGeminiTextChatModelId(id) {
+    const s = String(id || '');
+    if (!(GEMINI_TEXT_ALLOW.test(s) || GEMINI_TEXT_ALLOW_ALIAS.test(s))) return false;
+    return !GEMINI_NON_TEXT_DENY.test(s);
+}
+
+// OpenAI：/v1/models 响应零能力元数据，只能按 id 做「拒 → 允 → 隔离」三段。
+// -pro$ 是最不直觉的一条：gpt-5.2-pro / o1-pro 只走 Responses API，打 chat/completions 会 400/404。
+// deep-research：o3-deep-research / o4-mini-deep-research 只走 Responses API 且强制要求
+//                web_search 等工具，打 chat/completions 会 400（GEMINI_NON_TEXT_DENY 已经排过同类）。
+const OPENAI_DENY = /(^ft:|:ft-|embedding|^text-(similarity|search)|^code-search|whisper|transcrib|(^|[-_])tts([-_]|$)|audio|voice|speech|realtime|live-|dall-e|image|sora|video|moderation|guard|codex|computer-use|deep-research|^(ada|babbage|curie|davinci)(-|$)|-instruct$|search-preview|-pro$|-pro-\d{4}-\d{2}-\d{2}$)/i;
+const OPENAI_ALLOW = /^(gpt-[0-9]|chatgpt-|o[1-9]($|[-.]))/i;
+const OPENAI_DATED_SNAPSHOT = /-\d{4}-\d{2}-\d{2}$/;
+
+// ============= 模型价格表（内置，非实时拉取）=============
+// 单位：美元 / 每 1,000,000 tokens，付费层 Standard 档（非 Batch/Flex/Priority），来自
+// ai.google.dev/gemini-api/docs/pricing。目前只有 gemini 桶有数据；openai / claude 先留空对象，
+// 以后补价格只需往对应桶里加条目，getModelPrice() / 两处渲染点都不用改。
+// 限时促销价**不写死**：promoUntil（含当日的最后一天）+ after（恢复价）是可求值的数据，
+// getModelPrice() 到期后会自动改用 after 的数字，避免 2027-01-01 起界面显示的价格只有真实账单一半。
+const MODEL_PRICING_AS_OF = '2026-08-14';
+const MODEL_PRICING = {
+    gemini: {
+        'gemini-3.7-flash':       { in: 0.75, out: 3.75,  promoUntil: '2026-12-31', after: { in: 1.50, out: 7.50 } },
+        'gemini-3.6-flash':       { in: 0.75, out: 3.75,  promoUntil: '2026-12-31', after: { in: 1.50, out: 7.50 } },
+        'gemini-3.5-flash':       { in: 1.50, out: 9.00 },
+        'gemini-3.5-flash-lite':  { in: 0.30, out: 2.50 },
+        'gemini-3.1-flash-lite':  { in: 0.25, out: 1.50,  note: '音频输入另计 $0.50 / 1M（文本翻译不受影响）' },
+        'gemini-3.1-pro-preview': { in: 2.00, out: 12.00, longContext: { over: 200000, in: 4.00, out: 18.00 }, note: '无免费层；preview 模型，转 GA 时价格可能调整' },
+        'gemini-3-flash-preview': { in: 0.50, out: 3.00,  note: '音频输入另计 $1.00 / 1M（文本翻译不受影响）；preview 模型' },
+        'gemini-2.5-pro':         { in: 1.25, out: 10.00, longContext: { over: 200000, in: 2.50, out: 15.00 } },
+        'gemini-2.5-flash':       { in: 0.30, out: 2.50,  note: '音频输入另计 $1.00 / 1M（文本翻译不受影响）' },
+        'gemini-2.5-flash-lite':  { in: 0.10, out: 0.40,  note: '音频输入另计 $0.30 / 1M（文本翻译不受影响）' }
+    },
+    openai: {},   // 预留：结构与 gemini 桶一致，届时直接加 { 'gpt-5.2': { in, out } } 即可
+    claude: {}    // 预留：同上
+};
+
+// 前缀继承的**尾巴白名单**。规则：宁可少显示一个价，也绝不能显示一个错价。
+// 只有「同价变体」后缀才允许继承母模型价格 —— preview/exp/latest/thinking 这类标记、
+// 以及纯日期快照（-2026-09-01 / -09-2026 / -001）。其余一律视为不同档位，返回 null。
+// 反例（必须拦住）：gemini-3.7-flash-lite 不能继承 gemini-3.7-flash —— Google 每代 flash 都会
+// 补一个 -lite，而 lite 价常只有 flash 的 1/3~1/6（3.5-flash $1.50/$9.00 vs 3.5-flash-lite $0.30/$2.50）。
+const PRICE_KEY_TAIL_OK = /^(?:-(?:preview|exp|latest|thinking|customtools|\d{4}-\d{2}-\d{2}|\d{2}-\d{4}|\d{3}))+$/;
+
+// 促销价求值：promoUntil 当天结束前用促销价，之后自动切到 after 的恢复价。
+// 无 promoUntil 的条目原样返回。note 由这里合成，保证 UI 文案与实际取用的数字永远一致。
+function resolvePromoPrice(price) {
+    if (!price || !price.promoUntil || !price.after) return price;
+    const expired = Date.now() > new Date(price.promoUntil + 'T23:59:59').getTime();
+    const base = expired ? price.after : price;
+    const promoNote = expired
+        ? `限时价已于 ${price.promoUntil} 到期，此处显示的是恢复后的正常价`
+        : `限时价，${price.promoUntil} 之后恢复为 输入 ${formatPriceUsd(price.after.in)} / 输出 ${formatPriceUsd(price.after.out)}`;
+    return Object.assign({}, price, {
+        in: base.in,
+        out: base.out,
+        promoExpired: expired,
+        note: price.note ? `${promoNote}；${price.note}` : promoNote
+    });
+}
+
+// 按 id 找价格，最长前缀匹配 + 尾巴白名单校验：id 必须以某个表内 key 开头，多个匹配取最长的那个，
+// 且 key 之后剩下的那一段必须命中 PRICE_KEY_TAIL_OK（或完全相等）才认。
+// 找不到 / 尾巴不合法都返回 null —— 调用方必须把 null 当成「未知」处理，绝不能编造价格。
+function getModelPrice(id) {
+    const s = String(id || '');
+    let best = null; // { provider, key, price }
+    MODEL_PROVIDERS.forEach(function (p) {
+        const bucket = MODEL_PRICING[p];
+        if (!bucket) return;
+        Object.keys(bucket).forEach(function (key) {
+            if (s.indexOf(key) !== 0) return;   // s 必须以 key 开头
+            const tail = s.slice(key.length);
+            if (tail !== '' && !PRICE_KEY_TAIL_OK.test(tail)) return;
+            if (!best || key.length > best.key.length) best = { provider: p, key: key, price: bucket[key] };
+        });
+    });
+    if (!best) return null;
+    return resolvePromoPrice(Object.assign({ id: best.key, provider: best.provider }, best.price));
+}
+
+// 统一价格数字的显示形式：固定两位小数（$0.1 → $0.10），JS 数字字面量会吞掉末尾 0
+function formatPriceUsd(n) {
+    return `$${Number(n).toFixed(2)}`;
+}
+
+// 顶栏下拉 / 设置勾选框共用的紧凑价格文案，如 "入$0.10 出$0.40 /1M"。
+// 单位与口径必须写在**可见文字**里：title 属性在手机 / 平板上根本不触发，只靠悬停会让用户
+// 把 "$0.10/$0.40" 误读成「每次请求」或「每 1K tokens」，量级差 1000 倍。
+// 结尾的 * 表示这是限时促销价（含义写在下拉图例和设置区脚注里）。
+function formatPriceCompact(price) {
+    if (!price) return '价格未知';
+    const promo = (price.promoUntil && !price.promoExpired) ? '*' : '';
+    return `入${formatPriceUsd(price.in)} 出${formatPriceUsd(price.out)} /1M${promo}`;
+}
+
+// 悬浮提示用的完整价格说明，含长上下文分档、备注、数据口径
+function formatPriceTitle(price) {
+    if (!price) return '价格未知（不在内置价格表中，多为 OpenAI/Claude 或尚未收录的新模型）';
+    let s = `美元 / 每 1,000,000 tokens：输入 ${formatPriceUsd(price.in)} / 输出 ${formatPriceUsd(price.out)}（付费层标准档，非 Batch/Flex/Priority）`;
+    if (price.longContext) {
+        s += `；prompt 超过 ${price.longContext.over / 1000}k tokens 时：输入 ${formatPriceUsd(price.longContext.in)} / 输出 ${formatPriceUsd(price.longContext.out)}（整个 prompt 按高档计价，非仅超出部分）`;
+    }
+    if (price.note) s += `；${price.note}`;
+    s += `。价格为内置表（非 API 实时返回），截至 ${MODEL_PRICING_AS_OF}；推理/思考 token 按输出价计费，实际成本可能高于可见译文估算。`;
+    return s;
+}
+
+// 刷新失败的中文短语（芯片正文用；API 原文放在 title 属性里）
+const MODEL_ERROR_TEXT = {
+    NO_KEY: '未配置 API Key',
+    AUTH: 'Key 无效或无权限',
+    RATE: '限流 · 额度不足',
+    CORS: '被浏览器拦截或断网',
+    TIMEOUT: '请求超时',
+    PROXY_SHAPE: '代理不支持列表接口',
+    EMPTY: '返回 0 个，已保留原列表',
+    HTTP: '请求失败'
+};
+
+// Settings 弹窗默认宽度（px）。拖拽调整后的值持久化在 AppState.settingsModalWidth /
+// localStorage['settingsModalWidth']，双击拖拽手柄可回到这个默认值。
+const SETTINGS_MODAL_DEFAULT_WIDTH = 780;
+const SETTINGS_MODAL_MIN_WIDTH = 480;
+const SETTINGS_MODAL_MAX_WIDTH = 1400;
+// 把任意数字夹到合法范围内；越界或非数字一律回退到默认宽度，避免脏 localStorage 值
+// 把弹窗渲染成 5px 宽或 90000px 宽。视口过窄时由渲染时的 CSS min(...vw) 兜底，这里不依赖 window。
+function clampSettingsModalWidth(w) {
+    const n = Math.round(Number(w));
+    if (!Number.isFinite(n)) return SETTINGS_MODAL_DEFAULT_WIDTH;
+    return Math.max(SETTINGS_MODAL_MIN_WIDTH, Math.min(SETTINGS_MODAL_MAX_WIDTH, n));
+}
+// 拖拽过程中的“正在进行时”宽度（未提交进 AppState/localStorage）。渲染函数会优先读这个值，
+// 这样即使拖拽中途因为 toast/刷新等原因触发了一次 setState 全量重渲染，宽度也不会跳回上一次
+// 已提交的值——mouseup 才会把这里的值落盘进 AppState + localStorage，然后清回 null。
+let settingsModalDragWidth = null;
 
 const AppState = {
     // 输入输出状态
@@ -64,13 +287,16 @@ const AppState = {
 
     // API配置
     apiProvider: 'gemini', // 'gemini' | 'openai' | 'claude' | 'local'
-    selectedModel: "gemini-2.5-flash-lite",
+    selectedModel: DEFAULT_MODEL_CATALOG[0].id,
     geminiApiKey: "", // Gemini API Key
     openaiApiKey: "", // OpenAI API Key
     claudeApiKey: "", // Claude API Key
     claudeProxyUrl: "", // Claude Proxy URL (Cloudflare Worker)
     localBaseUrl: "http://localhost:1234",
     localModels: [],
+    // 在线模型目录的 API 拉取结果，按 provider 分桶。
+    // 空数组 = 从未成功拉取过，getModelCatalog() 自动落回 DEFAULT_MODEL_CATALOG。
+    fetchedModels: { gemini: [], openai: [], claude: [] },
 
     // 编辑状态
     activeIndex: null,
@@ -113,18 +339,22 @@ const AppState = {
     showSettings: false, // 新增：设置弹窗状态
     isConnectingLocal: false,
 
-    // 模型可见性设置
-    modelVisibility: {
-        'gemini-2.5-flash-lite': true,
-        'gemini-3-flash-preview': true,
-        'gemini-3-pro-preview': true,
-        'gpt-5-nano': true,
-        'gpt-5-mini': true,
-        'gpt-5.2': true,
-        'claude-haiku-4-5-20251001': true,
-        'claude-sonnet-4-5-20250929': true,
-        'claude-opus-4-5-20251101': true
+    // 在线模型刷新状态：每家独立结算，互不影响
+    // status: 'idle'(从未拉过) | 'loading' | 'ok' | 'error'
+    // source: 'builtin'(内置列表) | 'cache'(localStorage) | 'live'(本次刚拉到)
+    modelRefresh: {
+        gemini: { status: 'idle', at: 0, count: 0, errCode: null, errMsg: '', source: 'builtin' },
+        openai: { status: 'idle', at: 0, count: 0, errCode: null, errMsg: '', source: 'builtin' },
+        claude: { status: 'idle', at: 0, count: 0, errCode: null, errMsg: '', source: 'builtin' }
     },
+    settingsModelQuery: '',   // 设置弹窗里的模型搜索关键词
+    showDatedSnapshots: false, // 是否保留 OpenAI 的 -YYYY-MM-DD 固定快照（下次更新生效）
+    newlyFoundIds: [],         // 本次刷新新发现的 id，用于 NEW 徽标和「全部显示」
+    settingsModalWidth: SETTINGS_MODAL_DEFAULT_WIDTH, // Settings 弹窗宽度（px），拖拽手柄调整后持久化
+
+    // 模型可见性设置（键 = 模型 id，值 = 是否显示；键不存在时按 `!== false` 视为可见）
+    // 初值由 DEFAULT_MODEL_CATALOG 派生，与原来手写的 9 个 true 完全等价
+    modelVisibility: Object.fromEntries(DEFAULT_MODEL_CATALOG.map(m => [m.id, true])),
     
     // AI Toolbar 设置弹窗状态
     activeSettingsPopup: null, // 'grammar' | 'simplify' | null
@@ -410,6 +640,242 @@ async function fetchLocalModels(baseUrl) {
     }
 }
 
+// ============= 在线模型列表拉取（三家各自的 /models 端点）=============
+// 三家都实测可以从浏览器直连（含 file:// 打开，Origin: null），不需要任何代理。
+// 三条铁律，改代码时不要违反：
+//   1) Gemini 这个 GET 不许加任何自定义头 —— 该域 Access-Control-Allow-Headers 只放行
+//      x-goog-api-key，多加 Content-Type / Api-Revision 会 preflight 403 且不带 ACAO。
+//   2) 三家都不许设 credentials:'include' —— 服务端回 ACAO:*，规范禁止该组合，浏览器会硬失败，
+//      报错长得和「服务挂了」一模一样。
+//   3) Claude 必须带 anthropic-dangerous-direct-browser-access: true —— 这个头就是 CORS 开关本身：
+//      带它响应有 ACAO:*，不带它响应完全没有 ACAO，浏览器只抛无状态码的 TypeError。
+//      它没写进 Anthropic REST 官方参考（只通过官方 TS SDK 的 dangerouslyAllowBrowser 间接暴露），
+//      自 2024-08 稳定至今。**别当脏代码删掉。**
+
+const OPENAI_MODELS_API = "https://api.openai.com/v1/models";
+const CLAUDE_MODELS_API = "https://api.anthropic.com/v1/models";
+const MODEL_FETCH_TIMEOUT = 15000;
+
+// 带 15 秒超时的 fetch（三家共用）
+// ⚠️ 刻意**不**在响应头到达时 clearTimeout：fetch 的 promise 在拿到响应头那一刻就 settle，
+// 若那时清掉计时器，后面 `await response.json()` 读 body 就完全裸奔 —— 服务端回了 200 头
+// 却挂住 body（代理超时 / Worker 半死 / 网络挂起）时 json() 永不 resolve，
+// Promise.allSettled 永不 settle，三家状态会永远停在 loading、刷新按钮永久 disabled。
+// 保留计时器让 abort 覆盖「发请求 + 读 body」整个窗口：超时会中断 body 流，json() 抛
+// AbortError → classifyModelFetchError 归类成 TIMEOUT。请求已完成后再 abort() 是无害的空操作。
+function fetchWithTimeout(url, options = {}, ms = MODEL_FETCH_TIMEOUT) {
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), ms);
+    return fetch(url, { ...options, signal: controller.signal });
+}
+
+// 带错误码的 Error（错误码 → MODEL_ERROR_TEXT 里的中文人话）
+function modelFetchError(errCode, errMsg) {
+    const e = new Error(errMsg);
+    e.code = errCode;
+    return e;
+}
+
+// 注：sanitizeModelId(id) 已在文件靠前处定义（SAFE_MODEL_ID 之后），此处复用，不重复定义。
+
+// OpenAI 的 /v1/models 不返回 display_name，只能从 id 合成人类可读名字。
+// 规则刻意保守：只做首段大写 + 后续连字符转空格，其余原样保留。
+function prettifyModelId(id) {
+    const raw = String(id);
+    const parts = raw.split('-');
+    let head = parts.shift() || raw;
+    if (/^gpt$/i.test(head)) head = 'GPT';
+    else if (/^chatgpt$/i.test(head)) head = 'ChatGPT';
+    else if (/^o\d+$/i.test(head)) head = head.toLowerCase();
+    else head = head.charAt(0).toUpperCase() + head.slice(1);
+    if (parts.length === 0) return head;
+    const rest = parts.map(p => /^[a-z]+$/.test(p) ? p.charAt(0).toUpperCase() + p.slice(1) : p);
+    return head + '-' + rest.join(' ');
+}
+
+// HTTP 响应 → 错误码 + 中文短语（json 已解析成对象或 null）
+function classifyModelHttpError(status, json) {
+    // 截断：厂商/代理可能回一整页 HTML 错误页，原文会被塞进芯片的 title 属性
+    const apiMsg = String((json && ((json.error && (json.error.message || json.error.type)) || json.message)) || '').slice(0, 200);
+    if (status === 401 || status === 403) {
+        return { errCode: 'AUTH', errMsg: apiMsg || 'API Key 无效或无权限' };
+    }
+    if (status === 429) {
+        return { errCode: 'RATE', errMsg: apiMsg || '触发限流或额度不足，请稍后重试' };
+    }
+    if (status === 400 && /API_KEY_INVALID|API key not valid/i.test(apiMsg)) {
+        return { errCode: 'AUTH', errMsg: apiMsg };
+    }
+    // 极简 Cloudflare Worker 常把 GET 改写成 POST /v1/messages，Anthropic 就会回这个 400。
+    // 不识别它的话，用户会把「代理形状不对」误诊成「我的 Key 有问题」。
+    if (status === 400 && /messages/i.test(apiMsg) && /required/i.test(apiMsg)) {
+        return { errCode: 'PROXY_SHAPE', errMsg: '你的 Worker 只转发 POST /v1/messages，无法用于获取模型列表' };
+    }
+    return { errCode: 'HTTP', errMsg: apiMsg ? `HTTP ${status} - ${apiMsg}` : `HTTP ${status}` };
+}
+
+// 各种异常 → 统一错误码 + 中文人话
+function classifyModelFetchError(err) {
+    if (err && err.code) return { errCode: err.code, errMsg: err.message || '' };
+    if (err && err.name === 'AbortError') return { errCode: 'TIMEOUT', errMsg: '请求超时（15 秒）' };
+    const raw = String((err && err.message) || err || '');
+    if (err instanceof TypeError || /Failed to fetch|NetworkError|Load failed/i.test(raw)) {
+        return { errCode: 'CORS', errMsg: '浏览器被拦截（CORS 或断网），未拿到任何响应' };
+    }
+    return { errCode: 'HTTP', errMsg: raw || '未知错误' };
+}
+
+// —— Google Gemini ——
+// GET ${GEMINI_API_BASE}?key=...&pageSize=1000
+// 必须显式传 pageSize：默认只有 50 条，而当前目录超过 50 条，不传会**静默截断**、漏掉最新模型。
+// 纯 GET + query 参数 = simple request，零 preflight。
+async function fetchGeminiModelList(apiKey) {
+    if (!apiKey) throw modelFetchError('NO_KEY', '未填写 Gemini API Key');
+
+    const raw = [];
+    let pageToken = '';
+    for (let page = 0; page < 5; page++) {   // 上限 5 页，防跑飞
+        const url = `${GEMINI_API_BASE}?key=${encodeURIComponent(apiKey)}&pageSize=1000`
+                  + (pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : '');
+        const response = await fetchWithTimeout(url);   // 不加任何自定义头
+        if (!response.ok) {
+            const errJson = await response.json().catch(() => null);
+            const info = classifyModelHttpError(response.status, errJson);
+            throw modelFetchError(info.errCode, info.errMsg);
+        }
+        const data = await response.json();
+        raw.push(...(data.models || []));
+        pageToken = data.nextPageToken || '';
+        if (!pageToken) break;
+    }
+
+    return raw
+        // 线上字段名是 supportedGenerationMethods；supportedActions 只存在于 SDK 对象里，
+        // 读错会导致全部被过滤掉、列表为空，所以两个都兜一手
+        .filter(m => (m.supportedGenerationMethods || m.supportedActions || []).includes('generateContent'))
+        .map(m => {
+            // 不剥 "models/" 前缀会拼出 /v1beta/models/models/xxx:generateContent → 404
+            const id = sanitizeModelId(String(m.name || '').replace(/^models\//, ''));
+            if (!id) return null;
+            return { id, name: m.displayName || id, provider: 'gemini', group: 'chat', created: '' };
+        })
+        // 图像生成 / TTS / live 也声明 generateContent，只靠上面那级会让用户选到图像模型来翻译
+        .filter(m => m && isGeminiTextChatModelId(m.id))
+        .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+// —— OpenAI ——
+// GET https://api.openai.com/v1/models，唯一必需头 Authorization: Bearer。
+// 无分页（listModels 在 OpenAPI 规格里零参数，响应体只有 {object,data}），一次拿全。
+async function fetchOpenaiModelList(apiKey, hideSnapshots) {
+    if (!apiKey) throw modelFetchError('NO_KEY', '未填写 OpenAI API Key');
+
+    const response = await fetchWithTimeout(OPENAI_MODELS_API, {
+        method: "GET",
+        headers: { "Authorization": `Bearer ${apiKey}` }
+        // 不要加 credentials:'include'，服务端回 ACAO:* 会硬失败
+    });
+    if (!response.ok) {
+        const errJson = await response.json().catch(() => null);
+        const info = classifyModelHttpError(response.status, errJson);
+        throw modelFetchError(info.errCode, info.errMsg);
+    }
+
+    const json = await response.json();
+    const all = Array.isArray(json.data) ? json.data : [];
+
+    return all
+        .filter(m => m && typeof m.id === 'string')
+        .filter(m => !OPENAI_DENY.test(m.id))
+        .filter(m => !(hideSnapshots && OPENAI_DATED_SNAPSHOT.test(m.id)))
+        .map(m => {
+            const id = sanitizeModelId(m.id);
+            if (!id) return null;
+            return {
+                id,
+                name: prettifyModelId(id),
+                provider: 'openai',
+                created: m.created || 0,
+                // 过了硬拒但没过 ALLOW 的新家族（如 daybreak-*）进隔离区：渲染但默认不勾选。
+                // 这是抗陈旧的逃生口 —— 纯白名单对每个新发布家族都是零日盲区。
+                group: OPENAI_ALLOW.test(id) ? 'chat' : 'other'
+            };
+        })
+        .filter(Boolean)
+        .sort((a, b) => (b.created || 0) - (a.created || 0));
+}
+
+// —— Anthropic Claude ——
+// 主路直连 GET https://api.anthropic.com/v1/models?limit=1000
+// limit 默认 20 而目录就在 15-25 条这个量级，必须传 1000 并跟 has_more/last_id。
+// 直连失败且用户配了 proxyUrl 时才降级走代理 —— 极简 Worker 通常硬编码 POST /v1/messages，
+// 大概率失败，所以只作二选路，且对非 JSON 响应容错。
+async function fetchClaudeModelList(apiKey, proxyUrl) {
+    if (!apiKey) throw modelFetchError('NO_KEY', '未填写 Claude API Key');
+
+    const collected = [];
+    let afterId = '';
+    try {
+        for (let page = 0; page < 10; page++) {
+            const url = `${CLAUDE_MODELS_API}?limit=1000` + (afterId ? `&after_id=${encodeURIComponent(afterId)}` : '');
+            const response = await fetchWithTimeout(url, {
+                method: "GET",
+                headers: {
+                    "x-api-key": apiKey,
+                    "anthropic-version": "2023-06-01",
+                    // ↓ 这个头就是 CORS 开关本身，删掉它浏览器会直接抛无状态码的 Failed to fetch
+                    "anthropic-dangerous-direct-browser-access": "true"
+                }
+            });
+            if (!response.ok) {
+                const errJson = await response.json().catch(() => null);
+                const info = classifyModelHttpError(response.status, errJson);
+                throw modelFetchError(info.errCode, info.errMsg);
+            }
+            const json = await response.json();
+            collected.push(...(json.data || []));
+            if (!json.has_more || !json.last_id) break;
+            afterId = json.last_id;
+        }
+    } catch (directErr) {
+        const direct = classifyModelFetchError(directErr);
+        // Key 本身不对，或者根本没配代理 —— 没必要再试代理
+        if (direct.errCode === 'AUTH' || direct.errCode === 'NO_KEY' || !proxyUrl) throw directErr;
+
+        const base = String(proxyUrl).replace(/\/+$/, "").replace(/\/v1\/messages$/, "");
+        let proxyJson = null;
+        try {
+            const res = await fetchWithTimeout(`${base}/v1/models?limit=1000`, {
+                method: "GET",
+                headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01" }
+            });
+            proxyJson = await res.json().catch(() => null);   // Worker 可能返回 HTML 错误页
+            if (!res.ok) {
+                const info = classifyModelHttpError(res.status, proxyJson);
+                throw modelFetchError(info.errCode === 'HTTP' ? 'PROXY_SHAPE' : info.errCode, info.errMsg);
+            }
+        } catch (proxyErr) {
+            if (proxyErr && proxyErr.code) throw proxyErr;
+            throw modelFetchError('PROXY_SHAPE', '代理不支持模型列表请求（它可能只转发 POST /v1/messages），建议直连');
+        }
+        if (!proxyJson || !Array.isArray(proxyJson.data)) {
+            throw modelFetchError('PROXY_SHAPE', '代理返回的不是模型列表格式，建议直连');
+        }
+        collected.push(...proxyJson.data);
+    }
+
+    return collected
+        // Anthropic 公开 API 没有 embedding/TTS/图像/审核模型，只做形状校验。
+        // 绝不按 capabilities 过滤 —— 它在 schema 里可为 null，老模型会被误杀。
+        .filter(m => m && m.type === 'model' && typeof m.id === 'string')
+        .map(m => {
+            const id = sanitizeModelId(m.id);
+            if (!id) return null;
+            return { id, name: m.display_name || id, provider: 'claude', group: 'chat', created: m.created_at || '' };
+        })
+        .filter(Boolean);
+}
+
 // 解析JSON响应（处理可能的markdown包裹）
 function parseJsonResponse(text) {
     // 检查空响应
@@ -491,20 +957,25 @@ async function callGeminiAPI(model, contents, config = {}, apiKey = null, signal
 }
 
 // ============= OpenAI API调用 =============
-// 需要特殊参数处理的新模型（不支持 temperature 和 max_tokens）
+// 需要特殊参数处理的新模型（不支持自定义 temperature，且用 max_completion_tokens 而非 max_tokens）
+// 原数组降级为补充白名单，主判定改成规则匹配 —— 否则「更新」按钮拉回来的任何新模型
+// （gpt-5.4 / gpt-6 / o5 …）都会走旧分支被塞 temperature + max_tokens 而 400。
 const OPENAI_NEW_MODELS = ['gpt-5-nano', 'gpt-5-mini', 'gpt-5.2', 'o1', 'o1-mini', 'o1-preview', 'o3', 'o3-mini'];
+const OPENAI_NEW_MODEL_PATTERN = /^(gpt-[5-9]|gpt-\d{2}|o[1-9])/i;
 
 function isNewOpenAIModel(model) {
-    return OPENAI_NEW_MODELS.some(m => model.startsWith(m));
+    const id = String(model || '');
+    return OPENAI_NEW_MODEL_PATTERN.test(id) || OPENAI_NEW_MODELS.some(m => id.startsWith(m));
 }
 
 // 根据模型获取合适的 max tokens 限制
 function getMaxTokensForModel(model, configMax) {
     if (configMax) return configMax;
+    const id = String(model || '');
     // Nano 模型使用较小的 token 限制
-    if (model.includes('nano')) return 2048;
+    if (id.includes('nano')) return 2048;
     // Mini 模型使用中等限制
-    if (model.includes('mini')) return 4096;
+    if (id.includes('mini')) return 4096;
     // 其他模型使用默认值
     return 4096;
 }
@@ -1411,6 +1882,230 @@ async function handleConnectLocal() {
     }
 }
 
+// ============= 在线模型列表刷新（只由用户显式点击触发）=============
+// 刻意不做启动自动刷新 / 打开 Settings 自动刷新：/v1/models 有限流，且首屏不该依赖网络。
+// 【不变量，改代码时请守住】任何失败路径只写 AppState.modelRefresh，绝不写 fetchedModels、
+// 绝不触碰 DEFAULT_MODEL_CATALOG —— 可用列表永远只增不减，不会出现「点了更新，模型没了」。
+
+// 把 Settings 里还没点保存的输入框内容同步进 AppState 再落盘。
+// 必须先做：setState(L167) 会通过 root.innerHTML 全量重渲染，不同步的话刚粘贴的 Key 会被冲掉，
+// 而且刷新会拿旧 Key 去请求、误报 NO_KEY。沿用 handleConnectLocalClick(L2951) 的既有模式。
+function syncSettingsInputsToState() {
+    [
+        ['geminiApiKeyInput', 'geminiApiKey'],
+        ['openaiApiKeyInput', 'openaiApiKey'],
+        ['claudeApiKeyInput', 'claudeApiKey'],
+        ['claudeProxyUrlInput', 'claudeProxyUrl']
+    ].forEach(function (pair) {
+        const input = document.getElementById(pair[0]);
+        if (input) {
+            AppState[pair[1]] = input.value.trim();
+            try {
+                localStorage.setItem(pair[1], AppState[pair[1]]);
+            } catch (e) {}
+        }
+    });
+}
+
+function persistOnlineCatalog() {
+    try {
+        const payload = { v: MODEL_CATALOG_SCHEMA_VERSION };
+        MODEL_PROVIDERS.forEach(function (p) {
+            payload[p] = {
+                at: AppState.modelRefresh[p].at || 0,
+                models: (AppState.fetchedModels[p] || []).map(m => ({
+                    id: m.id, name: m.name, group: m.group || 'chat', created: m.created || ''
+                }))
+            };
+        });
+        localStorage.setItem(MODEL_CATALOG_LS_KEY, JSON.stringify(payload));
+    } catch (e) {}
+}
+
+function loadOnlineCatalog() {
+    try {
+        const saved = localStorage.getItem(MODEL_CATALOG_LS_KEY);
+        if (!saved) return;
+        const parsed = JSON.parse(saved);
+        if (!parsed || parsed.v !== MODEL_CATALOG_SCHEMA_VERSION) return;   // 版本不匹配 → 当作没有缓存
+        let visibilityPatched = false;
+        MODEL_PROVIDERS.forEach(function (p) {
+            const bucket = parsed[p];
+            if (!bucket || !Array.isArray(bucket.models)) return;
+            let models = bucket.models.map(function (m) {
+                // 白名单对 localStorage 里的数据同样生效：即使有人手工篡改也注入不进来。
+                // id 走 SAFE_MODEL_ID，name 走去标签 + 截断（它会被渲染进顶栏标签/下拉/勾选框）。
+                const id = sanitizeModelId(m && m.id);
+                return id ? {
+                    id: id,
+                    name: String((m && m.name) || id).replace(/[<>]/g, '').slice(0, 120) || id,
+                    group: m.group === 'other' ? 'other' : 'chat',
+                    created: m.created || '',
+                    provider: p
+                } : null;
+            }).filter(Boolean);
+            // Gemini 的文本/非文本过滤规则可能在这份缓存写入之后变严过（比如新增了黑名单词）。
+            // 缓存是纯回放，不会重新走 fetchGeminiModelList，所以这里必须重新套一遍同一个判定，
+            // 否则老版本缓存过的图像/TTS/live 模型会在「点更新之前」一直显示在下拉里。
+            if (p === 'gemini') {
+                models = models.filter(m => isGeminiTextChatModelId(m.id));
+            }
+            if (models.length === 0) return;
+
+            // 兜底补齐可见性键。缓存（onlineModelCatalog）和可见性表（modelVisibility）是两次
+            // 互相独立、各自吞异常的写入，只要有一份没落盘（配额爆掉 / 用户清了单个键 / 隐私模式 /
+            // 跨设备手搬），这里几十个 id 在 modelVisibility 里就全都不存在 → 全代码库的
+            // `!== false` 判定一律放行 → 顶栏下拉一次性灌进上百个模型。
+            // 规则与 mergeVisibilityForProvider 一致：内置目录里的默认可见，其余默认隐藏。
+            // 只补缺失的键，不改已有值，所以是幂等的；这里是纯读缓存路径，刻意不做剪枝。
+            const builtinIds = new Set(DEFAULT_MODEL_CATALOG.filter(x => x.provider === p).map(x => x.id));
+            models.forEach(function (m) {
+                if (!(m.id in AppState.modelVisibility)) {
+                    AppState.modelVisibility[m.id] = builtinIds.has(m.id);
+                    visibilityPatched = true;
+                }
+            });
+
+            AppState.fetchedModels[p] = models;
+            AppState.modelRefresh[p] = {
+                status: 'ok', at: bucket.at || 0, count: models.length,
+                errCode: null, errMsg: '', source: 'cache'
+            };
+        });
+        if (visibilityPatched) {
+            try {
+                localStorage.setItem('modelVisibility', JSON.stringify(AppState.modelVisibility));
+            } catch (e) {}
+        }
+    } catch (e) {}
+}
+
+// 合并可见性。新 id 必须**显式写入布尔值**：全代码库用 `!== false` 判定可见，
+// 留空等于默认打开，一次刷新会把 50-90 个 id 一股脑灌进顶栏下拉。
+// 新发现的模型默认隐藏，用户到「本次新发现」横幅一键放行。
+// ⚠️ 必须在覆盖 AppState.fetchedModels[provider] **之前**调用（剪枝要用到旧值）。
+function mergeVisibilityForProvider(provider, models) {
+    const builtinIds = new Set(DEFAULT_MODEL_CATALOG.filter(m => m.provider === provider).map(m => m.id));
+    const newIds = [];
+    models.forEach(function (m) {
+        if (!(m.id in AppState.modelVisibility)) {
+            AppState.modelVisibility[m.id] = builtinIds.has(m.id);
+            if (!builtinIds.has(m.id)) newIds.push(m.id);
+        }
+    });
+
+    // 剪枝：只清理「上次从这家 API 拉到、这次没再返回」的孤儿键，且要过四重保护
+    // （本次结果 / 内置目录 / 本地模型 / 当前选中项）。不剪枝的话 loadSavedSettings 的
+    // 浅合并会让这个 map 随每次模型换代无限膨胀。
+    const keepIds = new Set(models.map(m => m.id));
+    DEFAULT_MODEL_CATALOG.forEach(m => keepIds.add(m.id));
+    (AppState.localModels || []).forEach(lm => keepIds.add(lm.id));
+    if (AppState.selectedModel) keepIds.add(AppState.selectedModel);
+    (AppState.fetchedModels[provider] || []).forEach(function (old) {
+        if (!keepIds.has(old.id)) delete AppState.modelVisibility[old.id];
+    });
+
+    return newIds;
+}
+
+async function refreshOnlineModels(providers) {
+    const targets = (providers && providers.length ? providers : MODEL_PROVIDERS)
+        .filter(p => MODEL_PROVIDERS.indexOf(p) >= 0);
+    if (targets.length === 0) return;
+
+    syncSettingsInputsToState();
+
+    const keyOf = {
+        gemini: AppState.geminiApiKey,
+        openai: AppState.openaiApiKey,
+        claude: AppState.claudeApiKey
+    };
+    if (targets.every(p => !keyOf[p])) {
+        showToast('请先在下方填写至少一个 API Key', 'warning');
+        return;
+    }
+
+    targets.forEach(function (p) {
+        AppState.modelRefresh[p] = { ...AppState.modelRefresh[p], status: 'loading', errCode: null, errMsg: '' };
+    });
+    AppState.newlyFoundIds = [];
+    setState({});   // 让按钮和芯片先进入 loading 态
+
+    // 'loading' 同时充当 UI 状态和并发锁（芯片 disabled / anyRefreshing / refreshOnlineModelsClick
+    // 的守卫都读它），所以下面整段必须包在 try/finally 里 —— 漏一次解锁就是永久死锁，
+    // 用户只能刷新整个页面才能再点「更新」。
+    try {
+    const tasks = targets.map(function (p) {
+        if (p === 'gemini') return fetchGeminiModelList(AppState.geminiApiKey);
+        if (p === 'openai') return fetchOpenaiModelList(AppState.openaiApiKey, !AppState.showDatedSnapshots);
+        return fetchClaudeModelList(AppState.claudeApiKey, AppState.claudeProxyUrl);
+    });
+
+    // 必须是 allSettled：用 all 的话一家没填 Key 会把另外两家已成功的结果一起拖垮
+    const results = await Promise.allSettled(tasks);
+
+    const summary = [];
+    const allNew = [];
+    results.forEach(function (r, i) {
+        const p = targets[i];
+        if (r.status === 'fulfilled' && Array.isArray(r.value) && r.value.length > 0) {
+            const models = r.value;
+            allNew.push(...mergeVisibilityForProvider(p, models));   // 先合并（用得到旧值）
+            AppState.fetchedModels[p] = models;                      // 再覆盖
+            AppState.modelRefresh[p] = {
+                status: 'ok', at: Date.now(), count: models.length,
+                errCode: null, errMsg: '', source: 'live'
+            };
+            summary.push(`${MODEL_PROVIDER_LABEL[p]} ${models.length} 个`);
+        } else if (r.status === 'fulfilled') {
+            // 返回 0 条：**不覆盖**旧列表。project-scoped key 的模型白名单会真实导致空列表，
+            // 当成成功覆盖会把用户的列表清空。
+            AppState.modelRefresh[p] = {
+                ...AppState.modelRefresh[p], status: 'error',
+                errCode: 'EMPTY', errMsg: '返回 0 个可用模型，已保留原列表'
+            };
+            summary.push(`${MODEL_PROVIDER_LABEL[p]} 返回空`);
+        } else {
+            const info = classifyModelFetchError(r.reason);
+            AppState.modelRefresh[p] = {
+                ...AppState.modelRefresh[p], status: 'error',
+                errCode: info.errCode, errMsg: info.errMsg
+            };
+            summary.push(`${MODEL_PROVIDER_LABEL[p]} 失败`);
+        }
+    });
+
+    AppState.newlyFoundIds = allNew;
+
+    try {
+        localStorage.setItem('modelVisibility', JSON.stringify(AppState.modelVisibility));
+    } catch (e) {}
+    persistOnlineCatalog();
+
+    const okCount = targets.filter(p => AppState.modelRefresh[p].status === 'ok').length;
+    if (okCount === targets.length) {
+        showToast(`已更新：${summary.join(' · ')}${allNew.length ? `（新增 ${allNew.length} 个，默认隐藏）` : ''}`, 'success');
+    } else if (okCount > 0) {
+        showToast(`部分更新：${summary.join(' · ')}`, 'warning');
+    } else {
+        showToast('更新失败，仍在使用上次的列表', 'error');
+    }
+    } finally {
+        // 任何抛错路径都必须解锁。不变量照旧：只写 modelRefresh，绝不碰 fetchedModels。
+        let stuck = false;
+        MODEL_PROVIDERS.forEach(function (p) {
+            if (AppState.modelRefresh[p].status === 'loading') {
+                AppState.modelRefresh[p] = {
+                    ...AppState.modelRefresh[p], status: 'error',
+                    errCode: 'HTTP', errMsg: '刷新意外中断，已保留原列表'
+                };
+                stuck = true;
+            }
+        });
+        if (stuck) renderApp();
+    }
+}
+
 // ============= 全局历史管理 =============
 
 function addToGlobalHistory(pairs, sid) {
@@ -1823,6 +2518,150 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
+// 属性上下文专用。escapeHtml() 走 textContent→innerHTML，**不转义引号**，
+// 所以 attr="${escapeHtml(x)}" 里只要 x 含一个 " 就能闭合属性并注入 onmouseover= 之类。
+// 受影响的是「非白名单」变量：芯片 title 里的 errMsg（来自厂商 API 的 error.message，远端可控）
+// 和搜索框 value（用户输入，且 setSettingsModelQuery 渲染后会主动 focus）。
+function escapeAttr(value) {
+    return String(value == null ? '' : value)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// ============= 在线模型目录派生层 =============
+// 全 UI（Settings 勾选框、模型下拉、顶栏标签、页脚状态）都只消费这里，不再有第二份 id 列表。
+// 合并规则：DEFAULT_MODEL_CATALOG 打底 → API 结果按 id upsert（保留种子的 sub/tier/short）
+//          → 种子里有但 API 没返回的打 retired 标记（**只打标不删**：可能只是这个 project key
+//            没启用该模型，或列表接口有滞后）→ 最后钉住当前选中项，保证下拉永不丢失正在用的模型。
+const MODEL_ICON_CLASS = {
+    gemini: { lite: 'text-emerald-500', fast: 'text-orange-500', pro: 'text-indigo-600' },
+    openai: { lite: 'text-teal-500',    fast: 'text-green-500',  pro: 'text-sky-600'   },
+    claude: { lite: 'text-amber-500',   fast: 'text-orange-600', pro: 'text-rose-600'  }
+};
+
+// 给 API 拉回来的陌生模型猜一个档位（只影响图标和配色）
+function classifyModelTier(id) {
+    const s = String(id).toLowerCase();
+    if (/nano|lite|haiku/.test(s)) return 'lite';
+    if (/mini|flash|sonnet/.test(s)) return 'fast';
+    return 'pro';
+}
+
+function decorateModel(entry) {
+    const tier = entry.tier || classifyModelTier(entry.id);
+    const palette = MODEL_ICON_CLASS[entry.provider] || MODEL_ICON_CLASS.gemini;
+    return {
+        ...entry,
+        tier,
+        sub: entry.sub || (entry.group === 'other' ? '未验证是否支持对话' : '来自 API'),
+        icon: tier === 'lite' ? Icons.Rocket : (tier === 'fast' ? Icons.Zap : Icons.Cpu),
+        iconClass: palette[tier] || 'text-slate-500',
+        price: getModelPrice(entry.id)   // null = 不在内置价格表里，两处渲染点都要按「价格未知」兜底
+    };
+}
+
+// 某个 provider 的完整目录
+function getModelCatalog(provider) {
+    const map = new Map();
+    DEFAULT_MODEL_CATALOG
+        .filter(m => m.provider === provider)
+        .forEach(m => map.set(m.id, { ...m, builtin: true, retired: false, group: 'chat' }));
+
+    const fetched = (AppState.fetchedModels && AppState.fetchedModels[provider]) || [];
+    if (fetched.length > 0) {
+        const fetchedIds = new Set(fetched.map(m => m.id));
+        // 种子里有、这次 API 没返回的 → 标 retired，但保留（可能只是没权限/接口滞后）
+        Array.from(map.keys()).forEach(k => {
+            if (!fetchedIds.has(k)) map.set(k, { ...map.get(k), retired: true });
+        });
+        fetched.forEach(m => {
+            const old = map.get(m.id);
+            map.set(m.id, {
+                id: m.id,
+                name: m.name || (old && old.name) || m.id,
+                sub: (old && old.sub) || '',
+                short: (old && old.short) || '',
+                tier: (old && old.tier) || '',
+                provider: provider,
+                group: m.group || 'chat',
+                created: m.created || '',
+                builtin: !!(old && old.builtin),
+                retired: false
+            });
+        });
+    }
+
+    // 钉住：用户当前正在用的模型永远不会从下拉里消失。
+    // 刻意**不自动切换** selectedModel —— /v1/models 不是权威（project key 的模型白名单会过滤输出、
+    // 新模型有收录延迟、Gemini 的 Model schema 里根本没有 deprecated 字段）。
+    if (AppState.apiProvider === provider && AppState.selectedModel && !map.has(AppState.selectedModel)) {
+        const pinnedId = sanitizeModelId(AppState.selectedModel);
+        if (pinnedId) {
+            map.set(pinnedId, {
+                id: pinnedId, name: pinnedId, sub: '未在列表中（仍可用）', short: '',
+                provider: provider, group: 'chat', builtin: false, retired: true, pinned: true
+            });
+        }
+    }
+
+    return Array.from(map.values()).map(decorateModel);
+}
+
+// 「正在使用的模型永不从下拉里消失」。getModelCatalog 的 pinned 只在选中模型**不在** map 里
+// 时才成立，而最常见的情况恰恰是它还在目录里（只是被标了 retired）—— 那时 pinned 为 false，
+// 「隐藏所有未在 API 列表中的模型」/「全不选」会把它一起隐藏，用户再也切不回来。
+// 所以钉住判定必须在这一层做，而不是只依赖 pinned。
+function isPinnedModel(provider, m) {
+    return !!m.pinned || (provider === AppState.apiProvider && m.id === AppState.selectedModel);
+}
+
+function getVisibleModels(provider) {
+    return getModelCatalog(provider)
+        .filter(m => isPinnedModel(provider, m) || AppState.modelVisibility[m.id] !== false);
+}
+
+function getModelMeta(id) {
+    for (let i = 0; i < MODEL_PROVIDERS.length; i++) {
+        const hit = getModelCatalog(MODEL_PROVIDERS[i]).find(m => m.id === id);
+        if (hit) return hit;
+    }
+    const local = (AppState.localModels || []).find(lm => lm.id === id);
+    return local
+        ? { id: local.id, name: local.id, sub: '', tier: '', provider: 'local', icon: Icons.Server, iconClass: 'text-indigo-600' }
+        : null;
+}
+
+// 顶栏按钮的短标签。内置模型直接用目录里的 short（保证与重构前逐字一致），
+// API 新模型退化为「去掉厂商前缀 + 超 15 字截断」。
+function getModelShortLabel(id) {
+    const meta = getModelMeta(id);
+    if (meta && meta.short) return meta.short;
+    const fallback = String(id || '');
+    let label = (meta && meta.name) || fallback;
+    label = label.replace(/^(Google\s+)?(Gemini|ChatGPT|GPT|Claude)[\s-]*/i, '').trim() || fallback;
+    return label.length > 15 ? label.slice(0, 15) + '...' : label;
+}
+
+// 相对时间：刚刚 / N 分钟前 / N 小时前 / M/D HH:mm
+function formatModelRefreshTime(ts) {
+    if (!ts) return '从未更新';
+    const diff = Date.now() - ts;
+    if (diff < 60 * 1000) return '刚刚';
+    if (diff < 60 * 60 * 1000) return `${Math.floor(diff / 60000)} 分钟前`;
+    if (diff < 24 * 60 * 60 * 1000) return `${Math.floor(diff / 3600000)} 小时前`;
+    const d = new Date(ts);
+    return `${d.getMonth() + 1}/${d.getDate()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
+// 缓存是否超过 TTL —— 只用来改文案，绝不清空数据
+function isModelCatalogStale(provider) {
+    const st = AppState.modelRefresh[provider];
+    return !!(st && st.at && (Date.now() - st.at) > MODEL_CATALOG_TTL);
+}
+
 function copyToClipboard(text) {
     navigator.clipboard.writeText(text);
 }
@@ -1937,49 +2776,183 @@ function renderToast() {
     `;
 }
 
+// ============= 在线模型区块的渲染辅助 =============
+// 单个 provider 的状态芯片（含独立 ⟳ 只重试这一家）
+function renderModelRefreshChip(group) {
+    const st = group.state || {};
+    const stale = isModelCatalogStale(group.provider);
+    let dotClass = 'bg-slate-300';
+    let text = '使用内置列表';
+    let title = '';
+    if (st.status === 'loading') {
+        dotClass = 'bg-violet-500 animate-pulse';
+        text = '正在获取...';
+    } else if (st.status === 'error') {
+        const soft = (st.errCode === 'NO_KEY' || st.errCode === 'EMPTY');
+        dotClass = soft ? 'bg-amber-400' : 'bg-rose-500';
+        text = MODEL_ERROR_TEXT[st.errCode] || '更新失败';
+        title = st.errMsg || '';
+    } else if (st.status === 'ok') {
+        dotClass = stale ? 'bg-amber-400' : 'bg-emerald-500';
+        text = `${st.count} 个 · ${formatModelRefreshTime(st.at)}`
+             + (st.source === 'cache' ? ' · 缓存' : '')
+             + (stale ? ' · 已过期' : '');
+        title = stale ? '距上次更新已超过 7 天，建议重新更新' : '';
+    }
+    return `
+        <span class="inline-flex items-center gap-1.5 px-2 py-1 bg-slate-50 border border-slate-200 rounded-lg text-[10px] text-slate-500" title="${escapeAttr(title)}">
+            <span class="w-1.5 h-1.5 rounded-full shrink-0 ${dotClass}"></span>
+            <span class="font-semibold text-slate-600">${group.label}</span>
+            <span class="truncate max-w-[150px]">${escapeHtml(text)}</span>
+            <button onclick="refreshOnlineModelsClick('${group.provider}')" ${st.status === 'loading' ? 'disabled' : ''} class="text-slate-400 hover:text-violet-600 disabled:opacity-40" title="只更新这一家">${Icons.RefreshCw}</button>
+        </span>
+    `;
+}
+
+// 单个在线模型的勾选行
+function renderOnlineModelCheckbox(m) {
+    const locked = isPinnedModel(m.provider, m);   // 正在使用的模型不允许隐藏
+    const visible = locked || AppState.modelVisibility[m.id] !== false;
+    const bg = visible
+        ? (m.provider === 'claude' ? 'bg-orange-50' : (m.provider === 'openai' ? 'bg-sky-50' : 'bg-indigo-50'))
+        : '';
+    let badge = '';
+    if (locked) {
+        badge = `<span class="text-[8px] px-1 py-0.5 rounded bg-amber-100 text-amber-700 font-bold shrink-0" title="${escapeAttr(m.pinned ? '正在使用，未在 API 列表中但仍可调用' : '正在使用中，不可隐藏')}">使用中</span>`;
+    } else if (m.retired) {
+        badge = `<span class="text-[8px] px-1 py-0.5 rounded bg-slate-100 text-slate-500 font-bold shrink-0" title="上次更新时 API 没有返回这个模型（可能已下线，也可能是该 Key/项目没有权限）">未在列表</span>`;
+    } else if (m.group === 'other') {
+        badge = `<span class="text-[8px] px-1 py-0.5 rounded bg-slate-100 text-slate-500 font-bold shrink-0" title="新家族，未验证是否支持对话">?</span>`;
+    } else if ((AppState.newlyFoundIds || []).indexOf(m.id) >= 0) {
+        badge = `<span class="text-[8px] px-1 py-0.5 rounded bg-violet-100 text-violet-700 font-bold shrink-0">NEW</span>`;
+    }
+    // 价格挪到名字下面单独一行；同一行里再放模型的原始 id（等宽小字，超长时省略号 + title 兜底），
+    // 这样「用户实际调用时要认的 id」和「价格」都可见，不用再靠悬停才能读到完整模型名。
+    const priceLine = `<span class="text-[9px] text-slate-400 font-mono shrink-0" title="${escapeAttr(formatPriceTitle(m.price))}">${escapeHtml(formatPriceCompact(m.price))}</span>`;
+    const idLine = `<span class="text-[9px] text-slate-400 font-mono truncate min-w-0 flex-1" title="${escapeAttr(m.id)}">${escapeHtml(m.id)}</span>`;
+    return `
+        <label class="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all ${bg}" title="${escapeHtml(m.id)}">
+            <input type="checkbox" ${visible ? 'checked' : ''} ${locked ? 'disabled' : ''} onchange="toggleModelVisibility('${escapeHtml(m.id)}')" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 shrink-0">
+            <span class="flex flex-col min-w-0 flex-1 gap-0.5">
+                <span class="flex items-start gap-1 min-w-0">
+                    <span class="text-xs font-medium ${m.iconClass} break-words leading-snug min-w-0 flex-1">${escapeHtml(m.name)}</span>
+                    ${badge}
+                </span>
+                <span class="flex items-center gap-1.5 min-w-0">
+                    ${idLine}
+                    ${priceLine}
+                </span>
+            </span>
+        </label>
+    `;
+}
+
 // ============= 设置模态框 =============
 function renderSettingsModal() {
     if (!AppState.showSettings) return '';
 
-    const onlineModels = [
-        { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash Lite', provider: 'gemini', iconClass: 'text-emerald-500' },
-        { id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash', provider: 'gemini', iconClass: 'text-orange-500' },
-        { id: 'gemini-3-pro-preview', name: 'Gemini 3 Pro', provider: 'gemini', iconClass: 'text-indigo-600' },
-        { id: 'gpt-5-nano', name: 'GPT-5 Nano', provider: 'openai', iconClass: 'text-teal-500' },
-        { id: 'gpt-5-mini', name: 'GPT-5 Mini', provider: 'openai', iconClass: 'text-green-500' },
-        { id: 'gpt-5.2', name: 'GPT-5.2', provider: 'openai', iconClass: 'text-sky-600' },
-        { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', provider: 'claude', iconClass: 'text-amber-500' },
-        { id: 'claude-sonnet-4-5-20250929', name: 'Claude Sonnet 4.5', provider: 'claude', iconClass: 'text-orange-600' },
-        { id: 'claude-opus-4-5-20251101', name: 'Claude Opus 4.5', provider: 'claude', iconClass: 'text-rose-600' }
-    ];
+    // 在线模型全部来自 getModelCatalog()（种子 + API + 钉住当前选中项），不再有硬编码数组
+    const modelQuery = (AppState.settingsModelQuery || '').trim().toLowerCase();
+    const anyRefreshing = MODEL_PROVIDERS.some(p => AppState.modelRefresh[p].status === 'loading');
+    const onlineGroups = MODEL_PROVIDERS.map(p => ({
+        provider: p,
+        label: MODEL_PROVIDER_LABEL[p],
+        state: AppState.modelRefresh[p],
+        models: getModelCatalog(p).filter(m => !modelQuery
+            || m.id.toLowerCase().includes(modelQuery)
+            || String(m.name || '').toLowerCase().includes(modelQuery))
+    }));
+    const totalOnline = onlineGroups.reduce((n, g) => n + g.models.length, 0);
+
+    // 拖拽中优先用「正在进行时」的宽度（避免拖拽途中被 toast/刷新等异步 setState 弹回上次已提交的值），
+    // 否则用 AppState 里持久化的宽度；两者都经过夹紧，且渲染时再叠一层 CSS min(...,95vw) 防止在
+    // 小窗口/加载了过大的历史 localStorage 值时把弹窗撑出视口。
+    const settingsModalWidthPx = settingsModalDragWidth != null
+        ? clampSettingsModalWidth(settingsModalDragWidth)
+        : clampSettingsModalWidth(AppState.settingsModalWidth);
 
     return `
         <div class="fixed inset-0 z-[100] bg-black/20 backdrop-blur-sm flex items-center justify-center p-4">
-            <div class="bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-w-lg overflow-hidden max-h-[90vh] overflow-y-auto">
-                <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50 sticky top-0 z-10">
+            <div id="settingsModalPanel" class="relative bg-white rounded-2xl shadow-2xl border border-slate-200 w-full max-h-[90vh] overflow-hidden flex flex-col" style="max-width:min(${settingsModalWidthPx}px, 95vw);">
+                <div class="px-5 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50 shrink-0">
                     <h3 class="text-sm font-bold text-slate-700 flex items-center gap-2">
                         ${Icons.SettingsGear} Settings
                     </h3>
                     <button onclick="closeSettings()" class="text-slate-400 hover:text-slate-600">${Icons.X}</button>
                 </div>
-                <div class="p-6 space-y-6">
+                <!-- mr-2.5 = 拖拽手柄的 w-2.5：把整个滚动容器（连同它右内缘那条 6px 的 custom-scrollbar）
+                     整体左移 10px 让开手柄，否则手柄会把滚动条整条盖住、鼠标拖不动滚动条。
+                     右内边距用 pr-4 而非 p-6 的 pr-6，把让出去的 10px 视觉上补回来。 -->
+                <div class="pt-6 pb-6 pl-6 pr-4 mr-2.5 space-y-6 overflow-y-auto custom-scrollbar flex-1 min-h-0">
                     <!-- Online Model Visibility Section -->
                     <div class="pb-5 border-b border-slate-100">
-                        <div class="flex items-center gap-2 mb-4">
-                            <div class="w-6 h-6 bg-gradient-to-br from-violet-500 to-purple-600 rounded-lg flex items-center justify-center text-white">
-                                ${Icons.Globe}
+                        <div class="flex items-center justify-between gap-2 mb-3">
+                            <div class="flex items-center gap-2">
+                                <div class="w-6 h-6 bg-gradient-to-br from-violet-500 to-purple-600 rounded-lg flex items-center justify-center text-white">
+                                    ${Icons.Globe}
+                                </div>
+                                <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">Online Models Visibility</span>
                             </div>
-                            <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">Online Models Visibility</span>
+                            <button onclick="refreshOnlineModelsClick('all')" ${anyRefreshing ? 'disabled' : ''} class="flex items-center gap-1.5 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-lg font-bold text-[10px] shadow-md shadow-violet-200 active:scale-95 transition-all disabled:opacity-50 shrink-0">
+                                ${anyRefreshing ? Icons.LoaderSmall : Icons.RefreshCw}
+                                ${anyRefreshing ? '更新中...' : '更新 / Refresh'}
+                            </button>
                         </div>
-                        <p class="text-[10px] text-slate-400 mb-3">Select which online models to show in the model selector.</p>
-                        <div class="grid grid-cols-2 gap-2">
-                            ${onlineModels.map(m => `
-                                <label class="flex items-center gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all ${AppState.modelVisibility[m.id] !== false ? 'bg-indigo-50' : ''}">
-                                    <input type="checkbox" ${AppState.modelVisibility[m.id] !== false ? 'checked' : ''} onchange="toggleModelVisibility('${m.id}')" class="w-4 h-4 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500">
-                                    <span class="text-xs font-medium ${m.iconClass}">${m.name}</span>
-                                </label>
-                            `).join('')}
+                        <p class="text-[10px] text-slate-400 mb-3">从各家 API 拉取最新模型列表，勾选哪些出现在模型选择器里。当前共 ${totalOnline} 个。</p>
+
+                        <!-- 三家状态芯片：每家独立结算，可单独重试 -->
+                        <div class="flex flex-wrap gap-1.5 mb-3">
+                            ${onlineGroups.map(g => renderModelRefreshChip(g)).join('')}
                         </div>
+
+                        <!-- 搜索 + 日期快照开关 -->
+                        <div class="flex items-center gap-2 mb-3">
+                            <div class="flex-grow flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 focus-within:ring-2 focus-within:ring-violet-100 transition-all">
+                                <input type="text" id="modelSearchInput" oninput="setSettingsModelQuery(this.value)" value="${escapeAttr(AppState.settingsModelQuery)}" placeholder="搜索模型 id / 名称..." class="flex-grow bg-transparent border-none text-xs focus:ring-0 p-0 text-slate-700 outline-none">
+                                ${AppState.settingsModelQuery ? `<button onclick="setSettingsModelQuery('')" class="text-slate-400 hover:text-slate-600 ml-2">${Icons.XSmall}</button>` : ''}
+                            </div>
+                            <label class="flex items-center gap-1.5 text-[10px] text-slate-500 cursor-pointer whitespace-nowrap" title="OpenAI 的 gpt-x-2026-03-17 这类固定快照，勾上后下次更新才会拉进来">
+                                <input type="checkbox" ${AppState.showDatedSnapshots ? 'checked' : ''} onchange="toggleDatedSnapshots()" class="w-3.5 h-3.5 rounded border-slate-300 text-violet-600 focus:ring-violet-500">
+                                日期快照
+                            </label>
+                        </div>
+
+                        ${AppState.newlyFoundIds.length > 0 ? `
+                            <div class="flex items-center justify-between gap-2 mb-3 px-3 py-2 bg-violet-50 border border-violet-100 rounded-xl">
+                                <span class="text-[10px] text-violet-700 font-semibold">本次新发现 ${AppState.newlyFoundIds.length} 个模型（默认隐藏）</span>
+                                <button onclick="showAllNewlyFoundModels()" class="text-[10px] font-bold text-violet-600 hover:text-violet-800 underline shrink-0">全部显示</button>
+                            </div>
+                        ` : ''}
+
+                        ${onlineGroups.map(g => `
+                            <div class="mb-3">
+                                <div class="flex items-center justify-between px-1 mb-1.5">
+                                    <span class="text-[10px] font-bold text-slate-500 uppercase tracking-wide">${g.label} (${g.models.length})</span>
+                                    <span class="flex items-center gap-2 shrink-0">
+                                        <button onclick="setModelVisibilityBulk('${g.provider}', true)" class="text-[10px] text-slate-400 hover:text-violet-600">全选</button>
+                                        <button onclick="setModelVisibilityBulk('${g.provider}', false)" class="text-[10px] text-slate-400 hover:text-violet-600">全不选</button>
+                                    </span>
+                                </div>
+                                ${g.models.length > 0 ? `
+                                    <div class="grid grid-cols-2 gap-2 ${g.models.length > 8 ? 'max-h-80 overflow-y-auto custom-scrollbar pr-1' : ''}">
+                                        ${g.models.map(m => renderOnlineModelCheckbox(m)).join('')}
+                                    </div>
+                                ` : `
+                                    <p class="text-[10px] text-slate-400 italic px-1">${modelQuery ? '没有匹配的模型。' : '暂无模型。'}</p>
+                                `}
+                            </div>
+                        `).join('')}
+
+                        <button onclick="hideRetiredModels()" class="w-full mt-1 py-2 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-xl font-bold text-[10px] transition-all">
+                            隐藏所有「未在 API 列表中」的模型
+                        </button>
+
+                        <p class="text-[9px] text-slate-400 mt-2 leading-relaxed">
+                            价格口径：<b>美元（USD）／每 1,000,000 tokens</b>，付费层<b>标准档</b>（非 Batch / Flex / Priority）；「入」= 输入价，「出」= 输出价；
+                            带 <b>*</b> 的是厂商限时促销价（到期后本表会自动改显恢复价）。多数模型另有速率受限的<b>免费额度</b>，显示价并不等于一定会产生账单。
+                            价格为内置表（非 API 实时返回），截至 ${escapeHtml(MODEL_PRICING_AS_OF)}，目前仅收录 Gemini（OpenAI / Claude 待补）。
+                            推理/思考 token 按输出价计费、部分模型 prompt 超过 200k tokens 会跳到更高档位——悬停价格可看完整说明。
+                        </p>
                     </div>
 
                     <!-- Local Model Visibility Section -->
@@ -1994,9 +2967,9 @@ function renderSettingsModal() {
                             <p class="text-[10px] text-slate-400 mb-3">Select which local models to show in the model selector.</p>
                             <div class="space-y-1 max-h-40 overflow-y-auto custom-scrollbar">
                                 ${AppState.localModels.map(lm => `
-                                    <label class="flex items-center gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all ${AppState.modelVisibility[lm.id] !== false ? 'bg-purple-50' : ''}">
-                                        <input type="checkbox" ${AppState.modelVisibility[lm.id] !== false ? 'checked' : ''} onchange="toggleModelVisibility('${escapeHtml(lm.id)}')" class="w-4 h-4 rounded border-slate-300 text-purple-600 focus:ring-purple-500">
-                                        <span class="text-xs font-medium text-purple-600 truncate">${escapeHtml(lm.id)}</span>
+                                    <label class="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all ${AppState.modelVisibility[lm.id] !== false ? 'bg-purple-50' : ''}" title="${escapeHtml(lm.id)}">
+                                        <input type="checkbox" ${AppState.modelVisibility[lm.id] !== false ? 'checked' : ''} onchange="toggleModelVisibility('${escapeHtml(lm.id)}')" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-purple-600 focus:ring-purple-500 shrink-0">
+                                        <span class="text-xs font-medium text-purple-600 break-words leading-snug min-w-0 flex-1">${escapeHtml(lm.id)}</span>
                                     </label>
                                 `).join('')}
                             </div>
@@ -2106,6 +3079,7 @@ function renderSettingsModal() {
                         </button>
                     </div>
                 </div>
+                <div class="settings-resize-handle absolute top-0 right-0 h-full w-2.5 cursor-ew-resize z-20" onmousedown="startSettingsModalResize(event)" ondblclick="resetSettingsModalWidth()" title="拖拽调整宽度（双击恢复默认）"></div>
             </div>
         </div>
     `;
@@ -2267,66 +3241,36 @@ function renderHistoryMenu() {
 }
 
 // ============= 模型选择器 =============
+// 在线组被用户全部隐藏时的兜底文案（对齐本地组的 "All local models hidden. Check Settings."）。
+// 没有它的话该区块会渲染成一个只有标题、没有任何按钮的空壳。
+const MODEL_GROUP_EMPTY_HINT = `<div class="text-[10px] text-slate-400 italic text-center py-2 bg-white/60 rounded-lg">该厂商模型已全部隐藏，请在 Settings 勾选</div>`;
+
 function renderModelSelector() {
-    const allGeminiModels = [
-        { id: 'gemini-2.5-flash-lite', name: 'Gemini 2.5 Flash Lite', sub: 'Fast & Cheap', iconClass: 'text-emerald-500', icon: Icons.Rocket },
-        { id: 'gemini-3-flash-preview', name: 'Gemini 3 Flash', sub: 'Speed + Intelligence', iconClass: 'text-orange-500', icon: Icons.Zap },
-        { id: 'gemini-3-pro-preview', name: 'Gemini 3 Pro', sub: 'Best Quality', iconClass: 'text-indigo-600', icon: Icons.Cpu }
-    ];
-
-    const allOpenaiModels = [
-        { id: 'gpt-5-nano', name: 'GPT-5 Nano', sub: 'Ultra Fast & Light', iconClass: 'text-teal-500', icon: Icons.Rocket },
-        { id: 'gpt-5-mini', name: 'GPT-5 Mini', sub: 'Fast & Balanced', iconClass: 'text-green-500', icon: Icons.Zap },
-        { id: 'gpt-5.2', name: 'GPT-5.2', sub: 'Best Quality', iconClass: 'text-sky-600', icon: Icons.Cpu }
-    ];
-
-    const allClaudeModels = [
-        { id: 'claude-haiku-4-5-20251001', name: 'Claude Haiku 4.5', sub: 'Fast & Efficient', iconClass: 'text-amber-500', icon: Icons.Rocket },
-        { id: 'claude-sonnet-4-5-20250929', name: 'Claude Sonnet 4.5', sub: 'Balanced Performance', iconClass: 'text-orange-600', icon: Icons.Zap },
-        { id: 'claude-opus-4-5-20251101', name: 'Claude Opus 4.5', sub: 'Best Quality', iconClass: 'text-rose-600', icon: Icons.Cpu }
-    ];
-
-    // 根据可见性设置筛选模型
-    const geminiModels = allGeminiModels.filter(m => AppState.modelVisibility[m.id] !== false);
-    const openaiModels = allOpenaiModels.filter(m => AppState.modelVisibility[m.id] !== false);
-    const claudeModels = allClaudeModels.filter(m => AppState.modelVisibility[m.id] !== false);
+    // 单一事实源：目录与可见性全部从 getModelCatalog / getVisibleModels 派生，
+    // 不再有第二份硬编码 id 列表（原来那三个数组已删除）。
+    const geminiModels = getVisibleModels('gemini');
+    const openaiModels = getVisibleModels('openai');
+    const claudeModels = getVisibleModels('claude');
 
     let currentIcon, currentIconClass, currentLabel;
     if (AppState.apiProvider === 'local') {
         currentIcon = Icons.Server;
         currentIconClass = 'text-indigo-600';
         currentLabel = AppState.selectedModel === 'local-model' ? 'Local LLM' : (AppState.selectedModel.length > 15 ? AppState.selectedModel.slice(0, 15) + '...' : AppState.selectedModel);
-    } else if (AppState.apiProvider === 'openai') {
-        const openaiModel = allOpenaiModels.find(m => m.id === AppState.selectedModel);
-        currentIcon = openaiModel?.icon || Icons.Cpu;
-        currentIconClass = openaiModel?.iconClass || 'text-sky-600';
-        currentLabel = AppState.selectedModel === 'gpt-5-nano' ? 'GPT-5 Nano' :
-                       AppState.selectedModel === 'gpt-5-mini' ? 'GPT-5 Mini' : 'GPT-5.2';
-    } else if (AppState.apiProvider === 'claude') {
-        const claudeModel = allClaudeModels.find(m => m.id === AppState.selectedModel);
-        currentIcon = claudeModel?.icon || Icons.Cpu;
-        currentIconClass = claudeModel?.iconClass || 'text-orange-600';
-        currentLabel = AppState.selectedModel.includes('haiku') ? 'Haiku' :
-                       AppState.selectedModel.includes('sonnet') ? 'Sonnet 4.5' : 'Opus 4.5';
-    } else if (AppState.selectedModel === 'gemini-2.5-flash-lite') {
-        currentIcon = Icons.Rocket;
-        currentIconClass = 'text-emerald-500';
-        currentLabel = '2.5 Lite';
-    } else if (AppState.selectedModel === 'gemini-3-flash-preview') {
-        currentIcon = Icons.Zap;
-        currentIconClass = 'text-orange-500';
-        currentLabel = '3 Flash';
     } else {
-        currentIcon = Icons.Cpu;
-        currentIconClass = 'text-indigo-600';
-        currentLabel = '3 Pro';
+        // 查目录拿图标/配色/短标签。原来那串写死的 if/else 会把任何新模型误标成
+        // GPT-5.2 / Opus 4.5 / 3 Pro —— 这是「更新」按钮最容易被忽略的连带 bug。
+        const currentMeta = getModelMeta(AppState.selectedModel);
+        currentIcon = (currentMeta && currentMeta.icon) || Icons.Cpu;
+        currentIconClass = (currentMeta && currentMeta.iconClass) || 'text-indigo-600';
+        currentLabel = getModelShortLabel(AppState.selectedModel);
     }
 
     return `
         <div class="relative">
             <button onclick="toggleModelMenu()" class="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-2xl border border-slate-200 transition-all text-xs font-bold text-slate-700 active:scale-95">
                 <span class="${currentIconClass}">${currentIcon}</span>
-                <span class="uppercase tracking-wider">${currentLabel}</span>
+                <span class="uppercase tracking-wider">${escapeHtml(currentLabel)}</span>
                 <span class="transition-transform duration-200 ${AppState.showModelMenu ? 'rotate-180' : ''}">${Icons.ChevronDown}</span>
             </button>
             ${AppState.showModelMenu ? `
@@ -2334,14 +3278,14 @@ function renderModelSelector() {
                     <div class="p-2 space-y-1 bg-slate-50/50 border-b border-slate-100">
                         <div class="text-[10px] font-bold text-slate-400 px-2 py-1 uppercase">Google Cloud (Gemini)</div>
                         ${geminiModels.map(m => `
-                            <button onclick="selectModel('gemini','${m.id}')" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'gemini' && AppState.selectedModel === m.id ? 'bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
-                                <div class="flex flex-col items-start">
-                                    <span class="text-xs font-bold uppercase tracking-wide">${m.name}</span>
-                                    <span class="text-[9px] opacity-70">${m.sub}</span>
+                            <button onclick="selectModel('gemini','${escapeHtml(m.id)}')" title="${escapeAttr(formatPriceTitle(m.price))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'gemini' && AppState.selectedModel === m.id ? 'bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
+                                <div class="flex flex-col items-start overflow-hidden">
+                                    <span class="text-xs font-bold uppercase tracking-wide truncate max-w-[190px]">${escapeHtml(m.name)}</span>
+                                    <span class="text-[9px] opacity-70 truncate max-w-[190px]">${escapeHtml(m.sub || '')} · ${escapeHtml(formatPriceCompact(m.price))}</span>
                                 </div>
-                                <span class="${m.iconClass}">${m.icon}</span>
+                                <span class="${m.iconClass} shrink-0">${m.icon}</span>
                             </button>
-                        `).join('')}
+                        `).join('') || MODEL_GROUP_EMPTY_HINT}
                     </div>
                     <div class="p-2 space-y-1 bg-sky-50/50 border-b border-slate-100">
                         <div class="text-[10px] font-bold text-slate-400 px-2 py-1 uppercase flex items-center gap-2">
@@ -2349,14 +3293,14 @@ function renderModelSelector() {
                             OpenAI
                         </div>
                         ${openaiModels.map(m => `
-                            <button onclick="selectModel('openai','${m.id}')" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'openai' && AppState.selectedModel === m.id ? 'bg-sky-50 text-sky-700 ring-1 ring-sky-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
-                                <div class="flex flex-col items-start">
-                                    <span class="text-xs font-bold uppercase tracking-wide">${m.name}</span>
-                                    <span class="text-[9px] opacity-70">${m.sub}</span>
+                            <button onclick="selectModel('openai','${escapeHtml(m.id)}')" title="${escapeAttr(formatPriceTitle(m.price))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'openai' && AppState.selectedModel === m.id ? 'bg-sky-50 text-sky-700 ring-1 ring-sky-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
+                                <div class="flex flex-col items-start overflow-hidden">
+                                    <span class="text-xs font-bold uppercase tracking-wide truncate max-w-[190px]">${escapeHtml(m.name)}</span>
+                                    <span class="text-[9px] opacity-70 truncate max-w-[190px]">${escapeHtml(m.sub || '')} · ${escapeHtml(formatPriceCompact(m.price))}</span>
                                 </div>
-                                <span class="${m.iconClass}">${m.icon}</span>
+                                <span class="${m.iconClass} shrink-0">${m.icon}</span>
                             </button>
-                        `).join('')}
+                        `).join('') || MODEL_GROUP_EMPTY_HINT}
                     </div>
                     <div class="p-2 space-y-1 bg-orange-50/50 border-b border-slate-100">
                         <div class="text-[10px] font-bold text-slate-400 px-2 py-1 uppercase flex items-center gap-2">
@@ -2364,14 +3308,14 @@ function renderModelSelector() {
                             Anthropic Claude
                         </div>
                         ${claudeModels.map(m => `
-                            <button onclick="selectModel('claude','${m.id}')" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'claude' && AppState.selectedModel === m.id ? 'bg-orange-50 text-orange-700 ring-1 ring-orange-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
-                                <div class="flex flex-col items-start">
-                                    <span class="text-xs font-bold uppercase tracking-wide">${m.name}</span>
-                                    <span class="text-[9px] opacity-70">${m.sub}</span>
+                            <button onclick="selectModel('claude','${escapeHtml(m.id)}')" title="${escapeAttr(formatPriceTitle(m.price))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'claude' && AppState.selectedModel === m.id ? 'bg-orange-50 text-orange-700 ring-1 ring-orange-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
+                                <div class="flex flex-col items-start overflow-hidden">
+                                    <span class="text-xs font-bold uppercase tracking-wide truncate max-w-[190px]">${escapeHtml(m.name)}</span>
+                                    <span class="text-[9px] opacity-70 truncate max-w-[190px]">${escapeHtml(m.sub || '')} · ${escapeHtml(formatPriceCompact(m.price))}</span>
                                 </div>
-                                <span class="${m.iconClass}">${m.icon}</span>
+                                <span class="${m.iconClass} shrink-0">${m.icon}</span>
                             </button>
-                        `).join('')}
+                        `).join('') || MODEL_GROUP_EMPTY_HINT}
                     </div>
                     <div class="p-2 bg-white">
                         <div class="text-[10px] font-bold text-slate-400 px-2 py-1 uppercase flex items-center justify-between">
@@ -2400,6 +3344,9 @@ function renderModelSelector() {
                         <button onclick="openSettings()" class="w-full flex items-center justify-center gap-2 p-2 mt-1 rounded-xl bg-slate-100 hover:bg-indigo-50 text-slate-600 hover:text-indigo-600 text-xs font-bold transition-all border border-transparent hover:border-indigo-100">
                             ${Icons.SettingsGear} Settings
                         </button>
+                        <p class="text-[9px] text-slate-400 leading-snug px-1 pt-2 mt-2 border-t border-slate-100">
+                            价格 = 美元 / 每 1M tokens（付费层标准档），「入」= 输入价、「出」= 输出价，<b>*</b> = 限时促销价。
+                        </p>
                     </div>
                 </div>
             ` : ''}
@@ -2681,6 +3628,10 @@ function renderSettingsPopover(type) {
 // ============= 页脚 =============
 function renderFooter() {
     let statusText, statusDotClass;
+    // ⚠️ 阶段一是纯重构，页脚文案必须与重构前逐字一致，所以这里**仍按写死的 id 判定**。
+    // 计划 步骤 6A 想改成按目录 tier 判定（顺带修掉 'gemini-flash-lite-latest' 这条死分支），
+    // 但那会让 9 个内置模型里 5 个的页脚文案发生变化（含默认的 gemini-2.5-flash-lite：
+    // PRO QUALITY ACTIVE → ULTRA FAST LITE MODE），属于行为变更而非重构，已回退，待用户拍板后再切。
     if (AppState.apiProvider === 'local') {
         statusText = 'LOCAL SERVER CONNECTED';
         statusDotClass = 'bg-indigo-600 shadow-indigo-200';
@@ -2700,7 +3651,7 @@ function renderFooter() {
             <div class="flex gap-6 items-center">
                 <span class="flex items-center gap-2 text-indigo-500 font-black">
                     ${AppState.apiProvider === 'local' ? Icons.Server : Icons.Cpu}
-                    ENGINE: <span class="text-slate-600 truncate max-w-[150px]">${AppState.apiProvider === 'local' ? escapeHtml(AppState.selectedModel) : AppState.selectedModel.toUpperCase()}</span>
+                    ENGINE: <span class="text-slate-600 truncate max-w-[150px]">${escapeHtml(AppState.apiProvider === 'local' ? AppState.selectedModel : AppState.selectedModel.toUpperCase())}</span>
                 </span>
                 <div class="flex items-center gap-2">
                     <span class="w-2 h-2 rounded-full animate-pulse shadow-lg ${statusDotClass}"></span>
@@ -2940,12 +3891,151 @@ function closeSettings() {
 }
 
 function toggleModelVisibility(modelId) {
+    // 注意：刷新时新 id 会被显式写入布尔值，所以这里对未知 id 首次点击是视觉空操作的老毛病
+    // 在「更新」流程下自然消失（mergeVisibilityForProvider 保证键一定存在）
     AppState.modelVisibility[modelId] = !AppState.modelVisibility[modelId];
     // 保存到 localStorage
     try {
         localStorage.setItem('modelVisibility', JSON.stringify(AppState.modelVisibility));
     } catch (e) {}
     renderApp();
+}
+
+// 更新按钮入口。provider 传 'all' 更新三家，传 'gemini'/'openai'/'claude' 只重试一家
+// （失败本来就是 per-provider 的，重试一家不该把另外两家的限流额度也烧掉）
+function refreshOnlineModelsClick(provider) {
+    if (MODEL_PROVIDERS.some(p => AppState.modelRefresh[p].status === 'loading')) return;
+    // fire-and-forget，但必须接住 rejection：否则一次 unhandled rejection 就是静默死锁
+    refreshOnlineModels(provider && provider !== 'all' ? [provider] : MODEL_PROVIDERS)
+        .catch(function (e) { console.error('refreshOnlineModels failed:', e); });
+}
+
+function setModelVisibilityBulk(provider, value) {
+    getModelCatalog(provider).forEach(function (m) {
+        // 正在使用的模型（含钉住项）不允许被批量隐藏 —— 只看 m.pinned 是不够的，
+        // 选中模型仍在目录里（retired）时 pinned 为 false，会被误伤
+        if (!value && isPinnedModel(provider, m)) return;
+        AppState.modelVisibility[m.id] = !!value;
+    });
+    try {
+        localStorage.setItem('modelVisibility', JSON.stringify(AppState.modelVisibility));
+    } catch (e) {}
+    renderApp();
+}
+
+function showAllNewlyFoundModels() {
+    (AppState.newlyFoundIds || []).forEach(function (id) {
+        AppState.modelVisibility[id] = true;
+    });
+    try {
+        localStorage.setItem('modelVisibility', JSON.stringify(AppState.modelVisibility));
+    } catch (e) {}
+    renderApp();
+}
+
+// 一键隐藏「API 已不再返回」的模型。只取消勾选、不删数据，随时可以再勾回来。
+function hideRetiredModels() {
+    let n = 0;
+    MODEL_PROVIDERS.forEach(function (p) {
+        getModelCatalog(p).forEach(function (m) {
+            if (m.retired && !isPinnedModel(p, m) && AppState.modelVisibility[m.id] !== false) {
+                AppState.modelVisibility[m.id] = false;
+                n++;
+            }
+        });
+    });
+    try {
+        localStorage.setItem('modelVisibility', JSON.stringify(AppState.modelVisibility));
+    } catch (e) {}
+    showToast(n > 0 ? `已隐藏 ${n} 个未在 API 列表中的模型` : '没有需要隐藏的模型', n > 0 ? 'success' : 'info');
+}
+
+function setSettingsModelQuery(value) {
+    AppState.settingsModelQuery = String(value || '');
+    renderApp();
+    // renderApp 走 root.innerHTML 全量重建会丢焦点，手动还原光标
+    const input = document.getElementById('modelSearchInput');
+    if (input) {
+        input.focus();
+        const len = input.value.length;
+        try { input.setSelectionRange(len, len); } catch (e) {}
+    }
+}
+
+function toggleDatedSnapshots() {
+    AppState.showDatedSnapshots = !AppState.showDatedSnapshots;
+    try {
+        localStorage.setItem('showDatedSnapshots', AppState.showDatedSnapshots ? '1' : '0');
+    } catch (e) {}
+    renderApp();
+}
+
+// Settings 弹窗右边缘拖拽调宽。刻意不走 setState/renderApp——renderSettingsModal() 整段走
+// root.innerHTML 重建，拖拽中每次 mousemove 都 setState 会和重渲染打架、肉眼可见地弹回起点。
+// 做法：mousedown 记录起点，mousemove 直接把新宽度写进 DOM（每次都用 id 重新查一遍元素，
+// 因为拖拽过程中可能被别的异步 setState —— 比如 toast 3 秒后自动消失 —— 整体重渲染一次，
+// 之前 mousedown 时拿到的节点引用会变成一个脱离文档树的旧节点，继续写它的 style 不会有任何
+// 视觉效果），mouseup 才落盘进 AppState + localStorage。
+function startSettingsModalResize(e) {
+    e.preventDefault();
+    const panel = document.getElementById('settingsModalPanel');
+    if (!panel) return;
+    const startX = e.clientX;
+    const startWidth = panel.getBoundingClientRect().width;
+    let finished = false;                       // onUp 幂等哨兵：blur / buttons===0 兜底可能和真 mouseup 重复触发
+    document.body.classList.add('is-resizing-settings-modal');
+
+    function onMove(ev) {
+        // 兜底 1：鼠标已经松开却还在收 mousemove（在浏览器窗口外松手、右键系统菜单吞掉 mouseup、
+        // 拖拽中 Alt-Tab 切窗口）。ev.buttons === 0 是「mouseup 丢了」的确定信号，立刻收尾自愈，
+        // 否则 document 上的监听不会解绑，body 的 is-resizing 类会粘死（全局 ew-resize + 禁选中），
+        // 并且之后光是移动鼠标就会「幽灵拖拽」改宽度。
+        if (ev.buttons === 0) { onUp(); return; }
+        const live = document.getElementById('settingsModalPanel');
+        if (!live) return;
+        const dx = ev.clientX - startX;
+        const viewportCap = Math.max(SETTINGS_MODAL_MIN_WIDTH, Math.round(window.innerWidth * 0.95));
+        const maxAllowed = Math.min(SETTINGS_MODAL_MAX_WIDTH, viewportCap);
+        // 弹窗被 overlay 的 justify-center 水平居中：宽度每增加 2px，右边缘才右移 1px。
+        // 所以要让手柄贴住光标，宽度增量必须取 dx * 2，否则手柄会从光标下面「逃走」。
+        const newWidth = Math.max(SETTINGS_MODAL_MIN_WIDTH, Math.min(maxAllowed, startWidth + dx * 2));
+        live.style.maxWidth = `min(${newWidth}px, 95vw)`;
+        settingsModalDragWidth = newWidth;
+    }
+    function onUp() {
+        if (finished) return;
+        finished = true;
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        window.removeEventListener('blur', onUp);   // 兜底 2 的对称解绑
+        document.body.classList.remove('is-resizing-settings-modal');
+        if (settingsModalDragWidth != null) {
+            const finalWidth = clampSettingsModalWidth(settingsModalDragWidth);
+            settingsModalDragWidth = null;
+            AppState.settingsModalWidth = finalWidth;
+            try {
+                localStorage.setItem('settingsModalWidth', String(finalWidth));
+            } catch (e) {}
+            // 宽度已经通过 AppState 落盘；不需要再 renderApp()——DOM 上的宽度已经是最终值了，
+            // 下次任何原因触发的重渲染会自然带上这个持久化后的宽度（见 renderSettingsModal 里
+            // 对 settingsModalDragWidth / AppState.settingsModalWidth 的读取）。
+        }
+    }
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+    // 兜底 2：拖到窗口外松手 / Alt-Tab 切走时浏览器只给 blur，不给 mouseup。
+    window.addEventListener('blur', onUp);
+}
+
+// 双击拖拽手柄：恢复默认宽度（同样直接改 DOM + 落盘，不整段重渲染）
+function resetSettingsModalWidth() {
+    settingsModalDragWidth = null;
+    AppState.settingsModalWidth = SETTINGS_MODAL_DEFAULT_WIDTH;
+    try {
+        localStorage.setItem('settingsModalWidth', String(SETTINGS_MODAL_DEFAULT_WIDTH));
+    } catch (e) {}
+    const panel = document.getElementById('settingsModalPanel');
+    if (panel) panel.style.maxWidth = `min(${SETTINGS_MODAL_DEFAULT_WIDTH}px, 95vw)`;
 }
 
 function handleConnectLocalClick() {
@@ -3143,7 +4233,13 @@ function loadSavedSettings() {
             AppState.apiProvider = savedApiProvider;
         }
         if (savedSelectedModel) {
-            AppState.selectedModel = savedSelectedModel;
+            // localStorage 里的 selectedModel 是过滤器的一条绕过旁路：修复前点过 nano-banana 图像模型
+            // （gemini-2.5-flash-image-preview 等）的用户，刷新后该 id 会被原样恢复，再被 getModelCatalog
+            // 的「钉住」分支塞回 Gemini 下拉，callGeminiAPI 继续拿它去翻译。这里补上同一套判定。
+            // 只校验 gemini（openai/claude/local 走各自逻辑，不在本次范围内）。
+            const okId = sanitizeModelId(savedSelectedModel)
+                && (AppState.apiProvider !== 'gemini' || isGeminiTextChatModelId(savedSelectedModel));
+            AppState.selectedModel = okId ? savedSelectedModel : DEFAULT_MODEL_CATALOG[0].id;
         }
 
         // 加载 Model Visibility 设置
@@ -3154,6 +4250,22 @@ function loadSavedSettings() {
                 AppState.modelVisibility = { ...AppState.modelVisibility, ...parsed };
             } catch (e) {}
         }
+
+        // 加载「显示 OpenAI 日期快照」开关
+        const savedShowSnapshots = localStorage.getItem('showDatedSnapshots');
+        if (savedShowSnapshots === '1') {
+            AppState.showDatedSnapshots = true;
+        }
+
+        // 加载 Settings 弹窗宽度（拖拽调整后持久化）；clamp 一下防止脏值把弹窗渲染成极端宽/窄
+        const savedSettingsModalWidth = localStorage.getItem('settingsModalWidth');
+        if (savedSettingsModalWidth) {
+            AppState.settingsModalWidth = clampSettingsModalWidth(parseInt(savedSettingsModalWidth, 10));
+        }
+
+        // 加载上次从各家 API 拉到的在线模型目录（纯读缓存，不发任何网络请求）
+        // 刻意不做启动自动刷新：/v1/models 有限流，且首屏不该依赖网络
+        loadOnlineCatalog();
 
         // 只要有保存的本地地址，就自动尝试连接（获取模型列表）
         if (savedLocalUrl) {
@@ -3187,10 +4299,10 @@ async function autoConnectLocal() {
         console.warn('Auto-connect to local LM Studio failed:', e.message);
         AppState.localModels = [];
         
-        // 如果上次使用的是本地模型但现在连接失败，回退到 Gemini
+        // 如果上次使用的是本地模型但现在连接失败，回退到目录里的第一个在线模型
         if (AppState.apiProvider === 'local') {
-            AppState.apiProvider = 'gemini';
-            AppState.selectedModel = 'gemini-2.5-flash-lite';
+            AppState.apiProvider = DEFAULT_MODEL_CATALOG[0].provider;
+            AppState.selectedModel = DEFAULT_MODEL_CATALOG[0].id;
         }
         
         // 显示顶部错误提示
