@@ -317,13 +317,16 @@ const AppState = {
         show: false,
         loading: false,
         originalText: "",
-        history: [],
-        pageIndex: 0,
+        mode: "replace", // 'replace'（学术同义替换）| 'simplify'（简化）
+        historyByMode: { replace: [], simplify: [] }, // 每个模式各自的分页历史
+        pageIndexByMode: { replace: 0, simplify: 0 }, // 每个模式各自的页码
         position: { x: 0, y: 0 },
         selectionRange: { start: 0, end: 0 },
         field: null,
         contextSentence: ""
     },
+    // 选词弹窗默认功能：'replace' | 'simplify'（持久化到 localStorage）
+    synonymDefaultMode: "replace",
 
     // 历史记录
     globalHistory: [],
@@ -428,16 +431,26 @@ function renderSynonymPopupOnly() {
     // 移除旧的弹窗
     const oldPopup = document.getElementById('synonymPopup');
     if (oldPopup) oldPopup.remove();
-    
+
     // 如果不需要显示，直接返回
     if (!AppState.synonymState.show) return;
-    
-    // 创建新的弹窗元素
+
+    // 创建新的弹窗元素（所有新增状态读取都做防御性兜底：渲染函数绝不能抛错）
     const s = AppState.synonymState;
-    const currentSynonyms = s.history[s.pageIndex] || [];
-    
+    const mode = s.mode === 'simplify' ? 'simplify' : 'replace';
+    const hb = (s.historyByMode && typeof s.historyByMode === 'object') ? s.historyByMode : {};
+    const history = Array.isArray(hb[mode]) ? hb[mode] : [];
+    const pb = (s.pageIndexByMode && typeof s.pageIndexByMode === 'object') ? s.pageIndexByMode : {};
+    const pageIndex = typeof pb[mode] === 'number' ? pb[mode] : 0;
+    const currentSynonyms = Array.isArray(history[pageIndex]) ? history[pageIndex] : [];
+    const pos = (s.position && typeof s.position === 'object') ? s.position : { x: 0, y: 0 };
+
     const popupHtml = `
-        <div id="synonymPopup" style="position:fixed;left:${s.position.x}px;top:${s.position.y + 20}px;transform:translateX(-10%);" class="z-[100] bg-white border border-slate-200 rounded-xl shadow-2xl p-3 min-w-[240px] flex flex-col gap-2">
+        <div id="synonymPopup" style="position:fixed;left:0px;top:0px;visibility:hidden;" class="z-[100] bg-white border border-slate-200 rounded-xl shadow-2xl p-3 min-w-[240px] flex flex-col gap-2">
+            <div class="flex items-center bg-slate-100 rounded-lg p-0.5 gap-0.5">
+                <button onclick="handleSynonymModeSwitch('replace')" class="flex-1 px-2 py-1 rounded-md text-[10px] font-bold transition-all ${mode === 'replace' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">替换</button>
+                <button onclick="handleSynonymModeSwitch('simplify')" class="flex-1 px-2 py-1 rounded-md text-[10px] font-bold transition-all ${mode === 'simplify' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">简化</button>
+            </div>
             <div class="flex items-center justify-between border-b border-slate-100 pb-2">
                 <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1">
                     ${Icons.SparklesSmall} Options for "${escapeHtml(s.originalText)}"
@@ -447,10 +460,10 @@ function renderSynonymPopupOnly() {
             <div class="min-h-[60px] flex flex-col justify-center">
                 ${s.loading ? `
                     <div class="flex items-center gap-2 text-xs text-slate-400 py-2 justify-center">
-                        <span class="text-indigo-500">${Icons.LoaderSmall}</span> ${s.history.length > 0 ? 'Finding new options...' : 'Finding context matches...'}
+                        <span class="text-indigo-500">${Icons.LoaderSmall}</span> ${history.length > 0 ? 'Finding new options...' : 'Finding context matches...'}
                     </div>
                 ` : currentSynonyms.length > 0 ? `
-                    <div class="flex flex-col gap-1">
+                    <div class="flex flex-col gap-1 overflow-y-auto custom-scrollbar" style="max-height:min(320px, 45vh);">
                         ${currentSynonyms.map((syn, i) => `
                             <button onclick="applySynonym('${escapeHtml(syn).replace(/'/g, "\\'")}')" class="text-left px-2 py-1.5 rounded hover:bg-indigo-50 text-slate-700 text-xs font-medium hover:text-indigo-700 transition-colors flex items-center gap-2 group">
                                 <span class="opacity-0 group-hover:opacity-50 text-indigo-400">${Icons.ArrowRightLeftSmall}</span> ${escapeHtml(syn)}
@@ -459,18 +472,41 @@ function renderSynonymPopupOnly() {
                     </div>
                 ` : `<div class="text-xs text-slate-400 text-center py-2 italic">No context-aware alternatives found.</div>`}
             </div>
-            ${(currentSynonyms.length > 0 || s.history.length > 0) ? `
+            ${(currentSynonyms.length > 0 || history.length > 0) ? `
                 <div class="flex items-center justify-between border-t border-slate-100 mt-2 pt-2">
-                    <button onclick="handleSynonymPageChange(-1)" ${s.pageIndex === 0 || s.loading ? 'disabled' : ''} class="p-1 text-slate-400 hover:text-indigo-600 hover:bg-slate-50 rounded-lg disabled:opacity-30 transition-all">${Icons.ChevronLeft}</button>
-                    <span class="text-[9px] font-mono text-slate-300 select-none">Page ${s.pageIndex + 1}</span>
+                    <button onclick="handleSynonymPageChange(-1)" ${pageIndex === 0 || s.loading ? 'disabled' : ''} class="p-1 text-slate-400 hover:text-indigo-600 hover:bg-slate-50 rounded-lg disabled:opacity-30 transition-all">${Icons.ChevronLeft}</button>
+                    <span class="text-[9px] font-mono text-slate-300 select-none">Page ${pageIndex + 1}</span>
                     <button onclick="handleSynonymPageChange(1)" ${s.loading ? 'disabled' : ''} class="p-1 text-slate-400 hover:text-indigo-600 hover:bg-slate-50 rounded-lg disabled:opacity-30 transition-all">${Icons.ChevronRight}</button>
                 </div>
             ` : ''}
         </div>
     `;
-    
+
     // 插入到 body
     document.body.insertAdjacentHTML('beforeend', popupHtml);
+
+    // 同步测量并夹紧定位：每次重渲染（loading→结果、翻页、模式切换）都会走到这里，
+    // 高度变化后重新夹紧；同步读 offsetWidth/offsetHeight 不会闪烁，无需 RAF。
+    // 锚点始终是最初选中时的点击坐标（s.position），模式切换不改变锚点。
+    const popupEl = document.getElementById('synonymPopup');
+    if (popupEl) {
+        const margin = 8;
+        const w = popupEl.offsetWidth;
+        const h = popupEl.offsetHeight;
+        const clickX = Number(pos.x) || 0;
+        const clickY = Number(pos.y) || 0;
+        const x = Math.max(margin, Math.min(clickX, window.innerWidth - w - margin));
+        let y = clickY + 20; // 优先显示在点击点下方
+        if (y + h > window.innerHeight - margin) {
+            y = clickY - h - 10; // 下方放不下 → 放上方
+            if (y < margin) {
+                y = Math.max(margin, window.innerHeight - h - margin); // 上方也放不下 → 贴底夹紧
+            }
+        }
+        popupEl.style.left = x + 'px';
+        popupEl.style.top = y + 'px';
+        popupEl.style.visibility = 'visible';
+    }
 }
 
 // 默认Prompt常量
@@ -1345,18 +1381,30 @@ async function getSmartUpdate(prompt, config, signal = null) {
 }
 
 // ============= 获取同义词 =============
-async function getSynonyms(sentence, selectedText, lang, config, avoidList = []) {
+// mode: 'replace'（学术同义替换，默认）| 'simplify'（简化：更常用、更直白的说法）
+async function getSynonyms(sentence, selectedText, lang, config, avoidList = [], mode = 'replace') {
     const avoidInstruction = avoidList.length > 0
         ? `IMPORTANT: Do NOT include any of the following words/phrases in your output: ${JSON.stringify(avoidList)}. Find DIFFERENT alternatives.`
         : "";
 
-    const prompt = `Context Sentence: "${sentence}"
+    const prompt = mode === 'simplify' ? `Context Sentence: "${sentence}"
+Selected Text: "${selectedText}"
+Language: ${lang === 'zh' ? 'Chinese' : 'English'}
+
+Task: Provide 4-5 SIMPLER, more common, and more direct alternatives for the "Selected Text".
+1. If "Selected Text" is a single word, replace rare, obscure, or overly formal words with common, everyday equivalents.
+2. If "Selected Text" is a phrase, clause, or full sentence, rewrite it in plainer, more direct, and more concise language that conveys the SAME meaning.
+3. The alternatives must fit grammatically into the "Context Sentence" if substituted.
+4. SORT your result list by simplicity and commonness (most common and most direct first).
+5. ${avoidInstruction}
+
+Return JSON: { "alternatives": ["option1", "option2", "option3", "option4"] }` : `Context Sentence: "${sentence}"
 Selected Text: "${selectedText}"
 Language: ${lang === 'zh' ? 'Chinese' : 'English'}
 
 Task: Provide 4-5 distinct, academic-style alternatives for the "Selected Text".
 1. If "Selected Text" is a single word, provide synonyms.
-2. If "Selected Text" is a phrase or clause, provide rephrased versions that convey the SAME meaning and function within the context.
+2. If "Selected Text" is a phrase, clause, or full sentence, provide rephrased versions that convey the SAME meaning and function within the context.
 3. The alternatives must fit grammatically into the "Context Sentence" if substituted.
 4. SORT your result list by Semantic Proximity (closest meaning first, then slightly more varied).
 5. ${avoidInstruction}
@@ -1745,12 +1793,16 @@ async function handleTextSelect(event, field, index) {
 
     if (!selectedText || selectedText.length < 1 || /^\s*$/.test(selectedText)) return;
 
+    // 每次全新选择都按设置里的默认模式打开，并重置两个模式的缓存
+    const defaultMode = AppState.synonymDefaultMode === 'simplify' ? 'simplify' : 'replace';
+
     updateSynonymState({
         show: true,
         loading: true,
         originalText: selectedText,
-        history: [],
-        pageIndex: 0,
+        mode: defaultMode,
+        historyByMode: { replace: [], simplify: [] },
+        pageIndexByMode: { replace: 0, simplify: 0 },
         position: { x: event.clientX, y: event.clientY },
         selectionRange: { start, end },
         field,
@@ -1760,11 +1812,15 @@ async function handleTextSelect(event, field, index) {
     try {
         const lang = field === 'src' ? AppState.sourceLang : AppState.targetLang;
         const config = getApiConfig();
-        const alternatives = await getSynonyms(text, selectedText, lang, config, []);
+        const alternatives = await getSynonyms(text, selectedText, lang, config, [], defaultMode);
 
+        const cur = AppState.synonymState;
+        const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : { replace: [], simplify: [] };
+        curHb[defaultMode] = [alternatives];
         updateSynonymState({
-            loading: false,
-            history: [alternatives]
+            historyByMode: curHb,
+            // 请求返回时用户可能已切到另一个模式：只有当前模式就是本次请求的模式才收起 loading
+            ...(cur.mode === defaultMode ? { loading: false } : {})
         });
     } catch (err) {
         console.error(err);
@@ -1772,17 +1828,68 @@ async function handleTextSelect(event, field, index) {
     }
 }
 
-// 同义词翻页
+// 同义词弹窗模式切换（替换 / 简化）
+async function handleSynonymModeSwitch(mode) {
+    const s = AppState.synonymState || {};
+    const newMode = mode === 'simplify' ? 'simplify' : 'replace';
+    if (s.mode === newMode) return; // 点击当前激活模式 = no-op
+
+    const hb = (s.historyByMode && typeof s.historyByMode === 'object') ? s.historyByMode : { replace: [], simplify: [] };
+    const cached = Array.isArray(hb[newMode]) ? hb[newMode] : [];
+
+    if (cached.length > 0) {
+        // 该模式已有缓存：立即展示，不重新请求（锚点不变，renderSynonymPopupOnly 会按新高度重新夹紧）
+        updateSynonymState({ mode: newMode, loading: false });
+        return;
+    }
+
+    // 该模式还没请求过：切换并拉取第 1 页
+    updateSynonymState({ mode: newMode, loading: true });
+
+    if (!s.field) {
+        updateSynonymState({ loading: false });
+        return;
+    }
+
+    try {
+        const lang = s.field === 'src' ? AppState.sourceLang : AppState.targetLang;
+        const config = getApiConfig();
+        const alternatives = await getSynonyms(s.contextSentence, s.originalText, lang, config, [], newMode);
+
+        const cur = AppState.synonymState;
+        const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : { replace: [], simplify: [] };
+        curHb[newMode] = [alternatives];
+        updateSynonymState({
+            historyByMode: curHb,
+            ...(cur.mode === newMode ? { loading: false } : {})
+        });
+    } catch (e) {
+        console.error(e);
+        if (AppState.synonymState.mode === newMode) {
+            updateSynonymState({ loading: false });
+        }
+    }
+}
+
+// 同义词翻页（按当前模式独立分页；avoid 列表也按模式隔离）
 async function handleSynonymPageChange(direction) {
-    const { pageIndex, history, contextSentence, originalText, field } = AppState.synonymState;
+    const s = AppState.synonymState || {};
+    const mode = s.mode === 'simplify' ? 'simplify' : 'replace';
+    const hb = (s.historyByMode && typeof s.historyByMode === 'object') ? s.historyByMode : { replace: [], simplify: [] };
+    const history = Array.isArray(hb[mode]) ? hb[mode] : [];
+    const pb = (s.pageIndexByMode && typeof s.pageIndexByMode === 'object') ? s.pageIndexByMode : { replace: 0, simplify: 0 };
+    const pageIndex = typeof pb[mode] === 'number' ? pb[mode] : 0;
+    const { contextSentence, originalText, field } = s;
 
     if (direction === -1) {
         if (pageIndex > 0) {
-            updateSynonymState({ pageIndex: pageIndex - 1 });
+            pb[mode] = pageIndex - 1;
+            updateSynonymState({ pageIndexByMode: pb });
         }
     } else {
         if (pageIndex < history.length - 1) {
-            updateSynonymState({ pageIndex: pageIndex + 1 });
+            pb[mode] = pageIndex + 1;
+            updateSynonymState({ pageIndexByMode: pb });
         } else {
             if (!field) return;
             const lang = field === 'src' ? AppState.sourceLang : AppState.targetLang;
@@ -1792,12 +1899,17 @@ async function handleSynonymPageChange(direction) {
             try {
                 const avoidList = history.flat();
                 const config = getApiConfig();
-                const newAlternatives = await getSynonyms(contextSentence, originalText, lang, config, avoidList);
+                const newAlternatives = await getSynonyms(contextSentence, originalText, lang, config, avoidList, mode);
 
+                const cur = AppState.synonymState;
+                const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : { replace: [], simplify: [] };
+                curHb[mode] = [...history, newAlternatives];
+                const curPb = (cur.pageIndexByMode && typeof cur.pageIndexByMode === 'object') ? cur.pageIndexByMode : { replace: 0, simplify: 0 };
+                curPb[mode] = pageIndex + 1;
                 updateSynonymState({
-                    loading: false,
-                    history: [...history, newAlternatives],
-                    pageIndex: pageIndex + 1
+                    historyByMode: curHb,
+                    pageIndexByMode: curPb,
+                    ...(cur.mode === mode ? { loading: false } : {})
                 });
             } catch (e) {
                 updateSynonymState({ loading: false });
@@ -3038,6 +3150,23 @@ function renderSettingsModal() {
                         `}
                     </div>
 
+                    <!-- Synonym Popup Default Mode Section -->
+                    <div class="pb-5 border-b border-slate-100">
+                        <div class="flex items-center gap-2 mb-3">
+                            <div class="w-6 h-6 bg-gradient-to-br from-indigo-500 to-violet-600 rounded-lg flex items-center justify-center text-white">
+                                ${Icons.SparklesSmall}
+                            </div>
+                            <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">选词弹窗默认功能</span>
+                        </div>
+                        <div class="flex items-center justify-between gap-2">
+                            <span class="text-xs text-slate-600 font-medium">选中文本后弹窗默认打开的模式</span>
+                            <div class="flex items-center bg-slate-100 rounded-lg p-0.5">
+                                <button onclick="setSynonymDefaultMode('replace')" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all ${AppState.synonymDefaultMode !== 'simplify' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">替换（默认）</button>
+                                <button onclick="setSynonymDefaultMode('simplify')" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all ${AppState.synonymDefaultMode === 'simplify' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">简化</button>
+                            </div>
+                        </div>
+                    </div>
+
                     <!-- Gemini API Key Section -->
                     <div class="pb-5 border-b border-slate-100">
                         <div class="flex items-center gap-2 mb-3">
@@ -3915,6 +4044,16 @@ function setAutoSaveInterval(ms) {
     renderApp();
 }
 
+// 设置选词弹窗默认功能（替换 / 简化）
+function setSynonymDefaultMode(mode) {
+    AppState.synonymDefaultMode = mode === 'simplify' ? 'simplify' : 'replace';
+    // 保存到 localStorage
+    try {
+        localStorage.setItem('synonymDefaultMode', AppState.synonymDefaultMode);
+    } catch (e) {}
+    renderApp();
+}
+
 function restoreHistoryItem(idx) {
     restoreGlobalHistory(AppState.globalHistory[idx]);
 }
@@ -4328,6 +4467,12 @@ function loadSavedSettings() {
         const savedShowSnapshots = localStorage.getItem('showDatedSnapshots');
         if (savedShowSnapshots === '1') {
             AppState.showDatedSnapshots = true;
+        }
+
+        // 加载选词弹窗默认功能（'replace' | 'simplify'，脏值一律回退默认 'replace'）
+        const savedSynonymDefaultMode = localStorage.getItem('synonymDefaultMode');
+        if (savedSynonymDefaultMode === 'replace' || savedSynonymDefaultMode === 'simplify') {
+            AppState.synonymDefaultMode = savedSynonymDefaultMode;
         }
 
         // 加载 Settings 弹窗宽度（拖拽调整后持久化）；clamp 一下防止脏值把弹窗渲染成极端宽/窄
