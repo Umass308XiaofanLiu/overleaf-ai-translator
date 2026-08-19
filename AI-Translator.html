@@ -60,6 +60,23 @@ body { font-family: 'Inter', sans-serif; }
 .settings-resize-handle:active::after {
     background: #6366f1;
 }
+/* 选词高亮镜像层。
+   renderApp() 走 root.innerHTML 全量重建，会把编辑用的 <textarea> 整个换成新节点，
+   浏览器原生 Selection 随旧节点一起消失 —— 这就是「弹窗还在、蓝色高亮没了」的根因。
+   所以高亮改成状态驱动：在 textarea 背后铺一层同字体/同行高/同宽度的镜像文本，
+   只把选中片段包进 <mark> 画背景，文字本身透明。每次渲染都会按 synonymState 重新生成，
+   因此全量重渲染、失焦、翻页都不会让它消失。 */
+.sel-highlight-layer {
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+}
+.sel-highlight-layer mark {
+    background-color: rgba(99, 102, 241, 0.25);
+    color: transparent;
+    -webkit-text-fill-color: transparent;
+    border-radius: 2px;
+}
+
 /* 拖拽过程中禁止选中文字，光标全局保持左右拖拽箭头 */
 body.is-resizing-settings-modal {
     cursor: ew-resize !important;
@@ -317,15 +334,20 @@ const AppState = {
         show: false,
         loading: false,
         originalText: "",
-        mode: "replace", // 'replace'（学术同义替换）| 'simplify'（简化）
-        historyByMode: { replace: [], simplify: [] }, // 每个模式各自的分页历史
-        pageIndexByMode: { replace: 0, simplify: 0 }, // 每个模式各自的页码
+        mode: "replace", // 'replace'（学术同义替换）| 'simplify'（简化）| 'grammar'（语法修正）
+        historyByMode: { replace: [], simplify: [], grammar: [] }, // 每个模式各自的分页历史
+        pageIndexByMode: { replace: 0, simplify: 0, grammar: 0 }, // 每个模式各自的页码
+        // 语法修正的逐页判定结果，下标与 historyByMode.grammar 一一对齐：
+        // { status: 'correct' | 'issues' | 'empty' | 'parse', issue: string }
+        grammarNotes: [],
+        errorMessage: "", // 请求整体失败时展示在弹窗里（而不是把弹窗直接关掉）
         position: { x: 0, y: 0 },
         selectionRange: { start: 0, end: 0 },
         field: null,
+        index: null,      // 选中发生在哪一行（= AppState.activeIndex），高亮层据此定位
         contextSentence: ""
     },
-    // 选词弹窗默认功能：'replace' | 'simplify'（持久化到 localStorage）
+    // 选词弹窗默认功能：'replace' | 'simplify' | 'grammar'（持久化到 localStorage）
     synonymDefaultMode: "replace",
 
     // 历史记录
@@ -419,6 +441,47 @@ function updateTranslationPair(index, updates) {
     setState({ translationPairs: pairs });
 }
 
+// ============= 选词弹窗的三种模式（替换 / 简化 / 语法修正）=============
+// 三者在任何地方都是平级的：模式切换条、historyByMode、pageIndexByMode、默认模式设置、localStorage。
+const SYNONYM_MODES = ['replace', 'simplify', 'grammar'];
+const SYNONYM_MODE_LABEL = { replace: '替换', simplify: '简化', grammar: '语法修正' };
+
+// 脏值一律回落 'replace'。所有读 mode 的地方都必须过这个函数，渲染路径才不会碰到未知键。
+function normalizeSynonymMode(mode) {
+    return SYNONYM_MODES.indexOf(mode) !== -1 ? mode : 'replace';
+}
+
+function emptySynonymHistory() {
+    return { replace: [], simplify: [], grammar: [] };
+}
+
+function emptySynonymPageIndex() {
+    return { replace: 0, simplify: 0, grammar: 0 };
+}
+
+// 从 state 里安全取出「某模式的分页历史」，任何脏值都返回空数组，绝不抛错
+function getSynonymHistory(state, mode) {
+    const hb = (state && state.historyByMode && typeof state.historyByMode === 'object') ? state.historyByMode : {};
+    return Array.isArray(hb[mode]) ? hb[mode] : [];
+}
+
+function getSynonymPageIndex(state, mode) {
+    const pb = (state && state.pageIndexByMode && typeof state.pageIndexByMode === 'object') ? state.pageIndexByMode : {};
+    const n = pb[mode];
+    return (typeof n === 'number' && isFinite(n) && n >= 0) ? Math.floor(n) : 0;
+}
+
+// 语法模式下某一页的判定结果，永远返回一个形状固定的对象
+function getGrammarNote(state, pageIndex) {
+    const notes = (state && Array.isArray(state.grammarNotes)) ? state.grammarNotes : [];
+    const note = notes[pageIndex];
+    if (!note || typeof note !== 'object') return { status: '', issue: '' };
+    return {
+        status: typeof note.status === 'string' ? note.status : '',
+        issue: typeof note.issue === 'string' ? note.issue : ''
+    };
+}
+
 // 更新同义词状态
 function updateSynonymState(updates) {
     Object.assign(AppState.synonymState, updates);
@@ -432,47 +495,87 @@ function renderSynonymPopupOnly() {
     const oldPopup = document.getElementById('synonymPopup');
     if (oldPopup) oldPopup.remove();
 
+    // 选中高亮层跟弹窗同生共死：弹窗关掉时这里会把 <mark> 一起清掉。
+    // 放在最前面且自带兜底，保证下面任何一步提前 return 都不会漏同步。
+    syncSelectionHighlightLayers();
+
     // 如果不需要显示，直接返回
     if (!AppState.synonymState.show) return;
 
     // 创建新的弹窗元素（所有新增状态读取都做防御性兜底：渲染函数绝不能抛错）
     const s = AppState.synonymState;
-    const mode = s.mode === 'simplify' ? 'simplify' : 'replace';
-    const hb = (s.historyByMode && typeof s.historyByMode === 'object') ? s.historyByMode : {};
-    const history = Array.isArray(hb[mode]) ? hb[mode] : [];
-    const pb = (s.pageIndexByMode && typeof s.pageIndexByMode === 'object') ? s.pageIndexByMode : {};
-    const pageIndex = typeof pb[mode] === 'number' ? pb[mode] : 0;
+    const mode = normalizeSynonymMode(s.mode);
+    const history = getSynonymHistory(s, mode);
+    const pageIndex = getSynonymPageIndex(s, mode);
     const currentSynonyms = Array.isArray(history[pageIndex]) ? history[pageIndex] : [];
     const pos = (s.position && typeof s.position === 'object') ? s.position : { x: 0, y: 0 };
+    const errorMessage = typeof s.errorMessage === 'string' ? s.errorMessage : '';
 
-    const popupHtml = `
-        <div id="synonymPopup" style="position:fixed;left:0px;top:0px;visibility:hidden;" class="z-[100] bg-white border border-slate-200 rounded-xl shadow-2xl p-3 min-w-[240px] flex flex-col gap-2">
-            <div class="flex items-center bg-slate-100 rounded-lg p-0.5 gap-0.5">
-                <button onclick="handleSynonymModeSwitch('replace')" class="flex-1 px-2 py-1 rounded-md text-[10px] font-bold transition-all ${mode === 'replace' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">替换</button>
-                <button onclick="handleSynonymModeSwitch('simplify')" class="flex-1 px-2 py-1 rounded-md text-[10px] font-bold transition-all ${mode === 'simplify' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">简化</button>
-            </div>
-            <div class="flex items-center justify-between border-b border-slate-100 pb-2">
-                <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1">
-                    ${Icons.SparklesSmall} Options for "${escapeHtml(s.originalText)}"
-                </div>
-                <button onclick="updateSynonymState({show:false})" class="text-slate-300 hover:text-slate-500">${Icons.XSmall}</button>
-            </div>
-            <div class="min-h-[60px] flex flex-col justify-center">
-                ${s.loading ? `
+    // 语法修正模式的响应形状跟另外两个模式不同：要么「语法正确」，要么「N 条改写」。
+    const isGrammar = mode === 'grammar';
+    const note = isGrammar ? getGrammarNote(s, pageIndex) : { status: '', issue: '' };
+    const grammarChecked = isGrammar && note.status !== '';
+    // 判定为「语法正确」且只有这一页时，翻页条没有意义，直接不渲染
+    const showPager = (currentSynonyms.length > 0 || history.length > 0)
+        && !(isGrammar && note.status === 'correct' && history.length <= 1);
+
+    const modeButtonsHtml = SYNONYM_MODES.map(m => `
+                <button onclick="handleSynonymModeSwitch('${m}')" class="flex-1 px-1.5 py-1 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${mode === m ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">${SYNONYM_MODE_LABEL[m]}</button>
+    `).join('');
+
+    // 结果区：三个模式共用一段分支，任何一支都必须能渲染出可见文案，绝不留空
+    let bodyHtml;
+    if (s.loading) {
+        bodyHtml = `
                     <div class="flex items-center gap-2 text-xs text-slate-400 py-2 justify-center">
-                        <span class="text-indigo-500">${Icons.LoaderSmall}</span> ${history.length > 0 ? 'Finding new options...' : 'Finding context matches...'}
-                    </div>
-                ` : currentSynonyms.length > 0 ? `
+                        <span class="text-indigo-500">${Icons.LoaderSmall}</span> ${history.length > 0 ? 'Finding new options...' : (isGrammar ? 'Checking grammar...' : 'Finding context matches...')}
+                    </div>`;
+    } else if (errorMessage) {
+        bodyHtml = `
+                    <div class="text-xs text-rose-500 text-center py-2 leading-relaxed">${escapeHtml(errorMessage)}</div>`;
+    } else if (isGrammar && note.status === 'correct') {
+        bodyHtml = `
+                    <div class="flex items-center gap-1.5 text-xs font-bold text-emerald-600 py-2 justify-center">
+                        ${Icons.CheckCheck} 语法正确
+                    </div>`;
+    } else if (currentSynonyms.length > 0) {
+        bodyHtml = `
+                    ${isGrammar && note.issue ? `<div class="text-[10px] text-amber-600 bg-amber-50 border border-amber-100 rounded px-2 py-1 mb-1 leading-snug overflow-y-auto custom-scrollbar" style="max-height:56px;">${escapeHtml(note.issue)}</div>` : ''}
                     <div class="flex flex-col gap-1 overflow-y-auto custom-scrollbar" style="max-height:min(320px, 45vh);">
                         ${currentSynonyms.map((syn, i) => `
                             <button onclick="applySynonym('${escapeHtml(syn).replace(/'/g, "\\'")}')" class="text-left px-2 py-1.5 rounded hover:bg-indigo-50 text-slate-700 text-xs font-medium hover:text-indigo-700 transition-colors flex items-center gap-2 group">
                                 <span class="opacity-0 group-hover:opacity-50 text-indigo-400">${Icons.ArrowRightLeftSmall}</span> ${escapeHtml(syn)}
                             </button>
                         `).join('')}
-                    </div>
-                ` : `<div class="text-xs text-slate-400 text-center py-2 italic">No context-aware alternatives found.</div>`}
+                    </div>`;
+    } else if (isGrammar) {
+        bodyHtml = `
+                    ${note.issue ? `<div class="text-[10px] text-amber-600 bg-amber-50 border border-amber-100 rounded px-2 py-1 mb-1 leading-snug overflow-y-auto custom-scrollbar" style="max-height:56px;">${escapeHtml(note.issue)}</div>` : ''}
+                    <div class="text-xs text-slate-400 text-center py-2 leading-relaxed">
+                        ${grammarChecked ? '未能获得语法建议。' : '暂无语法结果。'}
+                        <span class="block text-[10px] text-slate-300 mt-0.5">模型未返回可用结果（响应为空或 JSON 解析失败）</span>
+                    </div>`;
+    } else {
+        bodyHtml = `
+                    <div class="text-xs text-slate-400 text-center py-2 italic">No context-aware alternatives found.
+                        <span class="block not-italic text-[10px] text-slate-300 mt-0.5">模型未返回可用结果（响应为空或 JSON 解析失败）</span>
+                    </div>`;
+    }
+
+    const popupHtml = `
+        <div id="synonymPopup" style="position:fixed;left:0px;top:0px;visibility:hidden;" class="z-[100] bg-white border border-slate-200 rounded-xl shadow-2xl p-3 min-w-[240px] flex flex-col gap-2">
+            <div class="flex items-center bg-slate-100 rounded-lg p-0.5 gap-0.5">${modeButtonsHtml}
             </div>
-            ${(currentSynonyms.length > 0 || history.length > 0) ? `
+            <div class="flex items-center justify-between border-b border-slate-100 pb-2">
+                <div class="text-[10px] font-bold text-slate-400 uppercase tracking-wider flex items-center gap-1">
+                    ${Icons.SparklesSmall} ${isGrammar ? 'Grammar' : 'Options'} for "${escapeHtml(s.originalText)}"
+                </div>
+                <button onclick="updateSynonymState({show:false})" class="text-slate-300 hover:text-slate-500">${Icons.XSmall}</button>
+            </div>
+            <div class="min-h-[60px] flex flex-col justify-center">
+                ${bodyHtml}
+            </div>
+            ${showPager ? `
                 <div class="flex items-center justify-between border-t border-slate-100 mt-2 pt-2">
                     <button onclick="handleSynonymPageChange(-1)" ${pageIndex === 0 || s.loading ? 'disabled' : ''} class="p-1 text-slate-400 hover:text-indigo-600 hover:bg-slate-50 rounded-lg disabled:opacity-30 transition-all">${Icons.ChevronLeft}</button>
                     <span class="text-[9px] font-mono text-slate-300 select-none">Page ${pageIndex + 1}</span>
@@ -506,6 +609,64 @@ function renderSynonymPopupOnly() {
         popupEl.style.left = x + 'px';
         popupEl.style.top = y + 'px';
         popupEl.style.visibility = 'visible';
+    }
+}
+
+// ============= 选中高亮（状态驱动，抗全量重渲染）=============
+// 背景：renderApp() 用 root.innerHTML 整块重建，编辑用的 <textarea> 会被换成新节点，
+// 浏览器原生 Selection 随之消失（已实测：全量渲染后 selectionStart/End 双双归零、焦点掉到 body），
+// 于是用户看到「弹窗还在、选中的蓝底没了」。恢复原生 selection 不可靠（会和下一次渲染打架，
+// 而且失焦时浏览器本来就会把选中画成灰色），所以改成：把选区位置记在 synonymState 里，
+// 由行渲染器在 textarea 背后生成一层镜像文本，用 <mark> 包住选中片段。
+// 这样每次渲染都会重新生成高亮，弹窗关闭 / 应用替换时再一起清掉。
+
+// 生成镜像层的内部 HTML。渲染路径专用 —— 整体 try/catch，任何脏状态都只返回空串，绝不抛错。
+function buildSelectionHighlightInner(side, idx) {
+    try {
+        const s = AppState.synonymState;
+        if (!s || !s.show) return '';
+        if (s.field !== side) return '';
+        if (AppState.activeIndex !== idx) return '';
+        if (typeof s.index === 'number' && s.index !== idx) return '';
+
+        const range = (s.selectionRange && typeof s.selectionRange === 'object') ? s.selectionRange : null;
+        if (!range) return '';
+
+        const values = (AppState.editValues && typeof AppState.editValues === 'object') ? AppState.editValues : {};
+        const text = typeof values[side] === 'string' ? values[side] : '';
+
+        let start = Math.floor(Number(range.start));
+        let end = Math.floor(Number(range.end));
+        if (!isFinite(start) || !isFinite(end)) return '';
+        start = Math.max(0, Math.min(text.length, start));
+        end = Math.max(0, Math.min(text.length, end));
+        if (end <= start) return '';
+
+        return escapeHtml(text.slice(0, start))
+            + '<mark>' + escapeHtml(text.slice(start, end)) + '</mark>'
+            + escapeHtml(text.slice(end));
+    } catch (e) {
+        return '';
+    }
+}
+
+// 行渲染器调用：产出整层（内容为空时就是一层不可见的空 div，不影响布局）
+function renderSelectionHighlightLayer(side, idx) {
+    return `<div class="sel-highlight-layer absolute inset-0 overflow-hidden whitespace-pre-wrap break-words leading-relaxed pointer-events-none select-none" aria-hidden="true" data-side="${side}" data-idx="${idx}">${buildSelectionHighlightInner(side, idx)}</div>`;
+}
+
+// 局部更新用（updateSynonymState 不走全量渲染，这里把已经在 DOM 里的镜像层刷新一遍）
+function syncSelectionHighlightLayers() {
+    try {
+        const layers = document.querySelectorAll('.sel-highlight-layer');
+        for (let i = 0; i < layers.length; i++) {
+            const layer = layers[i];
+            const side = layer.getAttribute('data-side');
+            const idx = Number(layer.getAttribute('data-idx'));
+            layer.innerHTML = buildSelectionHighlightInner(side, idx);
+        }
+    } catch (e) {
+        // 高亮是纯装饰，坏了也绝不能污染渲染路径
     }
 }
 
@@ -1475,6 +1636,149 @@ Return JSON: { "alternatives": ["option1", "option2", "option3", "option4"] }`;
     return data.alternatives || [];
 }
 
+// ============= 语法修正（选词弹窗第三个模式）=============
+// 与 getSynonyms 是平级的兄弟函数。之所以单独开一个而不是塞进 getSynonyms：
+// 语法模式的响应形状本质不同（要么「正确」，要么「N 条改写 + 原因」），
+// 硬塞回 string[] 只能靠哨兵值伪装，反而更容易在渲染路径上炸。
+// 返回值形状固定：{ status: 'correct'|'issues'|'empty'|'parse', issue: string, alternatives: string[] }
+// —— 这里绝不 throw 解析错误，调用方拿到 status 就能给出可见文案。
+
+// 把模型返回的任意脏数据压成固定形状
+function normalizeGrammarPayload(data) {
+    const d = (data && typeof data === 'object') ? data : {};
+
+    const raw = Array.isArray(d.alternatives) ? d.alternatives : [];
+    const seen = {};
+    const alternatives = [];
+    for (let i = 0; i < raw.length; i++) {
+        const v = raw[i];
+        const str = (typeof v === 'string' ? v : (v == null ? '' : String(v))).trim();
+        if (!str) continue;
+        if (seen[str]) continue; // 弱模型（如 qwen3-1.7b）实测会把同一条重复三遍
+        seen[str] = true;
+        alternatives.push(str);
+    }
+
+    let issue = '';
+    if (typeof d.issue === 'string') issue = d.issue.trim();
+    else if (typeof d.reason === 'string') issue = d.reason.trim();
+
+    // 「语法正确」必须有模型的明确表态才敢下结论。
+    // 响应是 null / 数组 / 缺字段时一律算 'empty'——绝不能把一次失败的请求显示成「语法正确」。
+    let correct = false;
+    if (typeof d.correct === 'boolean') correct = d.correct;
+    else if (typeof d.correct === 'string') correct = /^(true|yes|correct)$/i.test(d.correct.trim());
+
+    if (correct) return { status: 'correct', issue: '', alternatives: [] };
+    if (alternatives.length > 0) return { status: 'issues', issue: issue, alternatives: alternatives };
+    return { status: 'empty', issue: issue, alternatives: [] };
+}
+
+function buildGrammarPrompt(sentence, selectedText, lang, avoidInstruction) {
+    return `Context Sentence: "${sentence}"
+Selected Text: "${selectedText}"
+Language: ${lang === 'zh' ? 'Chinese' : 'English'}
+
+Task: Act as a strict academic proofreader. Judge ONLY the "Selected Text"; use the "Context Sentence" for context.
+1. Decide whether the "Selected Text" is grammatically correct where it sits in the "Context Sentence" (agreement, tense, number, article, preposition, word form, and punctuation inside the selection).
+2. If it is correct, answer with "correct": true, an empty "issue", and an EMPTY "alternatives" list. Do NOT invent stylistic rewrites.
+3. If it is NOT correct, answer with "correct": false, a SHORT "issue" (one clause naming the error), and 3-5 DISTINCT corrected versions in "alternatives".
+4. Every alternative must be a drop-in replacement for the "Selected Text" ONLY: do not rewrite the rest of the sentence, keep the original meaning and the academic tone.
+5. Fix grammar only. Do not change wording for style reasons.
+6. ${avoidInstruction}
+
+Return JSON: { "correct": true, "issue": "", "alternatives": ["option1", "option2"] }`;
+}
+
+async function getGrammarSuggestions(sentence, selectedText, lang, config, avoidList = []) {
+    const avoidInstruction = avoidList.length > 0
+        ? `IMPORTANT: Do NOT repeat any of the following corrections: ${JSON.stringify(avoidList)}. Propose DIFFERENT wordings of the fix.`
+        : "";
+
+    const prompt = buildGrammarPrompt(sentence, selectedText, lang, avoidInstruction);
+
+    if (config.provider === 'local') {
+        const response = await callLocalLLM(
+            config.localBaseUrl,
+            config.model,
+            [{ role: "user", content: prompt }],
+            false // 不使用json_mode（与 getSynonyms 保持一致）
+        );
+        try {
+            return normalizeGrammarPayload(parseJsonResponse(response));
+        } catch (e) { return { status: 'parse', issue: '', alternatives: [] }; }
+    }
+
+    // OpenAI Path
+    if (config.provider === 'openai') {
+        const response = await callOpenAIAPI(
+            config.model,
+            [{ role: "user", content: prompt }],
+            { jsonMode: true },
+            config.openaiApiKey
+        );
+        try {
+            return normalizeGrammarPayload(parseJsonResponse(response));
+        } catch (e) { return { status: 'parse', issue: '', alternatives: [] }; }
+    }
+
+    // Claude Path
+    if (config.provider === 'claude') {
+        const response = await callClaudeAPI(
+            config.model,
+            [{ role: "user", content: prompt }],
+            { temperature: 0.3 },
+            config.claudeApiKey,
+            null,
+            config.claudeProxyUrl
+        );
+        try {
+            return normalizeGrammarPayload(parseJsonResponse(response));
+        } catch (e) { return { status: 'parse', issue: '', alternatives: [] }; }
+    }
+
+    // Gemini Path
+    const responseSchema = {
+        type: "OBJECT",
+        properties: {
+            correct: { type: "BOOLEAN" },
+            issue: { type: "STRING" },
+            alternatives: {
+                type: "ARRAY",
+                items: { type: "STRING" }
+            }
+        },
+        required: ["correct", "issue", "alternatives"]
+    };
+
+    const response = await callGeminiAPI(config.model, prompt, {
+        responseMimeType: "application/json",
+        responseSchema: responseSchema
+    }, config.geminiApiKey);
+
+    try {
+        return normalizeGrammarPayload(JSON.parse(response || "{}"));
+    } catch (e) { return { status: 'parse', issue: '', alternatives: [] }; }
+}
+
+// 选词弹窗统一取数入口：三个模式共用一个返回形状 { alternatives: string[], note: {status,issue}|null }。
+// note 只有语法模式才有；另外两个模式保持原样走 getSynonyms（返回值契约一个字节都没动）。
+async function fetchSynonymOptions(mode, sentence, selectedText, lang, config, avoidList) {
+    const m = normalizeSynonymMode(mode);
+    const avoid = Array.isArray(avoidList) ? avoidList : [];
+
+    if (m === 'grammar') {
+        const result = await getGrammarSuggestions(sentence, selectedText, lang, config, avoid);
+        return {
+            alternatives: Array.isArray(result.alternatives) ? result.alternatives : [],
+            note: { status: result.status, issue: result.issue }
+        };
+    }
+
+    const alternatives = await getSynonyms(sentence, selectedText, lang, config, avoid, m);
+    return { alternatives: Array.isArray(alternatives) ? alternatives : [], note: null };
+}
+
 // ============= 文本摘要 =============
 async function summarizeText(text, config) {
     const prompt = `总结:\n${text}`;
@@ -1793,58 +2097,75 @@ async function handleTextSelect(event, field, index) {
 
     if (!selectedText || selectedText.length < 1 || /^\s*$/.test(selectedText)) return;
 
-    // 每次全新选择都按设置里的默认模式打开，并重置两个模式的缓存
-    const defaultMode = AppState.synonymDefaultMode === 'simplify' ? 'simplify' : 'replace';
+    // 每次全新选择都按设置里的默认模式打开，并重置三个模式的缓存
+    const defaultMode = normalizeSynonymMode(AppState.synonymDefaultMode);
 
     updateSynonymState({
         show: true,
         loading: true,
         originalText: selectedText,
         mode: defaultMode,
-        historyByMode: { replace: [], simplify: [] },
-        pageIndexByMode: { replace: 0, simplify: 0 },
+        historyByMode: emptySynonymHistory(),
+        pageIndexByMode: emptySynonymPageIndex(),
+        grammarNotes: [],
+        errorMessage: "",
         position: { x: event.clientX, y: event.clientY },
         selectionRange: { start, end },
         field,
+        index,
         contextSentence: text
     });
 
     try {
         const lang = field === 'src' ? AppState.sourceLang : AppState.targetLang;
         const config = getApiConfig();
-        const alternatives = await getSynonyms(text, selectedText, lang, config, [], defaultMode);
+        const result = await fetchSynonymOptions(defaultMode, text, selectedText, lang, config, []);
 
         const cur = AppState.synonymState;
-        const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : { replace: [], simplify: [] };
-        curHb[defaultMode] = [alternatives];
+        const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : emptySynonymHistory();
+        curHb[defaultMode] = [result.alternatives];
         updateSynonymState({
             historyByMode: curHb,
+            ...(result.note ? { grammarNotes: [result.note] } : {}),
             // 请求返回时用户可能已切到另一个模式：只有当前模式就是本次请求的模式才收起 loading
             ...(cur.mode === defaultMode ? { loading: false } : {})
         });
     } catch (err) {
         console.error(err);
-        updateSynonymState({ show: false });
+        // 不再直接关掉弹窗：把失败原因显示出来，用户还能切模式重试
+        if (AppState.synonymState.show) {
+            updateSynonymState({ loading: false, errorMessage: describeSynonymError(err) });
+        }
     }
 }
 
-// 同义词弹窗模式切换（替换 / 简化）
+// 把异常压成一句可直接显示的中文（渲染路径只吃字符串，绝不吃 Error 对象）
+function describeSynonymError(err) {
+    let detail = '';
+    try {
+        detail = (err && typeof err.message === 'string') ? err.message : String(err || '');
+    } catch (e) { detail = ''; }
+    detail = detail.trim();
+    if (detail.length > 120) detail = detail.slice(0, 120) + '…';
+    return detail ? `请求失败：${detail}` : '请求失败，请稍后重试。';
+}
+
+// 同义词弹窗模式切换（替换 / 简化 / 语法修正）
 async function handleSynonymModeSwitch(mode) {
     const s = AppState.synonymState || {};
-    const newMode = mode === 'simplify' ? 'simplify' : 'replace';
-    if (s.mode === newMode) return; // 点击当前激活模式 = no-op
+    const newMode = normalizeSynonymMode(mode);
+    if (normalizeSynonymMode(s.mode) === newMode) return; // 点击当前激活模式 = no-op
 
-    const hb = (s.historyByMode && typeof s.historyByMode === 'object') ? s.historyByMode : { replace: [], simplify: [] };
-    const cached = Array.isArray(hb[newMode]) ? hb[newMode] : [];
+    const cached = getSynonymHistory(s, newMode);
 
     if (cached.length > 0) {
         // 该模式已有缓存：立即展示，不重新请求（锚点不变，renderSynonymPopupOnly 会按新高度重新夹紧）
-        updateSynonymState({ mode: newMode, loading: false });
+        updateSynonymState({ mode: newMode, loading: false, errorMessage: "" });
         return;
     }
 
     // 该模式还没请求过：切换并拉取第 1 页
-    updateSynonymState({ mode: newMode, loading: true });
+    updateSynonymState({ mode: newMode, loading: true, errorMessage: "" });
 
     if (!s.field) {
         updateSynonymState({ loading: false });
@@ -1854,19 +2175,20 @@ async function handleSynonymModeSwitch(mode) {
     try {
         const lang = s.field === 'src' ? AppState.sourceLang : AppState.targetLang;
         const config = getApiConfig();
-        const alternatives = await getSynonyms(s.contextSentence, s.originalText, lang, config, [], newMode);
+        const result = await fetchSynonymOptions(newMode, s.contextSentence, s.originalText, lang, config, []);
 
         const cur = AppState.synonymState;
-        const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : { replace: [], simplify: [] };
-        curHb[newMode] = [alternatives];
+        const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : emptySynonymHistory();
+        curHb[newMode] = [result.alternatives];
         updateSynonymState({
             historyByMode: curHb,
-            ...(cur.mode === newMode ? { loading: false } : {})
+            ...(result.note ? { grammarNotes: [result.note] } : {}),
+            ...(normalizeSynonymMode(cur.mode) === newMode ? { loading: false } : {})
         });
     } catch (e) {
         console.error(e);
-        if (AppState.synonymState.mode === newMode) {
-            updateSynonymState({ loading: false });
+        if (normalizeSynonymMode(AppState.synonymState.mode) === newMode) {
+            updateSynonymState({ loading: false, errorMessage: describeSynonymError(e) });
         }
     }
 }
@@ -1874,45 +2196,49 @@ async function handleSynonymModeSwitch(mode) {
 // 同义词翻页（按当前模式独立分页；avoid 列表也按模式隔离）
 async function handleSynonymPageChange(direction) {
     const s = AppState.synonymState || {};
-    const mode = s.mode === 'simplify' ? 'simplify' : 'replace';
-    const hb = (s.historyByMode && typeof s.historyByMode === 'object') ? s.historyByMode : { replace: [], simplify: [] };
-    const history = Array.isArray(hb[mode]) ? hb[mode] : [];
-    const pb = (s.pageIndexByMode && typeof s.pageIndexByMode === 'object') ? s.pageIndexByMode : { replace: 0, simplify: 0 };
-    const pageIndex = typeof pb[mode] === 'number' ? pb[mode] : 0;
+    const mode = normalizeSynonymMode(s.mode);
+    const history = getSynonymHistory(s, mode);
+    const pb = (s.pageIndexByMode && typeof s.pageIndexByMode === 'object') ? s.pageIndexByMode : emptySynonymPageIndex();
+    const pageIndex = getSynonymPageIndex(s, mode);
     const { contextSentence, originalText, field } = s;
 
     if (direction === -1) {
         if (pageIndex > 0) {
             pb[mode] = pageIndex - 1;
-            updateSynonymState({ pageIndexByMode: pb });
+            updateSynonymState({ pageIndexByMode: pb, errorMessage: "" });
         }
     } else {
         if (pageIndex < history.length - 1) {
             pb[mode] = pageIndex + 1;
-            updateSynonymState({ pageIndexByMode: pb });
+            updateSynonymState({ pageIndexByMode: pb, errorMessage: "" });
         } else {
             if (!field) return;
             const lang = field === 'src' ? AppState.sourceLang : AppState.targetLang;
 
-            updateSynonymState({ loading: true });
+            updateSynonymState({ loading: true, errorMessage: "" });
 
             try {
                 const avoidList = history.flat();
                 const config = getApiConfig();
-                const newAlternatives = await getSynonyms(contextSentence, originalText, lang, config, avoidList, mode);
+                const result = await fetchSynonymOptions(mode, contextSentence, originalText, lang, config, avoidList);
 
                 const cur = AppState.synonymState;
-                const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : { replace: [], simplify: [] };
-                curHb[mode] = [...history, newAlternatives];
-                const curPb = (cur.pageIndexByMode && typeof cur.pageIndexByMode === 'object') ? cur.pageIndexByMode : { replace: 0, simplify: 0 };
+                const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : emptySynonymHistory();
+                curHb[mode] = [...history, result.alternatives];
+                const curPb = (cur.pageIndexByMode && typeof cur.pageIndexByMode === 'object') ? cur.pageIndexByMode : emptySynonymPageIndex();
                 curPb[mode] = pageIndex + 1;
+                // 语法模式的逐页判定结果要和 historyByMode.grammar 的下标对齐
+                const curNotes = Array.isArray(cur.grammarNotes) ? cur.grammarNotes.slice(0, history.length) : [];
+                if (result.note) curNotes[pageIndex + 1] = result.note;
                 updateSynonymState({
                     historyByMode: curHb,
                     pageIndexByMode: curPb,
-                    ...(cur.mode === mode ? { loading: false } : {})
+                    ...(result.note ? { grammarNotes: curNotes } : {}),
+                    ...(normalizeSynonymMode(cur.mode) === mode ? { loading: false } : {})
                 });
             } catch (e) {
-                updateSynonymState({ loading: false });
+                console.error(e);
+                updateSynonymState({ loading: false, errorMessage: describeSynonymError(e) });
             }
         }
     }
@@ -3161,8 +3487,9 @@ function renderSettingsModal() {
                         <div class="flex items-center justify-between gap-2">
                             <span class="text-xs text-slate-600 font-medium">选中文本后弹窗默认打开的模式</span>
                             <div class="flex items-center bg-slate-100 rounded-lg p-0.5">
-                                <button onclick="setSynonymDefaultMode('replace')" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all ${AppState.synonymDefaultMode !== 'simplify' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">替换（默认）</button>
-                                <button onclick="setSynonymDefaultMode('simplify')" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all ${AppState.synonymDefaultMode === 'simplify' ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">简化</button>
+                                ${SYNONYM_MODES.map(m => `
+                                <button onclick="setSynonymDefaultMode('${m}')" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${normalizeSynonymMode(AppState.synonymDefaultMode) === m ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">${m === 'replace' ? '替换（默认）' : SYNONYM_MODE_LABEL[m]}</button>
+                                `).join('')}
                             </div>
                         </div>
                     </div>
@@ -3695,7 +4022,10 @@ function renderPairRow(side, pair, idx) {
                             ${pair.isRegenerating ? `<span class="animate-pulse">${Icons.StopCircle}</span>` : Icons.RefreshCw}
                         </button>
                     </div>
-                    <textarea id="editTextarea_${side}_${idx}" class="w-full bg-transparent border-none focus:ring-0 p-0 text-slate-800 leading-relaxed resize-none overflow-hidden min-h-[40px]" placeholder="Edit ${side === 'src' ? 'source' : 'target'}..." onclick="event.stopPropagation();">${escapeHtml(editValue)}</textarea>
+                    <div class="relative">
+                        ${renderSelectionHighlightLayer(side, idx)}
+                        <textarea id="editTextarea_${side}_${idx}" class="relative block w-full bg-transparent border-none focus:ring-0 p-0 text-slate-800 leading-relaxed resize-none overflow-hidden min-h-[40px]" placeholder="Edit ${side === 'src' ? 'source' : 'target'}..." onclick="event.stopPropagation();">${escapeHtml(editValue)}</textarea>
+                    </div>
                     ${renderAiToolbar(side, idx)}
                 </div>
             </div>
@@ -3870,12 +4200,12 @@ function attachEventListeners() {
                     AppState.editValues[side] = e.target.value;
                     
                     // 关闭同义词弹窗但不重新渲染整个页面
+                    // （走 updateSynonymState 而不是手动 remove：它会顺带把选中高亮层一起清掉，
+                    //   否则用户一边打字、一边还留着一段位置早就对不上的 <mark>）
                     if (AppState.synonymState.show) {
-                        AppState.synonymState.show = false;
-                        const popup = document.getElementById('synonymPopup');
-                        if (popup) popup.remove();
+                        updateSynonymState({ show: false });
                     }
-                    
+
                     autoResizeTextarea(textarea);
                 });
                 textarea.addEventListener('mouseup', (e) => handleTextSelect(e, side, idx));
@@ -4044,9 +4374,9 @@ function setAutoSaveInterval(ms) {
     renderApp();
 }
 
-// 设置选词弹窗默认功能（替换 / 简化）
+// 设置选词弹窗默认功能（替换 / 简化 / 语法修正）
 function setSynonymDefaultMode(mode) {
-    AppState.synonymDefaultMode = mode === 'simplify' ? 'simplify' : 'replace';
+    AppState.synonymDefaultMode = normalizeSynonymMode(mode);
     // 保存到 localStorage
     try {
         localStorage.setItem('synonymDefaultMode', AppState.synonymDefaultMode);
@@ -4469,9 +4799,9 @@ function loadSavedSettings() {
             AppState.showDatedSnapshots = true;
         }
 
-        // 加载选词弹窗默认功能（'replace' | 'simplify'，脏值一律回退默认 'replace'）
+        // 加载选词弹窗默认功能（'replace' | 'simplify' | 'grammar'，脏值一律回退默认 'replace'）
         const savedSynonymDefaultMode = localStorage.getItem('synonymDefaultMode');
-        if (savedSynonymDefaultMode === 'replace' || savedSynonymDefaultMode === 'simplify') {
+        if (SYNONYM_MODES.indexOf(savedSynonymDefaultMode) !== -1) {
             AppState.synonymDefaultMode = savedSynonymDefaultMode;
         }
 
