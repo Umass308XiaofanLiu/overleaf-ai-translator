@@ -717,7 +717,7 @@ function cleanLatex(formula) {
 function renderFormattedText(text) {
     if (!text || !window.marked || !window.katex) return text || '';
     
-    let content = text.replace(/[\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000\uFEFF]/g, ' ');
+    let content = String(text).replace(/[\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000\uFEFF]/g, ' ');
     const placeholders = [];
     
     const pushPlaceholder = (regex, type, getFormula) => {
@@ -787,7 +787,7 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
         model: model || "local-model",
         messages: messages,
         temperature: 0.3,
-        max_tokens: 4096
+        max_tokens: 16384
     };
 
     // LM Studio的JSON模式
@@ -807,7 +807,8 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
         });
 
         if (!response.ok) {
-            throw new Error(`API Error: ${response.status}`);
+            const errText = await response.text();
+            throw new Error(`API Error: ${response.status} - ${errText}`);
         }
 
         const data = await response.json();
@@ -1927,13 +1928,8 @@ async function handleTranslate() {
         return;
     }
 
-    // 保存原始输入内容（首次翻译时）
-    if (!AppState.originalInputText || AppState.translationPairs.length === 0) {
-        AppState.originalInputText = AppState.inputText;
-    }
-
-    // 同步基线以防止重复自动翻译
-    AppState.lastTranslatedText = AppState.inputText;
+    // 保存原始输入内容（每次翻译都刷新；否则重新生成/原文视图会停留在第一段旧文本）
+    AppState.originalInputText = AppState.inputText;
 
     let srcLang, tgtLang;
     if (AppState.isAutoDetect) {
@@ -1966,6 +1962,8 @@ async function handleTranslate() {
                 isRegenerating: false
             }));
             setState({ translationPairs: pairs, isEditingMode: false, viewMode: 'preview', isLoading: false });
+            // 仅在成功后同步基线：失败时保持旧基线，TRANSLATE 才能重试
+            AppState.lastTranslatedText = AppState.inputText;
         }
     } catch (err) {
         if (err.name !== 'AbortError') {
@@ -2035,7 +2033,7 @@ async function saveRowUpdate(index, manualValues = null) {
 
     try {
         const config = getApiConfig();
-        const resultText = await getSmartUpdate(prompt, config, controller.signal);
+        const resultText = (await getSmartUpdate(prompt, config, controller.signal)) || (updateField === 'src' ? currentSrc : currentTgt);
         const finalSrc = updateField === 'src' ? resultText : currentSrc;
         const finalTgt = updateField === 'tgt' ? resultText : currentTgt;
         addHistory(index, finalSrc, finalTgt);
