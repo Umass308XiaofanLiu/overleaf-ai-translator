@@ -96,6 +96,21 @@ body.is-resizing-settings-modal * {
 // state.js - 全局状态管理
 // ========================================
 
+// ============= 版本号：唯一事实源是仓库根目录的 VERSION 文件 =============
+// 格式 vMM.mm.pp（三段各两位、前导零补齐）：
+//   MM 大版本号 —— 架构级 / 行为级大改
+//   mm 小版本号 —— 重要修改（新功能、重要修复）
+//   pp 调整版本 —— 小的功能调整
+// 语义版本没法从 git 推导（只有人能判断一次改动算大改还是小调），所以人只改 VERSION 文件，
+// 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
+// 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
+// ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
+const APP_VERSION = '01.00.00';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-08-19';   // APP_BUILD_DATE_STAMP
+// 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
+window.APP_VERSION = APP_VERSION;
+window.APP_BUILD_DATE = APP_BUILD_DATE;
+
 // ============= 在线模型目录：单一事实源 =============
 // 内置种子目录。它是「离线 / 未填 Key / 刷新失败」时的唯一兜底，永久保留，不要删。
 // 以后手动加模型只需改这一处；想跟上厂商更新，直接点 Settings 里的「更新」按钮从各家 API 拉取。
@@ -3225,15 +3240,178 @@ function adjustAllPopups() {
     });
 }
 
+// ============= 左右双栏逐行对齐 =============
+// 问题：左右两栏各自 space-y-2 堆自己的行，同一句的英文常比中文多折一行（如 163px vs 137px），
+// 高度差沿页面向下累加 —— 实测 top 差 3 / 29 / 55 ... 一路涨到 393px。
+// 另有一个常数偏移：两栏表头高度不等（70 vs 66.67），两个滚动容器的起点就差 3.33px。
+//
+// 修法（纯 CSS 做不到：两栏在两个独立的滚动容器里，无法互相知道对方那一行有多高）：
+//   1) 表头 min-h-[70px] 抹掉常数偏移（见 renderSourcePanel / renderTargetPanel）；
+//   2) 渲染后成对把 min-height 补到 max(左, 右)，短的那格多留白（预期且正确的代价）；
+//   3) 两栏滚动条互相跟随，否则用户一滚就散架，对齐只是摆设。
+//
+// ⚠️ 这里只碰**行高**，绝不碰容器的 padding-top。
+//    曾经有过一版「用两个滚动容器的视口 top 之差补 padding-top 兜底常数偏移」，
+//    它在 lg 断点以下（<1024px，main 是 grid-cols-1）会致命：两栏这时是上下堆叠的，
+//    那个「常数偏移」变成一整个面板的高度（实测 900px 宽时 298px），被原样写成源栏的留白，
+//    整个源面板一片空白。而且它自测还「通过」——把源栏推下去确实让两栏同一行落在同一个屏幕 Y，
+//    只是在堆叠布局里这个目标本身没有意义。表头已经用 min-h-[70px] 钉死等高，兜底纯属多余。
+//
+// ⚠️ 渲染路径 root.innerHTML 全程没有 try/catch，这里抛一次异常页面就永久冻死，
+//    所以整个同步过程自带 try/catch，出错只打 warn，绝不允许冒泡。
+// ⚠️ 读写严格分离：先一次性清空上一轮补白，再一次性读完所有高度（只触发一次强制重排），
+//    最后一次性写回。绝不逐行「读一次写一次」，那是 layout thrash。
+let alignSyncRaf = 0;              // 已排队的 rAF 句柄（0 = 没排队）
+let alignSyncTimer = 0;            // 兜底定时器句柄
+let alignSyncApplying = false;     // 正在写尺寸：此时 ResizeObserver 的回调是我们自己造成的，忽略
+let alignRowObserver = null;
+let alignNoopStreak = 0;           // 连续多少轮「观察器叫醒了我们、结果什么都不用改」
+let alignSyncFromObserver = false; // 这一轮是不是 ResizeObserver 触发的（熔断只统计它）
+
+function scheduleAlignSync() {
+    if (alignSyncRaf || alignSyncTimer) return;   // 本轮已排队，合并掉
+    const run = () => {
+        if (alignSyncRaf) { cancelAnimationFrame(alignSyncRaf); alignSyncRaf = 0; }
+        if (alignSyncTimer) { clearTimeout(alignSyncTimer); alignSyncTimer = 0; }
+        syncBilingualAlignment();
+    };
+    // 页面可见时 rAF 先到：在这一帧绘制之前就改完样式，用户看不到中间态，不会闪。
+    alignSyncRaf = requestAnimationFrame(run);
+    // 但后台标签页里浏览器会**暂停** rAF，上面那次排队会一直悬着，后续渲染全被合并挡掉。
+    // 定时器兜底把它捞回来；后台本来就不绘制，这条路径不可能造成闪烁。
+    alignSyncTimer = setTimeout(run, 50);
+}
+
+function syncBilingualAlignment() {
+    if (alignSyncApplying) return;
+    alignSyncApplying = true;
+    try {
+        const srcBox = document.querySelector('[data-align-content="src"]');
+        const tgtBox = document.querySelector('[data-align-content="tgt"]');
+        if (!srcBox || !tgtBox) return;
+
+        const srcRows = srcBox.children;
+        const tgtRows = tgtBox.children;
+        const n = Math.min(srcRows.length, tgtRows.length);
+        if (n === 0) return;
+
+        // 记下上一轮写进去的值，最后用来判断这一轮到底改没改（熔断依据，见文件末尾说明）
+        const prev = new Array(n * 2);
+        for (let i = 0; i < n; i++) {
+            prev[i] = srcRows[i].style.minHeight;
+            prev[n + i] = tgtRows[i].style.minHeight;
+        }
+
+        // ---- 写 1：清空上一轮的补白，让下面测到的是自然高度（否则永远只涨不缩）
+        for (let i = 0; i < n; i++) {
+            srcRows[i].style.minHeight = '';
+            tgtRows[i].style.minHeight = '';
+        }
+
+        // ---- 读：一次性读完（这里触发本轮唯一一次强制重排）
+        const srcH = new Array(n), tgtH = new Array(n);
+        for (let i = 0; i < n; i++) srcH[i] = srcRows[i].getBoundingClientRect().height;
+        for (let i = 0; i < n; i++) tgtH[i] = tgtRows[i].getBoundingClientRect().height;
+
+        // ---- 写 2：成对补齐
+        // 这里必须**向上取整**，不能直接用测到的小数高度：
+        // 取小数时，高的那一侧 min-height 不生效（用自然高度 137.328），矮的那一侧生效（用 137.33），
+        // 每行差个千分之几像素，几十行下来就攒出可见误差（实测 17 行攒到 0.15px，200 行就会破 1px）。
+        // 取整后 ceil(max) 一定 >= 两侧的自然高度，两边都被 min-height 钉在同一个整数上，误差恒等于 0。
+        // 代价是每行最多多留 1px 空白 —— 换来零累积，值。
+        let changed = false;
+        for (let i = 0; i < n; i++) {
+            const px = Math.ceil(Math.max(srcH[i], tgtH[i])) + 'px';
+            srcRows[i].style.minHeight = px;
+            tgtRows[i].style.minHeight = px;
+            if (prev[i] !== px || prev[n + i] !== px) changed = true;
+        }
+
+        // 熔断：只统计「观察器叫醒我们、结果一个字节都不用改」的连续轮次。
+        // 判据不能是「频率高」——拖窗口边框时每帧都在真改，会误伤；
+        // 也不能是「没改动」——渲染/打字触发的空跑很正常（菜单开关一下就是一次），
+        // 连着 31 次就把观察器关掉纯属误杀。只有观察器自己在空转，才是真的回环。
+        const fromObserver = alignSyncFromObserver;
+        alignSyncFromObserver = false;
+        alignNoopStreak = (fromObserver && !changed) ? alignNoopStreak + 1 : 0;
+        if (alignNoopStreak > 30) {
+            if (alignRowObserver) alignRowObserver.disconnect();
+            console.warn('[align] 连续 30 轮空转，已停用行对齐观察器');
+            return;
+        }
+
+        // 只有「不是观察器叫醒的」这一轮才重新挂观察器。
+        // ResizeObserver 的 observe() 一定会先派发一次当前尺寸（哪怕尺寸压根没变），
+        // 所以无条件 disconnect + 重新 observe 会自己喂自己：挂上 -> 立刻回调 -> 又挂上……
+        // 实测一次 renderApp 就空转 33 轮、22.9ms，直到熔断器把观察器**关掉** ——
+        // 观察器一关，字体/KaTeX 之后再改行高就没人补测了，恰好把它要保的东西弄丢。
+        // 观察器触发的这一轮跳过重挂即可：之前的 observe 从没被撤销，照样盯着这些行。
+        if (!fromObserver) observeAlignRows(srcRows, tgtRows, n);
+    } catch (e) {
+        console.warn('[align] 行对齐跳过：', e && e.message);
+    } finally {
+        alignSyncApplying = false;
+    }
+}
+
+// 行高会因为编辑区 textarea 自动撑高、字体加载、KaTeX 重排等原因在渲染之后继续变，
+// 所以盯住每一行的尺寸变化随时补测；ResizeObserver 只在「尺寸真的变了」时才回调，
+// 而我们清空后写回的是同一个值（帧末尺寸不变），所以最多再跑一轮就收敛。
+function observeAlignRows(srcRows, tgtRows, n) {
+    if (typeof ResizeObserver === 'undefined') return;
+    if (!alignRowObserver) {
+        alignRowObserver = new ResizeObserver(() => {
+            if (alignSyncApplying) return;   // 这次尺寸变化是我们自己刚写的，不是新情况
+            alignSyncFromObserver = true;
+            scheduleAlignSync();
+        });
+    }
+    alignRowObserver.disconnect();
+    for (let i = 0; i < n; i++) {
+        alignRowObserver.observe(srcRows[i]);
+        alignRowObserver.observe(tgtRows[i]);
+    }
+}
+
+// 两栏滚动联动。注意：顶栏那个 AUTO SYNC 按钮跟滚动毫无关系（它是 isAutoTranslate，
+// 停止输入 1.5s 后自动触发一次翻译），所以这里必须自己把两栏绑在一起，
+// 否则用户一滚动，上面辛苦对齐的行立刻又错开。
+function bindPaneScrollSync() {
+    try {
+        const a = document.querySelector('[data-align-scroll="src"]');
+        const b = document.querySelector('[data-align-scroll="tgt"]');
+        if (!a || !b) return;
+        // 不用「加锁 + 稍后解锁」那一套：解锁得挂在定时器或 rAF 上，
+        // 后台标签页里 rAF 是暂停的，锁会永久卡住，联动直接失效。
+        // 改成自终止判据：两边已经一样就什么都不做。
+        // 于是 A 改 B 触发的那次回声进来时条件不成立，自然停下，不需要任何标志位。
+        // 0.5px 容差是给高 DPI 下 scrollTop 的小数回读留的，防止两边互相追着差 0.001px。
+        const link = (from, to) => () => {
+            if (Math.abs(to.scrollTop - from.scrollTop) < 0.5) return;
+            to.scrollTop = from.scrollTop;
+        };
+        // 每次 renderApp 都是全新节点，旧监听器随旧节点一起被丢弃，不会叠加
+        a.addEventListener('scroll', link(a, b), { passive: true });
+        b.addEventListener('scroll', link(b, a), { passive: true });
+    } catch (e) {
+        console.warn('[align] 滚动联动绑定失败：', e && e.message);
+    }
+}
+
 // ============= 主渲染函数 =============
 function renderApp(preserveScroll = true) {
-    // 保存滚动位置
-    let savedSourceScroll = 0, savedTargetScroll = 0;
+    // 保存滚动位置。两栏是**联动**的（bindPaneScrollSync），逻辑上只有一个位置，
+    // 所以这里只存一个数。分开存两个数会在源栏那侧暂时没有滚动容器的那一轮出事：
+    // viewMode 切到 'edit' 时源面板是一个 textarea，选择器选不到东西，存下来的是 0，
+    // 切回 'preview' 又把这个 0 写回源栏，两栏当场差出一整页（实测 800px）；
+    // syncBilingualAlignment 只管行高、从不碰 scrollTop，这个落差它救不回来。
+    // 谁没有滚动容器就跟着另一边走，两边都没有才归零。
+    let savedScroll = 0;
     if (preserveScroll) {
         const sourceContainer = document.querySelector('section:first-of-type .overflow-y-auto');
         const targetContainer = document.querySelector('section:last-of-type .overflow-y-auto');
-        savedSourceScroll = sourceContainer ? sourceContainer.scrollTop : 0;
-        savedTargetScroll = targetContainer ? targetContainer.scrollTop : 0;
+        if (sourceContainer) savedScroll = sourceContainer.scrollTop;
+        else if (targetContainer) savedScroll = targetContainer.scrollTop;
     }
 
     const root = document.getElementById('root');
@@ -3254,12 +3432,20 @@ function renderApp(preserveScroll = true) {
     // 同义词弹窗独立渲染到 body（避免被 root 内容替换影响）
     renderSynonymPopupOnly();
 
+    // 左右双栏逐行对齐（内部自带 try/catch，绝不会把异常带回渲染路径）。
+    // ⚠️ 必须在恢复滚动位置**之前**同步跑完，不能排进 rAF/定时器等下一轮：
+    // 刚 innerHTML 出来的右栏是自然高度，比左栏矮一大截（实测 2915 vs 3669），
+    // 它的 scrollTop 上限也就跟着矮（1890 vs 2114）。先恢复滚动再对齐，右栏那次赋值会被
+    // 浏览器夹到自己的上限，等对齐把行撑高时 scrollTop 早就丢了 —— 两栏永久差 224px，
+    // 而行高对齐器不碰 scrollTop，之后谁也修不回来。先对齐则两栏高度一致，赋值不会被夹。
+    syncBilingualAlignment();
+
     // 同步恢复滚动位置（不使用 requestAnimationFrame，避免多次渲染时的竞态条件）
     if (preserveScroll) {
         const newSourceContainer = document.querySelector('section:first-of-type .overflow-y-auto');
         const newTargetContainer = document.querySelector('section:last-of-type .overflow-y-auto');
-        if (newSourceContainer) newSourceContainer.scrollTop = savedSourceScroll;
-        if (newTargetContainer) newTargetContainer.scrollTop = savedTargetScroll;
+        if (newSourceContainer) newSourceContainer.scrollTop = savedScroll;
+        if (newTargetContainer) newTargetContainer.scrollTop = savedScroll;
     }
 
     // 渲染后调整弹窗位置
@@ -3706,7 +3892,7 @@ function renderHeader() {
                 </div>
                 <div>
                     <h1 class="text-2xl font-extrabold text-slate-900 tracking-tight leading-none">Academic AI</h1>
-                    <p class="text-[11px] text-indigo-500 font-bold tracking-widest uppercase mt-1">LaTeX & Terminology Optimized</p>
+                    <p class="text-[11px] text-indigo-500 font-bold tracking-widest uppercase mt-1">LaTeX & Terminology Optimized <span style="color:#94a3b8;font-weight:400;letter-spacing:0.06em;text-transform:none;">· v${APP_VERSION} · ${APP_BUILD_DATE}</span></p>
                 </div>
             </div>
 
@@ -3980,8 +4166,10 @@ function renderMainWorkspace() {
 function renderSourcePanel() {
     return `
         <section class="bg-white rounded-[2rem] border border-slate-200 shadow-sm flex flex-col overflow-hidden relative group">
-            <div class="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
-                <h3 class="text-xs font-black text-slate-400 uppercase tracking-[0.2em] flex items-center gap-2">
+            <!-- min-h-[70px] + shrink-0：两栏表头必须等高，否则两个滚动容器的起点就差几个像素，
+                 左右行永远差一个常数。左栏的按钮组比右栏的单个图标按钮高 3px，就是那个常数的来源。 -->
+            <div class="px-6 py-4 min-h-[70px] shrink-0 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+                <h3 class="text-xs font-black text-slate-400 uppercase tracking-[0.2em] whitespace-nowrap flex items-center gap-2">
                     Source Panel
                     ${AppState.activeIndex !== null ? `<span class="text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full text-[9px] flex items-center gap-1.5 animate-pulse">${Icons.PenLineSmall} Editing</span>` : ''}
                 </h3>
@@ -4007,8 +4195,10 @@ function renderSourcePanel() {
             </div>
             <div class="flex-grow flex flex-col overflow-hidden bg-slate-50/20">
                 ${AppState.translationPairs.length > 0 && AppState.viewMode === 'preview' ? `
-                    <div class="overflow-y-auto h-full custom-scrollbar p-4 space-y-2" onclick="handleBlankAreaClick(event)">
-                        ${AppState.translationPairs.map((pair, idx) => renderPairRow('src', pair, idx)).join('')}
+                    <div class="overflow-y-auto h-full custom-scrollbar p-4" data-align-scroll="src" onclick="handleBlankAreaClick(event)">
+                        <div class="space-y-2 pb-24" data-align-content="src">
+                            ${AppState.translationPairs.map((pair, idx) => renderPairRow('src', pair, idx)).join('')}
+                        </div>
                     </div>
                 ` : AppState.translationPairs.length > 0 && AppState.viewMode === 'original' ? `
                     <div class="w-full h-full p-10 overflow-y-auto custom-scrollbar">
@@ -4029,11 +4219,12 @@ function renderSourcePanel() {
 function renderTargetPanel() {
     return `
         <section class="bg-white rounded-[2rem] border border-slate-200 shadow-sm flex flex-col overflow-hidden relative group">
-            <div class="px-6 py-4 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
-                <h3 class="text-xs font-black text-slate-400 uppercase tracking-[0.2em]">Target Panel</h3>
+            <!-- 高度必须和 SOURCE PANEL 表头逐像素一致，见那边的注释 -->
+            <div class="px-6 py-4 min-h-[70px] shrink-0 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+                <h3 class="text-xs font-black text-slate-400 uppercase tracking-[0.2em] whitespace-nowrap">Target Panel</h3>
                 <button onclick="copyTargetText()" class="p-2 text-slate-400 hover:text-indigo-600 transition-colors">${Icons.Copy}</button>
             </div>
-            <div class="flex-grow p-4 overflow-y-auto custom-scrollbar bg-slate-50/20" onclick="handleBlankAreaClick(event)">
+            <div class="flex-grow p-4 overflow-y-auto custom-scrollbar bg-slate-50/20" data-align-scroll="tgt" onclick="handleBlankAreaClick(event)">
                 ${AppState.isLoading && AppState.translationPairs.length === 0 ? `
                     <div class="h-full flex flex-col items-center justify-center text-slate-400 animate-pulse">
                         <span class="text-indigo-300 mb-6">${Icons.LoaderLarge}</span>
@@ -4045,7 +4236,7 @@ function renderTargetPanel() {
                         <p class="text-xl font-black uppercase tracking-widest">Awaiting Input</p>
                     </div>
                 ` : `
-                    <div class="space-y-2 pb-24" onclick="handleBlankAreaClick(event)">
+                    <div class="space-y-2 pb-24" data-align-content="tgt" onclick="handleBlankAreaClick(event)">
                         ${AppState.translationPairs.map((pair, idx) => renderPairRow('tgt', pair, idx)).join('')}
                     </div>
                 `}
@@ -4310,6 +4501,9 @@ function attachEventListeners() {
     // 全局点击（关闭菜单）
     document.removeEventListener('mousedown', globalClickHandler);
     document.addEventListener('mousedown', globalClickHandler);
+
+    // 两栏滚动联动（节点每轮全新，这里跟着重绑）
+    bindPaneScrollSync();
 }
 
 function globalClickHandler(event) {
@@ -4349,6 +4543,10 @@ function autoResizeTextarea(textarea) {
     if (!textarea) return;
     textarea.style.height = 'auto';
     textarea.style.height = textarea.scrollHeight + 'px';
+    // 编辑框长高 = 这一行长高 = 左右两栏当场错位。这是行高变化最高频的来源，
+    // 直接在这里补一刀，不指望 ResizeObserver（它和 rAF 一样绑在渲染步骤上，
+    // 后台标签页里根本不回调）。scheduleAlignSync 自带合并，连打字也只会每轮跑一次。
+    scheduleAlignSync();
 }
 
 // ============= 辅助UI函数 =============
@@ -4783,6 +4981,9 @@ document.addEventListener('DOMContentLoaded', function() {
 
     // 全局点击事件 - 点击空白区域退出编辑模式
     document.addEventListener('click', handleGlobalClick);
+
+    // 窗口尺寸变化会让文本重新折行，行高全变 —— 必须重测，不能只在启动时对一次
+    window.addEventListener('resize', scheduleAlignSync);
 
     // 自动保存定时器
     setInterval(function() {
