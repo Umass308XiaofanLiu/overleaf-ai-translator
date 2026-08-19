@@ -76,6 +76,12 @@ body { font-family: 'Inter', sans-serif; }
     -webkit-text-fill-color: transparent;
     border-radius: 2px;
 }
+/* 语法模式给出「整句改写」时，高亮的是即将被整体替换的那一句（不再只是选中的词），
+   所以换一个颜色，让用户在点下去之前就看清楚到底会替换掉多大一片。 */
+.sel-highlight-layer mark.sent-scope {
+    background-color: rgba(245, 158, 11, 0.28);
+    box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.45);
+}
 
 /* 拖拽过程中禁止选中文字，光标全局保持左右拖拽箭头 */
 body.is-resizing-settings-modal {
@@ -105,7 +111,7 @@ body.is-resizing-settings-modal * {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '01.00.01';        // APP_VERSION_STAMP
+const APP_VERSION = '01.01.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-08-19';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -353,11 +359,14 @@ const AppState = {
         historyByMode: { replace: [], simplify: [], grammar: [] }, // 每个模式各自的分页历史
         pageIndexByMode: { replace: 0, simplify: 0, grammar: 0 }, // 每个模式各自的页码
         // 语法修正的逐页判定结果，下标与 historyByMode.grammar 一一对齐：
-        // { status: 'correct' | 'issues' | 'empty' | 'parse', issue: string }
+        // { status: 'correct' | 'issues' | 'empty' | 'parse', issue: string, scope: 'selection' | 'sentence' }
         grammarNotes: [],
         errorMessage: "", // 请求整体失败时展示在弹窗里（而不是把弹窗直接关掉）
         position: { x: 0, y: 0 },
         selectionRange: { start: 0, end: 0 },
+        // 选区所在的整句范围（findSentenceRange 算出）。语法模式用它做分析范围和整句替换范围。
+        // 算不准时为 null —— 此时语法模式只允许词级替换，绝不会拿整句改写去动一个词的位置。
+        sentenceRange: null, // { start: number, end: number, text: string } | null
         field: null,
         index: null,      // 选中发生在哪一行（= AppState.activeIndex），高亮层据此定位
         contextSentence: ""
@@ -490,11 +499,44 @@ function getSynonymPageIndex(state, mode) {
 function getGrammarNote(state, pageIndex) {
     const notes = (state && Array.isArray(state.grammarNotes)) ? state.grammarNotes : [];
     const note = notes[pageIndex];
-    if (!note || typeof note !== 'object') return { status: '', issue: '' };
+    if (!note || typeof note !== 'object') return { status: '', issue: '', scope: 'selection' };
     return {
         status: typeof note.status === 'string' ? note.status : '',
-        issue: typeof note.issue === 'string' ? note.issue : ''
+        issue: typeof note.issue === 'string' ? note.issue : '',
+        // 作用域只认 'sentence' 这一个特殊值，其它一切（含缺失、脏值）都当词级
+        scope: note.scope === 'sentence' ? 'sentence' : 'selection'
     };
+}
+
+// 当前这一页的建议是不是「整句改写」。
+// 只有同时满足：语法模式 + 该页判定为 sentence + 该页确实有选项 + sentenceRange 可用，才算数。
+// 任何一条不成立都退回词级 —— 高亮范围和替换范围必须永远出自同一个判断。
+function isSentenceScopedPage(state, mode, pageIndex) {
+    try {
+        if (normalizeSynonymMode(mode) !== 'grammar') return false;
+        if (getGrammarNote(state, pageIndex).scope !== 'sentence') return false;
+        const page = getSynonymHistory(state, 'grammar')[pageIndex];
+        if (!Array.isArray(page) || page.length === 0) return false;
+        return getValidSentenceRange(state) !== null;
+    } catch (e) {
+        return false;
+    }
+}
+
+// 取出可用的整句范围；任何一处对不上就返回 null（调用方一律退回选区范围）
+function getValidSentenceRange(state) {
+    try {
+        const sr = state && state.sentenceRange;
+        if (!sr || typeof sr !== 'object') return null;
+        const start = Math.floor(Number(sr.start));
+        const end = Math.floor(Number(sr.end));
+        const text = sr.text;
+        if (!isFinite(start) || !isFinite(end) || start < 0 || end <= start) return null;
+        if (typeof text !== 'string' || text.length !== end - start) return null;
+        return { start, end, text };
+    } catch (e) {
+        return null;
+    }
 }
 
 // 更新同义词状态
@@ -533,6 +575,8 @@ function renderSynonymPopupOnly() {
     // 判定为「语法正确」且只有这一页时，翻页条没有意义，直接不渲染
     const showPager = (currentSynonyms.length > 0 || history.length > 0)
         && !(isGrammar && note.status === 'correct' && history.length <= 1);
+    // 这一页的建议是整句改写吗（决定：整句徽标 + 整句高亮 + 应用时的替换范围 + 弹窗限宽）
+    const sentenceScoped = isSentenceScopedPage(s, mode, pageIndex);
 
     const modeButtonsHtml = SYNONYM_MODES.map(m => `
                 <button onclick="handleSynonymModeSwitch('${m}')" class="flex-1 px-1.5 py-1 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${mode === m ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">${SYNONYM_MODE_LABEL[m]}</button>
@@ -554,10 +598,17 @@ function renderSynonymPopupOnly() {
                         ${Icons.CheckCheck} 语法正确
                     </div>`;
     } else if (currentSynonyms.length > 0) {
+        // 语法模式：这一页是整句改写还是词级替换，直接写在弹窗里，
+        // 和 textarea 背后那层高亮（整句 = 琥珀色）说的是同一件事。
         bodyHtml = `
                     ${isGrammar && note.issue ? `<div class="text-[10px] text-amber-600 bg-amber-50 border border-amber-100 rounded px-2 py-1 mb-1 leading-snug overflow-y-auto custom-scrollbar" style="max-height:56px;">${escapeHtml(note.issue)}</div>` : ''}
+                    ${sentenceScoped ? `<div class="text-[10px] font-bold text-amber-700 flex items-center gap-1 mb-1">${Icons.SparklesSmall} 整句改写 · 将替换高亮的整句</div>` : ''}
                     <div class="flex flex-col gap-1 overflow-y-auto custom-scrollbar" style="max-height:min(320px, 45vh);">
-                        ${currentSynonyms.map((syn, i) => `
+                        ${currentSynonyms.map((syn, i) => isGrammar ? `
+                            <button onclick="applySynonymOption(${pageIndex}, ${i})" class="text-left px-2 py-1.5 rounded hover:bg-indigo-50 text-slate-700 text-xs font-medium hover:text-indigo-700 transition-colors flex items-start gap-2 group">
+                                <span class="opacity-0 group-hover:opacity-50 text-indigo-400 shrink-0 mt-0.5">${Icons.ArrowRightLeftSmall}</span> <span class="leading-snug">${escapeHtml(syn)}</span>
+                            </button>
+                        ` : `
                             <button onclick="applySynonym('${escapeHtml(syn).replace(/'/g, "\\'")}')" class="text-left px-2 py-1.5 rounded hover:bg-indigo-50 text-slate-700 text-xs font-medium hover:text-indigo-700 transition-colors flex items-center gap-2 group">
                                 <span class="opacity-0 group-hover:opacity-50 text-indigo-400">${Icons.ArrowRightLeftSmall}</span> ${escapeHtml(syn)}
                             </button>
@@ -578,7 +629,7 @@ function renderSynonymPopupOnly() {
     }
 
     const popupHtml = `
-        <div id="synonymPopup" style="position:fixed;left:0px;top:0px;visibility:hidden;" class="z-[100] bg-white border border-slate-200 rounded-xl shadow-2xl p-3 min-w-[240px] flex flex-col gap-2">
+        <div id="synonymPopup" style="position:fixed;left:0px;top:0px;visibility:hidden;${sentenceScoped ? 'max-width:min(460px, 92vw);' : ''}" class="z-[100] bg-white border border-slate-200 rounded-xl shadow-2xl p-3 min-w-[240px] flex flex-col gap-2">
             <div class="flex items-center bg-slate-100 rounded-lg p-0.5 gap-0.5">${modeButtonsHtml}
             </div>
             <div class="flex items-center justify-between border-b border-slate-100 pb-2">
@@ -644,7 +695,13 @@ function buildSelectionHighlightInner(side, idx) {
         if (AppState.activeIndex !== idx) return '';
         if (typeof s.index === 'number' && s.index !== idx) return '';
 
-        const range = (s.selectionRange && typeof s.selectionRange === 'object') ? s.selectionRange : null;
+        // 高亮范围 = 即将被替换的范围。语法模式给出整句改写时，高亮整句；其余一律高亮选区。
+        // 这样用户在点下去之前就能看到替换范围，不会「以为只换一个词、结果整句被换掉」。
+        const mode = normalizeSynonymMode(s.mode);
+        const sentenceScoped = isSentenceScopedPage(s, mode, getSynonymPageIndex(s, mode));
+        const range = sentenceScoped
+            ? getValidSentenceRange(s)
+            : ((s.selectionRange && typeof s.selectionRange === 'object') ? s.selectionRange : null);
         if (!range) return '';
 
         const values = (AppState.editValues && typeof AppState.editValues === 'object') ? AppState.editValues : {};
@@ -657,8 +714,9 @@ function buildSelectionHighlightInner(side, idx) {
         end = Math.max(0, Math.min(text.length, end));
         if (end <= start) return '';
 
+        const markOpen = sentenceScoped ? '<mark class="sent-scope">' : '<mark>';
         return escapeHtml(text.slice(0, start))
-            + '<mark>' + escapeHtml(text.slice(start, end)) + '</mark>'
+            + markOpen + escapeHtml(text.slice(start, end)) + '</mark>'
             + escapeHtml(text.slice(end));
     } catch (e) {
         return '';
@@ -682,6 +740,189 @@ function syncSelectionHighlightLayers() {
         }
     } catch (e) {
         // 高亮是纯装饰，坏了也绝不能污染渲染路径
+    }
+}
+
+// ============= 句子边界（语法修正模式的分析范围）=============
+// 语法错误经常落在选区外面：选中 "results"，真正错的是后面的 "shows"。
+// 只看选区就只能给出「result / results / findings」这种改了等于没改的选项，
+// 所以语法模式要拿整句去问模型。
+//
+// 但范围一旦算错就是灾难：把一整句改写塞回一个词的位置，正文会被搅烂。
+// 因此这里的唯一原则是 —— 没把握就不给。返回 null，调用方老老实实退回选区范围。
+
+// 后面跟着 '.' 也不算句末的缩写（全小写，不含最后那个点）
+const SENTENCE_ABBREVIATIONS = [
+    'e.g', 'i.e', 'et al', 'al', 'etc', 'cf', 'vs', 'viz', 'resp', 'approx', 'ca', 'ibid',
+    'fig', 'figs', 'eq', 'eqs', 'sec', 'secs', 'ref', 'refs', 'tab', 'tabs', 'alg', 'thm',
+    'ch', 'chap', 'app', 'no', 'nos', 'vol', 'vols', 'pp', 'p', 'ed', 'eds', 'est',
+    'dr', 'prof', 'mr', 'mrs', 'ms', 'st', 'jr', 'sr', 'inc', 'ltd', 'dept', 'univ',
+    'w.r.t', 'a.k.a', 'ph.d', 'm.s', 'b.s', 'u.s', 'u.k', 'min', 'max', 'std', 'avg', 'var'
+];
+
+// LaTeX 数学与宏参数区：这些区域里的 '.' 不是句号（$x_i \cdot y$、\cite{smith2020} 等）。
+// 任何一处没闭合就干脆不保护它 —— 宁可少保护，也不能把后面整篇正文都吞掉。
+function buildProtectedMask(text) {
+    const n = text.length;
+    const mask = new Array(n);
+    for (let i = 0; i < n; i++) mask[i] = false;
+    const fill = (a, b) => {
+        const from = Math.max(0, a), to = Math.min(n, b);
+        for (let i = from; i < to; i++) mask[i] = true;
+    };
+
+    let i = 0;
+    while (i < n) {
+        const ch = text[i];
+
+        if (ch === '\\') {
+            // 行间公式 \[ ... \]
+            if (text[i + 1] === '[') {
+                const close = text.indexOf('\\]', i + 2);
+                if (close !== -1) { fill(i, close + 2); i = close + 2; continue; }
+                i += 2; continue;
+            }
+            // \命令[可选参数]{必选参数}：大括号配平，最多往前找 500 字符
+            const m = /^\\[a-zA-Z@]+\*?/.exec(text.slice(i, i + 40));
+            if (!m) { i += 2; continue; }
+            let j = i + m[0].length;
+            while (j < n && (text[j] === ' ' || text[j] === '\t')) j++;
+            if (text[j] === '[') {
+                const rb = text.indexOf(']', j);
+                if (rb !== -1 && rb - j < 200) {
+                    j = rb + 1;
+                    while (j < n && (text[j] === ' ' || text[j] === '\t')) j++;
+                }
+            }
+            if (text[j] === '{') {
+                let depth = 0, k = j, closed = false;
+                for (; k < n && k - j < 500; k++) {
+                    if (text[k] === '\\') { k++; continue; }
+                    if (text[k] === '{') depth++;
+                    else if (text[k] === '}') { depth--; if (depth === 0) { k++; closed = true; break; } }
+                }
+                if (closed) { fill(i, k); i = k; continue; }
+            }
+            i += m[0].length;
+            continue;
+        }
+
+        if (ch === '$') {
+            const marker = (text[i + 1] === '$') ? '$$' : '$';
+            const close = text.indexOf(marker, i + marker.length);
+            if (close !== -1 && close - i < 1000) { fill(i, close + marker.length); i = close + marker.length; continue; }
+            i += marker.length;
+            continue;
+        }
+
+        i++;
+    }
+    return mask;
+}
+
+// dotIndex 指向一个 '.'：往前抓一个词，判断它是不是「缩写 / 人名首字母」
+function isAbbreviationDot(text, dotIndex) {
+    let i = dotIndex - 1;
+    while (i >= 0 && /[A-Za-z0-9.'’]/.test(text[i])) i--;
+    const token = text.slice(i + 1, dotIndex);
+    if (!token) return false;
+    if (/^[A-Za-z]$/.test(token)) return true; // 人名首字母 "J."
+    const low = token.toLowerCase().replace(/\.+$/, '');
+    return SENTENCE_ABBREVIATIONS.indexOf(low) !== -1;
+}
+
+// 返回所有句末位置（下标 = 句子结束后的第一个字符）
+function findSentenceBoundaries(text) {
+    const n = text.length;
+    const mask = buildProtectedMask(text);
+    const CJK_END = '。！？';          // 。！？
+    const ASCII_END = '.!?';
+    const CLOSERS = '"\')]}»”’」』）】》';
+    const ends = [];
+
+    for (let i = 0; i < n; i++) {
+        if (mask[i]) continue;
+        const ch = text[i];
+        if (CJK_END.indexOf(ch) === -1 && ASCII_END.indexOf(ch) === -1) continue;
+
+        // 连续终止符算一组："?!"、"..."、"。。"
+        let j = i;
+        while (j + 1 < n && !mask[j + 1]
+               && (CJK_END.indexOf(text[j + 1]) !== -1 || ASCII_END.indexOf(text[j + 1]) !== -1)) j++;
+
+        // 单个 '.' 才需要防缩写（"Fig." / "et al." / "i.e."）
+        if (j === i && text[i] === '.' && isAbbreviationDot(text, i)) continue;
+
+        // 吸收紧跟其后的引号 / 右括号
+        let k = j + 1;
+        while (k < n && CLOSERS.indexOf(text[k]) !== -1) k++;
+
+        if (ASCII_END.indexOf(text[j]) !== -1) {
+            // 英文句末必须后接空白或文本结尾，否则多半是小数（0.95）、域名、版本号
+            if (k < n && !/\s/.test(text[k])) { i = j; continue; }
+            // 后面第一个非空白字符是小写字母 → 多半不是新句子的开头
+            let p = k;
+            while (p < n && /\s/.test(text[p])) p++;
+            if (p < n && /[a-z]/.test(text[p])) { i = j; continue; }
+        }
+
+        ends.push(k);
+        i = k - 1;
+    }
+    return ends;
+}
+
+// 选区所在的整句范围。拿不准一律返回 null。
+// 选区横跨两句时，返回把两句都包住的范围（用户问的就是这一片）。
+function findSentenceRange(text, selStart, selEnd) {
+    try {
+        if (typeof text !== 'string' || text.length === 0) return null;
+        let s = Math.floor(Number(selStart));
+        let e = Math.floor(Number(selEnd));
+        if (!isFinite(s) || !isFinite(e)) return null;
+        s = Math.max(0, Math.min(text.length, s));
+        e = Math.max(0, Math.min(text.length, e));
+        if (e <= s) return null;
+
+        const ends = findSentenceBoundaries(text);
+        let start = 0;
+        let end = text.length;
+        for (let i = 0; i < ends.length; i++) {
+            if (ends[i] <= s) start = ends[i];
+            else if (ends[i] >= e) { end = ends[i]; break; }
+        }
+
+        while (start < end && /\s/.test(text[start])) start++;
+        while (end > start && /\s/.test(text[end - 1])) end--;
+
+        if (end <= start) return null;
+        if (start > s || end < e) return null;            // 必须完整包住选区，否则说明算错了
+        const sentence = text.slice(start, end);
+        if (!sentence.trim()) return null;
+        if (sentence.length > 1200) return null;          // 超长块 = 大概率没有真正的句号，退回选区更安全
+        return { start: start, end: end, text: sentence };
+    } catch (err) {
+        return null;
+    }
+}
+
+// 语法模式要送进 prompt / 交叉核对的上下文：
+//   sentence —— 拿去分析的那一句；null = 没算出可靠句子范围，退回词级模式
+//   head/tail —— 这一句里、选区前后的两截文本。用来把「词级替换」塞回原位做交叉核对；
+//                定位不了时为 null，表示放弃核对（只会宽容，不会误伤）。
+function getGrammarScopeContext(state) {
+    try {
+        const sr = getValidSentenceRange(state);
+        if (!sr || !sr.text.trim()) return null;
+        const sel = (state && state.selectionRange && typeof state.selectionRange === 'object') ? state.selectionRange : null;
+        const s = Math.floor(Number(sel && sel.start));
+        const e = Math.floor(Number(sel && sel.end));
+        if (!isFinite(s) || !isFinite(e) || e <= s || s < sr.start || e > sr.end) {
+            return { sentence: sr.text, head: null, tail: null };
+        }
+        return { sentence: sr.text, head: sr.text.slice(0, s - sr.start), tail: sr.text.slice(e - sr.start) };
+    } catch (err) {
+        return null;
     }
 }
 
@@ -1790,23 +2031,68 @@ Return JSON: { "alternatives": ["option1", "option2", "option3", "option4"] }`;
 // 与 getSynonyms 是平级的兄弟函数。之所以单独开一个而不是塞进 getSynonyms：
 // 语法模式的响应形状本质不同（要么「正确」，要么「N 条改写 + 原因」），
 // 硬塞回 string[] 只能靠哨兵值伪装，反而更容易在渲染路径上炸。
-// 返回值形状固定：{ status: 'correct'|'issues'|'empty'|'parse', issue: string, alternatives: string[] }
+// 返回值形状固定：
+//   { status: 'correct'|'issues'|'empty'|'parse', issue: string, scope: 'selection'|'sentence', alternatives: string[] }
 // —— 这里绝不 throw 解析错误，调用方拿到 status 就能给出可见文案。
+// scope 决定这批 alternatives 该替换掉哪一段：'selection' = 只换选中的词，'sentence' = 换掉整句。
+// 它必须跟着建议一起走，绝不能在应用时再猜一次。
 
-// 把模型返回的任意脏数据压成固定形状
-function normalizeGrammarPayload(data) {
-    const d = (data && typeof data === 'object') ? data : {};
+// 两段文本在语法意义上算不算「同一句话」。
+// 只归一化空白：大小写、标点在语法里是有意义的，不能抹平。
+function isSameGrammarText(a, b) {
+    const na = (typeof a === 'string' ? a : '').trim().replace(/\s+/g, ' ');
+    const nb = (typeof b === 'string' ? b : '').trim().replace(/\s+/g, ' ');
+    return na === nb;
+}
 
-    const raw = Array.isArray(d.alternatives) ? d.alternatives : [];
+// 去空、去重、压成字符串数组
+function normalizeGrammarList(raw) {
+    const arr = Array.isArray(raw) ? raw : [];
     const seen = {};
-    const alternatives = [];
-    for (let i = 0; i < raw.length; i++) {
-        const v = raw[i];
+    const out = [];
+    for (let i = 0; i < arr.length; i++) {
+        const v = arr[i];
         const str = (typeof v === 'string' ? v : (v == null ? '' : String(v))).trim();
         if (!str) continue;
         if (seen[str]) continue; // 弱模型（如 qwen3-1.7b）实测会把同一条重复三遍
         seen[str] = true;
-        alternatives.push(str);
+        out.push(str);
+    }
+    return out;
+}
+
+// 把模型返回的任意脏数据压成固定形状
+// baseline: { selectedText, sentenceText, head, tail }
+//   sentenceText 为空串 = 本次没有可用的整句范围 → 整句改写一律丢弃，只允许词级替换。
+//   （没有范围却应用整句改写，就会把一整句塞进一个词的位置。）
+//   head/tail = 整句里选区前后的两截；两者都在时会对词级候选做交叉核对。
+function normalizeGrammarPayload(data, baseline) {
+    const d = (data && typeof data === 'object') ? data : {};
+    const base = (baseline && typeof baseline === 'object') ? baseline : {};
+    const selectedText = typeof base.selectedText === 'string' ? base.selectedText : '';
+    const sentenceText = typeof base.sentenceText === 'string' ? base.sentenceText : '';
+    const head = typeof base.head === 'string' ? base.head : null;
+    const tail = typeof base.tail === 'string' ? base.tail : null;
+
+    // 「换了等于没换」的选项一律丢掉：实测模型会把原词原样列进候选里（results → results）
+    const spanAlternatives = normalizeGrammarList(d.alternatives)
+        .filter(v => !isSameGrammarText(v, selectedText));
+
+    const corrected = typeof d.corrected_sentence === 'string' ? d.corrected_sentence.trim() : '';
+    const sentenceAlternatives = sentenceText
+        ? normalizeGrammarList(
+            normalizeGrammarList(d.sentence_alternatives != null ? d.sentence_alternatives : d.sentenceAlternatives)
+                .concat(corrected ? [corrected] : [])
+          ).filter(v => !isSameGrammarText(v, sentenceText))
+        : [];
+
+    // 交叉核对：把词级候选塞回选区位置，至少有一条要能还原出模型自己写的整句修正稿。
+    // 一条都对不上 = 这批「词级替换」换的其实是别处的词（实测出现过：焦点是 results，候选却是 show），
+    // 点下去只会把句子改坏 —— 这种情况直接不给词级选项，改用整句改写。
+    // 模型没给 corrected_sentence（弱模型 / 老响应）就无从核对，此时一律放行，行为与核对前一致。
+    let spanVerified = true;
+    if (spanAlternatives.length > 0 && corrected && head !== null && tail !== null) {
+        spanVerified = spanAlternatives.some(alt => isSameGrammarText(head + alt + tail, corrected));
     }
 
     let issue = '';
@@ -1819,33 +2105,61 @@ function normalizeGrammarPayload(data) {
     if (typeof d.correct === 'boolean') correct = d.correct;
     else if (typeof d.correct === 'string') correct = /^(true|yes|correct)$/i.test(d.correct.trim());
 
-    if (correct) return { status: 'correct', issue: '', alternatives: [] };
-    if (alternatives.length > 0) return { status: 'issues', issue: issue, alternatives: alternatives };
-    return { status: 'empty', issue: issue, alternatives: [] };
+    if (correct) return { status: 'correct', issue: '', scope: 'selection', alternatives: [] };
+
+    // 作用域：优先听模型的判断，但必须真有对应的候选才作数；否则退到另一种作用域。
+    const scopeHint = typeof d.scope === 'string' ? d.scope.trim().toLowerCase() : '';
+    if (scopeHint === 'sentence' && sentenceAlternatives.length > 0) {
+        return { status: 'issues', issue: issue, scope: 'sentence', alternatives: sentenceAlternatives };
+    }
+    if (spanAlternatives.length > 0 && spanVerified) {
+        return { status: 'issues', issue: issue, scope: 'selection', alternatives: spanAlternatives };
+    }
+    if (sentenceAlternatives.length > 0) {
+        return { status: 'issues', issue: issue, scope: 'sentence', alternatives: sentenceAlternatives };
+    }
+    return { status: 'empty', issue: issue, scope: 'selection', alternatives: [] };
 }
 
-function buildGrammarPrompt(sentence, selectedText, lang, avoidInstruction) {
-    return `Context Sentence: "${sentence}"
-Selected Text: "${selectedText}"
+// spanOnly = true：没有可用的整句范围，只能要词级替换（模型不许提整句改写）
+function buildGrammarPrompt(sentence, selectedText, lang, avoidInstruction, spanOnly) {
+    const scopeRules = spanOnly
+        ? `3. Only the "selection" scope is available here: set "scope": "selection" and put 3-5 DISTINCT drop-in replacements for the "Focus" in "alternatives". Each one is substituted for the Focus characters and NOTHING else: the words before and after the Focus stay exactly as they are. Leave "sentence_alternatives" EMPTY - it will be discarded.`
+        : `3. Then pick the SMALLEST scope that can FULLY repair the sentence:
+   - Use "scope": "selection" ONLY IF every error can be repaired by replacing the "Focus" substring alone. Put 3-5 DISTINCT drop-in replacements for the "Focus" in "alternatives". Each one is substituted for the Focus characters and NOTHING else: the words before and after the Focus stay exactly as they are. Also fill "corrected_sentence" with the whole Sentence as it reads after substituting alternatives[0] for the Focus - it must be identical to the Sentence except for the Focus part.
+   - Otherwise use "scope": "sentence" and put 3-5 DISTINCT fully corrected versions of the ENTIRE "Sentence" in "sentence_alternatives". Leave "alternatives" empty.`;
+
+    return `Sentence: "${sentence}"
+Focus (the part the user selected, inside the Sentence): "${selectedText}"
 Language: ${lang === 'zh' ? 'Chinese' : 'English'}
 
-Task: Act as a strict academic proofreader. Judge ONLY the "Selected Text"; use the "Context Sentence" for context.
-1. Decide whether the "Selected Text" is grammatically correct where it sits in the "Context Sentence" (agreement, tense, number, article, preposition, word form, and punctuation inside the selection).
-2. If it is correct, answer with "correct": true, an empty "issue", and an EMPTY "alternatives" list. Do NOT invent stylistic rewrites.
-3. If it is NOT correct, answer with "correct": false, a SHORT "issue" (one clause naming the error), and 3-5 DISTINCT corrected versions in "alternatives".
-4. Every alternative must be a drop-in replacement for the "Selected Text" ONLY: do not rewrite the rest of the sentence, keep the original meaning and the academic tone.
-5. Fix grammar only. Do not change wording for style reasons.
+Task: Act as a strict academic proofreader. Check the grammar of the WHOLE "Sentence", paying special attention to the "Focus".
+1. If the whole "Sentence" is already grammatically correct, answer "correct": true, "scope": "none", an empty "issue", an empty "alternatives" and an empty "sentence_alternatives". Do NOT invent stylistic rewrites.
+2. Otherwise answer "correct": false and a SHORT "issue" (one clause naming the error).
+${scopeRules}
+4. NEVER output an option that is identical to the text it would replace. Keep each option a plain replacement: do not append or drop surrounding punctuation.
+5. Fix grammar only; keep the original meaning and the academic tone. Reproduce LaTeX commands, math and citations exactly as given.
 6. ${avoidInstruction}
 
-Return JSON: { "correct": true, "issue": "", "alternatives": ["option1", "option2"] }`;
+Return JSON: { "correct": false, "issue": "...", "scope": "sentence", "alternatives": [], "corrected_sentence": "", "sentence_alternatives": ["option1", "option2"] }`;
 }
 
-async function getGrammarSuggestions(sentence, selectedText, lang, config, avoidList = []) {
+// sentence: 拿去分析的那一句（有整句范围时 = 整句；没有时 = 原来的整行上下文，并强制 spanOnly）
+// splice: { head, tail } = 整句里选区前后的两截，用于交叉核对；缺省则不做核对
+async function getGrammarSuggestions(sentence, selectedText, lang, config, avoidList = [], spanOnly = false, splice = null) {
     const avoidInstruction = avoidList.length > 0
         ? `IMPORTANT: Do NOT repeat any of the following corrections: ${JSON.stringify(avoidList)}. Propose DIFFERENT wordings of the fix.`
         : "";
 
-    const prompt = buildGrammarPrompt(sentence, selectedText, lang, avoidInstruction);
+    const prompt = buildGrammarPrompt(sentence, selectedText, lang, avoidInstruction, spanOnly);
+    // 判重基准：spanOnly 时没有整句范围，sentenceText 必须留空，整句候选会被全部丢弃
+    const sp = (!spanOnly && splice && typeof splice === 'object') ? splice : {};
+    const baseline = {
+        selectedText: selectedText,
+        sentenceText: spanOnly ? '' : sentence,
+        head: typeof sp.head === 'string' ? sp.head : null,
+        tail: typeof sp.tail === 'string' ? sp.tail : null
+    };
 
     if (config.provider === 'local') {
         const response = await callLocalLLM(
@@ -1855,8 +2169,8 @@ async function getGrammarSuggestions(sentence, selectedText, lang, config, avoid
             false // 不使用json_mode（与 getSynonyms 保持一致）
         );
         try {
-            return normalizeGrammarPayload(parseJsonResponse(response));
-        } catch (e) { return { status: 'parse', issue: '', alternatives: [] }; }
+            return normalizeGrammarPayload(parseJsonResponse(response), baseline);
+        } catch (e) { return { status: 'parse', issue: '', scope: 'selection', alternatives: [] }; }
     }
 
     // OpenAI Path
@@ -1868,8 +2182,8 @@ async function getGrammarSuggestions(sentence, selectedText, lang, config, avoid
             config.openaiApiKey
         );
         try {
-            return normalizeGrammarPayload(parseJsonResponse(response));
-        } catch (e) { return { status: 'parse', issue: '', alternatives: [] }; }
+            return normalizeGrammarPayload(parseJsonResponse(response), baseline);
+        } catch (e) { return { status: 'parse', issue: '', scope: 'selection', alternatives: [] }; }
     }
 
     // Claude Path
@@ -1883,22 +2197,32 @@ async function getGrammarSuggestions(sentence, selectedText, lang, config, avoid
             config.claudeProxyUrl
         );
         try {
-            return normalizeGrammarPayload(parseJsonResponse(response));
-        } catch (e) { return { status: 'parse', issue: '', alternatives: [] }; }
+            return normalizeGrammarPayload(parseJsonResponse(response), baseline);
+        } catch (e) { return { status: 'parse', issue: '', scope: 'selection', alternatives: [] }; }
     }
 
     // Gemini Path
+    // ⚠️ 未经实测：本环境没有 Gemini API Key，下面的 schema 变更（新增 scope /
+    // corrected_sentence / sentence_alternatives 三个字段）只做过代码审查，没有真跑过一次请求。
+    // 即使 schema 被 Gemini 拒绝或字段缺失，normalizeGrammarPayload 也只会退回
+    // 'empty' / 词级替换，不会拿不存在的范围去替换文本。
     const responseSchema = {
         type: "OBJECT",
         properties: {
             correct: { type: "BOOLEAN" },
             issue: { type: "STRING" },
+            scope: { type: "STRING" },
+            corrected_sentence: { type: "STRING" },
             alternatives: {
+                type: "ARRAY",
+                items: { type: "STRING" }
+            },
+            sentence_alternatives: {
                 type: "ARRAY",
                 items: { type: "STRING" }
             }
         },
-        required: ["correct", "issue", "alternatives"]
+        required: ["correct", "issue", "scope", "corrected_sentence", "alternatives", "sentence_alternatives"]
     };
 
     const response = await callGeminiAPI(config.model, prompt, {
@@ -1907,21 +2231,28 @@ async function getGrammarSuggestions(sentence, selectedText, lang, config, avoid
     }, config.geminiApiKey);
 
     try {
-        return normalizeGrammarPayload(JSON.parse(response || "{}"));
-    } catch (e) { return { status: 'parse', issue: '', alternatives: [] }; }
+        return normalizeGrammarPayload(JSON.parse(response || "{}"), baseline);
+    } catch (e) { return { status: 'parse', issue: '', scope: 'selection', alternatives: [] }; }
 }
 
-// 选词弹窗统一取数入口：三个模式共用一个返回形状 { alternatives: string[], note: {status,issue}|null }。
+// 选词弹窗统一取数入口：三个模式共用一个返回形状 { alternatives: string[], note: {status,issue,scope}|null }。
 // note 只有语法模式才有；另外两个模式保持原样走 getSynonyms（返回值契约一个字节都没动）。
-async function fetchSynonymOptions(mode, sentence, selectedText, lang, config, avoidList) {
+// grammarScope: getGrammarScopeContext() 的产物 { sentence, head, tail }；
+//   传 null 或 sentence 为空 = 没算出可靠的句子范围，语法模式退化成词级分析（等同改动前的行为）。
+async function fetchSynonymOptions(mode, sentence, selectedText, lang, config, avoidList, grammarScope) {
     const m = normalizeSynonymMode(mode);
     const avoid = Array.isArray(avoidList) ? avoidList : [];
 
     if (m === 'grammar') {
-        const result = await getGrammarSuggestions(sentence, selectedText, lang, config, avoid);
+        const gs = (grammarScope && typeof grammarScope === 'object') ? grammarScope : {};
+        const useSentence = (typeof gs.sentence === 'string' && gs.sentence.trim()) ? gs.sentence : null;
+        const result = await getGrammarSuggestions(
+            useSentence || sentence, selectedText, lang, config, avoid, !useSentence,
+            { head: gs.head, tail: gs.tail }
+        );
         return {
             alternatives: Array.isArray(result.alternatives) ? result.alternatives : [],
-            note: { status: result.status, issue: result.issue }
+            note: { status: result.status, issue: result.issue, scope: result.scope === 'sentence' ? 'sentence' : 'selection' }
         };
     }
 
@@ -2247,6 +2578,9 @@ async function handleTextSelect(event, field, index) {
     // 每次全新选择都按设置里的默认模式打开，并重置三个模式的缓存
     const defaultMode = normalizeSynonymMode(AppState.synonymDefaultMode);
 
+    // 选区所在的整句：语法模式的分析范围和整句替换范围都来自这里；算不准就是 null
+    const sentenceRange = findSentenceRange(text, start, end);
+
     updateSynonymState({
         show: true,
         loading: true,
@@ -2258,6 +2592,7 @@ async function handleTextSelect(event, field, index) {
         errorMessage: "",
         position: { x: event.clientX, y: event.clientY },
         selectionRange: { start, end },
+        sentenceRange,
         field,
         index,
         contextSentence: text
@@ -2266,7 +2601,10 @@ async function handleTextSelect(event, field, index) {
     try {
         const lang = field === 'src' ? AppState.sourceLang : AppState.targetLang;
         const config = getApiConfig();
-        const result = await fetchSynonymOptions(defaultMode, text, selectedText, lang, config, []);
+        const result = await fetchSynonymOptions(
+            defaultMode, text, selectedText, lang, config, [],
+            getGrammarScopeContext(AppState.synonymState)
+        );
 
         const cur = AppState.synonymState;
         const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : emptySynonymHistory();
@@ -2322,7 +2660,10 @@ async function handleSynonymModeSwitch(mode) {
     try {
         const lang = s.field === 'src' ? AppState.sourceLang : AppState.targetLang;
         const config = getApiConfig();
-        const result = await fetchSynonymOptions(newMode, s.contextSentence, s.originalText, lang, config, []);
+        const result = await fetchSynonymOptions(
+            newMode, s.contextSentence, s.originalText, lang, config, [],
+            getGrammarScopeContext(s)
+        );
 
         const cur = AppState.synonymState;
         const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : emptySynonymHistory();
@@ -2367,7 +2708,10 @@ async function handleSynonymPageChange(direction) {
             try {
                 const avoidList = history.flat();
                 const config = getApiConfig();
-                const result = await fetchSynonymOptions(mode, contextSentence, originalText, lang, config, avoidList);
+                const result = await fetchSynonymOptions(
+                    mode, contextSentence, originalText, lang, config, avoidList,
+                    getGrammarScopeContext(s)
+                );
 
                 const cur = AppState.synonymState;
                 const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : emptySynonymHistory();
@@ -2392,12 +2736,36 @@ async function handleSynonymPageChange(direction) {
 }
 
 // 应用同义词
-function applySynonym(synonym) {
+// scope: 'selection'（默认；替换 / 简化 / 词级语法都走这条，行为一个字节都没变）
+//        'sentence'（语法模式的整句改写：替换范围必须是 sentenceRange）
+// 作用域是跟着建议一起传进来的，不在这里重新猜。范围核对不上就中止 ——
+// 把一整句改写塞进一个词的位置会直接搅烂正文，宁可什么都不做。
+function applySynonym(synonym, scope) {
     if (!AppState.synonymState.field || AppState.activeIndex === null) return;
 
     const field = AppState.synonymState.field;
     const currentText = AppState.editValues[field];
-    const { start, end } = AppState.synonymState.selectionRange;
+    let start, end;
+
+    if (scope === 'sentence') {
+        const sr = getValidSentenceRange(AppState.synonymState);
+        // 逐字核对：当前正文在该范围上必须仍然等于当初记下来的那一句
+        if (!sr || typeof currentText !== 'string'
+            || sr.end > currentText.length
+            || currentText.substring(sr.start, sr.end) !== sr.text) {
+            updateSynonymState({
+                loading: false,
+                errorMessage: '整句范围已失效（正文被改动过），未做任何替换。请重新选中后再试。'
+            });
+            return;
+        }
+        start = sr.start;
+        end = sr.end;
+    } else {
+        const range = AppState.synonymState.selectionRange;
+        start = range.start;
+        end = range.end;
+    }
 
     const newText = currentText.substring(0, start) + synonym + currentText.substring(end);
 
@@ -2413,9 +2781,28 @@ function applySynonym(synonym) {
         textarea.setSelectionRange(newCursorPos, newCursorPos);
         textarea.focus();
     }
-    
+
     // 关闭弹窗
     updateSynonymState({ show: false });
+}
+
+// 语法模式的选项按「页码 + 下标」回查，不把文本内联进 onclick 字符串。
+// 原因有二：
+//   1) 整句改写里会出现 \cite{...}、$x_i$、引号，内联进 JS 字符串字面量会被吃掉反斜杠；
+//   2) 作用域必须和这一页的判定结果绑死，不能在应用时再猜一次。
+function applySynonymOption(pageIndex, optionIndex) {
+    try {
+        const s = AppState.synonymState;
+        const mode = normalizeSynonymMode(s.mode);
+        const page = getSynonymHistory(s, mode)[pageIndex];
+        if (!Array.isArray(page)) return;
+        const text = page[optionIndex];
+        if (typeof text !== 'string' || !text) return;
+        const scope = isSentenceScopedPage(s, mode, pageIndex) ? 'sentence' : 'selection';
+        applySynonym(text, scope);
+    } catch (e) {
+        console.error(e);
+    }
 }
 
 // 处理摘要
