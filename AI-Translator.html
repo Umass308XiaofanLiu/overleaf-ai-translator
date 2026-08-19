@@ -82,6 +82,21 @@ body { font-family: 'Inter', sans-serif; }
     background-color: rgba(245, 158, 11, 0.28);
     box-shadow: 0 0 0 1px rgba(245, 158, 11, 0.45);
 }
+/* 跨栏对应高亮：在**另一侧**画出与选中内容意思对应的片段。
+   刻意用第三种颜色（青绿），和「本侧选区」（靛蓝）、「整句改写范围」（琥珀）三者一眼可分。
+   ⚠️ 这两条规则里只许出现 background-color / box-shadow / border-radius —— 三者都不参与布局。
+   一旦加了 padding / margin / border / font-size / line-height，行高就会变，
+   syncBilingualAlignment 的「|top(src_i) - top(tgt_i)| <= 1px」不变量当场破功。 */
+.sel-highlight-layer mark.cross-hl {
+    background-color: rgba(13, 148, 136, 0.26);
+    box-shadow: 0 0 0 1px rgba(13, 148, 136, 0.42);
+}
+/* 非编辑行（已渲染的 marked/KaTeX 正文）上的跨栏高亮。同样只许改背景，不许碰盒模型。 */
+.cross-hl-span {
+    background-color: rgba(13, 148, 136, 0.26);
+    box-shadow: 0 0 0 1px rgba(13, 148, 136, 0.42);
+    border-radius: 2px;
+}
 
 /* 拖拽过程中禁止选中文字，光标全局保持左右拖拽箭头 */
 body.is-resizing-settings-modal {
@@ -90,6 +105,124 @@ body.is-resizing-settings-modal {
 }
 body.is-resizing-settings-modal * {
     user-select: none !important;
+}
+
+/* ============= 中文悬停提示（纯 CSS，data-tip 驱动）=============
+   为什么必须是纯 CSS 而不是 JS 浮层：
+   renderApp() 走 root.innerHTML 全量重建，JS 浮层每轮都要重新绑事件、重新定位，
+   而渲染路径外面没有 try/catch —— 多一行 JS 就多一次「整页永久冻死」的机会。
+   ::after + attr(data-tip) 是随节点走的，重建多少次都自动还在，零状态、零风险。
+
+   与原生 title 的关系：**同一个元素上二选一**。凡是加了 data-tip 的元素，
+   它自己的 title 必须删掉，否则悬停 1 秒后系统气泡会叠在自定义气泡上（两个提示）。
+   父元素带 data-tip、子元素带 title 同样会双出（:hover 会冒泡到父级），所以
+   两者在 DOM 上不允许存在祖先—后代关系。
+
+   延迟 0.3s 才浮出：鼠标划过工具栏时不会一路炸出一串气泡。 */
+[data-tip] { position: relative; }
+[data-tip]::after {
+    content: attr(data-tip);
+    position: absolute;
+    z-index: 2147483000;
+    left: 50%;
+    bottom: calc(100% + 8px);
+    transform: translateX(-50%);
+    width: max-content;
+    max-width: 240px;
+    padding: 6px 9px;
+    border-radius: 8px;
+    background: #1e293b;
+    color: #f8fafc;
+    /* 这些按钮很多带 uppercase / tracking-wider / text-[9px]，提示气泡必须自己钉死排版，
+       否则会继承成「大写+字距拉开」的一坨，中文尤其难看 */
+    font-family: 'Inter', sans-serif;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.55;
+    letter-spacing: normal;
+    text-transform: none;
+    text-align: left;
+    white-space: normal;
+    word-break: break-word;
+    box-shadow: 0 8px 20px -6px rgba(15, 23, 42, 0.45);
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;   /* 气泡自己绝不吃鼠标事件，不会挡住底下的按钮 */
+    transition: opacity 0.12s ease 0.3s, visibility 0s linear 0.42s;
+}
+[data-tip]:hover::after,
+[data-tip]:focus-visible::after {
+    opacity: 1;
+    visibility: visible;
+    transition: opacity 0.12s ease 0.3s, visibility 0s linear 0.3s;
+}
+/* 空 data-tip 一律不出气泡（防止某个分支算出空串时浮出一个黑色小方块） */
+[data-tip=""]::after { content: none; }
+
+/* 视口/容器边缘的方位修正。默认 top 居中；贴右边缘用 *-end，贴顶用 bottom，
+   贴左右两侧的窄按钮用 left/right。设置弹窗的滚动容器是 overflow-y:auto
+   （浏览器会把 overflow-x 一起变成 auto），横向溢出会被裁掉，所以弹窗内
+   靠右的控件一律 *-end / left。 */
+[data-tip][data-tip-pos="bottom"]::after { bottom: auto; top: calc(100% + 8px); }
+[data-tip][data-tip-pos="top-end"]::after { left: auto; right: 0; transform: none; }
+[data-tip][data-tip-pos="bottom-end"]::after { bottom: auto; top: calc(100% + 8px); left: auto; right: 0; transform: none; }
+[data-tip][data-tip-pos="top-start"]::after { left: 0; transform: none; }
+[data-tip][data-tip-pos="bottom-start"]::after { bottom: auto; top: calc(100% + 8px); left: 0; transform: none; }
+[data-tip][data-tip-pos="left"]::after {
+    left: auto; right: calc(100% + 8px); bottom: auto; top: 50%; transform: translateY(-50%);
+}
+[data-tip][data-tip-pos="right"]::after {
+    left: calc(100% + 8px); bottom: auto; top: 50%; transform: translateY(-50%);
+}
+
+/* ============= Settings 分页 =============
+   四个页签的内容**全部**渲染进 DOM，切页只切 class（setSettingsTab 直接改 DOM，
+   不走 setState/renderApp）。这么做有两个硬理由：
+     1) 切页不重渲染 = 输到一半还没点保存的 API Key 不会被 AppState 的旧值覆盖回去；
+     2) 切页不重渲染 = 切页这条路径上一行渲染代码都不跑，不可能冻页。
+   AppState.settingsTab + localStorage 只负责「下次整体重渲染/重开弹窗时落在哪一页」。 */
+.settings-panel { display: none; }
+.settings-panel.is-active { display: block; }
+.settings-tab-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 6px 12px;
+    border-radius: 10px 10px 0 0;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    color: #64748b;
+    background: transparent;
+    border-bottom: 2px solid transparent;
+    white-space: nowrap;
+    transition: color 0.15s ease, background-color 0.15s ease, border-color 0.15s ease;
+}
+.settings-tab-btn:hover { color: #4f46e5; background: #eef2ff; }
+.settings-tab-btn.is-active {
+    color: #4f46e5;
+    background: #ffffff;
+    border-bottom-color: #4f46e5;
+}
+
+/* ============= 句对行距（TASK 3）=============
+   ⚠️ 左右两栏共用同一个 --pair-gap，物理上不可能只改一边。
+   只改一边 = syncBilingualAlignment 补的行高还对，但行与行之间的外边距对不上，
+   top 差会沿页面向下累加 —— 那正是这个变量必须挂在 :root 而不是各栏自己身上的原因。
+   行本身的 mb-2 / my-4 已经从 renderPairRow 里删掉，space-y-2 也已从两个内容盒删掉，
+   所以行距只有这一个来源，滑块能一路调到 0。 */
+:root { --pair-gap: 8px; }
+[data-align-content] > * + * { margin-top: var(--pair-gap); }
+/* 每行都带 Tailwind 的 transition-all（0.15s），它会把 margin-top 一起做补间动画。
+   实测后果：拖动行距滑块时行距是「渐变」到位的，而 syncBilingualAlignment 在这 150ms 内
+   量到的是中间态高度；更糟的是后台标签页里动画时钟是冻结的，margin 会一直卡在旧值。
+   这里把过渡属性收窄回 Tailwind 默认 `transition` 的那一组（颜色/阴影/形变/透明度），
+   把 margin 排除在外 —— 行距改动立即生效，hover 高亮、编辑态放大等观感一点没丢。
+   属性选择器**故意写两遍**：Tailwind 的 .transition-all 特异度是 (0,1,0)，而它生成的
+   样式表是运行时注入的、排在本 <style> 之后，单写一次 [data-align-content] 打平后会输给它
+   （实测 transitionProperty 仍是 all）。写两遍把特异度抬到 (0,2,0) 才压得住。 */
+[data-align-content][data-align-content] > * {
+    transition-property: color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform, filter, -webkit-backdrop-filter, backdrop-filter;
 }
 
 </style>
@@ -111,7 +244,7 @@ body.is-resizing-settings-modal * {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '01.01.00';        // APP_VERSION_STAMP
+const APP_VERSION = '01.02.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-08-19';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -307,6 +440,47 @@ function clampSettingsModalWidth(w) {
 // 已提交的值——mouseup 才会把这里的值落盘进 AppState + localStorage，然后清回 null。
 let settingsModalDragWidth = null;
 
+// ============= Settings 弹窗分页 =============
+// 顺序 = 屏幕上从左到右的顺序。id 同时用作 data-settings-tab / data-settings-panel 的值
+// 和 localStorage 里存的字符串，改 id 等于让老用户回到第一页（无害）。
+const SETTINGS_TABS = [
+    { id: 'api',     label: 'API',       tip: '各家模型的 API Key、Claude 代理地址、本地 LM Studio 地址都在这一页。翻译发不出去、报 401/CORS 时先来这里。' },
+    { id: 'models',  label: '模型',      tip: '决定顶栏模型下拉里出现哪些模型：从各家 API 拉最新列表、搜索、按厂商勾选。下拉里找不到某个模型就来这里勾上。' },
+    { id: 'display', label: '显示',      tip: '只影响界面观感，不影响翻译结果：句对行距、设置弹窗宽度。' },
+    { id: 'editing', label: '编辑与历史', tip: '选词弹窗默认功能、Grammar/Simplify 的自定义提示词、自动保存间隔、历史保留条数。' }
+];
+// 脏值一律回落第一页。所有读 settingsTab 的地方都要过这个函数，渲染路径才不会拿到未知键。
+function normalizeSettingsTab(tab) {
+    for (let i = 0; i < SETTINGS_TABS.length; i++) {
+        if (SETTINGS_TABS[i].id === tab) return tab;
+    }
+    return SETTINGS_TABS[0].id;
+}
+
+// ============= 句对行距（TASK 3）=============
+// 改前实测：两栏内容盒各挂 space-y-2（行间 8px）+ 每行自己 mb-2（8px）= 行距恒 16px，
+// 用户反馈「左右句子之间的间隔都有些大」。默认改成 8px（比原来紧一半），可一路调到 0。
+// 上限 32px 留给「屏幕大、想要松散阅读」的场景。
+const ROW_GAP_DEFAULT = 8;
+const ROW_GAP_MIN = 0;
+const ROW_GAP_MAX = 32;
+// 脏 localStorage 值（NaN / -999 / 9999）不能把行距渲染成负数或几千像素
+function clampRowGap(v) {
+    const n = Math.round(Number(v));
+    if (!Number.isFinite(n)) return ROW_GAP_DEFAULT;
+    return Math.max(ROW_GAP_MIN, Math.min(ROW_GAP_MAX, n));
+}
+// 行距只经由 :root 上的 CSS 变量生效 —— 不写进任何模板字符串。
+// 好处：renderApp() 重建 root.innerHTML 时它压根不参与，重渲染丢不掉；
+// 拖动滑块时也不需要 setState，一次 setProperty 就是全部工作量（无布局抖动）。
+function applyRowGapToDom(px) {
+    try {
+        document.documentElement.style.setProperty('--pair-gap', clampRowGap(px) + 'px');
+    } catch (e) {
+        console.warn('[rowgap] 写入 CSS 变量失败：', e && e.message);
+    }
+}
+
 const AppState = {
     // 输入输出状态
     inputText: "",
@@ -401,6 +575,15 @@ const AppState = {
     newlyFoundIds: [],         // 本次刷新新发现的 id，用于 NEW 徽标和「全部显示」
     settingsModalWidth: SETTINGS_MODAL_DEFAULT_WIDTH, // Settings 弹窗宽度（px），拖拽手柄调整后持久化
     modelGroupExpanded: { gemini: false, openai: false, claude: false }, // Settings 弹窗里「展开了哪几家」；刻意不落 localStorage，每次开弹窗都回到折叠
+    settingsTab: SETTINGS_TABS[0].id, // Settings 弹窗当前页签（持久化到 localStorage['settingsTab']，关弹窗/刷新都记得）
+    rowGap: ROW_GAP_DEFAULT,          // 句对行距（px），左右两栏共用；持久化到 localStorage['rowGap']
+
+    // ---- 跨栏对应高亮（选中一侧，另一侧同时高亮出对应片段）----
+    crossHighlightEnabled: true,      // 总开关，「显示」页可关；持久化到 localStorage['crossHighlightEnabled']
+    // 本次跨栏高亮的结果。形状永远固定，渲染路径只读不写。
+    //   status: 'idle' 无 | 'pending' 请求在飞 | 'ok' 有可画的片段 | 'none' 查过了但一个都没逐字命中
+    //   fragments: **已经逐字校验过、且在目标侧只出现一次**的片段；除此之外一律不进这里
+    crossHighlight: { seq: 0, idx: null, fromSide: null, toSide: null, fragments: [], status: 'idle', via: '' },
 
     // 模型可见性设置（键 = 模型 id，值 = 是否显示；键不存在时按 `!== false` 视为可见）
     // 初值由 DEFAULT_MODEL_CATALOG 派生，与原来手写的 9 个 true 完全等价
@@ -469,6 +652,12 @@ function updateTranslationPair(index, updates) {
 // 三者在任何地方都是平级的：模式切换条、historyByMode、pageIndexByMode、默认模式设置、localStorage。
 const SYNONYM_MODES = ['replace', 'simplify', 'grammar'];
 const SYNONYM_MODE_LABEL = { replace: '替换', simplify: '简化', grammar: '语法修正' };
+// 悬停提示文案（选词弹窗的模式条 + 设置里的「默认功能」都用同一份，改一处两处同步）
+const SYNONYM_MODE_TIP = {
+    replace: '给选中的词换一批学术同义词，点一个就替换掉选中部分。',
+    simplify: '把选中的这段话改写得更直白简短，意思不变。',
+    grammar: '检查选中处所在的「整句」语法：没问题会直接说「语法正确」，有问题给出改写；整句级改写会用琥珀色高亮出将被替换的范围。'
+};
 
 // 脏值一律回落 'replace'。所有读 mode 的地方都必须过这个函数，渲染路径才不会碰到未知键。
 function normalizeSynonymMode(mode) {
@@ -579,7 +768,7 @@ function renderSynonymPopupOnly() {
     const sentenceScoped = isSentenceScopedPage(s, mode, pageIndex);
 
     const modeButtonsHtml = SYNONYM_MODES.map(m => `
-                <button onclick="handleSynonymModeSwitch('${m}')" class="flex-1 px-1.5 py-1 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${mode === m ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">${SYNONYM_MODE_LABEL[m]}</button>
+                <button onclick="handleSynonymModeSwitch('${m}')" class="flex-1 px-1.5 py-1 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${mode === m ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr(SYNONYM_MODE_TIP[m] || '')}" data-tip-pos="bottom">${SYNONYM_MODE_LABEL[m]}</button>
     `).join('');
 
     // 结果区：三个模式共用一段分支，任何一支都必须能渲染出可见文案，绝不留空
@@ -691,9 +880,12 @@ function buildSelectionHighlightInner(side, idx) {
     try {
         const s = AppState.synonymState;
         if (!s || !s.show) return '';
-        if (s.field !== side) return '';
         if (AppState.activeIndex !== idx) return '';
         if (typeof s.index === 'number' && s.index !== idx) return '';
+        // 这一侧不是「用户选中的那一侧」= 它是**对侧**，画跨栏对应高亮。
+        // （三条守卫的先后顺序无所谓：原来四条都是返回空串的纯守卫，这里只是把其中一条的
+        //   返回值从空串换成对侧分支，本侧那条路的判定条件一个字节都没变。）
+        if (s.field !== side) return buildCrossHighlightInner(side, idx);
 
         // 高亮范围 = 即将被替换的范围。语法模式给出整句改写时，高亮整句；其余一律高亮选区。
         // 这样用户在点下去之前就能看到替换范围，不会「以为只换一个词、结果整句被换掉」。
@@ -729,8 +921,16 @@ function renderSelectionHighlightLayer(side, idx) {
 }
 
 // 局部更新用（updateSynonymState 不走全量渲染，这里把已经在 DOM 里的镜像层刷新一遍）
+// 它同时是**整个高亮系统唯一的收口**：renderApp 和 updateSynonymState 都必经此处，
+// 所以「弹窗一关，跨栏高亮和在飞的请求一起收掉」只需要写在这一个地方，
+// 不必去补 updateSynonymState({show:false}) 那七八个调用点。
 function syncSelectionHighlightLayers() {
     try {
+        // 选中作废（弹窗关了）→ 跨栏状态清零 + 取消在飞请求。必须在重建镜像层之前做，
+        // 否则这一轮还会照着已作废的 fragments 再画一次。
+        const ss = AppState.synonymState;
+        if (!ss || !ss.show) resetCrossHighlight();
+
         const layers = document.querySelectorAll('.sel-highlight-layer');
         for (let i = 0; i < layers.length; i++) {
             const layer = layers[i];
@@ -738,9 +938,583 @@ function syncSelectionHighlightLayers() {
             const idx = Number(layer.getAttribute('data-idx'));
             layer.innerHTML = buildSelectionHighlightInner(side, idx);
         }
+
+        // 非编辑行（已渲染的 marked/KaTeX 正文）走 DOM 文本节点包裹那条路，镜像层管不到
+        applyCrossHighlightToRendered();
     } catch (e) {
         // 高亮是纯装饰，坏了也绝不能污染渲染路径
     }
+}
+
+// ============= 跨栏对应高亮 =============
+// 选中左边的一个词 / 短语 / 句子，右边把「意思对应的那一段」也一起高亮出来，反向同理。
+//
+// 这是校对工具，**一个自信的错高亮比不高亮糟糕得多**，所以整条链路只有一条铁律：
+//   只画在对侧**逐字**找得到、而且**只出现一次**的片段。
+// 模型给的答案不是拿来直接画的，是拿来当「候选串」去对侧做 indexOf 的；
+// 对不上就什么都不画。没有模糊匹配、没有近似、没有编辑距离，永远不会有。
+// 「只出现一次」这条比「找得到」更严：出现两次就无从判断是哪一次，宁可不画。
+//
+// ⚠️ 但这条铁律只保证「画上去的是对侧真实存在的文字」，它**保证不了**那段文字就是
+//    对应内容。模型从不凭空捏字 —— 译文漏译时它会挑一段看起来最像的真文字交上来，
+//    逐字闸门当然照单放行。实测（qwen3.6-35b-a3b，译文真实漏译的句对）：
+//    选中 "Willie Fusion Unit"（中文里根本没译）→ 稳定回 "@@联盟层面的量"，3/3 次都画错。
+//    漏译恰恰是校对最想抓的东西，功能却拿一片自信的绿色把它盖住 —— 这是最坏的失效方式。
+//    所以另外加了两道闸门，它们和逐字闸门是**并联**的，谁否决都不画：
+//      · prompt 里把「先判断有没有被译出来、漏了就 @@NONE」提到任务最前面
+//        （measured：漏译探针的错画率 6/9 → 0/27）；
+//      · crossPlausibleLength 的体量闸门（选一个词回一整句、选一整句回两个字，一律丢）。
+//
+// 两级：
+//   1) 确定性锚点（免费、即时、零模型调用）：行内公式、\cite/\ref、数字、全大写缩写
+//      —— 这些东西翻译过去是原样保留的，直接 indexOf 即可。
+//   2) 模型（仅在锚点一个都没命中时才发）：**绝不用 JSON 承载**。
+//      两侧正文里都有反斜杠，JSON 字符串转义正是这个 app 别处把 \ref 变成回车的元凶。
+//      改用纯分隔符协议：每行 `@@` 开头一段，自己切自己解析，反斜杠一路原样。
+
+const CROSS_HL_DEBOUNCE_MS = 180;   // 连续改选区时只发最后一次
+const CROSS_HL_CACHE_MAX = 240;     // 同一句里反复选同几个词，第二次起零延迟
+const CROSS_HL_MIN_LEN = 1;
+// 「逐字找得到 + 只出现一次」这道闸门只保证画上去的是**对侧真实存在的文字**，
+// 它保证不了那段文字**就是对应内容** —— 模型从不凭空捏字，它是挑一段看起来最像的真文字交上来，
+// 于是照单全收。补一道纯本地的体量闸门：对应片段的总长度必须和选区在同一个量级。
+// 中英互译的实测区间（178 次判对的模型调用，见下面注释）：英→中 0.17–0.35，中→英 1.5–4.7。
+// 取 [0.12, 5] 把两头都留足余量 —— 在那 178 次里**一次误杀都没有**，
+// 同时能挡住「选 28 字符、只回 2 个字」和「选一个词、把整句都回过来」这两类明显不成比例的答案。
+const CROSS_HL_LEN_RATIO_MIN = 0.12;
+const CROSS_HL_LEN_RATIO_MAX = 5;
+// 选区极短时比例上限没有意义（选 1 个汉字，对应的英文短语本来就有二三十个字符），
+// 给一个绝对下限兜住。
+const CROSS_HL_LEN_ABS_MAX = 32;
+const crossHighlightCache = new Map();
+let crossHighlightTimer = null;
+let crossHighlightAbort = null;
+let crossHighlightSeq = 0;          // 单调递增；响应回来时对不上就是陈旧响应，直接丢弃
+
+function otherSide(side) {
+    return side === 'src' ? 'tgt' : 'src';
+}
+
+// 对侧这一行现在有没有地方可以画高亮？两条路各认一种载体：
+//   编辑态 → 镜像层 .sel-highlight-layer；非编辑态 → 已渲染的正文容器。
+// 两者都没有就是画不出来，调用方据此提前放弃，省掉一次没有意义的模型调用。
+function crossCanPaint(idx, side) {
+    try {
+        if (document.querySelector(`.sel-highlight-layer[data-side="${side}"][data-idx="${idx}"]`)) return true;
+        return findRenderedRowBody(idx, side) !== null;
+    } catch (e) {
+        return false;
+    }
+}
+
+// 把状态恢复成「什么都没有」，并掐掉在飞的请求和排队中的防抖。
+// 纯状态操作 + 全程 try/catch：渲染路径会调它。
+function resetCrossHighlight() {
+    try {
+        crossHighlightSeq++;                      // 让任何在途响应立刻变成陈旧响应
+        if (crossHighlightTimer) { clearTimeout(crossHighlightTimer); crossHighlightTimer = null; }
+        if (crossHighlightAbort) { try { crossHighlightAbort.abort(); } catch (e) {} crossHighlightAbort = null; }
+        AppState.crossHighlight = { seq: crossHighlightSeq, idx: null, fromSide: null, toSide: null, fragments: [], status: 'idle', via: '' };
+    } catch (e) {}
+}
+
+// 某一侧「当前显示出来的文本」。跨栏高亮的逐字校验和最终定位**必须共用这一个字符串**，
+// 否则会出现「在 A 串里找到了、画到 B 串上」的错位。
+//   编辑中的行 = textarea 里的值（镜像层也是照这个值铺的）
+//   非编辑行   = 交给 DOM 那条路自己收集文本节点，这里返回 null
+function getCrossCorpus(idx, side) {
+    try {
+        if (AppState.activeIndex !== idx) return null;
+        const values = (AppState.editValues && typeof AppState.editValues === 'object') ? AppState.editValues : {};
+        return typeof values[side] === 'string' ? values[side] : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// 片段在语料里出现的全部位置。带词边界体检：
+// 片段以字母/数字开头（结尾）时，命中处的前（后）一个字符不许还是字母/数字 ——
+// 否则选中 "2" 会命中 "1024" 里的那个 2，选中 "route" 会命中 "router"。
+// 中文没有词边界概念，首尾不是 ASCII 字母数字时这条检查自动不生效。
+function crossFindOccurrences(corpus, frag) {
+    const out = [];
+    try {
+        if (typeof corpus !== 'string' || typeof frag !== 'string' || !frag) return out;
+        const headStrict = /[A-Za-z0-9]/.test(frag.charAt(0));
+        const tailStrict = /[A-Za-z0-9]/.test(frag.charAt(frag.length - 1));
+        let i = corpus.indexOf(frag);
+        while (i !== -1) {
+            const beforeOk = !headStrict || i === 0 || !/[A-Za-z0-9]/.test(corpus.charAt(i - 1));
+            const afterOk = !tailStrict || (i + frag.length >= corpus.length) || !/[A-Za-z0-9]/.test(corpus.charAt(i + frag.length));
+            if (beforeOk && afterOk) out.push(i);
+            if (out.length > 4) break;   // 出现这么多次早就判定为「有歧义、不画」，不必数完
+            i = corpus.indexOf(frag, i + 1);
+        }
+    } catch (e) {}
+    return out;
+}
+
+// 候选片段 → 可以放心画的区间。只保留「唯一出现」的，并且丢掉互相重叠的。
+// 纯函数、无 IO、全程 try/catch —— 渲染路径直接调它。
+function crossResolveRanges(corpus, fragments) {
+    const ranges = [];
+    try {
+        if (typeof corpus !== 'string' || !corpus || !Array.isArray(fragments)) return ranges;
+        for (let i = 0; i < fragments.length; i++) {
+            const frag = fragments[i];
+            if (typeof frag !== 'string' || frag.length < CROSS_HL_MIN_LEN) continue;
+            const hits = crossFindOccurrences(corpus, frag);
+            if (hits.length !== 1) continue;      // 0 次 = 没逐字命中；>1 次 = 有歧义。两种都不画。
+            ranges.push({ start: hits[0], end: hits[0] + frag.length });
+        }
+        ranges.sort((a, b) => a.start - b.start || b.end - a.end);
+        const out = [];
+        for (let i = 0; i < ranges.length; i++) {
+            if (out.length && ranges[i].start < out[out.length - 1].end) continue;   // 与前一段重叠，丢弃
+            out.push(ranges[i]);
+        }
+        return out;
+    } catch (e) {
+        return [];
+    }
+}
+
+// 体量闸门：模型交上来的对应片段，总长度必须和选区长度同一个量级。
+// 整组一起判、要么全收要么全弃 —— 这条链路的立场一贯是「拿不准就什么都不画」。
+// 纯函数、无 IO、全程 try/catch。
+function crossPlausibleLength(selected, fragments) {
+    try {
+        const sel = String(selected == null ? '' : selected).trim();
+        if (!sel || !Array.isArray(fragments) || !fragments.length) return false;
+        let total = 0;
+        for (let i = 0; i < fragments.length; i++) total += String(fragments[i] || '').length;
+        if (total < sel.length * CROSS_HL_LEN_RATIO_MIN) return false;
+        if (total > Math.max(sel.length * CROSS_HL_LEN_RATIO_MAX, CROSS_HL_LEN_ABS_MAX)) return false;
+        return true;
+    } catch (e) {
+        return false;
+    }
+}
+
+// 锚点够不够格「短路掉模型」？
+// 只有当选区**基本上就是这些锚点本身**时才够格 —— 把锚点从选区里抠掉，
+// 剩下的只有标点和空白，说明用户选的就是那个公式 / 那条 \cite / 那个缩写。
+// 反例（原先会中招的）：选中 125 个字符的一整个从句、末尾带一条 \cite，
+// 旧代码只要有一个锚点命中就当场收工，结果整句话只有那条 \cite 被点亮，
+// 模型压根没被问过 —— 偏偏是「选得越长越需要模型」的场景被跳过了。
+function crossAnchorsCoverSelection(selected, hits) {
+    try {
+        let rest = String(selected == null ? '' : selected).trim();
+        if (!rest || !Array.isArray(hits) || !hits.length) return false;
+        for (let i = 0; i < hits.length; i++) {
+            const h = String(hits[i] || '');
+            if (h) rest = rest.split(h).join('');
+        }
+        return !/[A-Za-z0-9一-鿿]/.test(rest);
+    } catch (e) {
+        return false;
+    }
+}
+
+// prompt 里那两个语言标签必须**从这一对文本自己身上算出来**。
+// 反面教材（原先的写法）：直接读 AppState.sourceLang / targetLang。那两个字段
+//   · 默认值恒为 'zh'，而且从不持久化；
+//   · restoreGlobalHistory 恢复 translationPairs 时压根不恢复它们；
+//   · 顶栏 ZH / EN 那两个按钮随时能把它们调反，而且不清空已有句对。
+// 一旦调反，prompt 就会指着英文那一栏说「【中文】」，命中率实测从 4/4 掉到 1/4，
+// 全程无报错、无提示 —— 用户只会觉得这功能「忽然就不灵了」。
+// 改成数汉字：这一对文本里汉字多的那一侧就是中文。自洽（两个标签必然不同）、
+// 与任何全局状态无关，也就永远不会被别处的开关带歪。
+function crossLangLabels(fromText, toText) {
+    try {
+        const cjk = (t) => (String(t == null ? '' : t).match(/[一-鿿]/g) || []).length;
+        const fromIsZh = cjk(fromText) > cjk(toText);
+        return { fromLabel: fromIsZh ? '中文' : '英文', toLabel: fromIsZh ? '英文' : '中文' };
+    } catch (e) {
+        return { fromLabel: '甲', toLabel: '乙' };
+    }
+}
+
+// 这一侧当前该画哪些片段（对侧才有；本侧走原来的选区高亮）
+function getCrossFragmentsFor(idx, side) {
+    try {
+        if (!AppState.crossHighlightEnabled) return null;
+        const ch = AppState.crossHighlight;
+        if (!ch || ch.status !== 'ok') return null;
+        if (ch.idx !== idx || ch.toSide !== side) return null;
+        return Array.isArray(ch.fragments) && ch.fragments.length ? ch.fragments : null;
+    } catch (e) {
+        return null;
+    }
+}
+
+// 对侧镜像层的内部 HTML。和 buildSelectionHighlightInner 同构：渲染路径专用，绝不抛错。
+function buildCrossHighlightInner(side, idx) {
+    try {
+        const fragments = getCrossFragmentsFor(idx, side);
+        if (!fragments) return '';
+        const text = getCrossCorpus(idx, side);
+        if (typeof text !== 'string' || !text) return '';
+        const ranges = crossResolveRanges(text, fragments);
+        if (!ranges.length) return '';
+
+        let html = '';
+        let cursor = 0;
+        for (let i = 0; i < ranges.length; i++) {
+            const r = ranges[i];
+            if (r.start < cursor || r.end > text.length) continue;   // 语料变过了，这一段就不画
+            html += escapeHtml(text.slice(cursor, r.start))
+                + '<mark class="cross-hl">' + escapeHtml(text.slice(r.start, r.end)) + '</mark>';
+            cursor = r.end;
+        }
+        return html + escapeHtml(text.slice(cursor));
+    } catch (e) {
+        return '';
+    }
+}
+
+// ============= 跨栏高亮：非编辑行（已渲染正文）=============
+// 非编辑行里是 marked + KaTeX 产出的 DOM，没有镜像层可用，只能走文本节点游走 + 包 <span>。
+// 三条纪律：
+//   1) 只包 <span class="cross-hl-span">，样式里只有背景色 —— 不改变任何盒模型尺寸，
+//      双栏逐行对齐不变量不受影响。
+//   2) 整个 .katex 子树跳过。KaTeX 的 DOM 里同一段公式有 HTML + MathML 两份文本，
+//      收进来会让扁平文本凭空翻倍、偏移全错；往里插节点还会直接毁掉公式排版。
+//      代价是公式片段在非编辑行画不出来 —— 那就不画，这正是本功能的默认立场。
+//   3) 每次都先把上一轮的 span 拆回纯文本再重画，绝不叠加。
+
+function clearRenderedCrossHighlights() {
+    try {
+        const spans = document.querySelectorAll('span[data-cross-hl]');
+        for (let i = 0; i < spans.length; i++) {
+            const span = spans[i];
+            const parent = span.parentNode;
+            if (!parent) continue;
+            parent.replaceChild(document.createTextNode(span.textContent || ''), span);
+            parent.normalize();   // 把拆开的相邻文本节点合回去，下一轮偏移才算得准
+        }
+    } catch (e) {}
+}
+
+// 找到某一行「非编辑态」的正文容器；那一行正在编辑（是 textarea）时返回 null
+function findRenderedRowBody(idx, side) {
+    try {
+        const pane = document.querySelector(`[data-align-content="${side}"]`);
+        if (!pane) return null;
+        const row = pane.querySelector(`[data-idx="${idx}"][data-side="${side}"]`);
+        if (!row) return null;
+        if (row.querySelector('textarea')) return null;   // 编辑态，归镜像层管
+        return row.querySelector('.prose') || row;
+    } catch (e) {
+        return null;
+    }
+}
+
+// 收集容器里可以安全高亮的文本节点，同时拼出扁平文本。返回 { text, nodes:[{node, start, end}] }
+function collectCrossTextNodes(host) {
+    const nodes = [];
+    let text = '';
+    try {
+        const walker = document.createTreeWalker(host, NodeFilter.SHOW_TEXT, {
+            acceptNode(node) {
+                let p = node.parentNode;
+                while (p && p !== host) {
+                    const tag = p.nodeName;
+                    if (tag === 'SCRIPT' || tag === 'STYLE') return NodeFilter.FILTER_REJECT;
+                    if (p.classList && (p.classList.contains('katex') || p.classList.contains('cross-hl-span'))) return NodeFilter.FILTER_REJECT;
+                    p = p.parentNode;
+                }
+                return node.nodeValue ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+            }
+        });
+        let node;
+        while ((node = walker.nextNode())) {
+            const v = node.nodeValue || '';
+            nodes.push({ node, start: text.length, end: text.length + v.length });
+            text += v;
+        }
+    } catch (e) {}
+    return { text, nodes };
+}
+
+// 把一个文本节点按若干局部区间拆开重组（区间必须已按升序、互不重叠）
+function wrapCrossIntervals(node, intervals) {
+    try {
+        const text = node.nodeValue || '';
+        const parent = node.parentNode;
+        if (!parent) return;
+        const frag = document.createDocumentFragment();
+        let cursor = 0;
+        for (let i = 0; i < intervals.length; i++) {
+            const iv = intervals[i];
+            if (iv.s < cursor || iv.e > text.length || iv.e <= iv.s) continue;
+            if (iv.s > cursor) frag.appendChild(document.createTextNode(text.slice(cursor, iv.s)));
+            const span = document.createElement('span');
+            span.className = 'cross-hl-span';
+            span.setAttribute('data-cross-hl', '1');
+            span.appendChild(document.createTextNode(text.slice(iv.s, iv.e)));
+            frag.appendChild(span);
+            cursor = iv.e;
+        }
+        if (cursor === 0) return;                                     // 一段都没落进来，原节点不动
+        if (cursor < text.length) frag.appendChild(document.createTextNode(text.slice(cursor)));
+        parent.replaceChild(frag, node);
+    } catch (e) {}
+}
+
+function applyCrossHighlightToRendered() {
+    try {
+        clearRenderedCrossHighlights();
+        const ss = AppState.synonymState;
+        if (!ss || !ss.show) return;
+        const ch = AppState.crossHighlight;
+        if (!ch || typeof ch.idx !== 'number') return;
+        const fragments = getCrossFragmentsFor(ch.idx, ch.toSide);
+        if (!fragments) return;
+
+        const host = findRenderedRowBody(ch.idx, ch.toSide);
+        if (!host) return;                                            // 那一行是 textarea，镜像层已经画过了
+        const flat = collectCrossTextNodes(host);
+        if (!flat.text) return;
+        const ranges = crossResolveRanges(flat.text, fragments);
+        if (!ranges.length) return;
+
+        // 区间 → 每个文本节点上的局部区间
+        for (let n = 0; n < flat.nodes.length; n++) {
+            const entry = flat.nodes[n];
+            const intervals = [];
+            for (let r = 0; r < ranges.length; r++) {
+                const s = Math.max(ranges[r].start, entry.start);
+                const e = Math.min(ranges[r].end, entry.end);
+                if (e > s) intervals.push({ s: s - entry.start, e: e - entry.start });
+            }
+            if (intervals.length) wrapCrossIntervals(entry.node, intervals);
+        }
+    } catch (e) {
+        // 装饰性功能：坏了就当没这个功能，绝不能把异常带回渲染路径
+    }
+}
+
+// ============= 跨栏高亮：第一级 —— 确定性锚点（零延迟、零模型调用）=============
+// 这几类东西翻译过去是**原样保留**的，根本不需要问模型：
+//   行内公式 $..$ / \(..\)、\cite{}/\ref{}/\eqref{}/\label{}、数字、全大写缩写。
+// 抽出来直接拿去对侧 indexOf 即可。命中就收工，一个 token 都不花。
+function extractCrossAnchors(selected) {
+    const out = [];
+    try {
+        if (typeof selected !== 'string' || !selected) return out;
+        const push = (raw) => {
+            const s = String(raw == null ? '' : raw).trim();
+            if (s.length < 2) return;                       // 单字符锚点噪声太大，一律不要
+            if (out.indexOf(s) === -1) out.push(s);
+        };
+        const grab = (re) => { const m = selected.match(re); if (m) for (let i = 0; i < m.length; i++) push(m[i]); };
+
+        grab(/\$[^$\n]+\$/g);                               // 行内公式 $..$
+        grab(/\\\([\s\S]*?\\\)/g);                          // 行内公式 \(..\)
+        grab(/\\(?:cite[a-zA-Z]*|ref|eqref|autoref|label)\s*\{[^{}]*\}/g);   // 引用类宏
+        grab(/\b\d+(?:\.\d+)?\\?%/g);                       // 百分比（含 LaTeX 的 \%）先抓，比裸数字更具体
+        grab(/\b\d+(?:\.\d+)+\b/g);                         // 小数 / 版本号
+        grab(/\b[A-Z0-9][A-Z0-9-]{1,15}[A-Z0-9]\b/g);       // 全大写缩写：LEO、SNR、U-CPSRI、6G、BAJOR
+        // 纯整数放最后，且只要 >= 2 位：单个 "2" 这种在对侧几乎必然多处出现，
+        // crossFindOccurrences 的唯一性检查也会把它挡掉，抓进来只是浪费。
+        grab(/\b\d{2,}\b/g);
+
+        // 全大写那条会把纯数字也捞进来（"2026"），去掉不含字母的项，交给数字那几条负责
+        const kept = out.filter(s => !(/^[0-9]+$/.test(s)) || /^\d{2,}$/.test(s));
+
+        // 去掉「已经被更长的锚点包住」的碎片：$27.3\%$ 会顺带抽出 27.3\% / 27.3 / 27，
+        // \cite{10488681,10333430} 会顺带抽出两个纯编号。它们指向的是同一处，
+        // 留着只是给唯一性检查添乱，还可能有个碎片碰巧在别处独立出现。长的优先。
+        kept.sort((a, b) => b.length - a.length);
+        const out2 = [];
+        for (let i = 0; i < kept.length; i++) {
+            let covered = false;
+            for (let j = 0; j < out2.length; j++) {
+                if (out2[j].indexOf(kept[i]) !== -1) { covered = true; break; }
+            }
+            if (!covered) out2.push(kept[i]);
+        }
+        return out2;
+    } catch (e) {
+        return out;
+    }
+}
+
+// ============= 跨栏高亮：第二级 —— 模型 =============
+// **刻意不用 JSON**。两侧正文里都有反斜杠（\cite、\epsilon、\%），
+// 一旦经过 JSON 字符串转义，\r \n \t \u 这些序列就会被解析成控制字符 ——
+// 这个 app 别处把 \ref 变成回车正是同一个坑。
+// 改用纯行分隔协议：一行一个片段、`@@` 开头，自己 split 自己解析，反斜杠全程原样。
+function buildCrossPrompt(fromLabel, toLabel, fromText, toText, selected) {
+    return `下面是一对互为翻译的句子。
+
+【${fromLabel}】
+${fromText}
+
+【${toLabel}】
+${toText}
+
+用户在【${fromLabel}】里选中了这一小段：
+<<<SEL
+${selected}
+SEL>>>
+
+先判断一件事：这一小段的意思，在【${toLabel}】里到底有没有被译出来？
+机器翻译经常整句整段漏译。漏了就是漏了 —— 这时【${toLabel}】里那些"位置差不多"、
+"话题相关"、"看起来像术语"的文字**都不是**它的对应内容。没译出来就输出 @@NONE。
+
+硬性规则：
+1. 只能从【${toLabel}】里逐字复制，一个字都不许改、不许翻译、不许增删标点。
+2. 对应内容若被别的词隔开（不连续），拆成几段分别输出，不要用省略号连接。
+3. 每段单独一行，行首必须是 @@ 紧接内容（@@ 后面不加空格）。
+4. 只输出这些行，不要解释、不要编号、不要引号、不要 markdown。
+5. 只摘意思真正对应的最小片段，不要把整句都摘出来。
+6. 下面任何一种情况都只输出一行 @@NONE，不许输出别的：
+   - 【${toLabel}】漏掉了这一小段的意思；
+   - 只找得到话题相关、但意思对不上的文字；
+   - 拿不准。`;
+}
+
+// 解析分隔符协议。任何脏输出都只会变成「片段更少」，绝不会抛错。
+function parseCrossFragments(raw) {
+    const out = [];
+    try {
+        let text = String(raw == null ? '' : raw);
+        text = text.replace(/<think>[\s\S]*?<\/think>/gi, '');   // 推理模型的思考段，整段丢掉
+        text = text.replace(/```[a-zA-Z]*\n?/g, '');             // 偶发的 markdown 代码围栏
+        const lines = text.split(/\r?\n/);
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i].trim();
+            if (line.slice(0, 2) !== '@@') continue;
+            const frag = line.slice(2).trim();
+            if (!frag || frag === 'NONE') continue;
+            if (frag.length > 400) continue;                     // 明显跑飞了
+            if (out.indexOf(frag) === -1) out.push(frag);
+            if (out.length >= 8) break;
+        }
+    } catch (e) {}
+    return out;
+}
+
+// 按当前 provider 发一次「纯文本进、纯文本出」的请求。
+// 分支形状照抄 summarizeText，只是把 prompt 换成我们自己的，且全程传 signal 以便取消。
+async function callModelPlainText(prompt, config, signal) {
+    if (config.provider === 'local') {
+        return await callLocalLLM(config.localBaseUrl, config.model, [{ role: 'user', content: prompt }], false, signal);
+    }
+    if (config.provider === 'openai') {
+        return await callOpenAIAPI(config.model, [{ role: 'user', content: prompt }], {}, config.openaiApiKey, signal) || '';
+    }
+    if (config.provider === 'claude') {
+        return await callClaudeAPI(config.model, [{ role: 'user', content: prompt }], {}, config.claudeApiKey, signal, config.claudeProxyUrl) || '';
+    }
+    return await callGeminiAPI(config.model, prompt, {}, config.geminiApiKey, signal) || '';
+}
+
+// ============= 跨栏高亮：调度 =============
+// UI 永远不等这个请求。防抖 → 锚点（同步命中就当场画）→ 缓存 → 模型（异步，回来再画）。
+// 每次调度都 ++seq；响应回来时 seq 对不上就是陈旧响应，直接丢弃，绝不覆盖新选区的结果。
+function scheduleCrossHighlight(fromSide, idx, selectedText) {
+    try {
+        resetCrossHighlight();                                   // 内部会 ++seq，掐掉上一次
+        if (!AppState.crossHighlightEnabled) return;
+        if (typeof idx !== 'number' || (fromSide !== 'src' && fromSide !== 'tgt')) return;
+        if (typeof selectedText !== 'string' || !selectedText.trim()) return;
+
+        const toSide = otherSide(fromSide);
+        const fromText = getCrossCorpus(idx, fromSide);
+        const toText = getCrossCorpus(idx, toSide);
+        if (!fromText || !toText) return;
+        // 对侧此刻根本没有可画的地方就别花这一次调用。
+        // 真实场景：viewMode 切到 'edit'/'original' 时左栏是一个大 textarea、压根没有逐行元素，
+        // 这时在右栏选词，查出来的对应片段无处可画。
+        if (!crossCanPaint(idx, toSide)) return;
+
+        const mySeq = crossHighlightSeq;
+
+        // --- 第一级：锚点。同步、免费 ---
+        // 但**只有锚点几乎就是整个选区**时才敢就此收工。选中一整句话、里面碰巧夹着一条
+        // \cite / 一个缩写 / 一个两位数时，只画那个 token 等于指着 3 个字符告诉用户
+        // 「对应的就是这里」—— 比不画糟糕得多。这种情况一律放行到模型那一级。
+        const anchors = extractCrossAnchors(selectedText);
+        if (anchors.length) {
+            const hits = anchors.filter(a => crossFindOccurrences(toText, a).length === 1);
+            if (crossAnchorsCoverSelection(selectedText, hits)) {
+                commitCrossHighlight(mySeq, idx, fromSide, toSide, hits, 'anchor');
+                return;
+            }
+        }
+
+        // --- 缓存：同一行、同一侧、同一段选中文本，第二次起零延迟零调用 ---
+        const key = idx + '|' + fromSide + '|' + selectedText;
+        if (crossHighlightCache.has(key)) {
+            commitCrossHighlight(mySeq, idx, fromSide, toSide, crossHighlightCache.get(key), 'cache');
+            return;
+        }
+
+        // --- 第二级：模型。防抖后异步发，UI 不等 ---
+        AppState.crossHighlight = { seq: mySeq, idx, fromSide, toSide, fragments: [], status: 'pending', via: 'model' };
+        crossHighlightTimer = setTimeout(() => {
+            crossHighlightTimer = null;
+            runCrossHighlight(mySeq, idx, fromSide, toSide, fromText, toText, selectedText, key);
+        }, CROSS_HL_DEBOUNCE_MS);
+    } catch (e) {
+        // 调度失败 = 这次没有跨栏高亮，其它一切照旧
+    }
+}
+
+async function runCrossHighlight(mySeq, idx, fromSide, toSide, fromText, toText, selectedText, key) {
+    let controller = null;
+    try {
+        if (mySeq !== crossHighlightSeq) return;
+        const config = getApiConfig();
+        // 标签从这一对文本自己算，不碰 AppState.sourceLang / targetLang（理由见 crossLangLabels）
+        const labels = crossLangLabels(fromText, toText);
+        const prompt = buildCrossPrompt(labels.fromLabel, labels.toLabel, fromText, toText, selectedText);
+
+        controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        crossHighlightAbort = controller;
+        const raw = await callModelPlainText(prompt, config, controller ? controller.signal : null);
+        if (mySeq !== crossHighlightSeq) return;                 // 选区早就换了，这是陈旧响应
+
+        // 闸门一：逐字校验。模型说什么不算数，能在对侧原样找到且只出现一次才算数。
+        const candidates = parseCrossFragments(raw);
+        let verified = candidates.filter(f => crossFindOccurrences(toText, f).length === 1);
+        // 闸门二：体量。逐字校验只管「是不是对侧的真文字」，管不了「是不是**对应的**那段文字」；
+        // 明显不成比例的答案（选一个词回一整句、选一整句回两个字）一律整组丢掉。
+        if (!crossPlausibleLength(selectedText, verified)) verified = [];
+
+        if (crossHighlightCache.size >= CROSS_HL_CACHE_MAX) {
+            const firstKey = crossHighlightCache.keys().next().value;
+            if (firstKey !== undefined) crossHighlightCache.delete(firstKey);
+        }
+        crossHighlightCache.set(key, verified);
+        commitCrossHighlight(mySeq, idx, fromSide, toSide, verified, 'model');
+    } catch (e) {
+        if (mySeq !== crossHighlightSeq) return;
+        // 取消是预期路径，不算错误；其它错误也只是「这次没高亮」
+        if (!(e && e.name === 'AbortError')) console.warn('[cross-hl] 对应查找失败：', e && e.message);
+        commitCrossHighlight(mySeq, idx, fromSide, toSide, [], 'model');
+    } finally {
+        if (crossHighlightAbort === controller) crossHighlightAbort = null;
+    }
+}
+
+// 落状态 + 重画。刻意不走 setState —— 全量重渲染会把 textarea 换掉、焦点和原生选区一起丢，
+// 而这里只是加一层装饰性背景，用局部同步就够了。
+function commitCrossHighlight(mySeq, idx, fromSide, toSide, fragments, via) {
+    try {
+        if (mySeq !== crossHighlightSeq) return;
+        const list = Array.isArray(fragments) ? fragments : [];
+        AppState.crossHighlight = {
+            seq: mySeq, idx, fromSide, toSide,
+            fragments: list,
+            status: list.length ? 'ok' : 'none',
+            via: via || ''
+        };
+        syncSelectionHighlightLayers();
+    } catch (e) {}
 }
 
 // ============= 句子边界（语法修正模式的分析范围）=============
@@ -2598,6 +3372,10 @@ async function handleTextSelect(event, field, index) {
         contextSentence: text
     });
 
+    // 跨栏对应高亮：在另一侧把「意思对应的那一段」也高亮出来。
+    // 完全异步、完全独立 —— 它失败也好、被关掉也好，同义词弹窗这条主链路一个字节都不受影响。
+    scheduleCrossHighlight(field, index, selectedText);
+
     try {
         const lang = field === 'src' ? AppState.sourceLang : AppState.targetLang;
         const config = getApiConfig();
@@ -3721,6 +4499,31 @@ function scheduleAlignSync() {
     alignSyncTimer = setTimeout(run, 50);
 }
 
+// 「保住滚动位置地跑一次对齐」。给的是**渲染路径之外**那些会改变行几何的操作用的
+// （目前只有句对行距的三个 handler）。
+//
+// 为什么不能直接用 scheduleAlignSync：
+//   syncBilingualAlignment 为了量到自然高度，必须先把上一轮补的 minHeight 全部清空，
+//   而清空的那一瞬间较短的那一栏（中文通常比英文矮）整体塌下去，滚动条上限跟着变小，
+//   浏览器**当场**把它的 scrollTop 夹掉；等行高补回来，被夹掉的那截滚动位置已经没人记得了。
+//   scheduleAlignSync 把这一切排进 rAF，调用方连「夹之前的值是多少」都拿不到。
+// 所以这里照抄 renderApp 的做法：**先记下滚动位置 → 同步跑完对齐（两栏高度就此一致）
+// → 再把位置写回去**。写回时两栏已经等高，赋值不会再被夹。
+// 全程 try/catch：万一 DOM 还没就绪也只是这一次没对齐，绝不能把异常抛给调用方。
+function alignSyncKeepingScroll() {
+    try {
+        const a = document.querySelector('[data-align-scroll="src"]');
+        const b = document.querySelector('[data-align-scroll="tgt"]');
+        // 两栏是联动的，逻辑上只有一个滚动位置；谁在就用谁的（和 renderApp 同一套判断）
+        const saved = a ? a.scrollTop : (b ? b.scrollTop : 0);
+        syncBilingualAlignment();
+        if (a) a.scrollTop = saved;
+        if (b) b.scrollTop = saved;
+    } catch (e) {
+        console.warn('[align] 保位对齐失败：', e && e.message);
+    }
+}
+
 function syncBilingualAlignment() {
     if (alignSyncApplying) return;
     alignSyncApplying = true;
@@ -3992,8 +4795,181 @@ function renderOnlineModelCheckbox(m) {
 }
 
 // ============= 设置模态框 =============
+// ============= Settings 分页：页签条 =============
+// 纯字符串拼接，唯一的变量是「哪一个 id 相等」——不可能抛错。
+function renderSettingsTabBar(activeTab) {
+    return `
+                <div class="px-5 pt-2 border-b border-slate-100 bg-slate-50 shrink-0">
+                    <div id="settingsTabBar" class="flex items-end gap-1 flex-wrap">
+                        ${SETTINGS_TABS.map(t => `
+                        <button type="button" data-settings-tab="${t.id}" onclick="setSettingsTab('${t.id}')" class="settings-tab-btn${activeTab === t.id ? ' is-active' : ''}" data-tip="${escapeAttr(t.tip)}" data-tip-pos="bottom-start">${escapeHtml(t.label)}</button>
+                        `).join('')}
+                    </div>
+                </div>`;
+}
+
+// ============= Settings 分页：显示 =============
+// 这一页只放「改了也不影响翻译结果、只影响眼睛」的东西。
+function renderSettingsDisplaySections() {
+    const gap = clampRowGap(AppState.rowGap);
+    const width = clampSettingsModalWidth(AppState.settingsModalWidth);
+    return `
+                    <!-- Row Spacing Section -->
+                    <div class="pb-5 border-b border-slate-100">
+                        <div class="flex items-center gap-2 mb-3" data-tip="调整上下两句之间的空隙。左右两栏永远同步改，不会破坏逐行对齐。" data-tip-pos="bottom-start">
+                            <div class="w-6 h-6 bg-gradient-to-br from-sky-500 to-indigo-600 rounded-lg flex items-center justify-center text-white">
+                                ${Icons.Settings2}
+                            </div>
+                            <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">句对行距</span>
+                        </div>
+                        <p class="text-[10px] text-slate-400 mb-3">句与句之间的垂直间隔。拖动即时预览；数值越小越紧凑，0 = 完全贴紧（每句自己还有 16px 内边距，不会糊在一起）。默认 ${ROW_GAP_DEFAULT}px。</p>
+                        <div class="flex items-center gap-3">
+                            <!-- data-tip 挂在这个只裹住滑块的内层盒子上，不能挂在外层那一行：
+                                 外层还装着「恢复默认」按钮，而按钮自己也有 data-tip —— 祖先和后代
+                                 同时有 data-tip 时，悬停按钮会同时浮出两个气泡。
+                                 也不能直接挂在 <input> 上：input 是替换元素，::after 不渲染。 -->
+                            <div class="flex-grow flex items-center gap-3" data-tip="向左更紧凑、向右更宽松（${ROW_GAP_MIN}–${ROW_GAP_MAX}px）。松开鼠标即保存，刷新后仍然生效。" data-tip-pos="bottom">
+                                <span class="text-[10px] text-slate-400 shrink-0 whitespace-nowrap">紧凑</span>
+                                <input type="range" id="rowGapSlider" min="${ROW_GAP_MIN}" max="${ROW_GAP_MAX}" step="1" value="${gap}"
+                                    oninput="handleRowGapInput(this.value)" onchange="commitRowGap(this.value)"
+                                    class="flex-grow accent-indigo-600 cursor-pointer h-1.5">
+                                <span class="text-[10px] text-slate-400 shrink-0 whitespace-nowrap">宽松</span>
+                            </div>
+                            <span id="rowGapValue" class="text-[10px] font-mono font-bold text-indigo-600 w-10 text-right shrink-0">${gap}px</span>
+                            <button onclick="resetRowGap()" class="px-2 py-1 text-[10px] font-bold text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors shrink-0" data-tip="把行距恢复成默认的 ${ROW_GAP_DEFAULT}px。" data-tip-pos="left">恢复默认</button>
+                        </div>
+                    </div>
+
+                    <!-- Cross-side Highlight Section -->
+                    <div class="py-5 border-b border-slate-100">
+                        <div class="flex items-center gap-2 mb-3" data-tip="${escapeAttr('在一侧选中文字时，另一侧自动把意思对应的那一段也高亮成青绿色，方便逐句核对译文。')}" data-tip-pos="bottom-start">
+                            <div class="w-6 h-6 bg-gradient-to-br from-teal-500 to-emerald-600 rounded-lg flex items-center justify-center text-white">
+                                ${Icons.SparklesSmall}
+                            </div>
+                            <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">跨栏对应高亮</span>
+                        </div>
+                        <p class="text-[10px] text-slate-400 mb-3">${escapeHtml('选中左边的词，右边对应的译文也一起高亮（反过来也一样）。公式、\\cite{}、数字、全大写缩写走本地匹配，瞬间出结果、不花钱；其余情况才会额外问一次模型。只高亮在另一侧能逐字找到、且只出现一次的内容 —— 找不到就什么都不显示，绝不猜。')}</p>
+                        <!-- data-tip-pos 必须是 bottom-start，不能是 left：这一行是滚动容器里的整宽
+                             块级元素，它左边根本没有空间，而设置弹窗的滚动容器是 overflow-y:auto
+                             （浏览器会把 overflow-x 一并变成 auto），横向溢出的部分直接被裁掉。
+                             实测 left 时气泡 240px 里有 224px 在裁剪框外，只剩贴着左边缘的一道黑条。
+                             同一页两个分节标题用的就是 bottom-start，整只气泡都在裁剪框内。 -->
+                        <label id="crossHighlightToggleRow" class="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all ${AppState.crossHighlightEnabled ? 'bg-teal-50' : ''}" data-tip="${escapeAttr('关掉后，选中文字时不再向模型多发一次请求，另一侧也不再高亮。默认开启。')}" data-tip-pos="bottom-start">
+                            <input type="checkbox" ${AppState.crossHighlightEnabled ? 'checked' : ''} onchange="setCrossHighlightEnabled(this.checked)" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-teal-600 focus:ring-teal-500 shrink-0">
+                            <span class="text-xs font-medium text-slate-700 leading-snug min-w-0 flex-1">
+                                启用跨栏对应高亮
+                                <span class="block text-[10px] text-slate-400 font-normal mt-0.5">${escapeHtml('关掉它可以省下这一次额外的模型调用（同义词/语法那几个功能不受影响）。')}</span>
+                            </span>
+                        </label>
+                    </div>
+
+                    <!-- Settings Modal Width Section -->
+                    <div>
+                        <div class="flex items-center gap-2 mb-3" data-tip="这个设置窗口本身的宽度。模型列表是两列排布，窗口拉宽后一屏能看到更多模型。" data-tip-pos="bottom-start">
+                            <div class="w-6 h-6 bg-gradient-to-br from-slate-400 to-slate-600 rounded-lg flex items-center justify-center text-white">
+                                ${Icons.SettingsGear}
+                            </div>
+                            <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">设置窗口宽度</span>
+                        </div>
+                        <p class="text-[10px] text-slate-400 mb-3">拖动本窗口<b>右边缘</b>那条竖线即可改宽（双击它直接恢复默认）。可用范围 ${SETTINGS_MODAL_MIN_WIDTH}–${SETTINGS_MODAL_MAX_WIDTH}px，实际还会被屏幕宽度的 95% 兜住。</p>
+                        <div class="flex items-center gap-3">
+                            <span class="text-[10px] text-slate-500">当前：<b class="font-mono text-indigo-600">${width}px</b></span>
+                            <button onclick="resetSettingsModalWidthFromPanel()" class="px-2 py-1 text-[10px] font-bold text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors" data-tip="把窗口宽度恢复成默认的 ${SETTINGS_MODAL_DEFAULT_WIDTH}px（等同于双击右边缘那条竖线）。" data-tip-pos="right">恢复默认宽度</button>
+                        </div>
+                    </div>`;
+}
+
+// ============= Settings 分页：编辑与历史（选词弹窗默认功能之外的部分）=============
+// 这三块原本只藏在顶栏的两个小菜单和每行 AI 工具栏的 ⋮ 里，用户不点开根本不知道存在，
+// 现在在设置里也各给一份入口。**刻意用不同的 input id**（settingsXxx 前缀）：
+// 顶栏菜单和这里可能同时在 DOM 里，id 撞车的话 getElementById 只会拿到文档里靠前的那个
+// （renderSettingsModal 在 renderHeader 之前拼进 root.innerHTML，撞了就是设置这边赢），
+// 顶栏那两个输入框会当场失灵。
+function renderSettingsEditingExtraSections() {
+    const autoSaveMin = Math.floor(AppState.autoSaveInterval / 60000);
+    const promptBlock = (type, label, colorClass) => {
+        const currentPrompt = AppState.customPrompts[type] || '';
+        const defaultPrompt = type === 'grammar' ? DEFAULT_GRAMMAR_PROMPT : DEFAULT_SIMPLIFY_PROMPT;
+        const isUsingCustom = currentPrompt.trim().length > 0;
+        return `
+                        <div class="mb-3">
+                            <div class="flex items-center justify-between mb-1.5">
+                                <span class="text-[10px] font-bold text-slate-500 uppercase tracking-wide">${escapeHtml(label)}</span>
+                                <span class="text-[9px] italic ${isUsingCustom ? 'text-' + colorClass + '-600 font-bold' : 'text-slate-400'}">${isUsingCustom ? '正在使用自定义提示词' : '正在使用默认提示词'}</span>
+                            </div>
+                            <div data-tip="留空 = 用内置提示词。写了什么，点 ${escapeAttr(label)} 时就按什么改写（例如「只修语法，别动术语和 LaTeX」）。" data-tip-pos="bottom-start">
+                                <textarea id="settingsCustomPrompt_${type}" rows="3" class="w-full text-xs p-2 border border-slate-200 rounded-lg bg-slate-50 focus:bg-white focus:ring-1 focus:ring-${colorClass}-400 outline-none resize-none custom-scrollbar" placeholder="${escapeHtml(defaultPrompt)}">${escapeHtml(currentPrompt)}</textarea>
+                            </div>
+                            <div class="flex items-center justify-end gap-2 mt-1.5">
+                                <button onclick="resetSettingsCustomPrompt('${type}')" class="px-2 py-1 text-[10px] font-bold text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded transition-colors" data-tip="清空这段自定义提示词，回到内置版本。" data-tip-pos="top-end">重置</button>
+                                <button onclick="saveSettingsCustomPrompt('${type}')" class="px-2.5 py-1 text-[10px] font-bold text-white bg-${colorClass}-600 hover:bg-${colorClass}-700 rounded transition-colors" data-tip="保存这段提示词（写进浏览器本地存储，刷新后仍然生效）。" data-tip-pos="top-end">保存</button>
+                            </div>
+                        </div>`;
+    };
+    return `
+                    <!-- Custom Prompts Section -->
+                    <div class="pb-5 border-b border-slate-100">
+                        <div class="flex items-center gap-2 mb-3" data-tip="每行 AI 工具栏上 Grammar / Simplify 两个按钮实际发给模型的指令。改这里等同于改每行 ⋮ 里的那个弹窗，两处共用同一份设置。" data-tip-pos="bottom-start">
+                            <div class="w-6 h-6 bg-gradient-to-br from-indigo-500 to-blue-600 rounded-lg flex items-center justify-center text-white">
+                                ${Icons.Wand2}
+                            </div>
+                            <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">自定义 AI 提示词</span>
+                        </div>
+                        ${promptBlock('grammar', 'Grammar 语法检查', 'indigo')}
+                        ${promptBlock('simplify', 'Simplify 精简改写', 'emerald')}
+                    </div>
+
+                    <!-- Auto-Save Interval Section -->
+                    <div class="pb-5 border-b border-slate-100">
+                        <div class="flex items-center gap-2 mb-3" data-tip="每隔多久把当前全部译文自动存一份进「历史记录」。翻译中途误关标签页时靠它找回。" data-tip-pos="bottom-start">
+                            <div class="w-6 h-6 bg-gradient-to-br from-emerald-500 to-teal-600 rounded-lg flex items-center justify-center text-white">
+                                ${Icons.Timer}
+                            </div>
+                            <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">自动保存间隔</span>
+                        </div>
+                        <div class="flex items-center justify-between gap-2 flex-wrap">
+                            <span class="text-xs text-slate-600 font-medium">每隔多久自动存一次</span>
+                            <div class="flex items-center gap-2">
+                                <div class="flex items-center bg-slate-100 rounded-lg p-0.5">
+                                    ${[1, 3, 5, 10].map(min => `
+                                    <button onclick="setAutoSaveInterval(${min * 60 * 1000})" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${AppState.autoSaveInterval === min * 60 * 1000 ? 'bg-white text-emerald-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}" data-tip="每 ${min} 分钟自动存一次。" data-tip-pos="top">${min} 分钟</button>
+                                    `).join('')}
+                                </div>
+                                <div class="flex items-center gap-1" data-tip="想要 1/3/5/10 之外的间隔就填这里（单位：分钟），填完点 OK。" data-tip-pos="left">
+                                    <input type="number" id="settingsAutoSaveInput" min="1" class="w-12 text-xs p-1 border border-slate-200 rounded text-center bg-slate-50" placeholder="${autoSaveMin}">
+                                    <button onclick="applySettingsAutoSave()" class="px-2 py-1 bg-emerald-500 hover:bg-emerald-600 text-white text-[10px] font-bold rounded transition-colors">OK</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!-- History Limit Section -->
+                    <div>
+                        <div class="flex items-center gap-2 mb-3" data-tip="顶栏时钟图标里那份「最近会话」最多留几条。超出的从最旧的开始丢，调小会立刻裁掉多余的。" data-tip-pos="bottom-start">
+                            <div class="w-6 h-6 bg-gradient-to-br from-amber-500 to-orange-600 rounded-lg flex items-center justify-center text-white">
+                                ${Icons.Clock}
+                            </div>
+                            <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">历史记录条数</span>
+                        </div>
+                        <div class="flex items-center justify-between gap-2">
+                            <span class="text-xs text-slate-600 font-medium">最多保留最近</span>
+                            <div class="flex items-center bg-slate-100 rounded-lg p-0.5">
+                                ${[5, 10, 20].map(limit => `
+                                <button onclick="setHistoryLimit(${limit})" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all ${AppState.historyLimit === limit ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}" data-tip="只保留最近 ${limit} 次会话快照。" data-tip-pos="top">${limit}</button>
+                                `).join('')}
+                                <div class="w-px h-3 bg-slate-200 mx-1"></div>
+                                <span data-tip="要别的条数就直接在这里改（≥1），失焦即生效。" data-tip-pos="left">
+                                    <input type="number" id="settingsHistoryLimitInput" min="1" value="${AppState.historyLimit}" class="w-8 bg-transparent text-[10px] font-bold text-center outline-none text-slate-600 border-none" onchange="setHistoryLimitCustom(this.value)">
+                                </span>
+                            </div>
+                        </div>
+                    </div>`;
+}
+
 function renderSettingsModal() {
     if (!AppState.showSettings) return '';
+    // 当前页签。normalize 一遍：localStorage 里的脏值/老版本残留不能让四个面板全都不显示。
+    const activeTab = normalizeSettingsTab(AppState.settingsTab);
 
     // 在线模型全部来自 getModelCatalog()（种子 + API + 钉住当前选中项），不再有硬编码数组
     const modelQuery = (AppState.settingsModelQuery || '').trim().toLowerCase();
@@ -4027,22 +5003,24 @@ function renderSettingsModal() {
                     <h3 class="text-sm font-bold text-slate-700 flex items-center gap-2">
                         ${Icons.SettingsGear} Settings
                     </h3>
-                    <button onclick="closeSettings()" class="text-slate-400 hover:text-slate-600">${Icons.X}</button>
+                    <button onclick="closeSettings()" class="text-slate-400 hover:text-slate-600" data-tip="关闭设置。已点过「保存」的内容都已生效；没点保存的输入框会丢弃。" data-tip-pos="left">${Icons.X}</button>
                 </div>
+${renderSettingsTabBar(activeTab)}
                 <!-- mr-2.5 = 拖拽手柄的 w-2.5：把整个滚动容器（连同它右内缘那条 6px 的 custom-scrollbar）
                      整体左移 10px 让开手柄，否则手柄会把滚动条整条盖住、鼠标拖不动滚动条。
                      右内边距用 pr-4 而非 p-6 的 pr-6，把让出去的 10px 视觉上补回来。 -->
-                <div class="pt-6 pb-6 pl-6 pr-4 mr-2.5 space-y-6 overflow-y-auto custom-scrollbar flex-1 min-h-0">
+                <div id="settingsScrollArea" class="pt-6 pb-6 pl-6 pr-4 mr-2.5 overflow-y-auto custom-scrollbar flex-1 min-h-0">
+                    <div data-settings-panel="models" class="settings-panel${activeTab === 'models' ? ' is-active' : ''} space-y-6">
                     <!-- Online Model Visibility Section -->
                     <div class="pb-5 border-b border-slate-100">
                         <div class="flex items-center justify-between gap-2 mb-3">
-                            <div class="flex items-center gap-2">
+                            <div class="flex items-center gap-2" data-tip="控制顶栏模型下拉里出现哪些在线模型。列表本身要点右边的「更新」才会去各家 API 拉新的。" data-tip-pos="bottom-start">
                                 <div class="w-6 h-6 bg-gradient-to-br from-violet-500 to-purple-600 rounded-lg flex items-center justify-center text-white">
                                     ${Icons.Globe}
                                 </div>
                                 <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">Online Models Visibility</span>
                             </div>
-                            <button onclick="refreshOnlineModelsClick('all')" ${anyRefreshing ? 'disabled' : ''} class="flex items-center gap-1.5 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-lg font-bold text-[10px] shadow-md shadow-violet-200 active:scale-95 transition-all disabled:opacity-50 shrink-0">
+                            <button onclick="refreshOnlineModelsClick('all')" ${anyRefreshing ? 'disabled' : ''} class="flex items-center gap-1.5 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-lg font-bold text-[10px] shadow-md shadow-violet-200 active:scale-95 transition-all disabled:opacity-50 shrink-0" data-tip="向三家 API 各要一次最新模型列表（要先填好对应的 Key）。新发现的模型默认不勾选，需要自己勾上。" data-tip-pos="bottom-end">
                                 ${anyRefreshing ? Icons.LoaderSmall : Icons.RefreshCw}
                                 ${anyRefreshing ? '更新中...' : '更新 / Refresh'}
                             </button>
@@ -4056,11 +5034,11 @@ function renderSettingsModal() {
 
                         <!-- 搜索 + 日期快照开关 -->
                         <div class="flex items-center gap-2 mb-3">
-                            <div class="flex-grow flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 focus-within:ring-2 focus-within:ring-violet-100 transition-all">
+                            <div class="flex-grow flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 focus-within:ring-2 focus-within:ring-violet-100 transition-all" data-tip="只搜索本页这三组在线模型的 id 和名称（不搜本地模型、也不搜界面上的其它内容）。搜索时会临时把折叠起来的模型也显示出来。" data-tip-pos="bottom-start">
                                 <input type="text" id="modelSearchInput" oninput="setSettingsModelQuery(this.value)" value="${escapeAttr(AppState.settingsModelQuery)}" placeholder="搜索模型 id / 名称..." class="flex-grow bg-transparent border-none text-xs focus:ring-0 p-0 text-slate-700 outline-none">
                                 ${AppState.settingsModelQuery ? `<button onclick="setSettingsModelQuery('')" class="text-slate-400 hover:text-slate-600 ml-2">${Icons.XSmall}</button>` : ''}
                             </div>
-                            <label class="flex items-center gap-1.5 text-[10px] text-slate-500 cursor-pointer whitespace-nowrap" title="OpenAI 的 gpt-x-2026-03-17 这类固定快照，勾上后下次更新才会拉进来">
+                            <label class="flex items-center gap-1.5 text-[10px] text-slate-500 cursor-pointer whitespace-nowrap" data-tip="OpenAI 的 gpt-x-2026-03-17 这类固定日期快照，默认过滤掉（太多且大多重复）。勾上后要再点一次「更新」才会拉进来。" data-tip-pos="left">
                                 <input type="checkbox" ${AppState.showDatedSnapshots ? 'checked' : ''} onchange="toggleDatedSnapshots()" class="w-3.5 h-3.5 rounded border-slate-300 text-violet-600 focus:ring-violet-500">
                                 日期快照
                             </label>
@@ -4129,8 +5107,8 @@ function renderSettingsModal() {
                                         ` : ''}
                                     </span>
                                     <span class="flex items-center gap-2 shrink-0">
-                                        <button onclick="setModelVisibilityBulk('${g.provider}', true)" class="text-[10px] text-slate-400 hover:text-violet-600">全选</button>
-                                        <button onclick="setModelVisibilityBulk('${g.provider}', false)" class="text-[10px] text-slate-400 hover:text-violet-600">全不选</button>
+                                        <button onclick="setModelVisibilityBulk('${g.provider}', true)" class="text-[10px] text-slate-400 hover:text-violet-600" data-tip="把 ${escapeAttr(g.label)} 的全部模型都勾上（含搜索框里没显示出来的）。" data-tip-pos="left">全选</button>
+                                        <button onclick="setModelVisibilityBulk('${g.provider}', false)" class="text-[10px] text-slate-400 hover:text-violet-600" data-tip="把 ${escapeAttr(g.label)} 的模型全部取消勾选，只有「正在使用中」的那个会被保留。" data-tip-pos="left">全不选</button>
                                     </span>
                                 </div>
                                 ${g.models.length === 0 ? `
@@ -4146,7 +5124,7 @@ function renderSettingsModal() {
                             </div>
                         `; }).join('')}
 
-                        <button onclick="hideRetiredModels()" class="w-full mt-1 py-2 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-xl font-bold text-[10px] transition-all">
+                        <button onclick="hideRetiredModels()" class="w-full mt-1 py-2 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-xl font-bold text-[10px] transition-all" data-tip="一键取消勾选所有带「未在列表」标记的模型（上次更新时 API 没返回它们，多半已下线）。只是取消勾选，随时可以再勾回来。" data-tip-pos="top">
                             隐藏所有「未在 API 列表中」的模型
                         </button>
 
@@ -4160,7 +5138,7 @@ function renderSettingsModal() {
 
                     <!-- Local Model Visibility Section -->
                     <div class="pb-5 border-b border-slate-100">
-                        <div class="flex items-center gap-2 mb-4">
+                        <div class="flex items-center gap-2 mb-4" data-tip="本地 LM Studio 里已加载的模型，勾选哪些出现在顶栏下拉的 Local 分组里。列表是「API」页点「Connect & Fetch Models」时抓下来的。" data-tip-pos="bottom-start">
                             <div class="w-6 h-6 bg-gradient-to-br from-purple-500 to-violet-600 rounded-lg flex items-center justify-center text-white">
                                 ${Icons.Server}
                             </div>
@@ -4180,10 +5158,16 @@ function renderSettingsModal() {
                             <p class="text-[10px] text-slate-400 italic">No local models available. Connect to LM Studio first.</p>
                         `}
                     </div>
+                    </div><!-- /panel: models -->
 
+                    <div data-settings-panel="display" class="settings-panel${activeTab === 'display' ? ' is-active' : ''} space-y-6">
+${renderSettingsDisplaySections()}
+                    </div><!-- /panel: display -->
+
+                    <div data-settings-panel="editing" class="settings-panel${activeTab === 'editing' ? ' is-active' : ''} space-y-6">
                     <!-- Synonym Popup Default Mode Section -->
                     <div class="pb-5 border-b border-slate-100">
-                        <div class="flex items-center gap-2 mb-3">
+                        <div class="flex items-center gap-2 mb-3" data-tip="在译文/原文里选中一段文字后会弹出的小窗口，这里决定它默认停在哪个功能上。" data-tip-pos="bottom-start">
                             <div class="w-6 h-6 bg-gradient-to-br from-indigo-500 to-violet-600 rounded-lg flex items-center justify-center text-white">
                                 ${Icons.SparklesSmall}
                             </div>
@@ -4193,15 +5177,19 @@ function renderSettingsModal() {
                             <span class="text-xs text-slate-600 font-medium">选中文本后弹窗默认打开的模式</span>
                             <div class="flex items-center bg-slate-100 rounded-lg p-0.5">
                                 ${SYNONYM_MODES.map(m => `
-                                <button onclick="setSynonymDefaultMode('${m}')" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${normalizeSynonymMode(AppState.synonymDefaultMode) === m ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">${m === 'replace' ? '替换（默认）' : SYNONYM_MODE_LABEL[m]}</button>
+                                <button onclick="setSynonymDefaultMode('${m}')" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${normalizeSynonymMode(AppState.synonymDefaultMode) === m ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr(SYNONYM_MODE_TIP[m] || '')}" data-tip-pos="bottom-end">${m === 'replace' ? '替换（默认）' : SYNONYM_MODE_LABEL[m]}</button>
                                 `).join('')}
                             </div>
                         </div>
                     </div>
 
+${renderSettingsEditingExtraSections()}
+                    </div><!-- /panel: editing -->
+
+                    <div data-settings-panel="api" class="settings-panel${activeTab === 'api' ? ' is-active' : ''} space-y-6">
                     <!-- Gemini API Key Section -->
                     <div class="pb-5 border-b border-slate-100">
-                        <div class="flex items-center gap-2 mb-3">
+                        <div class="flex items-center gap-2 mb-3" data-tip="Google Gemini 的密钥。顶栏选了 GEMINI 开头的模型时用它；没填会直接报「未配置 API Key」。" data-tip-pos="bottom-start">
                             <div class="w-6 h-6 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-lg flex items-center justify-center">
                                 <svg class="w-3.5 h-3.5 text-white" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"/></svg>
                             </div>
@@ -4217,14 +5205,14 @@ function renderSettingsModal() {
                         <p class="text-[10px] text-slate-400 mt-2 px-1">
                             Get your API key from <a href="https://aistudio.google.com/apikey" target="_blank" class="text-indigo-500 hover:underline">Google AI Studio</a>
                         </p>
-                        <button onclick="saveGeminiApiKey()" class="w-full mt-3 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-indigo-200 active:scale-95 transition-all flex items-center justify-center gap-2">
+                        <button onclick="saveGeminiApiKey()" class="w-full mt-3 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-indigo-200 active:scale-95 transition-all flex items-center justify-center gap-2" data-tip="保存上面这串 Key（只写进本浏览器的本地存储，不会上传到任何地方）。不点保存，刷新后就没了。" data-tip-pos="top">
                             ${Icons.Save} Save API Key
                         </button>
                     </div>
 
                     <!-- OpenAI API Key Section -->
                     <div class="pb-5 border-b border-slate-100">
-                        <div class="flex items-center gap-2 mb-3">
+                        <div class="flex items-center gap-2 mb-3" data-tip="OpenAI 的密钥（sk- 开头）。顶栏选了 GPT / o 系列模型时用它。" data-tip-pos="bottom-start">
                             <div class="w-6 h-6 bg-gradient-to-br from-teal-500 to-green-600 rounded-lg flex items-center justify-center">
                                 <svg class="w-3.5 h-3.5 text-white" viewBox="0 0 24 24" fill="currentColor"><path d="M22.2819 9.8211a5.9847 5.9847 0 0 0-.5157-4.9108 6.0462 6.0462 0 0 0-6.5098-2.9A6.0651 6.0651 0 0 0 4.9807 4.1818a5.9847 5.9847 0 0 0-3.9977 2.9 6.0462 6.0462 0 0 0 .7427 7.0966 5.98 5.98 0 0 0 .511 4.9107 6.051 6.051 0 0 0 6.5146 2.9001A5.9847 5.9847 0 0 0 13.2599 24a6.0557 6.0557 0 0 0 5.7718-4.2058 5.9894 5.9894 0 0 0 3.9977-2.9001 6.0557 6.0557 0 0 0-.7475-7.0729zm-9.022 12.6081a4.4755 4.4755 0 0 1-2.8764-1.0408l.1419-.0804 4.7783-2.7582a.7948.7948 0 0 0 .3927-.6813v-6.7369l2.02 1.1686a.071.071 0 0 1 .038.052v5.5826a4.504 4.504 0 0 1-4.4945 4.4944zm-9.6607-4.1254a4.4708 4.4708 0 0 1-.5346-3.0137l.142.0852 4.783 2.7582a.7712.7712 0 0 0 .7806 0l5.8428-3.3685v2.3324a.0804.0804 0 0 1-.0332.0615L9.74 19.9502a4.4992 4.4992 0 0 1-6.1408-1.6464zM2.3408 7.8956a4.485 4.485 0 0 1 2.3655-1.9728V11.6a.7664.7664 0 0 0 .3879.6765l5.8144 3.3543-2.0201 1.1685a.0757.0757 0 0 1-.071 0l-4.8303-2.7865A4.504 4.504 0 0 1 2.3408 7.8956zm16.5963 3.8558L13.1038 8.364 15.1192 7.2a.0757.0757 0 0 1 .071 0l4.8303 2.7913a4.4944 4.4944 0 0 1-.6765 8.1042v-5.6772a.79.79 0 0 0-.407-.667zm2.0107-3.0231l-.142-.0852-4.7735-2.7818a.7759.7759 0 0 0-.7854 0L9.409 9.2297V6.8974a.0662.0662 0 0 1 .0284-.0615l4.8303-2.7866a4.4992 4.4992 0 0 1 6.6802 4.66zM8.3065 12.863l-2.02-1.1638a.0804.0804 0 0 1-.038-.0567V6.0742a4.4992 4.4992 0 0 1 7.3757-3.4537l-.142.0805L8.704 5.459a.7948.7948 0 0 0-.3927.6813zm1.0976-2.3654l2.602-1.4998 2.6069 1.4998v2.9994l-2.5974 1.4997-2.6067-1.4997Z"/></svg>
                             </div>
@@ -4240,14 +5228,14 @@ function renderSettingsModal() {
                         <p class="text-[10px] text-slate-400 mt-2 px-1">
                             Get your API key from <a href="https://platform.openai.com/api-keys" target="_blank" class="text-teal-500 hover:underline">OpenAI Platform</a>
                         </p>
-                        <button onclick="saveOpenaiApiKey()" class="w-full mt-3 py-2.5 bg-teal-600 hover:bg-teal-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-teal-200 active:scale-95 transition-all flex items-center justify-center gap-2">
+                        <button onclick="saveOpenaiApiKey()" class="w-full mt-3 py-2.5 bg-teal-600 hover:bg-teal-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-teal-200 active:scale-95 transition-all flex items-center justify-center gap-2" data-tip="保存上面这串 Key（只写进本浏览器的本地存储）。不点保存，刷新后就没了。" data-tip-pos="top">
                             ${Icons.Save} Save API Key
                         </button>
                     </div>
 
                     <!-- Claude API Key Section -->
                     <div class="pb-5 border-b border-slate-100">
-                        <div class="flex items-center gap-2 mb-3">
+                        <div class="flex items-center gap-2 mb-3" data-tip="Anthropic 的密钥（sk-ant- 开头）。注意：浏览器直连会被 CORS 拦掉，所以下面那个 Proxy URL 是必填的。" data-tip-pos="bottom-start">
                             <div class="w-6 h-6 bg-gradient-to-br from-orange-500 to-rose-600 rounded-lg flex items-center justify-center">
                                 <svg class="w-3.5 h-3.5 text-white" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm-1 17.93c-3.95-.49-7-3.85-7-7.93 0-.62.08-1.21.21-1.79L9 15v1c0 1.1.9 2 2 2v1.93zm6.9-2.54c-.26-.81-1-1.39-1.9-1.39h-1v-3c0-.55-.45-1-1-1H8v-2h2c.55 0 1-.45 1-1V7h2c1.1 0 2-.9 2-2v-.41c2.93 1.19 5 4.06 5 7.41 0 2.08-.8 3.97-2.1 5.39z"/></svg>
                             </div>
@@ -4265,7 +5253,7 @@ function renderSettingsModal() {
                         </p>
 
                         <!-- Claude Proxy URL -->
-                        <div class="mt-4 mb-3">
+                        <div class="mt-4 mb-3" data-tip="浏览器不允许直接调 Anthropic 的接口（CORS），必须经一个自建中转地址（例如 Cloudflare Worker）。留空的话 Claude 模型一定报错。" data-tip-pos="bottom-start">
                             <label class="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-2 block">Proxy URL (Required for CORS)</label>
                             <div class="flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 focus-within:ring-2 focus-within:ring-orange-100 transition-all">
                                 ${Icons.Globe}
@@ -4283,22 +5271,23 @@ function renderSettingsModal() {
 
                     <!-- Local Server Section -->
                     <div>
-                        <div class="flex items-center gap-2 mb-3">
+                        <div class="flex items-center gap-2 mb-3" data-tip="本地/局域网跑的 OpenAI 兼容服务地址（LM Studio、Ollama 等）。不花钱、不出网，适合大批量翻译。" data-tip-pos="bottom-start">
                             <div class="w-6 h-6 bg-gradient-to-br from-purple-500 to-violet-600 rounded-lg flex items-center justify-center">
                                 ${Icons.Server}
                             </div>
                             <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">Local LM Studio</span>
                         </div>
-                        <div class="flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 focus-within:ring-2 focus-within:ring-indigo-100 transition-all">
+                        <div class="flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 focus-within:ring-2 focus-within:ring-indigo-100 transition-all" data-tip="只填到端口为止，例如 http://localhost:1234 —— 后面的 /v1 由程序自己补。多写一段 /v1 会拼成 /v1/v1 并得到一个看起来像「空响应」的错误。" data-tip-pos="top-start">
                             ${Icons.Globe}
                             <input type="text" id="localUrlInput" class="flex-grow bg-transparent border-none text-xs focus:ring-0 p-0 ml-2 text-slate-700 outline-none" value="${escapeHtml(AppState.localBaseUrl)}" placeholder="http://localhost:1234">
                         </div>
                         <p class="text-[10px] text-slate-400 mt-2 px-1">Ensure your local server (e.g., LM Studio) is running and CORS is enabled.</p>
-                        <button onclick="handleConnectLocalClick()" ${AppState.isConnectingLocal ? 'disabled' : ''} class="w-full mt-3 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-purple-200 active:scale-95 transition-all flex items-center justify-center gap-2 disabled:opacity-50">
+                        <button onclick="handleConnectLocalClick()" ${AppState.isConnectingLocal ? 'disabled' : ''} class="w-full mt-3 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-purple-200 active:scale-95 transition-all flex items-center justify-center gap-2 disabled:opacity-50" data-tip="连上面这个地址并把它的模型列表拉下来，拉到的模型会出现在顶栏下拉的 Local LM Studio 分组里。" data-tip-pos="top">
                             ${AppState.isConnectingLocal ? Icons.Loader2 : Icons.Plug}
                             ${AppState.isConnectingLocal ? 'Connecting...' : 'Connect & Fetch Models'}
                         </button>
                     </div>
+                    </div><!-- /panel: api -->
                 </div>
                 <div class="settings-resize-handle absolute top-0 right-0 h-full w-2.5 cursor-ew-resize z-20" onmousedown="startSettingsModalResize(event)" ondblclick="resetSettingsModalWidth()" title="拖拽调整宽度（双击恢复默认）"></div>
             </div>
@@ -4345,13 +5334,13 @@ function renderHeader() {
             </div>
 
             <div class="flex items-center gap-3">
-                <button onclick="handleSummary()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="px-5 py-2.5 bg-white border border-slate-200 text-slate-700 rounded-2xl hover:bg-slate-50 hover:border-indigo-200 transition-all font-semibold flex items-center gap-2 group disabled:opacity-50">
+                <button onclick="handleSummary()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="px-5 py-2.5 bg-white border border-slate-200 text-slate-700 rounded-2xl hover:bg-slate-50 hover:border-indigo-200 transition-all font-semibold flex items-center gap-2 group disabled:opacity-50" data-tip="让模型通读全文，在右侧拉出一个抽屉总结要点、术语和写作建议。不改动任何译文。需要先有译文。" data-tip-pos="bottom-start">
                     <span class="text-indigo-500 group-hover:animate-pulse">${Icons.Sparkles}</span> Insight
                 </button>
-                <button onclick="handleTranslate()" ${!AppState.inputText && !AppState.isLoading ? 'disabled' : ''} class="px-10 py-2.5 rounded-2xl font-black text-sm tracking-wider transition-all shadow-xl active:scale-95 flex items-center gap-2 ${!AppState.inputText && !AppState.isLoading ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isLoading ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}">
+                <button onclick="handleTranslate()" ${!AppState.inputText && !AppState.isLoading ? 'disabled' : ''} class="px-10 py-2.5 rounded-2xl font-black text-sm tracking-wider transition-all shadow-xl active:scale-95 flex items-center gap-2 ${!AppState.inputText && !AppState.isLoading ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isLoading ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isLoading ? '正在翻译，点一下立即中断（已翻好的部分保留）。' : '把左边输入框的全文按句拆开翻译，结果逐句出现在右栏。会覆盖当前译文。'}" data-tip-pos="bottom-end">
                     ${AppState.isLoading ? `<span class="animate-pulse">${Icons.StopCircle}</span> STOP` : 'TRANSLATE'}
                 </button>
-                <button onclick="handleRegenerateAll()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="p-2.5 rounded-2xl transition-all shadow-xl active:scale-95 flex items-center justify-center ${AppState.translationPairs.length === 0 ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isRegeneratingAll ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" title="重新生成所有翻译">
+                <button onclick="handleRegenerateAll()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="p-2.5 rounded-2xl transition-all shadow-xl active:scale-95 flex items-center justify-center ${AppState.translationPairs.length === 0 ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isRegeneratingAll ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isRegeneratingAll ? '正在逐句重译，点一下停下来。' : '用当前模型把每一句重新翻一遍（原文不动）。换了模型、或对整体译文不满意时用它；再点一次可中断。'}" data-tip-pos="bottom-end">
                     ${AppState.isRegeneratingAll ? `<span class="animate-pulse">${Icons.StopCircle}</span>` : Icons.RefreshCw}
                 </button>
             </div>
@@ -4363,7 +5352,7 @@ function renderHeader() {
 function renderSettingsButton() {
     return `
         <div class="relative">
-            <button onclick="openSettings()" class="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-all" title="Settings">
+            <button onclick="openSettings()" class="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-all" data-tip="打开设置：API Key、模型列表、句对行距、提示词与历史都在里面。" data-tip-pos="bottom-start">
                 ${Icons.SettingsGear}
             </button>
         </div>
@@ -4374,10 +5363,10 @@ function renderSettingsButton() {
 function renderSaveButtonGroup() {
     return `
         <div class="relative flex items-center bg-slate-100 rounded-full border border-slate-200">
-            <button onclick="handleManualSave()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="pl-3 pr-2 py-2 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-l-full transition-all disabled:opacity-30 flex items-center gap-1 border-r border-slate-200" title="Manual Save Session">
+            <button onclick="handleManualSave()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="pl-3 pr-2 py-2 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-l-full transition-all disabled:opacity-30 flex items-center gap-1 border-r border-slate-200" data-tip="立刻把当前全部原文+译文存一份快照进历史记录，之后可以从右边的时钟图标里恢复。" data-tip-pos="bottom-start">
                 ${Icons.Save}
             </button>
-            <button onclick="toggleSaveMenu()" class="pl-1 pr-2 py-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-r-full transition-all" title="Auto-Save Settings">
+            <button onclick="toggleSaveMenu()" class="pl-1 pr-2 py-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-r-full transition-all" data-tip="设置自动保存的间隔（每隔几分钟自动存一次快照）。" data-tip-pos="bottom-start">
                 ${Icons.MoreVertical}
             </button>
             ${AppState.showSaveMenu ? `
@@ -4407,7 +5396,7 @@ function renderSaveButtonGroup() {
 function renderHistoryMenu() {
     return `
         <div class="relative">
-            <button onclick="toggleHistoryMenu()" class="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-all" title="Global Session History">
+            <button onclick="toggleHistoryMenu()" class="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-all" data-tip="最近保存过的会话快照，点其中一条即可把当时的原文和译文整体恢复回来（会覆盖当前内容）。" data-tip-pos="bottom-start">
                 ${Icons.History}
             </button>
             ${AppState.showHistoryMenu ? `
@@ -4489,7 +5478,7 @@ function renderModelSelector() {
 
     return `
         <div class="relative">
-            <button onclick="toggleModelMenu()" class="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-2xl border border-slate-200 transition-all text-xs font-bold text-slate-700 active:scale-95">
+            <button onclick="toggleModelMenu()" class="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-2xl border border-slate-200 transition-all text-xs font-bold text-slate-700 active:scale-95" data-tip="当前用来翻译的模型。点开可在 Gemini / OpenAI / Claude / 本地 LM Studio 之间切换；列表里没有的模型去「设置 → 模型」勾选。" data-tip-pos="bottom-start">
                 <span class="${currentIconClass}">${currentIcon}</span>
                 <span class="uppercase tracking-wider">${escapeHtml(currentLabel)}</span>
                 <span class="transition-transform duration-200 ${AppState.showModelMenu ? 'rotate-180' : ''}">${Icons.ChevronDown}</span>
@@ -4579,14 +5568,14 @@ function renderModelSelector() {
 function renderControlButtons() {
     return `
         <div class="flex items-center gap-2 bg-slate-100 p-1.5 rounded-full border border-slate-200 shadow-inner">
-            <button onclick="toggleAutoTranslate()" class="px-4 py-1.5 rounded-full text-[10px] font-bold flex items-center gap-2 transition-all ${AppState.isAutoTranslate ? 'bg-orange-500 text-white shadow-md' : 'text-slate-500'}">
+            <button onclick="toggleAutoTranslate()" class="px-4 py-1.5 rounded-full text-[10px] font-bold flex items-center gap-2 transition-all ${AppState.isAutoTranslate ? 'bg-orange-500 text-white shadow-md' : 'text-slate-500'}" data-tip="${AppState.isAutoTranslate ? '已开：在左边输入框停手 1.5 秒就自动翻一次。粘贴长文时会自动开跑，关掉它可以改成只按 TRANSLATE 才翻。' : '已关：只有点 TRANSLATE 才翻译。打开后，停止输入 1.5 秒会自动翻一次。（跟左右两栏的滚动联动无关）'}" data-tip-pos="bottom">
                 ${AppState.isAutoTranslate ? Icons.ZapFilled : Icons.Zap} AUTO SYNC
             </button>
-            <button onclick="toggleAutoDetect()" class="px-4 py-1.5 rounded-full text-[10px] font-bold transition-all ${AppState.isAutoDetect ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-500'}">DETECT</button>
+            <button onclick="toggleAutoDetect()" class="px-4 py-1.5 rounded-full text-[10px] font-bold transition-all ${AppState.isAutoDetect ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-500'}" data-tip="${AppState.isAutoDetect ? '已开：自动判断输入是中文还是英文并决定翻译方向。手动点右边的 ZH / EN 会自动关掉它。' : '已关：翻译方向锁定为右边 ZH / EN 的选择。点开可恢复自动判断语种。'}" data-tip-pos="bottom">DETECT</button>
             <div class="h-4 w-px bg-slate-300 mx-1"></div>
-            <button onclick="setLanguage('zh','en')" class="px-5 py-2 rounded-full text-xs font-bold transition-all ${AppState.sourceLang === 'zh' ? 'bg-white shadow-sm text-indigo-700' : 'text-slate-500 hover:text-indigo-600'}">ZH</button>
-            <button onclick="swapLanguages()" class="p-2 text-slate-400 hover:bg-white rounded-full transition-colors">${Icons.ArrowRightLeft}</button>
-            <button onclick="setLanguage('en','zh')" class="px-5 py-2 rounded-full text-xs font-bold transition-all ${AppState.sourceLang === 'en' ? 'bg-white shadow-sm text-indigo-700' : 'text-slate-500 hover:text-indigo-600'}">EN</button>
+            <button onclick="setLanguage('zh','en')" class="px-5 py-2 rounded-full text-xs font-bold transition-all ${AppState.sourceLang === 'zh' ? 'bg-white shadow-sm text-indigo-700' : 'text-slate-500 hover:text-indigo-600'}" data-tip="源语言设为中文，译成英文（中 → 英）。点它会关掉自动判断语种。" data-tip-pos="bottom">ZH</button>
+            <button onclick="swapLanguages()" class="p-2 text-slate-400 hover:bg-white rounded-full transition-colors" data-tip="对调翻译方向（中→英 ⇄ 英→中）。只换方向，不动已有的原文和译文。" data-tip-pos="bottom">${Icons.ArrowRightLeft}</button>
+            <button onclick="setLanguage('en','zh')" class="px-5 py-2 rounded-full text-xs font-bold transition-all ${AppState.sourceLang === 'en' ? 'bg-white shadow-sm text-indigo-700' : 'text-slate-500 hover:text-indigo-600'}" data-tip="源语言设为英文，译成中文（英 → 中）。点它会关掉自动判断语种。" data-tip-pos="bottom-end">EN</button>
         </div>
     `;
 }
@@ -4614,28 +5603,31 @@ function renderSourcePanel() {
                 </h3>
                 <div class="flex items-center gap-3">
                     ${AppState.translationPairs.length > 0 ? `
-                        <button onclick="copySourceText()" class="p-2 text-slate-400 hover:text-indigo-600 transition-colors" title="Copy Source Text">
+                        <button onclick="copySourceText()" class="p-2 text-slate-400 hover:text-indigo-600 transition-colors" data-tip="把左栏所有原文按顺序拼起来复制到剪贴板（不含译文）。" data-tip-pos="bottom">
                             ${Icons.Copy}
                         </button>
                         <div class="flex items-center bg-slate-100 rounded-xl p-0.5 border border-slate-200">
-                            <button onclick="setViewMode('edit')" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${AppState.viewMode === 'edit' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}">
+                            <button onclick="setViewMode('edit')" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${AppState.viewMode === 'edit' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}" data-tip="回到大输入框，整篇原文可以直接改、直接粘贴新内容。此时左栏不再逐句显示。" data-tip-pos="bottom">
                                 ${Icons.PenLine} Edit
                             </button>
-                            <button onclick="setViewMode('preview')" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${AppState.viewMode === 'preview' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}">
+                            <button onclick="setViewMode('preview')" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${AppState.viewMode === 'preview' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}" data-tip="左栏按句排开、与右栏译文逐行对齐，LaTeX 公式渲染成成品样子。想逐句对照校对就用这个。" data-tip-pos="bottom">
                                 ${Icons.Eye} Preview
                             </button>
-                            <button onclick="setViewMode('original')" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${AppState.viewMode === 'original' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}" title="显示原始输入内容">
+                            <button onclick="setViewMode('original')" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${AppState.viewMode === 'original' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}" data-tip="显示最初粘贴进来的那份原始文本（未拆句、未被逐句编辑修改过），只读，用于核对。" data-tip-pos="bottom-end">
                                 ${Icons.History} Original
                             </button>
                         </div>
                     ` : ''}
-                    <button onclick="handleClear()" class="text-slate-400 hover:text-rose-500 p-2 transition-colors">${Icons.Trash2}</button>
+                    <button onclick="handleClear()" class="text-slate-400 hover:text-rose-500 p-2 transition-colors" data-tip="清空输入框和左右两栏的全部内容，重新开始。已保存过的历史快照不受影响。" data-tip-pos="left">${Icons.Trash2}</button>
                 </div>
             </div>
             <div class="flex-grow flex flex-col overflow-hidden bg-slate-50/20">
                 ${AppState.translationPairs.length > 0 && AppState.viewMode === 'preview' ? `
                     <div class="overflow-y-auto h-full custom-scrollbar p-4" data-align-scroll="src" onclick="handleBlankAreaClick(event)">
-                        <div class="space-y-2 pb-24" data-align-content="src">
+                        <!-- 行距不再来自 space-y-2：改由 :root 上的 --pair-gap 统一驱动
+                             （[data-align-content] > * + * { margin-top: var(--pair-gap) }），
+                             左右两栏共用同一个变量，物理上不可能只改一边而破坏逐行对齐。 -->
+                        <div class="pb-24" data-align-content="src">
                             ${AppState.translationPairs.map((pair, idx) => renderPairRow('src', pair, idx)).join('')}
                         </div>
                     </div>
@@ -4661,7 +5653,7 @@ function renderTargetPanel() {
             <!-- 高度必须和 SOURCE PANEL 表头逐像素一致，见那边的注释 -->
             <div class="px-6 py-4 min-h-[70px] shrink-0 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
                 <h3 class="text-xs font-black text-slate-400 uppercase tracking-[0.2em] whitespace-nowrap">Target Panel</h3>
-                <button onclick="copyTargetText()" class="p-2 text-slate-400 hover:text-indigo-600 transition-colors">${Icons.Copy}</button>
+                <button onclick="copyTargetText()" class="p-2 text-slate-400 hover:text-indigo-600 transition-colors" data-tip="把右栏所有译文按顺序拼起来复制到剪贴板（不含原文）。" data-tip-pos="bottom-end">${Icons.Copy}</button>
             </div>
             <div class="flex-grow p-4 overflow-y-auto custom-scrollbar bg-slate-50/20" data-align-scroll="tgt" onclick="handleBlankAreaClick(event)">
                 ${AppState.isLoading && AppState.translationPairs.length === 0 ? `
@@ -4675,7 +5667,8 @@ function renderTargetPanel() {
                         <p class="text-xl font-black uppercase tracking-widest">Awaiting Input</p>
                     </div>
                 ` : `
-                    <div class="space-y-2 pb-24" data-align-content="tgt" onclick="handleBlankAreaClick(event)">
+                    <!-- 行距同源栏：--pair-gap，见 renderSourcePanel 里的注释 -->
+                    <div class="pb-24" data-align-content="tgt" onclick="handleBlankAreaClick(event)">
                         ${AppState.translationPairs.map((pair, idx) => renderPairRow('tgt', pair, idx)).join('')}
                     </div>
                 `}
@@ -4719,16 +5712,16 @@ function renderPairRow(side, pair, idx) {
 
     if (isEditing) {
         return `
-            <div class="group relative p-4 rounded-xl transition-all border cursor-pointer mb-2 bg-white border-indigo-300 shadow-xl ring-4 ring-indigo-50 z-20 scale-[1.01] my-4" data-idx="${idx}" data-side="${side}">
+            <div class="group relative p-4 rounded-xl transition-all border cursor-pointer bg-white border-indigo-300 shadow-xl ring-4 ring-indigo-50 z-20 scale-[1.01]" data-idx="${idx}" data-side="${side}">
                 <div class="absolute -top-3 left-1/2 -translate-x-1/2 z-30">
                     ${renderHistoryControls(pair, idx)}
                 </div>
                 <div class="relative flex flex-col gap-3">
                     <div class="absolute -top-10 right-0 z-40 flex items-center gap-2">
-                        <button onclick="event.stopPropagation();triggerSaveRowUpdate(${idx});" class="flex items-center gap-2 px-3 py-1.5 rounded-lg text-white text-xs font-bold shadow-lg transition-all ${pair.isUpdating ? 'bg-rose-500 hover:bg-rose-600' : 'bg-indigo-600 hover:bg-indigo-700'}" title="${pair.isUpdating ? '停止 AI 更新' : '保存并更新'}">
+                        <button onclick="event.stopPropagation();triggerSaveRowUpdate(${idx});" class="flex items-center gap-2 px-3 py-1.5 rounded-lg text-white text-xs font-bold shadow-lg transition-all ${pair.isUpdating ? 'bg-rose-500 hover:bg-rose-600' : 'bg-indigo-600 hover:bg-indigo-700'}" data-tip="${pair.isUpdating ? '正在更新这一句，点一下停下来。' : '保存你刚才手改的内容，并让模型把另一侧那句同步改过来（改原文→重译，改译文→回译校对）。'}" data-tip-pos="left">
                             ${pair.isUpdating ? `<span class="animate-pulse">${Icons.StopCircle}</span> Stop` : `${Icons.PenLineSmall} Update`}
                         </button>
-                        <button onclick="event.stopPropagation();handleRegenerateTranslation(${idx});" class="flex items-center justify-center p-1.5 rounded-lg text-white shadow-lg transition-all ${pair.isRegenerating ? 'bg-rose-500 hover:bg-rose-600' : 'bg-indigo-600 hover:bg-indigo-700'}" title="${pair.isRegenerating ? '停止重新生成' : '重新生成此翻译'}">
+                        <button onclick="event.stopPropagation();handleRegenerateTranslation(${idx});" class="flex items-center justify-center p-1.5 rounded-lg text-white shadow-lg transition-all ${pair.isRegenerating ? 'bg-rose-500 hover:bg-rose-600' : 'bg-indigo-600 hover:bg-indigo-700'}" data-tip="${pair.isRegenerating ? '正在重新翻译这一句，点一下停下来。' : '只把这一句重新翻一遍（原文不动）。对这句译文不满意时用它，不影响其它句子。'}" data-tip-pos="left">
                             ${pair.isRegenerating ? `<span class="animate-pulse">${Icons.StopCircle}</span>` : Icons.RefreshCw}
                         </button>
                     </div>
@@ -4742,7 +5735,7 @@ function renderPairRow(side, pair, idx) {
         `;
     } else {
         return `
-            <div class="group relative p-4 rounded-xl transition-all border cursor-pointer mb-2 border-transparent hover:bg-white/80 hover:shadow-md" onclick="handleRowClick(${idx},'${side}')" data-idx="${idx}" data-side="${side}">
+            <div class="group relative p-4 rounded-xl transition-all border cursor-pointer border-transparent hover:bg-white/80 hover:shadow-md" onclick="handleRowClick(${idx},'${side}')" data-idx="${idx}" data-side="${side}">
                 <div class="prose prose-slate prose-sm max-w-none text-slate-700 leading-relaxed transition-all ${pair.isUpdating ? 'opacity-30 blur-[2px]' : ''}">${renderFormattedText(textValue)}</div>
             </div>
         `;
@@ -4753,13 +5746,13 @@ function renderPairRow(side, pair, idx) {
 function renderHistoryControls(pair, idx) {
     return `
         <div class="flex gap-1 bg-white shadow-sm border border-slate-200 rounded-full p-0.5 z-20 transition-all">
-            <button onclick="event.stopPropagation();handleHistoryNav(${idx},-1);" ${pair.historyIndex <= 0 ? 'disabled' : ''} class="p-1 hover:bg-slate-100 rounded-full disabled:opacity-30 text-slate-600 transition-colors" title="Undo Change">
+            <button onclick="event.stopPropagation();handleHistoryNav(${idx},-1);" ${pair.historyIndex <= 0 ? 'disabled' : ''} class="p-1 hover:bg-slate-100 rounded-full disabled:opacity-30 text-slate-600 transition-colors" data-tip="撤销：回到这一句的上一个版本（中间的数字就是第几版 / 共几版）。只影响这一句。" data-tip-pos="left">
                 ${Icons.Undo2}
             </button>
             <span class="text-[9px] px-1 text-slate-400 font-mono flex items-center select-none">
                 ${pair.historyIndex + 1}/${pair.history.length}
             </span>
-            <button onclick="event.stopPropagation();handleHistoryNav(${idx},1);" ${pair.historyIndex >= pair.history.length - 1 ? 'disabled' : ''} class="p-1 hover:bg-slate-100 rounded-full disabled:opacity-30 text-slate-600 transition-colors" title="Redo Change">
+            <button onclick="event.stopPropagation();handleHistoryNav(${idx},1);" ${pair.historyIndex >= pair.history.length - 1 ? 'disabled' : ''} class="p-1 hover:bg-slate-100 rounded-full disabled:opacity-30 text-slate-600 transition-colors" data-tip="重做：回到这一句更新的那个版本。只影响这一句。" data-tip-pos="right">
                 ${Icons.Redo2}
             </button>
         </div>
@@ -4779,11 +5772,11 @@ function renderAiToolbar(side, idx) {
 
             <!-- Grammar Button Group -->
             <div class="flex items-stretch rounded-lg bg-indigo-50 border border-indigo-100 relative">
-                <button onclick="handleAiRefine(${idx},'${side}','grammar')" ${AppState.isRefining ? 'disabled' : ''} class="flex items-center gap-1.5 px-2 py-1 hover:bg-indigo-100 text-indigo-700 rounded-l-lg text-xs transition-colors disabled:opacity-50">
+                <button onclick="handleAiRefine(${idx},'${side}','grammar')" ${AppState.isRefining ? 'disabled' : ''} class="flex items-center gap-1.5 px-2 py-1 hover:bg-indigo-100 text-indigo-700 rounded-l-lg text-xs transition-colors disabled:opacity-50" data-tip="让模型检查并订正这一整句的语法，直接改写进上面的编辑框。用的提示词可在右边 ⋮ 或「设置 → 编辑与历史」里改。" data-tip-pos="bottom-start">
                     ${Icons.CheckCheck} Grammar
                 </button>
                 <div class="w-px bg-indigo-200 my-1"></div>
-                <button onclick="toggleSettingsPopup('grammar',${idx},'${side}')" class="px-1 hover:bg-indigo-200 text-indigo-400 hover:text-indigo-700 rounded-r-lg transition-colors">
+                <button onclick="toggleSettingsPopup('grammar',${idx},'${side}')" class="px-1 hover:bg-indigo-200 text-indigo-400 hover:text-indigo-700 rounded-r-lg transition-colors" data-tip="自定义 Grammar 按钮发给模型的指令（例如「只改语法，别动术语和 LaTeX」）。留空则用内置提示词。" data-tip-pos="bottom">
                     ${Icons.MoreVertical}
                 </button>
                 ${isGrammarSettingsOpen ? renderSettingsPopover('grammar') : ''}
@@ -4791,18 +5784,18 @@ function renderAiToolbar(side, idx) {
 
             <!-- Simplify Button Group -->
             <div class="flex items-stretch rounded-lg bg-emerald-50 border border-emerald-100 relative">
-                <button onclick="handleAiRefine(${idx},'${side}','simplify')" ${AppState.isRefining ? 'disabled' : ''} class="flex items-center gap-1.5 px-2 py-1 hover:bg-emerald-100 text-emerald-700 rounded-l-lg text-xs transition-colors disabled:opacity-50">
+                <button onclick="handleAiRefine(${idx},'${side}','simplify')" ${AppState.isRefining ? 'disabled' : ''} class="flex items-center gap-1.5 px-2 py-1 hover:bg-emerald-100 text-emerald-700 rounded-l-lg text-xs transition-colors disabled:opacity-50" data-tip="把这一整句改写得更直白简短，意思和 LaTeX 公式保持不变。句子太绕、太长时用它。" data-tip-pos="bottom-start">
                     ${Icons.Feather} Simplify
                 </button>
                 <div class="w-px bg-emerald-200 my-1"></div>
-                <button onclick="toggleSettingsPopup('simplify',${idx},'${side}')" class="px-1 hover:bg-emerald-200 text-emerald-400 hover:text-emerald-700 rounded-r-lg transition-colors">
+                <button onclick="toggleSettingsPopup('simplify',${idx},'${side}')" class="px-1 hover:bg-emerald-200 text-emerald-400 hover:text-emerald-700 rounded-r-lg transition-colors" data-tip="自定义 Simplify 按钮发给模型的指令。留空则用内置提示词。" data-tip-pos="bottom">
                     ${Icons.MoreVertical}
                 </button>
                 ${isSimplifySettingsOpen ? renderSettingsPopover('simplify') : ''}
             </div>
 
             <!-- Custom Rewrite Input -->
-            <div class="flex-grow flex items-center gap-2 bg-indigo-50/50 rounded border border-indigo-100 px-2 py-0.5 focus-within:ring-1 focus-within:ring-indigo-200 transition-all">
+            <div class="flex-grow flex items-center gap-2 bg-indigo-50/50 rounded border border-indigo-100 px-2 py-0.5 focus-within:ring-1 focus-within:ring-indigo-200 transition-all" data-tip="用自己的话指挥模型改写这一句，例如「更正式一些」「把被动改成主动」。输完按回车或点右边的魔杖。" data-tip-pos="bottom-end">
                 <span class="text-indigo-300">${Icons.MessageSquare}</span>
                 <input type="text" id="refineInput_${side}_${idx}" class="bg-transparent border-none text-xs w-full focus:ring-0 p-0 text-slate-700 placeholder-indigo-200" placeholder="${side === 'src' ? 'e.g. Make it formal...' : 'e.g. More concise...'}" value="${escapeHtml(AppState.refinePrompt)}">
                 <button onclick="triggerCustomRefine(${idx},'${side}')" ${AppState.isRefining || !AppState.refinePrompt.trim() ? 'disabled' : ''} class="text-indigo-600 hover:text-indigo-800 disabled:opacity-30 transition-colors">
@@ -5146,6 +6139,150 @@ function toggleModelGroup(provider) {
 
 function closeSettings() {
     AppState.showSettings = false;
+    renderApp();
+}
+
+// ============= Settings 页签切换 =============
+// ⚠️ 刻意**不走 setState/renderApp**。两个理由，缺一不可：
+//   1) 保住输入到一半的 API Key。renderApp 会用 AppState 里的旧值重建 <input value="...">，
+//      而 Key 只有点了 Save 才进 AppState —— 一旦重渲染，没保存的那串就没了。
+//      四页内容全都在 DOM 里、切页只切 class，输入框节点根本没被碰过，自然不会丢。
+//   2) 渲染路径（root.innerHTML）外面没有 try/catch，抛一次就永久冻页。切页这条路上
+//      一行渲染代码都不跑，风险归零；整段还是包了 try/catch，最坏情况只是页签没切动。
+// AppState.settingsTab + localStorage 只负责「下一次整体重渲染 / 重开弹窗时落在哪一页」。
+function setSettingsTab(tab) {
+    const t = normalizeSettingsTab(tab);
+    AppState.settingsTab = t;
+    try {
+        localStorage.setItem('settingsTab', t);
+    } catch (e) {}
+    try {
+        const panels = document.querySelectorAll('[data-settings-panel]');
+        for (let i = 0; i < panels.length; i++) {
+            panels[i].classList.toggle('is-active', panels[i].getAttribute('data-settings-panel') === t);
+        }
+        const tabs = document.querySelectorAll('[data-settings-tab]');
+        for (let i = 0; i < tabs.length; i++) {
+            tabs[i].classList.toggle('is-active', tabs[i].getAttribute('data-settings-tab') === t);
+        }
+        // 换页后回到顶部：不然从「模型」那页滚到底再切过去，新页面会停在一片空白处
+        const scroller = document.getElementById('settingsScrollArea');
+        if (scroller) scroller.scrollTop = 0;
+    } catch (e) {
+        console.warn('[settings] 切换页签失败：', e && e.message);
+    }
+}
+
+// ============= 句对行距（TASK 3）=============
+// 拖动中：只写一次 CSS 变量 + 更新那个数字标签，然后叫一次对齐同步。
+// 不 setState、不 renderApp —— 拖拽期间每帧重建整页 DOM 会又卡又丢焦点。
+// scheduleAlignSync 自带「本轮已排队就合并」，一次拖拽最多每帧跑一遍对齐，
+// 而且它内部是「先清空补白 → 一次性读完 → 一次性写回」的批处理，不会 layout thrash；
+// ResizeObserver 那边看到的是我们自己写的尺寸变化，alignSyncApplying 会把它挡掉，不会互相打架。
+//
+// ⚠️ 这里**不能**直接叫 scheduleAlignSync()，必须走 alignSyncKeepingScroll()。
+// syncBilingualAlignment 的「写 1」阶段会先把每一行的 minHeight 清空再量高度，
+// 那一瞬间目标栏塌回自然高度（中文比英文短一大截），浏览器当场把它的 scrollTop
+// 夹到新的上限；「写 2」把行高补回去，但夹掉的滚动位置**再也没人恢复**，
+// 随后 bindPaneScrollSync 还会把这个被夹过的值同步回源栏。
+// 实测：滚到底（scrollTop 2851）时动一格滑块，两栏一起跳回 1621 —— 用户正在校对的
+// 那句话被甩出去 1230px。文档后 44%（scrollTop > 目标栏自然高度上限 1598）全中招。
+// renderApp 早就防过同一件事（见它里面「先对齐则两栏高度一致，赋值不会被夹」那段注释），
+// 这两个新 handler 当初漏抄了这道保险。
+function handleRowGapInput(value) {
+    const gap = clampRowGap(value);
+    AppState.rowGap = gap;
+    applyRowGapToDom(gap);
+    try {
+        const label = document.getElementById('rowGapValue');
+        if (label) label.textContent = gap + 'px';
+    } catch (e) {}
+    alignSyncKeepingScroll();   // 行距变了 = 行几何变了，必须重跑对齐，否则左右两栏当场散架
+}
+
+// 松开鼠标（change）才落盘。拖拽途中每帧写 localStorage 没必要。
+function commitRowGap(value) {
+    const gap = clampRowGap(value);
+    AppState.rowGap = gap;
+    applyRowGapToDom(gap);
+    try {
+        localStorage.setItem('rowGap', String(gap));
+    } catch (e) {}
+    alignSyncKeepingScroll();
+}
+
+function resetRowGap() {
+    AppState.rowGap = ROW_GAP_DEFAULT;
+    applyRowGapToDom(ROW_GAP_DEFAULT);
+    try {
+        localStorage.setItem('rowGap', String(ROW_GAP_DEFAULT));
+    } catch (e) {}
+    try {
+        const slider = document.getElementById('rowGapSlider');
+        if (slider) slider.value = String(ROW_GAP_DEFAULT);
+        const label = document.getElementById('rowGapValue');
+        if (label) label.textContent = ROW_GAP_DEFAULT + 'px';
+    } catch (e) {}
+    alignSyncKeepingScroll();
+}
+
+// ============= 跨栏对应高亮的开关 =============
+// 刻意**不**走 renderApp：这个勾选框长在设置弹窗里，全量重渲染会把弹窗整块重建，
+// 用户滚到哪、展开了哪几组全都归零。checkbox 自己已经是勾上的状态，
+// 我们只要落盘 + 把可能还挂着的高亮收干净就够了。
+function setCrossHighlightEnabled(enabled) {
+    const on = !!enabled;
+    AppState.crossHighlightEnabled = on;
+    try {
+        localStorage.setItem('crossHighlightEnabled', on ? '1' : '0');
+    } catch (e) {}
+    if (!on) {
+        // 关掉的瞬间就把在飞的请求掐掉、把已经画上去的高亮擦掉
+        resetCrossHighlight();
+        try { syncSelectionHighlightLayers(); } catch (e) {}
+    }
+    try {
+        const label = document.getElementById('crossHighlightToggleRow');
+        if (label) label.classList.toggle('bg-teal-50', on);
+    } catch (e) {}
+}
+
+// 「显示」页里的「恢复默认宽度」按钮。resetSettingsModalWidth() 只改 DOM + 落盘、
+// 不重渲染（那是拖拽手柄双击的正确行为），但这里旁边还印着一行「当前：xxxpx」，
+// 不重渲染那行数字就不会变。所以这里补一次重渲染。
+function resetSettingsModalWidthFromPanel() {
+    resetSettingsModalWidth();
+    renderApp();
+}
+
+// ============= 「编辑与历史」页里的三个转发型 handler =============
+// 之所以不直接复用 applyCustomAutoSave / saveCustomPrompt：那两个是按 id 找 DOM 的，
+// 而顶栏菜单 / 每行 ⋮ 弹窗可能同时在 DOM 里挂着同名 id。这里用 settingsXxx 前缀的独立 id，
+// 两边互不干扰。
+function applySettingsAutoSave() {
+    const input = document.getElementById('settingsAutoSaveInput');
+    if (!input) return;
+    const val = parseInt(input.value, 10);
+    if (val > 0) setAutoSaveInterval(val * 60 * 1000);
+}
+
+function saveSettingsCustomPrompt(type) {
+    if (type !== 'grammar' && type !== 'simplify') return;   // 未知键不进 customPrompts
+    const textarea = document.getElementById('settingsCustomPrompt_' + type);
+    if (!textarea) return;
+    AppState.customPrompts[type] = textarea.value.trim();
+    try {
+        localStorage.setItem('customPrompts', JSON.stringify(AppState.customPrompts));
+    } catch (e) {}
+    showToast(AppState.customPrompts[type] ? '已保存自定义提示词' : '已清空，回到默认提示词', 'success');
+}
+
+function resetSettingsCustomPrompt(type) {
+    if (type !== 'grammar' && type !== 'simplify') return;
+    AppState.customPrompts[type] = '';
+    try {
+        localStorage.setItem('customPrompts', JSON.stringify(AppState.customPrompts));
+    } catch (e) {}
     renderApp();
 }
 
@@ -5529,6 +6666,26 @@ function loadSavedSettings() {
         const savedSettingsModalWidth = localStorage.getItem('settingsModalWidth');
         if (savedSettingsModalWidth) {
             AppState.settingsModalWidth = clampSettingsModalWidth(parseInt(savedSettingsModalWidth, 10));
+        }
+
+        // 加载 Settings 弹窗上次停在哪一页（脏值/老版本残留一律回落第一页）
+        const savedSettingsTab = localStorage.getItem('settingsTab');
+        if (savedSettingsTab) {
+            AppState.settingsTab = normalizeSettingsTab(savedSettingsTab);
+        }
+
+        // 加载句对行距。⚠️ 必须**在首次 renderApp 之前**把 CSS 变量写进 :root，
+        // 否则首屏会先用默认 8px 排一次版、行高对齐也按 8px 算完，再跳成用户设定值 —— 肉眼可见地闪一下。
+        const savedRowGap = localStorage.getItem('rowGap');
+        if (savedRowGap !== null) {
+            AppState.rowGap = clampRowGap(savedRowGap);
+        }
+        applyRowGapToDom(AppState.rowGap);
+
+        // 加载跨栏对应高亮开关。默认开（缺键 = 从没动过 = 开），只有显式存过 '0' 才算关。
+        const savedCrossHl = localStorage.getItem('crossHighlightEnabled');
+        if (savedCrossHl !== null) {
+            AppState.crossHighlightEnabled = savedCrossHl !== '0';
         }
 
         // 加载上次从各家 API 拉到的在线模型目录（纯读缓存，不发任何网络请求）
