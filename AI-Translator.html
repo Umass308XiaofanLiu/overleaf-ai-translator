@@ -1301,9 +1301,91 @@ async function callClaudeAPI(model, messages, config = {}, apiKey = null, signal
     return data.content?.[0]?.text || "";
 }
 
+// ============= 传输期 \textcolor 剥离 =============
+// \textcolor{color}{content} -> content，仅作用于"发给模型的文本"。
+// 原因：\textcolor 以 \t 开头，混在模型返回的 JSON 字符串字面量里会被 JSON.parse 解析成 TAB+"extcolor"。
+// 宏不进 JSON 就不可能被破坏。绝不修改 AppState.inputText / originalInputText 等用户原文。
+// 约束：单遍扫描、括号配平、可嵌套、有工作量上限、任何异常都返回原文（renderApp 无 try/catch，禁止抛出）。
+function stripTextColorOnce(input) {
+    const n = input.length;
+    let budget = n * 8 + 100000; // 硬性工作量上限，病态输入也不会长时间同步阻塞
+    const isSpace = (ch) => ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r';
+    // 返回与 input[open] 处 '{' 配对的 '}' 下标；不配平或超预算返回 -1
+    const matchBrace = (open) => {
+        let depth = 0;
+        for (let p = open; p < n; p++) {
+            if (--budget < 0) return -1;
+            const ch = input[p];
+            if (ch === '\\') { p++; continue; }
+            if (ch === '{') depth++;
+            else if (ch === '}') { depth--; if (depth === 0) return p; }
+        }
+        return -1;
+    };
+    let out = '';
+    let i = 0;
+    const drop = []; // 待吞掉的 '}' 下标（内容组右括号），栈顶总是最近的一个
+    while (i < n) {
+        if (--budget < 0) return input;
+        const ch = input[i];
+        if (ch === '\\') {
+            if (input.startsWith('\\textcolor', i)) {
+                let j = i + 10;
+                while (j < n && isSpace(input[j])) j++;
+                if (input[j] === '[') { // \textcolor[rgb]{1,0,0}{...}
+                    const rb = input.indexOf(']', j);
+                    if (rb !== -1) { j = rb + 1; while (j < n && isSpace(input[j])) j++; }
+                }
+                if (input[j] === '{') {
+                    const colorEnd = matchBrace(j);
+                    if (colorEnd !== -1) {
+                        let k = colorEnd + 1;
+                        while (k < n && isSpace(input[k])) k++;
+                        if (input[k] === '{') {
+                            const contentEnd = matchBrace(k);
+                            if (contentEnd !== -1) {
+                                drop.push(contentEnd); // 丢掉宏名 + 颜色组 + 内容组左括号
+                                i = k + 1;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            // 其他反斜杠序列原样保留（连带下一个字符），避免 \{ \} 干扰括号配对
+            out += ch;
+            if (i + 1 < n) { out += input[i + 1]; i += 2; } else { i += 1; }
+            continue;
+        }
+        if (ch === '}' && drop.length && drop[drop.length - 1] === i) { drop.pop(); i += 1; continue; }
+        out += ch;
+        i += 1;
+    }
+    return out;
+}
+
+function stripTextColorForModel(input) {
+    try {
+        if (typeof input !== 'string' || input.indexOf('\\textcolor') === -1) return input;
+        let text = input;
+        for (let pass = 0; pass < 5; pass++) { // 迭代到不动点，硬上限防死循环
+            if (text.indexOf('\\textcolor') === -1) break;
+            const next = stripTextColorOnce(text);
+            if (next === text) break;
+            text = next;
+        }
+        return text;
+    } catch (e) {
+        return input; // 绝不抛出
+    }
+}
+
 // ============= 批量翻译 =============
 async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+
+    // 传输期剥离颜色宏（不改动用户原文，仅改动本次发送给模型的副本）
+    text = stripTextColorForModel(text);
 
     const srcName = srcLang === 'zh' ? 'Chinese' : 'English';
     const tgtName = tgtLang === 'zh' ? 'Chinese' : 'English';
