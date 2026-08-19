@@ -105,7 +105,7 @@ body.is-resizing-settings-modal * {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '01.00.00';        // APP_VERSION_STAMP
+const APP_VERSION = '01.00.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-08-19';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -1322,15 +1322,29 @@ async function callClaudeAPI(model, messages, config = {}, apiKey = null, signal
 // 原因：\textcolor 以 \t 开头，混在模型返回的 JSON 字符串字面量里会被 JSON.parse 解析成 TAB+"extcolor"。
 // 宏不进 JSON 就不可能被破坏。绝不修改 AppState.inputText / originalInputText 等用户原文。
 // 约束：单遍扫描、括号配平、可嵌套、有工作量上限、任何异常都返回原文（renderApp 无 try/catch，禁止抛出）。
+//
+// ⚠️ 截断是常态，不是边角情况（v01.00.01 修）
+//   用户是按手选区间一段一段翻译的，右括号落在选区外再正常不过。旧版一遇括号不配平
+//   就「保守地」原样返回，宏于是整条漏给模型，模型再原样回显 —— 译文里就出现
+//   \textcolor{purple}{...}。真实复现：745 字符、2 个 '{' 对 1 个 '}'，旧实现零改动。
+//   现在按「宏语法 vs 用户正文」分开处理：
+//     内容组被截断 -> 丢宏头，后面的正文一个字都不能少
+//     颜色组被截断 -> 丢掉这截宏语法（'{pur' 不是用户的话）
+//     压根没有内容组 -> 只丢宏头
+//     选区起点落在颜色组内部（多出无主的 '}'）-> 清掉那些无主右括号
+//   回归测试：tests/latex/textcolor-suite.js（直接从本文件抽函数跑，不是副本），
+//   pre-commit 钩子会在 AI-Translator.html 进暂存区时强制跑一遍。
 function stripTextColorOnce(input) {
     const n = input.length;
     let budget = n * 8 + 100000; // 硬性工作量上限，病态输入也不会长时间同步阻塞
+    let blown = false;           // 预算耗尽 ≠ 括号截断，两者绝不能混为一谈
     const isSpace = (ch) => ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r';
-    // 返回与 input[open] 处 '{' 配对的 '}' 下标；不配平或超预算返回 -1
+    const isAlpha = (ch) => (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+    // 返回与 input[open] 处 '{' 配对的 '}' 下标；不配平返回 -1（预算耗尽时另置 blown）
     const matchBrace = (open) => {
         let depth = 0;
         for (let p = open; p < n; p++) {
-            if (--budget < 0) return -1;
+            if (--budget < 0) { blown = true; return -1; }
             const ch = input[p];
             if (ch === '\\') { p++; continue; }
             if (ch === '{') depth++;
@@ -1345,28 +1359,41 @@ function stripTextColorOnce(input) {
         if (--budget < 0) return input;
         const ch = input[i];
         if (ch === '\\') {
-            if (input.startsWith('\\textcolor', i)) {
+            // \textcolorbox 之类同前缀的别的宏必须原样放过：后面紧跟字母就不是 \textcolor
+            if (input.startsWith('\\textcolor', i) && !isAlpha(input[i + 10])) {
                 let j = i + 10;
+                let headEnd = j; // 已确认属于「宏语法」的部分结束在哪；空白不算，留给正文
                 while (j < n && isSpace(input[j])) j++;
                 if (input[j] === '[') { // \textcolor[rgb]{1,0,0}{...}
                     const rb = input.indexOf(']', j);
-                    if (rb !== -1) { j = rb + 1; while (j < n && isSpace(input[j])) j++; }
+                    if (rb === -1) return out; // 可选参数被截断：后面全是宏语法残骸，不是正文
+                    j = rb + 1;
+                    headEnd = j;
+                    while (j < n && isSpace(input[j])) j++;
                 }
                 if (input[j] === '{') {
                     const colorEnd = matchBrace(j);
-                    if (colorEnd !== -1) {
-                        let k = colorEnd + 1;
-                        while (k < n && isSpace(input[k])) k++;
-                        if (input[k] === '{') {
-                            const contentEnd = matchBrace(k);
-                            if (contentEnd !== -1) {
-                                drop.push(contentEnd); // 丢掉宏名 + 颜色组 + 内容组左括号
-                                i = k + 1;
-                                continue;
-                            }
-                        }
+                    if (colorEnd === -1) {
+                        if (blown) return input;
+                        return out; // 颜色组被截断：'{pur' 是宏语法的残骸，不是用户的话
                     }
+                    let k = colorEnd + 1;
+                    while (k < n && isSpace(input[k])) k++;
+                    if (input[k] === '{') {
+                        const contentEnd = matchBrace(k);
+                        if (blown) return input;
+                        // 内容组配平就顺手记下要吞掉的右括号；被截断（-1）就只丢宏头，
+                        // 后面的正文一个字都不能少 —— 用户是按选区分段翻译的，
+                        // 右括号落在选区外是常态，不是边角情况。
+                        if (contentEnd !== -1) drop.push(contentEnd);
+                        i = k + 1;
+                        continue;
+                    }
+                    i = colorEnd + 1; // 没有内容组：只丢 \textcolor{color}，其余（含空白）原样保留
+                    continue;
                 }
+                i = headEnd; // 连 '{' 都没有：丢掉宏名（和已吃掉的 [rgb]），其余原样保留
+                continue;
             }
             // 其他反斜杠序列原样保留（连带下一个字符），避免 \{ \} 干扰括号配对
             out += ch;
@@ -1382,13 +1409,38 @@ function stripTextColorOnce(input) {
 
 function stripTextColorForModel(input) {
     try {
-        if (typeof input !== 'string' || input.indexOf('\\textcolor') === -1) return input;
+        if (typeof input !== 'string') return input;
         let text = input;
-        for (let pass = 0; pass < 5; pass++) { // 迭代到不动点，硬上限防死循环
-            if (text.indexOf('\\textcolor') === -1) break;
-            const next = stripTextColorOnce(text);
-            if (next === text) break;
-            text = next;
+        if (text.indexOf('\\textcolor') !== -1) {
+            for (let pass = 0; pass < 5; pass++) { // 迭代到不动点，硬上限防死循环
+                if (text.indexOf('\\textcolor') === -1) break;
+                const next = stripTextColorOnce(text);
+                if (next === text) break;
+                text = next;
+            }
+        }
+        // 选区起点落在颜色组内部时，会剩下无主的 '}'。它是宏语法的残骸，不是正文；
+        // 留着模型会当成 LaTeX 回显。一次扫完所有无主右括号（只清一个的话不幂等）。
+        if (text.indexOf('}') !== -1) {
+            let depth = 0, stray = false;
+            for (let i = 0; i < text.length; i++) {
+                const c = text[i];
+                if (c === '\\') { i++; continue; }
+                if (c === '{') depth++;
+                else if (c === '}') { if (depth === 0) { stray = true; break; } depth--; }
+            }
+            if (stray) {
+                let out = '';
+                depth = 0;
+                for (let i = 0; i < text.length; i++) {
+                    const c = text[i];
+                    if (c === '\\') { out += c; if (i + 1 < text.length) out += text[i + 1]; i++; continue; }
+                    if (c === '{') depth++;
+                    else if (c === '}') { if (depth === 0) continue; depth--; }
+                    out += c;
+                }
+                text = out;
+            }
         }
         return text;
     } catch (e) {
