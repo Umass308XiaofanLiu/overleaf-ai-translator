@@ -1817,6 +1817,14 @@ function syncSelectionHighlightLayers() {
         const ss = AppState.synonymState;
         if (!ss || !ss.show) resetCrossHighlight();
 
+        // 渲染中途失败时 #root 还停在上一帧的 DOM 上，而 AppState 已经是新文档了。
+        // 上面这行只清 AppState 里的跨栏状态（对不对得上当前 DOM 不重要），
+        // 下面开始的每一步都要在真实 DOM 里找节点、往里画高亮 —— 拿新状态去配旧 DOM
+        // 会画错地方。这个函数有三个非渲染路径调用点（focusAfterChange /
+        // commitCrossHighlight / setCrossHighlightEnabled），renderApp 自身的调用点
+        // 不受影响（那里只在 wrote=true 之后才会走到这一句）。
+        if (!RENDER_BOUNDARY.wrote) return;
+
         // 关注标记先整体拆回纯文本。必须在跨栏那一趟**之前**做：跨栏的文本节点游走器
         // 会走进关注 span 里（它只拒绝 .katex 和 .cross-hl-span），上一轮的残留还在的话，
         // 它就可能把自己的 span 套进关注 span 里 —— 两套系统互相嵌套正是要避免的事。
@@ -9180,6 +9188,16 @@ function handleGlobalClick(event) {
     // 如果没有正在编辑的句子，直接返回
     if (AppState.activeIndex === null) return;
 
+    // 对话窗正在被拖拽/缩放时，松手瞬间的 click 一律不算「点了空白区域」。
+    // 【为什么不能只靠 pointer capture】chatBeginDrag 建立 capture 的那句包在一个静默吞异常
+    // 的 try/catch 里（pid 为空、capture 被提前释放等情况下会悄悄失败、没有后备）。capture
+    // 一旦没生效，拖拽结束的 click 就会正常冒泡，如果这次松手点恰好落在 #root 外的空白处，
+    // 就会走到下面的 saveRowUpdate —— 实测复现过：正在编辑的行被静默提交、退出编辑态，
+    // 且因为「只有一侧变了」触发一次重译，产出的译文里 LaTeX 被搞坏（\ref 嵌套大括号）。
+    // data-aichat-drag 在整个拖拽期间（chatBeginDrag 设置、onUp 清除）都在，不依赖 capture
+    // 是否生效，是这条路径唯一不会静默失效的判据。
+    if (document.body.hasAttribute('data-aichat-drag')) return;
+
     // —— 浮层通用豁免：按语义写，不再按 id 写 ——
     // 任何挂在 <body> 上、**不属于 #root** 的浮层（渲染错误边界面板、浮动对话窗、
     // 同义词弹窗、推理模式横幅……以及将来还会有的第 N 个），它内部的点击都不该被
@@ -13702,6 +13720,15 @@ const CHAT_EDGE_KEEP = 48;       // 无论怎么拖，横向至少留这么多�
 const CHAT_TITLEBAR_H = 40;      // 必须和 CSS 里 .aichat-titlebar 的 height 一致
 const CHAT_RESTORE_PAD = 8;      // 从 localStorage 恢复时，整窗回到视口内所留的边
 
+// 当前正在进行的拖拽/缩放会话的收尾函数（chatBeginDrag 里的 onUp），没有拖拽时为 null。
+// 【为什么需要】chatClose()（连同 Esc 处理器）要能在关窗前主动结束一次进行中的拖拽 ——
+// 否则 Esc 关闭对话窗时，只要用户当时还按着鼠标没松开，document 上的 pointermove/up
+// 监听器和 data-aichat-drag 属性都不会被清掉：拖拽会在窗口已经视觉消失之后继续在后台跑，
+// 真正松手时算出的尺寸会被当成「用户特意调的」写进 localStorage —— 而这是一次被 Esc
+// 打断的操作，不是用户主动选择的结果。onUp 是 chatBeginDrag 内部的闭包，外部拿不到，
+// 所以在这里存一份引用；onUp 自己跑完后立刻把这里清回 null（幂等，不依赖谁先调用）。
+let chatActiveDragEnd = null;
+
 // 聊天的全部状态。刻意是一个独立对象而不是 AppState 的字段：
 // 放进 AppState 就意味着「改聊天状态 = 可能触发 renderApp」，那正是要躲开的东西。
 const ChatState = {
@@ -13963,7 +13990,7 @@ function chatShellHtml() {
 // 文本一律走 textContent，不经过任何 HTML 字符串拼接。窗口里显示的是**模型生成的文本**
 // （以及远端返回的错误信息），一个 `<` 都不许被当成标签 —— 这是正确性，不是安全加固。
 // C2 里助手气泡要渲染 Markdown/KaTeX 时，走 renderFormattedText，别把这条通道改成 innerHTML。
-function chatAppendRow(kind, text) {
+function chatAppendRow(kind, text, opts) {
     try {
         const log = document.getElementById('aiChatLog');
         if (!log) return null;
@@ -13977,7 +14004,11 @@ function chatAppendRow(kind, text) {
         chatScrollToBottom();
         // 折叠着的时候这一行用户看不见 —— 标题栏上亮个未读数，别让回复静静地烂在后台。
         // 只认助手回复和错误行：系统提示（「已开始新对话」之类）不是「有人回你话了」。
-        chatNoteUnread(kind);
+        // opts.skipUnread：流式占位行专用（chatLiveSink.ensureRow）。一条完整回复会先建一个
+        // 空占位行、再在收全之后由 chatRenderAssistant 建一条真正的最终行——两次调用都是
+        // chatAppendRow('assistant', ...)，不加这个旗标的话未读数会给同一条回复计两次
+        // （实测：一问一答角标显示「2」而不是「1」，虽然最终 DOM 里只留了一条气泡）。
+        if (!(opts && opts.skipUnread)) chatNoteUnread(kind);
         return row;
     } catch (e) {
         console.error('[chat] appendRow failed', e);
@@ -14106,6 +14137,10 @@ function chatBeginDrag(ev, kind) {
 
         try { if (pid != null && capEl.setPointerCapture) capEl.setPointerCapture(pid); } catch (e) {}
         try { document.body.setAttribute('data-aichat-drag', kind); } catch (e) {}
+        // onUp 是下面的函数声明，在整个 chatBeginDrag 作用域内提升，这里引用它不用等它的
+        // 文本定义先出现。
+        chatActiveDragEnd = function () { onUp(); };
+        const thisDragEnd = chatActiveDragEnd;
 
         function onMove(e) {
             try {
@@ -14159,6 +14194,11 @@ function chatBeginDrag(ev, kind) {
         function onUp() {
             if (finished) return;                 // 幂等哨兵：下面两个兜底可能和真 pointerup 撞车
             finished = true;
+            // 只清自己这一份：一旦这个 onUp 真的跑到这里，chatActiveDragEnd 要么还指着
+            // 这次会话自己的包装函数（正常收尾），要么已经被下一次 chatBeginDrag 换成了
+            // 新会话的包装函数（不应该发生——旧会话的监听器在到达这里之前已经解绑——
+            // 但万一发生，这一句绝不能把新会话的收尾函数误清掉）。
+            if (chatActiveDragEnd === thisDragEnd) chatActiveDragEnd = null;
             try { document.removeEventListener('pointermove', onMove); } catch (e) {}
             try { document.removeEventListener('pointerup', onUp); } catch (e) {}
             try { document.removeEventListener('pointercancel', onUp); } catch (e) {}
@@ -16063,7 +16103,9 @@ function chatLiveSink() {
     const st = { row: null, node: null, thinkBody: null };
     const ensureRow = function () {
         if (st.row) return;
-        st.row = chatAppendRow('assistant', '');
+        // skipUnread：这只是流式占位行，还没收全。真正代表「一条完整回复」的未读计数
+        // 由 chatRenderAssistant 收全之后建最终行时记一次，见 chatAppendRow 里的注释。
+        st.row = chatAppendRow('assistant', '', { skipUnread: true });
         const b = chatBubbleOf(st.row);
         st.node = document.createTextNode('');
         if (b) b.appendChild(st.node);
@@ -18209,6 +18251,12 @@ function chatOpen() {
 
 function chatClose() {
     try {
+        // 关闭必须是拖拽状态的确定性终点。不这样做的话：Esc 在拖拽途中把窗口关掉，
+        // chatBeginDrag 挂在 document/window 上的监听器和 data-aichat-drag 都不会被清 ——
+        // 拖拽会在窗口已经视觉消失之后继续在后台跑，真正松手时算出的尺寸会被当成
+        // 「用户特意调的」写进 localStorage，下次打开就静默出现在这个从没主动选过的
+        // 尺寸/位置上（实测复现：Esc 中途打断后最终落盘 {"x":350,"y":250,"w":563,"h":500}）。
+        if (typeof chatActiveDragEnd === 'function') { try { chatActiveDragEnd(); } catch (e) {} }
         ChatState.open = false;
         const rootEl = document.getElementById('aiChatRoot');
         if (rootEl) rootEl.classList.remove('is-open');
