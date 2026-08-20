@@ -1303,6 +1303,11 @@ const AppState = {
 
     // 历史记录
     globalHistory: [],
+    // 内容落盘（IndexedDB）的状态。**不进 localStorage**，每次启动重新判定。
+    // persistError 非空 = 这次会话没能存到本地，历史菜单里常驻一行红字说明，绝不静默。
+    persistError: null,
+    persistErrorShown: null,   // 已经弹过 toast 的那条错误，避免同一条错误反复糊屏
+    persistOkAt: 0,            // 最近一次成功落盘的时间戳
     sessionId: Date.now().toString(),
     autoSaveInterval: 5 * 60 * 1000,
     historyLimit: 5,
@@ -1367,6 +1372,16 @@ const AppState = {
     // 控制标志
     isRestoringHistory: false,
     lastTranslatedText: "",
+    // 本次翻译之后，用户有没有在**原文栏**逐句改过稿。只有它为真时，切进 Edit 视图才会
+    // 用 pairs 重建大输入框（见 syncInputFromPairs）—— 没改过就一个字都不动用户粘进来的原文。
+    srcEditedSinceTranslate: false,
+    // 「当前屏幕上这份文档」的代号。从历史恢复 / 清空 各加一次。handleTranslate 在发请求
+    // 之前记下它、在结果落地之前核对：对不上就把结果丢掉。
+    // 【为什么不能只靠 abort】恢复历史时把在途请求 abort 掉是必要的，但不充分：响应已经
+    // 回来、正卡在 await 与 setState 之间的那一刻，abort 什么也拦不住，那份**别的文档**的
+    // 译文照样会盖到刚恢复出来的文档上（实测：恢复 A 之后屏幕变成 B 的 8 行，
+    // 而 sessionId / inputText 还是 A 的）。代号比对是那一刻唯一拦得住的东西。
+    docGeneration: 0,
 
     // Abort Controllers
     mainAbortController: null,
@@ -1550,8 +1565,13 @@ function renderSynonymPopupOnly() {
     // 这一页的建议是整句改写吗（决定：整句徽标 + 整句高亮 + 应用时的替换范围 + 弹窗限宽）
     const sentenceScoped = isSentenceScopedPage(s, mode, pageIndex);
 
+    // 【为什么不再 flex-1】flex-1 让每个页签的宽度 = 弹窗宽度 ÷ 3，于是**弹窗一变宽页签就横着跑**：
+    // 实测同一次选中，加载态弹窗 209px 宽、结果回来 240px 宽，三个页签的中心从
+    // 716/736/766 跳到 740/811/882 —— 最右那个横移了 116px。用户在模型思考的那一两秒里
+    // 瞄准「语法修正」点下去，落点已经不是它了。三个标签是固定的中文词（替换/简化/语法修正），
+    // 按内容定宽之后页签只依赖弹窗的**左边缘**，而左边缘在下面被钉死了 —— 瞄哪儿就是哪儿。
     const modeButtonsHtml = SYNONYM_MODES.map(m => `
-                <button onclick="handleSynonymModeSwitch('${m}')" class="flex-1 px-1.5 py-1 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${mode === m ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr(SYNONYM_MODE_TIP[m] || '')}" data-tip-pos="bottom">${SYNONYM_MODE_LABEL[m]}</button>
+                <button onclick="handleSynonymModeSwitch('${m}')" class="px-2 py-1 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${mode === m ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr(SYNONYM_MODE_TIP[m] || '')}" data-tip-pos="bottom">${SYNONYM_MODE_LABEL[m]}</button>
     `).join('');
 
     // 附带提议行（「整句别处还有问题」）。**永远是可选的第二行**，用户不点就什么都不发生。
@@ -1644,7 +1664,11 @@ function renderSynonymPopupOnly() {
                 </div>
                 <button onclick="updateSynonymState({show:false})" class="text-slate-300 hover:text-slate-500">${Icons.XSmall}</button>
             </div>
-            <div class="min-h-[60px] flex flex-col justify-center">
+            <!-- 等结果的时候先把位置**占住**：见下方定位代码里那段「弹窗不许从光标底下跑掉」。
+                 加载态只有一行 spinner（整窗 152px），结果回来是 4~5 条候选（263px）——
+                 这 111px 的落差就是让弹窗翻到锚点上方、整体上跳 293px 的直接原因。
+                 先按结果的大致高度留白，第一次落点算的就是最终形态该待的地方。 -->
+            <div class="${s.loading ? '' : 'min-h-[60px] '}flex flex-col justify-center"${s.loading ? ' style="min-height:180px;"' : ''}>
                 ${bodyHtml}
             </div>
             ${focusPopupRowHtml()}
@@ -1661,24 +1685,55 @@ function renderSynonymPopupOnly() {
     // 插入到 body
     document.body.insertAdjacentHTML('beforeend', popupHtml);
 
-    // 同步测量并夹紧定位：每次重渲染（loading→结果、翻页、模式切换）都会走到这里，
-    // 高度变化后重新夹紧；同步读 offsetWidth/offsetHeight 不会闪烁，无需 RAF。
-    // 锚点始终是最初选中时的点击坐标（s.position），模式切换不改变锚点。
+    // ============= 定位：一次选中只决定一次落点，之后左上角钉死 =============
+    // 【改动前是怎么坑人的 —— 实测，本轮实跑 qwen3.6-35b-a3b】
+    // 每次重渲染都按**当时的高度**重算一遍落点。加载态整窗 152px，放得进点击点下方；
+    // 1.5 秒后候选回来撑到 263px，下方放不下 → 翻到锚点上方：
+    //     loading  rect (627|691, 1038, 240×152)   模式条 y=1064
+    //     loaded   rect (627|691,  745, 240×263)   模式条 y= 771     ← Δy = −293px
+    // 用户看着加载中的弹窗、把鼠标移到「简化」页签上、在模型思考的这一两秒里点下去 ——
+    // 页签已经跑到 293px 以外，这一下落在弹窗自己的边框上或者页面上。这正是
+    // 「点弹窗自己的壳子」那条故障最主要的**触发方式**（对方是两次误触才找到确定复现路径）。
+    //
+    // 【修法】落点只在**锚点变了**（= 换了一次选中）的时候算一次，算完记进 s.placement；
+    // 同一次弹窗后面的所有重渲染（loading→结果、翻页、模式切换）一律沿用那个左上角。
+    // 模式条在弹窗顶部，钉住左上角就等于钉住了所有页签 —— 用户瞄准哪儿，点下去就是哪儿。
+    // 内容再长也不许溢出屏幕：给弹窗一个高度上限，超出部分在弹窗内部滚动（而不是整体位移）。
+    //
+    // 【margin 用 12 不是 8】renderApp 末尾的 adjustAllPopups() 会在 rAF 里再看一眼，
+    // 一旦发现 bottom/right 越过 viewport−10 就用 `bottom:100%` / transform 把弹窗挪走 ——
+    // 那正好会把这里刚钉住的位置再弹一次。留 12px 的余量，它对 #synonymPopup 恒为空操作。
     const popupEl = document.getElementById('synonymPopup');
     if (popupEl) {
-        const margin = 8;
+        const margin = 12;
         const w = popupEl.offsetWidth;
         const h = popupEl.offsetHeight;
         const clickX = Number(pos.x) || 0;
         const clickY = Number(pos.y) || 0;
-        const x = Math.max(margin, Math.min(clickX, window.innerWidth - w - margin));
-        let y = clickY + 20; // 优先显示在点击点下方
-        if (y + h > window.innerHeight - margin) {
-            y = clickY - h - 10; // 下方放不下 → 放上方
-            if (y < margin) {
-                y = Math.max(margin, window.innerHeight - h - margin); // 上方也放不下 → 贴底夹紧
+        const kept = (s.placement && typeof s.placement === 'object') ? s.placement : null;
+        // 窗口被缩小到旧落点已经不合理时（y 已经贴到底了）重新算一次，宁可跳一下也不能跑出屏幕。
+        const reusable = kept && kept.ax === clickX && kept.ay === clickY
+            && isFinite(kept.x) && isFinite(kept.y)
+            && kept.y >= margin && kept.y <= window.innerHeight - 120;
+        let x, y;
+        if (reusable) {
+            x = kept.x; y = kept.y;
+        } else {
+            x = clickX;
+            y = clickY + 20;                                        // 优先显示在点击点下方
+            if (y + h > window.innerHeight - margin) {
+                y = clickY - h - 10;                                // 下方放不下 → 放上方
+                if (y < margin) {
+                    y = Math.max(margin, window.innerHeight - h - margin);  // 上方也放不下 → 贴底夹紧
+                }
             }
+            s.placement = { ax: clickX, ay: clickY, x: x, y: y };
         }
+        // 横向宽度会随内容变，每次都重新夹一次：夹紧只防出屏，不会让页签上下乱跑。
+        x = Math.max(margin, Math.min(x, window.innerWidth - w - margin));
+        const room = window.innerHeight - y - margin;
+        popupEl.style.maxHeight = (room > 140 ? room : 140) + 'px';
+        popupEl.style.overflowY = 'auto';
         popupEl.style.left = x + 'px';
         popupEl.style.top = y + 'px';
         popupEl.style.visibility = 'visible';
@@ -4818,7 +4873,52 @@ function xportProtectedSpan(text, i) {
         return 0;   // 不配对：当普通字符放过，绝不吞掉半段正文
     }
 
+    // (2c) LaTeX 注释：未转义的 `%` 起、**到行末为止，连那个换行一起**收成一个 token。
+    // 【为什么必须有 —— 实测，两个模型 4/4】原文 #417 是一句被作者用 `%` 注释掉一半的话：
+    //     Subsequently, both players
+    //     %employ Temporal Graph Neural Networks (TGNNs) to
+    //     predict the opponent's strategy and refine their beliefs.
+    // LaTeX 只排 `%` 之外的部分。改动前 `%` 和换行都是**裸的普通字符**送给模型，模型顺手
+    // 把它们抹平，交回来的是「随后，两名玩家均利用时序图神经网络（TGNNs）预测……」——
+    // 作者**故意注释掉、不打算发表**的技术论断，被提升成了中文正文里的一句断言。
+    // 而 xportBlockOk 只查占位符/哨兵/控制字符、xportEquationAudit 只数 \begin{env}，
+    // 两个都看不见 `%`：`failedCount=0`、没有 toast、没有失败标记。全篇 1390 段里约 10% 有暴露面。
+    //
+    // 【为什么是「占位符」而不是「先删掉、译完再塞回去」】译文的语序和原文不一样，
+    // 删掉之后没有任何可靠的锚点能把注释放回它原来的位置；而占位符这条路直接复用了
+    // 传输层**已经验证过**的那套保证：xportBlockOk 逐个点名 [[k]]，注释被删/被复制/被改号
+    // 一律当场判失败并进恢复阶梯 —— 六类损坏检查里本来就有它的位置。删除法一点校验都没有。
+    //
+    // 【为什么换行必须收进 token 里】这是这条规则的关键细节：还原是逐字splice 的，
+    // 模型把 [[k]] 放到句中时，还原出来的是 `……译文%注释\n后半句`，`%` 只吃到自己那个换行为止，
+    // 后半句安然无恙（LaTeX 里行尾 `%` 正好就是「吃掉换行」的惯用法，两行会被接成一行，
+    // 与原文的排版结果一致）。若不收换行，`%` 会把它后面的整行译文一起注释掉 ——
+    // 那等于换一种方式毁掉用户的正文。
+    //
+    // 【`\%` 不会走到这里】xportMask / xportProtectedRanges 在扫到 `\` 时整体跳过转义序列
+    // （`/^\\[a-zA-Z@]+\*?/` 匹配不上 `\%`，走 `i += 2` 那一支），所以本函数拿到的 `%`
+    // 一定是**未转义**的注释符。语料里 `32\%` 这类字面百分号原样不动。
+    // 数学环境 / $…$ / \url{…} 内部的 `%` 更早就被 (2)(3)(4) 整体收走了，同样不受影响。
+    if (ch === '%') {
+        const nl = text.indexOf('\n', i);
+        return (nl === -1 ? n : nl + 1) - i;
+    }
+
     if (ch !== '\\') return 0;
+
+    // 【`\%` 为什么**不**在这里被遮起来 —— 上一版遮过，量出来更糟，已撤回】
+    // 曾经有一条规则 (2a) `if (text[i + 1] === '%') return 2;`，把字面百分号整体换成 [[k]]。
+    // 它确实治好了「模型吃掉反斜杠」这一类；但同一套 A/B 量下来，它造出了一类更糟的：
+    //     同样 3 句 × 2 个模型 × 4 轮 = 24 次
+    //     · 遮起来：反斜杠被吃 0/24，**数值含义被改 14/24**
+    //       （「隐蔽吞吐量提升了32\%倍」= 32 倍；「仅有4\%条候选路线」）
+    //     · 不遮  ：反斜杠被吃 10/24，数值含义被改 0/24
+    // 模型看见 `32[[1]]` 时不知道那是百分号，会顺手补一个量词，把论文的主结论数字改掉，
+    // 而 xportBlockOk 看占位符是完好的、failedCount=0 —— 比丢反斜杠更隐蔽、更频繁。
+    // 所以 `\%` 原样送给模型（`%` 前有 `\`，xportMask/xportProtectedRanges 扫到 `\` 一律
+    // 跳两格，所以它也不会被下面 (2c) 的注释规则误吞）。
+    // 「反斜杠被吃」那一类改由 xportBlockOk 的裸 `%` 检查兜住 —— 掩码后的正文里裸 `%`
+    // 恒为 0，模型交回来出现一个就一定是损坏，当场判失败进恢复阶梯，绝不静默交付。
 
     // (2b) LaTeX 强制换行 \\ / \\* / \\[1pt]。main.tex 里 \\[1pt] 是唯一一处
     //      「掩码之后仍然裸露在正文里的 LaTeX 语法」，收进来正好把覆盖率补满。
@@ -5012,7 +5112,19 @@ function xportThinkCut(raw, anchorSrc) {
     return { text: t, cut: false, allReasoning: false };
 }
 
-// 「丢、多、改号、写坏、串段、控制字符」六类损坏一次判掉。
+// 没有被 `\` 转义的 `%` 有几个。LaTeX 里这样一个 `%` 会把它到行末的内容全部吞掉，
+// 编译**不报错**，只是排出来的 PDF 里少了一段 —— 全部损坏类型里最安静的一个。
+function xportBareComments(s) {
+    const t = String(s == null ? '' : s);
+    let n = 0;
+    for (let i = 0; i < t.length; i++) {
+        if (t[i] === '\\') { i++; continue; }
+        if (t[i] === '%') n++;
+    }
+    return n;
+}
+
+// 「丢、多、改号、写坏、串段、控制字符、裸注释符」七类损坏一次判掉。
 // 不通过 = 进重试阶梯，绝不静默入库 —— 这是整个改动的安全底线。
 function xportBlockOk(body, map) {
     if (typeof body !== 'string') return false;
@@ -5024,6 +5136,12 @@ function xportBlockOk(body, map) {
     // `\textcolor` → TAB + "extcolor"，`\ref` → CR + "ef"。LF(0x0A) 仍然合法（多行块是常态）。
     // 误判的代价是多走一次恢复阶梯；漏判的代价是把控制字符写进用户文档。
     if (/[\x00-\x09\x0B-\x1F\x7F]/.test(t)) return false;
+    // 裸 `%` = 反斜杠被吃掉（`32\%` → `32%`），或者模型自己编了个注释符。
+    // 【为什么这条检查不可能误杀】送给模型的**掩码后**正文里裸 `%` 恒为 0：注释被
+    // xportProtectedSpan (2c) 整体收成占位符，字面百分号一律以 `\%` 的形式出现。
+    // 所以交回来的正文里只要有一个裸 `%`，它就一定不是原文里的东西 —— 与
+    // 「占位符少了一个」同一个性质，判失败进阶梯重问，绝不写进用户的 .tex。
+    if (xportBareComments(t) > 0) return false;
     const seen = [];
     for (let i = 0; i < map.length; i++) seen.push(0);
     const re = /\[\[\s*(\d+)\s*\]\]/g;
@@ -5039,9 +5157,64 @@ function xportBlockOk(body, map) {
     return true;
 }
 
+// ============= 「一个哨兵都没有的整段回复」的守门员 =============
+// 【它守的是哪条路】xportParseBlocks 里那条 `expectedCount === 1 且没有哨兵 → 整段当译文`
+// 的宽容规则。它存在的理由是好的（模型忘了写 @@1@@ 不该让整段作废），但它**一点校验都没有**：
+// 回复是什么就原样入库。而这条路正是逐行「重新生成这一句」按钮和恢复阶梯第 1 级走的路。
+//
+// 【实测（本轮离线复现，stub 模型）】三种回复原封不动地成了用户文档里的正文，
+// failedCount=0、无 toast、无失败标记：
+//   · "Sure! Here's the Chinese translation …:\n\n所提出的方案…\n\nLet me know if you'd like…"
+//     → 连英文闲聊一起写进译文栏
+//   · "I'm sorry, but I can't help with that request."  → 这句话本身成了译文
+//   · "As an AI language model, I am unable to translate that text."  → 同上
+// 占位符为 0 的段（纯散文，语料里最常见的一种）xportBlockOk 平凡通过，什么也拦不住。
+//
+// 【为什么是「否决」而不是「把闲聊剪掉」】多段批次那条路本来就是整批否决闲聊的
+// （实测 expectedCount=2 时同样的回复返回 {} —— 单段路是唯一的缺口）。否决之后这一段
+// 进恢复阶梯重问一次，比猜「哪几行才是译文」可靠得多；猜错就是把错的内容写进用户论文，
+// 正是这次要根除的那一类。
+//
+// 【四条规则，每条都单独求高精度 —— 宁可漏判也不能误杀一句真译文】
+//   R  拒绝语：只认**开头**的固定说法（I'm sorry / I can't / As an AI / 抱歉 / 作为语言模型…）。
+//      句中出现 sorry 的正常句子（"The authors are sorry to report…"）不受影响。
+//   L1 招呼语开场：Sure! / Certainly, … 学术句子不会这样开头。
+//   L2 「这是……的翻译：」那一行：同一行里同时有 here is/below is 和 translat*，且后面还有正文。
+//   T  收尾兜售：Let me know… / Hope this helps… / Feel free to… 作为**最后一行**。
+// 单独用「首行以冒号结尾」之类的宽规则会误杀 "We consider two regimes:" 这种真句子，
+// 所以四条规则都带了额外的锚点。
+//
+// 【本轮删掉的三条 —— 它们误杀的是真句子，代价是整篇翻译当场抛异常】
+//   · `unfortunately\s*[,，]`：学术写作里 "Unfortunately, this bound is not tight." 是常见句式，
+//     不是拒绝语。误杀之后单段文档三级阶梯全部否决同一个字符串，translateViaSentinel 抛
+//     「请检查本地服务器与模型设置」—— 模型明明答对了，却把锅甩给用户的服务器，
+//     而且是确定性的、重试多少次都一样。
+//   · `of\s+course`：zh→en 方向译文合法地以 "Of course, the receiver…" 开头。
+//   · 收尾兜售里的 `anything\s+else`：正文最后一行完全可能是
+//     "…outperforms anything else reported to date."
+// 判据从来只有一条：宁可漏判一句闲聊，也绝不误杀一句真译文 —— 漏判是脏一行，
+// 误杀是整篇翻不出来。
+// 四条规则写在函数体里（而不是模块级 const）是刻意的：测试用的抽取器只会按名字
+// 把**函数**整体搬进沙箱，模块级正则常量得再单独列一遍、而它的 const 扫描器认不出
+// 这几条正则字面量。放在体内，谁加载 xportSoloOk 就一定拿到完整的它。
+function xportSoloOk(text) {
+    const t = String(text == null ? '' : text).trim();
+    if (t === '') return false;
+    const refuse = /^\s*(?:i\s*(?:'|’)?\s*m\s+sorry|i\s+am\s+sorry|sorry\s*[,，.!]|i\s+apolog|i\s+(?:can(?:no|(?:'|’)?)t|cannot|won(?:'|’)?t|am\s+unable\s+to|am\s+not\s+able\s+to|must\s+decline)\b|as\s+an\s+ai\b|as\s+a\s+(?:large\s+)?language\s+model\b|抱歉|很抱歉|对不起|我(?:无法|不能)\s*(?:翻译|提供|帮|协助|完成|处理|回答|执行|满足|继续|生成|输出|给出|回应|参与)|作为(?:一个|一名)?\s*(?:ai|人工智能|语言模型))/i;
+    const leadin = /^\s*(?:(?:sure|absolutely|okay|ok|alright|got\s+it|no\s+problem|great|understood)\b\s*[!,.:：—-]|certainly\b\s*[!:：])/i;
+    const hereis = /^[^\n]*\b(?:here\s*(?:'|’)?s|here\s+is|here\s+are|below\s+is|below\s+are)\b[^\n]*\btranslat/i;
+    const tail = /\n[^\n]*\b(?:let\s+me\s+know|hope\s+(?:this|that)\s+helps|feel\s+free\s+to|if\s+you\s*(?:'|’)?\s*(?:d|would)\s+like|would\s+you\s+like\s+me\s+to)\b[^\n]*$/i;
+    if (refuse.test(t)) return false;
+    if (leadin.test(t)) return false;
+    // 「这是译文：」只有在**后面还有别的行**时才是前导废话；整段就这一行时它自己就是内容。
+    if (t.indexOf('\n') !== -1 && hereis.test(t)) return false;
+    if (tail.test(t)) return false;
+    return true;
+}
+
 // 容忍：<think>（含未闭合）、markdown 围栏、首个哨兵之前的任何前导废话、重复编号（先到先得）。
 // expectedCount === 1 且一个哨兵都没有时，把整段正文当作第 1 块 —— 这条专门堵
-// 「模型忘了写 @@1@@ 就让整段作废」的旧行为（第 2 条）。
+// 「模型忘了写 @@1@@ 就让整段作废」的旧行为（第 2 条）；xportSoloOk 是它唯一的守门员。
 // truncated = 本次响应的 finish_reason 是 'length' / 'MAX_TOKENS'，即输出被 token 上限
 // 砍断。它有两个用处：① 最后一块必然是半截的，直接作废让它走阶梯（否则「砍在最后一个
 // [[k]] 之后」的半句话能通过全部完整性检查，被当成完整译文入库）；② 它是「块数少于段数」
@@ -5062,7 +5235,7 @@ function xportParseBlocks(raw, expectedCount, truncated) {
         const body = t.slice(marks[i].end, i + 1 < marks.length ? marks[i + 1].start : t.length).trim();
         if (!(marks[i].n in blocks)) blocks[marks[i].n] = body;
     }
-    if (marks.length === 0 && expectedCount === 1 && t.trim() !== '') blocks[1] = t.trim();
+    if (marks.length === 0 && expectedCount === 1 && t.trim() !== '' && xportSoloOk(t)) blocks[1] = t.trim();
 
     // ---- 编号归一 / 整批否决 ----
     // 【为什么必须有这一段】故障注入实测：模型把编号整体 +1（从 @@2@@ 开始）时，
@@ -5168,8 +5341,21 @@ function xportEnvRanges(text) {
 // **按句**而不是按段，是第 8 条要求：逐句编辑 / 逐句重生成 / 同义词弹窗 / 跨栏高亮
 // 的精度全部建立在「一行 = 一句」上，退化到段会把它们一起拖下水。
 function xportSegments(text) {
+    return xportSegmentsEx(text).segs;
+}
+
+// 与 xportSegments 同一次切分，外加**段落结构**：breaks[i] === true 表示第 i 段是它所在
+// 那个 LaTeX 段落的最后一句，也就是它和第 i+1 句之间原文里隔着一个空行。
+//
+// 【为什么必须把这个信息带出来】复制按钮和「回到大输入框」都要把逐句的行重新拼成一整篇。
+// 用单个 '\n' 拼，LaTeX 里所有分段全部消失：整节正文被并成一大坨连续散文。LaTeX 不报错，
+// 只有编出 PDF 才看得见 —— 实测 main.tex 370 个空行拼回来只剩 4 个（那 4 个还是数学环境
+// 内部的）。段落结构不需要猜：切分本来就是「先按空行分段、再按句号分句」，
+// 谁是某一段的最后一句在切分当场就知道，这里只是把它记下来传出去。
+function xportSegmentsEx(text) {
     const src = String(text == null ? '' : text);
     const out = [];
+    const breaks = [];
     // 段落 = 空行分隔，但**落在数学环境内部的空行不算**（见 xportEnvRanges）。
     // envs 为空时这段逐字等价于原来的 src.split(/\n[ \t]*\n+/)。
     const envs = xportEnvRanges(src);
@@ -5185,6 +5371,7 @@ function xportSegments(text) {
     for (let p = 0; p < paras.length; p++) {
         const para = paras[p];
         if (!para.trim()) continue;
+        const madeBefore = out.length;
         let ends;
         try { ends = findSentenceBoundaries(para); } catch (e) { ends = []; }
         const ranges = xportProtectedRanges(para);
@@ -5213,8 +5400,13 @@ function xportSegments(text) {
             }
             if (buf.trim()) out.push(buf);
         }
+        // 这一段确实产出了句子：它的**最后一句**后面原文里隔着一个空行。
+        if (out.length > madeBefore) breaks[out.length - 1] = true;
     }
-    return out;
+    for (let i = 0; i < out.length; i++) if (breaks[i] !== true) breaks[i] = false;
+    // 最后一句后面没有「下一段」，标不标都一样；置 false 免得调用方在末尾多拼一个空行。
+    if (out.length > 0) breaks[out.length - 1] = false;
+    return { segs: out, breaks: breaks };
 }
 
 // 失败段的「再切一刀」：先按句，句只有一条就按换行，再不行按空格找中点。
@@ -5851,6 +6043,56 @@ async function xportLegacyOne(seg, srcName, tgtName, config, signal) {
     return parts.length ? parts.join(' ') : null;
 }
 
+// ============= 阶梯第 3 级（旧 JSON 协议）交付前的完整性检查 =============
+// 【改动前】级 1、级 2 都用 xportBlockOk 逐个点名占位符才敢交付；级 3 把 xportLegacyOne
+// 的字符串**原样 return**，一次检查都没有，failedCount 不加、没有失败标记、没有 toast。
+// 哨兵传输的全部承诺就是「交付出去的每一行都过了六类损坏检查」——级 3 是这个承诺上的洞。
+//
+// 【实测（本轮离线复现）】把一段带 \cite{} 和 $\alpha_i$ 的正文逼到级 3，让旧协议交回
+// 一份**丢掉了整个 \cite{smith2020}、还带着裸 TAB** 的译文：
+//     via={"legacy":1,"batch":1}  failedCount=0  markedFailed=false
+// 同一份内容如果走批次路，xportBlockOk 第一眼就判失败。语料轮里也抓到过真的：
+// 级 3 交回的公式被重排成一行、`(T)` 后面多出个 `\=`（数学模式里是重音符，**编译不过**），
+// 而 xportEquationAudit 只数 \begin{env}，两边都有，lost=0，一声不吭。
+//
+// 【为什么不能直接调 xportBlockOk】级 3 发出去的是**没有遮罩**的原文，收回来的自然也
+// 没有 [[k]]，xportBlockOk 会把每一行都判失败。等价的检查是：把 mm.map 里那些原文片段
+// 直接拿到译文里逐个点名 —— 哨兵路的 xportUnmask 是把 map[k] 原样 splice 回去的，
+// 所以「原样出现且只出现一次」正是那条路已经在保证的东西，一个字都没有更严。
+//
+// 【长的先抠】`$\alpha$` 和 `\alpha` 同时在 map 里时，先抠短的会让长的那处被重复计数。
+// 按长度降序、抠掉的位置填一个 NUL 占位（NUL 不可能与任何片段拼出新的匹配），
+// 抠完再扫一遍：还剩下同样的片段 = 模型把它复制了一份，与 xportBlockOk 的 seen!==1 同义。
+//
+// 【rawSeg 是可选的】给了就多做一条检查：交回来的裸 `%` 不能比原文里的多。级 3 发出去的是
+// **没有遮罩**的原文，所以它自己可能带着真注释，不能像 xportBlockOk 那样要求恒为 0；
+// 但「多出来一个」只能是模型把 `\%` 的反斜杠吃掉了，那一行在 PDF 里会从那里起整段消失。
+function xportLegacyOk(body, map, rawSeg) {
+    if (typeof body !== 'string') return false;
+    const t = body.trim();
+    if (t === '') return false;
+    if (/@@\s*\d+\s*@@/.test(t)) return false;                  // 哨兵漏进正文 = 段落串了
+    if (/[\x00-\x09\x0B-\x1F\x7F]/.test(t)) return false;       // 裸控制字符 = 反斜杠命令被吃掉
+    if (/\[\[\s*\d+\s*\]\]/.test(t)) return false;              // 旧协议根本没发过占位符，出现即是幻觉
+    if (!xportSoloOk(t)) return false;                          // 拒绝语 / 闲聊同样不能当译文入库
+    if (typeof rawSeg === 'string' && xportBareComments(t) > xportBareComments(rawSeg)) return false;
+    const lits = [];
+    const arr = Array.isArray(map) ? map : [];
+    for (let i = 0; i < arr.length; i++) {
+        const s = String(arr[i] == null ? '' : arr[i]);
+        if (s !== '') lits.push(s);
+    }
+    lits.sort(function (a, b) { return b.length - a.length; });
+    let rest = t;
+    for (let i = 0; i < lits.length; i++) {
+        const at = rest.indexOf(lits[i]);
+        if (at === -1) return false;                            // 丢了一段受保护内容
+        rest = rest.slice(0, at) + '\u0000' + rest.slice(at + lits[i].length);
+    }
+    for (let i = 0; i < lits.length; i++) if (rest.indexOf(lits[i]) !== -1) return false;   // 复制了一份
+    return true;
+}
+
 // 单段恢复阶梯。每一级都**改变了请求内容**——实测占位符丢失是确定性的，
 // 重发同样的请求 6/6 次丢同样的 token，所以「原样重试」被刻意排除在外。
 async function xportRecoverSegment(mm, rawSeg, wasBatched, srcName, tgtName, config, signal, spend) {
@@ -5875,14 +6117,23 @@ async function xportRecoverSegment(mm, rawSeg, wasBatched, srcName, tgtName, con
                 if (body != null && xportBlockOk(body, pm[i].map)) pieces.push(xportUnmask(body, pm[i].map));
                 else { ok = false; break; }
             }
-            if (ok) return { tgt: pieces.join(' '), via: 'split' };
+            // 【为什么是 '\n' 而不是 ' '】用空格拼，一块**结尾停在 LaTeX 注释里**的碎片会
+            // 把下一块整个拉到同一行上 —— 那一行从 `%` 起全被注释掉，编译不报错，
+            // PDF 里整段正文消失，而 failedCount 仍是 0。实测 main.tex 的第 632 段
+            // （`%Both players observe…` 后面跟一条 \STATE）走到这一级时，交付出来的行
+            // LaTeX 排出来是空的 —— 整句被删，一声不吭。
+            // 换成换行之后 `%` 只吃到它自己那个换行为止，下一块安然无恙；而 xportSplitSegment
+            // 本来就是**按句/按行**切的，用换行拼回去比用空格更接近原文的排版。
+            if (ok) return { tgt: pieces.join('\n'), via: 'split' };
         } catch (err) { if (err && err.name === 'AbortError') throw err; }
     }
-    // 级 3：退回旧协议
+    // 级 3：退回旧协议。**和前两级同一把尺子**：过不了 xportLegacyOk 就当这一级也失败，
+    // 这一段回到调用方后是可见的失败标记 + failedCount + toast —— 交付一份查不过的内容
+    // 并把它算成成功，正是这次要堵的那个洞。
     if (spend()) {
         try {
             const legacy = await xportLegacyOne(rawSeg, srcName, tgtName, config, signal);
-            if (legacy) return { tgt: legacy, via: 'legacy' };
+            if (legacy && xportLegacyOk(legacy, mm.map, rawSeg)) return { tgt: legacy, via: 'legacy' };
         } catch (err) { if (err && err.name === 'AbortError') throw err; }
     }
     return null;
@@ -5898,21 +6149,87 @@ function xportActive(config) {
     } catch (e) { return false; }
 }
 
+// 掩码之后，这一段还剩下**可翻译的字**吗？把 [[k]] 抠掉还是空 = 整段是注释、或者整段
+// 就是一条公式，一个字都没得翻。这种段不该发出去：发出去只会让模型对着一个孤零零的
+// 占位符编话（xportParseBlocks 的单段路对前导废话没有任何守卫），而它本来就该原样交付。
+// main.tex 里光是「整段都是 % 注释」的段落就有 200 个。
+function xportNothingToTranslate(maskedText) {
+    return String(maskedText == null ? '' : maskedText).replace(/\[\[\s*\d+\s*\]\]/g, '').trim() === '';
+}
+
+// ============= 每一行「剥离颜色宏之前」的那份原文 =============
+// 【它救的是什么】pair.src 是 stripTextColorForModel **之后**的文本 —— 用户论文里那
+// 566 处 `\textcolor{...}{...}`（他用来标记修订）在里面一个都不剩。只要有任何一条路
+// 拿 pairs 重建整篇（切进 Edit 视图、复制原文、从归档恢复、整篇重新生成），
+// 那 566 处标记就被从文档里**删掉**，而且会随着下一次翻译 / 落盘变成永久的。
+//
+// 【为什么可以逐行对上】stripTextColorForModel 只**删字符**，从不插入、不重排，
+// 所以剥离后的文本是原文的一个子序列；一次两指针扫描就能给每个剥离后字符找回它在
+// 原文里的下标。而 xportSegmentsEx 交出的每一段都是剥离后文本的一段连续子串（按顺序），
+// 用一个游标 indexOf 就能定位。两者一合，每一行都能切回原文里对应的那一片。
+//
+// 【切片边界】第 i 行取 [上一行最后一个字符之后, 本行最后一个字符] —— 被删掉的宏头
+// （`\textcolor{blue}{`）和宏尾（`}`）不管落在行内还是行与行之间的空白里，都会被
+// 某一行收进去，逐行拼起来正好还原整篇。最后一行一直取到文末。
+//
+// 【对不上就当没有这回事】任何一步不成立（不是子序列、某一段找不到、legacy 那条路
+// 的 src 是模型自己编的）都直接 return，pairs 里就没有 srcRaw，行为与改动前逐字一致。
+// 原文里根本没有 \textcolor 时更是第一行就返回 —— 常见情形零开销、零行为变化。
+function xportAttachRawSrc(translations, pristine, stripped) {
+    try {
+        if (!Array.isArray(translations) || translations.length === 0) return;
+        if (typeof pristine !== 'string' || typeof stripped !== 'string') return;
+        if (pristine === stripped) return;          // 没有颜色宏：src 本身就是原样
+        const idx = new Array(stripped.length);     // 剥离后下标 -> 原文下标
+        let p = 0;
+        for (let s = 0; s < stripped.length; s++) {
+            const c = stripped[s];
+            while (p < pristine.length && pristine[p] !== c) p++;
+            if (p >= pristine.length) return;       // 不是子序列：放弃，不猜
+            idx[s] = p++;
+        }
+        const ends = [];
+        let cur = 0;
+        for (let i = 0; i < translations.length; i++) {
+            const seg = translations[i] && translations[i].src;
+            if (typeof seg !== 'string' || seg === '') return;
+            const at = stripped.indexOf(seg, cur);
+            if (at === -1) return;                  // 这一行不是剥离后文本的子串：放弃
+            ends.push(at + seg.length);
+            cur = at + seg.length;
+        }
+        for (let i = 0; i < translations.length; i++) {
+            const from = (i === 0) ? 0 : idx[ends[i - 1] - 1] + 1;
+            const to = (i === translations.length - 1) ? pristine.length : idx[ends[i] - 1] + 1;
+            translations[i].srcRaw = pristine.slice(from, to);
+        }
+    } catch (e) { /* 对不上就当没有这份信息 */ }
+}
+
 // 返回值与 translateBulk 完全同形（{translations:[{src,tgt}]}），外加统计字段。
 // 契约：**只要有一段成功就绝不抛异常** —— 已交付的内容永远不会因为后面某一段失败而消失。
 async function translateViaSentinel(text, srcLang, tgtLang, config, signal) {
     const srcName = srcLang === 'zh' ? 'Chinese' : 'English';
     const tgtName = tgtLang === 'zh' ? 'Chinese' : 'English';
-    const segs = xportSegments(text);
+    const cut = xportSegmentsEx(text);
+    const segs = cut.segs;
+    const brks = cut.breaks;
     // 切不出任何一段 = 输入是空白/纯注释。**抛**而不是返回空数组：调用方拿到
     // { translations: [] } 会当成一次成功的翻译，把屏幕上现有的译文整份换成 0 行。
     if (segs.length === 0) throw new Error('没有可翻译的内容（输入为空或只有空白）');
 
     const masked = segs.map(xportMask);
     const limits = await xportLimits(config);
-    const batches = xportPack(masked, limits);
     const tgts = new Array(segs.length).fill(null);
     const via = new Array(segs.length).fill('');
+    // 没有可翻译字符的段（纯注释段 / 纯公式段）直接原样交付，不占请求、不进批次。
+    const pending = [];
+    for (let i = 0; i < segs.length; i++) {
+        if (xportNothingToTranslate(masked[i].text)) { tgts[i] = segs[i]; via[i] = 'verbatim'; }
+        else pending.push(i);
+    }
+    // xportPack 返回的是「它收到的那个数组」的下标，映射回全局段号。
+    const batches = xportPack(pending.map(i => masked[i]), limits).map(b => b.map(k => pending[k]));
     let firstErr = null;
     let budget = limits.recovery;
     const spend = function () { if (budget <= 0) return false; budget--; return true; };
@@ -5962,10 +6279,20 @@ async function translateViaSentinel(text, srcLang, tgtLang, config, signal) {
         }
     }
 
-    if (tgts.every(t => t === null)) {
-        // 一段都没成 = 配置 / 连接 / 模型级问题，把原始报错原样上抛（调用方保留旧译文）
+    // 【只看**发出去过**的那些段】原样交付的纯注释/纯公式段永远是「成功」的，把它们算进来
+    // 会让「整轮网络全挂」变成一次「部分成功」，于是调用方拿一份几乎全是失败标记的文档
+    // 覆盖掉屏幕上原来那份好的译文。判据必须是「送出去的段一段都没成」。
+    if (pending.length > 0 && pending.every(i => tgts[i] === null)) {
+        // 有过真的传输错误 = 配置 / 连接 / 模型级问题，把原始报错原样上抛（调用方保留旧译文）
         if (firstErr) throw firstErr;
-        throw new Error('翻译失败：模型没有返回任何可解析的分段（请检查本地服务器与模型设置）');
+        // ============= 没有任何传输错误，但每一段都没通过检查 =============
+        // 【为什么改这句话】上一版这里说的是「请检查本地服务器与模型设置」。实测（单段文档，
+        // 模型连续四次把 `32\%` 的反斜杠吃掉）它就是这么弹出来的 —— 服务器好好的、模型也
+        // 答了、答得还挺像样，是**完整性检查**把它拦下来的。把锅甩给用户的服务器，
+        // 会让他去改一个根本没坏的东西。这条 throw 本身是对的（抛出去调用方才会保留屏幕上
+        // 原来那份译文，不至于被一份全是失败标记的文档覆盖），错的只是它说的话。
+        throw new Error('翻译失败：模型有回应，但每一段都没通过完整性检查'
+            + '（占位符、公式或注释符 % 被改动了），已保留原有译文。可以再点一次，或换一个模型。');
     }
 
     let failedCount = 0;
@@ -5975,7 +6302,9 @@ async function translateViaSentinel(text, srcLang, tgtLang, config, signal) {
         const key = via[i] || 'failed';
         viaCount[key] = (viaCount[key] || 0) + 1;
         if (tgts[i] === null) failedCount++;
-        translations.push({ src: segs[i], tgt: tgts[i] === null ? XPORT_FAIL_MARK : tgts[i] });
+        // brk：这一句后面在原文里是不是一个空行（= LaTeX 分段）。复制按钮和「回到大输入框」
+        // 靠它把整篇拼回去，不然全篇分段会在导出时被抹平。
+        translations.push({ src: segs[i], tgt: tgts[i] === null ? XPORT_FAIL_MARK : tgts[i], brk: brks[i] === true });
     }
     return { translations: translations, transport: 'sentinel', failedCount: failedCount, viaCount: viaCount, viaRows: via };
 }
@@ -5985,12 +6314,16 @@ async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
     // 传输期剥离颜色宏（不改动用户原文，仅改动本次发送给模型的副本）
+    const pristine = typeof text === 'string' ? text : String(text == null ? '' : text);
     text = stripTextColorForModel(text);
 
     // 哨兵传输协议（详见上方大段注释）。开关关掉、或 provider 不在实测范围内时，
     // 下面一行之后的代码与改动前逐字一致。
     if (xportActive(config)) {
-        return await translateViaSentinel(text, srcLang, tgtLang, config, signal);
+        const r = await translateViaSentinel(text, srcLang, tgtLang, config, signal);
+        // 每一行**剥离之前**的那份原文，逐行挂回去（见 xportAttachRawSrc）。
+        xportAttachRawSrc(r && r.translations, pristine, text);
+        return r;
     }
 
     const srcName = srcLang === 'zh' ? 'Chinese' : 'English';
@@ -6824,7 +7157,12 @@ async function summarizeText(text, config) {
 // ============= 翻译相关函数 =============
 
 // 执行翻译
-async function handleTranslate() {
+// opts.auto = true 表示这一次是 AUTO SYNC 的防抖定时器发起的，不是用户亲手点 TRANSLATE。
+// 唯一的区别在下面那道「未提交草稿闸门」：定时器不许弹 window.confirm（用户正在大输入框里
+// 打字，一个从后台冒出来的模态框会被顺手按掉、连带丢掉他右栏那处没保存的修改），改成
+// 什么都不做 + 一条说清楚原因的 toast。
+async function handleTranslate(opts) {
+    const autoFired = !!(opts && opts.auto === true);
     // 停止功能
     if (AppState.isLoading && AppState.mainAbortController) {
         AppState.mainAbortController.abort();
@@ -6832,12 +7170,69 @@ async function handleTranslate() {
         return;
     }
 
+    // 先把原文栏里的逐句改稿收回大输入框（见 syncInputFromPairs）。
+    // 【为什么必须在下面那个相等判断**之前**】用户在原文栏改了一句、直接按 TRANSLATE：
+    // 改动只落在 pairs 里，inputText 一个字都没变，于是相等成立，弹出
+    // 「原文和上次翻译的一模一样」—— 而屏幕上的原文明明就在那儿，跟上次不一样。
+    // 收回来之后 inputText 反映的就是屏幕上那份，说的和做的从此一致。
+    // 重建真的发生了才提示：这一次翻译之后 pairs 会整份换新，缝不回来的那几行的
+    // \textcolor 从此**永久**没了（新 pairs 的 srcRaw 是按这份不带宏的文本重新算的），
+    // 所以这是最后一次能说的机会。
+    if (syncInputFromPairs()) xportWarnColorMacroLoss('这次要翻译的原文');
+
     if (!AppState.inputText.trim()) return;
 
     // 检查输入是否变化：如果已有翻译结果且输入未改变，则不执行翻译
     // 用户应使用重新生成按钮来重新翻译
+    //
+    // 【为什么这里必须说一句话】这条 return 是**用户按下按钮之后**唯一一条什么都不做、
+    // 又什么都不说的路。按钮此刻是亮的、可点的，点下去 0 个网络请求、error=null、toast=null，
+    // 用户只能理解成「这个应用坏了」。自动翻译那条防抖路自己就带了同样的判断，走不到这里，
+    // 所以这句提示只会在用户**亲手点**的时候出现，不会糊屏。
     if (AppState.translationPairs.length > 0 && AppState.inputText === AppState.lastTranslatedText) {
+        try {
+            showToast('原文和上次翻译的一模一样，没有重新翻译。想换一版译文请用旁边的「重新生成所有翻译」。', 'info');
+        } catch (e) {}
         return;
+    }
+
+    // ---- 未提交草稿闸门（与 handleRegenerateAll 那道逐字同一条理由）----
+    // 【实测的原始故障（L2-1）】开着第 2 行的编辑框、框里有没按 Update 的字，点顶栏 TRANSLATE：
+    // handleGlobalClick 对 <button> 直接 return，所以 activeIndex 一直留着；renderPairRow 的
+    // isEditing 分支不吃 rowLocked，于是那一行照旧是一个可编辑的 textarea（实测
+    // `open row carries the lock tooltip = false`，而**别的**行 lock tooltip / cursor-not-allowed
+    // 都有），同时 toast 说着「这期间不能逐句编辑」。翻译落地把 translationPairs 整份换掉之后，
+    // 随便点一下空白 → saveRowUpdate 拿**过期草稿**覆盖刚翻出来的新译文，而且因为「只有一侧变了」
+    // 还会发一次智能更新把**原文栏**也改写掉（实测终态
+    // pairs[1] = {"src":"AI-REWRITTEN-SOURCE","tgt":"T:Two sentence. MYDRAFT"}，error=null、
+    // toast 只有那句「不能逐句编辑」）。
+    // 文案和注释都说这期间不能编，那么正在开着的那一行也必须被关掉 —— renderPairRow 的
+    // isEditing 分支同时补上了只读样式，两处一起才把那句话变成真的。
+    // 【为什么放在这里】必须在相等判断之后（那一条什么都不做，不该顺手把编辑框关掉），
+    // 又必须在 isLoading 置位之前（一旦置位，行就被 rowLocked 锁住，用户再也点不了 Update）。
+    if (AppState.activeIndex !== null) {
+        const cur = AppState.translationPairs[AppState.activeIndex];
+        const dirty = !!cur && (AppState.editValues.src !== cur.src || AppState.editValues.tgt !== cur.tgt);
+        if (dirty) {
+            if (autoFired) {
+                // 定时器路：不弹模态框，也**不**丢弃草稿 —— 什么都不做，把原因说出来。
+                // 用户点 Update（或点走这一行）之后，下一次击键的防抖就会正常翻。
+                try {
+                    showToast('第 ' + (AppState.activeIndex + 1) + ' 行还有没保存的修改，自动翻译先停一下：'
+                        + '翻译会把整篇译文换成新的一版，那处修改会被覆盖。点这一行的 Update 保存它'
+                        + '（或者点走这一行放弃它），之后自动翻译会自己继续。', 'warning');
+                } catch (e) {}
+                return;
+            }
+            let go = false;
+            try {
+                go = window.confirm('第 ' + (AppState.activeIndex + 1) + ' 行还有没保存的修改。\n\n'
+                    + 'TRANSLATE 会把整篇译文换成新的一版，这处修改会被丢掉，而且找不回来。\n\n'
+                    + '确定 = 丢弃它并继续；取消 = 先回去点 Update 保存。');
+            } catch (e) { go = false; }
+            if (!go) return;
+        }
+        setState({ activeIndex: null, editValues: { src: '', tgt: '' } });
     }
 
     // 保存原始输入内容（每次翻译都刷新；否则重新生成/原文视图会停留在第一段旧文本）
@@ -6860,9 +7255,17 @@ async function handleTranslate() {
     const controller = new AbortController();
     AppState.mainAbortController = controller;
 
+    // 这一次请求属于**哪一份文档**。从历史恢复 / 清空会把 docGeneration 加一，届时下面
+    // 的核对就不成立，这份在途结果会被原地丢掉，而不是盖到用户刚恢复出来的文档上。
+    const gen = AppState.docGeneration;
+    // 真正送出去的那份文本。基线必须同步成**它**，不是响应落地那一刻输入框里的内容 ——
+    // 后者会把「等待期间又敲进去的那句」一起算进基线，于是 TRANSLATE 从此静默失效。
+    const sentText = AppState.inputText;
+
     try {
         const config = getApiConfig();
-        const result = await translateBulk(AppState.inputText, srcLang, tgtLang, config, controller.signal);
+        const result = await translateBulk(sentText, srcLang, tgtLang, config, controller.signal);
+        if (gen !== AppState.docGeneration) return;   // 屏幕上已经换成别的文档了
 
         // 必须是 length > 0，不能只判 `result?.translations`：空数组也是真值，
         // 会把屏幕上现有的整份译文换成 0 行 —— 一次「成功」的翻译反而销毁了内容。
@@ -6870,34 +7273,81 @@ async function handleTranslate() {
             const pairs = result.translations.map(t => ({
                 src: t.src,
                 tgt: t.tgt,
+                brk: t.brk === true,
+                srcRaw: (typeof t.srcRaw === 'string') ? t.srcRaw : undefined,
                 history: [{ src: t.src, tgt: t.tgt }],
                 historyIndex: 0,
                 isUpdating: false,
                 isRegenerating: false
             }));
+            // ============= 顶掉屏幕上那一份之前，先把它存进归档 =============
+            // 【实测的原始故障（本轮，与 handleClear / handleRegenerateAll 同一条规矩，这里独独漏了）】
+            // 「翻译」和「清空」「从历史恢复」「整篇重新生成」一样是**整份文档替换**，可全文件
+            // addToGlobalHistory 的调用点里一个都不是 handleTranslate。逐字复现（node vm 里跑真
+            // handler，模型走哨兵协议桩）：粘一段 A → TRANSLATE（2 行）→ 把第 1 行译文改成
+            // 「…【我校对过的译文A】」→ Update → 等 2.5 秒（此刻 diskHasA=true、savedAt=…669090，
+            // 历史面板写着「已存到本地（IndexedDB），刷新页面可恢复」，globalHistory 里没有 A，
+            // 因为默认 5 分钟自动存档还没跑到）→ 切 Edit 视图、整段粘上 B 覆盖 → TRANSLATE →
+            // 等落地：diskHasA=false、diskGhHasA=false、memGhHasA=false、globalHistory 从 0 到 0，
+            // confirms=[]、toasts=[]、error=null —— **零通知**，A_anywhere=false，永久不可恢复。
+            // 下面那段「换一把归档钥匙」的注释讨论的正是这条路，但它只换了钥匙；前提
+            //「A 已经有一个归档槽位」在自动存档跑到之前根本不成立。
+            // 【为什么不学 handleRegenerateAll 那样「同一份文档就不换钥匙」】那边的源头就是屏幕上
+            // 这份 pairs，「同一份文档」几乎是必然；这里的 sentText 来自大输入框，用户可能整份换过，
+            // 唯一的判据只有首句前 60 个非空白字符那把尺子。尺子判错一次 = A 和 B 共用一个槽位，
+            // 5 分钟后自动存档把 A 顶掉 —— 正是这次要根除的那类静默永久损坏。
+            // 所以钥匙**无条件换**（下面那行原样不动），尺子只用来决定要不要弹那句提示：
+            // 判错的代价是多一条/少一条 toast，不是一份文档。
+            const outgoing = Array.isArray(AppState.translationPairs) ? AppState.translationPairs : [];
+            if (outgoing.length > 0) {
+                addToGlobalHistory(outgoing, AppState.sessionId);
+                try {
+                    const head = (s) => String(s || '').replace(/\s+/g, '').slice(0, 60);
+                    const onScreenHead = head(outgoing[0] && outgoing[0].src);
+                    // 两边必须是同一把尺子量出来的：屏幕上那句 pair.src 是剥离颜色宏之后的文本
+                    //（理由与 handleRegenerateAll 里那段逐字相同）。
+                    let sentHead;
+                    try { sentHead = head(stripTextColorForModel(sentText)); } catch (e) { sentHead = head(sentText); }
+                    if (onScreenHead && sentHead.slice(0, onScreenHead.length) !== onScreenHead) {
+                        showToast('这次翻译把屏幕上原来那份译文整份换掉了。原来那份已经存进「历史」菜单，'
+                            + '可以从那里整体恢复回来。', 'info');
+                    }
+                } catch (e) {}
+            }
+            // ============= 换一份文档就要换一把归档钥匙 =============
+            // 这一行把 translationPairs **整份**换掉 —— 屏幕上从此是另一份文档了。
+            // 不换 sessionId 的话，「保存 A → 粘贴 B → 翻译 → 保存」会让 B 直接写进 A 的
+            // 归档槽位（addToGlobalHistory 按 id 命中就整份替换 pairs），A 从此哪儿都不存在。
+            // 实测过：那正是上一版留下的 B3。换钥匙之后 A 那一条原地不动，B 另开一条。
             setState({
+                sessionId: xportNewSessionId(),
                 translationPairs: pairs, isEditingMode: false, viewMode: 'preview', isLoading: false,
                 lastTransportFailures: Number(result.failedCount) || 0
             });
+            AppState.srcEditedSinceTranslate = false;
             // 仅在成功后同步基线：失败时保持旧基线，TRANSLATE 才能重试
-            AppState.lastTranslatedText = AppState.inputText;
+            AppState.lastTranslatedText = sentText;
             // 逐段失败必须**说出来**：结果已经交付了（其余段都在），但有几行是失败标记。
             // 静默交付一份缺口文档，正是这次改动要杜绝的那类问题。
             // A7 把「公式整块被吞掉」并进同一条 toast —— 那是唯一一类
             // 「JSON 合法、分段完整、内容却没了」的损坏，别的检查全都看不见。
             AppState.lastEquationLoss = xportReportAfterTranslate(
-                AppState.inputText, result.translations, Number(result.failedCount) || 0).lost;
+                sentText, result.translations, Number(result.failedCount) || 0).lost;
+            xportPersistSoon();
         }
     } catch (err) {
+        if (gen !== AppState.docGeneration) return;   // 这份文档已经被换掉，报错也不再属于它
         if (err.name !== 'AbortError') {
             setState({ error: err.message || "AI Translation failed. Please try again." });
             console.error(err);
         }
     } finally {
-        // 确保 isLoading 状态被正确设置并触发重新渲染
-        AppState.mainAbortController = null;
-        if (AppState.isLoading) {
-            setState({ isLoading: false });
+        // 只清理**自己那次**的状态。恢复历史 / 用户按 STOP 都会在这之前把 isLoading 归零、
+        // 甚至已经开了新的一次请求；无条件清理会把新那次的 STOP 按钮和 loading 态一起废掉。
+        const stillOurs = (AppState.mainAbortController === controller);
+        if (stillOurs) {
+            AppState.mainAbortController = null;
+            if (AppState.isLoading) setState({ isLoading: false });
         }
     }
 }
@@ -6928,11 +7378,27 @@ async function saveRowUpdate(index, manualValues = null) {
     const tgtChanged = currentTgt !== original.tgt;
     const needsAiUpdate = (srcChanged && !tgtChanged) || (tgtChanged && !srcChanged);
 
+    // 原文侧动过 = 大输入框（inputText）和重新生成的输入源（originalInputText）都过时了。
+    // 切进 Edit 视图、或者直接按 TRANSLATE 时，syncInputFromPairs 会据此把整篇重建出来
+    // 并同时更新这两个字段，用户的逐句改稿才不会在下一次翻译/重新生成时被整份抹掉。
+    if (srcChanged) AppState.srcEditedSinceTranslate = true;
+
     updateTranslationPair(index, {
         src: currentSrc,
         tgt: currentTgt,
         isUpdating: needsAiUpdate
     });
+    // ============= 用户手打的这两句，从落进 pairs 的这一刻起就要落盘 =============
+    // 【实测的原始故障】上一行已经把用户按 Update 时框里的原文/译文写进 translationPairs 了
+    // （屏幕上当场就是新的），可这条路上唯一会 xportPersistSoon 的是下面的 addHistory ——
+    // 而智能更新在飞的时候再点一次 Update 就是**取消**：函数顶上那条分支
+    // `if (original.isUpdating) { … updateTranslationPair(…, {isUpdating:false}); return; }`
+    // 直接 return，addHistory 一次都不会跑。逐字复现（真 Chrome，qwen/qwen3.6-35b-a3b）：
+    //   改第 1 行原文加 ` ZZCANCEL2.` → Update（智能更新开始飞）→ 60ms 后再点一次 Update 取消
+    //   → 等 4 秒：内存/屏幕都是 "… ZZCANCEL2."，盘上还是没有它，savedAt 停在 1787262958381
+    //   一个数没动，error=null；刷新之后那句手打的原文没了。
+    // 取消的是**模型那次改写**，不是用户自己打的字 —— 后者必须留下。
+    xportPersistSoon();
 
     let prompt = "";
     let updateField = null;
@@ -6975,6 +7441,23 @@ async function saveRowUpdate(index, manualValues = null) {
 // 添加历史记录
 function addHistory(index, s, t) {
     const pairs = [...AppState.translationPairs];
+    // 【这里曾经有一行 `if (pairs[index].src !== s) AppState.srcEditedSinceTranslate = true;`，
+    //   实测它是一条把模型编的英文写进用户手稿的路（L3-1），已删】
+    // 那一行的理由是「智能更新把原文改写掉的那条路也算原文改稿」。但 srcEditedSinceTranslate
+    // 的含义只能有一个：**用户**动过原文栏，所以 pairs 才是这份文档的准绳。模型的回写不是。
+    // 实测的完整链条（真 Chrome + jump 上的 qwen3.6-35b-a3b，也可用 stub 逐字复现）：
+    //   ① 用户在第 0 行原文栏加了一句 ` SRCEDITMARK01.` → 切 Edit 视图 → 收进 inputText /
+    //      originalInputText（这一步是对的，是本轮的修复）；
+    //   ② 用户接着去校对**译文**：只改了 tgt，saveRowUpdate 走 `updateField='src'`，
+    //      发出 "You are aligning a source text to match a modified translation…"，
+    //      模型交回一句它自己编的英文，addHistory 把它写进 pairs[0].src ——
+    //      用户手打的 SRCEDITMARK01 在这一行里没了（这是 HEAD 就有的行为，且逐行可撤销、看得见）；
+    //   ③ 上面那一行把 srcEditedSinceTranslate 置成 true；
+    //   ④ 随便切一次视图 → syncInputFromPairs 把 pairs 重建进 inputText **和**
+    //      originalInputText —— 实测 `origHasMark:false, hasResearch:true`，模型编的英文
+    //      成了整篇文档的新准绳，用户手打的那句在 AppState 里哪儿都不剩（只剩逐行撤销栈）。
+    // 删掉这一行之后：模型回写只影响它那一行（HEAD 行为，屏幕上看得见、↺ 撤得回），
+    // 不再有任何一条路把它升级成整篇覆盖。
     const newHistory = [...pairs[index].history, { src: s, tgt: t }];
     pairs[index] = {
         ...pairs[index],
@@ -6991,6 +7474,7 @@ function addHistory(index, s, t) {
     }
     
     setState({ translationPairs: pairs });
+    xportPersistSoon();
 }
 
 // 历史导航
@@ -6999,15 +7483,42 @@ function handleHistoryNav(index, delta) {
     const newIdx = item.historyIndex + delta;
     if (newIdx >= 0 && newIdx < item.history.length) {
         const historic = item.history[newIdx];
+        if (item.src !== historic.src) AppState.srcEditedSinceTranslate = true;   // 撤销/重做也会换原文
         const pairs = [...AppState.translationPairs];
         pairs[index] = { ...item, src: historic.src, tgt: historic.tgt, historyIndex: newIdx };
         
         // 同时更新 editValues 以保持同步
         if (AppState.activeIndex === index) {
             AppState.editValues = { src: historic.src, tgt: historic.tgt };
+            // 撤销/重做把这一行的正文整段换掉了 —— 挂在旧正文上的选词弹窗从这一刻起
+            // 指的是别的字。applySynonym 那边现在会核对并中止（F3），但一个「候选项还亮着、
+            // 点下去只会告诉你失效了」的弹窗本身就是在骗人。直接收起来。
+            if (AppState.synonymState && AppState.synonymState.show
+                && AppState.synonymState.index === index) {
+                updateSynonymState({ show: false, loading: false, errorMessage: '' });
+            }
         }
-        
+
         setState({ translationPairs: pairs });
+        // ============= 撤销/重做也必须落盘 =============
+        // 【实测的原始故障】上一版这里没有 xportPersistSoon()。
+        // 【上一版这段注释写的是「这是全文件唯一一个会改内容、却不叫 xportPersistSoon() 的
+        //   处理器」——那句话是错的，本轮重新普查过全文所有会写 translationPairs[i].src/.tgt、
+        //   inputText、originalInputText、globalHistory 的地方，另外还有三处也不落盘，
+        //   都已在各自位置补上并写了实测证据：
+        //     · saveRowUpdate 里 updateTranslationPair 那一处（智能更新被取消 → 手打的原文丢掉）；
+        //     · syncInputFromPairs 重建成功那一支（改稿收回大输入框之后没人落盘）；
+        //     · setViewMode（viewMode 本身就在快照里）。
+        //   别再在任何地方写「唯一」——那种断言每次被独立复核都是错的。】
+        // 逐字复现（真 Chrome，127.0.0.1:8765）：改一行原文+译文 → Update（addHistory 落盘，
+        // disk="…ZZUNDOTEST."，savedAt=1787260254382）→ 点这一行的 ↺ 撤销 → 等 4 秒：
+        // 内存里是撤销后的文本，盘上还是撤销前的那份，savedAt **一个数都没动**（没写过），
+        // 而历史面板同时写着「已存到本地（IndexedDB），刷新页面可恢复 · <时间>」。
+        // 刷新之后被撤销掉的那一版原样回到屏幕上（undoSurvived:false），零提示、零报错。
+        // 撤销是用户用来**挽回**误改的动作，挽回结果不落盘等于挽回了个寂寞。
+        // 别指望 5 分钟自动存档或 pagehide 兜底：前者太晚，后者根本不提交
+        //（见 DOMContentLoaded 里注册 pagehide / visibilitychange 那两行上面的注释）。
+        xportPersistSoon();
     }
 }
 
@@ -7392,7 +7903,20 @@ function handleGrammarOfferAccept(pageIndex) {
 // 作用域是跟着建议一起传进来的，不在这里重新猜。范围核对不上就中止 ——
 // 把一整句改写塞进一个词的位置会直接搅烂正文，宁可什么都不做。
 function applySynonym(synonym, scope) {
-    if (!AppState.synonymState.field || AppState.activeIndex === null) return;
+    // 【改动前这里是一个光秃秃的 `return`】没有提示、不关弹窗、什么状态都不动。
+    // 结果就是一个「悬空的弹窗」：候选项还在，鼠标划过去还变蓝、还出 ⇄ 图标，
+    // 点下去**一个字都不会变，而且永远不会变**，用户完全无从知道发生了什么
+    //（实测：点建议项后 srcHasElucidates=false、error=null、toast=null、弹窗照旧开着）。
+    // 这个函数下面二十行的整句范围守卫本来就会把失效原因说出来
+    //（「整句范围已失效（正文被改动过）…」），同一个函数里两条守卫两种态度，这一条只是被漏了。
+    // 现在：把死掉的弹窗**关掉**（留着只会继续骗人），并用 toast 说清楚为什么和怎么办。
+    if (!AppState.synonymState.field || AppState.activeIndex === null) {
+        updateSynonymState({ show: false, loading: false, errorMessage: '' });
+        try {
+            showToast('这一行已经退出编辑状态，替换没有执行（正文一个字都没改）。请重新点开那一行、重新选中后再试。', 'warning');
+        } catch (e) {}
+        return;
+    }
 
     const field = AppState.synonymState.field;
     const currentText = AppState.editValues[field];
@@ -7413,9 +7937,39 @@ function applySynonym(synonym, scope) {
         start = sr.start;
         end = sr.end;
     } else {
+        // ============= 选区范围也要逐字核对（F3）=============
+        // 【实测的原始故障】这里原来是光秃秃的三行：拿下来 selectionRange 就直接 substring 拼接，
+        // 没有任何「这段范围现在还是不是当初那段文字」的核对。而 editValues 会在弹窗还开着的时候
+        // 被换掉 —— handleHistoryNav（行首的 ↺/↻）和 addHistory 都不关弹窗。实测：
+        //   · 选中译文里的「存在性」[11,14] → 点 ↻ 切到另一版 → [11,14] 现在盖住的是「跳无人」
+        //     → 点候选词，「…多跳无人机网络中…」变成「…多存在机网络中…」，toast=null、error=null，
+        //     按 Update 之后落进 pair.tgt 并随 xportPersistSoon 落盘；
+        //   · 反方向（撤销到更短的一版）则把候选词追加到句尾，要替换的词一个字没动。
+        // 同一个函数上面那条 sentence 分支**有**逐字核对，两条守卫两种态度，这一条被漏了。
+        // 【修法与 chatApplyProposal 的闸门 3 同一把尺子】原位对得上就用原位；对不上就在正文里
+        // 找当初选中的那段文字，恰好一处才重定位，零处或多处一律中止并说明原因。
         const range = AppState.synonymState.selectionRange;
-        start = range.start;
-        end = range.end;
+        const orig = AppState.synonymState.originalText;
+        const bad = () => {
+            updateSynonymState({
+                loading: false,
+                errorMessage: '选中范围已失效（正文被改动过），未做任何替换。请重新选中后再试。'
+            });
+        };
+        if (!range || typeof currentText !== 'string'
+            || typeof range.start !== 'number' || typeof range.end !== 'number'
+            || typeof orig !== 'string' || orig === '') { bad(); return; }
+        if (range.start >= 0 && range.end <= currentText.length
+            && currentText.substring(range.start, range.end) === orig) {
+            start = range.start;
+            end = range.end;
+        } else {
+            let n = 0, at = currentText.indexOf(orig), first = at;
+            while (at !== -1) { n++; if (n > 1) break; at = currentText.indexOf(orig, at + 1); }
+            if (n !== 1) { bad(); return; }   // 0 处 = 没了；≥2 处 = 有歧义。两种都中止。
+            start = first;
+            end = first + orig.length;
+        }
     }
 
     const newText = currentText.substring(0, start) + synonym + currentText.substring(end);
@@ -7745,6 +8299,21 @@ function addToGlobalHistory(pairs, sid, opts) {
 
     let history = [...AppState.globalHistory];
     const existingIndex = history.findIndex(item => item.id === sid);
+    // 自动存档去重：内容与归档里**任何**一份逐字相同就什么都不做。
+    // 【为什么需要】从历史恢复出来的文档现在会拿到一个新的会话 id（见 restoreGlobalHistory
+    // 里那段注释），不去重的话「恢复一下、什么都没干」也会在一个存档周期后凭空多出一条
+    // 近乎重复的快照，Keep-Last 5 很快就把真正的旧版本挤出去了。手动保存不受限制。
+    if (opts && opts.auto) {
+        let incomingJson = null;
+        try { incomingJson = JSON.stringify(pairs.map(p => [p && p.src, p && p.tgt])); } catch (e) { incomingJson = null; }
+        if (incomingJson !== null) {
+            for (let i = 0; i < history.length; i++) {
+                let hj = null;
+                try { hj = JSON.stringify((history[i].pairs || []).map(p => [p && p.src, p && p.tgt])); } catch (e) { hj = null; }
+                if (hj !== null && hj === incomingJson) return;
+            }
+        }
+    }
     if (opts && opts.auto && existingIndex !== -1) {
         const incoming = countFailMarks(pairs);
         const archived = countFailMarks(history[existingIndex].pairs);
@@ -7756,11 +8325,31 @@ function addToGlobalHistory(pairs, sid, opts) {
     }
     const updatedPairs = JSON.parse(JSON.stringify(pairs));
 
+    // ============= 归档条目必须带着**这份文档的方向** =============
+    // 【实测的原始故障（F1）】归档条目原来只有 {id, timestamp, pairs}，一个语言字段都没有。
+    // 于是「翻一份英文稿 → 存档 → 翻一份中文稿（方向变成 zh→en）→ 从 RECENT SESSIONS
+    // 恢复那份英文稿」之后，AppState.sourceLang 还停在 'zh'，而屏幕上的原文栏是英文：
+    //   · 顶栏芯片实测渲染成 ZH 高亮（`setLanguage('zh','en')`），说的和屏幕上的对不上；
+    //   · 在英文原文里双击 "existence" 开替换弹窗，wire text 实测是 `Language: Chinese`，
+    //     回来的候选是 ["存在","存续","显现","踪迹"]，点一下就把中文塞进英文原文
+    //     （实测 pair.src = "…hide the very 存在 of a transmission…"，toast/error 全 null）；
+    //   · 智能更新的 wire text 实测是 `Task: Translate the "New Source" to English.`
+    //     —— 对着一份英文原文说要译成英文。
+    // 方向是这份文档的属性，不是会话的属性，所以它必须跟着文档一起进归档。
+    // （旧版本写进 IndexedDB 的条目没有这两个字段，restoreGlobalHistory 那边对缺字段的
+    //   条目退回 detectLanguage，见那里的注释。）
+    const stamp = {
+        sourceLang: AppState.sourceLang,
+        targetLang: AppState.targetLang,
+        isAutoDetect: AppState.isAutoDetect === true
+    };
+
     if (existingIndex !== -1) {
         history[existingIndex] = {
             ...history[existingIndex],
             timestamp: Date.now(),
-            pairs: updatedPairs
+            pairs: updatedPairs,
+            ...stamp
         };
         const item = history.splice(existingIndex, 1)[0];
         history.unshift(item);
@@ -7768,34 +8357,155 @@ function addToGlobalHistory(pairs, sid, opts) {
         const newItem = {
             id: sid,
             timestamp: Date.now(),
-            pairs: updatedPairs
+            pairs: updatedPairs,
+            ...stamp
         };
         history = [newItem, ...history];
     }
 
-    setState({ globalHistory: history.slice(0, AppState.historyLimit) });
+    // opts.skipRender = true：只写状态、不重画。给 handleInputChange 那条路用 ——
+    // 它挂在每一次击键上，一次 renderApp 会把 <textarea> 整个换掉、焦点掉到 body，
+    // 之后的击键全部落空（文件里已经因为这个失败模式修过两次，见 handleRowClick 上方注释）。
+    setState({ globalHistory: history.slice(0, AppState.historyLimit) },
+        { skipRender: !!(opts && opts.skipRender) });
+    xportPersistSoon();
 }
 
+// ============= 归档槽位的钥匙：会话 id =============
+// addToGlobalHistory 用 sessionId 去 findIndex 归档里的槽位，**对上就整份替换 pairs**。
+// 所以 sessionId 的含义只能有一个：「屏幕上这一份文档」。换了一份文档就必须换一把钥匙。
+//
+// 【实测的原始故障（B3）】上一版只有 handleClear 和 restoreGlobalHistory 换钥匙，
+// handleTranslate 从来不换：保存文档 A → 粘贴文档 B → 翻译 → 保存，
+// A 的归档槽位里躺的就是 B 了，A 在任何地方都不存在。翻译一次 = 换了一份文档，
+// 这是这个应用里最常见的一个动作，也是最容易毁掉旧存档的那一个。
+//
+// 每一处「整份文档被替换」都从这里取钥匙，一处都不许自己拼 Date.now()：
+// 同一毫秒内连按两次会拿到同一把钥匙，第二份文档又会盖掉第一份。
+function xportNewSessionId() {
+    let nid = String(Date.now()) + '-' + Math.random().toString(36).slice(2, 8);
+    try {
+        const used = {};
+        used[String(AppState.sessionId)] = 1;
+        const gh = AppState.globalHistory || [];
+        for (let i = 0; i < gh.length; i++) used[String(gh[i] && gh[i].id)] = 1;
+        let guard = 0;
+        while (used[nid] && guard++ < 50) nid = String(Date.now()) + '-' + Math.random().toString(36).slice(2, 8);
+    } catch (e) {}
+    return nid;
+}
+
+// 从归档里恢复一份文档。**恢复必须是非破坏性的**：既不能被在途请求顶掉，也绝不能让
+// 它来的那个归档槽位被覆盖。
+//
+// 【实测的原始故障，两个都是「内容哪儿都不剩了」】
+//   ① 慢翻译在飞的时候恢复 A：A 上屏 → B 的响应落地把 pairs 换成 B 的 8 行（sessionId /
+//      inputText 还是 A 的）→ 一个自动存档周期后，B 的内容被写进 A 的归档槽位。
+//      终态实测 alphaTextExistsAnywhere: false —— 文档 A 屏幕上没有、归档里也没有了。
+//   ② 某一行处于编辑态时恢复：activeIndex / editValues 还指着**上一份文档**，随后
+//      随便点一下空白就把上一份的草稿 saveRowUpdate 到恢复出来这份的同一行号上，
+//      并且「只有一侧变了」还会顺手发一次 AI 请求把另一栏改写掉。
+//
+// 【三道修法，都是「让它不可能发生」而不是「事后提示」】
+//   · docGeneration 加一 + abort：在途请求既拦得住（abort），落地那一刻也认不出自己的
+//     文档（代号比对），两条路都堵死。
+//   · **换一个新的会话 id**（xportNewSessionId）：恢复出来的这份是一个新的工作副本，
+//     item.id 那个归档槽位从此不会再被这个会话写到。为了不让「恢复一下就多一条重复快照」，
+//     自动存档那边加了逐字去重（见 addToGlobalHistory）。
+//     ⚠️ 这条只保证**恢复**这条路：归档槽位被覆盖这件事本身并没有从根上消失，它的另一半
+//     在 handleTranslate —— 翻译一份新文档同样必须换钥匙，否则旧存档照样被顶掉（B3）。
+//     上一版这里写着「这是从根上不可能发生的唯一写法」，那句话当时就不成立：
+//     验证的人正是在这段注释的作用域里，用「保存 A → 粘 B → 翻译 → 保存」把 A 的槽位覆盖掉的。
+//     换钥匙这件事的完整性由 xportNewSessionId 的**每一个**调用点共同保证，不由这一处。
+//   · 把整份会话级的临时状态全部归零，一条不落。
 function restoreGlobalHistory(item) {
+    if (!item || !Array.isArray(item.pairs)) return;
+
+    // 在途的东西一律先掐掉：整篇翻译、逐行智能更新、逐行重新生成、整篇重新生成、
+    // 自动翻译防抖、选词弹窗请求。任何一个漏掉，它落地时都会写到**别的文档**上。
+    AppState.docGeneration++;
+    try { if (AppState.mainAbortController) AppState.mainAbortController.abort(); } catch (e) {}
+    AppState.mainAbortController = null;
+    try { if (AppState.regenerateAllAbortController) AppState.regenerateAllAbortController.abort(); } catch (e) {}
+    AppState.regenerateAllAbortController = null;
+    try { AppState.rowAbortControllers.forEach(function (c) { try { c.abort(); } catch (e) {} }); AppState.rowAbortControllers.clear(); } catch (e) {}
+    try { AppState.regenerateAbortControllers.forEach(function (c) { try { c.abort(); } catch (e) {} }); AppState.regenerateAbortControllers.clear(); } catch (e) {}
+    try { if (AppState.debounceTimer) clearTimeout(AppState.debounceTimer); } catch (e) {}
+    AppState.debounceTimer = null;
+    try { if (AppState.synonymAbort) AppState.synonymAbort.abort(); } catch (e) {}
+    AppState.synonymAbort = null;
+
     if (AppState.translationPairs.length > 0) {
         addToGlobalHistory(AppState.translationPairs, AppState.sessionId);
     }
 
     AppState.isRestoringHistory = true;
 
-    const restoredText = item.pairs.map(p => p.src).join('\n');
+    // 归档里存的 pairs 直接引用进来会让后续编辑就地改到归档那份对象上。深拷贝。
+    let pairs;
+    try { pairs = JSON.parse(JSON.stringify(item.pairs)); } catch (e) { pairs = item.pairs; }
+    const restoredText = joinPairsAsDocument('src', pairs);
+
+    // ============= 恢复出来的这份文档，方向必须当场确定 =============
+    // 【实测的原始故障（F1）】这个函数原来全文不含 sourceLang / targetLang / detectLanguage，
+    // 于是恢复完之后 AppState 的方向还是**上一份文档**的。屏幕上是英文原文、芯片写着 ZH，
+    // 替换弹窗按 sourceLang='zh' 发 `Language: Chinese` 并把中文候选塞进英文原文，
+    // 智能更新则说 `Task: Translate the "New Source" to English`。全程 toast=null / error=null。
+    // 【三段优先级】
+    //   ① 归档条目自带方向（addToGlobalHistory 从现在起一律写进去）—— 它就是这份文档
+    //      当初真正跑的那个方向，是唯一的事实来源，手动锁定与否都以它为准。
+    //   ② 旧条目没有这两个字段：只在 AUTO（isAutoDetect）时重新检测，与 handleTranslate /
+    //      handleRegenerateAll 逐字同一条规则 —— 手动锁定的意思就是「别猜」。
+    //   ③ 旧条目 + 手动锁定：一个字节都不动（保持用户自己锁的方向）。
+    // 检测的输入必须先剥掉颜色宏：restoredText 优先用 srcRaw，`\textcolor{purple}{` 里的
+    // 拉丁字母会被 detectLanguage 算进 en 那一边（它只数汉字和 a-zA-Z）。
+    let restSrcLang = AppState.sourceLang, restTgtLang = AppState.targetLang;
+    if ((item.sourceLang === 'zh' || item.sourceLang === 'en')
+        && (item.targetLang === 'zh' || item.targetLang === 'en')) {
+        restSrcLang = item.sourceLang;
+        restTgtLang = item.targetLang;
+    } else if (AppState.isAutoDetect) {
+        let basis = restoredText;
+        try { basis = stripTextColorForModel(restoredText); } catch (e) { basis = restoredText; }
+        const detected = detectLanguage(basis);
+        restSrcLang = detected.src;
+        restTgtLang = detected.tgt;
+    }
+
     setState({
-        sessionId: item.id,
-        translationPairs: item.pairs,
+        // 新会话 id：归档里 item.id 那一条从此不会再被这个会话写到。
+        sessionId: xportNewSessionId(),
+        translationPairs: pairs,
         inputText: restoredText,
+        // 顶栏芯片、替换/简化/语法弹窗、智能更新全都从这两个字段取方向 —— 它们必须
+        // 和屏幕上这份文档一致，而不是和上一份文档一致。
+        sourceLang: restSrcLang,
+        targetLang: restTgtLang,
         // ⚠️ originalInputText 必须跟着一起换。它是「重新生成所有翻译」的输入源，
         //    不换的话恢复完历史再点重新生成，会拿**上一份文档**去覆盖刚恢复出来的这份，
         //    并且随后自动存档会把归档也一起覆盖掉（上一版第 7 条）。
         originalInputText: restoredText,
         lastTransportFailures: 0,
         isEditingMode: false,
-        showHistoryMenu: false
+        showHistoryMenu: false,
+        // ---- 会话级临时状态，一条不落地归零 ----
+        isLoading: false,
+        isRegeneratingAll: false,
+        isRefining: false,
+        activeIndex: null,
+        editValues: { src: '', tgt: '' },
+        refinePrompt: '',
+        error: null,
+        toast: null,
+        activeSettingsPopup: null,
+        activeSettingsIndex: null,
+        activeSettingsSide: null,
+        crossHighlight: { seq: 0, idx: null, fromSide: null, toSide: null, fragments: [], status: 'idle', via: '' }
     });
+    AppState.lastTranslatedText = restoredText;
+    AppState.lastEquationLoss = 0;
+    AppState.srcEditedSinceTranslate = false;
+    updateSynonymState({ show: false });
 
     // 恢复一份翻译 ⇒ 把属于这份翻译的那段对话也接回来（换文档则归档旧的、绝不带过去）。
     // 【放在 setState 之后】chatSyncSession 读的是 AppState.sessionId，必须先换成新的那一份。
@@ -7806,9 +8516,451 @@ function restoreGlobalHistory(item) {
     setTimeout(() => {
         AppState.isRestoringHistory = false;
     }, 500);
+    xportPersistSoon();
 }
 
+// ============================================================================
+// ============= 会话内容的落盘（IndexedDB）与可再武装的自动存档定时器 =============
+// ============================================================================
+//
+// 【改动前的实测事实】翻译内容、逐行撤销栈、globalHistory **全部只活在内存里**：
+// 刷新一次页面 `{pairs:10, ghLen:1}` 变成 `{pairs:0, inputLen:0, ghLen:0}`，历史面板空白。
+// 全文件 grep 不到一处 indexedDB / sessionStorage，localStorage 里那 11 个键 273 个字符
+// **全是设置**。每一个设置都持久化，没有任何一份内容持久化。
+// 而界面同时摆着「自动保存」间隔、「Keep Last: 5/10/20」和一列 RECENT SESSIONS ——
+// 它承诺了一件它根本没做的事。文件里第二位作者甚至已经**依赖**了这个承诺：对话窗那段
+// 注释说不落盘聊天记录的理由是「globalHistory 已经存着最多 5 份全文」。它存着 0 份。
+//
+// 【为什么是 IndexedDB 而不是 localStorage】localStorage 每个源大约 5 MB（实测这台机器
+// 5,242,880 个 UTF-16 单元），而且是**同步**的、跟 37 处设置写共用同一个配额。
+// 用户的 main.tex 单文件就 318 KB，切成句对（src + tgt + 每行撤销栈）序列化之后一份就
+// 超过 1 MB；界面承诺的「保留最近 20 份」在 localStorage 里连一半都放不下，而一旦撞上限，
+// 那 37 处 `try{...}catch(e){}` 空体会把每一次设置写都静默吞掉（实测：配额满时
+// setRowGap / saveGeminiApiKey 全部失败，AppState 更新了、localStorage 是 null、
+// 弹窗照常关闭，用户的 API key 下次打开就没了）。所以内容一律走 IndexedDB：异步、
+// 不阻塞渲染、配额是磁盘可用空间的量级、存结构化克隆不用 JSON 字符串化。
+// 设置继续留在 localStorage —— 它们只有几百字节，且需要在首帧之前同步读到。
+//
+// 【不可协商的两条】
+//   1. 写失败必须**看得见**。配额、隐私模式、IDB 被禁用，任何一种都会弹一条 toast、
+//      在历史菜单里留一行常驻提示、并写 console.error。绝不静默。
+//   2. **绝不**为了腾地方悄悄丢内容。淘汰只由用户自己设的 Keep-Last 决定；
+//      写不下就报错，而不是偷偷少存一份。
+const XPORT_DB_NAME = 'ai-translator';
+const XPORT_DB_STORE = 'session';
+const XPORT_DB_KEY = 'live';
+const XPORT_PERSIST_DEBOUNCE = 1200;
+
+let xportPersistTimer = null;      // 防抖句柄
+let xportPersistInFlight = false;  // 正在写
+let xportPersistAgain = false;     // 写的过程中又有新变化
+let xportPersistDb = null;         // 已打开的连接
+let xportPersistBooted = false;    // 启动恢复跑过了没有（跑之前不许写，否则空状态会盖掉盘上那份）
+
+// 失败必须留下痕迹：toast 会自己消失，这两个字段是常驻的（历史菜单里渲染成一行红字）。
+function xportPersistFail(where, err) {
+    const msg = (err && (err.name === 'QuotaExceededError' || (err.message || '').indexOf('quota') !== -1))
+        ? '浏览器存储配额已满，本次会话没能存到本地。请在历史菜单里把 Keep Last 调小，或导出后清理。'
+        : '本地存档失败（' + where + '）：' + ((err && (err.message || err.name)) || '未知错误')
+          + '。这次会话刷新后可能找不回来。';
+    AppState.persistError = msg;
+    AppState.persistOkAt = 0;
+    try { console.error('[persist] ' + where, err); } catch (e) {}
+    // toast 只在错误内容变化时弹一次，免得每次自动存档都糊一屏
+    if (AppState.persistErrorShown !== msg) {
+        AppState.persistErrorShown = msg;
+        try { showToast(msg, 'warning'); } catch (e) {}
+    }
+}
+
+function xportPersistOpen() {
+    if (xportPersistDb) return Promise.resolve(xportPersistDb);
+    return new Promise(function (resolve, reject) {
+        let req;
+        try {
+            if (typeof indexedDB === 'undefined' || !indexedDB) { reject(new Error('这个浏览器/隐私模式下没有 IndexedDB')); return; }
+            req = indexedDB.open(XPORT_DB_NAME, 1);
+        } catch (e) { reject(e); return; }
+        req.onupgradeneeded = function () {
+            try {
+                const db = req.result;
+                if (!db.objectStoreNames.contains(XPORT_DB_STORE)) db.createObjectStore(XPORT_DB_STORE, { keyPath: 'id' });
+            } catch (e) {}
+        };
+        req.onsuccess = function () { xportPersistDb = req.result; resolve(xportPersistDb); };
+        req.onerror = function () { reject(req.error || new Error('indexedDB.open 失败')); };
+        req.onblocked = function () { reject(new Error('另一个标签页占住了数据库升级')); };
+    });
+}
+
+// 一份快照（或者盘上那条记录）里到底有没有东西。空 = 没有句对、没有原文、没有归档。
+function xportPersistHasContent(rec) {
+    if (!rec || typeof rec !== 'object') return false;
+    if (Array.isArray(rec.translationPairs) && rec.translationPairs.length > 0) return true;
+    if (typeof rec.inputText === 'string' && rec.inputText.trim() !== '') return true;
+    if (Array.isArray(rec.globalHistory) && rec.globalHistory.length > 0) return true;
+    return false;
+}
+
+// 存什么：整份会话内容。设置一概不进来（它们在 localStorage，且要在首帧之前同步读到）。
+function xportPersistSnapshot() {
+    return {
+        id: XPORT_DB_KEY,
+        savedAt: Date.now(),
+        owner: XPORT_TAB_ID,
+        version: 1,
+        sessionId: AppState.sessionId,
+        inputText: AppState.inputText,
+        originalInputText: AppState.originalInputText,
+        lastTranslatedText: AppState.lastTranslatedText,
+        viewMode: AppState.viewMode,
+        sourceLang: AppState.sourceLang,
+        targetLang: AppState.targetLang,
+        isAutoDetect: AppState.isAutoDetect,
+        srcEditedSinceTranslate: AppState.srcEditedSinceTranslate === true,
+        // 结构化克隆存不了函数/DOM，但 pairs 和 history 都是纯数据。深拷贝一次，
+        // 免得写的过程中用户继续编辑导致克隆到半路的状态。
+        translationPairs: JSON.parse(JSON.stringify(AppState.translationPairs || [])),
+        globalHistory: JSON.parse(JSON.stringify(AppState.globalHistory || []))
+    };
+}
+
+// ============= 「另一个标签页」这件事 =============
+// 【实测的原始故障 —— 这是整轮里最狠的一条】xportPersistNow 挂在 pagehide 和
+// visibilitychange→hidden 上，而 visibilitychange 在**每一次切换标签页**时都会触发。
+// 它又是无条件 put 整份内存状态到唯一那条 id:'live' 记录上，跨标签页零协调。
+// 于是：开着一个空白的第二个标签页，用户每从它切走一次，盘上那条记录就被一份空状态
+// 整个覆盖一次。端到端复现：磁盘 {pairs:2, hasWork:true} → {pairs:0, gh:0}，
+// 重开一无所有，persistError=null、toast=null —— 而历史面板同时还写着
+// 「已存到本地（IndexedDB），刷新页面可恢复」。内容正在消失的那一刻它在撒谎。
+//
+// 【两条规则，都在同一个 readwrite 事务里比对，中间没有别人插得进来的缝】
+//   ① 判据只有一条：这条记录是不是**别的标签页**在我上次看过之后写的
+//      （cur.savedAt > 我启动/上次写成功时看到的那个值，且 owner 不是我）。是就不许覆盖。
+//      注意判据**不是**「空的不覆盖有内容的」—— 那条更直觉，但会连自己的清空一起挡掉：
+//      单标签页刷新之后 owner 是上一次页面加载的 id，用户按「清空」时盘上那条正是他自己
+//      刚恢复出来的内容，挡下来就等于清空按钮对本地存档无效，刷新一下东西又回来了。
+//      「比我看过的更新 + 不是我写的」精确地只圈住真正的第二个标签页。
+//   ② 撞上之后怎么办分两种：本页**有内容** = 让位并常驻说明（最后写的人赢是不可接受的，
+//      两个标签页都有真内容时谁也没资格替对方决定哪份该留下）；本页**是空的** = 安静跳过
+//      （它没有东西可丢，不必弹一条红字吓人）。两种都绝不写。
+// 「不写了」是刻意的：这个标签页屏幕上的内容一个字都不会少，只是不再往盘上写；
+// 想让它接管，关掉别的标签页再刷新即可。这比悄悄覆盖诚实，也比装作存上了诚实。
+const XPORT_TAB_ID = 'tab-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 10);
+let xportPersistSeenAt = 0;        // 我最后一次看到/写下的那条记录的 savedAt
+let xportPersistYielded = false;   // 已经让位给另一个标签页，本页不再写
+
+function xportPersistYield() {
+    if (xportPersistYielded) return;
+    xportPersistYielded = true;
+    // 这条字符串会被 escapeHtml 之后直接渲染成纯文本，别用任何标记语法。
+    // 更要紧的是原来那句「关掉其它标签页后刷新本页」：刷新会用**盘上那一份**（另一个
+    // 标签页写的）恢复本页，而本页正是没写成盘的那个，照着做就等于亲手把这里的内容删掉。
+    // 所以先说导出，再说接管。
+    const msg = '另一个标签页正在写同一份本地存档。为了不互相覆盖，这个标签页已经停止写入本地：'
+        + '屏幕上的内容一个字都不会少，但它不会被存到本地，刷新之后以另一个标签页的版本为准。'
+        + '⚠️ 刷新之前请先用复制按钮把这里的原文和译文导出 —— 刷新会用另一个标签页的那一份'
+        + '替换本页内容。导出之后再关掉其它标签页刷新，本页就能重新接管本地存档。';
+    AppState.persistError = msg;
+    AppState.persistOkAt = 0;
+    try { console.warn('[persist] ' + msg); } catch (e) {}
+    if (AppState.persistErrorShown !== msg) {
+        AppState.persistErrorShown = msg;
+        try { showToast(msg, 'warning'); } catch (e) {}
+    }
+}
+
+function xportPersistNow() {
+    if (!xportPersistBooted) return Promise.resolve(false);
+    if (xportPersistYielded) return Promise.resolve(false);
+    if (xportPersistInFlight) { xportPersistAgain = true; return Promise.resolve(false); }
+    xportPersistInFlight = true;
+    let rec;
+    try { rec = xportPersistSnapshot(); }
+    catch (e) { xportPersistInFlight = false; xportPersistFail('快照', e); return Promise.resolve(false); }
+    const mine = xportPersistHasContent(rec);
+    return xportPersistOpen().then(function (db) {
+        return new Promise(function (resolve, reject) {
+            let tx, store;
+            try { tx = db.transaction(XPORT_DB_STORE, 'readwrite'); store = tx.objectStore(XPORT_DB_STORE); }
+            catch (e) { reject(e); return; }
+            let verdict = 'wrote';
+            tx.oncomplete = function () { resolve(verdict); };
+            tx.onerror = function () { reject(tx.error || new Error('写事务失败')); };
+            tx.onabort = function () { reject(tx.error || new Error('写事务被中止')); };
+            let getReq;
+            try { getReq = store.get(XPORT_DB_KEY); } catch (e) { reject(e); return; }
+            getReq.onerror = function () { reject(getReq.error || new Error('读事务失败')); };
+            getReq.onsuccess = function () {
+                try {
+                    const cur = getReq.result || null;
+                    // 别的标签页在我上次看过之后写过这条记录
+                    const foreign = !!cur && Number(cur.savedAt) > xportPersistSeenAt
+                                    && cur.owner !== XPORT_TAB_ID;
+                    if (foreign) { verdict = mine ? 'yield' : 'skip-empty'; return; }
+                    store.put(rec);
+                } catch (e) { reject(e); }
+            };
+        });
+    }).then(function (verdict) {
+        if (verdict === 'yield') { xportPersistYield(); return false; }
+        if (verdict === 'skip-empty') return false;   // 什么都没写，也什么都没坏
+        AppState.persistError = null;
+        AppState.persistErrorShown = null;
+        AppState.persistOkAt = rec.savedAt;
+        xportPersistSeenAt = rec.savedAt;
+        return true;
+    }).catch(function (err) {
+        xportPersistFail('写入', err);
+        return false;
+    }).then(function (ok) {
+        xportPersistInFlight = false;
+        if (xportPersistAgain) { xportPersistAgain = false; if (!xportPersistYielded) xportPersistSoon(); }
+        xportPersistBadgeSync();
+        return ok;
+    });
+}
+
+// 内容变了就叫一声。防抖 1.2 秒，连续打字只写一次。**绝不抛**：调用点全在事件链上。
+function xportPersistSoon() {
+    try {
+        if (xportPersistTimer) clearTimeout(xportPersistTimer);
+        xportPersistTimer = setTimeout(function () {
+            xportPersistTimer = null;
+            try { xportPersistNow(); } catch (e) { xportPersistFail('写入', e); }
+            xportPersistBadgeSync();
+        }, XPORT_PERSIST_DEBOUNCE);
+        xportPersistBadgeSync();
+    } catch (e) {}
+}
+
+// ============= 「还没写进本地」这件事必须一直看得见 =============
+// 【为什么有这一节】防抖窗口（1.2 秒，后台标签页里定时器被节流后还更宽）里关标签 / 刷新，
+// 那一次改动**真的会丢**，而且没有任何提示 —— 见 DOMContentLoaded 里 pagehide 那段注释，
+// 那条敞口是本轮明知而未修的。既然修不动，界面就不许在这一刻继续说「已存到本地，
+// 刷新页面可恢复」。实测（真 Chrome，本地 http 服务）：屏幕上是
+// "ZZCLAIMCHECK2 a brand new edit, definitely not on disk yet."，盘上还是上一句
+// "ZZCLAIMCHECK typed inside the debounce window."，而历史面板同时写着
+// 「已存到本地（IndexedDB），刷新页面可恢复 · 5:52:56 PM」。那句话在那一刻是假的。
+// 【为什么不能只改历史面板里那一行】那行字藏在一个要用户主动点开的菜单里。用户根本
+// 不会为了「我这一秒钟的输入存住了没有」去点开菜单，所以顶栏的历史按钮上还要有一个
+// 始终可见的「未存」角标。两处读的是同一个函数，不可能各说各话。
+// 【为什么不能靠重渲染】handleInputChange 故意不 renderApp（会丢焦点，见它下面那行注释），
+// 所以这里照抄 syncTranslateButtonState 的做法：只改那两个节点，不重渲染。
+function xportPersistUnsaved() {
+    // 让位给别的标签页 = 从此一个字都不会再写，屏幕上的内容永远不在盘上 —— 也算未存。
+    if (xportPersistYielded) return true;
+    // ============= 上一次写**失败**同样是「未存」，而且是最该亮的那一次 =============
+    // 【实测的原始故障（本轮）】屏幕上 3 行真译文、盘上同一份，然后让每一次 put 抛
+    // QuotaExceededError（隐私模式 / IDB 被拒走的是同一条 reject → xportPersistFail 路径）。
+    // 点行内 Update 触发一次写：persistError=「浏览器存储配额已满…」、toast 弹了一次、
+    // 盘上 savedAt 一个数没动（1787266699092 → 1787266699092）—— 而顶栏那个**始终可见**的
+    // 角标 persistPendingDot.style.display === 'none'、xportPersistUnsaved() === false、
+    // xportPersistStatusText() 返回「本地存档已就绪，还没写过；内容变化 1.2 秒后自动写入」，
+    // 一句在此刻永远不会兑现的承诺。3.5 秒后 toast 消失，角标仍 none。**第二次失败完全静默**：
+    // 新 toast 0 条（persistErrorShown 去重把它吃掉了）、角标仍 none、文案不变。
+    // 也就是说：在最需要这个角标的场景 —— 写入**永久**失败 —— 它反而不亮，
+    // 这恰好推翻了本轮加角标时自己写的那条理由（见上面「那行字藏在菜单里」）。
+    // 去重继续压 toast 的频率（那是刻意的，免得糊一屏），但顶栏从此不许无声。
+    if (AppState.persistError) return true;
+    return !!xportPersistTimer || xportPersistInFlight === true || xportPersistAgain === true;
+}
+
+// 历史面板里那一行落盘状态的**唯一**文案来源（模板首帧和后续 DOM 直更都读它）。
+function xportPersistStatusText() {
+    // 写失败 / 让位给别的标签页：说失败本身。绝不许再返回「…1.2 秒后自动写入」——
+    // persistError 非空时那句话是假的（persistOkAt 已被 xportPersistFail 归零，
+    // 连「盘上目前是几点那一版」都没得说）。
+    if (AppState.persistError) return AppState.persistError;
+    if (xportPersistUnsaved()) {
+        return '有改动还没写进本地：这一刻关标签页或刷新，这一次改动会丢（约 1 秒后自动写入）。'
+            + (AppState.persistOkAt ? ' 盘上目前是 ' + new Date(AppState.persistOkAt).toLocaleTimeString() + ' 那一版。' : '');
+    }
+    if (AppState.persistOkAt) {
+        return '已存到本地（IndexedDB），刷新页面可恢复 · ' + new Date(AppState.persistOkAt).toLocaleTimeString();
+    }
+    return '本地存档已就绪，还没写过；内容变化 1.2 秒后自动写入';
+}
+
+function xportPersistBadgeSync() {
+    try {
+        const unsaved = xportPersistUnsaved();
+        const dot = document.getElementById('persistPendingDot');
+        if (dot) dot.style.display = unsaved ? '' : 'none';
+        // ============= 菜单开着的时候出错，这行字也必须当场改口 =============
+        // 【实测的原始故障（本轮）】上一版这里是 `if (line && !AppState.persistError)`：
+        // 红字那一块只有**重渲染**才画得出来，而第二次及以后的写失败被 persistErrorShown
+        // 去重压掉了 toast、也就没有那次 setState 带来的重渲染 —— 于是历史面板里这行字
+        // 原地停在「已存到本地（IndexedDB），刷新页面可恢复 · <某个时刻>」，
+        // 而此刻每一次写都在失败。改成：出错时就地把这行字换成错误本身并染红。
+        const line = document.getElementById('persistStatusLine');
+        if (line) {
+            const err = AppState.persistError;
+            line.textContent = err ? ('⚠️ ' + err) : xportPersistStatusText();
+            // 颜色也要跟着走，否则会出现「橙色警告写着已经存好了」这种自相矛盾的一帧。
+            line.classList.toggle('text-rose-600', !!err);
+            line.classList.toggle('text-amber-600', !err && unsaved);
+            line.classList.toggle('font-medium', !!err || unsaved);
+            line.classList.toggle('text-slate-400', !err && !unsaved);
+        }
+    } catch (e) {}
+}
+
+// 启动时把盘上那份读回来。异步，落在首帧之后，所以拿到之后要自己 renderApp。
+function xportPersistRestore() {
+    return xportPersistOpen().then(function (db) {
+        return new Promise(function (resolve, reject) {
+            let req;
+            try { req = db.transaction(XPORT_DB_STORE, 'readonly').objectStore(XPORT_DB_STORE).get(XPORT_DB_KEY); }
+            catch (e) { reject(e); return; }
+            req.onsuccess = function () { resolve(req.result || null); };
+            req.onerror = function () { reject(req.error || new Error('读取失败')); };
+        });
+    }).then(function (rec) {
+        xportPersistBooted = true;
+        // 启动这一刻盘上是什么样，就是这个标签页的「我上次看到的」基准。跨标签页的冲突
+        // 判据全靠它：之后 savedAt 再往前走，就一定是**别人**写的（见 xportPersistNow）。
+        xportPersistSeenAt = (rec && Number(rec.savedAt)) || 0;
+        if (!rec) return false;
+        // 恢复期间用户可能已经开始打字/粘贴了 —— 那份是新的，绝不拿盘上的旧内容盖掉它。
+        if ((AppState.translationPairs && AppState.translationPairs.length > 0) || (AppState.inputText || '').trim()) return false;
+        const pairs = normalizeTranslationPairs(Array.isArray(rec.translationPairs) ? rec.translationPairs : []);
+        const gh = Array.isArray(rec.globalHistory) ? rec.globalHistory.filter(function (it) {
+            return it && Array.isArray(it.pairs) && it.pairs.length > 0;
+        }) : [];
+        if (pairs.length === 0 && !(rec.inputText || '').trim() && gh.length === 0) return false;
+        if (typeof rec.sessionId === 'string' && rec.sessionId) AppState.sessionId = rec.sessionId;
+        AppState.lastTranslatedText = typeof rec.lastTranslatedText === 'string' ? rec.lastTranslatedText : '';
+        AppState.srcEditedSinceTranslate = rec.srcEditedSinceTranslate === true;
+        // ============= 语言方向必须跟着内容一起回来 =============
+        // 【实测的原始故障】快照**存了** sourceLang / targetLang / isAutoDetect，恢复时却一个
+        // 都不用，于是刷新之后方向永远停在写死的默认值 zh→en。TRANSLATE 按钮自己会重新
+        // 检测语言，所以它把这个洞盖住了；但「重新生成所有翻译」「智能更新」「选词/语法弹窗」
+        // 全都直接读 AppState.sourceLang / targetLang —— 一份英文文档刷新之后按重新生成，
+        // 跑的是 zh→en，结果是把英文原文换成英文改写；点「替换」给出的是中文候选词。
+        // 全程 failedCount=0、error=null、没有 toast。存了不用，比不存更坏。
+        if (rec.sourceLang === 'zh' || rec.sourceLang === 'en') AppState.sourceLang = rec.sourceLang;
+        if (rec.targetLang === 'zh' || rec.targetLang === 'en') AppState.targetLang = rec.targetLang;
+        if (typeof rec.isAutoDetect === 'boolean') AppState.isAutoDetect = rec.isAutoDetect;
+        setState({
+            translationPairs: pairs,
+            globalHistory: gh.slice(0, AppState.historyLimit),
+            inputText: typeof rec.inputText === 'string' ? rec.inputText : '',
+            originalInputText: typeof rec.originalInputText === 'string' ? rec.originalInputText : '',
+            viewMode: (rec.viewMode === 'preview' || rec.viewMode === 'original' || rec.viewMode === 'edit')
+                ? rec.viewMode : (pairs.length ? 'preview' : 'edit'),
+            isEditingMode: !(pairs.length > 0)
+        });
+        return true;
+    }).catch(function (err) {
+        xportPersistBooted = true;   // 读不出来也要放行写，否则连「以后能存」都没了
+        xportPersistFail('读取', err);
+        return false;
+    });
+}
+
+// ============= 可再武装的自动存档定时器 =============
+// 【改动前】定时器在 DOMContentLoaded 里用**启动时**的 AppState.autoSaveInterval 注册一次，
+// 全文件没有一处 clearInterval，AppState.autoSaveTimer 声明了从未被赋值。
+// setAutoSaveInterval 改 AppState、改 localStorage、renderApp，就是不碰活着的那个定时器。
+// 实测：设置面板显示 1 分钟、localStorage 也是 60000，实际节拍稳稳的 300 秒 ± 1 秒，
+// 25 分钟 5 次 —— 正是启动时的默认值。改完只有刷新页面才生效。
+// 那个用户之所以把间隔调短，恰恰是因为他担心丢东西。
+//
+// 【这里怎么修】句柄存进本来就声明好的 AppState.autoSaveTimer，setAutoSaveInterval 先
+// clearInterval 再重新注册。DOMContentLoaded 里那一处**没有改动**（那段属于另一条分支），
+// 所以启动后会有它注册的一个按启动值走的定时器同时存在；它的效果被 addToGlobalHistory
+// 的逐字去重完全吸收（内容没变就什么都不做），用户能观察到的只有他设定的那个节拍。
+function armAutoSaveTimer() {
+    try {
+        if (AppState.autoSaveTimer) clearInterval(AppState.autoSaveTimer);
+        AppState.autoSaveTimer = null;
+        const ms = Number(AppState.autoSaveInterval);
+        if (!(ms > 0)) return;
+        AppState.autoSaveTimer = setInterval(function () {
+            try {
+                if (AppState.autoSaveInterval > 0 && AppState.translationPairs.length > 0) {
+                    addToGlobalHistory(AppState.translationPairs, AppState.sessionId, { auto: true });
+                }
+                xportPersistNow();
+            } catch (e) { console.error('[autosave]', e); }
+        }, ms);
+    } catch (e) {}
+}
+
+// 自带的启动钩子。刻意**不**写进文件末尾那个 DOMContentLoaded（那段属于另一条分支）：
+// 多个监听器互不影响，函数声明有提升，谁先谁后都成立。
+document.addEventListener('DOMContentLoaded', function () {
+    try {
+        xportPersistRestore().then(function () { armAutoSaveTimer(); });
+    } catch (e) { xportPersistBooted = true; armAutoSaveTimer(); }
+    // ============= 这两个监听器各自到底兑现了什么（别再写「抢存一次」）=============
+    // 上一版这里写的是「关标签 / 切到后台时抢存一次：防抖窗口里的最后一次编辑不能就这么
+    // 没了」。**pagehide 那一半是假的**，实测（真 Chrome，127.0.0.1:8765）：
+    //   · 往 #mainInput 里敲一段字（handleInputChange → xportPersistSoon，防抖 1.2 秒），
+    //     200 毫秒后刷新 → 刷新回来 survived:false、盘上 savedAt 一个数没动、persistError=null。
+    //   · 把防抖定时器 clearTimeout 掉、只留 pagehide 这条路，结果一样：那条记录压根没被碰过。
+    // 【为什么修不动】xportPersistNow 为了跨标签页那条不可协商的规则，必须在**同一个事务里**
+    // 先 get 再 put（见它上面那段）。put 是写在 getReq.onsuccess 里的，而文档正在拆的时候
+    // IndexedDB 的请求回调不再派发 —— get 的回调不来，put 就从来没被发出去过。
+    // 能让它提交的两种办法都比现在这条更糟，所以**一条都没做**：
+    //   ① pagehide 上跳过 get 直接 put：那正好是「另一个标签页刚写过的整份文档被我覆盖掉」，
+    //      也就是这一轮里最狠的那条故障（见 xportPersistYield 上面「另一个标签页」那段），
+    //      拿 ≤1.2 秒的击键去换整篇文档，不换。
+    //   ② 再加一层同步的 localStorage 镜像：多一套存储层、多一套恢复期合并语义、还有配额
+    //      会在 pagehide 里抛 —— 为了 1.2 秒的窗口新造一套会自己坏的机制，不做。
+    // 【所以现在的真话是】visibilitychange→hidden 这一条**是**真的会提交（切标签页时页面还活着，
+    // 双标签页实测已验证），它覆盖「切走就不回来了」这类用法；pagehide 那行留着只当尽力而为，
+    // 不承诺任何事。**残留敞口**：关标签 / 刷新恰好落在最后一次改动后的 1.2 秒内，那一次改动
+    // 会丢（后台标签页里定时器被节流到 ~1 秒粒度，窗口还会更宽一点）。
+    // 这一条是**明知而未修**的，不许再有注释宣称它已经被兜住了。
+    // 【本轮补上的那一半 —— 敞口修不动，就不许界面继续假装它不存在】
+    // 复测（真 Chrome，本地 http 服务，改动后的这份代码）：敲
+    // "ZZLOSTBYPAGEHIDE this edit is inside the 1.2s debounce window." 后 200 毫秒刷新
+    // → survived:false、盘上 savedAt 停在 1787262734382 一个数没动、persistError=null。
+    // **数据仍然会丢，这一条没修**。修掉的是那句假话：从这一版起，只要有一次改动还没写进
+    // 本地，顶栏历史按钮上就常驻一个「未存」角标，历史面板里那行字也改说
+    // 「有改动还没写进本地：这一刻关标签页或刷新，这一次改动会丢」（见 xportPersistUnsaved /
+    // xportPersistStatusText / xportPersistBadgeSync）。一个用户看得见的老失败，
+    // 胜过一个他看不见的静默丢失。
+    try {
+        window.addEventListener('pagehide', function () { try { xportPersistNow(); } catch (e) {} });
+        document.addEventListener('visibilitychange', function () {
+            if (document.visibilityState === 'hidden') { try { xportPersistNow(); } catch (e) {} }
+        });
+    } catch (e) {}
+});
+
 // ============= 事件处理 =============
+
+// ============= TRANSLATE 按钮的「说的和实际一致」=============
+// 【改动前的实测故障】renderHeader 把 `${!AppState.inputText && !AppState.isLoading ? 'disabled' : ''}`
+// 烤进 HTML 字符串里，而 handleInputChange 为了不丢焦点**故意不重渲染**（见它下面那行注释）。
+// 于是按钮的 disabled 永久停在「输入框还是空的」那一帧算出来的 true：
+//     AUTO SYNC 关掉 → 粘 1006 个字符进原文框 → 真鼠标点 TRANSLATE 两次
+//     → btnDisabled=true、发出去 0 个请求、pairs=0、error=null、toast=null
+// 也就是说，把自动翻译关掉的用户，这个应用的核心功能对他**完全不可达**，
+// 直到他碰巧点了别的什么控件触发一次重渲染为止。AUTO SYNC 开着时 1.5 秒的防抖会自己
+// 调 handleTranslate() 绕开按钮，所以这个 bug 一直被盖着。
+// 【修法】按钮状态直接按当下的真值改到 DOM 上，不重渲染 —— 那条「避免焦点丢失」的理由原封不动。
+function syncTranslateButtonState() {
+    try {
+        const btn = document.getElementById('translateBtn');
+        if (!btn) return;
+        const shouldDisable = !AppState.inputText && !AppState.isLoading;
+        if (btn.disabled === shouldDisable) return;
+        btn.disabled = shouldDisable;
+        // 灰底/禁用手势也要跟着走，否则会出现「看着能点其实不能」或者反过来 —— 同样是骗人。
+        btn.classList.toggle('bg-slate-200', shouldDisable);
+        btn.classList.toggle('text-slate-400', shouldDisable);
+        btn.classList.toggle('cursor-not-allowed', shouldDisable);
+        const live = !shouldDisable && !AppState.isLoading;   // 翻译中是红色 STOP 态，别去动它
+        btn.classList.toggle('bg-indigo-600', live);
+        btn.classList.toggle('text-white', live);
+        btn.classList.toggle('hover:bg-indigo-700', live);
+        btn.classList.toggle('shadow-indigo-200', live);
+    } catch (e) {}
+}
 
 function handleInputChange(value) {
     // 如果正在恢复历史，跳过
@@ -7819,18 +8971,70 @@ function handleInputChange(value) {
     // 如果从空变为有内容，创建新会话
     if (AppState.inputText === "" && value !== "") {
         if (AppState.translationPairs.length === 0) {
-            AppState.sessionId = Date.now().toString();
+            AppState.sessionId = xportNewSessionId();
         }
     }
+
+    const prevInput = AppState.inputText;   // 这一次击键**之前**大输入框里那份
 
     AppState.inputText = value;
     AppState.isEditingMode = true;
     AppState.isRestoringHistory = false;
+    // 用户正在**大输入框**里重写整篇原文 —— 从这一刻起它就是这份文档的准绳。
+    // 标志留着的话，下一次 syncInputFromPairs 会拿 pairs 重建一遍，把刚敲进去的字覆盖掉。
+    //
+    // ============= 清掉这面旗之前，先看一眼原文栏里有没有还没收回来的改动 =============
+    // 【实测的原始故障（本轮 F1/F2）】这一行原来是无条件的。而 pairs 那边可以在**用户已经
+    // 待在 Edit 视图里**的时候被改：浮动对话窗的「应用」（chatApplyProposal 情形 B，它挂在
+    // <body> 上、不看 viewMode）、右栏 Target Panel 那一行的 ↺/↻（handleHistoryNav，
+    // renderTargetPanel 同样不看 viewMode）。两条路都会把 srcEditedSinceTranslate 置成 true、
+    // 只改 pairs 不改 inputText，接着用户在大输入框里敲一个词，这一行就把旗抹掉 ——
+    // 下一次 TRANSLATE / ⟳ / AUTO SYNC 必然用大输入框那份旧文本赢。逐字实测（node vm 跑真
+    // handler）：CHATMARK99 从原文栏原地消失，confirms=[]、toasts=[]、error=null，
+    // 逐行撤销栈被整份换掉（history 2 → 1），recoverableAnywhere=false。
+    // 对照组（同样步骤但不敲那个词）markSurvives=true —— 证明那面旗本身是对的。
+    //
+    // 【为什么最终仍然「以大输入框这份为准」】两份都是用户亲手改的，谁也没资格替他决定；
+    // 但大输入框是他眼睛正看着、手正在改的那一份，拿 pairs 重建会把刚敲的字顶掉（那是
+    // 另一种静默丢失，而且更刺眼）。所以旗照清，但**不许静默**：
+    //   ① 主路在旗被**打上**的那一刻就把改动收进大输入框（见 xportFoldPairsIntoLiveInput），
+    //      这三条路上根本不会走到这里；
+    //   ② 走到这里的只剩「大输入框里已经是另一份文本」那种被收编闸门挡住的情形 ——
+    //      那就把要被作废的这份 pairs（含每一行的撤销栈）整份存进归档，用户可以从「历史」
+    //      菜单整体取回。skipRender：这里挂在每一次击键上，重画会把 textarea 换掉、焦点掉到
+    //      body、之后的击键全部落空。
+    // 【诚实说明】②这条路**不出提示**：任何 toast 都会走 setState → renderApp（还有 3 秒后
+    // 自动消失时的第二次），在用户正打字的这一刻抢走焦点、吞掉后续击键 —— 那比它要修的
+    // 问题更坏。所以这里只保证「找得回来」，不保证「当场看得见」；看得见那一半由 ① 兜住。
+    if (AppState.srcEditedSinceTranslate && AppState.translationPairs.length > 0) {
+        try {
+            if (joinPairsAsDocument('src') !== prevInput) {
+                addToGlobalHistory(AppState.translationPairs, AppState.sessionId, { skipRender: true });
+            }
+        } catch (e) {}
+    }
+    AppState.srcEditedSinceTranslate = false;
 
     // 如果输入为空，清空状态并重新渲染（需要隐藏翻译结果）
     if (!value.trim()) {
+        // ============= 这一支同时清掉 translationPairs 和 inputText，必须落盘 =============
+        // 【实测的原始故障（本轮）】上一版这里 `return` 在下面那个 xportPersistSoon() **之前**，
+        // 于是「在大输入框里全选删除」这个最狠的改内容动作一次都不写盘。逐字复现：屏幕上 4 行
+        // 真译文、盘上同步（savedAt=1787266734450、pairs=4、inputText 48 字节）→ 切 Edit 视图 →
+        // el.value=''; dispatchEvent('input')（等价 Ctrl+A、Delete）→ 等 4 秒（远超 1.2 秒防抖）：
+        // 内存 pairs=0/inputLen=0，盘上 savedAt **一个数都没动**、pairs 仍是 4、inputText 仍是 48，
+        // 而界面写着「已存到本地（IndexedDB），刷新页面可恢复 · 6:58:56 PM」，
+        // xportPersistUnsaved()=false、角标不亮。刷新之后被删掉的整份文档原样回到屏幕上，零提示。
+        // 另一半更糟：删空之后再敲一个字，就会落盘一份 {pairs:[], inputText:新内容}，
+        // 原来那 4 行译文当场从盘上消失，而它从没进过 globalHistory。
+        // 【所以这里和 handleClear 一样先归档】清空输入框 = 整份文档被替换，走同一条规矩。
+        // 这一支本来就 renderApp()，多一次归档带来的重画不改变终态（焦点在这条路上早就没了）。
+        if (AppState.translationPairs.length > 0) {
+            addToGlobalHistory(AppState.translationPairs, AppState.sessionId);
+        }
         AppState.translationPairs = [];
         renderApp();
+        xportPersistSoon();
         return;
     }
 
@@ -7839,18 +9043,71 @@ function handleInputChange(value) {
         if (AppState.debounceTimer) {
             clearTimeout(AppState.debounceTimer);
         }
-        AppState.debounceTimer = setTimeout(() => {
-            if (AppState.isEditingMode && AppState.inputText !== AppState.lastTranslatedText) {
-                handleTranslate();
+        // 【为什么要在这里等一等 —— 实测的静默失效】改动前防抖到点就直接调 handleTranslate()。
+        // 如果上一次翻译还在飞，handleTranslate 的第一条分支是**停止**：它把在途请求 abort 掉、
+        // isLoading 归零就 return 了。AbortError 在 catch 里被吞掉，没有 toast、没有 error，
+        // 也**没有任何人再排一次**。于是「开着 AUTO SYNC 打字」这个立身工作流的结果是：
+        // 已经跑了一半的翻译被悄悄取消，新的一次从来没开始，屏幕停在原地。
+        // 【修法】在途就不动它，把这一次重排到 1.5 秒后再看 —— 不打断已经花掉的算力，
+        // 也不丢掉这次意图。翻完（isLoading 归零）之后的第一次到点就会真的翻。
+        // 判据用 mainAbortController：它就是「整篇翻译在途」的那个句柄，
+        // isRegeneratingAll 同理（整篇重新生成期间开翻译同样会互相顶掉）。
+        // 【为什么不再看 isEditingMode】这个定时器**只**由 handleInputChange 起武，而它上面
+        // 三行刚把 isEditingMode 置成 true —— 起武那一刻这个条件恒真，它在这里唯一能做的事
+        // 就是在**等待期间**被别人置成 false 之后把这次意图吞掉：handleTranslate 成功落地时
+        // 会 setState({isEditingMode:false, viewMode:'preview'})，于是「翻译在飞的时候又打了
+        // 一句」这个最常见的情形正好命中 —— 重排到的那一次醒来一看 isEditingMode 已经是 false，
+        // 一声不吭地什么也不做，用户新打的那句永远等不到翻译。删掉它，判据只剩「文本确实
+        // 和上次翻译的不一样」。不会成环：handleTranslate 成功后 lastTranslatedText 就等于
+        // 送出去的那份，而 fire 只在**真的有东西在飞**时才重排自己。
+        const fire = () => {
+            AppState.debounceTimer = null;
+            if (AppState.mainAbortController || AppState.isLoading || AppState.isRegeneratingAll) {
+                AppState.debounceTimer = setTimeout(fire, 1500);
+                return;
             }
-        }, 1500);
+            if (AppState.inputText !== AppState.lastTranslatedText) {
+                // auto:true —— 未提交草稿闸门在这条路上只出 toast，不弹模态框（见 handleTranslate 顶上）
+                handleTranslate({ auto: true });
+            }
+        };
+        AppState.debounceTimer = setTimeout(fire, 1500);
     }
+
+    // 粘进来的原文也要活过一次刷新（防抖 1.2 秒，连续打字只写一次）
+    xportPersistSoon();
+
+    // 按钮的可点状态跟着实际内容走（只改这一个属性，不重渲染 —— 焦点不受影响）
+    syncTranslateButtonState();
 
     // 不再调用 renderApp()，避免焦点丢失
     // 输入时 textarea 的值已经被浏览器更新，无需重新渲染
 }
 
+// ============= 整篇操作进行时，逐句编辑必须是**看得出来的**不可用 =============
+// 【实测的原始故障】开着一行的编辑框、点下「重新生成所有翻译」：
+//   · 框还在、没有禁用样式、没有转圈，disabled=false / readOnly=false —— 看上去完全能用；
+//   · 真键盘敲 9 个字符，editValues 一个字都没收到，document.activeElement 全程是 BODY；
+//   · 扫描开始那一下的整页重渲染换掉了 textarea 节点，焦点掉到 body（文件自己在第 64 行和
+//     选中高亮那段注释里写过这个失败模式），点回去只会再触发一次重渲染、再掉一次焦点；
+//   · 扫完之后 translationPairs 被整份替换，框里原来那句没提交的 CONTROL 也一起没了。
+// 一个「看着能编、其实吞掉每一次击键、最后还把已有草稿丢掉」的输入框，是这次要根除的
+// 那类问题里最直接的一个。
+//
+// 【为什么是「锁住」而不是「让它真的能编」】整篇翻译 / 整篇重新生成结束时都会把
+// translationPairs **整份换掉**（handleTranslate、handleRegenerateAll 各一处 setState）。
+// 就算把焦点救回来、让每一个字都落进 editValues，扫完照样被整份覆盖 —— 那只是把
+// 「吞掉击键」换成「让你白打五分钟字」。所以这几分钟里唯一诚实的表现是：说明白不能编，
+// 并且不让人进去。扫描一结束锁自动解除（isRegeneratingAll / isLoading 归零）。
 function handleRowClick(index, clickedSide = null) {
+    if (AppState.isRegeneratingAll || AppState.isLoading) {
+        try {
+            showToast(AppState.isRegeneratingAll
+                ? '正在整篇重新生成，这期间不能逐句编辑：跑完会把整篇译文换成新的一版，现在改的会被覆盖。再点一次那颗按钮可以停下来。'
+                : '正在翻译整篇原文，这期间不能逐句编辑：翻完会把整篇译文换成新的一版，现在改的会被覆盖。点 STOP 可以停下来。', 'info');
+        } catch (e) {}
+        return;
+    }
     if (AppState.activeIndex !== null && AppState.activeIndex !== index) {
         saveRowUpdate(AppState.activeIndex);
     }
@@ -7956,6 +9213,10 @@ function handleGlobalClick(event) {
     // 第一道防线是对话窗根节点上的 stopPropagation（见 chatBindShell），这里是第二道：
     // 两道都便宜，而这个失败模式一旦漏掉就是直接吞掉用户的编辑。
     if (event.target && event.target.closest && event.target.closest('#aiChatRoot')) return;
+    // 选词弹窗同样挂在 <body> 上，同样的失败模式：点它自己的标题栏/内边距会一路走到下面的
+    // saveRowUpdate + activeIndex=null，弹窗还开着却已经废了（实测点建议项 0 变化、无提示），
+    // 而且「只有一侧变了」时会顺手发一次把另一栏重写掉的请求。#aiChatRoot 那行修过一次，这里被漏了。
+    if (event.target && event.target.closest && event.target.closest('#synonymPopup')) return;
 
     // 「关注」复选框（句对行上那颗、AI 工具栏里那颗、选词弹窗里那颗）同理，**永远不算点了空白区域**。
     // 这是 chat-focus-selection.md 的 C2：勾一个复选框绝不许把用户正在编辑的那一行静默提交掉。
@@ -7997,6 +9258,10 @@ function handleManualSave() {
 }
 
 function handleClear() {
+    // 与 restoreGlobalHistory 同一条理由：在途请求落地时必须认不出自己的文档，
+    // 否则「清空之后那次翻译回来了」会把已经清掉的内容原地放回来。
+    AppState.docGeneration++;
+    AppState.srcEditedSinceTranslate = false;
     if (AppState.mainAbortController) {
         AppState.mainAbortController.abort();
     }
@@ -8015,7 +9280,7 @@ function handleClear() {
         isEditingMode: true,
         viewMode: 'edit',
         isLoading: false,
-        sessionId: Date.now().toString(),
+        sessionId: xportNewSessionId(),
         error: null
     });
 
@@ -8026,16 +9291,215 @@ function handleClear() {
     }, 100);
 
     AppState.lastTranslatedText = "";
+    xportPersistSoon();
 }
 
-function toggleEditMode() {
-    if (AppState.isEditingMode) {
-        setState({ isEditingMode: false });
-    } else {
-        const reconstructed = AppState.translationPairs.map(p => p.src).join('\n');
-        setState({ inputText: reconstructed, isEditingMode: true });
-        AppState.lastTranslatedText = reconstructed;
+// ============= 逐句的行 → 一整篇可以直接贴回 .tex 的文本 =============
+// 【为什么不是 join('\n')】复制按钮原来就是 `pairs.map(p => p.tgt).join('\n')`，而
+// xportSegments 交出来的每一句都 .trim() 过、也从不产出空行，所以 LaTeX 的分段符（空行）
+// 在导出时**全部消失**：实测 main.tex 的 370 个空行拼回来只剩 4 个。贴回 .tex 之后整节
+// 正文并成一坨连续散文，LaTeX 一声不吭，只有编出 PDF 才看得见。这是全篇 100% 命中、
+// 与模型无关的一类损坏，而复制按钮是这个应用**唯一**的导出口（全文件没有任何
+// Blob / download 路径）。
+// 分段信息不靠猜：切分本来就是「先按空行分段、再按句号分句」，pair.brk 就是切分当场
+// 记下来的「这一句后面原文里是空行」（见 xportSegmentsEx）。缺 brk 的行（旧协议链路、
+// 从更早版本恢复出来的归档）退回原来的单个 '\n'，逐字等于改动前的行为。
+//
+// 【原文侧：优先用 srcRaw】pair.src 是剥离颜色宏之后的文本。有 srcRaw（见 xportAttachRawSrc）
+// 就用它 —— 它是这一行**剥离之前**的原文，把 `\textcolor{...}{...}` 一并带回来，
+// 而且它自带这一行前面的那段分隔空白，所以用它的时候不能再补 '\n'。
+// srcRaw 一旦过期（用户改过这一行的原文）就自动失效，退回 src。
+//
+// 【失效判据为什么是 history[0]】pair 建立的那一刻，srcRaw 和 history[0].src 取自**同一次
+// 切分的同一段**，一个是剥离前、一个是剥离后。所以「这一行的原文还是不是当初那一版」
+// 只要比 p.src === p.history[0].src 就够了 —— 精确、零成本，撤销回第 0 版时还会自动重新生效。
+// （试过「把 srcRaw 再剥一次看还等不等于 src」：不行。剥离是上下文相关的，单独剥一个切片
+// 会把跨行 `\textcolor{...}{` 留下的那个收尾 `}` 多删一个，785 行里有 2 行会被误判成「改过」。）
+// ============= 改过的那一行也要把颜色宏带回来（F4）=============
+// 【实测的原始故障】上一版对「用户改过原文的行」直接 return null，整行退回剥离后的 p.src。
+// main.tex 实测：785 行里 275 行（35%）的 srcRaw 带 \textcolor，最狠的一行 19 处、中位数 1 处，
+// 566 处标记合计。用户在原文栏改两个字符（改错别字），那一行的标记当场没了 ——
+// 实测 566 → 565，第一处分歧是 `\textcolor{purple}{facing intelligent adversaries…}` 的
+// 宏头宏尾被删、只剩里面的字；全程 toast=null / error=null，而这份被削过的文本会同时写进
+// inputText / originalInputText 并随 xportPersistSoon 落盘变成永久的。校对原文正是这个应用
+// 的立身工作流，所以「改一行 = 删掉那一行的修订标记」是不能接受的。
+//
+// 【怎么缝】只用两条已经成立的事实，不猜：
+//   · stripTextColorForModel 只**删**字符，从不插入、不重排 → 剥离后的文本是 raw 的子序列；
+//   · h0.src 是这一行**建立那一刻**的剥离结果，用户的改动是 h0.src → src 的一次编辑。
+// 于是：把 raw 单独再剥一次得到 re（实测 main.tex 275 个带宏的行 275/275 都能对上，
+// re 里 h0.src 恰好出现一次、两侧只有空白）；在 re 空间里取最长公共前缀/后缀定位出用户
+// 真正改动的那一小段；把它映射回 raw 的下标；**只有当 raw 里那一段完全不含 \textcolor、
+// 也不含任何花括号**时才允许替换 —— 这一条保证被替换掉的那段里没有任何宏语法，
+// 区域之外的宏一个字节都不动，也不可能缝出半个宏或者多余的右括号。
+// 最后再剥一次验算：strip(merged) 必须逐字等于「原来的空白 + 用户改后的文本 + 原来的空白」，
+// 不等就当没缝成。任何一步不成立都返回 null，调用方退回 p.src（= 上一版行为），
+// 并由 xportRowDropsColorMacros / xportWarnColorMacroLoss 把这件事**说出来**。
+function xportRawEditMerge(raw, h0src, curSrc) {
+    try {
+        if (typeof raw !== 'string' || typeof h0src !== 'string' || typeof curSrc !== 'string') return null;
+        if (raw === '' || h0src === '') return null;
+        const re = stripTextColorForModel(raw);
+        if (typeof re !== 'string') return null;
+        if (re === raw) return null;                       // 这一行本来就没有宏可缝
+        const at = re.indexOf(h0src);
+        if (at === -1 || re.indexOf(h0src, at + 1) !== -1) return null;   // 找不到 / 有歧义
+        const lead = re.slice(0, at);
+        const tail = re.slice(at + h0src.length);
+        if (!/^\s*$/.test(lead) || !/^\s*$/.test(tail)) return null;      // 两侧必须只有空白
+        const target = lead + curSrc + tail;
+
+        // re 在 raw 里的一个合法嵌入（贪心最左）。未必就是 strip 当初走的那一条，
+        // 所以下面既有「区域必须干净」的硬条件，也有最后的验算。
+        const map = new Array(re.length + 1);
+        let q = 0;
+        for (let k = 0; k < re.length; k++) {
+            while (q < raw.length && raw[q] !== re[k]) q++;
+            if (q >= raw.length) return null;
+            map[k] = q++;
+        }
+        map[re.length] = raw.length;
+
+        // 用户到底改了哪一小段：re 空间的最长公共前缀 / 后缀
+        let pre = 0;
+        const lim = Math.min(re.length, target.length);
+        while (pre < lim && re[pre] === target[pre]) pre++;
+        let suf = 0;
+        while (suf < (lim - pre) && re[re.length - 1 - suf] === target[target.length - 1 - suf]) suf++;
+        const reEnd = re.length - suf;
+        if (reEnd < pre) return null;
+
+        const rawStart = map[pre];
+        const rawEnd = map[reEnd];
+        if (typeof rawStart !== 'number' || typeof rawEnd !== 'number' || rawEnd < rawStart) return null;
+
+        // 被替换掉的那一段 raw 必须是**纯正文**：没有宏、没有花括号、没有反斜杠。
+        // 有任何一样就说明用户的改动压到了宏语法上，这时候缝出来的东西不可信 —— 不缝。
+        const region = raw.slice(rawStart, rawEnd);
+        if (/[{}\\]/.test(region)) return null;
+
+        const merged = raw.slice(0, rawStart) + target.slice(pre, target.length - suf) + raw.slice(rawEnd);
+
+        // 验算：剥一次必须逐字等于目标。不等 = 上面的嵌入选错了，当没缝成。
+        if (stripTextColorForModel(merged) !== target) return null;
+        return merged;
+    } catch (e) { return null; }
+}
+
+function xportRowSource(p) {
+    const src = (typeof p.src === 'string') ? p.src : '';
+    const raw = p.srcRaw;
+    if (typeof raw !== 'string' || raw === '') return null;
+    const h = Array.isArray(p.history) ? p.history : null;
+    const h0 = (h && h.length > 0) ? h[0] : null;
+    if (!h0 || typeof h0.src !== 'string') return null;
+    if (h0.src === src) return raw;          // 没改过：原样（撤销回第 0 版时自动重新生效）
+    return xportRawEditMerge(raw, h0.src, src);   // 改过：把宏缝回来；缝不上返回 null
+}
+
+// 这一行重建整篇时会**丢掉** \textcolor 修订标记吗。
+// 只在「srcRaw 里有宏、但缝不回来、而且用户自己也没把宏写回正文」时为真。
+function xportRowDropsColorMacros(p) {
+    try {
+        if (!p || typeof p.srcRaw !== 'string' || p.srcRaw === '') return false;
+        if (p.srcRaw.indexOf('\\textcolor') === -1) return false;
+        if (xportRowSource(p) !== null) return false;              // 缝上了 / 没改过：什么都不丢
+        const cur = (typeof p.src === 'string') ? p.src : '';
+        return cur.indexOf('\\textcolor') === -1;                  // 用户自己写回来了就不算丢
+    } catch (e) { return false; }
+}
+
+function xportColorMacroLossRows(pairsArg) {
+    const src = (pairsArg === undefined) ? AppState.translationPairs : pairsArg;
+    const pairs = Array.isArray(src) ? src : [];
+    const rows = [];
+    try {
+        for (let i = 0; i < pairs.length; i++) if (xportRowDropsColorMacros(pairs[i])) rows.push(i + 1);
+    } catch (e) {}
+    return rows;
+}
+
+// 硬约束第 7 条：一个用户认得出的失败，胜过一个他看不见的静默删除。
+// 缝不回来的那几行必须在**文本真正离开这一屏**的那一刻说出来（复制、进大输入框、
+// 拿 pairs 去重新生成），而不是等用户贴回 .tex 编出 PDF 才发现标记没了。
+function xportWarnColorMacroLoss(where) {
+    try {
+        const rows = xportColorMacroLossRows();
+        if (rows.length === 0) return 0;
+        const list = rows.slice(0, 8).join('、') + (rows.length > 8 ? ' 等 ' + rows.length + ' 行' : '');
+        showToast('第 ' + list + ' 行的 \\textcolor 修订标记没能带回来：你改过这几行的原文，'
+            + '改动压在了颜色宏上，' + where + '里这几行是不带宏的纯文本（其余行原样保留）。'
+            + '需要那几处标记就到「历史」里取回改动前的那一版。', 'warning');
+        return rows.length;
+    } catch (e) { return 0; }
+}
+
+function joinPairsAsDocument(field, pairsArg) {
+    const src = (pairsArg === undefined) ? AppState.translationPairs : pairsArg;
+    const pairs = Array.isArray(src) ? src : [];
+    let out = '';
+    for (let i = 0; i < pairs.length; i++) {
+        const p = pairs[i] || {};
+        const raw = (field === 'src') ? xportRowSource(p) : null;
+        if (raw !== null) { out += raw; continue; }              // srcRaw 自带前导分隔
+        if (i > 0) {
+            const prev = pairs[i - 1] || {};
+            out += (prev.brk === true ? '\n\n' : '\n');
+        }
+        out += (typeof p[field] === 'string') ? p[field] : '';
     }
+    return out;
+}
+
+// ============= 「大输入框」与「逐句原文栏」之间那条分歧的唯一出口 =============
+// 【实测的原始故障】用户在**原文栏**逐句改稿（这是本应用的立身工作流：粘贴 → 翻译 →
+// 校对改稿 → 粘下一段 → 再翻译），改动只落进 translationPairs[i].src，从来不回写
+// AppState.inputText。切到 Edit 视图时大输入框仍然是**没有那些修改的旧文本**（实测：
+// 复制原文按钮读 pairs、含修改；Edit 框读 inputText、不含），随后 AUTO SYNC 在 1.5 秒后
+// 自己触发 handleTranslate()，handleTranslate 又是整份从 inputText 重建 pairs ——
+// 一整篇的原文修改被无声抹掉，没有提示、没有确认、没有撤销（逐行的历史分页也一起重建了）。
+//
+// 【为什么是「消灭分歧」而不是「加一层同步机制」】原本已经写好了一个做这件事的函数
+// （toggleEditMode），但它是**死代码**：三个视图按钮全都调 setViewMode。这里不再新增
+// 第二套机制，而是把那段逻辑挪到唯一真正会被调用的入口上，并把死函数删掉 ——
+// 分歧从此只有一个出口。
+//
+// 【为什么加了 srcEdited 这个前提】没改过原文的常见情形下，大输入框逐字保持用户粘进来的
+// 原样，一个字节都不动。翻译期间（isLoading / isRegeneratingAll）一律不重建：那时候
+// pairs 是上一份文档，而 inputText 正是用户刚粘进去、正在翻的那一份，重建等于把它顶掉。
+//
+// 【颜色宏怎么活下来的】重建走 joinPairsAsDocument('src')，它对每一行优先用 srcRaw ——
+// 也就是这一行**剥离颜色宏之前**的原文（见 xportAttachRawSrc）。没改过的行原样带回；
+// 改过的行由 xportRawEditMerge 把宏缝回改后的文本上（main.tex 实测：275 个带宏的行，
+// 「句尾追加一句」「句首加词」两种改法 275/275 缝上、566/566 处宏全部保留；
+// 「句中改一个字」274/275；「句中删三个字」233/275 —— 缝不上的那些退回剥离后的 p.src，
+// 并由 xportWarnColorMacroLoss / 行首的 ⚠ 把哪几行受影响**说出来**，绝不静默）。
+// 上一版这里直接拼 pair.src（剥离后的文本），一进 Edit 视图就把全篇 566 处修订标记删光；
+// 上上一版对改过的行整行退回 p.src，改两个字符就丢掉那一行的宏（实测 566 → 565）。
+//
+// 【这三个字段必须一起换 —— 少换一个就是另一条静默丢失】
+//   · inputText：大输入框里显示的那份。
+//   · originalInputText：「重新生成所有翻译」的输入源。不换它，重新生成就会拿最初粘进来
+//     的那一版覆盖掉用户的逐句改稿（这正是上一版把 srcEdited 标志清掉之后留下的洞）。
+//   · srcEditedSinceTranslate：改稿已经收回到上面两个字段里了，标志到此为止。
+// 基线 lastTranslatedText **不**动：动了的话，切进 Edit 视图之后按 TRANSLATE 会被
+// 「原文和上次翻译的一模一样」挡回去 —— 而屏幕上的原文明明已经不一样了。
+// （不动它也不会引发自动重译：防抖只在 handleInputChange 里起武，视图切换不经过那里。）
+function syncInputFromPairs() {
+    if (!Array.isArray(AppState.translationPairs) || AppState.translationPairs.length === 0) return false;
+    if (!AppState.srcEditedSinceTranslate) return false;
+    if (AppState.isLoading || AppState.isRegeneratingAll) return false;
+    const reconstructed = joinPairsAsDocument('src');
+    AppState.srcEditedSinceTranslate = false;
+    if (reconstructed === AppState.inputText) return false;
+    AppState.inputText = reconstructed;
+    AppState.originalInputText = reconstructed;
+    // 这三个字段刚被整份换掉，屏幕上的内容也跟着变了 —— 那就必须落盘。
+    // （调用点有两个：setViewMode('edit') 和 handleTranslate 的第一行。后者只在**翻译成功**
+    //   之后才落盘，翻译失败/被「和上次一模一样」挡回去的那两条路上一次都不会落。
+    //   放在这里而不是放在两个调用点上：出口只有一个，将来多一个调用点也不会漏。）
+    xportPersistSoon();
+    return true;
 }
 
 // ============= 重新生成所有翻译 =============
@@ -8053,17 +9517,69 @@ async function handleRegenerateAll() {
         return;
     }
 
+    // ---- 未提交草稿闸门 ----
+    // 下面那次扫描结束时会把 translationPairs **整份换掉**，此刻编辑框里没按 Update 的字
+    // 一个都不会留下（实测：框里的 CONTROL 在扫到那一行时被丢掉，全程没有任何提示）。
+    // 先说一声、给一次反悔的机会；继续则当场退出编辑态 —— 留着一个整篇扫描期间根本编不了
+    // 的输入框只会继续骗人（扫描期间 handleRowClick 也不再放人进去，见那里的注释）。
+    if (AppState.activeIndex !== null) {
+        const cur = AppState.translationPairs[AppState.activeIndex];
+        const dirty = !!cur && (AppState.editValues.src !== cur.src || AppState.editValues.tgt !== cur.tgt);
+        if (dirty) {
+            let go = false;
+            try {
+                go = window.confirm('第 ' + (AppState.activeIndex + 1) + ' 行还有没保存的修改。\n\n'
+                    + '「重新生成所有翻译」会把整篇译文换成新的一版，这处修改会被丢掉，而且找不回来。\n\n'
+                    + '确定 = 丢弃它并继续；取消 = 先回去点 Update 保存。');
+            } catch (e) { go = false; }
+            if (!go) return;
+        }
+        setState({ activeIndex: null, editValues: { src: '', tgt: '' } });
+    }
+
     // ---- 一致性闸门（上一版第 7 条：从历史恢复后点「重新生成」会用**另一份文档**
     //      覆盖归档，既不提示也无法找回）----
     // 根因是 originalInputText 与屏幕上这份译文不是同一份文档。两种真实产生路径：
     //   ① restoreGlobalHistory 换掉了 translationPairs 但没换 originalInputText；
     //   ② handleTranslate 在**发请求之前**就更新了 originalInputText，那次翻译却失败了。
     // ①已在 restoreGlobalHistory 里从根上堵掉；这里再加一道闸门兜住②和任何将来的新路径。
-    const regenSource = AppState.originalInputText || AppState.inputText;
+    //
+    // ---- 逐句改稿必须跟着走 ----
+    // 原文栏逐句改过稿时，「屏幕上这份」就是 pairs，不是 originalInputText（那是最初粘进来
+    // 的那一版）。拿旧的那份去重新生成 = 又一次把用户的逐句改稿整份丢掉，而上面那道
+    // 一致性闸门只比对第一句的前 60 个字，改在第 5 行它一个字都察觉不到。
+    // 【两条路都要堵，缺一条就是上一版的 B6】
+    //   · 改完**没进过** Edit 视图：标志还是 true，走下面第一支，直接从 pairs 拼。
+    //   · 改完**进过** Edit 视图：syncInputFromPairs 已经把重建结果同时写进 inputText 和
+    //     originalInputText 才清掉标志，走第二支拿到的就是含改稿的那一份。
+    //     上一版 syncInputFromPairs 只写 inputText 就把标志清了，于是「改一句 → 开一次
+    //     Edit → 重新生成」拿最初粘进来的那一版覆盖全篇，逐句改稿一条不剩 —— 而它上面
+    //     那段注释当时正宣称这条路已经堵住了。
+    // 【这一支走的是哪条路，后面回写时必须知道 —— 我自己在这一轮改出来的一个回归】
+    // 下面成功之后要把 regenSource 写回 inputText / originalInputText（F2）。但那**只能**在
+    // 「源头就是屏幕上的 pairs」这一支做。另一支的源头是 originalInputText，而此刻 inputText
+    // 里可能是用户刚粘进去、还没翻的下一段：AUTO SYNC 关掉 → 粘一段新文本 → 手滑点了 ⟳ 而不是
+    // TRANSLATE，无条件回写会把那段新文本原地抹掉（实测 inputText 从 "BRAND-NEW-PASTED-SECTION…"
+    // 变回 "Alpha one sentence. …"，confirms=[]、toast=null、error=null —— 正是这次要根除的那类静默损坏）。
+    // 反过来，srcEditedSinceTranslate 为 true 时 inputText 一定没被动过（handleInputChange
+    // 第一件事就是把这个标志清掉），所以那一支回写是安全的。
+    const usedPairsAsSource = AppState.srcEditedSinceTranslate === true;
+    const regenSource = usedPairsAsSource
+        ? joinPairsAsDocument('src')
+        : (AppState.originalInputText || AppState.inputText);
+    // 拿 pairs 拼出来的那一支才可能丢宏（另一支是用户粘进来的原样文本）。
+    // 这一次重新生成会把结果写回 inputText / originalInputText 并落盘，所以现在就要说。
+    if (usedPairsAsSource) xportWarnColorMacroLoss('重新生成用的原文');
     const head = (s) => String(s || '').replace(/\s+/g, '').slice(0, 60);
     const onScreenHead = head(AppState.translationPairs[0] && AppState.translationPairs[0].src);
+    // 两边必须是**同一把尺子**量出来的：屏幕上那句 pair.src 是剥离颜色宏之后的文本，
+    // 而 regenSource 现在是**带宏的原文**（joinPairsAsDocument 优先用 srcRaw）。
+    // 不先剥一次，一篇开头带 `\textcolor{blue}{` 的文档每次点重新生成都会弹一次
+    // 「将用另一份文档替换」——一句假警报，而且它把正确的操作挡在确认框后面。
+    let regenHead;
+    try { regenHead = head(stripTextColorForModel(regenSource)); } catch (e) { regenHead = head(regenSource); }
     let switchingDoc = false;
-    if (onScreenHead && head(regenSource).slice(0, onScreenHead.length) !== onScreenHead) {
+    if (onScreenHead && regenHead.slice(0, onScreenHead.length) !== onScreenHead) {
         let go = false;
         try {
             go = window.confirm('「重新生成所有翻译」将用另一份文档的内容替换当前这份译文。\n\n'
@@ -8084,11 +9600,14 @@ async function handleRegenerateAll() {
         // 同一个归档槽位，一个自动存档周期（默认 5 分钟）后就把刚存进去的旧文档原地
         // 覆盖掉 —— 确认框里「可从历史菜单找回」的承诺只兑现 5 分钟。
         // 同文档重新生成不换 id：那是同一份稿子的新版本，占两个槽位反而会把历史挤爆。
-        if (switchingDoc) {
-            let nid = String(Date.now());
-            if (nid === AppState.sessionId) nid = String(Date.now() + 1);
-            AppState.sessionId = nid;
-        }
+        // 一处都不许自己拼 Date.now()（见 xportNewSessionId 上面那段注释）。这里拼出来的
+        // 裸毫秒串只跟 AppState.sessionId 比过，**没跟归档里已有的 id 比过**：归档里只要有
+        // 一条 id 也是裸毫秒串（AppState 的默认 sessionId、或旧版本写进 IndexedDB 之后
+        // 又恢复回来的那些），同一毫秒内就会撞上；而 addToGlobalHistory 按 id 命中就整份
+        // 替换 pairs —— 上面那行刚存进去的旧文档当场被新文档顶掉，确认框里「可从历史菜单
+        // 找回」的承诺当场作废。xportNewSessionId 会把 globalHistory 里每一条 id 一起避开，
+        // 并且带随机后缀。
+        if (switchingDoc) AppState.sessionId = xportNewSessionId();
     }
 
     // 初始化 AbortController
@@ -8097,13 +9616,46 @@ async function handleRegenerateAll() {
 
     setState({ isRegeneratingAll: true, error: null });
 
+    // ============= 这一次扫描属于**哪一份文档** =============
+    // 【实测的原始故障】handleTranslate 有这道核对（见它那边 `const gen = AppState.docGeneration`），
+    // 这里没有。而 handleClear 只 abort 了 mainAbortController，**没有** abort
+    // regenerateAllAbortController —— 于是「点重新生成 → 立刻点清空」之后，那次扫描照旧
+    // 跑完并把整份 pairs 写回屏幕：清空按钮当着用户的面把内容清掉，十几秒后内容自己回来了，
+    // error=null、toast=null。restoreGlobalHistory 那条路靠 abort 侥幸挡住，但挡住的理由
+    // 不该是「另一个函数记得 abort」。docGeneration 就是为这件事准备的，用它。
+    const regenGen = AppState.docGeneration;
+
     try {
         const config = getApiConfig();
         // 使用原始输入内容重新翻译（不是按句拼接的）
         const originalText = regenSource;
 
+        // ============= 方向必须跟着**这份文本**走 =============
+        // 【实测的残留故障】刷新那条路已经堵上了（xportPersistRestore 现在会把
+        // sourceLang / targetLang / isAutoDetect 一起恢复回来），但「从历史菜单恢复一份
+        // 文档」这条路没有：归档条目里只有 {id, timestamp, pairs}，一个语言字段都没有
+        //（restoreGlobalHistory 全文不含 sourceLang / targetLang / detectLanguage）。
+        // 于是在 zh→en 状态下恢复一份英文稿再点「重新生成所有翻译」，跑的是 zh→en：
+        // 系统提示词写的是 Translate Chinese into English，整篇英文原文被换成英文改写，
+        // 而 failedCount=0、error=null、没有 toast。
+        // 【修法与 TRANSLATE 逐字一致】只在 AUTO（isAutoDetect）时重新检测；用户手动
+        // 锁定方向时一个字节都不动 —— 手动锁定的意思就是「别猜」。detectLanguage 只数
+        // 汉字与拉丁字母、与空白无关，所以拿 regenSource 检测和拿 inputText 检测结论必然相同。
+        let regenSrcLang = AppState.sourceLang, regenTgtLang = AppState.targetLang;
+        if (AppState.isAutoDetect) {
+            const detected = detectLanguage(originalText);
+            regenSrcLang = detected.src;
+            regenTgtLang = detected.tgt;
+            // 顶栏那两个语言芯片也跟着换，否则屏幕上写着 ZH ⇄ EN、实际跑的是 EN ⇄ ZH。
+            // skipRender=true：整篇扫描刚刚开始，这里不该多画一帧。
+            if (detected.src !== AppState.sourceLang || detected.tgt !== AppState.targetLang) {
+                setState({ sourceLang: detected.src, targetLang: detected.tgt }, true);
+            }
+        }
+
         // 重新翻译所有内容
-        const result = await translateBulk(originalText, AppState.sourceLang, AppState.targetLang, config, controller.signal);
+        const result = await translateBulk(originalText, regenSrcLang, regenTgtLang, config, controller.signal);
+        if (regenGen !== AppState.docGeneration) return;   // 屏幕上已经换成别的文档了（清空 / 从历史恢复）
 
         // 同上：空数组不算成功，绝不用 0 行覆盖现有译文
         if (result?.translations?.length > 0) {
@@ -8111,6 +9663,8 @@ async function handleRegenerateAll() {
             const pairs = result.translations.map((t) => ({
                 src: t.src,
                 tgt: t.tgt,
+                brk: t.brk === true,
+                srcRaw: (typeof t.srcRaw === 'string') ? t.srcRaw : undefined,
                 history: [{ src: t.src, tgt: t.tgt }],
                 historyIndex: 0,
                 isUpdating: false,
@@ -8120,9 +9674,32 @@ async function handleRegenerateAll() {
                 translationPairs: pairs, viewMode: 'preview', activeIndex: null,
                 lastTransportFailures: Number(result.failedCount) || 0
             });
+            // ============= 用掉了改稿，就必须把它收回这三个字段 =============
+            // 【实测的原始故障（F2 / L3-2）】上一版这里只有下面那行 `= false`。regenSource
+            // 在 :7662 已经把逐句改稿拼进来并且真的翻了，可 inputText / originalInputText
+            // 一个都没跟着换，标志却被清掉 —— 从此 syncInputFromPairs 第一行就 return，
+            // 再也没有任何一条路会来对账。实测：
+            //   · 改第 3 行原文 → 重新生成 → `pairs have fix=true  inputText has fix=false`；
+            //   · 再点一次重新生成 → `pairs have fix=false`，改稿从屏幕上消失，
+            //     confirms=[]（一致性闸门只比第 0 行前 60 个非空白字符）、toast=null、error=null；
+            //   · 或者进 Edit 视图 → 大输入框 `shows fix: false`，敲一个字触发 AUTO SYNC 之后
+            //     `pairs have fix=false`，同样零提示。
+            // 这三个字段必须一起换 —— 这句话是 :7589 那段注释自己写的，这里没照做。
+            // lastTranslatedText 这里**要**跟着换（syncInputFromPairs 那边不换，理由不同）：
+            // 这一次是真的把 originalText 逐字送出去翻过了，不同步的话紧接着按 TRANSLATE
+            // 会拿旧基线比出「不一样」而整篇重翻一遍；同步之后那句
+            // 「原文和上次翻译的一模一样」才是真话。
+            // 只有「源头就是屏幕上的 pairs」那一支才回写（理由见上面 usedPairsAsSource 那段）。
+            if (usedPairsAsSource) {
+                AppState.inputText = originalText;
+                AppState.originalInputText = originalText;
+                AppState.lastTranslatedText = originalText;
+            }
+            AppState.srcEditedSinceTranslate = false;
             // 与 handleTranslate 同一条路：逐段失败 + A7 公式存活审计，合并成一条 toast。
             AppState.lastEquationLoss = xportReportAfterTranslate(
                 originalText, result.translations, Number(result.failedCount) || 0).lost;
+            xportPersistSoon();
         }
     } catch (err) {
         if (err.name !== 'AbortError') {
@@ -8740,6 +10317,12 @@ function normalizePair(p) {
     if (hi > history.length - 1) hi = history.length - 1;
     return {
         src: src, tgt: tgt, history: history, historyIndex: hi,
+        // brk = 「这一句后面原文里是空行」。归一化时必须带过来，否则任何一次归一化都会
+        // 把整篇的 LaTeX 分段信息抹平，复制出去的译文再也贴不回 .tex（见 joinPairsAsDocument）。
+        brk: o.brk === true,
+        // srcRaw = 这一行剥离颜色宏**之前**的原文（见 xportAttachRawSrc）。同理必须带过来：
+        // 丢掉它，用户论文里那 566 处 \textcolor 就会在下一次「拼回整篇」时被删光。
+        srcRaw: (typeof o.srcRaw === 'string') ? o.srcRaw : undefined,
         isUpdating: !!o.isUpdating, isRegenerating: !!o.isRegenerating
     };
 }
@@ -10742,7 +12325,10 @@ function renderHeader() {
                 <button id="chatToggleBtn" onclick="chatToggle()" aria-pressed="${chatIsOpen() ? 'true' : 'false'}" class="px-5 py-2.5 bg-white border border-slate-200 text-slate-700 rounded-2xl hover:bg-slate-50 hover:border-indigo-200 transition-all font-semibold flex items-center gap-2 group ${chatIsOpen() ? 'is-chat-open' : ''}" data-tip="开/关浮动 AI 对话窗：一个能自由拖动、自己调大小的聊天窗，随便问、也能让模型改左右两栏里的任意一段。窗口挂在页面最外层，界面刷新和自动存档都打断不了你输到一半的内容。" data-tip-pos="bottom-start">
                     <span class="text-indigo-500 group-hover:animate-pulse">${Icons.MessageSquare}</span> Chat
                 </button>
-                <button onclick="handleTranslate()" ${!AppState.inputText && !AppState.isLoading ? 'disabled' : ''} class="px-10 py-2.5 rounded-2xl font-black text-sm tracking-wider transition-all shadow-xl active:scale-95 flex items-center gap-2 ${!AppState.inputText && !AppState.isLoading ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isLoading ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isLoading ? '正在翻译，点一下立即中断（已翻好的部分保留）。' : '把左边输入框的全文按句拆开翻译，结果逐句出现在右栏。会覆盖当前译文。'}" data-tip-pos="bottom-end">
+                <!-- id 是给 syncTranslateButtonState() 用的：handleInputChange 刻意不重渲染
+                     （避免焦点丢失），所以这颗按钮的 disabled 必须由那边直接改到 DOM 上，
+                     否则它会一直停在「输入框还是空的」那一刻算出来的值上。 -->
+                <button id="translateBtn" onclick="handleTranslate()" ${!AppState.inputText && !AppState.isLoading ? 'disabled' : ''} class="px-10 py-2.5 rounded-2xl font-black text-sm tracking-wider transition-all shadow-xl active:scale-95 flex items-center gap-2 ${!AppState.inputText && !AppState.isLoading ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isLoading ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isLoading ? '正在翻译，点一下立即中断（已翻好的部分保留）。' : '把左边输入框的全文按句拆开翻译，结果逐句出现在右栏。会覆盖当前译文。'}" data-tip-pos="bottom-end">
                     ${AppState.isLoading ? `<span class="animate-pulse">${Icons.StopCircle}</span> STOP` : 'TRANSLATE'}
                 </button>
                 <button onclick="handleRegenerateAll()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="p-2.5 rounded-2xl transition-all shadow-xl active:scale-95 flex items-center justify-center ${AppState.translationPairs.length === 0 ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isRegeneratingAll ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isRegeneratingAll ? '正在逐句重译，点一下停下来。' : '用当前模型把每一句重新翻一遍（原文不动）。换了模型、或对整体译文不满意时用它；再点一次可中断。'}" data-tip-pos="bottom-end">
@@ -10801,8 +12387,14 @@ function renderSaveButtonGroup() {
 function renderHistoryMenu() {
     return `
         <div class="relative">
-            <button onclick="toggleHistoryMenu()" class="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-all" data-tip="最近保存过的会话快照，点其中一条即可把当时的原文和译文整体恢复回来（会覆盖当前内容）。" data-tip-pos="bottom-start">
+            <button onclick="toggleHistoryMenu()" class="relative p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-all" data-tip="最近保存过的会话快照，点其中一条即可把当时的原文和译文整体恢复回来（会覆盖当前内容）。角标「未存」= 这一刻屏幕上的内容还没写进本地存档；写入失败（配额满、隐私模式、被别的标签页占住）时它会一直亮着，点开菜单看红字说明。" data-tip-pos="bottom-start">
                 ${Icons.History}
+                <!-- 落盘状态角标。防抖窗口里关标签/刷新会丢这一次改动（见 xportPersistUnsaved
+                     上面那段），所以「还没存」这件事必须在顶栏一直看得见，而不是藏在这个
+                     菜单里等用户点开。首帧由模板给出正确初值，之后由 xportPersistBadgeSync
+                     直接改这一个节点（不重渲染，理由同 syncTranslateButtonState）。 -->
+                <span id="persistPendingDot" style="display:${xportPersistUnsaved() ? '' : 'none'}"
+                      class="absolute top-0 right-0 px-1 rounded-full bg-amber-500 text-white text-[8px] font-bold leading-[13px] pointer-events-none">未存</span>
             </button>
             ${AppState.showHistoryMenu ? `
                 <div id="historyMenuPopup" class="absolute top-full right-0 mt-2 w-80 bg-white border border-slate-200 shadow-2xl rounded-2xl p-4 z-[70]">
@@ -10825,6 +12417,28 @@ function renderHistoryMenu() {
                         </div>
                     </div>
                     
+                    <!-- 落盘状态：这个面板承诺「会话可以恢复」，所以它必须说实话。
+                         存成功了就说存到哪一刻，存失败了 / 让位给别的标签页了就红字常驻
+                        （toast 会消失，这行不会）。
+                         ⚠️ 「刷新页面可恢复」这句话只有在**真的写成功过一次**时才成立：
+                         persistOkAt 只在写事务 oncomplete 之后才被赋值，跳过写（空快照、
+                         或让位给另一个标签页）一律不赋值。上一版这行在盘上那条记录正被
+                         一个空白标签页清掉的同一刻还在显示它，那是这轮里最刺眼的一句假话。
+                         ⚠️ 第二句假话（本轮实测并改掉）：persistOkAt 只说「上一次写成功是几点」，
+                         它**不知道**此刻还有没有一次防抖没落地的改动。于是屏幕上是新文本、
+                         盘上是旧文本的那 1.2 秒里，这行字照旧写着「刷新页面可恢复」——
+                         而刷新恰恰会把那次改动丢掉。文案现在统一由 xportPersistStatusText()
+                         给出（见它上面那段实测记录），未落盘时明说「会丢」。 -->
+                    ${AppState.persistError ? `
+                        <div class="mb-3 p-2 rounded-lg bg-rose-50 border border-rose-200 text-[10px] leading-relaxed text-rose-700">
+                            ⚠️ ${escapeHtml(AppState.persistError)}
+                        </div>
+                    ` : `
+                        <div id="persistStatusLine" class="mb-3 text-[10px] ${xportPersistUnsaved() ? 'text-amber-600 font-medium' : 'text-slate-400'}">
+                            ${escapeHtml(xportPersistStatusText())}
+                        </div>
+                    `}
+
                     <h4 class="text-xs font-black text-slate-400 uppercase tracking-widest mb-3 flex items-center gap-2">
                         ${Icons.Clock} Recent Sessions
                     </h4>
@@ -11095,25 +12709,38 @@ function renderPairRow(side, pair, idx) {
     const isEditing = AppState.activeIndex === idx;
     const textValue = side === 'src' ? pair.src : pair.tgt;
     const editValue = side === 'src' ? AppState.editValues.src : AppState.editValues.tgt;
+    // 整篇翻译 / 整篇重新生成期间这一行是**只读**的（理由见 handleRowClick 上方那段注释）。
+    // 光在 handleRowClick 里挡住还不够：行还带着 cursor-pointer 和悬停抬起效果，
+    // 那本身就是一句「点我，能编」的承诺。这里把承诺一并撤掉，点下去再由 toast 说明原因。
+    const rowLocked = AppState.isRegeneratingAll || AppState.isLoading;
+
+    // 整篇操作期间**正在打开**的那一行也必须锁住。上一版 rowLocked 只用在 else 分支：
+    // 实测 `open row carries the lock tooltip = false`、`OTHER rows carry the lock tooltip = true`，
+    // 而 toast 同时说着「这期间不能逐句编辑」—— 屏幕上明摆着一个能打字的框在打这句话的脸。
+    // handleTranslate / handleRegenerateAll 现在都会在开始之前先把这一行收掉，所以正常路径下
+    // 走不到这里；这一支是兜底（例如别处直接置了 isLoading），一旦发生也要**看得出来**不能用。
+    const lockTip = escapeAttr(AppState.isRegeneratingAll
+        ? '整篇重新生成进行中，这几分钟里逐句编辑是关掉的：跑完会把整篇译文换成新的一版。'
+        : '整篇翻译进行中，这几分钟里逐句编辑是关掉的：翻完会把整篇译文换成新的一版。');
 
     if (isEditing) {
         return `
-            <div class="group relative p-4 rounded-xl transition-all border cursor-pointer bg-white border-indigo-300 shadow-xl ring-4 ring-indigo-50 z-20 scale-[1.01]" data-idx="${idx}" data-side="${side}">
+            <div class="group relative p-4 rounded-xl transition-all border ${rowLocked ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'} bg-white border-indigo-300 shadow-xl ring-4 ring-indigo-50 z-20 scale-[1.01]" data-idx="${idx}" data-side="${side}"${rowLocked ? ` data-tip="${lockTip}" data-tip-pos="top"` : ''}>
                 <div class="absolute -top-3 left-1/2 -translate-x-1/2 z-30">
                     ${renderHistoryControls(pair, idx)}
                 </div>
                 <div class="relative flex flex-col gap-3">
                     <div class="absolute -top-10 right-0 z-40 flex items-center gap-2">
-                        <button onclick="event.stopPropagation();triggerSaveRowUpdate(${idx});" class="flex items-center gap-2 px-3 py-1.5 rounded-lg text-white text-xs font-bold shadow-lg transition-all ${pair.isUpdating ? 'bg-rose-500 hover:bg-rose-600' : 'bg-indigo-600 hover:bg-indigo-700'}" data-tip="${pair.isUpdating ? '正在更新这一句，点一下停下来。' : '保存你刚才手改的内容，并让模型把另一侧那句同步改过来（改原文→重译，改译文→回译校对）。'}" data-tip-pos="left">
+                        <button onclick="event.stopPropagation();triggerSaveRowUpdate(${idx});" ${rowLocked ? 'disabled' : ''} class="flex items-center gap-2 px-3 py-1.5 rounded-lg text-white text-xs font-bold shadow-lg transition-all ${rowLocked ? 'bg-slate-300 cursor-not-allowed' : pair.isUpdating ? 'bg-rose-500 hover:bg-rose-600' : 'bg-indigo-600 hover:bg-indigo-700'}" data-tip="${rowLocked ? lockTip : pair.isUpdating ? '正在更新这一句，点一下停下来。' : '保存你刚才手改的内容，并让模型把另一侧那句同步改过来（改原文→重译，改译文→回译校对）。'}" data-tip-pos="left">
                             ${pair.isUpdating ? `<span class="animate-pulse">${Icons.StopCircle}</span> Stop` : `${Icons.PenLineSmall} Update`}
                         </button>
-                        <button onclick="event.stopPropagation();handleRegenerateTranslation(${idx});" class="flex items-center justify-center p-1.5 rounded-lg text-white shadow-lg transition-all ${pair.isRegenerating ? 'bg-rose-500 hover:bg-rose-600' : 'bg-indigo-600 hover:bg-indigo-700'}" data-tip="${pair.isRegenerating ? '正在重新翻译这一句，点一下停下来。' : '只把这一句重新翻一遍（原文不动）。对这句译文不满意时用它，不影响其它句子。'}" data-tip-pos="left">
+                        <button onclick="event.stopPropagation();handleRegenerateTranslation(${idx});" ${rowLocked ? 'disabled' : ''} class="flex items-center justify-center p-1.5 rounded-lg text-white shadow-lg transition-all ${rowLocked ? 'bg-slate-300 cursor-not-allowed' : pair.isRegenerating ? 'bg-rose-500 hover:bg-rose-600' : 'bg-indigo-600 hover:bg-indigo-700'}" data-tip="${rowLocked ? lockTip : pair.isRegenerating ? '正在重新翻译这一句，点一下停下来。' : '只把这一句重新翻一遍（原文不动）。对这句译文不满意时用它，不影响其它句子。'}" data-tip-pos="left">
                             ${pair.isRegenerating ? `<span class="animate-pulse">${Icons.StopCircle}</span>` : Icons.RefreshCw}
                         </button>
                     </div>
                     <div class="relative">
                         ${renderSelectionHighlightLayer(side, idx)}
-                        <textarea id="editTextarea_${side}_${idx}" class="relative block w-full bg-transparent border-none focus:ring-0 p-0 text-slate-800 leading-relaxed resize-none overflow-hidden min-h-[40px]" placeholder="Edit ${side === 'src' ? 'source' : 'target'}..." onclick="event.stopPropagation();">${escapeHtml(editValue)}</textarea>
+                        <textarea id="editTextarea_${side}_${idx}" ${rowLocked ? 'readonly' : ''} class="relative block w-full bg-transparent border-none focus:ring-0 p-0 ${rowLocked ? 'text-slate-500 cursor-not-allowed' : 'text-slate-800'} leading-relaxed resize-none overflow-hidden min-h-[40px]" placeholder="Edit ${side === 'src' ? 'source' : 'target'}..." onclick="event.stopPropagation();">${escapeHtml(editValue)}</textarea>
                     </div>
                     ${renderAiToolbar(side, idx)}
                 </div>
@@ -11121,7 +12748,7 @@ function renderPairRow(side, pair, idx) {
         `;
     } else {
         return `
-            <div class="group relative p-4 rounded-xl transition-all border cursor-pointer border-transparent hover:bg-white/80 hover:shadow-md" onclick="handleRowClick(${idx},'${side}')" data-idx="${idx}" data-side="${side}">
+            <div class="group relative p-4 rounded-xl transition-all border border-transparent ${rowLocked ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:bg-white/80 hover:shadow-md'}" onclick="handleRowClick(${idx},'${side}')" data-idx="${idx}" data-side="${side}"${rowLocked ? ` data-tip="${lockTip}" data-tip-pos="top"` : ''}>
                 <!-- 「关注」复选框 —— 取代了原来那颗「附到对话」按钮。
                      附加曾经是「让模型看得见这一句」的唯一通道；文档现在每一轮整篇发过去，
                      那个用途没有了，剩下的需求是「这几处请多留意」，那是一个**多选**的状态，
@@ -11134,6 +12761,12 @@ function renderPairRow(side, pair, idx) {
                      它同时也让这次点击到不了 document 上的 handleGlobalClick（那家伙会 saveRowUpdate
                      并退出编辑态）。handleGlobalClick 里另有一条按 [data-focus-cb] 的显式豁免兜底。 -->
                 ${focusCheckboxHtml(idx, side, 'row')}
+                ${side === 'src' && xportRowDropsColorMacros(pair) ? `
+                <!-- 这一行的 \\textcolor 修订标记重建整篇时带不回来（用户改过这一行原文，
+                     而改动压在了宏语法上）。绝对定位，脱离文档流 —— 对行高和左右两栏
+                     逐像素对齐没有任何影响，理由同上面「关注」复选框。 -->
+                <span class="absolute top-1.5 left-1.5 z-10 text-[11px] leading-none text-amber-500 select-none" data-tip="这一行的 \\textcolor 修订标记带不回来：你改过这一行的原文，改动压在了颜色宏上。复制原文 / 切到大输入框 / 重新生成时，这一行是不带宏的纯文本（其余行原样保留）。需要那几处标记就到「历史」里取回改动前的那一版。" data-tip-pos="top">⚠</span>
+                ` : ''}
                 <div class="prose prose-slate prose-sm max-w-none text-slate-700 leading-relaxed transition-all ${pair.isUpdating ? 'opacity-30 blur-[2px]' : ''}">${renderFormattedText(textValue)}</div>
             </div>
         `;
@@ -11389,13 +13022,15 @@ function autoResizeTextarea(textarea) {
 
 // ============= 辅助UI函数 =============
 function copySourceText() {
-    const text = AppState.translationPairs.map(p => p.src).join('\n');
-    copyToClipboard(text);
+    // LaTeX 分段必须跟着一起复制出去，否则贴回 .tex 会把整节并成一段（见 joinPairsAsDocument）
+    copyToClipboard(joinPairsAsDocument('src'));
+    // 复制 = 这份文本要贴回 .tex 了。有哪几行的 \textcolor 缝不回来，必须在这一刻说，
+    // 而不是等用户编出 PDF 才发现修订标记没了（见 xportWarnColorMacroLoss）。
+    xportWarnColorMacroLoss('复制出去的文本');
 }
 
 function copyTargetText() {
-    const text = AppState.translationPairs.map(p => p.tgt).join('\n');
-    copyToClipboard(text);
+    copyToClipboard(joinPairsAsDocument('tgt'));
 }
 
 function saveGeminiApiKey() {
@@ -11487,6 +13122,9 @@ function setAutoSaveInterval(ms) {
     try {
         localStorage.setItem('autoSaveInterval', ms.toString());
     } catch (e) {}
+    // 改完立刻对活着的定时器生效。少了这一行，新间隔要等到下次刷新页面才算数
+    // （实测：面板显示 1 分钟，实际节拍仍是启动时的 300 秒）。
+    armAutoSaveTimer();
     renderApp();
 }
 
@@ -11501,7 +13139,9 @@ function setSynonymDefaultMode(mode) {
 }
 
 function restoreHistoryItem(idx) {
-    restoreGlobalHistory(AppState.globalHistory[idx]);
+    const item = AppState.globalHistory[idx];
+    if (!item) return;
+    restoreGlobalHistory(item);
 }
 
 function selectModel(provider, modelId) {
@@ -11874,25 +13514,50 @@ function handleConnectLocalClick() {
     handleConnectLocal();
 }
 
+// ============= 手动锁定的方向必须跟着落盘 =============
+// 【实测的原始故障】xportPersistSnapshot 存了 sourceLang / targetLang / isAutoDetect，
+// xportPersistRestore 也把它们恢复回来 —— 但这两个**唯一**会改方向的函数一个都不落盘。
+// 于是（真 Chrome，127.0.0.1:8765，屏幕上有 3 行译文）：
+//   setLanguage('zh','en') → 内存 ["zh","en",false]，等 3.5 秒读盘 ["en","zh",true]、
+//   savedAt 一个数没动 → 刷新 → 回来还是 ["en","zh",true]，顶栏芯片也翻回 EN⇄ZH，
+//   零提示、persistError=null。用户手动锁的方向被静默解锁并翻转。
+// 接下来按 TRANSLATE / 「重新生成所有翻译」跑的就是反方向：系统提示词写着
+// Translate English into Chinese，而整篇中文原文被当英文送进去 —— 正是
+// handleRegenerateAll 里那段注释宣称「刷新那条路已经堵上了」的那个故障，
+// 它当时只堵了「恢复」这一半，没堵「保存」这一半。
+// 【为什么不能靠别的写点兜底】剩下所有 xportPersistSoon() 都挂在**内容**变化上；
+// 只改方向不改内容时一次都不会触发，那条记录可以停在几十分钟前的方向上。
 function setLanguage(src, tgt) {
     AppState.sourceLang = src;
     AppState.targetLang = tgt;
     AppState.isAutoDetect = false;
     renderApp();
+    xportPersistSoon();
 }
 
 function setViewMode(mode) {
+    // 进大输入框之前先把原文栏里的逐句改稿收回来（见 syncInputFromPairs 上方那段注释）。
+    // 这是原来那个死函数 toggleEditMode 唯一该待的地方。
+    // 重建真的发生了（返回 true）才提示：那一刻才是「被削过的文本写进 inputText /
+    // originalInputText」的时刻，也才值得打断用户。没重建就一声不吭。
+    if (mode === 'edit' && syncInputFromPairs()) xportWarnColorMacroLoss('大输入框');
     AppState.viewMode = mode;
     AppState.isEditingMode = (mode === 'edit');
     renderApp();
+    // viewMode 本来就在 xportPersistSnapshot 里、xportPersistRestore 也读它，
+    // 却没有任何一条路会因为「切了视图」而落盘 —— 存了不用/用了不存都是同一种不一致。
+    xportPersistSoon();
 }
 
+// 与 setLanguage 同一条理由、同一个实测故障（见它上面那段）：这也是一次「只改方向、
+// 不改内容」的变更，不在这里落盘就没有任何别的路会替它落。
 function swapLanguages() {
     const temp = AppState.sourceLang;
     AppState.sourceLang = AppState.targetLang;
     AppState.targetLang = temp;
     AppState.isAutoDetect = false;
     renderApp();
+    xportPersistSoon();
 }
 
 function triggerCustomRefine(idx, side) {
@@ -11947,15 +13612,32 @@ function resetPromptToDefault(type) {
 
 // ============= History Limit 设置 =============
 function setHistoryLimit(limit) {
-    AppState.historyLimit = limit;
-    // 裁剪历史记录
+    // 【取消 = 什么都没发生】上一版取消那一支写的是
+    // `AppState.historyLimit = AppState.globalHistory.length` 然后 return —— 它既不是
+    // 用户原来的设置，也没写进 localStorage：内存里是「当前条数」，盘上还是旧值，两边对不上。
+    // 后果是下一次自动存档时 slice(0, historyLimit) 正好把最旧的一份挤掉 —— 用户刚刚
+    // 明确拒绝的那件事，转头就在他不知情的时候发生了。取消必须原样退回**之前的设置**。
+    const prev = AppState.historyLimit;
+    // 裁剪历史记录 —— 这是**唯一**会淘汰内容的地方，而且是用户自己按下的。
+    // 调小会当场丢掉多出来的快照，所以先说一声：内容绝不在用户不知情的时候消失。
     if (AppState.globalHistory.length > limit) {
+        const drop = AppState.globalHistory.length - limit;
+        let go = true;
+        try {
+            go = window.confirm('把「保留最近」调到 ' + limit + ' 份，会立刻删掉最旧的 '
+                + drop + ' 份快照，删掉之后找不回来。\n\n确定吗？');
+        } catch (e) { go = true; }
+        if (!go) { AppState.historyLimit = prev; renderApp(); return; }
+        AppState.historyLimit = limit;
         AppState.globalHistory = AppState.globalHistory.slice(0, limit);
+        try { showToast('已删除最旧的 ' + drop + ' 份快照', 'warning'); } catch (e) {}
     }
+    AppState.historyLimit = limit;
     // 保存到 localStorage
     try {
         localStorage.setItem('historyLimit', limit.toString());
     } catch (e) {}
+    xportPersistSoon();
     renderApp();
 }
 
@@ -15022,6 +16704,24 @@ function chatApplyProposal(id) {
             // 并发一次模型请求，那正是「静默改写用户另一栏」的那种失败。
             const newSrc = p.side === 'src' ? next : String(row.src == null ? '' : row.src);
             const newTgt = p.side === 'tgt' ? next : String(row.tgt == null ? '' : row.tgt);
+            // ============= 改到**原文栏**上，就必须打上「用户动过原文」这个标志 =============
+            // 【实测的原始故障（真 Chrome + jump 上的 qwen/qwen3.6-35b-a3b）】这里原来直接
+            // addHistory 就完了。addHistory 刻意**不**碰 srcEditedSinceTranslate（它那边的理由是
+            // 「模型自己回写的 src 不算用户改稿」，见它上面那段注释），于是聊天窗口把一处修改
+            // 应用进 pairs[i].src 之后：pairs 变了、inputText / originalInputText 一个字没动、
+            // 标志还是 false。从此 syncInputFromPairs 第一行就 return，没有任何一条路会来对账 ——
+            // 这正是 handleRegenerateAll 里那段注释宣称已经堵掉的 B6，只是入口换成了聊天窗口。
+            // 逐字复现（3 行文档，两次实测）：
+            //   · 第 1 行 src 应用 `CHATMARK77` → 进 Edit 视图：大输入框 hasMark=false，
+            //     而原文栏 hasMark=true —— 分歧就摆在屏幕上，用户分不出哪一份才算数；
+            //   · 第 3 行 src 应用 `CHATMARK88` → 点「重新生成所有翻译」→ 标记原地消失，
+            //     confirms=[]、toasts=[]、error=null、failedCount=0，零通知。
+            //     （一致性闸门只比第 0 行前 60 个非空白字符，改在第 3 行它一个字都察觉不到；
+            //      改在第 1 行倒是会弹一次确认框，但那只是碰巧撞上了尺子。）
+            // 这一处和 saveRowUpdate 里 `if (srcChanged) AppState.srcEditedSinceTranslate = true`
+            // 是同一件事：**用户**点了「应用」，这就是他认可的原文改动。标志一打上，
+            // syncInputFromPairs / handleRegenerateAll 就都会拿 pairs 当这份文档的准绳。
+            if (p.side === 'src') AppState.srcEditedSinceTranslate = true;
             addHistory(p.rowIndex, newSrc, newTgt);      // 内含 setState → 一次整页重渲染（用户主动动作，可接受）
             scheduleAlignSync();
             chatAppendRow('system', '已应用到「' + (p.side === 'src' ? '原文' : '译文') + ' 第 '
