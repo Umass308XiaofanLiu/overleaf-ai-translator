@@ -383,7 +383,10 @@ body.is-resizing-settings-modal * {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 0 8px 0 12px;
+    /* 右边距 12px（不是 8px）是给右上角那颗 12×12 缩放手柄让位的：最右一颗按钮的右边缘
+       必须落在手柄之外，否则「关闭」的右上角会有一小片按不到（点下去变成拖拽缩放）。
+       改这个值前先量一遍 .aichat-resize-tr 的尺寸。 */
+    padding: 0 12px;
     background: #f8fafc;
     border-bottom: 1px solid #e2e8f0;
     cursor: grab;
@@ -401,6 +404,27 @@ body.is-resizing-settings-modal * {
     white-space: nowrap;
 }
 #aiChatRoot .aichat-title-spacer { flex: 1 1 auto; min-width: 0; }
+/* 三颗标题栏按钮自成一组、组内 gap 2px。不这么做的话它们会继承标题栏的 gap:8px，
+   在 320px 的最小宽度下白白吃掉 16px，而且三颗按钮看上去像三件不相干的东西。 */
+#aiChatRoot .aichat-titlebtns { display: inline-flex; align-items: center; gap: 2px; flex: 0 0 auto; }
+/* 未读徽标：最小化期间模型回完了才出现。纯 CSS 显隐（JS 只改 hidden 属性和数字），
+   不参与任何渲染路径。 */
+#aiChatRoot .aichat-unread {
+    display: none;
+    flex: 0 0 auto;
+    min-width: 16px;
+    height: 16px;
+    padding: 0 4px;
+    border-radius: 8px;
+    background: #e11d48;
+    color: #ffffff;
+    font-size: 9px;
+    font-weight: 800;
+    line-height: 16px;
+    text-align: center;
+    font-variant-numeric: tabular-nums;
+}
+#aiChatRoot.is-min .aichat-unread[data-n]:not([data-n="0"]) { display: inline-block; }
 #aiChatRoot .aichat-iconbtn {
     display: inline-flex;
     align-items: center;
@@ -462,7 +486,10 @@ body.is-resizing-settings-modal * {
     flex: 0 0 auto;
     border-top: 1px solid #e2e8f0;
     background: #f8fafc;
-    padding: 8px;
+    /* 下边距 12px（不是 8px）是给底部那三个缩放手柄让位的：底边手柄 6px、左下/右下角
+       手柄 12px，最后一行的按钮（会话 / 清理 / 压缩）必须整个落在手柄之外，
+       否则它们的下沿会有一条按不到的带子。改这个值前先量一遍 .aichat-resize-b* 的尺寸。 */
+    padding: 8px 8px 12px;
 }
 #aiChatRoot .aichat-inputrow { display: flex; align-items: flex-end; gap: 8px; }
 #aiChatRoot .aichat-input {
@@ -854,21 +881,56 @@ body.is-resizing-settings-modal * {
 #aiChatRoot .aichat-md pre { background: #f1f5f9; border-radius: 8px; padding: 6px 8px; overflow-x: auto; }
 #aiChatRoot .aichat-md pre code { background: transparent; padding: 0; }
 
-/* ---- 缩放手柄：只做左边、上边、左上角三个。
-       窗口默认锚在右下角，这三个覆盖了所有有用的手势，也省掉八向命中测试。 ---- */
+/* ---- 缩放手柄：八向，四条边 + 四个角，光标形状照 Windows 的窗口边框 ----
+   【尺寸不是拍的，是被两侧夹出来的】
+     · 太薄抓不住；Windows 自己的可拖边框（SM_CXSIZEFRAME + 边框填充）实际约 4–8 px。
+     · 太厚就会盖住底下真正能点的东西 —— 而这个窗口的边缘全是控件：
+       标题栏三颗按钮上下各留 7px（(40−26)/2）、页脚内边距 8px。
+   于是取 **边 6px、角 12px**，再把标题栏右边距和页脚下边距各放宽到 12px 给四个角让位。
+   结论：没有任何一颗按钮的任何一个像素落在手柄之下（实测见提交说明）。
+   textarea 自带的 resize 角不存在冲突 —— .aichat-input 一直是 resize:none，
+   输入框的高度由 chatAutoGrowInput 按内容自增长（1→6 行），本来就没有原生把手。 ---- */
 #aiChatRoot .aichat-resize { position: absolute; touch-action: none; }
-#aiChatRoot .aichat-resize-l  { left: 0; top: 10px; bottom: 0; width: 10px; cursor: ew-resize; }
-#aiChatRoot .aichat-resize-t  { left: 10px; right: 0; top: 0; height: 10px; cursor: ns-resize; }
-#aiChatRoot .aichat-resize-tl { left: 0; top: 0; width: 12px; height: 12px; cursor: nwse-resize; }
+#aiChatRoot .aichat-resize-l  { left: 0;   top: 12px;    bottom: 12px; width: 6px;   cursor: ew-resize; }
+#aiChatRoot .aichat-resize-r  { right: 0;  top: 12px;    bottom: 12px; width: 6px;   cursor: ew-resize; }
+#aiChatRoot .aichat-resize-t  { left: 12px; right: 12px; top: 0;       height: 6px;  cursor: ns-resize; }
+#aiChatRoot .aichat-resize-b  { left: 12px; right: 12px; bottom: 0;    height: 6px;  cursor: ns-resize; }
+#aiChatRoot .aichat-resize-tl { left: 0;   top: 0;    width: 12px; height: 12px; cursor: nwse-resize; }
+#aiChatRoot .aichat-resize-tr { right: 0;  top: 0;    width: 12px; height: 12px; cursor: nesw-resize; }
+#aiChatRoot .aichat-resize-bl { left: 0;   bottom: 0; width: 12px; height: 12px; cursor: nesw-resize; }
+#aiChatRoot .aichat-resize-br { right: 0;  bottom: 0; width: 12px; height: 12px; cursor: nwse-resize; }
+
+/* ---- 最小化：折叠成一条只剩标题栏的窄条 ----
+   【为什么用 height:auto + 隐藏内容，而不是把 geom.h 改成 42】
+   geom.h 是**用户手动调出来的尺寸**，最小化不许动它 —— 动了就意味着展开时要靠另一份
+   备份把它算回来，而那份备份迟早会和 geom 分叉。这里的做法是：ChatState.geom 一个字段
+   都不改，只让 CSS 把渲染高度接管过去（!important 压过 chatApplyGeom 写的内联 height），
+   展开时把 class 摘掉，内联 height 原封不动地重新生效。
+   内容用 display:none 而不是 visibility:hidden：后者照样占位、照样撑大祖先的 scrollWidth。
+   草稿/选区/滚动位置在 display:none 期间不会被浏览器清掉，但 chatScrollToBottom 之类的
+   代码在隐藏期间会把 scrollTop 写成 0，所以这三样由 chatMinimize 显式存、chatExpand 显式还原。 */
+#aiChatRoot.is-min { height: auto !important; }
+#aiChatRoot.is-min .aichat-frame { height: auto; }
+#aiChatRoot.is-min .aichat-log,
+#aiChatRoot.is-min .aichat-footer { display: none; }
+/* 折叠成一条的时候只剩标题栏 = 只剩「移动」这一个手势，八个手柄一律撤掉：
+   留着它们等于让用户去改一个看不见的高度。 */
+#aiChatRoot.is-min .aichat-resize { display: none; }
+#aiChatRoot.is-min .aichat-titlebar { border-bottom: none; }
 
 /* 拖动/缩放全程：禁选中，并把光标钉死成对应形状（松手时属性一起摘掉）。
-   照抄 body.is-resizing-settings-modal 的做法，用属性值区分四种手势。 */
+   照抄 body.is-resizing-settings-modal 的做法，用属性值区分九种手势。 */
 body[data-aichat-drag] { user-select: none !important; }
 body[data-aichat-drag] * { user-select: none !important; }
 body[data-aichat-drag="move"] { cursor: grabbing !important; }
 body[data-aichat-drag="l"]    { cursor: ew-resize !important; }
+body[data-aichat-drag="r"]    { cursor: ew-resize !important; }
 body[data-aichat-drag="t"]    { cursor: ns-resize !important; }
+body[data-aichat-drag="b"]    { cursor: ns-resize !important; }
 body[data-aichat-drag="tl"]   { cursor: nwse-resize !important; }
+body[data-aichat-drag="br"]   { cursor: nwse-resize !important; }
+body[data-aichat-drag="tr"]   { cursor: nesw-resize !important; }
+body[data-aichat-drag="bl"]   { cursor: nesw-resize !important; }
 
 /* 顶栏开关按钮在「窗口开着」时的状态。这个类由 chatSyncToggleButton 直接改 DOM 挂上去，
    不走 setState —— 聊天的任何动作都不许触发整页重渲染。 */
@@ -7509,6 +7571,11 @@ const Icons = {
     Plug: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></svg>`,
     SparklesSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>`,
     XSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`,
+    // 对话窗标题栏那三颗按钮的图标（+ 新建对话 / − 最小化 / ⃞ 还原）。尺寸和 XSmall 对齐，
+    // 三颗按钮的视觉重量才一致；stroke-width 也一样，否则 + 会显得比 × 细。
+    PlusSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>`,
+    MinusSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/></svg>`,
+    RestoreSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="5" y="5" rx="2"/></svg>`,
     ArrowRightLeftSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 3 4 4-4 4"/><path d="M20 7H4"/><path d="m8 21-4-4 4-4"/><path d="M4 17h16"/></svg>`,
     LoaderSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="animate-spin"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>`,
     LoaderLarge: `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="animate-spin"><path d="M21 12a9 9 0 1 1-6.219-8.56"/></svg>`,
@@ -10446,8 +10513,19 @@ function applyCustomAutoSave() {
 //   发生了什么的界面（实测：冻页之后它的点击处理器照样计数）。
 
 // —— 几何常量（取值依据见 chat-window.md §3.2）——
-const CHAT_MIN_W = 320;          // 再窄下面那排控件就要换行了
-const CHAT_MIN_H = 240;          // 标题栏 + 一条消息 + 输入框
+// 【这两个下限是量出来的，不是拍的】八向缩放落地时在 Chrome 里按 5px 步长扫过一遍
+// （geom 直接改 + chatApplyGeom + 逐个读 getBoundingClientRect）：
+//   · 参数条（模型 / 思考 / 强度 / ⋮）在 **≥300px** 时是一行，295px 起折成两行（22px → 47px）；
+//   · 状态条那一行（用量圆环 + 「文档 …」+「会话」）在 **≥315px** 时是一行，310px 起折成两行（27px → 53px）；
+//   · 全程没有任何一处横向溢出（root / 参数条 / 状态条 / 页脚 / 标题栏的 scrollWidth−clientWidth 恒为 0），
+//     因为这几行都是 flex-wrap —— 所以「溢出」不是有效判据，「换行吃掉消息区」才是。
+// 取 320：压过两个阈值里较大的那个（315）还剩 5px 余量，输入框此时仍有 234px 可打字宽度。
+const CHAT_MIN_W = 320;
+// 同一次实测：标题栏 41px + 页脚 121px = 162px 是「一个控件都不被裁掉」的绝对地板
+// （h=180 时 send / 圆环仍然完整在框内，frame 的 scrollHeight−clientHeight = 0）。
+// 但 162px 的窗口消息区只剩 18px，连一条气泡都放不下。取 240：消息区 78px ≈ 一条短气泡，
+// 是「还能当聊天窗用」的下限。
+const CHAT_MIN_H = 240;
 const CHAT_DEFAULT_W = 420;
 const CHAT_DEFAULT_H = 560;
 const CHAT_VIEWPORT_PAD = 16;    // 尺寸上限相对视口留的边
@@ -10465,6 +10543,20 @@ const ChatState = {
     //       'free' = 用户拖过了，之后一律尊重用户存下来的几何。
     geom: { x: 0, y: 0, w: CHAT_DEFAULT_W, h: CHAT_DEFAULT_H, mode: 'auto' },
     lastFocus: null,                // 关窗时把焦点还回去的那个元素
+
+    // —— 最小化到后台 ——
+    // 【和「关闭」的区别是刻意的】关闭 = 窗口不见了、焦点还给页面、下次打开重新对一次会话；
+    // 最小化 = 窗口还在原地，只是折叠成一条标题栏，一个字节都不丢。
+    // minimized 只影响**渲染**：geom 一个字段都不改（见 CSS 里 #aiChatRoot.is-min 那段注释），
+    // 所以用户手动调过的尺寸在折叠 → 展开之后原样回来。
+    minimized: false,
+    // 折叠瞬间抄下来的那几样浏览器会在 display:none 期间弄丢或被我们自己写坏的东西：
+    // { draft, selStart, selEnd, hadFocus, logScroll, atBottom }。展开时逐项还原。
+    minSaved: null,
+    unread: 0,                      // 折叠期间新到的助手回复 / 错误行条数，展开即归零
+    // 拖过没有。标题栏的 click 用它区分「点了一下」（= 展开）和「拖完松手」（浏览器同样会
+    // 在拖拽结束时补一个 click）—— 没有这个标记，拖动折叠条会顺手把窗口展开。
+    dragMoved: false,
 
     // —— C2：对话 ——
     // messages: 全部轮次，只用于显示和拼历史。assistant 条目形如
@@ -10658,7 +10750,14 @@ function chatShellHtml() {
         +     '<span class="aichat-title-icon">' + Icons.MessageSquare + '</span>'
         +     '<span class="aichat-title-text" data-tip="按住这里拖动窗口。窗口挂在页面最外层，界面刷新、自动存档都不会打断你输到一半的内容。" data-tip-pos="bottom-start">AI 对话</span>'
         +     '<span class="aichat-title-spacer"></span>'
-        +     '<button type="button" class="aichat-iconbtn" id="aiChatCloseBtn" data-tip="关掉对话窗（按 Esc 也一样）。位置和大小会记住，下次打开还在原处。" data-tip-pos="bottom-end">' + Icons.XSmall + '</button>'
+        +     '<span class="aichat-unread" id="aiChatUnread" data-n="0"></span>'
+        // 三颗按钮从左到右：+ 新建对话 → − 最小化 → × 关闭。
+        // 每颗都有中文 data-tip；按 data-tip 纪律，它们互相是兄弟、祖先（.aichat-titlebtns）不带 tip。
+        +     '<span class="aichat-titlebtns">'
+        +       '<button type="button" class="aichat-iconbtn" id="aiChatNewBtn" data-tip="新建对话：先把当前这段存进「会话」再开一段空的（和面板里的「清理」是同一条代码路径）。文档上下文不受影响 —— 它每轮现生成，新对话第一轮照样带整篇最新译文。你标出来的关注（黄色高亮 / 勾选框）属于稿子不属于这段对话，**会原样保留**。当前对话是空的时就什么都不做，不会往历史里塞空条目。" data-tip-pos="bottom-end">' + Icons.PlusSmall + '</button>'
+        +       '<button type="button" class="aichat-iconbtn" id="aiChatMinBtn" data-tip="最小化到后台：折叠成一条标题栏停在原地，仍然可以拖。和「关闭」不一样 —— 草稿（连同光标选区）、滚动位置、全部消息、关注标记、用量圆环、窗口尺寸全都留着，展开后逐项还原。折叠期间模型回完了，这里会亮出未读数。点这颗按钮或点标题栏都能展开。" data-tip-pos="bottom-end">' + Icons.MinusSmall + '</button>'
+        +       '<button type="button" class="aichat-iconbtn" id="aiChatCloseBtn" data-tip="关掉对话窗（按 Esc 也一样）。位置和大小会记住，下次打开还在原处。" data-tip-pos="bottom-end">' + Icons.XSmall + '</button>'
+        +     '</span>'
         +   '</div>'
         +   '<div class="aichat-log" id="aiChatLog"></div>'
         +   '<div class="aichat-footer">'
@@ -10672,10 +10771,23 @@ function chatShellHtml() {
         +     '<div class="aichat-bar" id="aiChatBar"></div>'
         +     '<div id="aiChatPanel"></div>'
         +   '</div>'
-        +   '<div class="aichat-resize aichat-resize-l" id="aiChatResizeL" data-tip="拖左边框改宽度。" data-tip-pos="right"></div>'
-        +   '<div class="aichat-resize aichat-resize-t" id="aiChatResizeT" data-tip="拖上边框改高度。" data-tip-pos="bottom"></div>'
-        +   '<div class="aichat-resize aichat-resize-tl" id="aiChatResizeTL" data-tip="拖左上角同时改宽高。" data-tip-pos="bottom-start"></div>'
-        + '</div>';
+        + '</div>'
+        // —— 八向缩放手柄 ——
+        // ⚠️【它们必须是 #aiChatRoot 的直接子节点，绝不能待在 .aichat-frame 里面】
+        // .aichat-frame 有 `overflow:hidden` + `border-radius:16px`。手柄放在框里的话，
+        // **四个角**正好落在圆角被裁掉的那一块：实测 elementFromPoint(角+3px) 返回的是
+        // #aiChatRoot 本身而不是手柄，光标也不变形 —— 四个角的缩放整个是死的。
+        // （C1 那版只有一个 tl 手柄，它从落地起就带着这个毛病，只是没人往角上放过鼠标。）
+        // 挪出来之后它们和 .aichat-frame 是兄弟、且在其后，所以照样画在框上面。
+        // 顺序 = 四条边、四个角；data-h 的值就是 chatBeginDrag 的 kind。
+        +   '<div class="aichat-resize aichat-resize-l"  data-h="l"  data-tip="拖左边框改宽度（右边缘钉住不动）。" data-tip-pos="right"></div>'
+        +   '<div class="aichat-resize aichat-resize-r"  data-h="r"  data-tip="拖右边框改宽度。" data-tip-pos="left"></div>'
+        +   '<div class="aichat-resize aichat-resize-t"  data-h="t"  data-tip="拖上边框改高度（下边缘钉住不动）。" data-tip-pos="bottom"></div>'
+        +   '<div class="aichat-resize aichat-resize-b"  data-h="b"  data-tip="拖下边框改高度。" data-tip-pos="top"></div>'
+        +   '<div class="aichat-resize aichat-resize-tl" data-h="tl" data-tip="拖左上角同时改宽高（右下角钉住不动）。" data-tip-pos="bottom-start"></div>'
+        +   '<div class="aichat-resize aichat-resize-tr" data-h="tr" data-tip="拖右上角同时改宽高（左下角钉住不动）。" data-tip-pos="bottom-end"></div>'
+        +   '<div class="aichat-resize aichat-resize-bl" data-h="bl" data-tip="拖左下角同时改宽高（右上角钉住不动）。" data-tip-pos="top-start"></div>'
+        +   '<div class="aichat-resize aichat-resize-br" data-h="br" data-tip="拖右下角同时改宽高（左上角钉住不动）。" data-tip-pos="top-end"></div>';
 }
 
 // —— 消息行 ——
@@ -10695,6 +10807,9 @@ function chatAppendRow(kind, text) {
         row.appendChild(bubble);
         log.appendChild(row);
         chatScrollToBottom();
+        // 折叠着的时候这一行用户看不见 —— 标题栏上亮个未读数，别让回复静静地烂在后台。
+        // 只认助手回复和错误行：系统提示（「已开始新对话」之类）不是「有人回你话了」。
+        chatNoteUnread(kind);
         return row;
     } catch (e) {
         console.error('[chat] appendRow failed', e);
@@ -10731,11 +10846,21 @@ function chatAutoGrowInput() {
 // pointerup / pointercancel 也保证送得到，mouse 版那三个兜底大部分就不需要了。
 // 但 buttons===0 和 window blur 两个兜底照样留着 —— 一共 4 行，而这个代码库的注释
 // 记录了这类「mouseup 丢了 → 监听不解绑 → 幽灵拖拽」真实发生过（见 startSettingsModalResize）。
+// 这一格里的哪几条边跟着光标走。八向就是这三张表的组合，没有第二处需要同步的地方。
+const CHAT_HANDLE_L = { l: 1, tl: 1, bl: 1 };
+const CHAT_HANDLE_R = { r: 1, tr: 1, br: 1 };
+const CHAT_HANDLE_T = { t: 1, tl: 1, tr: 1 };
+const CHAT_HANDLE_B = { b: 1, bl: 1, br: 1 };
+const CHAT_DRAG_SLOP = 3;        // 位移不超过这么多像素就当「点了一下」，不当拖拽
+
 function chatBeginDrag(ev, kind) {
     try {
         if (ev.button != null && ev.button !== 0) return;                       // 只认左键
-        // 标题栏上的关闭按钮不算把手，否则点关闭会先起一次拖拽
+        // 标题栏上的三颗按钮不算把手，否则点它们会先起一次拖拽
         if (kind === 'move' && ev.target && ev.target.closest && ev.target.closest('button')) return;
+        // 折叠成一条时只剩「移动」这一个手势 —— 手柄虽然已经 display:none，
+        // 这里再挡一道：改一个看不见的高度对用户没有任何意义。
+        if (kind !== 'move' && ChatState.minimized) return;
         const capEl = ev.currentTarget || ev.target;
         if (!capEl) return;
         ev.preventDefault();
@@ -10748,6 +10873,30 @@ function chatBeginDrag(ev, kind) {
         };
         const pid = ev.pointerId;
         let finished = false;
+        ChatState.dragMoved = false;
+
+        // —— rAF 合帧 ——
+        // 一次拖拽里 pointermove 可以来得比屏幕刷新还密（高刷鼠标 1000Hz）。每来一个就写
+        // 一次 left/top/width/height，等于让浏览器在**同一帧内**为同一个窗口重排好几次；
+        // 而这个窗口里装着一整条消息列表，改宽度会让每一条气泡重新折行。
+        // 这里把「最新一份几何」攒起来，一帧只落一次。攒的是**结果**不是增量，
+        // 所以丢掉中间帧不会累积误差 —— 最后一帧永远是光标当前位置算出来的那一份。
+        let pendingGeom = null;
+        let rafId = 0;
+        const raf = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame : null;
+        const caf = (typeof cancelAnimationFrame === 'function') ? cancelAnimationFrame : null;
+        function flush() {
+            rafId = 0;
+            if (!pendingGeom) return;
+            ChatState.geom = pendingGeom;
+            pendingGeom = null;
+            chatApplyGeom();
+        }
+        function schedule(g) {
+            pendingGeom = g;
+            if (!raf) { flush(); return; }        // 没有 rAF 的环境（测试沙箱）退回同步
+            if (!rafId) rafId = raf(flush);
+        }
 
         try { if (pid != null && capEl.setPointerCapture) capEl.setPointerCapture(pid); } catch (e) {}
         try { document.body.setAttribute('data-aichat-drag', kind); } catch (e) {}
@@ -10759,6 +10908,7 @@ function chatBeginDrag(ev, kind) {
                 if (e.buttons === 0) { onUp(); return; }
                 const dx = chatNum(e.clientX, startX) - startX;
                 const dy = chatNum(e.clientY, startY) - startY;
+                if (Math.abs(dx) > CHAT_DRAG_SLOP || Math.abs(dy) > CHAT_DRAG_SLOP) ChatState.dragMoved = true;
                 const v = chatViewport();
                 const maxW = Math.max(CHAT_MIN_W, v.vw - CHAT_VIEWPORT_PAD);
                 const maxH = Math.max(CHAT_MIN_H, v.vh - CHAT_VIEWPORT_PAD);
@@ -10769,19 +10919,21 @@ function chatBeginDrag(ev, kind) {
                 }
                 // 左边框 / 上边框：右下角必须钉死不动，所以宽高先夹到合法区间，
                 // 再由「原右边缘 - 新宽度」反算左上角。先算 x 再夹宽度的话，
-                // 撞到最小宽度时右边缘会开始跟着光标跑。
-                if (kind === 'l' || kind === 'tl') {
+                // 撞到最小宽度时右边缘会开始跟着光标跑。这正是 Windows 的行为。
+                if (CHAT_HANDLE_L[kind]) {
                     const nw = Math.max(CHAT_MIN_W, Math.min(start.w - dx, maxW));
                     g.x = start.x + (start.w - nw);
                     g.w = nw;
                 }
-                if (kind === 't' || kind === 'tl') {
+                if (CHAT_HANDLE_T[kind]) {
                     const nh = Math.max(CHAT_MIN_H, Math.min(start.h - dy, maxH));
                     g.y = start.y + (start.h - nh);
                     g.h = nh;
                 }
-                ChatState.geom = chatClampGeom(g);
-                chatApplyGeom();
+                // 右边框 / 下边框：左上角本来就不动，直接改宽高。
+                if (CHAT_HANDLE_R[kind]) g.w = Math.max(CHAT_MIN_W, Math.min(start.w + dx, maxW));
+                if (CHAT_HANDLE_B[kind]) g.h = Math.max(CHAT_MIN_H, Math.min(start.h + dy, maxH));
+                schedule(chatClampGeom(g));
             } catch (err) {
                 console.error('[chat] drag move failed', err);
                 onUp();
@@ -10797,6 +10949,11 @@ function chatBeginDrag(ev, kind) {
             try { window.removeEventListener('blur', onUp); } catch (e) {}
             try { if (pid != null && capEl.hasPointerCapture && capEl.hasPointerCapture(pid)) capEl.releasePointerCapture(pid); } catch (e) {}
             try { document.body.removeAttribute('data-aichat-drag'); } catch (e) {}
+            // 落盘前必须把攒着的那一帧先写进 ChatState.geom，否则「最后一帧还没落地就松手」
+            // 会把**上一帧**的尺寸存进 localStorage —— 快速拖一下再松手，尺寸就差一截。
+            try { if (rafId && caf) caf(rafId); } catch (e) {}
+            rafId = 0;
+            flush();
             chatSaveGeom();                       // 只在松手时落盘，绝不每次 move 都写 localStorage
         }
 
@@ -10839,14 +10996,38 @@ function chatBindShell(rootEl) {
     rootEl.addEventListener('pointerdown', chatStopEvent);
 
     const bar = rootEl.querySelector('#aiChatTitleBar');
-    if (bar) bar.addEventListener('pointerdown', function (e) { chatBeginDrag(e, 'move'); });
+    if (bar) {
+        bar.addEventListener('pointerdown', function (e) { chatBeginDrag(e, 'move'); });
+        // 折叠状态下点标题栏 = 展开。必须挡掉「拖完松手浏览器补的那个 click」
+        // （dragMoved），否则把折叠条拖到别处、一松手窗口就自己展开了。
+        // 三颗按钮上的点击也要放过去 —— 它们有自己的处理器。
+        bar.addEventListener('click', function (e) {
+            try {
+                if (!ChatState.minimized || ChatState.dragMoved) return;
+                if (e && e.target && e.target.closest && e.target.closest('button')) return;
+                chatExpand();
+            } catch (err) { console.error('[chat] titlebar click failed', err); }
+        });
+    }
 
-    const hL = rootEl.querySelector('#aiChatResizeL');
-    if (hL) hL.addEventListener('pointerdown', function (e) { chatBeginDrag(e, 'l'); });
-    const hT = rootEl.querySelector('#aiChatResizeT');
-    if (hT) hT.addEventListener('pointerdown', function (e) { chatBeginDrag(e, 't'); });
-    const hTL = rootEl.querySelector('#aiChatResizeTL');
-    if (hTL) hTL.addEventListener('pointerdown', function (e) { chatBeginDrag(e, 'tl'); });
+    // 八向缩放手柄：类名后缀就是 kind，一次绑完，新增一个方向不需要改这里。
+    const handles = rootEl.querySelectorAll('.aichat-resize');
+    for (let i = 0; i < handles.length; i++) {
+        (function (h) {
+            const kind = h.getAttribute('data-h') || '';
+            if (!kind) return;
+            h.addEventListener('pointerdown', function (e) { chatBeginDrag(e, kind); });
+        })(handles[i]);
+    }
+
+    const newBtn = rootEl.querySelector('#aiChatNewBtn');
+    // 【刻意不写第二套实现】新建对话 = 「清理」，同一个函数。两套实现迟早会分叉，
+    // 而分叉出去的那一套一定是漏掉归档的那一套 —— 那就是用户的对话被静默销毁。
+    // 空对话的处理也一并继承：chatClearConversation 自己会在没有消息时原地返回、不归档。
+    if (newBtn) newBtn.addEventListener('click', function () { chatClearConversation(); });
+
+    const minBtn = rootEl.querySelector('#aiChatMinBtn');
+    if (minBtn) minBtn.addEventListener('click', function () { chatToggleMinimize(); });
 
     const closeBtn = rootEl.querySelector('#aiChatCloseBtn');
     if (closeBtn) closeBtn.addEventListener('click', function () { chatClose(); });
@@ -14452,9 +14633,12 @@ function ensureChatRoot() {
         const stored = chatLoadGeom();
         ChatState.geom = stored ? chatClampGeomForRestore(stored) : chatClampGeom(chatAutoGeom());
         chatApplyGeom();
+        chatSyncMinUI();          // 把最小化按钮的图标/提示和未读徽标刷成初始状态
         chatRenderParamBar();
 
-        chatAppendRow('system', '对话窗已就绪。拖标题栏移动，拖左边/上边/左上角改大小，位置和大小会记住。'
+        chatAppendRow('system', '对话窗已就绪。拖标题栏移动；四条边和四个角都能拖着改大小（和 Windows 的窗口一样，'
+            + '拖左边或上边时对面那条边钉住不动），手动调过的尺寸之后一直作数。'
+            + '标题栏右上角从左到右是「+ 新建对话」「− 最小化到后台」「× 关闭」。'
             + '想让我改某一段：在左栏或右栏那一行点「附到对话」（编辑态下先选中一段就只附那一段），'
             + '我会给出前后对照，改动只有你点「应用」才会写进文档。');
         return rootEl;
@@ -14476,10 +14660,138 @@ function chatSyncToggleButton() {
     } catch (e) {}
 }
 
+// ============================================================================
+// 最小化到后台
+// ============================================================================
+//
+// 【合约】最小化 ≠ 关闭。关闭把窗口收走；最小化只是把它折叠成一条标题栏停在原地，
+// **一个字节都不许丢**：未发送的草稿及其光标选区、消息区滚动位置、全部消息、关注标记、
+// 用量圆环的读数、以及用户手动调过的窗口尺寸，展开后逐项还原。
+//
+// 【为什么要显式存草稿/选区/滚动位置，明明 display:none 不会清掉它们】
+// 浏览器确实不会清 —— 但**我们自己的代码**会：chatAppendRow → chatScrollToBottom 在折叠期间
+// 照常跑，而对一个 display:none 的容器写 scrollTop 的结果是 0（clientHeight/scrollHeight 都是 0）。
+// 同理 chatAutoGrowInput 在隐藏期间量出来的 scrollHeight 是 0，会把输入框高度写成 0px。
+// 所以这三样在折叠瞬间抄下来，展开时按抄下来的值写回去，不去赌中间没人碰过它们。
+const CHAT_UNREAD_CAP = 99;      // 徽标上最多显示到这个数，再多就写 99+
+
+// 标题栏上会随折叠状态变化的那几处：最小化按钮的图标与提示、未读徽标。
+// 只改 DOM 属性，不走任何渲染路径；被 renderApp 抹掉是不可能的（窗口不在 #root 里）。
+function chatSyncMinUI() {
+    try {
+        const rootEl = document.getElementById('aiChatRoot');
+        if (!rootEl) return;
+        if (ChatState.minimized) rootEl.classList.add('is-min');
+        else rootEl.classList.remove('is-min');
+
+        const btn = document.getElementById('aiChatMinBtn');
+        if (btn) {
+            btn.innerHTML = ChatState.minimized ? Icons.RestoreSmall : Icons.MinusSmall;
+            btn.setAttribute('data-tip', ChatState.minimized
+                ? '还原窗口：展开回折叠前的尺寸，草稿（连同光标选区）、滚动位置、消息、关注标记、圆环读数逐项回来。点标题栏空白处也一样。'
+                : '最小化到后台：折叠成一条标题栏停在原地，仍然可以拖。和「关闭」不一样 —— 草稿（连同光标选区）、滚动位置、全部消息、关注标记、用量圆环、窗口尺寸全都留着，展开后逐项还原。折叠期间模型回完了，这里会亮出未读数。点这颗按钮或点标题栏都能展开。');
+        }
+
+        const badge = document.getElementById('aiChatUnread');
+        if (badge) {
+            const n = Math.max(0, Number(ChatState.unread) || 0);
+            badge.setAttribute('data-n', String(n));
+            badge.textContent = n > CHAT_UNREAD_CAP ? (CHAT_UNREAD_CAP + '+') : String(n);
+            badge.setAttribute('title', n ? ('折叠期间新到 ' + n + ' 条回复') : '');
+        }
+    } catch (e) {
+        console.error('[chat] syncMinUI failed', e);
+    }
+}
+
+// 折叠期间来了新回复（或错误行）就记一笔。由 chatAppendRow 调用，只认 assistant / error 两种。
+function chatNoteUnread(kind) {
+    try {
+        if (!ChatState.minimized) return;
+        if (kind !== 'assistant' && kind !== 'error') return;
+        ChatState.unread = (Number(ChatState.unread) || 0) + 1;
+        chatSyncMinUI();
+    } catch (e) {}
+}
+
+function chatMinimize() {
+    try {
+        if (ChatState.minimized) return;
+        const ta = document.getElementById('aiChatInput');
+        const log = document.getElementById('aiChatLog');
+        ChatState.minSaved = {
+            draft: ta ? String(ta.value == null ? '' : ta.value) : '',
+            // selectionStart/End 在 display:none 之后仍然读得到，但这里抄的是**折叠那一刻**的值，
+            // 免得折叠期间任何一次 value 写入（会把选区重置到末尾）把它冲掉。
+            selStart: ta ? chatNum(ta.selectionStart, 0) : 0,
+            selEnd: ta ? chatNum(ta.selectionEnd, 0) : 0,
+            hadFocus: !!(ta && document.activeElement === ta),
+            logScroll: log ? chatNum(log.scrollTop, 0) : 0,
+            // 折叠前本来就贴着底 ⇒ 展开时继续贴底（否则新到的回复藏在下面看不见）。
+            // 折叠前停在中间 ⇒ 精确还原那个位置，一像素都不动。
+            atBottom: log ? (chatNum(log.scrollHeight, 0) - chatNum(log.scrollTop, 0)
+                             - chatNum(log.clientHeight, 0) < 4) : true
+        };
+        ChatState.minimized = true;
+        ChatState.unread = 0;
+        // geom 一个字段都不改 —— 折叠只是渲染态，展开后内联的 width/height 原样生效。
+        chatSyncMinUI();
+        chatSyncToggleButton();
+    } catch (e) {
+        console.error('[chat] minimize failed', e);
+    }
+}
+
+function chatExpand() {
+    try {
+        if (!ChatState.minimized) return;
+        ChatState.minimized = false;
+        ChatState.unread = 0;
+        chatSyncMinUI();                 // 先摘 class：下面要量高度，必须先让内容重新参与布局
+        chatApplyGeom();                 // 内联几何原样重写一遍（含用户手动调过的尺寸）
+        const s = ChatState.minSaved;
+        ChatState.minSaved = null;
+        const ta = document.getElementById('aiChatInput');
+        const log = document.getElementById('aiChatLog');
+        if (ta && s) {
+            // 只有真的不一样才写 value —— 写 value 会把选区重置到末尾，
+            // 而绝大多数情况下浏览器压根没动过它，白写一次反而把选区弄丢。
+            if (String(ta.value == null ? '' : ta.value) !== s.draft) ta.value = s.draft;
+        }
+        // 隐藏期间量出来的 scrollHeight 是 0，输入框高度可能已经被写成 0px；这里按可见状态重量一次。
+        chatAutoGrowInput();
+        if (ta && s) {
+            try { if (ta.setSelectionRange) ta.setSelectionRange(s.selStart, s.selEnd); } catch (e2) {}
+            if (s.hadFocus && ta.focus) { try { ta.focus(); } catch (e3) {} }
+        }
+        if (log && s) {
+            if (s.atBottom) chatScrollToBottom();
+            else log.scrollTop = s.logScroll;
+        }
+        chatSyncToggleButton();
+    } catch (e) {
+        console.error('[chat] expand failed', e);
+    }
+}
+
+function chatToggleMinimize() {
+    try {
+        if (ChatState.minimized) chatExpand();
+        else chatMinimize();
+    } catch (e) {
+        console.error('[chat] toggleMinimize failed', e);
+    }
+}
+
 function chatOpen() {
     try {
         const rootEl = ensureChatRoot();
         if (!rootEl) return;
+        // 已经开着但折叠着 ⇒ 这次「打开」的意思是**还原**，不是再开一个。
+        // 顶栏那颗 Chat 按钮走的就是这条路（chatToggle）。
+        if (ChatState.open && ChatState.minimized) { chatExpand(); return; }
+        // 关掉之后再打开：不许还带着上一次的折叠态开出来一条空壳窄条。
+        if (ChatState.minimized) { ChatState.minimized = false; ChatState.minSaved = null; ChatState.unread = 0; chatSyncMinUI(); }
         if (!ChatState.open) {
             // 记住是谁把窗口打开的，关的时候把焦点还回去。不还 = 键盘用户被丢在 <body> 上。
             const active = document.activeElement;
@@ -14534,6 +14846,11 @@ function chatClose() {
 
 function chatToggle() {
     try {
+        // 【折叠态下这颗按钮的语义是「还原」，不是「关闭」】折叠成一条窄条之后，用户去点
+        // 顶栏那颗 Chat 按钮，想要的一定是把窗口拿回来 —— 让它去执行关闭，等于把用户
+        // 唯一一个「我要看它」的动作解释成「我不要看它」。也绝不去开第二个窗口：
+        // ensureChatRoot 是幂等的，这个应用里从头到尾只有一个对话窗。
+        if (ChatState.open && ChatState.minimized) { chatExpand(); return; }
         if (ChatState.open) chatClose();
         else chatOpen();
     } catch (e) {
