@@ -3040,14 +3040,43 @@ async function callClaudeAPI(model, messages, config = {}, apiKey = null, signal
 //     选区起点落在颜色组内部（多出无主的 '}'）-> 清掉那些无主右括号
 //   回归测试：tests/latex/textcolor-suite.js（直接从本文件抽函数跑，不是副本），
 //   pre-commit 钩子会在 AI-Translator.html 进暂存区时强制跑一遍。
-function stripTextColorOnce(input) {
+//   病态输入的专项测量与回归：tools/measure-textcolor.js、tests/latex/pathological-suite.js。
+//
+// ⚠️ v01.05.01 修：预算耗尽是**真会发生**的，而且发生得非常早（实测，不是估算）
+//   旧实现每遇到一个 \textcolor 就用 matchBrace() 往前找内容组的右括号，找到之后
+//   却只把 i 前进到组内**第一个字符** —— 刚扫过的那一整段马上被外层循环重扫一遍。
+//   于是代价是 O(n²)，而 n*8+100000 的预算在下面这两种输入上直接见底：
+//     · 未闭合的内容组：第 **106** 个就爆（旧代码，本机 node v24 实测）
+//     · 良构的嵌套层数：第 **121** 层就爆
+//   ——都远低于「五万个组 / 五十层」这种量级的传闻值，也远低于用户真会粘贴的规模。
+//   爆掉之后 stripTextColorOnce 返回 **原样输入**，stripTextColorForModel 原样往下传，
+//   全程没有一个字的提示：那 106 个 \textcolor 一字不落地发给模型，再被模型回显进译文。
+//   这正是本项目一直在打的那类 bug —— 只不过这次是「整条漏」而不是「漏碎片」。
+//
+// 【怎么改的】把内容组的 matchBrace 整个删掉，换成一个**显式层号栈**：
+//   看到内容组的 '{' 只记下「它开在第几层」，右括号交给外层循环自然走到时按层号认领。
+//   于是每个字符只被外层看一次；颜色参数组虽然仍要整体跳读，但 i 会直接跨到组尾之后，
+//   所有颜色组的扫描区间两两不相交。总代价从 O(n²) 降到 O(n)。
+//   实测（同机同 node）：未闭合组从 106 → 200 万个仍然剥干净；嵌套从 121 → 20 万层仍然剥干净；
+//   4.4MB / 20 万个未闭合组耗时 162.8ms → 34.5ms，且结果由「原样漏光」变成「全部剥净」。
+//
+// 【预算为什么还留着】证明和保证不是一回事。单遍扫描下每个字符最多被看 3 次
+//   （外层一次、宏头空白窥视一次、颜色组尾空白窥视一次），实测峰值恒 < 3n，
+//   n*8+100000 从此是一条够不到的兜底线。真要是将来改出了逻辑洞，宁可退化成
+//   一次**看得见的放弃**，也不要变成浏览器同步卡死 —— 渲染错误边界能救回抛出的异常，
+//   救不回一个转不完的 while。
+//   而「放弃」这件事本身现在必须说出来：见 stripTextColorForModel 末尾的自检与上报。
+function stripTextColorOnce(input, report) {
     const n = input.length;
-    let budget = n * 8 + 100000; // 硬性工作量上限，病态输入也不会长时间同步阻塞
+    let budget = n * 8 + 100000; // 够不到的兜底线；见上方说明
     let blown = false;           // 预算耗尽 ≠ 括号截断，两者绝不能混为一谈
+    const rep = (report && typeof report === 'object') ? report : null;
     const isSpace = (ch) => ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r';
     const isAlpha = (ch) => (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
-    // 返回与 input[open] 处 '{' 配对的 '}' 下标；不配平返回 -1（预算耗尽时另置 blown）
-    const matchBrace = (open) => {
+    // 只服务于**颜色参数组**：它一定会被整体跳过（i 直接跨到组尾之后），
+    // 所以所有颜色组的扫描区间两两不相交，累计代价 O(n)。
+    // 内容组绝不许用它 —— 那正是旧实现 O(n²) 的唯一来源。
+    const scanGroup = (open) => {
         let depth = 0;
         for (let p = open; p < n; p++) {
             if (--budget < 0) { blown = true; return -1; }
@@ -3060,38 +3089,44 @@ function stripTextColorOnce(input) {
     };
     let out = '';
     let i = 0;
-    const drop = []; // 待吞掉的 '}' 下标（内容组右括号），栈顶总是最近的一个
+    let depth = 0;        // 外层循环走过的 '{' 层数（颜色组被整体跳过，且必然配平，净贡献 0）
+    const dropDepth = []; // 内容组开括号所在的层号；栈顶永远是最里面那一层
     while (i < n) {
-        if (--budget < 0) return input;
+        if (--budget < 0) { blown = true; break; }
         const ch = input[i];
         if (ch === '\\') {
             // \textcolorbox 之类同前缀的别的宏必须原样放过：后面紧跟字母就不是 \textcolor
             if (input.startsWith('\\textcolor', i) && !isAlpha(input[i + 10])) {
                 let j = i + 10;
                 let headEnd = j; // 已确认属于「宏语法」的部分结束在哪；空白不算，留给正文
-                while (j < n && isSpace(input[j])) j++;
+                while (j < n && isSpace(input[j])) { if (--budget < 0) { blown = true; break; } j++; }
+                if (blown) break;
                 if (input[j] === '[') { // \textcolor[rgb]{1,0,0}{...}
                     const rb = input.indexOf(']', j);
                     if (rb === -1) return out; // 可选参数被截断：后面全是宏语法残骸，不是正文
+                    budget -= (rb - j);        // 这一段一定会被跨过，记账后总量仍是 O(n)
+                    if (budget < 0) { blown = true; break; }
                     j = rb + 1;
                     headEnd = j;
-                    while (j < n && isSpace(input[j])) j++;
+                    while (j < n && isSpace(input[j])) { if (--budget < 0) { blown = true; break; } j++; }
+                    if (blown) break;
                 }
                 if (input[j] === '{') {
-                    const colorEnd = matchBrace(j);
+                    const colorEnd = scanGroup(j);
                     if (colorEnd === -1) {
-                        if (blown) return input;
+                        if (blown) break;
                         return out; // 颜色组被截断：'{pur' 是宏语法的残骸，不是用户的话
                     }
                     let k = colorEnd + 1;
-                    while (k < n && isSpace(input[k])) k++;
+                    while (k < n && isSpace(input[k])) { if (--budget < 0) { blown = true; break; } k++; }
+                    if (blown) break;
                     if (input[k] === '{') {
-                        const contentEnd = matchBrace(k);
-                        if (blown) return input;
-                        // 内容组配平就顺手记下要吞掉的右括号；被截断（-1）就只丢宏头，
-                        // 后面的正文一个字都不能少 —— 用户是按选区分段翻译的，
-                        // 右括号落在选区外是常态，不是边角情况。
-                        if (contentEnd !== -1) drop.push(contentEnd);
+                        // ⚠️ 本次修复的核心：**不去找**内容组的右括号。
+                        // 只记下它开在第几层；右括号由下面 '}' 分支按层号认领。
+                        // 内容组被截断（右括号落在选区外）时这个层号永远等不到人来认领 ——
+                        // 结果恰好就是旧实现要的「只丢宏头，正文一个字不少」，不需要额外分支。
+                        depth++;
+                        dropDepth.push(depth);
                         i = k + 1;
                         continue;
                     }
@@ -3106,21 +3141,76 @@ function stripTextColorOnce(input) {
             if (i + 1 < n) { out += input[i + 1]; i += 2; } else { i += 1; }
             continue;
         }
-        if (ch === '}' && drop.length && drop[drop.length - 1] === i) { drop.pop(); i += 1; continue; }
+        if (ch === '{') { depth++; out += ch; i += 1; continue; }
+        if (ch === '}') {
+            if (depth > 0) {
+                if (dropDepth.length && dropDepth[dropDepth.length - 1] === depth) {
+                    dropDepth.pop(); depth--; i += 1; continue; // 内容组的右括号：吞掉
+                }
+                depth--;
+            }
+            // depth === 0 的 '}' 是无主右括号（选区起点落在组内），原样留着，
+            // 由 stripTextColorForModel 末尾那一遍统一清理 —— 那里才知道全局配平情况。
+            out += ch; i += 1; continue;
+        }
         out += ch;
         i += 1;
+    }
+    if (blown) {
+        // 绝不返回半成品：半剥离的文本会把 \textcolor 的碎片留在用户文档里，
+        // 比整条漏出去更难被发现。原样退回 + 置位，由调用方负责说出来。
+        if (rep) rep.blown = true;
+        return input;
     }
     return out;
 }
 
 function stripTextColorForModel(input) {
+    // 出口只有两个：剥干净的文本，或者「原样退回 + 已经明确告知用户」。
+    // 绝不存在第三种「安静地交出半成品」。
+    const giveUp = (why, detail) => {
+        try {
+            console.error('[textcolor] 剥离放弃（' + why + '）：本次发给模型的是**未经剥离的原文**，'
+                + '\\textcolor 会原样出现在译文里。', detail || '');
+        } catch (e) {}
+        try {
+            // 边界面板是全应用唯一的「出事了」告知口；它挂在 <body> 上，不受渲染重建影响。
+            // 用 typeof 守卫是必须的：回归测试把这两个函数单独抽进 vm 沙箱跑，那里没有边界。
+            if (typeof rbReportStripGiveUp === 'function') rbReportStripGiveUp(why, input, detail);
+        } catch (e) {}
+    };
+    // 「还有没有活的 \textcolor」——判定规则必须和扫描器逐字一致，否则会误报：
+    //   · 后面紧跟字母的不算（\textcolorbox 是另一个宏，本来就该留着）；
+    //   · 反斜杠本身被转义的不算（\\textcolor 在 LaTeX 里是「反斜杠 + 文字 textcolor」）。
+    // 刻意写成局部函数：回归测试只按名字抽 stripTextColorOnce / stripTextColorForModel 两个，
+    // 提到外面就会让沙箱里的调用变成 ReferenceError，把整套 EXACT 用例一起打挂。
+    const hasLiveTextColor = (s) => {
+        if (typeof s !== 'string') return false;
+        let at = s.indexOf('\\textcolor');
+        while (at !== -1) {
+            const nxt = s[at + 10];
+            const alpha = nxt !== undefined && ((nxt >= 'a' && nxt <= 'z') || (nxt >= 'A' && nxt <= 'Z'));
+            if (!alpha) {
+                let back = 0, p = at - 1;
+                while (p >= 0 && s[p] === '\\') { back++; p--; }
+                if (back % 2 === 0) return true; // 这个反斜杠是活的
+            }
+            at = s.indexOf('\\textcolor', at + 1);
+        }
+        return false;
+    };
     try {
         if (typeof input !== 'string') return input;
         let text = input;
+        const report = { blown: false };
         if (text.indexOf('\\textcolor') !== -1) {
             for (let pass = 0; pass < 5; pass++) { // 迭代到不动点，硬上限防死循环
                 if (text.indexOf('\\textcolor') === -1) break;
-                const next = stripTextColorOnce(text);
+                const next = stripTextColorOnce(text, report);
+                if (report.blown) {
+                    giveUp('工作量预算耗尽', '输入 ' + input.length + ' 字符，第 ' + (pass + 1) + ' 遍');
+                    return input;
+                }
                 if (next === text) break;
                 text = next;
             }
@@ -3148,9 +3238,18 @@ function stripTextColorForModel(input) {
                 text = out;
             }
         }
+        // 出门自检。走到这里还剩下活的 \textcolor，说明上面某条分支没干完活；
+        // 安静地把它交出去 = 用户的译文里长出 \textcolor —— 正是这个模块存在的理由。
+        // 宁可原样退回（至少是一段完整、可辨认的原文）并且大声说出来。
+        if (hasLiveTextColor(text)) {
+            giveUp('五遍之后仍有残留', '输入 ' + input.length + ' 字符');
+            return input;
+        }
         return text;
     } catch (e) {
-        return input; // 绝不抛出
+        // 绝不抛出（调用点在 translateBulk 的最前面），但也绝不装作没事发生。
+        giveUp('剥离过程抛异常', (e && e.message) ? String(e.message) : String(e));
+        return input;
     }
 }
 
@@ -6840,8 +6939,674 @@ function normalizeTranslationPairs(list) {
     return list;   // 全干净：原样返回，零分配
 }
 
-// ============= 主渲染函数 =============
+// ============= 渲染错误边界 =============
+// 这一段是整个文件里唯一一处「把整页从永久冻死里救回来」的代码。
+//
+// 【要救的是什么】
+//   setState() -> renderApp() -> root.innerHTML = `<一整个模板字符串>`，全程没有 try/catch。
+//   模板字符串是**先拼完再赋值**的，所以拼的过程中任何一处抛错：
+//     · root.innerHTML 那一行根本没执行 —— 页面停在**上一帧**。看上去还活着，实际上此后
+//       每一次 setState 都在同一处再抛一次，用户不刷新永远救不回来，控制台之外没有任何提示；
+//     · 首次渲染时上一帧是空的 —— 用户看到的是一张白页，同样没有任何提示。
+//   真实踩过的抛点（不是假想）：renderFormattedText 收到真值非字符串；translationPairs 里
+//   混进 literal null（updateTranslationPair 用过期行号写出空洞，History 的 JSON 往返把空洞
+//   变成 null）。浮动对话窗当初被刻意挂到 #root **外面**，就是因为这条路径会带走 #root 里的一切。
+//
+// 【为什么不能只写一个 try{}catch{} 就算完】
+//   吞掉异常比不加更糟：不加的时候至少「看得见的那一帧是旧的 + 控制台里有红字」，吞掉之后
+//   连红字都没有，应用会安静地永远显示陈旧或半截界面。所以这个边界的合同是五条：
+//     1) 绝不吞：每一次捕获都同时 (a) console.error 带真栈 (b) 弹一个用户不可能错过的面板；
+//     2) 绝不动用户正文：边界自己不写 localStorage、不调 addToGlobalHistory / setState，
+//        不碰 translationPairs / inputText / originalInputText / editValues；
+//     3) 给真的退路：自动重试一次（只清浮层类状态）+ 手动重试 + 正文备份（复制/下载）+ 刷新；
+//     4) 边界自身不可能抛：面板全部用 createElement/textContent 造、挂在 <body> 上
+//        （对话窗已实测这个位置扛得住 root.innerHTML 全量重建），每一步各自 try/catch，
+//        并且不假设 AppState 是好的；
+//     5) 绝不自转：同一个错误签名只自动重试一次，连续失败到上限后只累加计数、不再重排渲染。
+//
+// ⚠️ 一条决定了面板措辞的硬事实：**globalHistory 只活在内存里**。全文没有任何一处
+//    localStorage.setItem 落盘 translationPairs / inputText / globalHistory（可自行搜证）。
+//    所以「刷新页面」= 正文全部丢失。面板里因此把「先备份」排在「刷新」前面，
+//    刷新按钮还要过一次 confirm()。
+const RB_LOG_MAX = 50;           // 记录环形上限；只为排查，不显示全部
+const RB_STREAK_MAX = 3;         // 连续失败到这个数就不再自动重试（防 CPU 空转）
+const RB_ASYNC_PANEL_MAX = 3;    // 异步错误最多主动弹 3 次面板，之后只累加计数（防第三方脚本刷屏）
+const RB_RESCUE_MAX_CHARS = 8 * 1024 * 1024;   // 备份文本硬上限，防止归档巨大时把内存顶爆
+
+// 刻意是一个独立对象而不是 AppState 的字段：放进 AppState 就意味着
+// 「记录一次渲染失败」本身可能触发一次渲染 —— 那正是要躲开的东西。
+const RENDER_BOUNDARY = {
+    ok: 0,             // 已经完整跑完的渲染次数（0 = 还没有过任何一帧 => 首次渲染）
+    okAtFail: 0,       // 最近一次渲染失败发生时 ok 的值。面板要说的是「这次失败之后成功了几次」，
+                       // 用它做基线；直接印 ok 就是把一辈子的成功次数当成恢复次数，永远偏乐观。
+    fail: 0,           // 累计捕获到的渲染异常条数
+    streak: 0,         // 连续失败次数，成功一次即归零；自动重试的熔断依据
+    retries: 0,        // 自动重试实际跑过几次
+    wrote: false,      // 本轮 root.innerHTML 是否已经赋值成功（决定面板说「上一帧」还是「半帧」）
+    depth: 0,          // 重入深度：渲染过程中再调 renderApp 时不再套第二层边界
+    lastRetrySig: '',  // 上次自动重试针对的错误签名；同签名不再重试第二遍
+    asyncSeen: 0,      // window error / unhandledrejection 累计条数
+    asyncShown: 0,     // 其中真正弹过面板的条数
+    log: [],           // { at, kind, message, stack } 环形记录，给排查和自动化验收用
+    visible: false,
+    shownKind: '',     // 面板此刻显示的是哪一类故障（rbShow 的 kind）。恢复文案只许改写渲染类的那两种，
+                       // 否则一次成功渲染会把正显示着的「颜色宏没能剥离」顶掉，等于把另一件事的告知吞了。
+    titleSaved: null,
+    stripGaveUp: 0,    // \textcolor 剥离放弃的累计次数（与渲染失败共用面板，但计数分开）
+    el: null, msgEl: null, whereEl: null, statusEl: null, detailEl: null,
+    taEl: null, countEl: null, titleEl: null, btns: null
+};
+
+// 任何值 -> 字符串，且**保证不抛**（Symbol 的 String() 会抛，对象的 toString 可能是用户数据里的陷阱）
+function rbText(v) {
+    try {
+        if (typeof v === 'string') return v;
+        if (v == null) return '';
+        if (typeof v === 'object') {
+            try { return JSON.stringify(v); } catch (e) { return '[object]'; }
+        }
+        return String(v);
+    } catch (e) { return ''; }
+}
+
+// 错误签名：消息 + 栈顶那一行。用来判断「这是不是刚才那个错」，决定要不要再自动重试一次。
+function rbSignature(err) {
+    try {
+        const msg = (err && err.message != null) ? rbText(err.message) : rbText(err);
+        const st = (err && err.stack) ? String(err.stack).split('\n')[1] || '' : '';
+        return (msg + '|' + st.trim()).slice(0, 300);
+    } catch (e) { return 'unknown'; }
+}
+
+// 栈顶那一行里的 AI-Translator.html:<行号>，给面板显示「大概在哪炸的」
+function rbWhere(err) {
+    try {
+        const st = err && err.stack ? String(err.stack) : '';
+        const m = /([\w.\-]+\.html):(\d+)(?::(\d+))?/.exec(st);
+        if (m) return m[1] + ':' + m[2];
+        const l = st.split('\n')[1];
+        return l ? l.trim().slice(0, 120) : '';
+    } catch (e) { return ''; }
+}
+
+function rbRecord(kind, err) {
+    try {
+        RENDER_BOUNDARY.log.push({
+            at: Date.now(), kind: kind,
+            message: (err && err.message != null) ? rbText(err.message) : rbText(err),
+            stack: (err && err.stack) ? String(err.stack).split('\n').slice(0, 24).join('\n') : ''
+        });
+        if (RENDER_BOUNDARY.log.length > RB_LOG_MAX) RENDER_BOUNDARY.log.shift();
+    } catch (e) {}
+}
+
+// ---- 正文备份 ----
+// 只读 AppState，逐字段各自兜底；includeArchive=true 时把 globalHistory 里的历史快照也带上
+// （它同样只在内存里，刷新即丢，所以下载版必须包含它才算真的「备份」）。
+function rbRescueText(includeArchive) {
+    const out = [];
+    const push = (s) => { try { out.push(s); } catch (e) {} };
+    try {
+        push('===== AI-Translator 正文应急备份 =====');
+        try { push('时间：' + new Date().toISOString()); } catch (e) {}
+        push('说明：本页的正文只存在于内存中，刷新页面会全部丢失。此文件是渲染失败时抓下来的原始内容。');
+        push('');
+        let pairs = null;
+        try { pairs = AppState.translationPairs; } catch (e) {}
+        if (Array.isArray(pairs)) {
+            push('----- 句对（共 ' + pairs.length + ' 行）-----');
+            for (let i = 0; i < pairs.length; i++) {
+                let p = null;
+                try { p = pairs[i]; } catch (e) {}
+                const src = (p && typeof p === 'object') ? rbText(p.src) : '';
+                const tgt = (p && typeof p === 'object') ? rbText(p.tgt) : '';
+                push('--- #' + (i + 1) + ' 原文 ---');
+                push(src);
+                push('--- #' + (i + 1) + ' 译文 ---');
+                push(tgt);
+                push('');
+            }
+        } else {
+            push('----- 句对：不是数组（' + Object.prototype.toString.call(pairs) + '）-----');
+        }
+        try {
+            const ev = AppState.editValues;
+            if (ev && typeof ev === 'object' && (rbText(ev.src) || rbText(ev.tgt))) {
+                push('----- 编辑框里尚未保存的内容（activeIndex=' + rbText(AppState.activeIndex) + '）-----');
+                push('原文侧：' + rbText(ev.src));
+                push('译文侧：' + rbText(ev.tgt));
+                push('');
+            }
+        } catch (e) {}
+        try {
+            push('----- 输入框原文（inputText）-----');
+            push(rbText(AppState.inputText));
+            push('');
+            push('----- 最初粘贴的原文（originalInputText）-----');
+            push(rbText(AppState.originalInputText));
+            push('');
+        } catch (e) {}
+        if (includeArchive) {
+            try {
+                const hist = AppState.globalHistory;
+                if (Array.isArray(hist) && hist.length) {
+                    push('===== 内存里的历史快照（共 ' + hist.length + ' 份，刷新同样会丢）=====');
+                    for (let h = 0; h < hist.length; h++) {
+                        const item = hist[h] || {};
+                        push('--- 快照 ' + (h + 1) + ' id=' + rbText(item.id) + ' ---');
+                        const hp = item.pairs;
+                        if (Array.isArray(hp)) {
+                            for (let i = 0; i < hp.length; i++) {
+                                const q = hp[i];
+                                push('  [' + (i + 1) + '] 原文：' + ((q && typeof q === 'object') ? rbText(q.src) : ''));
+                                push('  [' + (i + 1) + '] 译文：' + ((q && typeof q === 'object') ? rbText(q.tgt) : ''));
+                            }
+                        }
+                        push('');
+                    }
+                }
+            } catch (e) {}
+        }
+    } catch (e) {
+        push('（备份过程中出错：' + rbText(e && e.message) + '；以上是抓到的部分）');
+    }
+    let s = '';
+    try { s = out.join('\n'); } catch (e) { s = ''; }
+    if (s.length > RB_RESCUE_MAX_CHARS) s = s.slice(0, RB_RESCUE_MAX_CHARS) + '\n…（已截断，超过备份上限）';
+    return s;
+}
+
+// ---- 面板（全部 createElement/textContent，任何一步失败都只是少一块，不会把边界带走）----
+function rbStyle(el, css) {
+    try { for (const k in css) { try { el.style[k] = css[k]; } catch (e) {} } } catch (e) {}
+}
+
+function rbButton(label, onClick, primary) {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    rbStyle(b, {
+        cursor: 'pointer', border: '1px solid ' + (primary ? '#be123c' : '#cbd5e1'),
+        background: primary ? '#e11d48' : '#f8fafc',
+        color: primary ? '#fff' : '#0f172a',
+        borderRadius: '9px', padding: '6px 11px', fontSize: '12px',
+        fontWeight: primary ? '600' : '500', marginRight: '6px', marginTop: '6px'
+    });
+    try { b.addEventListener('click', function () { try { onClick(); } catch (e) { try { console.error('[render-boundary] 按钮处理失败', e); } catch (_) {} } }); } catch (e) {}
+    return b;
+}
+
+function rbEnsurePanel() {
+    const RB = RENDER_BOUNDARY;
+    if (RB.el) {
+        try { if (!RB.el.parentNode && document.body) document.body.appendChild(RB.el); } catch (e) {}
+        return RB.el;
+    }
+    try {
+        if (!document || !document.body || typeof document.createElement !== 'function') return null;
+
+        const box = document.createElement('div');
+        box.id = 'renderBoundaryPanel';
+        // 「用户不可能错过」也要对读屏用户成立：assertive 的 live region 会在面板出现时直接朗读。
+        try { box.setAttribute('role', 'alert'); box.setAttribute('aria-live', 'assertive'); } catch (e) {}
+        // z 预算：对话窗是 2147483000、它的拖动遮罩是 2147482000。这个面板必须盖在最上面，
+        // 否则「页面炸了」的告知会被一个还在正常工作的浮窗挡住。
+        rbStyle(box, {
+            position: 'fixed', top: '12px', left: '50%', transform: 'translateX(-50%)',
+            zIndex: '2147483600', width: 'min(760px, calc(100vw - 24px))',
+            maxHeight: '86vh', overflowY: 'auto', boxSizing: 'border-box',
+            background: '#ffffff', color: '#0f172a',
+            border: '2px solid #e11d48', borderRadius: '14px',
+            boxShadow: '0 18px 50px rgba(15,23,42,.30)',
+            padding: '14px 16px',
+            fontFamily: 'ui-sans-serif, system-ui, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif',
+            fontSize: '13px', lineHeight: '1.6'
+        });
+
+        const head = document.createElement('div');
+        rbStyle(head, { display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' });
+        const title = document.createElement('strong');
+        // 面板不止服务于渲染失败（见 rbShow 的 kind 表），所以标题由 rbShow 按 kind 改写；
+        // 这里的默认值只是它最常见的那一种。
+        title.textContent = '⚠ 页面渲染出错';
+        rbStyle(title, { color: '#be123c', fontSize: '15px' });
+        const countEl = document.createElement('span');
+        rbStyle(countEl, { color: '#64748b', fontSize: '12px' });
+        const spacer = document.createElement('span');
+        rbStyle(spacer, { flex: '1 1 auto' });
+        const closeBtn = rbButton('关闭', function () { rbHide(); }, false);
+        rbStyle(closeBtn, { marginRight: '0', marginTop: '0' });
+        head.appendChild(title); head.appendChild(countEl); head.appendChild(spacer); head.appendChild(closeBtn);
+        box.appendChild(head);
+
+        const msgEl = document.createElement('div');
+        rbStyle(msgEl, { marginBottom: '4px' });
+        box.appendChild(msgEl);
+
+        const whereEl = document.createElement('div');
+        rbStyle(whereEl, {
+            marginBottom: '8px', color: '#334155', fontSize: '12px',
+            fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+            wordBreak: 'break-all'
+        });
+        box.appendChild(whereEl);
+
+        const hintEl = document.createElement('div');
+        hintEl.textContent = '正文只存在于内存里（本页从不把译文落盘）。刷新页面会全部丢失 —— 请先「复制」或「下载」备份，再考虑刷新。';
+        rbStyle(hintEl, {
+            background: '#fff7ed', border: '1px solid #fed7aa', color: '#9a3412',
+            borderRadius: '9px', padding: '7px 10px', fontSize: '12px', marginBottom: '4px'
+        });
+        box.appendChild(hintEl);
+
+        const bar = document.createElement('div');
+        const bCopy = rbButton('复制正文备份', function () { rbCopy(); }, true);
+        const bDown = rbButton('下载备份 .txt', function () { rbDownload(); }, false);
+        const bRetry = rbButton('重试渲染', function () { rbManualRetry(); }, false);
+        const bDetail = rbButton('详细堆栈', function () { rbToggleDetail(); }, false);
+        const bReload = rbButton('刷新页面', function () { rbReload(); }, false);
+        bar.appendChild(bCopy); bar.appendChild(bDown); bar.appendChild(bRetry);
+        bar.appendChild(bDetail); bar.appendChild(bReload);
+        box.appendChild(bar);
+
+        const statusEl = document.createElement('div');
+        rbStyle(statusEl, { color: '#0f766e', fontSize: '12px', minHeight: '18px', marginTop: '4px' });
+        box.appendChild(statusEl);
+
+        // 备份文本框：即使剪贴板 API 被浏览器拒绝（file:// 下常见），用户也永远有一条
+        // 「全选 + Ctrl+C」的手动出路。默认收起，点「复制正文备份」时展开并自动选中。
+        const taEl = document.createElement('textarea');
+        taEl.readOnly = false;
+        rbStyle(taEl, {
+            display: 'none', width: '100%', boxSizing: 'border-box', height: '180px',
+            marginTop: '8px', fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+            fontSize: '12px', border: '1px solid #cbd5e1', borderRadius: '9px', padding: '8px',
+            whiteSpace: 'pre', background: '#f8fafc'
+        });
+        box.appendChild(taEl);
+
+        const detailEl = document.createElement('pre');
+        rbStyle(detailEl, {
+            display: 'none', marginTop: '8px', maxHeight: '260px', overflow: 'auto',
+            background: '#0f172a', color: '#e2e8f0', borderRadius: '9px', padding: '10px',
+            fontSize: '11px', lineHeight: '1.5', whiteSpace: 'pre-wrap', wordBreak: 'break-all'
+        });
+        box.appendChild(detailEl);
+
+        document.body.appendChild(box);
+
+        RB.el = box; RB.msgEl = msgEl; RB.whereEl = whereEl; RB.statusEl = statusEl;
+        RB.detailEl = detailEl; RB.taEl = taEl; RB.countEl = countEl; RB.titleEl = title;
+        RB.btns = { copy: bCopy, download: bDown, retry: bRetry, detail: bDetail, reload: bReload, close: closeBtn };
+        return box;
+    } catch (e) {
+        try { console.error('[render-boundary] 面板构建失败（异常本身见下一条）', e); } catch (_) {}
+        return null;
+    }
+}
+
+function rbSetStatus(s) {
+    try { if (RENDER_BOUNDARY.statusEl) RENDER_BOUNDARY.statusEl.textContent = rbText(s); } catch (e) {}
+}
+
+function rbCopy() {
+    const text = rbRescueText(false);
+    try {
+        if (RENDER_BOUNDARY.taEl) {
+            RENDER_BOUNDARY.taEl.value = text;
+            RENDER_BOUNDARY.taEl.style.display = 'block';
+            try { RENDER_BOUNDARY.taEl.focus(); RENDER_BOUNDARY.taEl.select(); } catch (e) {}
+        }
+    } catch (e) {}
+    // 先给一句**同步**的回执再去碰剪贴板：clipboard.writeText 是异步的，
+    // 只在 then/catch 里写状态的话，点下按钮到状态出现之间是一段「什么都没发生」的空白，
+    // 而这正是用户最需要确定「我的字保住了没有」的时刻。文本框此刻已经填好且全选，
+    // 所以这句话在任何浏览器上都是真的。剪贴板真的成功了再把它升级成更好的那一句。
+    rbSetStatus('备份已放进下面的文本框并全选（' + text.length + ' 字符），按 Ctrl+C / ⌘C 即可复制。');
+    try {
+        if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            const p = navigator.clipboard.writeText(text);
+            if (p && typeof p.then === 'function') {
+                p.then(function () { rbSetStatus('已复制到剪贴板（' + text.length + ' 字符）。下面的文本框里也有一份。'); },
+                       function () { rbSetStatus('剪贴板被浏览器拒绝了。文本已经放在下面的框里并全选，按 Ctrl+C / ⌘C 即可。'); });
+            }
+        }
+    } catch (e) { /* 同步回执已经给过，这里不需要再改文案 */ }
+}
+
+function rbDownload() {
+    const text = rbRescueText(true);
+    try {
+        const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        let stamp = '';
+        try { stamp = new Date().toISOString().replace(/[:.]/g, '-'); } catch (e) { stamp = String(Date.now()); }
+        a.download = 'AI-Translator-rescue-' + stamp + '.txt';
+        rbStyle(a, { display: 'none' });
+        document.body.appendChild(a);
+        a.click();
+        try { document.body.removeChild(a); } catch (e) {}
+        try { setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000); } catch (e) {}
+        rbSetStatus('已触发下载（' + text.length + ' 字符，含内存里的历史快照）。');
+        return;
+    } catch (e) {
+        try { console.error('[render-boundary] 下载失败', e); } catch (_) {}
+    }
+    // 下载这条路走不通时，退回文本框，用户仍然有一条完整的出路
+    try {
+        if (RENDER_BOUNDARY.taEl) {
+            RENDER_BOUNDARY.taEl.value = text;
+            RENDER_BOUNDARY.taEl.style.display = 'block';
+            try { RENDER_BOUNDARY.taEl.focus(); RENDER_BOUNDARY.taEl.select(); } catch (e2) {}
+        }
+    } catch (e2) {}
+    rbSetStatus('这个环境不允许下载。完整备份已经放在下面的框里，请手动复制保存。');
+}
+
+function rbToggleDetail() {
+    try {
+        const d = RENDER_BOUNDARY.detailEl;
+        if (!d) return;
+        d.style.display = (d.style.display === 'block') ? 'none' : 'block';
+    } catch (e) {}
+}
+
+function rbReload() {
+    try {
+        const ok = (typeof confirm === 'function')
+            ? confirm('刷新会丢掉这一页的全部正文（本页从不把译文存到磁盘）。确定已经备份好了吗？')
+            : true;
+        if (!ok) { rbSetStatus('已取消刷新。'); return; }
+        location.reload();
+    } catch (e) {
+        try { console.error('[render-boundary] 刷新失败', e); } catch (_) {}
+    }
+}
+
+// 手动重试：把熔断计数清零后重新走一遍**带边界的** renderApp。
+// 它只可能由用户点击触发，所以不存在自转风险；失败时面板会自己更新成最新的错。
+function rbManualRetry() {
+    try {
+        RENDER_BOUNDARY.streak = 0;
+        RENDER_BOUNDARY.lastRetrySig = '';
+        rbSetStatus('正在重试渲染…');
+        renderApp(false);
+        // renderApp 失败时会走 rbShow，而 rbShow 会把状态行清空（不许拿旧回执糊新故障），
+        // 所以这里按 streak 补一句结论：成功说成功，还失败就说还失败，不留空。
+        // ⚠️ 只能说「仍然失败」，不能说「还是同样的错」：这里唯一读到的事实是 streak，
+        //    它分不出第二次抛的是不是同一个错。上方的错误行已经被 rbShow 换成了最新那一次，
+        //    真要判断是不是同一个错，看那一行即可 —— 由文案替用户下这个结论就是在瞎猜。
+        if (RENDER_BOUNDARY.streak === 0) rbSetStatus('重试成功，界面已经是最新的。可以关掉这个面板继续用了。');
+        else rbSetStatus('重试之后仍然失败，上方显示的是最新的那一次错误。请先备份正文，再刷新页面。');
+    } catch (e) {
+        // renderApp 现在不会抛；这一层纯属万一
+        try { console.error('[render-boundary] 手动重试仍然失败', e); } catch (_) {}
+        rbSetStatus('重试仍然失败：' + rbText(e && e.message));
+    }
+}
+
+function rbHide() {
+    try {
+        RENDER_BOUNDARY.visible = false;
+        if (RENDER_BOUNDARY.el) RENDER_BOUNDARY.el.style.display = 'none';
+        if (RENDER_BOUNDARY.titleSaved != null) {
+            try { document.title = RENDER_BOUNDARY.titleSaved; } catch (e) {}
+            RENDER_BOUNDARY.titleSaved = null;
+        }
+    } catch (e) {}
+}
+
+// 面板可见时，每一次成功渲染都要把面板**整体**改写成此刻为真的样子。
+//
+// ⚠️ 这里不能只补计数行。rbShow 写的那段「页面停在上一帧、之后每一次操作都会在同一处
+//    再抛一次、界面永远不会再更新」，在这一刻每一个分句都已经是假的：屏幕上就是刚画完的
+//    新一帧，streak 已归零，ok 还在涨。留着它不动，面板就会一边显示「已成功渲染 N 次」
+//    一边劝用户去刷新 —— 而刷新会丢掉全部正文。所以正文、标题、计数一起重写。
+// 只在「面板此刻显示的确实是渲染故障」时做：它也可能正显示着异步错误 / \textcolor 剥离
+// 放弃，那两件事和这次渲染成功毫无关系，把它们顶掉就是用一条真话吞掉另一条真话。
+function rbNoteRecovery() {
+    try {
+        const RB = RENDER_BOUNDARY;
+        if (!RB.visible || RB.fail === 0) return;
+        if (RB.shownKind !== 'render-failed' && RB.shownKind !== 'render-recovered') return;
+        const after = RB.ok - RB.okAtFail;   // 最近一次失败之后成功渲染了几次（不是一辈子几次）
+        if (RB.countEl) {
+            RB.countEl.textContent =
+                '· 累计 ' + RB.fail + ' 次失败，最近一次失败之后已成功渲染 ' + after + ' 次';
+        }
+        if (RB.msgEl) {
+            RB.msgEl.textContent =
+                '之前有过 ' + RB.fail + ' 次渲染失败，现在已经恢复：你看到的是最新的一帧，'
+                + '界面可以正常操作，不需要刷新。下面留的是最后那一次故障的现场，'
+                + '如果反复出现，请点「下载备份 .txt」把正文和堆栈都存下来再排查。';
+        }
+        if (RB.titleEl) RB.titleEl.textContent = '⚠ 渲染出错（已恢复）';
+        // 标签页标题同理：还留着「⚠ 渲染出错」这四个字（确实出过事，面板也还开着），
+        // 但必须说清楚现在的状态，否则切回这个标签的人会以为页面还是坏的。
+        if (RB.titleSaved != null) {
+            try { document.title = '⚠ 渲染出错（已恢复） · ' + RB.titleSaved; } catch (e) {}
+        }
+    } catch (e) {}
+}
+
+// 唯一的「告知用户」出口。kind:
+//   'render-failed'    渲染失败且自动重试没救回来
+//   'render-recovered' 渲染抛过，但自动重试后这一帧是好的
+//   'async'            window error / unhandledrejection
+//   'strip-gaveup'     \textcolor 剥离放弃 —— 不是渲染故障，但同样是「静默就会毁文档」的一类，
+//                      所以复用同一个面板（用户只需要认识一个「出事了」的界面）
+// 整个函数不允许抛：面板造不出来时退回 console + 标题栏，绝不把异常带回渲染路径。
+function rbShow(kind, err, extra) {
+    const RB = RENDER_BOUNDARY;
+    // 标签页标题也要说实话：不是渲染炸了就别说「渲染出错」。
+    // 三种 kind 三种说法 —— 漏掉哪一种，那一种就会顶着别人的名字出现。
+    const tabTag = (kind === 'strip-gaveup') ? '⚠ 颜色宏未剥离 · '
+                 : (kind === 'async') ? '⚠ 后台出错 · '
+                 : (kind === 'render-recovered') ? '⚠ 渲染出错（已恢复） · '
+                 : '⚠ 渲染出错 · ';
+    try { console.error('[render-boundary] ' + kind + ' —', err); } catch (e) {}
+    try {
+        const panel = rbEnsurePanel();
+        if (!panel) {
+            // 最后一道：至少让标签页标题喊出来。这一行几乎不可能失败。
+            try {
+                if (RB.titleSaved == null) RB.titleSaved = document.title;
+                document.title = tabTag + RB.titleSaved;
+            } catch (e) {}
+            return;
+        }
+        panel.style.display = 'block';
+        RB.visible = true;
+        RB.shownKind = kind;
+        // 状态行是上一次按钮操作的回执。新的一次故障进来时必须先清掉，
+        // 否则一条「重试成功」会挂在一条全新的失败下面 —— 那就是在说假话。
+        rbSetStatus('');
+        try {
+            if (RB.titleSaved == null) RB.titleSaved = document.title;
+            document.title = tabTag + RB.titleSaved;
+        } catch (e) {}
+        try {
+            if (RB.titleEl) {
+                // 标题必须和正文说同一件事：'async' 的正文写着「不是渲染路径抛的」，
+                // 标题再写「页面渲染出错」就是当场自相矛盾。
+                RB.titleEl.textContent = (kind === 'strip-gaveup') ? '⚠ 颜色宏没能剥离'
+                                       : (kind === 'async') ? '⚠ 后台任务出错'
+                                       : (kind === 'render-recovered') ? '⚠ 渲染出错（已恢复）'
+                                       : '⚠ 页面渲染出错';
+            }
+        } catch (e) {}
+
+        // —— 文案必须为真：屏幕上现在到底是什么，由 ok / wrote 两个事实推出来，不能猜 ——
+        let msg;
+        if (kind === 'strip-gaveup') {
+            msg = '这一次要发给模型的文本里有 \\textcolor 颜色宏，剥离器没能把它剥干净，'
+                + '于是**原文原样发了出去**（一个字都没改，也没有交出半剥离的残缺文本）。'
+                + '后果：译文里很可能出现 \\textcolor{...}{...} 字样，需要你自己删掉。'
+                + '正文和历史都没有被动过，可以直接重试；换一段更小的选区通常就能绕开。';
+        } else if (kind === 'async') {
+            msg = '有一个异步错误没人接住（不是渲染路径抛的，界面本身仍然是正常的一帧）。'
+                + '它通常意味着某个后台请求或定时器失败了，结果可能没有出现在界面上。';
+        } else if (kind === 'render-recovered') {
+            msg = '这一次渲染抛了异常，已经自动重试成功 —— 你现在看到的界面是最新的。'
+                + '重试前关掉了设置弹窗 / 选词弹窗 / 各类菜单等浮层（正文一个字都没动）。'
+                + '如果反复出现，请把下面的堆栈留存。';
+        } else if (RB.ok === 0 && !RB.wrote) {
+            msg = '首次渲染就失败了，所以这个面板后面是一张空白页 —— 界面根本没有画出来。'
+                + '此时还没有任何正文，刷新是安全的。';
+        } else if (RB.ok === 0 && RB.wrote) {
+            msg = '首次渲染画出了界面，但收尾步骤（事件绑定 / 对齐 / 弹窗定位）失败了：'
+                + '页面看得见，部分按钮和输入框可能没有反应。';
+        } else if (RB.wrote) {
+            msg = '渲染中途失败，但页面内容已经被换成了新的一帧：界面是新的，'
+                + '收尾步骤（事件绑定 / 对齐 / 弹窗定位）没跑完，部分按钮和输入框可能没有反应。'
+                + '请先备份正文，再点「重试渲染」或刷新。';
+        } else {
+            msg = '渲染失败，页面停在「上一帧」：你看到的是出错之前的界面，之后的每一次操作'
+                + '都会在同一处再抛一次，不处理的话界面永远不会再更新。'
+                + '请先备份正文，再点「重试渲染」；仍然不行就刷新（会丢正文，务必先备份）。';
+        }
+        if (RB.msgEl) RB.msgEl.textContent = msg;
+
+        if (RB.whereEl) {
+            const where = rbWhere(err);
+            RB.whereEl.textContent = '错误：' + rbText(err && err.name ? err.name : '') + ' ' +
+                ((err && err.message != null) ? rbText(err.message) : rbText(err)) +
+                (where ? '   @ ' + where : '');
+        }
+        if (RB.countEl) {
+            RB.countEl.textContent = (kind === 'strip-gaveup')
+                ? ('· 第 ' + RB.stripGaveUp + ' 次剥离放弃')
+                : ('· 第 ' + RB.fail + ' 次捕获，连续失败 ' + RB.streak +
+                   ' 次，自动重试 ' + RB.retries + ' 次');
+        }
+        if (RB.detailEl) {
+            let d = '';
+            try {
+                d += '[' + kind + '] ' + rbText(err && err.name) + ': ' +
+                     ((err && err.message != null) ? rbText(err.message) : rbText(err)) + '\n';
+                d += (err && err.stack) ? String(err.stack) : '（没有堆栈）';
+                if (extra && extra.second) {
+                    d += '\n\n—— 自动重试时的第二次异常 ——\n';
+                    d += rbText(extra.second && extra.second.message) + '\n';
+                    d += (extra.second && extra.second.stack) ? String(extra.second.stack) : '';
+                }
+                d += '\n\n—— 计数 ——\nok=' + RB.ok + ' fail=' + RB.fail + ' streak=' + RB.streak +
+                     ' retries=' + RB.retries + ' wroteRoot=' + RB.wrote +
+                     ' async=' + RB.asyncSeen;
+            } catch (e) { d = '（堆栈整理失败）'; }
+            RB.detailEl.textContent = d;
+        }
+    } catch (e) {
+        try { console.error('[render-boundary] 面板更新失败（原异常已在上一条打印）', e); } catch (_) {}
+    }
+}
+
+// 自动重试前清掉的**只有浮层类状态**。挑选标准：清掉它绝不会丢用户写过的任何一个字。
+//   · 明确不碰：translationPairs / inputText / originalInputText / editValues / activeIndex
+//     —— activeIndex 一清就退出行内编辑态，那一行没保存的修改会没；宁可重试失败也不能丢字。
+//   · 明确不碰：globalHistory —— 内存里唯一的历史副本。
+//   · 明确不做：任何 localStorage 写入、任何 addToGlobalHistory、任何 setState。
+function rbCalmTransientState() {
+    try {
+        AppState.showSettings = false;
+        AppState.showLocalSettings = false;
+        AppState.showModelMenu = false;
+        AppState.showHistoryMenu = false;
+        AppState.showSaveMenu = false;
+        AppState.activeSettingsPopup = null;
+        AppState.activeSettingsIndex = null;
+        AppState.activeSettingsSide = null;
+        AppState.toast = null;
+    } catch (e) {}
+    try {
+        AppState.synonymState = {
+            show: false, loading: false, originalText: "", mode: "replace",
+            historyByMode: { replace: [], simplify: [], grammar: [] },
+            pageIndexByMode: { replace: 0, simplify: 0, grammar: 0 },
+            grammarNotes: [], errorMessage: "",
+            position: { x: 0, y: 0 }, selectionRange: { start: 0, end: 0 },
+            sentenceRange: null, field: null, index: null, contextSentence: ""
+        };
+    } catch (e) {}
+    try {
+        AppState.crossHighlight = { seq: 0, idx: null, fromSide: null, toSide: null, fragments: [], status: 'idle', via: '' };
+    } catch (e) {}
+}
+
+// ============= 主渲染函数（外层 = 错误边界，内层 = 原来的 renderApp）=============
+// 边界必须包在 renderApp 这一层而不是 setState 里：全文有 ~40 处直接调 renderApp()
+// 而不经过 setState（切页签、拖宽度、恢复历史……），只包 setState 会漏掉它们。
 function renderApp(preserveScroll = true) {
+    const RB = RENDER_BOUNDARY;
+
+    // 重入：渲染过程中又调了一次 renderApp（事件处理器同步回调等）。
+    // 不再套第二层边界，直接执行，异常交给最外层那一层处理 —— 否则内层会先把状态清一遍，
+    // 外层拿到的就不是第一现场了。
+    if (RB.depth > 0) return renderAppCore(preserveScroll);
+
+    RB.depth++;
+    try {
+        RB.wrote = false;
+        try {
+            renderAppCore(preserveScroll);
+            RB.ok++;
+            RB.streak = 0;
+            if (RB.visible) rbNoteRecovery();
+            return;
+        } catch (err1) {
+            // 这个 catch 块是全函数最要紧的一段：它自己一旦抛，异常就会越过边界继续往上冒，
+            // 等于边界压根没修好（「把冻死挪了个位置」）。下面每个 rb* 都已经各自带 try/catch，
+            // 这一层是**结构性**兜底 —— 不靠逐个函数的自觉，靠语法保证。
+            try {
+                RB.fail++;
+                RB.streak++;
+                RB.okAtFail = RB.ok;   // 恢复计数的基线，见 RENDER_BOUNDARY.okAtFail 的说明
+                rbRecord('render', err1);
+
+                const sig = rbSignature(err1);
+                // 只有「没连续炸到熔断上限」且「不是刚刚重试过的同一个错」才值得再试一次。
+                // 同签名重试第二遍在本质上是同一次计算，只会白烧 CPU。
+                const worthRetry = (RB.streak <= RB_STREAK_MAX) && (RB.lastRetrySig !== sig);
+                if (worthRetry) {
+                    RB.lastRetrySig = sig;
+                    RB.retries++;
+                    rbCalmTransientState();
+                    RB.wrote = false;
+                    try {
+                        renderAppCore(false);
+                        RB.ok++;
+                        RB.streak = 0;
+                        rbShow('render-recovered', err1, null);
+                        return;
+                    } catch (err2) {
+                        rbRecord('render-retry', err2);
+                        rbShow('render-failed', err1, { second: err2 });
+                        return;
+                    }
+                }
+                rbShow('render-failed', err1, null);
+                return;
+            } catch (boundaryErr) {
+                // 走到这里说明「报告故障」这件事本身也失败了。最后一件还能做的事：
+                // 把两条异常都打进控制台，然后正常返回（绝不再往上抛）。
+                try { console.error('[render-boundary] 边界自身失败：', boundaryErr, ' 原始渲染异常：', err1); } catch (_) {}
+                return;
+            }
+        }
+    } finally {
+        RB.depth--;
+    }
+    // 刻意不往外抛：调用点有上百处，绝大多数是 `setState(...)` 后面还跟着别的收尾语句
+    // （关弹窗、清 loading、装 3 秒后关 toast 的定时器……）。让异常继续往上冒，
+    // 那些收尾语句就全被跳过，用户会同时得到「界面不动」和「按钮永远转圈」。
+    // 代价是：渲染失败后调用点的后续语句会照常执行。这是可接受的 —— renderAppCore
+    // 第一件事就是把 translationPairs 归一化写回，所以之后哪怕真触发了自动存档，
+    // 存进去的也是已经归一化过的数据，不会把归档里那份好的换成带缺口的。
+}
+
+function renderAppCore(preserveScroll = true) {
     // ⚠️ 必须是这个函数的第一件事：下面每一行渲染代码都假定 translationPairs 是
     //    「数组 + 每个元素形状完整」，而这个假定在真实运行中会被打破（见上方注释）。
     //    归一化本身不可能抛；写回 AppState 让这次修复对后续所有读取者同样生效。
@@ -6874,6 +7639,10 @@ function renderApp(preserveScroll = true) {
             ${renderFooter()}
         </div>
     `;
+    // 走到这一行说明整块模板字符串**已经拼完并且已经赋进 #root**。
+    // 边界靠这个布尔量区分两种完全不同的故障现场：抛在赋值之前 = 屏幕上是上一帧（旧但完整），
+    // 抛在赋值之后 = 屏幕上是新的一帧但收尾没跑完（新但可能点不动）。两种情况的正确说法不一样。
+    RENDER_BOUNDARY.wrote = true;
     attachEventListeners();
 
     // 同义词弹窗独立渲染到 body（避免被 root 内容替换影响）
@@ -6902,6 +7671,115 @@ function renderApp(preserveScroll = true) {
 
     // 渲染后调整弹窗位置
     adjustAllPopups();
+}
+
+// ============= 全局异步异常 -> 同一个面板 =============
+// 为什么要接：渲染路径修好之后，剩下唯一还会「静默失败」的就是异步路径 ——
+// handleTranslate / refreshOnlineModels / 各种定时器里的 promise 没人 catch 时，
+// 今天的表现是控制台一条红字、界面上什么都没有，用户只会觉得「点了没反应」。
+// 它们和渲染失败共用同一个面板：用户只需要认识一个「出事了」的界面。
+//
+// 为什么必须限流：window 的 error 事件也会被第三方脚本（KaTeX / marked / Tailwind CDN）
+// 和浏览器自身的噪声触发。所以
+//   · 只认真正带 error/message 的事件，资源加载失败（img/script 404）一律不认；
+//   · AbortError 一律不认 —— 那是用户点「停止」的正常结果，不是故障；
+//   · ResizeObserver 那条著名的良性告警一律不认（本文件确实在用 ResizeObserver 对齐行高）；
+//   · 最多主动弹 RB_ASYNC_PANEL_MAX 个**不同签名**的错，之后只累加计数、不再打扰；
+//   · 渲染那边还没救回来时（streak > 0），异步错误绝不占用这个面板 —— 渲染失败更严重。
+//     判据只能是 streak，**不能**再加「面板还开着」：「关闭」是面板上的一等按钮，
+//     用户关掉它并不代表渲染修好了，而按可见性判断会让这条保护在关闭的那一刻蒸发，
+//     下一条异步错误就会把面板重新弹成「界面本身仍然是正常的一帧」—— 那句话此刻是假的。
+const rbAsyncSigs = [];
+
+function rbShouldReportAsync(err, message) {
+    try {
+        const name = rbText(err && err.name);
+        if (name === 'AbortError') return false;
+        const msg = (err && err.message != null) ? rbText(err.message) : rbText(message);
+        if (!msg && !err) return false;
+        if (msg.indexOf('ResizeObserver loop') !== -1) return false;
+        return true;
+    } catch (e) { return false; }
+}
+
+function rbHandleAsync(err, message) {
+    try {
+        const RB = RENDER_BOUNDARY;
+        if (!rbShouldReportAsync(err, message)) return;
+        RB.asyncSeen++;
+        const e = (err && typeof err === 'object') ? err : new Error(rbText(message) || '未知异步错误');
+        rbRecord('async', e);
+        const sig = rbSignature(e);
+        if (rbAsyncSigs.indexOf(sig) !== -1) return;          // 同一个错反复来，只记一次
+        if (rbAsyncSigs.length < RB_ASYNC_PANEL_MAX * 4) rbAsyncSigs.push(sig);
+        if (RB.streak > 0) return;                            // 渲染那边还没救回来，不抢面板（面板被关掉了也一样）
+        if (RB.asyncShown >= RB_ASYNC_PANEL_MAX) {
+            try { console.error('[render-boundary] 异步错误（已达面板上限，只记录）', e); } catch (_) {}
+            return;
+        }
+        RB.asyncShown++;
+        rbShow('async', e, null);
+    } catch (e2) {
+        try { console.error('[render-boundary] 异步上报自身失败', e2); } catch (_) {}
+    }
+}
+
+// ============= \textcolor 剥离放弃 -> 同一个面板 =============
+// stripTextColorForModel 唯一的对外告知口，由它以 typeof 守卫调用（回归测试在没有边界的
+// vm 沙箱里跑同一份函数，所以那边必须能安全地跳过这条路）。
+//
+// 为什么值得占用这个面板：剥离失败**不会抛异常**、**不会让界面变样**，用户唯一能察觉的
+// 途径是事后在译文里读到 \textcolor{purple}{...}。这正是本项目一路在打的「静默损坏」，
+// 和渲染冻死属于同一类事故，只是表现在文档里而不是屏幕上。控制台一条红字不算告知。
+//
+// 限流规则和异步错误一样：同一个原因只主动弹一次面板，之后只累加计数 —— 一次批量翻译
+// 会连着调用很多次，不能变成弹窗刷屏。
+const rbStripGaveUpReasons = [];
+
+function rbReportStripGiveUp(why, sample, detail) {
+    try {
+        const RB = RENDER_BOUNDARY;
+        RB.stripGaveUp++;
+        const head = rbText(sample).slice(0, 160);
+        const e = new Error('\\textcolor 剥离放弃：' + rbText(why) +
+            (detail ? '（' + rbText(detail) + '）' : '') +
+            ' —— 原文原样发给模型');
+        rbRecord('strip-gaveup', e);
+        const key = rbText(why);
+        if (rbStripGaveUpReasons.indexOf(key) !== -1) {
+            try { console.error('[textcolor] 又一次剥离放弃（同一原因，只记录不再弹窗）', key); } catch (_) {}
+            return;
+        }
+        rbStripGaveUpReasons.push(key);
+        // 渲染那边还没救回来的时候不抢面板：页面冻住比译文里多几个宏严重得多。
+        // 判据同样只看 streak，不看面板是否还开着 —— 理由见 rbHandleAsync 上方那段。
+        if (RB.streak > 0) {
+            try { console.error('[textcolor] 剥离放弃，但渲染仍在失败中，不抢这个面板', e); } catch (_) {}
+            return;
+        }
+        rbShow('strip-gaveup', e, { second: null, sample: head });
+    } catch (e2) {
+        try { console.error('[textcolor] 放弃上报自身失败', e2); } catch (_) {}
+    }
+}
+
+try {
+    window.addEventListener('error', function (ev) {
+        try {
+            // 资源加载失败（<img>/<script> 404）走的也是 error 事件，但没有 error/message，
+            // 而且和「代码炸了」是两回事，不该弹这个面板。
+            if (!ev || (ev.error == null && ev.message == null)) return;
+            rbHandleAsync(ev.error, ev.message);
+        } catch (e) {}
+    });
+    window.addEventListener('unhandledrejection', function (ev) {
+        try {
+            if (!ev) return;
+            rbHandleAsync(ev.reason, ev.reason && ev.reason.message);
+        } catch (e) {}
+    });
+} catch (e) {
+    try { console.warn('[render-boundary] 全局异常监听注册失败：', e && e.message); } catch (_) {}
 }
 
 // ============= 错误横幅 =============
