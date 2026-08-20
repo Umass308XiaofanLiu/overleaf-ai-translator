@@ -257,7 +257,7 @@ body.is-resizing-settings-modal * {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '01.03.00';        // APP_VERSION_STAMP
+const APP_VERSION = '01.04.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-08-19';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -599,6 +599,9 @@ const AppState = {
     // 会弹一次 toast 明确告知；本字段留着给排查用（失败的那几行自己也带可见标记）。
     // 刻意**不**进渲染模板：渲染路径没有 try/catch，能不碰就不碰。
     lastTransportFailures: 0,
+    // 上一次翻译里有几处公式环境在译文里凭空消失（A7 审计的结果）。同样**不进渲染模板**，
+    // 只留给排查用；用户看到的是那一条 toast。
+    lastEquationLoss: 0,
 
     // ---- 跨栏对应高亮（选中一侧，另一侧同时高亮出对应片段）----
     crossHighlightEnabled: true,      // 总开关，「显示」页可关；持久化到 localStorage['crossHighlightEnabled']
@@ -610,6 +613,11 @@ const AppState = {
     // 模型可见性设置（键 = 模型 id，值 = 是否显示；键不存在时按 `!== false` 视为可见）
     // 初值由 DEFAULT_MODEL_CATALOG 派生，与原来手写的 9 个 true 完全等价
     modelVisibility: Object.fromEntries(DEFAULT_MODEL_CATALOG.map(m => [m.id, true])),
+
+    // B2：每个本地模型各自的推理档位（键 = 模型 id，值 = UI 词表里的 off/on/low/medium/xhigh）。
+    // 缺键 = 'off' —— 翻译场景默认关，理由见 XPORT_PARAM_SPECS 里 reasoning 那条的实测数字。
+    // 持久化到 localStorage['reasoningByModel']，在首次 renderApp 之前恢复。
+    reasoningByModel: {},
     
     // AI Toolbar 设置弹窗状态
     activeSettingsPopup: null, // 'grammar' | 'simplify' | null
@@ -1403,7 +1411,10 @@ function parseCrossFragments(raw) {
     const out = [];
     try {
         let text = String(raw == null ? '' : raw);
-        text = text.replace(/<think>[\s\S]*?<\/think>/gi, '');   // 推理模型的思考段，整段丢掉
+        // 推理模型的思考段。**不能**用成对正则 /<think>[\s\S]*?<\/think>/ ——
+        // 开标签被 Qwen3 模板预填进提示词里，真实泄漏只有闭合标签，成对匹配是空操作
+        // （实测一条 815 字符的泄漏只删掉 20 个字符）。走全文件唯一那条规则。
+        text = xportThinkCut(text, XPORT_CROSS_ANCHOR).text;
         text = text.replace(/```[a-zA-Z]*\n?/g, '');             // 偶发的 markdown 代码围栏
         const lines = text.split(/\r?\n/);
         for (let i = 0; i < lines.length; i++) {
@@ -1834,6 +1845,41 @@ const OPENAI_API_BASE = "https://api.openai.com/v1/chat/completions";
 const CLAUDE_API_BASE = "https://api.anthropic.com/v1/messages";
 
 // ============= 本地LLM调用（OpenAI兼容）=============
+// ============= 模型响应的唯一读取口（A2）=============
+// 「模型到底说了什么」只在这里判定一次，全文件不许有第二处。
+//
+// 【硬规则 1】`message.content` 是答案通道，**永远、且只有它**。content 为空时
+// 绝不回落到 reasoning_content —— 那是**关于**答案的自言自语，不是答案。把它当答案
+// 写进用户文档，正是 xportParseBlocks 那个洞（见 xportThinkCut 上方注释）干的事。
+//
+// 【硬规则 2】判「模型是否在推理」只看 `usage.completion_tokens_details.reasoning_tokens`
+// 和 reasoning_content 的**内容**，**绝不看 key 是否存在**。实测（n=54 与 n=20+，三个
+// 模型）：无论开没开思考，message 的键永远是 [content, reasoning_content, role, tool_calls]，
+// 没用到时值是 ""。曾经有一份报告据「key 存在」判定 qwen3.8 在 enable_thinking:false 下
+// 仍然推理，那是 schema 假象，已被两轮独立测量推翻。
+//
+// 【硬规则 3】finish_reason 对**每一次**调用都读出来。它是 TRUNCATED 与 EMPTY 之间
+// 唯一的分辨依据（见 classifyLocalFailure）。
+function readLocalChoice(data) {
+    const ch = (data && data.choices && data.choices[0]) || {};
+    const msg = ch.message || {};
+    const content = typeof msg.content === 'string' ? msg.content : '';
+    const reasoning = (typeof msg.reasoning_content === 'string' && msg.reasoning_content)
+        || (typeof msg.reasoning === 'string' && msg.reasoning) || '';
+    const finish = ch.finish_reason || '';
+    const usage = (data && data.usage) || {};
+    const det = usage.completion_tokens_details || {};
+    const rtok = Number(det.reasoning_tokens) || 0;
+    return {
+        text: content,                  // 答案通道。永远。且只有它。
+        reasoning: reasoning,           // 只用于诊断/横幅，绝不当答案
+        finish: finish,
+        truncated: finish === 'length',
+        thinking: reasoning.trim() !== '' || rtok > 0,
+        reasoningTokens: rtok
+    };
+}
+
 async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal = null, meta = null) {
     const body = {
         model: model || "local-model",
@@ -1847,16 +1893,47 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
         body.response_format = { type: "json_object" };
     }
 
+    // B2：推理档位。**必须显式发，不能靠省略**——实测省略 reasoning_effort 等于关闭推理，
+    // 哪怕 /api/v1/models 里 capabilities.reasoning.default 写着 "xhigh"。所以「关」也要
+    // 老老实实发 "none"（发 "off" 是 400）。映射与禁发值见 XPORT_EFFORT_WIRE 上方注释。
+    // 值从每模型持久化设置来，默认 'off'；xportWireEffort 自带兜底，任何异常都退回 'none'。
+    let effortSent = '';
+    try {
+        if (!xportEffortUnsupported.has(xportCapsOrigin(baseUrl))) {
+            effortSent = xportWireEffort(baseUrl, model);
+            if (effortSent) body.reasoning_effort = effortSent;
+        }
+    } catch (e) { effortSent = ''; }
+
     // 构建endpoint - 直接使用/v1/chat/completions
     const endpoint = `${baseUrl.replace(/\/$/, "")}/v1/chat/completions`;
 
     try {
-        const response = await fetch(endpoint, {
+        let response = await fetch(endpoint, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(body),
             signal
         });
+
+        // 兼容闸：只有当对端**明确点名** reasoning_effort 地 400 时，才摘掉这个字段重试一次，
+        // 并把这个 origin 记进 xportEffortUnsupported，之后不再发。三个实测模型都不会走到这里；
+        // 它存在只是为了保证「多一个可选参数」永远不可能把整条翻译链路弄挂。
+        if (response && !response.ok && response.status === 400 && body.reasoning_effort) {
+            const firstErr = await response.text();
+            if (/reasoning_effort/i.test(firstErr)) {
+                xportEffortUnsupported.add(xportCapsOrigin(baseUrl));
+                delete body.reasoning_effort;
+                response = await fetch(endpoint, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify(body),
+                    signal
+                });
+            } else {
+                throw new Error(`API Error: ${response.status} - ${firstErr}`);
+            }
+        }
 
         if (!response.ok) {
             const errText = await response.text();
@@ -1864,10 +1941,25 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
         }
 
         const data = await response.json();
-        // 可选出参：把 finish_reason 交给调用方。'length' = 输出被 token 上限**截断**，
-        // 返回的正文是半截的。不传 meta 的调用方逐字不受影响。
-        if (meta) meta.truncated = (data.choices?.[0]?.finish_reason === 'length');
-        return data.choices?.[0]?.message?.content || "";
+        // 出参：**整份** readLocalChoice 结果，不只是 truncated。A4 的错误分类要靠
+        // truncated / thinking / text 三个字段一起判，任何一个缺了都会把
+        // 「推理吃光了预算」误报成「收到空响应」。不传 meta 的调用方逐字不受影响。
+        const choice = readLocalChoice(data);
+        if (meta) {
+            meta.truncated = choice.truncated;
+            meta.text = choice.text;
+            meta.reasoning = choice.reasoning;
+            meta.finish = choice.finish;
+            meta.thinking = choice.thinking;
+            meta.reasoningTokens = choice.reasoningTokens;
+            // B2：这次到底发出去的是哪个档位（''=没发）。留给排查与验收用，
+            // 「UI 说的」和「线上发的」对不上时，这里是唯一能一眼看穿的地方。
+            meta.reasoningEffortSent = body.reasoning_effort || '';
+        }
+        // A3：被动探测。每一次真实响应都顺手判一次「这个模型在推理吗」，
+        // 不额外花任何一次调用。判到了就把横幅弹出来（见 xportNoteThinking）。
+        try { xportNoteThinking(model, choice.thinking); } catch (e) {}
+        return choice.text;
     } catch (error) {
         if (error.name === 'AbortError') throw error;
         throw error;
@@ -2130,6 +2222,48 @@ async function fetchClaudeModelList(apiKey, proxyUrl) {
         .filter(Boolean);
 }
 
+// ============= A5：平衡花括号候选扫描 =============
+// 取代原来的贪婪 `/\{[\s\S]*\}/`（从**第一个** { 一路吃到**最后一个** }）。两个实测理由：
+//   1. 推理开着时，content 里常常先有一份**完整的 pretty-printed JSON 草稿**，再跟一份
+//      答案。贪婪匹配把草稿和答案跨着一起吃掉，于是这段输出**永远**解析不出来 ——
+//      明明答案本身是合法 JSON。
+//   2. LaTeX 满篇花括号（`\ref{x}` / `\textcolor{red}{y}`），贪婪匹配天然容易切错边界。
+// 扫描器是**字符串感知 + 转义感知**的：JSON 字符串里的 { } " 一律不计入配平，
+// 否则 `{"a":"}"}` 这种输入会让朴素计数器选错跨度。
+function xportJsonCandidates(s) {
+    const src = String(s == null ? '' : s);
+    const n = src.length;
+    const out = [];
+    let i = 0, guard = 0;
+    while (i < n && ++guard < 200000) {
+        if (src[i] !== '{') { i++; continue; }
+        let depth = 0, inStr = false, esc = false, closed = -1;
+        for (let j = i; j < n; j++) {
+            const c = src[j];
+            if (inStr) {
+                if (esc) { esc = false; continue; }
+                if (c === '\\') { esc = true; continue; }
+                if (c === '"') inStr = false;
+                continue;
+            }
+            if (c === '"') { inStr = true; continue; }
+            if (c === '{') depth++;
+            else if (c === '}') { depth--; if (depth === 0) { closed = j; break; } }
+        }
+        if (closed === -1) { i++; continue; }     // 这个 { 配不平：从下一个字符继续找
+        out.push(src.slice(i, closed + 1));
+        i = closed + 1;
+        if (out.length >= 32) break;              // 32 份草稿已经足够诊断，再多是模型跑飞了
+    }
+    return out;
+}
+
+// 候选择优用的「期望键」。命中其一 = 这份候选是某条链路真正的应答形状，
+// 而不是模型在推理里写的草稿或半成品。规则：**取最后一个**命中的 ——
+// 实测模型的真答案永远跟在它自己的草稿后面。
+const XPORT_JSON_KEYS = ['translations', 'alternatives', 'sentence_alternatives',
+    'corrected_sentence', 'correct', 'issue', 'text'];
+
 // 解析JSON响应（处理可能的markdown包裹）
 function parseJsonResponse(text) {
     // 检查空响应
@@ -2149,11 +2283,23 @@ function parseJsonResponse(text) {
     try {
         return JSON.parse(clean);
     } catch (e) {
-        // 尝试提取JSON对象
-        const match = clean.match(/\{[\s\S]*\}/);
-        if (match) {
-            try { return JSON.parse(match[0]); } catch (e2) {}
+        // 提取 JSON 对象：平衡花括号扫描（见 xportJsonCandidates 上方注释）。
+        // 顺序：带期望键的最后一份 → 任意能解析的最后一份 → 数组兜底 → 失败。
+        // 前两级是新增的；第三级与改动前逐字相同，所以旧行为只增不减。
+        const cands = xportJsonCandidates(clean);
+        let keyed = null, anyObj = null;
+        for (let ci = 0; ci < cands.length; ci++) {
+            let val;
+            try { val = JSON.parse(cands[ci]); } catch (e2) { continue; }
+            anyObj = val;
+            if (val && typeof val === 'object') {
+                for (let ki = 0; ki < XPORT_JSON_KEYS.length; ki++) {
+                    if (Object.prototype.hasOwnProperty.call(val, XPORT_JSON_KEYS[ki])) { keyed = val; break; }
+                }
+            }
         }
+        if (keyed !== null) return keyed;
+        if (anyObj !== null) return anyObj;
         // 尝试提取JSON数组
         const arrayMatch = clean.match(/\[[\s\S]*\]/);
         if (arrayMatch) {
@@ -2163,7 +2309,85 @@ function parseJsonResponse(text) {
             } catch (e3) {}
         }
         console.error('parseJsonResponse failed. Raw response:', text.substring(0, 500));
-        throw new Error('无法解析 JSON 响应');
+        // 【必须把原始 SyntaxError 带出去】classifyLocalFailure 判 BAD_ESCAPE 靠的是
+        // 解析器的**措辞**（"Bad escaped character…"）。改动前这里把 e 丢了，只抛一句
+        // 「无法解析 JSON 响应」，于是 BAD_ESCAPE 在生产链路上**永远不可能触发** ——
+        // 而它恰恰是推理模式下最常见的那一种失败（48 次实测里与硬失败 6/6 相关），
+        // 用户看到的却是没有补救办法的「模型输出不是合法 JSON」。
+        const wrapped = new Error('无法解析 JSON 响应');
+        wrapped.cause = e;
+        throw wrapped;
+    }
+}
+
+// ============= A4：错误分类 =============
+// 【为什么必须分类】改动前整条 JSON 链路只有两条字符串，而
+// `THINKING_ATE_BUDGET` 和 `EMPTY` **共用**其中一条（「无法解析 JSON 响应: 收到空响应」）
+// —— 两者的补救办法却毫无共同之处。实测：max_tokens=128 且推理开着时，推理吃掉
+// 100% 的补全预算、content 为空，用户看到的是「收到空响应」，于是去查网络和模型加载，
+// 而真正要做的是去 LM Studio 把 Enable Thinking 关掉或把 max_tokens 调高。
+//
+// 顺序 = 先到先得。与 spec §3.6 的表相比只挪动了一处，并且是**有意**的：
+// BAD_ESCAPE 提到了 TRUNCATED/EMPTY 之前。理由是这条判据来自 parseErr 的**文本签名**，
+// 而它在 48 次实测里与「解析硬失败」6/6 完全相关，是全表信息量最大的一条；
+// 何况「解析器报了转义错」本身就证明正文非空，与 EMPTY 互斥。
+//
+// 【补救办法必须先说本应用里那个**真的管用**的开关】实测（11 次请求、三个模型）：
+// 请求里的 reasoning_effort 完全决定推理是否发生，LM Studio 每模型的界面默认值根本不参与
+// —— qwen3.8-27b 元数据默认 "xhigh"，省略该参数得到 reasoning_tokens 0，发 'medium' 得到 220。
+// 所以只要本应用还在发 'medium'，用户在 LM Studio 里怎么点都关不掉。真正能解决问题的是
+// 「设置 → 模型 → 推理 → 关」。LM Studio 那条留作次选（本应用设成「关」之后仍在推理，
+// 才轮到它）。TRUNCATED 里原来的「请缩小批次」也删掉了：批次由 xportLimits 自动算，
+// 用户没有任何入口能改它，写出来只是让人白找一遍。
+const XPORT_FAIL_TEXT = {
+    THINKING_ATE_BUDGET: '模型把全部 token 预算用在了推理上，正文为空。请到「设置 → 模型」把该模型的「推理」设为「关」；若那里已是「关」仍然如此，说明是 LM Studio 端开的，请在 LM Studio 里关闭该模型的 Enable Thinking。',
+    BAD_ESCAPE: '模型把 LaTeX 反斜杠写成了单反斜杠，JSON 转义非法 —— 这是推理模式最典型的症状。请到「设置 → 模型」把该模型的「推理」设为「关」；若那里已是「关」，请在 LM Studio 里关闭该模型的 Enable Thinking。',
+    TRUNCATED: '模型输出被 token 上限截断（finish_reason=length），返回的是半截内容。多半是推理占掉了预算：请到「设置 → 模型」把该模型的「推理」设为「关」，或在 LM Studio 里给该模型加载更大的上下文。',
+    EMPTY: '模型返回了空正文。',
+    THINKING_LEAK: '模型的推理内容混进了正文。请到「设置 → 模型」把该模型的「推理」设为「关」；若那里已是「关」，请在 LM Studio 里关闭该模型的 Enable Thinking。',
+    UNPARSEABLE: '模型输出不是合法 JSON。'
+};
+// 各浏览器对同一类非法转义的措辞不同：V8 是 "Bad escaped character in JSON at position N"
+// （旧版是 "Unexpected token r in JSON..."），SpiderMonkey 是 "JSON.parse: bad escaped character"。
+// 只收这三种**明确指向转义/控制字符**的措辞，绝不用泛化的 "Unexpected token" ——
+// 那会把真正的 UNPARSEABLE 一起吞进来。
+const XPORT_BAD_ESCAPE_RE = /bad escaped character|invalid \\escape|bad control character/i;
+function classifyLocalFailure(res, parseErr) {
+    const r = res || {};
+    const text = typeof r.text === 'string' ? r.text : '';
+    const thinking = !!r.thinking;
+    const truncated = !!r.truncated;
+    const em = parseErr ? String((parseErr && parseErr.message) || parseErr) : '';
+    let code;
+    if (truncated && !text.trim() && thinking) code = 'THINKING_ATE_BUDGET';
+    else if (em && XPORT_BAD_ESCAPE_RE.test(em)) code = 'BAD_ESCAPE';
+    else if (truncated) code = 'TRUNCATED';
+    else if (!text.trim()) code = 'EMPTY';
+    else if (thinking || /<\/?\s*think\s*>/i.test(text)) code = 'THINKING_LEAK';
+    else code = 'UNPARSEABLE';
+    return { code: code, message: '无法解析 JSON 响应（' + code + '）：' + XPORT_FAIL_TEXT[code] };
+}
+
+// 本地链路专用的解析入口：解析失败时把 meta 里的 finish_reason / thinking / 正文
+// 一起交给分类器，抛出**带补救办法**的错误。meta 为空时退化成「只看正文」，
+// 与改动前的报错等价，不会更糟。
+function parseLocalJson(text, meta) {
+    try {
+        return parseJsonResponse(text);
+    } catch (e) {
+        const m = meta || {};
+        const res = {
+            text: (typeof m.text === 'string') ? m.text : String(text == null ? '' : text),
+            thinking: !!m.thinking,
+            truncated: !!m.truncated
+        };
+        // parseJsonResponse 把原始 SyntaxError 挂在 .cause 上（见那里的注释）：分类必须
+        // 看原始措辞，看包装后的那句固定文案永远只能得到 UNPARSEABLE。
+        const c = classifyLocalFailure(res, (e && e.cause) || e);
+        const err = new Error(c.message);
+        err.code = c.code;
+        err.cause = e;
+        throw err;
     }
 }
 
@@ -2207,9 +2431,29 @@ async function callGeminiAPI(model, contents, config = {}, apiKey = null, signal
     }
 
     const data = await response.json();
-    // 同 callLocalLLM：MAX_TOKENS = 输出被上限截断，正文是半截的。不传 meta 就没有任何变化。
-    if (meta) meta.truncated = (data.candidates?.[0]?.finishReason === 'MAX_TOKENS');
-    return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    // ---- A2 / §3.3：绝不再读 parts[0] ----
+    // 【实测，用户的真实 Key，gemini-2.5-flash-lite】开了 thinkingConfig.includeThoughts 之后
+    // parts[0] 就是**思维链**（[THOUGHT:2296, text:369]），旧代码会把
+    // 「**My Translation Strategy**\n\nOkay, here's my plan…」交给 JSON.parse 然后抛错；
+    // 而 thinkingBudget:8 时 parts 干脆是**空数组**，旧代码返回 ""，调用方的
+    // `JSON.parse(response || "{}")` 把它变成 {} —— **零条译文、零个报错**，
+    // 屏幕上现有的整份译文被一份空文档换掉。这是本文件里最安静的一类数据丢失。
+    // 今天没人设 thinkingConfig，所以它是**潜伏**而不是活跃缺陷；B2/C4 一加推理开关就会活。
+    const cand = (data && data.candidates && data.candidates[0]) || {};
+    const parts = (cand.content && Array.isArray(cand.content.parts)) ? cand.content.parts : [];
+    const finish = cand.finishReason || '';
+    const partText = function (p) { return (p && typeof p.text === 'string') ? p.text : ''; };
+    if (meta) {
+        // 同 callLocalLLM：MAX_TOKENS = 输出被上限截断，正文是半截的。
+        meta.truncated = (finish === 'MAX_TOKENS');
+        meta.finish = finish;
+        meta.thoughts = parts.filter(function (p) { return p && p.thought === true; }).map(partText).join('');
+        meta.thinking = meta.thoughts.trim() !== '';
+    }
+    if (!parts.length) throw new Error('Gemini 返回了空内容（可能是 thinking 预算耗尽或被安全策略拦截）');
+    const answer = parts.filter(function (p) { return !p || p.thought !== true; }).map(partText).join('');
+    if (meta) meta.text = answer;
+    return answer;
 }
 
 // ============= OpenAI API调用 =============
@@ -2280,7 +2524,10 @@ async function callOpenAIAPI(model, messages, config = {}, apiKey = null, signal
     }
 
     const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
+    // OpenAI 的响应形状与 LM Studio 的 OpenAI 兼容层同形，所以复用同一个读取口
+    // （A2：「模型说了什么」全文件只判定一次）。取值与改动前逐字等价：
+    // content 不是字符串时两边都得到 ""。
+    return readLocalChoice(data).text;
 }
 
 // ============= Claude API调用 =============
@@ -2703,6 +2950,91 @@ function xportUnmask(body, map) {
     });
 }
 
+// ============= A1：全文件唯一的 <think> 规则 =============
+// 【为什么必须只有一条】改动前文件里有两处各自为政的剥离，两处都是错的：
+//   · parseCrossFragments 用 /<think>[\s\S]*?<\/think>/ 匹配**成对**标签。而 Qwen3 的
+//     聊天模板把 `<think>\n` 预填进**提示词**里，所以真实泄漏只有**闭合**标签，
+//     成对正则是空操作 —— 实测一条 815 字符的泄漏只被删掉 20 个字符，
+//     整段思维链原样留在结果里。
+//   · xportParseBlocks 用 lastIndexOf('</think>') 硬切：译文里正当出现 `</think>`
+//     （讲解推理模型的段落天天出现）就会把前半句整个吃掉；配不到闭合标签时再退一步用
+//     indexOf('<think>') 保留**尾巴**，等于把推理正文当译文写进用户文档 ——
+//     而那一段若没有占位符，xportBlockOk 平凡通过，**没有标记、没有报错**。
+//
+// 【第三个实测事实，决定了标签不可当锚点】源文里出现的 `<think>` 是**按模型删的**：
+// qwen3.6 原样透传，qwen3.8 删标签，qwen3-1.7b 连标签带内容一起删（被删的东西
+// 哪儿都没去，reasoning_content 是空的）。所以 `<think>` 根本不能往返，
+// 拿它当结构锚点在任何一个模型上都不成立。
+//
+// 【第四个实测事实，它决定了下面两条规则的形状】`</think>` 在**译文正文里**是家常便饭：
+// 用户翻的就是论文，凡是讲推理模型的段落都会原样出现这个标签（本仓库自己的文档也有）。
+// 实测：`推理模型…且答案仅在闭合的</think>标记之后才开始。`（116 字符）经过旧规则只剩
+// 7 个字符入库，没有标记、没有 toast、没有报错 —— 而 renderFormattedText 是按 HTML 插的，
+// 浏览器把 `<think>` 直接吃掉，用户连「句子为什么变短了」都看不见。
+// 所以这一刀的默认答案必须是**不切**；要切，得拿出证据。
+//
+// 规则，按优先级：
+//   1. 输出**以** `<think>` 开头 = 唯一"确凿"的推理区标志（第三方 OpenAI 兼容端把思维链
+//      内联进 content 时就是这个形状）。此时第一个 `</think>` 就是推理与答案的分界：
+//      切它。一个闭合标签都没有 = 整段都是推理，返回空让恢复阶梯去跑。**绝不**返回
+//      「尽力而为」的半截正文：那正是把思维链写进用户文档的那条路。
+//   2. 不以 `<think>` 开头时（Qwen3 模板把开标签预填进提示词，真实泄漏可能只有闭合标签），
+//      「泄漏」与「译文里正当出现 </think>」在文本上**完全同形**，唯一能区分的证据是
+//      协议锚点。两条都成立才许切：
+//        (a) 切完之后**紧接着**就是协议锚点（中间只许有空白）—— 真泄漏的答案总是从
+//            锚点开始，而译文里的 </think> 后面跟的是句子的后半截；
+//        (b) 被切掉的那一段里出现过的每一个锚点，切完之后**依然在** —— 否则这一刀
+//            切掉的是正文（模型把 @@1@@ 写在草稿里再抄一遍时两者都成立，那才是真泄漏）。
+//      拿不出这两条证据就**原样保留**：没有锚点可依（单段恢复请求、跨栏纯散文）时
+//      宁可漏掉一次假设中的泄漏，也绝不再静默删掉用户句子的前半截。
+//   3. 绝不静默：返回值带 cut / allReasoning，调用方可以据此报错。
+// anchorSrc = 该链路协议锚点的正则**源串**（不带 g 标志）；null = 这条链路没有协议锚点。
+const XPORT_THINK_ANCHOR = '@@\\s*\\d+\\s*@@';         // 哨兵传输协议
+const XPORT_CROSS_ANCHOR = '(?:^|\\n)[ \\t]*@@';       // 跨栏高亮的片段协议
+function xportThinkCut(raw, anchorSrc) {
+    const t = String(raw == null ? '' : raw);
+    // 这条链路上所有协议锚点的**字面量**（去掉空白后归一），顺序无关，只用来比对存活。
+    const anchorsOf = function (s) {
+        const out = [];
+        if (!anchorSrc) return out;
+        try {
+            const re = new RegExp(anchorSrc, 'g');
+            let m, guard = 0;
+            while ((m = re.exec(s)) && ++guard < 20000) {
+                out.push(String(m[0]).replace(/\s+/g, ''));
+                if (re.lastIndex === m.index) re.lastIndex++;   // 零宽匹配防死循环
+            }
+        } catch (e) { return []; }
+        return out;
+    };
+    const firstAnchorAt = function (s) {
+        if (!anchorSrc) return -1;
+        try { return s.search(new RegExp(anchorSrc)); } catch (e) { return -1; }
+    };
+    // 规则 1
+    if (/^[\s\uFEFF]*<think>/i.test(t)) {   // U+FEFF = BOM，某些端会在正文前带一个
+        const ci = t.indexOf('</think>');
+        if (ci === -1) return { text: '', cut: true, allReasoning: true };
+        return { text: t.slice(ci + 8), cut: true, allReasoning: false };
+    }
+    // 规则 2
+    const closeIdx = t.indexOf('</think>');
+    if (closeIdx !== -1) {
+        const after = t.slice(closeIdx + 8);
+        const at = firstAnchorAt(after);
+        if (at !== -1 && after.slice(0, at).trim() === '') {          // (a)
+            const dropped = anchorsOf(t.slice(0, closeIdx));
+            const kept = anchorsOf(after);
+            let safe = true;
+            for (let i = 0; i < dropped.length && safe; i++) {        // (b)
+                if (kept.indexOf(dropped[i]) === -1) safe = false;
+            }
+            if (safe) return { text: after, cut: true, allReasoning: false };
+        }
+    }
+    return { text: t, cut: false, allReasoning: false };
+}
+
 // 「丢、多、改号、写坏、串段、控制字符」六类损坏一次判掉。
 // 不通过 = 进重试阶梯，绝不静默入库 —— 这是整个改动的安全底线。
 function xportBlockOk(body, map) {
@@ -2710,7 +3042,11 @@ function xportBlockOk(body, map) {
     const t = body.trim();
     if (t === '') return false;
     if (/@@\s*\d+\s*@@/.test(t)) return false;                              // 哨兵漏进正文 = 段落串了
-    if (/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(t)) return false;   // 裸控制字符 = 反斜杠命令被吃掉
+    // 裸控制字符 = 反斜杠命令被吃掉。**必须包含 TAB(0x09) 与 CR(0x0D)** —— 改动前的
+    // 字符类恰恰把这两个漏了，而它们正是 JSON 转义缺陷产出的那两个字节：
+    // `\textcolor` → TAB + "extcolor"，`\ref` → CR + "ef"。LF(0x0A) 仍然合法（多行块是常态）。
+    // 误判的代价是多走一次恢复阶梯；漏判的代价是把控制字符写进用户文档。
+    if (/[\x00-\x09\x0B-\x1F\x7F]/.test(t)) return false;
     const seen = [];
     for (let i = 0; i < map.length; i++) seen.push(0);
     const re = /\[\[\s*(\d+)\s*\]\]/g;
@@ -2734,13 +3070,11 @@ function xportBlockOk(body, map) {
 // [[k]] 之后」的半句话能通过全部完整性检查，被当成完整译文入库）；② 它是「块数少于段数」
 // 的**证据**，有它就说明少的那几块在尾巴上，没有它就得整批否决（见下）。
 function xportParseBlocks(raw, expectedCount, truncated) {
-    let t = String(raw == null ? '' : raw);
-    const closeIdx = t.lastIndexOf('</think>');
-    if (closeIdx !== -1) t = t.slice(closeIdx + 8);
-    else {
-        const openIdx = t.indexOf('<think>');
-        if (openIdx !== -1) t = t.slice(openIdx + 7);
-    }
+    // <think> 一律走全文件唯一那条规则（见 xportThinkCut）。整段都是推理时返回 {}，
+    // 让恢复阶梯去跑 —— 绝不像改动前那样保留 <think> 之后的尾巴当译文。
+    const thinkCut = xportThinkCut(raw, XPORT_THINK_ANCHOR);
+    if (thinkCut.allReasoning) return {};
+    let t = thinkCut.text;
     t = t.replace(/```[a-zA-Z]*[ \t]*\n?/g, '').replace(/```/g, '');
     const marks = [];
     const re = /@@\s*(\d+)\s*@@/g;
@@ -2930,9 +3264,15 @@ function xportSplitSegment(seg) {
     return [s];
 }
 
+// provider 保留在签名里（调用方都在传），但已经不再影响提示词内容 —— 见下方注释。
 function xportSystemPrompt(srcName, tgtName, provider) {
-    return (provider === 'local' ? '/no_think\n' : '') +
-`You are a professional academic translator. Translate ${srcName} into ${tgtName}.
+    // 【删掉了什么，为什么】这里曾经给 local 加过 `/no_think\n` 前缀。**实测是空操作**：
+    // enable_thinking、chat_template_kwargs.{enable_thinking,thinking}、/think、/no_think
+    // 在这版 LM Studio 上全部被静默忽略（6 组对照请求字节一致，reasoning_tokens 恒为 0）；
+    // 唯一真正起作用的参数是 reasoning_effort。留着它除了白花 3–4 个提示词 token，
+    // 更糟的是让人以为有一层根本不存在的保护 —— 这个文件里的**虚假安全感本身就是缺陷**。
+    // 真正的办法是察觉推理开着并告诉用户，见 xportNoteThinking / xportThinkingBanner。
+    return `You are a professional academic translator. Translate ${srcName} into ${tgtName}.
 
 The user message contains numbered segments. Each segment starts with a line @@n@@.
 Tokens like [[1]] and [[2]] are protected placeholders standing for formulas,
@@ -2974,6 +3314,444 @@ async function xportLocalContext(baseUrl, model) {
     return ctx;
 }
 
+// ============= B1：按模型发现「这个模型能调什么」 =============
+// 【先读完这一段再动手，否则会写出一个会撒谎的 UI】
+//
+// 结论一句话：**发现可行，行为探测不可行**。
+//
+// 1) 唯一有用的路由是 `GET <origin>/api/v1/models`（注意是 v1，**不是** v0）。
+//    它按模型给出 capabilities.reasoning.{allowed_options, default}，而且 GET 响应自带
+//    `Access-Control-Allow-Origin: *`，浏览器直接 fetch 就行，不需要任何代理。
+//    同命名空间下另外 12 个候选路由（/api/v1、/api/v1/models/{id}、/api/v1/capabilities…）
+//    全部 404；/api/v0/models 只有 loaded_context_length，没有任何调参元数据。
+//    实测三个模型：3.8-27b → ["off","low","medium","xhigh","on"] 默认 "xhigh"；
+//    3.6-35b-a3b 与 3-1.7b → ["off","on"] 默认 "on"。
+//
+// 2) **行为探测是死路**。LM Studio 对未知参数一律 HTTP 200 静默丢弃（6 个不同的假参数
+//    与基准响应字节一致），所以「发过去看它报不报错」什么也问不出来。
+//
+// 3) 唯一被校验的参数 `reasoning_effort` 是按**固定全局枚举**校验的，不看模型：
+//    `"off"` 在 allowed_options 里含 off 的 3.8 上照样 400；反过来 low/medium/high/xhigh
+//    在只支持 on/off 的 3.6 上全部 200 且输出字节一致（服务端日志逐字写着
+//    「Reasoning setting 'low' is not supported by model 'qwen/qwen3.6-35b-a3b'.
+//     Supported settings: 'on', 'off'. Falling back to reasoning setting 'on'.」）。
+//    ⇒ **HTTP 的拒绝面携带零per-model信息**，/api/v1/models 是唯一事实源。
+//
+// 【形状陷阱，三个，全部实测】顶层键是 `models`（不是 data）；模型 id 键是 `key`（不是 id）；
+// 非 LLM 条目（embedding）**整个 capabilities 键都不存在**。任何一处写错都会静默半工作。
+//
+// 【什么**不该**有控件 —— 这是对用户提问的诚实回答的一半】
+//   · Preserve Thinking：实测**按请求不可设**（preserve_thinking 与
+//     chat_template_kwargs.preserve_thinking 都被静默忽略，多轮对照 prompt_tokens 完全相同），
+//     它只存在于磁盘上的 model.yaml。画一个假装能设它的开关就是撒谎。
+//   · Context length：实测**只在加载期生效**（发 context_length/num_ctx/n_ctx 返回 200 但
+//     /api/v0/models 与 lms ps 的值纹丝不动）。所以这里只**只读展示**，不给滑块。
+//     loaded_instances[].config 里的其余项（flash_attention/parallel/speculative_*…）同理。
+const XPORT_CAPS_TTL = 60000;           // 与 xportLocalContext 的 60 秒缓存纪律完全一致
+const xportCapsCache = new Map();       // origin -> { at, ok, byKey }
+const xportCapsInFlight = new Map();    // origin -> Promise（同一 origin 并发只发一次）
+
+// baseUrl 一律先归一成 **ORIGIN**。用户在「API」页把地址写成 http://host:1235/v1 是常见写法，
+// 直接拼就变成 /v1/api/v1/models —— 404，而且错得像「这台机器没这个端点」。
+function xportCapsOrigin(baseUrl) {
+    return String(baseUrl == null ? '' : baseUrl).trim().replace(/\/+$/, '').replace(/\/v1$/, '');
+}
+
+// 把 /api/v1/models 的一条记录压成本文件内部的规范形状。逐字段防御，绝不抛。
+function xportNormalizeCaps(m) {
+    const src = (m && typeof m === 'object') ? m : {};
+    const c = (src.capabilities && typeof src.capabilities === 'object') ? src.capabilities : null;
+    const r = (c && c.reasoning && typeof c.reasoning === 'object') ? c.reasoning : null;
+    const inst = Array.isArray(src.loaded_instances) ? src.loaded_instances : [];
+    const cfg = (inst[0] && inst[0].config && typeof inst[0].config === 'object') ? inst[0].config : null;
+    return {
+        key: String(src.key == null ? '' : src.key),
+        displayName: String(src.display_name || src.key || ''),
+        type: String(src.type || ''),
+        arch: String(src.architecture || ''),
+        quant: String((src.quantization && src.quantization.name) || ''),
+        params: String(src.params_string || ''),
+        vision: !!(c && c.vision),
+        tools: !!(c && c.trained_for_tool_use),
+        ctx: Number(cfg && cfg.context_length) || 0,
+        maxCtx: Number(src.max_context_length) || 0,
+        loaded: inst.length > 0,
+        // capabilities 缺失 ⇒ reasoning 恒为 null ⇒ 上层**隐藏控件**，绝不猜。
+        // （embedding 条目就是这个形状；一个没加载的 LLM 是否也这样没实测过 —— 见 spec P5，
+        //   刻意不去卸载别人正在用的模型来验证，而是把「不知道」设计成一个安全状态。）
+        reasoning: r ? {
+            allowed: (Array.isArray(r.allowed_options) ? r.allowed_options : []).map(String),
+            uiDefault: r.default == null ? '' : String(r.default)
+        } : null
+    };
+}
+
+// 整份表按 origin 缓存 60 秒：一次 GET 就够所有本地模型用，开两次设置弹窗也只发一个请求。
+async function xportFetchCaps(baseUrl) {
+    const origin = xportCapsOrigin(baseUrl);
+    const hit = xportCapsCache.get(origin);
+    if (hit && Date.now() - hit.at < XPORT_CAPS_TTL) return hit.byKey;
+    const flying = xportCapsInFlight.get(origin);
+    if (flying) return flying;
+    const p = (async function () {
+        const byKey = {};
+        let ok = false;
+        try {
+            const resp = await fetchWithTimeout(origin + '/api/v1/models', {}, 4000);
+            if (resp && resp.ok) {
+                const data = await resp.json();
+                const list = (data && Array.isArray(data.models)) ? data.models : [];
+                for (let i = 0; i < list.length; i++) {
+                    const one = xportNormalizeCaps(list[i]);
+                    if (one.key) byKey[one.key] = one;
+                }
+                ok = true;
+            }
+        } catch (e) { ok = false; }
+        xportCapsCache.set(origin, { at: Date.now(), ok: ok, byKey: byKey });
+        xportCapsInFlight.delete(origin);
+        return byKey;
+    })();
+    xportCapsInFlight.set(origin, p);
+    return p;
+}
+
+// 异步问一个模型的能力。拿不到一律返回 null —— **不猜**。
+async function xportModelCaps(baseUrl, model) {
+    try {
+        const byKey = await xportFetchCaps(baseUrl);
+        return (byKey && byKey[String(model)]) || null;
+    } catch (e) { return null; }
+}
+
+// 渲染路径专用的**同步**读法：只看缓存，绝不发请求、绝不抛。
+//   undefined = 还没问过（该画「读取中」）
+//   null      = 问过了但这个 id 不在表里（该隐藏控件）
+function xportCapsPeek(baseUrl, model) {
+    try {
+        const hit = xportCapsCache.get(xportCapsOrigin(baseUrl));
+        if (!hit) return undefined;
+        return hit.byKey[String(model)] || null;
+    } catch (e) { return undefined; }
+}
+// 那一次整份 GET 成功了吗？undefined = 还没问过。用来把「服务器不可达」和
+// 「服务器答了但没这个模型」两种 null 分开说 —— 它们的补救办法完全不同。
+function xportCapsOk(baseUrl) {
+    try {
+        const hit = xportCapsCache.get(xportCapsOrigin(baseUrl));
+        return hit ? !!hit.ok : undefined;
+    } catch (e) { return undefined; }
+}
+
+// ============= B1/B2：UI 词表 → 线上词表。**这层映射是强制的** =============
+// 发现词表 ≠ 请求词表，这不是风格问题，是实测：
+//   · 'off' 直接发出去是 **HTTP 400**（两个模型上都是），必须发 'none'；
+//   · 二值模型上任何非 'none' 的值都塌缩成「开」，所以 'on' 发 'medium' 即可；
+//   · **永远不要发 'high'**（连 3.8 都不支持，会回落 'on' 然后整个字段被跳过）；
+//   · **永远不要发 'minimal'**（服务端会 WARN 着把它映射成 'low'）；
+//   · **永远显式发**：省略 reasoning_effort **等于关闭推理**，哪怕
+//     capabilities.reasoning.default 写着 "xhigh"（3.8 实测：省略 = 0 推理 token，
+//     与显式 "none" 逐字相同）。所以 default 是 **model.yaml 的界面默认值，不是 API 默认值**，
+//     照它显示却不发出去，UI 就在撒谎。
+//   · allowed_options 里出现映射表里没有的值 ⇒ **从下拉里丢掉**，绝不发出去。
+const XPORT_EFFORT_WIRE = {
+    off:    'none',
+    on:     'medium',
+    low:    'low',
+    medium: 'medium',
+    xhigh:  'xhigh'
+};
+const XPORT_EFFORT_LABEL = { off: '关', on: '开', low: '低', medium: '中', xhigh: '极高' };
+
+// 控件形态只能从 allowed_options **反推** —— model.yaml 里的 type（boolean/select）
+// 在 HTTP 投影里丢失了，这是端点的信息损失，不是这里偷懒。
+function xportReasoningControl(allowed) {
+    if (!allowed || !allowed.length) return { kind: 'none' };
+    const levels = [];
+    let canOff = false;
+    for (let i = 0; i < allowed.length; i++) {
+        const v = String(allowed[i]);
+        if (v === 'off') { canOff = true; continue; }
+        if (v === 'on') continue;
+        if (!Object.prototype.hasOwnProperty.call(XPORT_EFFORT_WIRE, v)) continue; // 映射不了的一律丢弃
+        if (levels.indexOf(v) === -1) levels.push(v);
+    }
+    if (!levels.length) return { kind: 'toggle', canOff: canOff };   // 3.6 / 1.7b
+    return { kind: 'select', levels: levels, canOff: canOff };       // 3.8 → low/medium/xhigh
+}
+
+// ============= 规范化的参数模型（给以后的 Gemini/OpenAI/Claude 留座位）=============
+// 发现负责「有哪些选项」，这张表负责「叫什么、怎么发、发给谁」—— HTTP 投影把
+// displayName/description/option label/type 全丢了，只能由这里补。表刻意很小：
+// **2 个概念，不是每模型一份**，因为真正能按请求设的东西就这么多。
+// scope='load-time' 的项**只读渲染、永不发送**。
+const XPORT_PARAM_SPECS = [
+    {
+        id: 'reasoning',
+        label: '推理',
+        // 【这段文案改过一次，别再写回原样】原文是「慢 6.05 倍（每段中位 104s vs 12.6s）」。
+        // 三处都站不住：① 104.1/12.6 = 8.26，和 6.05 对不上 —— 两个数来自**两次不同的实验**
+        // （中位耗时来自 thinking-json §4.4，6.05 倍是 benchmark §6.2 的配对墙钟比），拼在
+        // 一句话里就成了假的；② 那两个绝对值所在的表自己写着「全部被另一路工作负载的
+        // ~7.7 req/min 抬高了，只有**比值**有意义」，UI 却把它们当「实测每段中位」发布；
+        // ③ 用现在这条哨兵链路复测（qwen3.6，main.tex 8000 字符，29 段），比值是 10.6 倍，
+        // 绝对值差了近 20 倍。所以这里只保留三次独立测量都支持的**比值区间**，绝对值一律删掉。
+        desc: '让模型先想再答。翻译场景三次独立实测都指向同一个结论：qwen3.6 开启后整体耗时是关闭时的 6–10 倍、每源字符的往返 token 约 5.8 倍、旧 JSON 链路的硬失败率从 16.7% 涨到 33.3%，而盲评 6 段里有 5 段看不出质量差别。默认关。',
+        kind: 'select|toggle',            // 由 xportReasoningControl(allowed) 按模型现算
+        scope: 'per-request',
+        providers: ['local'],             // 已接线的 provider
+        wire: {
+            local: { param: 'reasoning_effort', map: XPORT_EFFORT_WIRE }
+        },
+        discover: { local: 'capabilities.reasoning.allowed_options' },
+        optionLabels: XPORT_EFFORT_LABEL,
+        default: 'off',
+        // ↓ 未接线，仅记录已实测/已查证的形状，以后接进来不用重写这套结构：
+        //   gemini: generationConfig.thinkingConfig.thinkingBudget
+        //           ∈ {0=关, -1=动态} ∪ [512, 24576]（实测；1–511 全部 400），
+        //           能力位来自 models.get 的 `thinking: true`，flash-lite 默认**关**；
+        //           推理以 parts[] 里 thought:true 的条目返回（A2 已过滤，勿读 parts[0]）。
+        //   claude: GET /v1/models/{id} 返回真正的 capabilities 树，
+        //           档位在 output_config.effort。**本轮只记录，不调用、不碰 Claude 链路。**
+        futureProviders: ['gemini', 'claude']
+    },
+    {
+        id: 'contextLength',
+        label: '上下文',
+        desc: '在 LM Studio 加载模型时设定，HTTP 改不了（实测发 context_length/num_ctx/n_ctx 返回 200 但实际值不变）。这里只读展示。',
+        kind: 'readonly',
+        scope: 'load-time',
+        providers: ['local'],
+        wire: {},
+        discover: { local: 'loaded_instances[0].config.context_length' },
+        default: 0
+    }
+];
+
+// ============= B2：每模型一个推理档位，持久化 =============
+const XPORT_REASONING_LS_KEY = 'reasoningByModel';
+const XPORT_REASONING_DEFAULT = 'off';   // 翻译默认关：见 XPORT_PARAM_SPECS.reasoning.desc 的实测数字
+
+// 用户存的原始 UI 值（脏值一律回落 'off'）。
+function xportReasoningRaw(model) {
+    try {
+        const box = AppState.reasoningByModel;
+        const v = (box && typeof box === 'object') ? box[String(model)] : null;
+        return (typeof v === 'string' && Object.prototype.hasOwnProperty.call(XPORT_EFFORT_WIRE, v))
+            ? v : XPORT_REASONING_DEFAULT;
+    } catch (e) { return XPORT_REASONING_DEFAULT; }
+}
+
+// 夹到这个模型**真正支持**的档位上。发现数据拿不到就原样返回（默认 'off' 与省略等价，安全）。
+function xportReasoningValue(baseUrl, model) {
+    const raw = xportReasoningRaw(model);
+    // 400 闩已经合上：这个 origin 不认 reasoning_effort，callLocalLLM 之后一个字节都不再发。
+    // 而实测「省略 = 不推理」，所以这个模型的**实际**档位就是「关」。这里必须跟着收敛到
+    // 'off'，否则设置行会一直亮着「开」而线上什么都没带 —— 屏幕上写的和实际发生的不是
+    // 一回事，正是这次要根除的那一类问题。显示、线值、探针都读这个函数，改这一处就够了。
+    try { if (xportEffortUnsupported.has(xportCapsOrigin(baseUrl))) return 'off'; } catch (e) {}
+    try {
+        const caps = xportCapsPeek(baseUrl, model);
+        if (!caps || !caps.reasoning) return raw;
+        const ctl = xportReasoningControl(caps.reasoning.allowed);
+        if (ctl.kind === 'toggle') return raw === 'off' ? 'off' : 'on';
+        if (ctl.kind === 'select') {
+            if (raw === 'off') return 'off';
+            if (ctl.levels.indexOf(raw) !== -1) return raw;
+            return ctl.levels.indexOf('medium') !== -1 ? 'medium' : ctl.levels[0];
+        }
+        return 'off';
+    } catch (e) { return raw; }
+}
+
+// 真正写进请求体的值。永远返回一个合法字符串，永远不抛。
+function xportWireEffort(baseUrl, model) {
+    try {
+        const ui = xportReasoningValue(baseUrl, model);
+        return XPORT_EFFORT_WIRE[ui] || 'none';
+    } catch (e) { return 'none'; }
+}
+
+// 某些第三方 OpenAI 兼容端可能压根不认 reasoning_effort。callLocalLLM 只要吃到一次
+// 「400 且错误信息里点名 reasoning_effort」，就把这个 origin 记进来，之后不再发这个字段。
+// 一次性闩，只在会话内有效；宁可少一个可选参数，也不能让整条翻译链路挂掉。
+const xportEffortUnsupported = new Set();
+
+// ============= A3：推理模式的探测与告知 =============
+// 【先读这一段，否则会写出错的修法】客户端**没有**关掉推理的开关。实测：enable_thinking、
+// chat_template_kwargs.{enable_thinking,thinking}、`/think`、`/no_think` 在这版 LM Studio 上
+// 一律被静默忽略（reasoning_tokens 恒为 0，6 组对照请求与基准字节一致）；唯一起作用的
+// 是 reasoning_effort。所以这里能做、也只能做的是：**察觉它开着，并把关掉它的办法说出来**。
+//
+// 【为什么值得做 —— 实测根因，且它不是 <think> 标签】推理开着时，Qwen 会先在**推理里**
+// 把 JSON 草稿写成 LaTeX 散文（单反斜杠），再把那份草稿原样抄进正文。同模型同提示词，
+// 用 `<think>\n` 预填做对照：关闭时输出 `\\ref{fig:arch}` / `32\\%`（能解析，175 token），
+// 开启时输出 `\ref{fig:arch}` / `32\%`（Bad escaped character）。48 次响应里
+// 「出现非法转义」与「硬失败」6/6 完全相关（6/6 失败、42/42 通过）。
+// qwen3.6-35b 的 JSON 硬失败率因此从 16.7% 涨到 33.3%，翻译耗时是 6–9 倍。
+//
+// 【补救办法写两条，不是啰嗦】UI 上的 Enable Thinking 开关与 reasoning_effort 是否等价，
+// 这一轮**没有实测过**（探针 P1）。两条都写，在任一结论下都是对的，代价只有一个从句。
+const xportThinkState = { model: '', on: false, at: 0, dismissed: {} };
+function xportThinkingMessage(model) {
+    return '检测到「' + String(model || '当前模型') + '」开启了推理模式。该模式会让模型把 LaTeX 反斜杠'
+        + '写成单反斜杠，导致「无法解析 JSON 响应」，并使翻译耗时变成关闭时的 6–10 倍'
+        + '（三次独立实测：配对墙钟 6.05 倍、12 段合计 9.2 倍、本哨兵链路 8000 字符 10.6 倍）。'
+        + '请到「设置 → 模型」把该模型的「推理」设为「关」；如果那里已经是关，'
+        + '说明是 LM Studio 端把它打开的，请在 LM Studio 里关闭该模型的 Enable Thinking。';
+}
+// 记一次观测。on=true 且这个模型还没被用户关掉横幅时，把横幅弹出来。
+// 【绝不进渲染路径】renderApp 没有 try/catch，一次抛异常就把页面永久冻在旧帧上。
+// 所以横幅是挂在 document.body 上的独立节点，renderApp 一行都不碰它。
+function xportNoteThinking(model, on) {
+    try {
+        const id = String(model || '');
+        xportThinkState.model = id;
+        xportThinkState.at = Date.now();
+        xportThinkState.on = !!on;
+        // B2：用户自己在「设置 → 模型」里给这个模型开了推理，那推理开着就是**预期行为**，
+        // 再弹一个「快去关掉它」的警告就是在对用户撒谎。只有「没人要求它却在推理」才是异常。
+        // 拿不到设置（例如测试沙箱里没有这个函数）时按 false 处理，行为与本行加入前逐字一致。
+        let selfEnabled = false;
+        try { selfEnabled = xportWireEffort(AppState.localBaseUrl, id) !== 'none'; } catch (e2) { selfEnabled = false; }
+        xportThinkState.selfEnabled = selfEnabled;
+        if (on && !selfEnabled) xportThinkingBanner(id); else xportThinkingBannerHide();
+    } catch (e) {}
+}
+function xportThinkingBannerHide() {
+    try {
+        if (typeof document === 'undefined') return;
+        const el = document.getElementById('xport-thinking-banner');
+        if (el && el.parentNode) el.parentNode.removeChild(el);
+    } catch (e) {}
+}
+function dismissThinkingBanner() {
+    try { xportThinkState.dismissed[xportThinkState.model] = true; } catch (e) {}
+    xportThinkingBannerHide();
+}
+function xportThinkingBanner(model) {
+    try {
+        if (typeof document === 'undefined' || !document.body) return;
+        // 【必须先摘掉旧横幅再 return】这一行原来是裸 return：为模型 A 关掉横幅之后，
+        // 屏幕上那块仍然写着**模型 B** 的名字的横幅就被原样留下了 —— 而横幅正文是一条
+        // 点名道姓的操作指令（「把该模型的推理设为关」），指错了模型就是在骗用户。
+        // 请求是异步的，飞行中的请求带着发起时的 config，所以「横幅上的模型 ≠ 当前选中的
+        // 模型」不需要任何控制台操作就能发生。
+        if (xportThinkState.dismissed[String(model || '')]) { xportThinkingBannerHide(); return; }
+        let el = document.getElementById('xport-thinking-banner');
+        if (!el) {
+            el = document.createElement('div');
+            el.id = 'xport-thinking-banner';
+            el.setAttribute('style', 'position:fixed;left:50%;top:14px;transform:translateX(-50%);'
+                + 'z-index:99999;max-width:min(760px,92vw);padding:12px 40px 12px 14px;border-radius:14px;'
+                + 'background:#fff7ed;color:#7c2d12;border:1px solid #fdba74;'
+                + 'box-shadow:0 14px 34px -14px rgba(15,23,42,.5);'
+                + "font-family:'Inter',sans-serif;font-size:12px;line-height:1.65;");
+            document.body.appendChild(el);
+        }
+        el.innerHTML = '<span style="font-weight:700;">⚠️ 推理模式已开启</span><br>'
+            + escapeHtml(xportThinkingMessage(model))
+            + '<button onclick="dismissThinkingBanner()" title="知道了"'
+            + ' style="position:absolute;top:8px;right:10px;border:none;background:transparent;'
+            + 'color:#9a3412;font-size:16px;line-height:1;cursor:pointer;padding:2px 4px;">×</button>';
+    } catch (e) {}
+}
+// 显式探针：一次 24-token 的 "hi"，问「这个模型在**我们实际发送的档位下**推理吗」。
+// 缓存纪律与 xportLocalContext 完全一致（60 秒）。任何失败都当「不知道」处理，绝不报错。
+//
+// 【B2 改了什么，为什么必须改】原来这个探针刻意**不带** reasoning_effort。B2 落地后
+// 真实请求每次都显式带档位，而实测「省略 = 关闭」—— 探针再省略，量的就是一个本应用
+// 根本不会使用的配置，结论恒为「不推理」，等于把探针变成一句空话。现在探针发的档位与
+// 真实请求逐字相同：设为「关」时它验证的是「显式 none 之后是否仍在推理」（那才是真异常），
+// 设为其它档位时它验证的是这个档位是否真的生效。缓存键因此必须带上档位，否则改完设置
+// 会读到 60 秒前另一个档位的结论。
+const xportThinkProbeCache = new Map();
+async function xportProbeThinking(baseUrl, model) {
+    let effort = 'none';
+    try { effort = xportWireEffort(baseUrl, model); } catch (e) { effort = 'none'; }
+    const key = String(baseUrl) + '|' + String(model) + '|' + effort;
+    const hit = xportThinkProbeCache.get(key);
+    if (hit && Date.now() - hit.at < 60000) return hit.on;
+    let on = false;
+    try {
+        const url = String(baseUrl).replace(/\/$/, '') + '/v1/chat/completions';
+        const probeBody = { model: model, messages: [{ role: 'user', content: 'hi' }], max_tokens: 24, temperature: 0 };
+        if (effort && !xportEffortUnsupported.has(xportCapsOrigin(baseUrl))) probeBody.reasoning_effort = effort;
+        const resp = await fetchWithTimeout(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(probeBody)
+        }, 15000);
+        if (resp.ok) {
+            const data = await resp.json();
+            on = readLocalChoice(data).thinking;
+        }
+    } catch (e) { on = false; }
+    xportThinkProbeCache.set(key, { on: on, at: Date.now() });
+    xportNoteThinking(model, on);
+    return on;
+}
+
+// ============= A7：公式存活审计 =============
+// 【为什么需要它】两份研究里最坏的一次事故是**完全静默**的：qwen3.6 把一整块 635 字符的
+// `\begin{equation}\begin{aligned}` 奖励函数定义整个跳过了，返回的 JSON 合法、15 段结构
+// 完整、没有任何报错、原文回显覆盖率 0.82。xportBlockOk 看不见它 —— 那一段一个占位符
+// 都没有，所有完整性检查都**平凡通过**。合计：3.6 在旧路径上丢了 2/14 个公式（14.3%），
+// 3.8 是 0/14。数量对比是唯一能抓住这一类「JSON 合法、分段完整、内容却没了」的手段。
+// 契约：**只报警，绝不让翻译失败** —— 「只要有一段成功就绝不抛异常」的约定必须守住。
+const XPORT_AUDIT_ENVS = ['equation', 'align', 'aligned', 'gather', 'multline',
+    'eqnarray', 'flalign', 'alignat', 'IEEEeqnarray', 'split', 'cases', 'dcases'];
+function xportCountEnvs(text) {
+    const s = String(text == null ? '' : text);
+    let n = 0;
+    try {
+        const re = new RegExp('\\\\begin\\{(?:' + XPORT_AUDIT_ENVS.join('|') + ')\\*?\\}', 'g');
+        let guard = 0;
+        while (re.exec(s) && ++guard < 20000) n++;
+    } catch (e) { return 0; }
+    return n;
+}
+// 返回 { envIn, envOut, lost, rows }。rows = 该行源文里的公式环境比译文多（0 基下标）。
+function xportEquationAudit(srcText, translations) {
+    const res = { envIn: 0, envOut: 0, lost: 0, rows: [] };
+    try {
+        const list = Array.isArray(translations) ? translations : [];
+        res.envIn = xportCountEnvs(srcText);
+        for (let i = 0; i < list.length; i++) {
+            const pair = list[i] || {};
+            const a = xportCountEnvs(typeof pair.src === 'string' ? pair.src : '');
+            const b = xportCountEnvs(typeof pair.tgt === 'string' ? pair.tgt : '');
+            res.envOut += b;
+            if (a > b) res.rows.push(i);
+        }
+        // 【为什么不是单纯的进出差额】差额是**全文级**的，会被互相抵消：一行把 equation
+        // 抄了两遍、另一行把 align 整块吞掉时 envIn=envOut=2、差额 0，而 rows 早就知道
+        // 第 2 行丢了东西 —— 旧写法在这里一声不吭。逐行丢失才是用户要点 ↻ 重试的单位，
+        // 所以取两者的较大值：一行丢两个时差额更大，抵消发生时行数更大，都不会漏报。
+        res.lost = Math.max(res.envIn - res.envOut, res.rows.length, 0);
+    } catch (e) { return { envIn: 0, envOut: 0, lost: 0, rows: [] }; }
+    return res;
+}
+// 翻译落地后的统一告警口：把「N 段失败」和「N 处公式消失」合并成**一条** toast。
+// 分成两次 showToast 会让第二条把第一条顶掉（showToast 走 setState 全量重渲染）。
+// 返回 audit 结果，方便调用方记账。
+function xportReportAfterTranslate(srcText, translations, failedCount) {
+    const audit = xportEquationAudit(srcText, translations);
+    try {
+        const notes = [];
+        if (Number(failedCount) > 0) notes.push(failedCount + ' 段未能翻译，已在对应行标出，可单独点 ↻ 重试');
+        if (audit.lost > 0) {
+            const where = audit.rows.length
+                ? '（第 ' + audit.rows.slice(0, 8).map(function (i) { return i + 1; }).join('、') + ' 行）'
+                : '';
+            notes.push('有 ' + audit.lost + ' 处公式环境在译文里消失' + where + '，请点 ↻ 单独重试这几行');
+            console.warn('xportEquationAudit: equations in=' + audit.envIn + ' out=' + audit.envOut + ' rows=' + JSON.stringify(audit.rows));
+        }
+        if (notes.length) showToast(notes.join('；'), 'warning');
+    } catch (e) {}
+    return audit;
+}
+
 // 标定常数（tests/transport/calibrate.js 实测，两个模型各 4 个真实批次）：
 // 掩码后 1 个源字符的**往返** token 成本（prompt 里它自己 + completion 里它的译文）
 //   35B：0.526–0.559，均值 0.541 tok/char
@@ -2995,7 +3773,13 @@ async function xportLimits(config) {
     try { ctx = await xportLocalContext(config.localBaseUrl, config.model); } catch (e) { ctx = 0; }
     // 问不到就按「LM Studio 刚重启、上下文 4096」这个最坏情况算
     if (!ctx) ctx = 4096;
-    const chars = Math.max(600, Math.min(8000, Math.floor(ctx * XPORT_CTX_USE / XPORT_TOK_PER_CHAR_ROUNDTRIP)));
+    const base = Math.min(8000, Math.floor(ctx * XPORT_CTX_USE / XPORT_TOK_PER_CHAR_ROUNDTRIP));
+    // B2：推理开着时字符预算减半。XPORT_TOK_PER_CHAR_ROUNDTRIP = 0.8 是在**不推理**的
+    // 前提下标定的；开着推理时 completion token 有约 92% 花在推理上（实测 qwen3.6），
+    // 再按原预算装批就是在主动制造截断。关着时 mul = 1，逐字等于原来的算式。
+    let mul = 1;
+    try { mul = (xportWireEffort(config.localBaseUrl, config.model) === 'none') ? 1 : 0.5; } catch (e) { mul = 1; }
+    const chars = Math.max(600, Math.floor(base * mul));
     return { chars: chars, segs: XPORT_SEGS_PER_BATCH, ph: 40, recovery: 8 };
 }
 
@@ -3015,10 +3799,14 @@ function xportPack(masked, limits) {
     return batches;
 }
 
-async function xportRequest(items, srcName, tgtName, config, signal) {
+// outMeta（可选，末位）：调用方想看 finish_reason / thinking / 推理 token 数时传一个空对象进来。
+// 不传的调用方逐字不受影响 —— 这是为了让恢复阶梯能判断「这次失败是不是推理导致的」，
+// 而不必再开第二套「上一次响应」的全局状态（见 spec §6.5）。
+async function xportRequest(items, srcName, tgtName, config, signal, outMeta) {
     const user = items.map((it, i) => '@@' + (i + 1) + '@@\n' + it.text).join('\n\n');
     const sys = xportSystemPrompt(srcName, tgtName, config.provider);
-    const meta = {};   // 出参：finish_reason === 'length' / 'MAX_TOKENS' 时 meta.truncated = true
+    // 出参：finish_reason === 'length' / 'MAX_TOKENS' 时 meta.truncated = true
+    const meta = (outMeta && typeof outMeta === 'object') ? outMeta : {};
     let raw;
     if (config.provider === 'local') {
         raw = await callLocalLLM(config.localBaseUrl, config.model,
@@ -3041,9 +3829,12 @@ async function xportLegacyOne(seg, srcName, tgtName, config, signal) {
 5. Do NOT include any text before or after the JSON.`;
     let data;
     if (config.provider === 'local') {
+        // 阶梯的最后一级正是「模型已经在乱来」的时候才会跑到 —— A4 的分类必须落在这里，
+        // 否则最后一根横杆保留着原来那条什么都不说的报错（见 spec §6.3）。
+        const meta = {};
         const r = await callLocalLLM(config.localBaseUrl, config.model,
-            [{ role: 'system', content: systemPrompt }, { role: 'user', content: seg }], false, signal);
-        data = parseJsonResponse(r);
+            [{ role: 'system', content: systemPrompt }, { role: 'user', content: seg }], false, signal, meta);
+        data = parseLocalJson(r, meta);
     } else {
         const r = await callGeminiAPI(config.model, seg, {
             systemInstruction: systemPrompt,
@@ -3140,8 +3931,9 @@ async function translateViaSentinel(text, srcLang, tgtLang, config, signal) {
         if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
         const batch = batches[b];
         let blocks = null;
+        const bmeta = {};
         try {
-            blocks = await xportRequest(batch.map(i => masked[i]), srcName, tgtName, config, signal);
+            blocks = await xportRequest(batch.map(i => masked[i]), srcName, tgtName, config, signal, bmeta);
         } catch (err) {
             if (err && err.name === 'AbortError') throw err;
             firstErr = firstErr || err;
@@ -3156,6 +3948,19 @@ async function translateViaSentinel(text, srcLang, tgtLang, config, signal) {
             } else {
                 failed.push(si);
             }
+        }
+        // ---- A3：推理模式下把横幅弹出来，并把它记成**候选报错** ----
+        // 【上一版在这里 throw，那是个可测的回归，别再写回去】条件是「这一批整批失败 +
+        // 模型在推理 + 到现在一段都没成」，但它**没有**要求后面的批次也会失败。离线对照
+        // （HEAD vs 上一版，同一输入同一桩、只有第 1 批不可解析）：HEAD 交付 27/27，
+        // 上一版只发了 1 个请求就整轮抛异常、交付 0 —— 本来能翻的整篇文档被扔掉了。
+        // 即使悲观情形（每批都不可解析）HEAD 也还能靠阶梯捞回 5 段 + 22 个可见重试标记。
+        // 所以这里**不中止**：横幅立刻弹（十秒就能解决问题的那条信息，用户马上看得到），
+        // 阶梯照跑，交付照旧。只有当整轮**一段都没成功**时，下面那个 tgts.every(null)
+        // 分支才会把这条推理报错抛出去 —— 那时「模型在推理」才是唯一还站得住的线索。
+        if (bmeta.thinking === true && failed.length === batch.length) {
+            try { xportNoteThinking(config.model, true); } catch (e) {}
+            firstErr = firstErr || new Error(xportThinkingMessage(config.model));
         }
         for (let f = 0; f < failed.length; f++) {
             if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -3209,6 +4014,7 @@ async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
 5. Do NOT include any text before or after the JSON.`;
 
     if (config.provider === 'local') {
+        const meta = {};
         const response = await callLocalLLM(
             config.localBaseUrl,
             config.model,
@@ -3217,9 +4023,10 @@ async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
                 { role: "user", content: text }
             ],
             false, // 不使用json_mode，让模型自由返回
-            signal
+            signal,
+            meta
         );
-        return parseJsonResponse(response);
+        return parseLocalJson(response, meta);
     }
 
     // OpenAI Path
@@ -3360,6 +4167,7 @@ async function getSmartUpdate(prompt, config, signal = null) {
     const systemPrompt = "You update translations intelligently. Return valid JSON only.";
 
     if (config.provider === 'local') {
+        const meta = {};
         const response = await callLocalLLM(
             config.localBaseUrl,
             config.model,
@@ -3368,12 +4176,15 @@ async function getSmartUpdate(prompt, config, signal = null) {
                 { role: "user", content: prompt + "\n\nRETURN JSON: {\"text\": \"...\"}" }
             ],
             false, // 不使用json_mode
-            signal
+            signal,
+            meta
         );
+        // 这条链路按既有行为**吞掉**失败（返回空串 = 不改动用户的译文），所以 A4 的分类
+        // 只落到 console：把「推理吃光预算」和「真的没输出」在排查时分开，UI 行为一字不变。
         try {
-            const data = parseJsonResponse(response);
+            const data = parseLocalJson(response, meta);
             return data.text || "";
-        } catch (e) { return ""; }
+        } catch (e) { console.warn('getSmartUpdate: ' + (e && e.code ? e.code : '') + ' ' + (e && e.message)); return ""; }
     }
 
     // OpenAI Path
@@ -3466,16 +4277,21 @@ Task: Provide 4-5 distinct, academic-style alternatives for the "Selected Text".
 Return JSON: { "alternatives": ["option1", "option2", "option3", "option4"] }`;
 
     if (config.provider === 'local') {
+        const meta = {};
         const response = await callLocalLLM(
             config.localBaseUrl,
             config.model,
             [{ role: "user", content: prompt }],
-            false // 不使用json_mode
+            false, // 不使用json_mode
+            null,
+            meta
         );
+        // 同 getSmartUpdate：吞掉失败是既有行为（弹窗显示「没有候选」），
+        // A4 的分类只进 console —— 这条链路上 UI 一字不变。
         try {
-            const data = parseJsonResponse(response);
+            const data = parseLocalJson(response, meta);
             return data.alternatives || [];
-        } catch (e) { return []; }
+        } catch (e) { console.warn('getSynonyms: ' + (e && e.code ? e.code : '') + ' ' + (e && e.message)); return []; }
     }
 
     // OpenAI Path
@@ -3664,15 +4480,22 @@ async function getGrammarSuggestions(sentence, selectedText, lang, config, avoid
     };
 
     if (config.provider === 'local') {
+        const meta = {};
         const response = await callLocalLLM(
             config.localBaseUrl,
             config.model,
             [{ role: "user", content: prompt }],
-            false // 不使用json_mode（与 getSynonyms 保持一致）
+            false, // 不使用json_mode（与 getSynonyms 保持一致）
+            null,
+            meta
         );
+        // 同上：既有的 status:'parse' 返回值一字不变，A4 的分类只进 console。
         try {
-            return normalizeGrammarPayload(parseJsonResponse(response), baseline);
-        } catch (e) { return { status: 'parse', issue: '', scope: 'selection', alternatives: [] }; }
+            return normalizeGrammarPayload(parseLocalJson(response, meta), baseline);
+        } catch (e) {
+            console.warn('getGrammarSuggestions: ' + (e && e.code ? e.code : '') + ' ' + (e && e.message));
+            return { status: 'parse', issue: '', scope: 'selection', alternatives: [] };
+        }
     }
 
     // OpenAI Path
@@ -3871,9 +4694,10 @@ async function handleTranslate() {
             AppState.lastTranslatedText = AppState.inputText;
             // 逐段失败必须**说出来**：结果已经交付了（其余段都在），但有几行是失败标记。
             // 静默交付一份缺口文档，正是这次改动要杜绝的那类问题。
-            if (Number(result.failedCount) > 0) {
-                showToast(result.failedCount + ' 段未能翻译，已在对应行标出，可单独点 ↻ 重试', 'warning');
-            }
+            // A7 把「公式整块被吞掉」并进同一条 toast —— 那是唯一一类
+            // 「JSON 合法、分段完整、内容却没了」的损坏，别的检查全都看不见。
+            AppState.lastEquationLoss = xportReportAfterTranslate(
+                AppState.inputText, result.translations, Number(result.failedCount) || 0).lost;
         }
     } catch (err) {
         if (err.name !== 'AbortError') {
@@ -4364,6 +5188,9 @@ async function handleConnectLocal() {
         } catch (e) {}
         
         setState({ showLocalSettings: false });
+        // B1：刚换过地址/刚连上，之前那份按 origin 的能力缓存要么不存在要么属于旧地址。
+        // 顺手预热一次，用户随后打开设置就能立刻看到能力信息，而不是先看几秒「读取中」。
+        xportCapsWarm();
     } catch (e) {
         setState({ error: e.message });
     } finally {
@@ -4949,9 +5776,9 @@ async function handleRegenerateAll() {
                 translationPairs: pairs, viewMode: 'preview', activeIndex: null,
                 lastTransportFailures: Number(result.failedCount) || 0
             });
-            if (Number(result.failedCount) > 0) {
-                showToast(result.failedCount + ' 段未能翻译，已在对应行标出，可单独点 ↻ 重试', 'warning');
-            }
+            // 与 handleTranslate 同一条路：逐段失败 + A7 公式存活审计，合并成一条 toast。
+            AppState.lastEquationLoss = xportReportAfterTranslate(
+                originalText, result.translations, Number(result.failedCount) || 0).lost;
         }
     } catch (err) {
         if (err.name !== 'AbortError') {
@@ -5934,6 +6761,141 @@ function renderSettingsEditingExtraSections() {
                     </div>`;
 }
 
+// ============= B1/B2：本地模型的能力芯片 + 唯一那个推理控件 =============
+// 【为什么这一块是自己刷自己，而不是走 renderApp】
+// 能力发现是异步的（4s 超时），而设置弹窗里有四个**没保存就不能重渲染**的输入框
+// （三家 API Key + 本地地址）。发现结果几秒后回来时再 renderApp()，会用 AppState 里的
+// 旧值重建 <input value="...">，把用户正在输入的 Key 抹掉 —— 这正是 setSettingsTab
+// 上方那段注释在躲的坑。所以这里走**定点重绘**：每个模型一个 [data-xport-model] 容器，
+// 发现结果回来时只替换这些容器的 innerHTML，弹窗其余部分一个节点都不碰。
+// 整条路径全程 try/catch 且只返回字符串，renderApp（无 try/catch）永远拿不到异常。
+
+// 只读芯片：加载期上下文 / 量化 / 架构 / 参数量 / 视觉 / 工具。
+// 上下文实测是**加载期**参数，HTTP 改不了，所以只显示不给调 —— 给滑块就是撒谎。
+function xportCapsChipsHtml(caps) {
+    const chips = [];
+    if (caps.ctx || caps.maxCtx) {
+        const ctxTxt = (caps.ctx ? String(caps.ctx) : '?') + ' / ' + (caps.maxCtx ? String(caps.maxCtx) : '?');
+        chips.push('<span data-tip="' + escapeAttr('当前加载的上下文 / 该模型支持的上限（token）。上下文只能在 LM Studio 加载模型时设定，HTTP 改不了，所以这里只读。') + '" data-tip-pos="top-start">ctx ' + escapeAttr(ctxTxt) + '</span>');
+    }
+    if (caps.quant) chips.push('<span data-tip="' + escapeAttr('量化格式（权重精度）。加载期属性，只读。') + '" data-tip-pos="top">' + escapeAttr(caps.quant) + '</span>');
+    if (caps.arch) chips.push('<span data-tip="' + escapeAttr('模型架构标识。') + '" data-tip-pos="top">' + escapeAttr(caps.arch) + '</span>');
+    if (caps.params) chips.push('<span data-tip="' + escapeAttr('参数规模。') + '" data-tip-pos="top">' + escapeAttr(caps.params) + '</span>');
+    if (caps.vision) chips.push('<span data-tip="' + escapeAttr('该模型声明支持图像输入（本翻译器不使用）。') + '" data-tip-pos="top">视觉 ✓</span>');
+    if (caps.tools) chips.push('<span data-tip="' + escapeAttr('该模型声明经过工具调用训练（本翻译器不使用）。') + '" data-tip-pos="top">工具 ✓</span>');
+    if (!chips.length) return '';
+    return '<div class="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[9px] text-slate-400 font-mono">' + chips.join('<span class="text-slate-300">·</span>') + '</div>';
+}
+
+// 一个模型 = **一个**推理控件，形态由 allowed_options 反推：
+//   二值模型（3.6 / 1.7b）→ 关/开 两态；有真实档位的（3.8）→ 关 + 低/中/极高 下拉。
+// 下拉里出现的每一项都保证能映射到合法的 reasoning_effort —— 映射不了的档位在
+// xportReasoningControl 里就被丢掉了，所以 UI 永远不会给出一个模型会拒绝的选项。
+function xportReasoningControlHtml(id, caps) {
+    const ctl = xportReasoningControl(caps.reasoning ? caps.reasoning.allowed : null);
+    if (ctl.kind === 'none') return '';
+    const cur = xportReasoningValue(AppState.localBaseUrl, id);
+    const on = cur !== 'off';
+    // 提示里把「实测代价」和「default 不是 API 默认值」这两件事都说清楚，不含糊其辞。
+    // 数字与 XPORT_PARAM_SPECS.reasoning.desc 保持同一套（只留三次测量都支持的比值，
+    // 不再印那对拼接出来、且被自己的实验报告标注为受污染的绝对耗时）——理由见那里的注释。
+    let latched = false;
+    try { latched = xportEffortUnsupported.has(xportCapsOrigin(AppState.localBaseUrl)); } catch (e) { latched = false; }
+    const tip = '推理（reasoning_effort）。默认关：实测开启后 qwen3.6 整体耗时是关闭时的 6–10 倍、'
+        + '每源字符的往返 token 约 5.8 倍、旧 JSON 链路硬失败率从 16.7% 涨到 33.3%，盲评 6 段里 5 段看不出差别。'
+        + '注意本模型元数据里的默认值「' + (caps.reasoning && caps.reasoning.uiDefault ? caps.reasoning.uiDefault : '未知')
+        + '」是 LM Studio 界面默认值，不是 API 默认值 —— 实测不显式发送时 API 一律不推理，'
+        + '所以选「关」时发的是 reasoning_effort:"none"，而不是靠省略。'
+        + (latched
+            ? '（本地址已经用 400 明确拒绝过 reasoning_effort，这个字段现在不再发送；省略与「关」等价，'
+              + '所以本开关只能停在「关」上，直到重新载入页面。）'
+            : '');
+    if (ctl.kind === 'toggle') {
+        const btn = function (val, label) {
+            const active = (val === 'off') ? !on : on;
+            return '<button onclick="setModelReasoning(\'' + id + '\',\'' + val + '\')" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all '
+                + (active ? 'bg-white text-purple-600 shadow-sm' : 'text-slate-400 hover:text-slate-600') + '">' + label + '</button>';
+        };
+        return '<span class="flex items-center gap-1.5" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top-end">'
+            + '<span class="text-[10px] text-slate-500 font-medium">推理</span>'
+            + '<span class="flex items-center bg-slate-100 rounded-lg p-0.5">'
+            + btn('off', XPORT_EFFORT_LABEL.off) + btn('on', XPORT_EFFORT_LABEL.on)
+            + '</span></span>';
+    }
+    const opts = ['off'].concat(ctl.levels).map(function (v) {
+        return '<option value="' + escapeAttr(v) + '"' + (v === cur ? ' selected' : '') + '>'
+            + escapeAttr(XPORT_EFFORT_LABEL[v] || v) + '</option>';
+    }).join('');
+    return '<span class="flex items-center gap-1.5" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top-end">'
+        + '<span class="text-[10px] text-slate-500 font-medium">推理</span>'
+        + '<select onchange="setModelReasoning(\'' + id + '\', this.value)" class="text-[10px] font-bold text-purple-600 bg-slate-100 border-none rounded-lg py-0.5 pl-2 pr-6 outline-none cursor-pointer">'
+        + opts + '</select></span>';
+}
+
+// 一个本地模型在设置里的那一行「能力 + 控件」。**纯字符串、绝不抛**。
+function xportCapsRowHtml(modelId) {
+    try {
+        const id = sanitizeModelId(modelId);
+        if (!id) return '';
+        const caps = xportCapsPeek(AppState.localBaseUrl, id);
+        if (caps === undefined) {
+            return '<span class="text-[9px] text-slate-300 italic">正在读取模型能力…</span>';
+        }
+        if (!caps) {
+            // 两种 null 分开说：整份 GET 失败 vs 表里没这个 id。补救办法不同，不能混为一谈。
+            const ok = xportCapsOk(AppState.localBaseUrl);
+            const tip = (ok === false)
+                ? '读不到 ' + xportCapsOrigin(AppState.localBaseUrl) + '/api/v1/models（LM Studio 没在跑，或版本过旧没有这个端点）。没有能力信息就不画控件——宁可不显示，也不显示一个可能是假的开关。'
+                : '模型未加载：LM Studio 的模型列表里没有这一项，拿不到它支持哪些推理档位。在 LM Studio 里加载该模型后重开本页即可。';
+            return '<span class="text-[9px] text-slate-300 italic" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top-start">'
+                + (ok === false ? '能力信息不可用' : '模型未加载') + '</span>';
+        }
+        const chips = xportCapsChipsHtml(caps);
+        const ctlHtml = caps.reasoning ? xportReasoningControlHtml(id, caps) : '';
+        // reasoning 为 null（能力里没有 reasoning 段，例如 embedding 条目）也走这条：只出芯片，不出控件。
+        const right = ctlHtml || '<span class="text-[9px] text-slate-300 italic" data-tip="'
+            + escapeAttr('该模型没有声明任何推理档位（capabilities.reasoning 缺失），因此不提供推理开关。') + '" data-tip-pos="top-end">无推理档位</span>';
+        return '<div class="flex items-center justify-between gap-3 flex-wrap">' + (chips || '<span></span>') + right + '</div>';
+    } catch (e) { return ''; }
+}
+
+// 定点重绘：只换 [data-xport-model] 容器的内容，弹窗其它节点（含没保存的输入框）零影响。
+function xportCapsPaint() {
+    try {
+        if (typeof document === 'undefined') return;
+        const nodes = document.querySelectorAll('[data-xport-model]');
+        for (let i = 0; i < nodes.length; i++) {
+            nodes[i].innerHTML = xportCapsRowHtml(nodes[i].getAttribute('data-xport-model'));
+        }
+    } catch (e) {}
+}
+
+// 发起一次发现（60 秒内重复调用不会真的再发请求），回来后定点重绘。fire-and-forget，
+// 但两个分支都接住 —— 一次 unhandled rejection 在这个文件里就是静默死锁。
+function xportCapsWarm() {
+    try {
+        // 从没连过本地服务的用户不该因为「打开了设置」就每次吃一个必然失败的请求。
+        // 没有本地模型时那一段本来就只显示「No local models available」，一行容器都不会渲染。
+        const list = Array.isArray(AppState.localModels) ? AppState.localModels : [];
+        if (!list.length && AppState.apiProvider !== 'local') return;
+        xportFetchCaps(AppState.localBaseUrl).then(function () { xportCapsPaint(); }, function () {});
+    } catch (e) {}
+}
+
+// 用户改了某个模型的推理档位。**不走 renderApp** —— 理由同上（会抹掉没保存的 API Key）。
+function setModelReasoning(modelId, value) {
+    try {
+        const id = sanitizeModelId(modelId);
+        if (!id) return;
+        const v = (typeof value === 'string' && Object.prototype.hasOwnProperty.call(XPORT_EFFORT_WIRE, value))
+            ? value : XPORT_REASONING_DEFAULT;
+        if (!AppState.reasoningByModel || typeof AppState.reasoningByModel !== 'object') AppState.reasoningByModel = {};
+        AppState.reasoningByModel[id] = v;
+        try { localStorage.setItem(XPORT_REASONING_LS_KEY, JSON.stringify(AppState.reasoningByModel)); } catch (e) {}
+        xportCapsPaint();
+    } catch (e) {}
+}
+
 function renderSettingsModal() {
     if (!AppState.showSettings) return '';
     // 当前页签。normalize 一遍：localStorage 里的脏值/老版本残留不能让四个面板全都不显示。
@@ -6113,13 +7075,19 @@ ${renderSettingsTabBar(activeTab)}
                             <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">Local Models Visibility</span>
                         </div>
                         ${AppState.localModels.length > 0 ? `
-                            <p class="text-[10px] text-slate-400 mb-3">Select which local models to show in the model selector.</p>
-                            <div class="space-y-1 max-h-40 overflow-y-auto custom-scrollbar">
+                            <p class="text-[10px] text-slate-400 mb-3">Select which local models to show in the model selector. 每个模型下方的能力信息与推理档位来自 LM Studio 的 <span class="font-mono">/api/v1/models</span>（按模型实时发现，不是写死的表）。</p>
+                            <div class="space-y-1 max-h-72 overflow-y-auto custom-scrollbar">
                                 ${AppState.localModels.map(lm => `
-                                    <label class="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all ${AppState.modelVisibility[lm.id] !== false ? 'bg-purple-50' : ''}" title="${escapeHtml(lm.id)}">
+                                    <div class="rounded-lg ${AppState.modelVisibility[lm.id] !== false ? 'bg-purple-50' : ''}">
+                                    <label class="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all" title="${escapeHtml(lm.id)}">
                                         <input type="checkbox" ${AppState.modelVisibility[lm.id] !== false ? 'checked' : ''} onchange="toggleModelVisibility('${escapeHtml(lm.id)}')" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-purple-600 focus:ring-purple-500 shrink-0">
                                         <span class="text-xs font-medium text-purple-600 break-words leading-snug min-w-0 flex-1">${escapeHtml(lm.id)}</span>
                                     </label>
+                                    <!-- B1/B2：能力芯片 + 唯一那个推理控件。刻意放在 <label> **外面** ——
+                                         放里面的话点按钮会顺带切掉可见性勾选框。内容由 xportCapsPaint()
+                                         在发现结果回来时定点重绘，不走 renderApp（见该函数上方注释）。 -->
+                                    <div data-xport-model="${escapeAttr(lm.id)}" class="px-2 pb-2 -mt-0.5">${xportCapsRowHtml(lm.id)}</div>
+                                    </div>
                                 `).join('')}
                             </div>
                         ` : `
@@ -7070,14 +8038,24 @@ function selectModel(provider, modelId) {
     AppState.apiProvider = provider;
     AppState.selectedModel = modelId;
     AppState.showModelMenu = false;
-    
+
     // 保存到 localStorage
     try {
         localStorage.setItem('apiProvider', provider);
         localStorage.setItem('selectedModel', modelId);
     } catch (e) {}
-    
+
     renderApp();
+
+    // A3：选完模型顺手问一句「你现在推理吗」。**必须放在 renderApp 之后**，而且
+    // 不 await —— 渲染路径没有 try/catch，任何在它之前抛的东西都会把页面永久冻住。
+    // 换模型 = 换一台机器上的开关状态，所以先把上一轮的横幅撤掉再重新判定。
+    xportThinkingBannerHide();
+    if (provider === 'local') {
+        // B1：先把能力表拉起来（60 秒缓存），探针要用它把档位夹到这个模型真正支持的范围内。
+        xportCapsWarm();
+        try { Promise.resolve(xportProbeThinking(AppState.localBaseUrl, modelId)).catch(function () {}); } catch (e) {}
+    }
 }
 
 function openLocalSettings() {
@@ -7092,6 +8070,9 @@ function openSettings() {
     AppState.showModelMenu = false;
     AppState.modelGroupExpanded = { gemini: false, openai: false, claude: false };
     renderApp();
+    // B1：先把弹窗画出来，再去问本地模型的能力（60 秒缓存，连开两次只发一个请求）。
+    // 结果回来后只定点重绘那几个容器，绝不重渲染整页 —— 详见 xportCapsPaint 上方注释。
+    xportCapsWarm();
 }
 
 // Settings 弹窗里某一家的模型列表默认折叠：只显示已勾选的（+ 钉住项 + 搜索命中项），
@@ -7628,6 +8609,27 @@ function loadSavedSettings() {
             } catch (e) {}
         }
 
+        // B2：加载每模型的推理档位。**必须在首次 renderApp 之前**恢复，否则设置面板会先
+        // 画一遍「关」再跳成用户设定值；更糟的是首次翻译可能用错档位发出去。
+        // 逐键校验：只认 XPORT_EFFORT_WIRE 里存在的 UI 值，脏值直接丢弃（不是回落，是不收）。
+        const savedReasoning = localStorage.getItem(XPORT_REASONING_LS_KEY);
+        if (savedReasoning) {
+            try {
+                const parsed = JSON.parse(savedReasoning);
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    const clean = {};
+                    Object.keys(parsed).forEach(function (k) {
+                        const id = sanitizeModelId(k);
+                        const v = parsed[k];
+                        if (id && typeof v === 'string' && Object.prototype.hasOwnProperty.call(XPORT_EFFORT_WIRE, v)) {
+                            clean[id] = v;
+                        }
+                    });
+                    AppState.reasoningByModel = clean;
+                }
+            } catch (e) {}
+        }
+
         // 加载「显示 OpenAI 日期快照」开关
         const savedShowSnapshots = localStorage.getItem('showDatedSnapshots');
         if (savedShowSnapshots === '1') {
@@ -7703,6 +8705,8 @@ async function autoConnectLocal() {
         
         console.log('Auto-connected to local LM Studio:', AppState.localBaseUrl, 'Models:', models.length);
         renderApp();
+        // B1：连上了就顺手预热能力表（60 秒缓存，不会和 openSettings 的那次重复发请求）
+        xportCapsWarm();
     } catch (e) {
         // 显示错误提示
         console.warn('Auto-connect to local LM Studio failed:', e.message);
