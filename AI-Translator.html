@@ -6142,6 +6142,30 @@ function handleGlobalClick(event) {
     // 如果没有正在编辑的句子，直接返回
     if (AppState.activeIndex === null) return;
 
+    // —— 浮层通用豁免：按语义写，不再按 id 写 ——
+    // 任何挂在 <body> 上、**不属于 #root** 的浮层（渲染错误边界面板、浮动对话窗、
+    // 同义词弹窗、推理模式横幅……以及将来还会有的第 N 个），它内部的点击都不该被
+    // 当成「点了空白区域」。#root 是 renderApp 唯一写入的容器，所以「在不在 #root 里」
+    // 正好就是「是不是应用正文」这个判据本身。
+    //
+    // 【为什么非要有这一条】下面那条 #aiChatRoot 豁免就是硬编码换来的：对话窗踩过一次坑、
+    // 补了一条按 id 写的豁免；错误边界面板挂上来之后原样又踩了一次 —— 实测：第 2 行处于
+    // 行内编辑态、textarea 里是未提交文本时，在边界面板的**说明文字**（一个 <div>，
+    // 不是 button 也不是 input）上点一次真实冒泡 click，会一路走到下面的
+    // saveRowUpdate(AppState.activeIndex)：activeIndex 从 1 变成 null、那段未提交文本被
+    // 静默写进 translationPairs[1].tgt，而且因为「只有一侧变了」还会发一次重译另一栏的
+    // 网络请求（实测 getSmartUpdate 被调 1 次）。面板里的 <button>/<textarea> 因为下面
+    // 那两条 closest 恰好被放行，出事的是标题、说明段落和堆栈 <pre>。
+    // 再按 id 补第三条，只是在等下一个浮层。
+    //
+    // 【边界条件：绝不能扩得过宽】<body> 和 <html> 本身也不在 #root 里，而点它们
+    // **就是**点了空白区域，必须照旧提交并退出编辑 —— 这是既有行为，有对照实测把着。
+    // 所以判据是「在 #root 之外**且**不是 body/html 本身」，不是光一句「不在 #root 里」。
+    const clickTarget = event.target;
+    if (clickTarget && typeof clickTarget.closest === 'function'
+        && clickTarget !== document.body && clickTarget !== document.documentElement
+        && !clickTarget.closest('#root')) return;
+
     // 浮动对话窗挂在 <body> 上（不在 #root 里），它内部的点击一律不算「点了空白区域」。
     // 这是 C1 唯一一处改到聊天代码之外的生产代码，必须留着：
     // 实测（chat-window.md §2.6）—— 行 3 处于编辑态时，点对话窗的**标题栏**或**消息气泡**
