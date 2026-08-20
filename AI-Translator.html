@@ -481,6 +481,33 @@ body.is-resizing-settings-modal * {
     max-width: 100%;
 }
 
+/* ---- 「正在处理」指示器（C8）----
+   在飞请求的**唯一**活体证据：一个纯 CSS 动画（不代表进度，只代表「还活着」）+ 一个每 100ms
+   只改 textContent 的计时节点（真实已耗时秒数，唯一说得准的量）。「显示思考过程」关着的时候
+   *尤其*需要它——那正是最容易让人以为卡死的状态，所以这东西两种模式下都画，不受那个开关管。 */
+#aiChatRoot .aichat-pending { display: inline-flex; align-items: center; gap: 6px; }
+#aiChatRoot .aichat-pending-dots { display: inline-flex; align-items: center; gap: 3px; }
+#aiChatRoot .aichat-pending-dots i {
+    width: 4px; height: 4px; border-radius: 50%; background: #a5b4fc; display: inline-block;
+    animation: aichat-pending-blink 1.1s ease-in-out infinite;
+}
+#aiChatRoot .aichat-pending-dots i:nth-child(2) { animation-delay: 0.15s; }
+#aiChatRoot .aichat-pending-dots i:nth-child(3) { animation-delay: 0.3s; }
+@keyframes aichat-pending-blink {
+    0%, 80%, 100% { opacity: 0.25; transform: scale(0.85); }
+    40% { opacity: 1; transform: scale(1); }
+}
+#aiChatRoot .aichat-pending-label { font-style: italic; color: #818cf8; }
+#aiChatRoot .aichat-pending-time { font-variant-numeric: tabular-nums; color: #94a3b8; }
+
+/* ---- 每条回复下面那一行「本轮用量」（C8）——只画实测到的数字，拿不到就明写一句话，绝不估。 ---- */
+#aiChatRoot .aichat-usageline {
+    display: flex; flex-wrap: wrap; gap: 3px 10px; margin-top: 6px;
+    font-size: 10px; color: #94a3b8;
+}
+#aiChatRoot .aichat-usage-kv { cursor: default; }
+#aiChatRoot .aichat-usage-kv b { font-weight: 600; color: #64748b; }
+
 /* ---- 输入区 ---- */
 #aiChatRoot .aichat-footer {
     flex: 0 0 auto;
@@ -2272,8 +2299,12 @@ function focusClearAll() {
 }
 
 // 行上那颗复选框：整行关注。el 是那个 <input>，它的 checked 已经被浏览器翻好了。
+// C7（对话上下文收窄）：只有左栏（原文/src）能被关注——右栏译文不再进上下文，勾了也没有
+// 意义。界面上右栏那颗复选框已经不渲染（focusCheckboxHtml 直接返回空字符串），这里再守一道，
+// 防止有别的调用点误传 side='tgt' 悄悄创建一条发不出去、也用不上的关注。
 function focusToggleRow(rowIndex, side, el) {
     try {
+        if (side !== 'src') { if (el) el.checked = false; return; }
         const want = el ? !!el.checked : !focusHasWholeRow(rowIndex, side);
         const at = focusIndexOfWhole(rowIndex, side);
         if (want && at === -1) {
@@ -2303,7 +2334,8 @@ function focusToggleRow(rowIndex, side, el) {
 function focusTogglePopupSpan(el) {
     try {
         const s = AppState.synonymState;
-        if (!s || !s.show || typeof s.index !== 'number' || (s.field !== 'src' && s.field !== 'tgt')) {
+        // C7：field 只接受 'src'——右栏（译文）选词不再提供「额外关注这一段」入口。
+        if (!s || !s.show || typeof s.index !== 'number' || s.field !== 'src') {
             if (el) el.checked = false;
             return;
         }
@@ -2354,7 +2386,7 @@ function focusPopupChecked() {
     try {
         const s = AppState.synonymState;
         if (!s || !s.show || typeof s.index !== 'number') return false;
-        if (s.field !== 'src' && s.field !== 'tgt') return false;
+        if (s.field !== 'src') return false;   // C7：只有左栏能关注
         const range = (s.selectionRange && typeof s.selectionRange === 'object') ? s.selectionRange : null;
         if (!range) return false;
         const base = focusLiveBase(s.index, s.field);
@@ -2722,7 +2754,10 @@ function focusLoad() {
             // 逐键校验，脏值一律**不收**（和 chatParamsLoad 同一条纪律）
             if (!e || typeof e !== 'object') continue;
             if (typeof e.rowIndex !== 'number' || !isFinite(e.rowIndex) || e.rowIndex < 0) continue;
-            if (e.side !== 'src' && e.side !== 'tgt') continue;
+            // C7（对话上下文收窄）：只收左栏（原文/src）。旧版本允许在右栏（译文/tgt）打关注，
+            // localStorage 里可能还留着那时候存下的条目——这里就是迁移点：不是 src 的一律
+            // 不收，静默清理，绝不让一条指不到（右栏已经不进上下文）的悬空关注混进这一版。
+            if (e.side !== 'src') continue;
             if (typeof e.quote !== 'string' || !e.quote) continue;
             if (!e.whole && e.quote.length > FOCUS_QUOTE_MAX) continue;
             out.push(focusMakeEntry({
@@ -2767,24 +2802,22 @@ function focusWireBlock() {
             const e = entries[i];
             const r = focusResolve(e);
             if (!r.ok) continue;                       // 解不出来的一律不发（陈旧的东西一个字节都不许出门）
-            const sideCn = e.side === 'src' ? '原文' : '译文';
-            const otherSide = e.side === 'src' ? 'tgt' : 'src';
-            const otherCn = otherSide === 'src' ? '原文' : '译文';
-            const otherText = focusLiveBase(e.rowIndex, otherSide);
+            // C7（对话上下文收窄）：走到这里的条目 side 只可能是 'src'（焦点入口已经收窄，
+            // focusLoad 也会把旧版本留下的 tgt 条目滤掉）——所以不再需要「对侧（译文）」那一段：
+            // 那一段本来就是把右栏内容塞进上下文，和「只关联左边输入内容」直接冲突。
             const n = items.length + 1;
             if (e.whole) {
-                items.push('[关注 ' + n + ']  整行 · ' + sideCn + ' · 第 ' + (e.rowIndex + 1) + ' 行\n'
+                items.push('[关注 ' + n + ']  整行 · 原文 · 第 ' + (e.rowIndex + 1) + ' 行\n'
                     + '  文本：' + chatEscapeDelims(r.text));
             } else {
-                // 决策 4：片段必须带上「所在句 + 句内偏移 + 对侧同一行」，
-                // 否则模型收到的是一个光秃秃的 token，只能自信地猜。
+                // 决策 4：片段必须带上「所在句 + 句内偏移」，否则模型收到的是一个光秃秃的
+                // token，只能自信地猜；C7 之后不再附「对侧同一行」（那是译文，已经出上下文）。
                 const sentence = String(e.sentence || r.text);
-                items.push('[关注 ' + n + ']  片段 · ' + sideCn + ' · 第 ' + (e.rowIndex + 1) + ' 行'
+                items.push('[关注 ' + n + ']  片段 · 原文 · 第 ' + (e.rowIndex + 1) + ' 行'
                     + ' · 该片段从所在句的第 ' + e.sentOffset + ' 个字符开始\n'
                     + '  片段：' + chatEscapeDelims(r.text) + '\n'
                     + '  所在句：' + chatEscapeDelims(sentence)
-                    + (e.sentFallback ? '\n  （注：这一行的句子边界判不准，「所在句」退回了整行）' : '') + '\n'
-                    + '  对侧（' + otherCn + '）同一行：' + chatEscapeDelims(otherText));
+                    + (e.sentFallback ? '\n  （注：这一行的句子边界判不准，「所在句」退回了整行）' : ''));
             }
         }
         if (!items.length) return '';
@@ -2896,10 +2929,12 @@ function focusRenderChip() {
 //   variant 'toolbar'：编辑行 AI 工具栏里那颗
 function focusCheckboxHtml(idx, side, variant) {
     try {
+        // C7（对话上下文收窄）：只有左栏（原文/src）能被关注——右栏译文不再进对话上下文，
+        // 那颗复选框勾了也不起作用，所以右栏干脆不渲染它，而不是渲染一个点了没反应的控件。
+        if (side !== 'src') return '';
         const on = focusHasWholeRow(idx, side);
-        const sideCn = side === 'src' ? '原文' : '译文';
-        const tip = '勾上 = 让对话窗的模型**额外留意**这一整行的' + sideCn + '。'
-            + '可以同时勾好几行、两栏混着勾，被勾中的文字会显示成黄色底。'
+        const tip = '勾上 = 让对话窗的模型**额外留意**这一整行原文。'
+            + '可以同时勾好几行，被勾中的文字会显示成黄色底。'
             + '这只是「请多看一眼」，不会授权模型改动它 —— 改字照旧要模型给出修改块并逐字复核。'
             + '想只关注一个词或短语，就在编辑框里选中它，弹窗里也有同一颗复选框。';
         const cls = 'focus-chip' + (variant === 'row' ? ' focus-row-chip' : '') + (on ? ' is-on' : '');
@@ -2927,10 +2962,11 @@ function focusCheckboxHtml(idx, side, variant) {
 function focusPopupRowHtml() {
     try {
         const s = AppState.synonymState;
-        if (!s || typeof s.index !== 'number' || (s.field !== 'src' && s.field !== 'tgt')) return '';
+        // C7（对话上下文收窄）：只有左栏（原文/src）能被关注。
+        if (!s || typeof s.index !== 'number' || s.field !== 'src') return '';
         const on = focusPopupChecked();
         const tip = '把选中的这一段登记成「额外关注」，之后每一轮问话都会连同它的**所在句、'
-            + '它在句中的位置、以及对侧同一行的文字**一起发给对话窗的模型，让它知道你在指什么。'
+            + '它在句中的位置**一起发给对话窗的模型，让它知道你在指什么（只发原文，不发译文）。'
             + '这只是「请多留意」，不是修改授权。'
             + '勾选**不会**关闭这个面板，关掉面板也**不会**取消已经勾上的关注。';
         return `
@@ -3595,6 +3631,12 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
             // 刻意就地取值、不新开一个 helper：callLocalLLM 被 phaseB 的抽取器加载，
             // 加一个它调用的新函数就得同时改那份加载清单（漏过两次，phaseB 当场炸）。
             meta.promptTokens = Number(data && data.usage && data.usage.prompt_tokens) || 0;
+            // C8：同一份 usage 对象里的输出侧两个数，同样就地取值、同样实测（2026-08-20，
+            // jump LM Studio，qwen3.6-35b-a3b 关思考 / qwen3.8-27b 开思考各抓过一次真实响应体，
+            // 两次 usage 都带 completion_tokens 和 total_tokens）。回复下面那一行「本轮用量」
+            // 只认这两个字段，拿不到就显示"本轮未提供用量"，不拿字符数估一个填上去。
+            meta.completionTokens = Number(data && data.usage && data.usage.completion_tokens) || 0;
+            meta.totalTokens = Number(data && data.usage && data.usage.total_tokens) || 0;
         }
         // A3：被动探测。每一次真实响应都顺手判一次「这个模型在推理吗」，
         // 不额外花任何一次调用。判到了就把横幅弹出来（见 xportNoteThinking）。
@@ -9708,8 +9750,9 @@ function renderAiToolbar(side, idx) {
             </div>
 
             <!-- 「关注」复选框（取代了原来那颗「附到对话」按钮，理由见 renderPairRow 里的注释）。
-                 这一颗管的是**整行**；只想关注一个词或短语的话，在上面的编辑框里选中它，
-                 选词弹窗里有同一颗复选框，而且那一条会连所在句、句内偏移、对侧同一行一起发过去。
+                 这一颗管的是**整行**（且只对左栏/原文渲染，见 focusCheckboxHtml 的 C7 收窄）；
+                 只想关注一个词或短语的话，在上面的编辑框里选中它，选词弹窗里有同一颗复选框，
+                 而且那一条会连所在句、句内偏移一起发过去。
                  ⚠️ C2：这一整条工具栏的容器已经带 onclick="event.stopPropagation()"，
                  复选框自己再带一层 —— 行处于编辑态时勾它，AppState.activeIndex 一动不动。 -->
             ${focusCheckboxHtml(idx, side, 'toolbar')}
@@ -10754,7 +10797,7 @@ function chatShellHtml() {
         // 三颗按钮从左到右：+ 新建对话 → − 最小化 → × 关闭。
         // 每颗都有中文 data-tip；按 data-tip 纪律，它们互相是兄弟、祖先（.aichat-titlebtns）不带 tip。
         +     '<span class="aichat-titlebtns">'
-        +       '<button type="button" class="aichat-iconbtn" id="aiChatNewBtn" data-tip="新建对话：先把当前这段存进「会话」再开一段空的（和面板里的「清理」是同一条代码路径）。文档上下文不受影响 —— 它每轮现生成，新对话第一轮照样带整篇最新译文。你标出来的关注（黄色高亮 / 勾选框）属于稿子不属于这段对话，**会原样保留**。当前对话是空的时就什么都不做，不会往历史里塞空条目。" data-tip-pos="bottom-end">' + Icons.PlusSmall + '</button>'
+        +       '<button type="button" class="aichat-iconbtn" id="aiChatNewBtn" data-tip="新建对话：先把当前这段存进「会话」再开一段空的（和面板里的「清理」是同一条代码路径）。文档上下文不受影响 —— 它每轮现生成，新对话第一轮照样带整篇最新原文（左栏，不含译文）。你标出来的关注（黄色高亮 / 勾选框）属于稿子不属于这段对话，**会原样保留**。当前对话是空的时就什么都不做，不会往历史里塞空条目。" data-tip-pos="bottom-end">' + Icons.PlusSmall + '</button>'
         +       '<button type="button" class="aichat-iconbtn" id="aiChatMinBtn" data-tip="最小化到后台：折叠成一条标题栏停在原地，仍然可以拖。和「关闭」不一样 —— 草稿（连同光标选区）、滚动位置、全部消息、关注标记、用量圆环、窗口尺寸全都留着，展开后逐项还原。折叠期间模型回完了，这里会亮出未读数。点这颗按钮或点标题栏都能展开。" data-tip-pos="bottom-end">' + Icons.MinusSmall + '</button>'
         +       '<button type="button" class="aichat-iconbtn" id="aiChatCloseBtn" data-tip="关掉对话窗（按 Esc 也一样）。位置和大小会记住，下次打开还在原处。" data-tip-pos="bottom-end">' + Icons.XSmall + '</button>'
         +     '</span>'
@@ -10813,6 +10856,44 @@ function chatAppendRow(kind, text) {
         return row;
     } catch (e) {
         console.error('[chat] appendRow failed', e);
+        return null;
+    }
+}
+
+// 「正在处理」指示器（C8）。**两种「显示思考过程」模式下都要画**——那个开关只决定
+// 思考正文显不显示，不决定「我还活着」这个信号显不显示；关掉思考正文恰恰最容易让人
+// 以为卡死。内容：动画（纯 CSS，不代表进度）+ "thinking" 字样 + 真实已耗时秒数。
+// 动画和计时是两条独立的线：动画一旦挂上 CSS class 就自己转，不需要 JS 再摸它；
+// 计时由调用方起一个 interval，只改这里返回的 timeEl 的 textContent 一个节点。
+// 绝不在这里画任何「进度」「预计还需 N 秒」「token 数」—— 在请求真正落地之前，
+// 这些数字这个函数一个都不知道，画出来就是编的。
+function chatAppendPendingRow() {
+    try {
+        const log = document.getElementById('aiChatLog');
+        if (!log) return null;
+        const row = document.createElement('div');
+        row.className = 'aichat-row aichat-row-system';
+        const bubble = document.createElement('div');
+        bubble.className = 'aichat-bubble aichat-pending';
+        const dots = document.createElement('span');
+        dots.className = 'aichat-pending-dots';
+        dots.setAttribute('aria-hidden', 'true');
+        for (let i = 0; i < 3; i++) dots.appendChild(document.createElement('i'));
+        const label = document.createElement('span');
+        label.className = 'aichat-pending-label';
+        label.textContent = 'thinking…';
+        const time = document.createElement('span');
+        time.className = 'aichat-pending-time';
+        time.textContent = '0.0s';
+        bubble.appendChild(dots);
+        bubble.appendChild(label);
+        bubble.appendChild(time);
+        row.appendChild(bubble);
+        log.appendChild(row);
+        chatScrollToBottom();
+        return { row: row, timeEl: time };
+    } catch (e) {
+        console.error('[chat] appendPendingRow failed', e);
         return null;
     }
 }
@@ -11112,7 +11193,7 @@ function chatBindShell(rootEl) {
 //
 //     ==CHAT==
 //     <给用户看的话>
-//     ==EDIT side=tgt row=4==
+//     ==EDIT side=src row=4==
 //     <替换后的完整文本>
 //     ==END==
 //
@@ -11164,23 +11245,42 @@ function chatUnescapeDelims(s) {
         .replace(new RegExp('==' + CHAT_ZWSP + '(CHAT|EDIT|END|DOC|FOCUS)', 'g'), '==$1');
 }
 
+// C7（对话上下文收窄）：左栏（原文/src）此刻是什么语言。只在 hasDoc 为真时才有意义
+// （没有文档就没有任何可指认的行，也就没有 EDIT），但计算本身不依赖 hasDoc —— 只要
+// 已经翻译过一次，AppState.sourceLang 就是权威值（isAutoDetect 也会在那时把它写实），
+// 不需要在这里重新跑一次 detectLanguage。
+function chatDocLang() {
+    const code = (AppState.sourceLang === 'en') ? 'en' : 'zh';
+    return { code: code, name: code === 'en' ? '英文' : '中文' };
+}
+
 // hasTarget = 这一轮附了选段；hasDoc = 这一轮带了自动文档上下文（==DOC== 块）；
 // hasFocus  = 这一轮带了 ==FOCUS== 关注块。
 // 前两者都没有时才回到「绝对不要输出 ==EDIT==」那条老规则 —— 因为那时模型根本没有可指认的行。
 // ⚠️ hasFocus **不**参与那个判断：关注不是可指认的编辑目标，也不是修改授权。
 //    一份只有关注、没有文档也没有选段的载荷，照旧一个 ==EDIT== 块都不许出。
-function chatSystemPrompt(hasTarget, hasDoc, hasFocus) {
+//
+// C7（对话上下文收窄）：docLang 是左栏原文此刻的语言（chatDocLang()）。EDIT 块里的改写正文
+// **必须**用这个语言写，和「用什么语言回答用户」是两回事——那句话回什么语言跟着用户的问题走，
+// 这里的改写文本只跟着原文的语言走，两条规则互不干扰。
+function chatSystemPrompt(hasTarget, hasDoc, hasFocus, docLang) {
+    const lang = docLang || chatDocLang();
     const focusRule = hasFocus
         ? '\n用户这一轮还标了若干「额外关注」，装在 ==FOCUS …== 与 ==FOCUSEND== 之间。\n'
           + '那是**请你多留意的地方**，不是让你改的地方：没有被明确要求改动之前，'
           + '不要因为某处被标出来就去改写它，更不要为此输出 ==EDIT== 块。\n'
         : '';
     const base = ''
-        + '你是学术论文翻译工具里的助手。用户正在逐句校对一篇论文的「原文」(src) 和「译文」(tgt)。\n'
-        + '用中文回答，除非用户用别的语言问。\n\n'
+        + '你是学术论文翻译工具里的助手。用户正在处理一篇需要翻译的论文，你**只看得到左栏「原文」**'
+        + '（用户正在写、正在改的那份待翻译内容）；右栏的「译文」是翻译结果，你看不到它，'
+        + '也不能改动它——这个工具现在只把左栏的内容当作你的上下文和可能的修改对象。\n'
+        + '这句话回答用什么语言，跟着用户提问的语言走（用户用中文问就用中文答，用英文问就用英文答）；\n'
+        + '但下面 ==EDIT== 块里改写之后的正文是另一回事，**必须永远使用原文的语言**'
+        + '（此刻左栏原文是' + lang.name + '），不会因为你这句话用了别的语言就跟着换，见规则里单独那一条。\n\n'
         + (hasDoc
-            ? '用户这一轮附带了**整份已翻译的文档**，装在 ==DOC …== 与 ==DOCEND== 之间，'
-              + '每一行都编了号，形如 `[3] 原文：…` 与 `[3] 译文：…`。\n'
+            ? '用户这一轮附带了**整份待翻译的原文**，装在 ==DOC …== 与 ==DOCEND== 之间，'
+              + '每一行都编了号，形如 `[3] 原文：…`。这份文档**只有原文，没有译文**——'
+              + '你看不到用户那边已经翻译出来的结果，回答时不要假装看过。\n'
               + '这个编号就是**寻址方式**：用户说「第 3 行」指的就是 [3]，你回答时也用 [n] 指认。\n'
               + '文档块只给了 ==DOC== 头部声明的那个行号范围；范围之外的行你没有看到，'
               + '**不许假装看过**，直接说「这一轮没给我第 N 行」。\n\n'
@@ -11193,32 +11293,36 @@ function chatSystemPrompt(hasTarget, hasDoc, hasFocus) {
         + '规则：\n'
         + '1. LaTeX 命令（\\cite{...}、\\ref{...}、$...$、\\textcolor{..}{..}、\\begin{..}...\\end{..}）'
         + '必须逐字符原样保留，一个反斜杠都不许增删。\n'
-        + '2. 不要复述用户给你的原文，直接说结论。\n';
+        + '2. 不要复述用户给你的原文，直接说结论。\n'
+        + '3. **这个工具现在只能改左栏的原文，不能改右栏的译文**：任何 ==EDIT== 块的 side 都只能写'
+        + ' side=src；写 side=tgt 会被直接拒绝、不会生效。\n'
+        + '4. ==EDIT== 块里替换之后的正文必须使用**' + lang.name + '**（和左栏原文同一种语言）——'
+        + '不要因为你刚才这句 ==CHAT== 用别的语言回答了用户，就顺手把改写结果也换了语言。\n';
     if (!hasTarget && !hasDoc) {
-        return base + '3. 这一轮用户**没有附加选段、也没有文档上下文**，所以**绝对不要**输出 ==EDIT== 块。\n';
+        return base + '5. 这一轮用户**没有附加选段、也没有文档上下文**，所以**绝对不要**输出 ==EDIT== 块。\n';
     }
     if (!hasTarget) {
         // 文档在手、没有附加选段：允许**按行号整行替换**。这是 chat-auto-context.md 决策 2
         // 的全部意义 —— 附加从此是精确工具，不再是提问的前置条件。
         return base
-            + '3. 只有当用户明确要求修改某一行时，才在 ==CHAT== 段之后追加一个修改块：\n'
-            + '==EDIT side=<src|tgt> row=<行号>==\n'
-            + '<这一行替换之后的完整文本>\n'
+            + '5. 只有当用户明确要求修改某一行原文时，才在 ==CHAT== 段之后追加一个修改块：\n'
+            + '==EDIT side=src row=<行号>==\n'
+            + '<这一行替换之后的完整原文>\n'
             + '==END==\n'
-            + '4. ==EDIT== 与 ==END== 之间只放正文本身：不要引号、不要 diff、不要任何解释，\n'
+            + '6. ==EDIT== 与 ==END== 之间只放正文本身：不要引号、不要 diff、不要任何解释，\n'
             + '   而且必须是**整行**替换之后的完整文本，不是片段、不是只写改动的那几个字。\n'
-            + '5. side 和 row 必须写全，且 row 必须落在这一轮 ==DOC== 声明的范围内。一轮最多一个 ==EDIT== 块。\n'
-            + '6. 只是回答问题、没有要改的时候，**不要**输出 ==EDIT== 块。\n';
+            + '7. row 必须落在这一轮 ==DOC== 声明的范围内。一轮最多一个 ==EDIT== 块。\n'
+            + '8. 只是回答问题、没有要改的时候，**不要**输出 ==EDIT== 块。\n';
     }
     return base
-        + '3. 只有当用户明确要求改写「附加的选段」时，才在 ==CHAT== 段之后追加一个修改块：\n'
-        + '==EDIT side=<src|tgt> row=<行号>==\n'
+        + '5. 只有当用户明确要求改写「附加的选段」时，才在 ==CHAT== 段之后追加一个修改块：\n'
+        + '==EDIT side=src row=<行号>==\n'
         + '<替换后的完整文本>\n'
         + '==END==\n'
-        + '4. ==EDIT== 与 ==END== 之间只放替换后的正文本身：不要引号、不要 diff、不要任何解释，\n'
+        + '6. ==EDIT== 与 ==END== 之间只放替换后的正文本身：不要引号、不要 diff、不要任何解释，\n'
         + '   而且必须是**整个选段**替换之后的完整文本，不是片段。\n'
-        + '5. side 和 row 必须与用户附加的选段一致。一轮最多一个 ==EDIT== 块。\n'
-        + '6. 只是回答问题、没有要改的时候，**不要**输出 ==EDIT== 块。\n';
+        + '7. row 必须与用户附加的选段一致。一轮最多一个 ==EDIT== 块。\n'
+        + '8. 只是回答问题、没有要改的时候，**不要**输出 ==EDIT== 块。\n';
 }
 
 // 解析模型回复。返回 { prose, edit:{side,row,body}|null, hadChatMark, unterminated }
@@ -11535,6 +11639,57 @@ function chatAppendCopyAnswer(row, answerText) {
     } catch (e) {}
 }
 
+// C8：这条回复下面那一行「本轮用量」。**只用这一次调用自己的 meta**（chatSend 里每轮新建
+// 一个），不读任何跨轮次共享的状态——这就是「连发多轮不会把用量行挂到错的消息上」的
+// 结构性保证：meta 从 chatCallModel 收到响应的那一刻起就已经和这一条 assistant 消息绑死，
+// 不存在"上一轮的用量被下一轮覆盖后显示在旧气泡下面"这种错位。
+// **拿不到就明说，绝不估**：本地流式/非流式两条路都已经把 usage.prompt_tokens /
+// usage.completion_tokens / usage.completion_tokens_details.reasoning_tokens 实测填进 meta；
+// Claude/OpenAI 这条路目前没有接这些字段（前者按硬约束不能碰），所以那两家走到这里时
+// promptTokens 和 completionTokens 都是 0 —— 老老实实显示"本轮未提供用量"，不拿估算数字充数。
+function chatAppendUsageLine(row, meta) {
+    try {
+        if (!row) return;
+        const m = meta || {};
+        const ptok = Number(m.promptTokens) || 0;
+        const ctok = Number(m.completionTokens) || 0;
+        const rtok = Number(m.reasoningTokens) || 0;
+        const ttok = Number(m.totalTokens) || 0;
+        const box = chatBubbleOf(row) || row;
+        const line = document.createElement('div');
+        line.className = 'aichat-usageline';
+        if (ptok <= 0 && ctok <= 0) {
+            line.textContent = '本轮未提供用量';
+            line.setAttribute('data-tip', '这个模型/服务商这一轮的响应里没有可用的 usage 字段'
+                + '（或者请求中途被停止了）。如实说明，不去按字符数估一个填上去——那样会假装它是实测的。');
+            line.setAttribute('data-tip-pos', 'top-start');
+            box.appendChild(line);
+            return;
+        }
+        const kv = function (label, val, tip) {
+            const s = document.createElement('span');
+            s.className = 'aichat-usage-kv';
+            s.innerHTML = '<b>' + escapeHtml(label) + '</b> ' + chatFmtNum(val);
+            s.setAttribute('data-tip', tip);
+            s.setAttribute('data-tip-pos', 'top');
+            return s;
+        };
+        line.appendChild(kv('输入', ptok, '实测 usage.prompt_tokens：服务器报告的这一轮输入 token 数'
+            + '（系统提示 + 文档上下文 + 对话历史 + 你这句话）。'));
+        line.appendChild(kv('输出', ctok, '实测 usage.completion_tokens：服务器报告的这一轮输出 token 数'
+            + '——下面「思考」那个数已经包含在这里面，不是另外加的。'));
+        if (rtok > 0) {
+            line.appendChild(kv('含思考', rtok, '实测 usage.completion_tokens_details.reasoning_tokens：'
+                + '上面「输出」里花在思考过程上的那部分。这正是等回复时你看不到、'
+                + '「显示思考过程」关掉时尤其容易被忽略的那部分开销，但它是真花掉的 token。'));
+        }
+        if (ttok > 0) {
+            line.appendChild(kv('合计', ttok, '实测 usage.total_tokens：服务器自己报告的输入+输出合计。'));
+        }
+        box.appendChild(line);
+    } catch (e) {}
+}
+
 // 助手气泡里的正文。**先 escapeHtml，再 marked.parse**，刻意不走 renderFormattedText：
 //   · escapeHtml 是本文件对「往 HTML 里塞不受控文本」的既有约定（见 escapeAttr 上方的注释），
 //     而气泡里装的是模型自由生成的文本。实测不转义时，回复里的
@@ -11666,12 +11821,16 @@ async function chatSend() {
         ChatState.abort = controller;
         chatSetBusy(true);
 
-        pendingRow = chatAppendRow('system', '思考中… 0.0s');
+        // C8：「正在处理」指示器。**不受「显示思考过程」开关影响**——那个开关只管思考正文
+        // 显不显示，这里画的是「请求还在飞、我还活着」，两回事。页面上只允许有这一个活跃计时器：
+        // chatStop()（上面已经调过）会让上一轮的 killPending 先跑，所以这里起的永远是唯一一个。
+        const pending = chatAppendPendingRow();
+        pendingRow = pending ? pending.row : null;
         const t0 = Date.now();
         tick = setInterval(function () {
             try {
-                const b = chatBubbleOf(pendingRow);
-                if (b) b.textContent = '思考中… ' + ((Date.now() - t0) / 1000).toFixed(1) + 's';
+                // 只改这一个节点的 textContent —— 动画是纯 CSS，interval 不摸它。
+                if (pending && pending.timeEl) pending.timeEl.textContent = ((Date.now() - t0) / 1000).toFixed(1) + 's';
             } catch (e) {}
         }, CHAT_TICK_MS);
 
@@ -11815,7 +11974,7 @@ function chatRenderAssistant(raw, meta) {
 
     // 正文为空 + 有推理 = 推理吃光了预算。这是本地模型最典型的一种「什么都没返回」。
     if (!String(raw || '').trim()) {
-        chatErrorRow('对话', m.thinking
+        const errRow = chatErrorRow('对话', m.thinking
             ? '模型把 token 预算全用在推理上了，正文是空的。到「设置 → 模型」把该模型的「推理」设为「关」再试。'
             : '模型返回了空正文。');
         // 推理内容仍然给出来（诊断用），但没有推理时不要留一条空行。
@@ -11828,6 +11987,9 @@ function chatRenderAssistant(raw, meta) {
             try { chatAppendThinking(diag, record.reasoning, record.reasoningTokens); }
             finally { ChatState.showThinking = keep; }
         }
+        // C8：这正是「输出全花在思考上」的例证——用量行会直接把 reasoning_tokens 摆在
+        // 「输出」旁边，用户不用猜 token 去哪了。
+        chatAppendUsageLine(errRow, m);
         ChatState.messages.push(record);
         chatUpdateBar();
         chatScrollToBottom();
@@ -11837,10 +11999,11 @@ function chatRenderAssistant(raw, meta) {
     const row = chatAppendRow('assistant', '');
     const bubble = chatBubbleOf(row);
     if (bubble) chatRenderProse(bubble, parsed.prose || String(raw));
-    // 顺序要点：先画正文，再把思考区**插到最前面**，最后把「复制答案」追加到末尾。
+    // 顺序要点：先画正文，再把思考区**插到最前面**，然后「复制答案」，最后「本轮用量」。
     chatAppendThinking(row, record.reasoning, record.reasoningTokens);
     // 复制的永远是 parsed.prose（来自 message.content），和思考区读的是两个不同的字段。
     chatAppendCopyAnswer(row, parsed.prose || String(raw));
+    chatAppendUsageLine(row, m);
 
     if (m.truncated) {
         chatAppendRow('system', '⚠ 这条回复被 token 上限截断了（finish_reason=length），下面的内容是半截的。');
@@ -12647,7 +12810,8 @@ function chatBindParamBar(box) {
 //   data: {... "delta":{"reasoning_content":"'s"} ...}          ← 思考先流完
 //   data: {... "delta":{"content":"OK"} ...}                    ← 然后才是答案，**另一个字段**
 //   data: {... "delta":{}, "finish_reason":"stop"|"length" ...}
-//   data: {... "choices":[], "usage":{...completion_tokens_details.reasoning_tokens...} ...}
+//   data: {... "choices":[], "usage":{"prompt_tokens":N,"completion_tokens":N,"total_tokens":N,
+//          "completion_tokens_details":{"reasoning_tokens":N}} ...}   ← C8 也从这一帧取这四个数
 //   data: [DONE]
 // 两个通道天生分开 ⇒ 思考区和答案气泡各自流各自的，**零解析启发式**。
 //
@@ -12674,7 +12838,7 @@ async function chatStreamLocal(config, messages, signal, meta, req, sink) {
         }
     } catch (e) { effortSent = ''; }
 
-    let text = '', reasoning = '', finish = '', rtok = 0, ptok = 0, aborted = false;
+    let text = '', reasoning = '', finish = '', rtok = 0, ptok = 0, ctok = 0, ttok = 0, aborted = false;
     const finishUp = function () {
         if (meta) {
             meta.text = text;
@@ -12689,6 +12853,10 @@ async function chatStreamLocal(config, messages, signal, meta, req, sink) {
             // C6：实测输入 token。流式下它在**最后一帧**（choices:[] + usage）才到，
             // 所以中止时通常是 0 —— 0 就当作「这一轮没量到」，环退回估算，不许拿 0 当实测。
             meta.promptTokens = ptok;
+            // C8：同一最后一帧里的输出侧两个数，同样只在收全时才非零——中止时通常也是 0，
+            // 用量行会照 chatAppendUsageLine 的规矩显示"本轮未提供用量"，不去凑一个数字。
+            meta.completionTokens = ctok;
+            meta.totalTokens = ttok;
         }
         // 被动探测，和 callLocalLLM 里那一次同样的语义：第三个参数说明「这一次到底要没要推理」，
         // 免得对话开着推理、翻译关着推理时弹出一条「没人要求它却在推理」的假警报。
@@ -12747,6 +12915,8 @@ async function chatStreamLocal(config, messages, signal, meta, req, sink) {
                     const det = (j && j.usage && j.usage.completion_tokens_details) || null;
                     if (det && typeof det.reasoning_tokens === 'number') rtok = det.reasoning_tokens;
                     if (j && j.usage && typeof j.usage.prompt_tokens === 'number') ptok = j.usage.prompt_tokens;
+                    if (j && j.usage && typeof j.usage.completion_tokens === 'number') ctok = j.usage.completion_tokens;
+                    if (j && j.usage && typeof j.usage.total_tokens === 'number') ttok = j.usage.total_tokens;
                 }
             }
             if (done) break;
@@ -13030,9 +13200,20 @@ function chatRowProposalBase(edit) {
             + '无据可依的改动一律不给「应用」按钮 —— 已丢弃。想改这一行，先让它进入文档窗口范围再问一次。');
         return null;
     }
-    if (edit.side !== 'src' && edit.side !== 'tgt') {
-        chatAppendRow('error', '模型没有写 side=src 或 side=tgt。替用户猜该覆盖哪一侧是不允许的 —— '
-            + '已丢弃，没有「应用」按钮。');
+    // C7（对话上下文收窄）：side 只接受 src。这个工具现在只能改左栏的原文；
+    // 译文是翻译结果，不是用户在编辑的对象。side=tgt 和「没写 side」是两种不同的错，
+    // 分开说清楚 —— 前者是模型明确想改译文（用户最容易被这条误伤，必须说明白为什么被拒），
+    // 后者是模型没写全（老的那句提示照旧适用）。两种都不给「应用」按钮，卡片上都说明原因，
+    // 不是静默丢弃。
+    if (edit.side !== 'src') {
+        if (edit.side === 'tgt') {
+            chatAppendRow('error', '模型给出的修改标的是 side=tgt（译文），但这个工具现在只能改'
+                + '左栏的原文——译文是原文重新翻译之后的结果，不接受直接改写。已丢弃，没有「应用」按钮。'
+                + '想让译文变，请先把这一行原文改对，再重新翻译这一句。');
+        } else {
+            chatAppendRow('error', '模型没有写 side=src。替用户猜要不要改是不允许的 —— '
+                + '已丢弃，没有「应用」按钮。');
+        }
         return null;
     }
     const pairs = AppState.translationPairs;
@@ -13049,7 +13230,7 @@ function chatRowProposalBase(edit) {
             + '已丢弃，没有「应用」按钮 —— 请再问一次，下一轮会把改过之后的文档重新发过去。');
         return null;
     }
-    const base = edit.side === 'src' ? liveSrc : liveTgt;
+    const base = liveSrc;
     return {
         rowIndex: idx, side: edit.side, start: 0, end: base.length, text: base,
         baseAtCapture: base, rowSrcAtCapture: liveSrc, rowTgtAtCapture: liveTgt, wholeRow: true
@@ -13541,16 +13722,18 @@ function chatFmtNum(n) {
 }
 
 // —— 文档块 ——
-// 行号写成 [n]，两侧都给。用户说「第 3 行的 xxx 改成 yyy」，模型就能回一个 row=3 的修改块 ——
+// C7（对话上下文收窄）：只给**原文**（左栏，被翻译的那一侧），**不给译文**。
+// 用户的原话是「只关联左边的输入内容」——译文是翻译的结果，不是用户在编辑的东西，
+// 混进上下文只会让「改这一句」这种指令有时候悄悄落到译文头上。
+// 行号写成 [n]。用户说「第 3 行的 xxx 改成 yyy」，模型就能回一个 row=3 的修改块 ——
 // 这就是「附加从此可选」的全部机制。
-// 信封是纯文本，**不是 JSON**：两侧都可能含反斜杠，而 JSON 字符串搬运正是这个项目里
+// 信封是纯文本，**不是 JSON**：原文里可能含反斜杠，而 JSON 字符串搬运正是这个项目里
 // 把 \ref 变成 CR+ef、把 \textcolor 变成 TAB+extcolor 的那台绞肉机。
 function chatDocBody(pairs, from, to) {
     const lines = [];
     for (let i = from; i <= to; i++) {
         const p = pairs[i - 1] || {};
         lines.push('[' + i + '] 原文：' + chatEscapeDelims(String(p.src == null ? '' : p.src)));
-        lines.push('[' + i + '] 译文：' + chatEscapeDelims(String(p.tgt == null ? '' : p.tgt)));
     }
     return lines.join('\n');
 }
@@ -13558,9 +13741,10 @@ function chatDocBody(pairs, from, to) {
 function chatDocFrame(body, from, to, total, windowed) {
     const head = '==DOC rows=' + from + '-' + to + ' total=' + total + '=='
         + '\n本轮上下文：第 ' + from + '–' + to + ' 行（共 ' + total + ' 行）。'
+        + '这是**待翻译的原文**，只有原文，没有译文——你看不到、也不知道用户译成了什么。'
         + (windowed
             ? '⚠ 这一份是**截断过的窗口**，范围之外的行你没有看到，被问到时请直说没看到，不要推测。'
-            : '这是整篇已翻译的文档，一行不缺。')
+            : '这是整篇待翻译的原文，一行不缺。')
         + '\n';
     return head + body + '\n==DOCEND==';
 }
@@ -13836,8 +14020,9 @@ function chatUpdateBar() {
         const doc = ro.assembled.doc;
 
         const ctxTip = ChatState.autoContext
-            ? '开着：每一轮都把**整篇已翻译的文档**按 [行号] 重新生成一遍发过去（不是存下来的旧副本）。'
-              + '所以压缩之后文档还在、清理之后第一轮就带全文、重译之后带的是新文档。'
+            ? '开着：每一轮都把**左栏整篇原文**（只有原文，没有译文——模型看不到译文）按 [行号] '
+              + '重新生成一遍发过去（不是存下来的旧副本）。'
+              + '所以压缩之后原文还在、清理之后第一轮就带全文、重译之后带的是新原文。'
               + '关掉之后 ==DOC== 文档块和 ==FOCUS== 关注块都不再发；但**窗口里已有的对话轮次照旧会发**，'
               + '而模型早先的回答里可能引用过你的原文 —— 要连那些一起断掉得再点「清理」。'
             : '关着：这一轮既不发 ==DOC== 文档块，也不发 ==FOCUS== 关注块（关注条目带的就是稿子原文，'
@@ -13908,7 +14093,7 @@ function chatSetAutoContext(on) {
         chatParamsSave();
         chatUpdateBar();
         chatAppendRow('system', on
-            ? '已打开文档上下文：从这一轮起，每次提问都会把整篇已翻译的内容（按 [行号] 编号）一并发过去。'
+            ? '已打开文档上下文：从这一轮起，每次提问都会把左栏整篇原文（按 [行号] 编号，不含译文）一并发过去。'
             : '已关闭文档上下文：从这一轮起不再发送 ==DOC== 文档块，也不再发送 ==FOCUS== 关注块'
               + '（关注条目带的就是稿子原文，它跟着这个开关走）。'
               + '⚠ 但**已经在窗口里的对话轮次照旧会发**，而模型早先的回答里可能引用过你的原文'
@@ -14689,8 +14874,9 @@ function ensureChatRoot() {
         chatAppendRow('system', '对话窗已就绪。拖标题栏移动；四条边和四个角都能拖着改大小（和 Windows 的窗口一样，'
             + '拖左边或上边时对面那条边钉住不动），手动调过的尺寸之后一直作数。'
             + '标题栏右上角从左到右是「+ 新建对话」「− 最小化到后台」「× 关闭」。'
-            + '想让我改某一段：在左栏或右栏那一行点「附到对话」（编辑态下先选中一段就只附那一段），'
-            + '我会给出前后对照，改动只有你点「应用」才会写进文档。');
+            + '左栏（原文）的内容每一轮都会自动带给我；想让我额外留意某一行或某一段，'
+            + '勾左栏行上、或选词弹窗里的「关注」复选框即可。直接说「第 N 行……」告诉我要改哪里，'
+            + '我会给出前后对照，改动只有你点「应用」才会写进文档 —— 这个工具现在只能改左栏的原文，不会碰右栏的译文。');
         return rootEl;
     } catch (e) {
         console.error('[chat] ensureChatRoot failed', e);
