@@ -118,10 +118,23 @@ body.is-resizing-settings-modal * {
    父元素带 data-tip、子元素带 title 同样会双出（:hover 会冒泡到父级），所以
    两者在 DOM 上不允许存在祖先—后代关系。
 
-   延迟 0.3s 才浮出：鼠标划过工具栏时不会一路炸出一串气泡。 */
+   延迟 0.3s 才浮出：鼠标划过工具栏时不会一路炸出一串气泡。
+
+   ⚠️ 隐藏态必须是 display:none，**不能**是 visibility:hidden。
+   visibility:hidden 的盒子仍然占布局，绝对定位的它照样计进最近那个滚动容器的
+   scrollWidth/scrollHeight —— 每一个 data-tip 都在给祖先偷偷加宽。实测（设置弹窗
+   「编辑与历史」页，一次渲染就有 70 个 data-tip）：
+     · 1440px 视口：settingsScrollArea scrollWidth 769 / clientWidth 763 → 弹窗常驻一条横向滚动条；
+     · 415px 视口：页签条 389 / 327，弹窗面板溢出 42px，文档级横向溢出里有 34px 是它们贡献的。
+   把 6 / 62 / 42 / 34 一次性清零的唯一根因修法，就是让这些气泡压根不参与布局。
+   代价是 display 不能做补间，所以「悬停 0.3s 后才浮出」改用 animation 复刻：
+   display:none → block 时 transition 没有起始帧不会跑，animation 会跑，
+   而 fill-mode:both 让 0.3s 延迟期间一直停在 opacity:0（= 原来那 0.3s 空窗）。
+   唯一的行为差异：移开鼠标时气泡立即消失，不再有 0.12s 淡出。 */
 [data-tip] { position: relative; }
 [data-tip]::after {
     content: attr(data-tip);
+    display: none;
     position: absolute;
     z-index: 2147483000;
     left: 50%;
@@ -145,16 +158,16 @@ body.is-resizing-settings-modal * {
     white-space: normal;
     word-break: break-word;
     box-shadow: 0 8px 20px -6px rgba(15, 23, 42, 0.45);
-    opacity: 0;
-    visibility: hidden;
     pointer-events: none;   /* 气泡自己绝不吃鼠标事件，不会挡住底下的按钮 */
-    transition: opacity 0.12s ease 0.3s, visibility 0s linear 0.42s;
 }
 [data-tip]:hover::after,
 [data-tip]:focus-visible::after {
-    opacity: 1;
-    visibility: visible;
-    transition: opacity 0.12s ease 0.3s, visibility 0s linear 0.3s;
+    display: block;
+    animation: data-tip-fade-in 0.12s ease 0.3s both;
+}
+@keyframes data-tip-fade-in {
+    from { opacity: 0; }
+    to   { opacity: 1; }
 }
 /* 空 data-tip 一律不出气泡（防止某个分支算出空串时浮出一个黑色小方块） */
 [data-tip=""]::after { content: none; }
@@ -244,7 +257,7 @@ body.is-resizing-settings-modal * {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '01.02.00';        // APP_VERSION_STAMP
+const APP_VERSION = '01.03.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-08-19';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -447,7 +460,7 @@ const SETTINGS_TABS = [
     { id: 'api',     label: 'API',       tip: '各家模型的 API Key、Claude 代理地址、本地 LM Studio 地址都在这一页。翻译发不出去、报 401/CORS 时先来这里。' },
     { id: 'models',  label: '模型',      tip: '决定顶栏模型下拉里出现哪些模型：从各家 API 拉最新列表、搜索、按厂商勾选。下拉里找不到某个模型就来这里勾上。' },
     { id: 'display', label: '显示',      tip: '只影响界面观感，不影响翻译结果：句对行距、设置弹窗宽度。' },
-    { id: 'editing', label: '编辑与历史', tip: '选词弹窗默认功能、Grammar/Simplify 的自定义提示词、自动保存间隔、历史保留条数。' }
+    { id: 'editing', label: '编辑与历史', tip: '翻译传输协议、选词弹窗默认功能、Grammar/Simplify 的自定义提示词、自动保存间隔、历史保留条数。' }
 ];
 // 脏值一律回落第一页。所有读 settingsTab 的地方都要过这个函数，渲染路径才不会拿到未知键。
 function normalizeSettingsTab(tab) {
@@ -577,6 +590,15 @@ const AppState = {
     modelGroupExpanded: { gemini: false, openai: false, claude: false }, // Settings 弹窗里「展开了哪几家」；刻意不落 localStorage，每次开弹窗都回到折叠
     settingsTab: SETTINGS_TABS[0].id, // Settings 弹窗当前页签（持久化到 localStorage['settingsTab']，关弹窗/刷新都记得）
     rowGap: ROW_GAP_DEFAULT,          // 句对行距（px），左右两栏共用；持久化到 localStorage['rowGap']
+
+    // 哨兵传输协议总开关（详见 translateViaSentinel 上方的大段注释）。
+    // 持久化到 localStorage['sentinelTransport']；关掉 = 逐字回到旧的 JSON 协议。
+    // 只对 local / gemini 两条**已实测**链路生效，OpenAI / Claude 永远走旧协议。
+    sentinelTransport: true,
+    // 上一次翻译里有几段落进了失败标记。>0 时 handleTranslate / handleRegenerateAll
+    // 会弹一次 toast 明确告知；本字段留着给排查用（失败的那几行自己也带可见标记）。
+    // 刻意**不**进渲染模板：渲染路径没有 try/catch，能不碰就不碰。
+    lastTransportFailures: 0,
 
     // ---- 跨栏对应高亮（选中一侧，另一侧同时高亮出对应片段）----
     crossHighlightEnabled: true,      // 总开关，「显示」页可关；持久化到 localStorage['crossHighlightEnabled']
@@ -1812,7 +1834,7 @@ const OPENAI_API_BASE = "https://api.openai.com/v1/chat/completions";
 const CLAUDE_API_BASE = "https://api.anthropic.com/v1/messages";
 
 // ============= 本地LLM调用（OpenAI兼容）=============
-async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal = null) {
+async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal = null, meta = null) {
     const body = {
         model: model || "local-model",
         messages: messages,
@@ -1842,6 +1864,9 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
         }
 
         const data = await response.json();
+        // 可选出参：把 finish_reason 交给调用方。'length' = 输出被 token 上限**截断**，
+        // 返回的正文是半截的。不传 meta 的调用方逐字不受影响。
+        if (meta) meta.truncated = (data.choices?.[0]?.finish_reason === 'length');
         return data.choices?.[0]?.message?.content || "";
     } catch (error) {
         if (error.name === 'AbortError') throw error;
@@ -2143,7 +2168,7 @@ function parseJsonResponse(text) {
 }
 
 // ============= Gemini API调用 =============
-async function callGeminiAPI(model, contents, config = {}, apiKey = null, signal = null) {
+async function callGeminiAPI(model, contents, config = {}, apiKey = null, signal = null, meta = null) {
     if (!apiKey) {
         throw new Error("Gemini API Key not configured. Please add your API key in Settings.");
     }
@@ -2182,6 +2207,8 @@ async function callGeminiAPI(model, contents, config = {}, apiKey = null, signal
     }
 
     const data = await response.json();
+    // 同 callLocalLLM：MAX_TOKENS = 输出被上限截断，正文是半截的。不传 meta 就没有任何变化。
+    if (meta) meta.truncated = (data.candidates?.[0]?.finishReason === 'MAX_TOKENS');
     return data.candidates?.[0]?.content?.parts?.[0]?.text || "";
 }
 
@@ -2463,12 +2490,713 @@ function stripTextColorForModel(input) {
     }
 }
 
+// ==========================================================================
+// ============= 哨兵传输协议（把原文从 JSON 字符串字面量里搬出来）=============
+// ==========================================================================
+//
+// 【为什么非改不可】现行协议要求模型把原文和译文都塞进一个 JSON 字符串里回来。
+// 反斜杠在 JSON 字符串里必须转义，而模型在**同一个字符串内部**都做不到一致。实测
+// （261 条真实服务器日志 + 应用内对照）出现两种后果：
+//   · 静默损坏（最危险）：\textcolor → TAB + "extcolor"、\ref → CR + "ef"、
+//     \nu/\neq/\begin/\beta/\frac 同理。它们都是**合法**的 JSON 转义，JSON.parse
+//     一声不吭，界面上不报错，用户只能靠肉眼发现自己的公式没了。
+//   · 硬失败：非法转义 → "Bad escaped character in JSON" → 报错横幅 + 零产出。
+// 分模型剖面：qwen3-1.7b 硬失败 37.7%、已解析结果里 12.6% 静默损坏；
+// qwen3.6-35b 硬失败 0；gemini-2.5-flash-lite 硬失败 0 但**照样静默吃掉 \ref/\cite**
+// —— 它是本应用的默认模型，也是最危险的那个，因为它永远不报错。
+// 语法约束解码（Gemini responseSchema）只能消掉「硬失败」，静默损坏原样保留。
+// 提示词也治不了：模型在一个字符串里就自相矛盾。
+//
+// 【怎么改】客户端自己分段 → 每段前加一行 @@n@@ 哨兵 → 数学/引用/交叉引用换成
+// [[k]] 占位符 → 按下标配对 → **不要求模型回显原文**。载荷全程是纯文本，
+// 一个 JSON 字符串字面量都不经过，转义问题从根上不存在。副产品：输出 token 减半，
+// 实测 35B 上数学段落中位耗时 11009ms → 4524ms，7862 字大输入 48.8s → 13.2s。
+//
+// 【上一版被否掉的九条，这里逐条堵住】
+//   ①从陈旧基线分叉 → 本版直接长在 HEAD 上，只增不改；
+//   ②整段全有或全无 → 逐段失败阶梯 + 逐段失败标记，绝不因为一段拖垮整批；
+//   ③失败还改写输入框 → 本路径一个字都不碰 AppState.inputText；
+//   ④遮罩漏跨行行内数学 → 改用字符级扫描器（不是正则），并按 main.tex 全量标定；
+//   ⑤哨兵/占位符语法带内未转义 → 原文里出现的 [[k]] / @@n@@ 一律**也**当受保护
+//     token 收进 map，模型永远看不到裸语法，还原时逐字回填；
+//   ⑥后批失败销毁前批好译文 → 结果数组一次性交付，任何失败都只影响它自己那一段；
+//   ⑦历史恢复后重新生成覆盖归档 → 见 handleRegenerateAll 的一致性确认；
+//   ⑧粒度从句退化到段 → 复用 HEAD 的 findSentenceBoundaries，**按句**切分；
+//   ⑨Gemini 分支没测 → 本版 Gemini 已实测（见 tests/transport/）。
+//
+// 【实测推翻的两条旧结论，别再写回去】
+//   · 批次大小必须按 /api/v0/models 报的 loaded_context_length 现算，不能按配置上限。
+//     上下文是**加载期**参数，LM Studio 重启就回落 4096。
+//   · 占位符丢失不是独立随机事件，是**确定性**的：qwen3-1.7b 在同一段 equation 上
+//     6/6 孤立试验 + 3/3 应用内运行丢的都是同一批 token。所以重试阶梯的每一级都必须
+//     **改变请求内容**（孤立 → 拆段 → 退回旧协议），重发同样的请求不可能收敛。
+//
+// 全套函数只在事件处理链上跑，不在渲染路径上；且除了 network 调用之外不抛异常。
+
+// 单段失败时写进译文栏的可见标记。绝不留空、绝不静默塞回原文 —— 用户必须一眼看见。
+const XPORT_FAIL_MARK = '⚠️ 本段翻译失败——请点击本行的 ↻ 单独重试';
+
+// 这些环境整体不可拆：内部出现空行会让 amsmath 编译报错，所以段落切分切不开它们。
+const XPORT_MATH_ENVS = ['equation', 'align', 'alignat', 'flalign', 'eqnarray', 'gather',
+    'multline', 'IEEEeqnarray', 'cases', 'dcases', 'split', 'array', 'smallmatrix',
+    'matrix', 'pmatrix', 'bmatrix', 'Bmatrix', 'vmatrix', 'Vmatrix', 'subequations',
+    'displaymath', 'math'];
+
+// 「不透明」命令：花括号里装的不是正文，翻译它等于破坏它。其余命令（\textbf/\emph/\caption…）
+// 刻意**不**进这个表 —— 它们的花括号里是人话，遮起来会让那段话永远不被翻译。
+const XPORT_OPAQUE_RE = /^\\(?:[a-zA-Z]*[Cc]ite[a-zA-Z]*|ref|eqref|autoref|cref|Cref|cpageref|pageref|vref|nameref|url|nolinkurl|path|href|label|includegraphics|input|include|bibliography|bibliographystyle|usepackage|documentclass|begin|end|hspace|vspace|hphantom|vphantom|phantom|setlength|linespread|newcommand|renewcommand|def)\*?(?![a-zA-Z@])/;
+
+const XPORT_MATH_MAX = 4000;      // 一个数学 token 的字符上限，防止一个孤立 $ 把整段吞掉
+const XPORT_SEG_SOFT_MAX = 6000;  // 超过就按换行再切，避免单段撑爆上下文
+
+// 与 text[open]（必须是 '{'）配对的 '}' 的**后一位**下标；不配平返回 -1
+function xportMatchBrace(text, open, limit) {
+    let depth = 0;
+    const end = Math.min(text.length, open + (limit || 2000));
+    for (let p = open; p < end; p++) {
+        const c = text[p];
+        if (c === '\\') { p++; continue; }
+        if (c === '{') depth++;
+        else if (c === '}') { depth--; if (depth === 0) return p + 1; }
+    }
+    return -1;
+}
+
+// text[i] 起是不是一个「受保护 token」？是就返回它的字符长度，不是返回 0。
+// 纯函数、不抛、只读；上限全部有界，病态输入不会长时间阻塞。
+function xportProtectedSpan(text, i) {
+    const n = text.length;
+    const ch = text[i];
+    if (ch === undefined) return 0;
+
+    // (1) 协议自身的语法出现在原文里 —— 也当受保护 token 收走。
+    //     这就是「带内注入」的根治法：模型永远看不到裸的 [[k]] / @@n@@，
+    //     用户原文里的 [[3]] 会被原样还原，再也不会被截断或吃掉。
+    if (ch === '[' && text[i + 1] === '[') {
+        const m = /^\[\[\s*\d+\s*\]\]/.exec(text.slice(i, i + 20));
+        if (m) return m[0].length;
+    }
+    if (ch === '@' && text[i + 1] === '@') {
+        const m = /^@@\s*\d+\s*@@/.exec(text.slice(i, i + 20));
+        if (m) return m[0].length;
+    }
+
+    // (2) $…$ / $$…$$：**逐字符**扫，允许跨行（上一版用正则的 [^$\n]+ 漏掉了
+    //     main.tex 352 段里的 34 段），遇到 \ 直接跳两格，所以 \$ 不会被当成定界符。
+    if (ch === '$') {
+        const marker = (text[i + 1] === '$') ? '$$' : '$';
+        let p = i + marker.length;
+        while (p < n && p - i <= XPORT_MATH_MAX) {
+            if (text[p] === '\\') { p += 2; continue; }
+            if (text.startsWith(marker, p)) return p + marker.length - i;
+            p++;
+        }
+        return 0;   // 不配对：当普通字符放过，绝不吞掉半段正文
+    }
+
+    if (ch !== '\\') return 0;
+
+    // (2b) LaTeX 强制换行 \\ / \\* / \\[1pt]。main.tex 里 \\[1pt] 是唯一一处
+    //      「掩码之后仍然裸露在正文里的 LaTeX 语法」，收进来正好把覆盖率补满。
+    if (text[i + 1] === '\\') {
+        const br = /^\\\\\*?(?:[ \t]*\[[^\]\n]{0,24}\])?/.exec(text.slice(i, i + 40));
+        if (br) return br[0].length;
+    }
+
+    // (3) \[ … \] 与 \( … \)
+    if (text[i + 1] === '[') {
+        const c = text.indexOf('\\]', i + 2);
+        if (c !== -1 && c - i <= XPORT_MATH_MAX) return c + 2 - i;
+        return 0;
+    }
+    if (text[i + 1] === '(') {
+        const c = text.indexOf('\\)', i + 2);
+        if (c !== -1 && c - i <= XPORT_MATH_MAX) return c + 2 - i;
+        return 0;
+    }
+
+    const m = XPORT_OPAQUE_RE.exec(text.slice(i, i + 40));
+    if (!m) return 0;
+    let j = i + m[0].length;
+
+    // (4) \begin{数学环境} … \end{同名}：整体一个 token
+    if (m[0] === '\\begin' && text[j] === '{') {
+        const close = xportMatchBrace(text, j, 200);
+        if (close !== -1) {
+            const env = text.slice(j + 1, close - 1);
+            if (XPORT_MATH_ENVS.indexOf(env.replace(/\*$/, '')) !== -1) {
+                const endTok = '\\end{' + env + '}';
+                const e = text.indexOf(endTok, close);
+                if (e !== -1) return e + endTok.length - i;
+            }
+        }
+    }
+
+    // (5) 吃掉紧随其后的 [可选] / {必选} 参数组（同一行内，绝不跨行乱吞）
+    for (let guard = 0; guard < 6; guard++) {
+        let k = j;
+        while (k < n && (text[k] === ' ' || text[k] === '\t')) k++;
+        if (text[k] === '{') {
+            const c = xportMatchBrace(text, k, 2000);
+            if (c === -1) break;
+            j = c; continue;
+        }
+        if (text[k] === '[') {
+            const rb = text.indexOf(']', k);
+            if (rb === -1 || rb - k > 200) break;
+            j = rb + 1; continue;
+        }
+        break;
+    }
+    return j - i;
+}
+
+// 把一段原文变成 { text: 掩码后送给模型的文本, map: [被换走的原文片段…] }
+// 相邻 token（含仅隔一个 ~ 的）会合并成一个占位符：既保住了 ~，又直接降低占位符密度
+// —— 实测「占位符丢失是确定性的、且发生在密集处」，降密度是唯一有效的结构性缓解。
+function xportMask(seg) {
+    const text = String(seg == null ? '' : seg);
+    const n = text.length;
+    const map = [];
+    let out = '';
+    let i = 0;
+    let budget = n * 6 + 20000;   // 硬性工作量上限：任何输入都不可能死循环
+    while (i < n) {
+        if (--budget < 0) { out += text.slice(i); break; }
+        let len = xportProtectedSpan(text, i);
+        let start = i;
+        if (len === 0 && text[i] === '~') {
+            const t = xportProtectedSpan(text, i + 1);
+            if (t > 0) len = 1 + t;
+        }
+        if (len > 0) {
+            let end = start + len;
+            for (let guard = 0; guard < 500; guard++) {
+                let p = end;
+                if (text[p] === '~') p++;
+                const more = (p < n) ? xportProtectedSpan(text, p) : 0;
+                if (more <= 0) break;
+                end = p + more;
+            }
+            map.push(text.slice(start, end));
+            out += '[[' + map.length + ']]';
+            i = end;
+            continue;
+        }
+        if (text[i] === '\\') {
+            // 不在不透明表里的命令：命令名原样送给模型抄，参数里的正文照常翻译
+            const cm = /^\\[a-zA-Z@]+\*?/.exec(text.slice(i, i + 40));
+            if (cm) { out += cm[0]; i += cm[0].length; continue; }
+            out += text.slice(i, i + 2); i += 2; continue;   // \% \$ \& \_ \\ 等转义序列
+        }
+        out += text[i]; i++;
+    }
+    return { text: out, map: map };
+}
+
+// 还原：**一次扫描**完成，绝不迭代替换 —— 否则还原出来的内容里如果本身含 [[2]]
+// （用户原文就写了这个），下一轮会把它当占位符再替换一次，正是第 5 条要堵的洞。
+function xportUnmask(body, map) {
+    return String(body).replace(/\[\[\s*(\d+)\s*\]\]/g, function (whole, d) {
+        const k = parseInt(d, 10);
+        return (k >= 1 && k <= map.length) ? map[k - 1] : whole;
+    });
+}
+
+// 「丢、多、改号、写坏、串段、控制字符」六类损坏一次判掉。
+// 不通过 = 进重试阶梯，绝不静默入库 —— 这是整个改动的安全底线。
+function xportBlockOk(body, map) {
+    if (typeof body !== 'string') return false;
+    const t = body.trim();
+    if (t === '') return false;
+    if (/@@\s*\d+\s*@@/.test(t)) return false;                              // 哨兵漏进正文 = 段落串了
+    if (/[\x00-\x08\x0B\x0C\x0E-\x1F]/.test(t)) return false;   // 裸控制字符 = 反斜杠命令被吃掉
+    const seen = [];
+    for (let i = 0; i < map.length; i++) seen.push(0);
+    const re = /\[\[\s*(\d+)\s*\]\]/g;
+    let m, total = 0;
+    while ((m = re.exec(t))) {
+        total++;
+        const k = parseInt(m[1], 10);
+        if (!(k >= 1 && k <= map.length)) return false;
+        seen[k - 1]++;
+    }
+    if (total !== map.length) return false;
+    for (let i = 0; i < map.length; i++) if (seen[i] !== 1) return false;
+    return true;
+}
+
+// 容忍：<think>（含未闭合）、markdown 围栏、首个哨兵之前的任何前导废话、重复编号（先到先得）。
+// expectedCount === 1 且一个哨兵都没有时，把整段正文当作第 1 块 —— 这条专门堵
+// 「模型忘了写 @@1@@ 就让整段作废」的旧行为（第 2 条）。
+// truncated = 本次响应的 finish_reason 是 'length' / 'MAX_TOKENS'，即输出被 token 上限
+// 砍断。它有两个用处：① 最后一块必然是半截的，直接作废让它走阶梯（否则「砍在最后一个
+// [[k]] 之后」的半句话能通过全部完整性检查，被当成完整译文入库）；② 它是「块数少于段数」
+// 的**证据**，有它就说明少的那几块在尾巴上，没有它就得整批否决（见下）。
+function xportParseBlocks(raw, expectedCount, truncated) {
+    let t = String(raw == null ? '' : raw);
+    const closeIdx = t.lastIndexOf('</think>');
+    if (closeIdx !== -1) t = t.slice(closeIdx + 8);
+    else {
+        const openIdx = t.indexOf('<think>');
+        if (openIdx !== -1) t = t.slice(openIdx + 7);
+    }
+    t = t.replace(/```[a-zA-Z]*[ \t]*\n?/g, '').replace(/```/g, '');
+    const marks = [];
+    const re = /@@\s*(\d+)\s*@@/g;
+    let m;
+    while ((m = re.exec(t))) marks.push({ n: parseInt(m[1], 10), start: m.index, end: re.lastIndex });
+    const blocks = {};
+    for (let i = 0; i < marks.length; i++) {
+        const body = t.slice(marks[i].end, i + 1 < marks.length ? marks[i + 1].start : t.length).trim();
+        if (!(marks[i].n in blocks)) blocks[marks[i].n] = body;
+    }
+    if (marks.length === 0 && expectedCount === 1 && t.trim() !== '') blocks[1] = t.trim();
+
+    // ---- 编号归一 / 整批否决 ----
+    // 【为什么必须有这一段】故障注入实测：模型把编号整体 +1（从 @@2@@ 开始）时，
+    // 「按编号取 blocks[j+1]」会把**第 j 段的译文配到第 j+1 段**上。两段占位符个数
+    // 恰好相同（最常见的情况是都为 0）时，完整性检查一个字都察觉不到 —— 这正是
+    // 「静默损坏」，也是整个改动要根除的那一类。
+    // 规则：
+    //   · 恰好是 1..n            → 直接用（正常路径）
+    //   · 是连续区间但不从 1 开始 → 整体平移归一（块与段仍然一一对应）
+    //   · 编号有**明显缺口**（1,2,4,5…）→ 直接用（缺的那几段自己走阶梯）
+    //   · 1..k 前缀且 k<n         → 歧义：可能是「尾部漏了」，也可能是「中间漏了一段之后
+    //     整体重排号」。后者会让第 d 段之后的译文整体错位一行，而相邻两段占位符个数相同
+    //     （最常见是都为 0）时 xportBlockOk 一个字都察觉不到 = 静默损坏。
+    //     只有 truncated 能证明是前者；否则 **整批否决**。
+    //   · 其余（超出 n / 乱码）→ **整批否决**，宁可全走阶梯也绝不按位置猜
+    let result = blocks;
+    const nums = Object.keys(blocks).map(Number).filter(x => isFinite(x)).sort((a, b) => a - b);
+    if (nums.length > 0 && expectedCount > 0) {
+        const exact = nums.length === expectedCount && nums[0] === 1 && nums[nums.length - 1] === expectedCount;
+        if (!exact) {
+            let consecutive = nums.length === expectedCount;
+            for (let i = 1; consecutive && i < nums.length; i++) if (nums[i] !== nums[i - 1] + 1) consecutive = false;
+            if (consecutive) {
+                const shifted = {};
+                for (let i = 0; i < nums.length; i++) shifted[i + 1] = blocks[nums[i]];
+                result = shifted;
+            } else if (nums[0] < 1 || nums[nums.length - 1] > expectedCount) return {};
+            else if (!truncated && nums[nums.length - 1] === nums.length) return {};
+        }
+    }
+    // 被截断时，编号最大的那一块是**半截**的：作废它，让那一段走恢复阶梯。
+    if (truncated) {
+        const ks = Object.keys(result).map(Number).filter(x => isFinite(x));
+        if (ks.length) {
+            let mx = ks[0];
+            for (let i = 1; i < ks.length; i++) if (ks[i] > mx) mx = ks[i];
+            delete result[mx];
+        }
+    }
+    return result;
+}
+
+// 一段文本里所有「受保护区间」的 [start, end) 对，平铺成一个数组。
+// 扫描规则与 xportMask 逐字一致（含「不透明表外的命令按命令名跳过」那条），
+// 所以这里算出来的区间就是 xportMask 稍后一定会整体收走的那些片段。
+// 【为什么必须有】xportSegments 先按句切、xportMask 后遮罩。equation 体里的一个句号
+// （`\right].` 这类）会把 \begin{equation} 和 \end{equation} 切到两段去，
+// xportProtectedSpan 第 (4) 条再也匹配不上，整个公式体就**裸着**送给模型 ——
+// 而那一段一个占位符都没有，xportBlockOk 便什么都查不出来。这是「静默损坏」的
+// 最后一个入口，堵法是：句末落在受保护区间内部时不许切。
+function xportProtectedRanges(text) {
+    const s = String(text == null ? '' : text);
+    const n = s.length;
+    const out = [];
+    let budget = n * 6 + 20000;   // 与 xportMask 同样的硬性工作量上限
+    let i = 0;
+    while (i < n) {
+        if (--budget < 0) break;
+        const len = xportProtectedSpan(s, i);
+        if (len > 0) { out.push(i, i + len); i += len; continue; }
+        if (s[i] === '\\') {
+            const cm = /^\\[a-zA-Z@]+\*?/.exec(s.slice(i, i + 40));
+            i += cm ? cm[0].length : 2;   // 与 xportMask 一致：\$ \% 这类转义整体跳过
+            continue;
+        }
+        i++;
+    }
+    return out;
+}
+
+// 位置 pos 落在任何一个受保护区间**内部**（两端不算）就不能在这里下刀
+function xportCutAllowed(ranges, pos) {
+    for (let r = 0; r < ranges.length; r += 2) {
+        if (pos > ranges[r] && pos < ranges[r + 1]) return false;
+    }
+    return true;
+}
+
+// 文档级：\begin{数学环境} … \end{同名} 占的区间（配对方式与 xportProtectedSpan 第 (4)
+// 条逐字一致，所以「切不开的地方」和「掩码要整体收走的地方」永远是同一批）。
+// 【为什么段落切分也要它】amsmath 环境内部出现空行本来就是编译错误，所以环境里的空行
+// 绝不是作者的分段意图。而现实里它天天出现：main.tex 里 `\textcolor{blue}{` 独占一行，
+// 传输期剥离颜色宏之后**那一行就变成了空行**，equation 于是被空行切成两半，
+// \begin 和 \end 落到不同段，掩码再也匹配不上，整段公式体裸着送给模型 —— 而它一个
+// 占位符都没有，xportBlockOk 什么都查不出来。
+function xportEnvRanges(text) {
+    const s = String(text == null ? '' : text);
+    const out = [];
+    const re = /\\begin\{([A-Za-z]+\*?)\}/g;
+    let m, guard = 0;
+    while ((m = re.exec(s)) && ++guard < 20000) {
+        if (XPORT_MATH_ENVS.indexOf(m[1].replace(/\*$/, '')) === -1) continue;
+        const endTok = '\\end{' + m[1] + '}';
+        const e = s.indexOf(endTok, re.lastIndex);
+        if (e === -1) continue;                 // 没配对：当普通正文放过，绝不吞掉后面整篇
+        out.push(m.index, e + endTok.length);
+        re.lastIndex = e + endTok.length;       // 跳过内层环境，顺带把扫描成本压成线性
+    }
+    return out;
+}
+
+// 分段：段落（空行）→ 句子（复用 HEAD 那套受保护掩码 + 缩写词表的句末识别）。
+// **按句**而不是按段，是第 8 条要求：逐句编辑 / 逐句重生成 / 同义词弹窗 / 跨栏高亮
+// 的精度全部建立在「一行 = 一句」上，退化到段会把它们一起拖下水。
+function xportSegments(text) {
+    const src = String(text == null ? '' : text);
+    const out = [];
+    // 段落 = 空行分隔，但**落在数学环境内部的空行不算**（见 xportEnvRanges）。
+    // envs 为空时这段逐字等价于原来的 src.split(/\n[ \t]*\n+/)。
+    const envs = xportEnvRanges(src);
+    const paras = [];
+    const psplit = /\n[ \t]*\n+/g;
+    let pLast = 0, pm;
+    while ((pm = psplit.exec(src))) {
+        if (!xportCutAllowed(envs, pm.index)) continue;
+        paras.push(src.slice(pLast, pm.index));
+        pLast = psplit.lastIndex;
+    }
+    paras.push(src.slice(pLast));
+    for (let p = 0; p < paras.length; p++) {
+        const para = paras[p];
+        if (!para.trim()) continue;
+        let ends;
+        try { ends = findSentenceBoundaries(para); } catch (e) { ends = []; }
+        const ranges = xportProtectedRanges(para);
+        if (ranges.length) ends = ends.filter(e => xportCutAllowed(ranges, e));
+        let from = 0;
+        for (let k = 0; k <= ends.length; k++) {
+            const to = (k < ends.length) ? ends[k] : para.length;
+            if (to <= from) continue;
+            const piece = para.slice(from, to).trim();
+            from = to;
+            if (!piece) continue;
+            if (piece.length <= XPORT_SEG_SOFT_MAX) { out.push(piece); continue; }
+            // 单句就超长（整块 equation / 没有句号的表格）：按空行以外的换行再兜一刀。
+            // 这一刀同样不许落进受保护区间里面 —— 否则超长公式又会被从中间劈开。
+            const pranges = xportProtectedRanges(piece);
+            const lines = piece.split('\n');
+            let buf = '';
+            let off = 0;                       // buf 在 piece 里的起点
+            for (let li = 0; li < lines.length; li++) {
+                const cand = buf ? (buf + '\n' + lines[li]) : lines[li];
+                const cut = off + buf.length;  // 这一刀落在 piece 的哪个下标
+                if (cand.length > XPORT_SEG_SOFT_MAX && buf && xportCutAllowed(pranges, cut)) {
+                    out.push(buf); off = cut + 1; buf = lines[li];
+                }
+                else buf = cand;
+            }
+            if (buf.trim()) out.push(buf);
+        }
+    }
+    return out;
+}
+
+// 失败段的「再切一刀」：先按句，句只有一条就按换行，再不行按空格找中点。
+// 目的**不是**切得漂亮，而是让下一次请求的占位符密度和边界都与失败那次不同。
+function xportSplitSegment(seg) {
+    const s = String(seg == null ? '' : seg);
+    let parts = xportSegments(s);
+    if (parts.length > 1) return parts;
+    // 兜底的「硬切一刀」：刀口一律不许落进受保护区间。从中间切开一条 equation 等于把
+    // 整段数学裸着送出去，而切出来的两半一个占位符都没有，xportBlockOk 看不见任何异常。
+    // 找不到合法刀口就干脆不切，让阶梯直接走到第 3 级（旧协议），最差也只是回到改动前。
+    const ranges = xportProtectedRanges(s);
+    const nls = [];
+    for (let i = s.indexOf('\n'); i !== -1; i = s.indexOf('\n', i + 1)) if (xportCutAllowed(ranges, i)) nls.push(i);
+    if (nls.length > 0) {
+        const at = nls[Math.floor(nls.length / 2)];
+        const a = s.slice(0, at).trim(), b = s.slice(at + 1).trim();
+        if (a && b) return [a, b];
+    }
+    const half = Math.floor(s.length / 2);
+    let cut = s.indexOf(' ', half);
+    if (cut === -1 || cut >= s.length - 1) cut = s.lastIndexOf(' ', half);
+    if (cut > 0 && cut < s.length - 1 && xportCutAllowed(ranges, cut)) return [s.slice(0, cut).trim(), s.slice(cut + 1).trim()];
+    return [s];
+}
+
+function xportSystemPrompt(srcName, tgtName, provider) {
+    return (provider === 'local' ? '/no_think\n' : '') +
+`You are a professional academic translator. Translate ${srcName} into ${tgtName}.
+
+The user message contains numbered segments. Each segment starts with a line @@n@@.
+Tokens like [[1]] and [[2]] are protected placeholders standing for formulas,
+citations and cross-references.
+
+Rules:
+1. Reply with the SAME numbered blocks: a line @@n@@, then the ${tgtName} translation
+   of that segment. Nothing else.
+2. Do NOT repeat the source text.
+3. Keep every [[k]] token exactly as it is, in the place it belongs in the sentence.
+   Never delete, translate, renumber, zero-pad or duplicate a placeholder.
+4. Copy any remaining LaTeX command verbatim.
+5. Do not merge, split, reorder or skip segments. No commentary, no code fences.`;
+}
+
+// LM Studio 报的**加载期**上下文（不是配置上限）。拿不到就返回 0，调用方回落默认值。
+// 上下文是运行期参数、LM Studio 重启会回落 4096 —— 所以必须现问，不能写死。
+const xportCtxCache = new Map();
+async function xportLocalContext(baseUrl, model) {
+    const key = String(baseUrl) + '|' + String(model);
+    const hit = xportCtxCache.get(key);
+    if (hit && Date.now() - hit.at < 60000) return hit.ctx;
+    let ctx = 0;
+    try {
+        const url = String(baseUrl).replace(/\/$/, '') + '/api/v0/models';
+        const resp = await fetchWithTimeout(url, {}, 4000);
+        if (resp.ok) {
+            const data = await resp.json();
+            const list = (data && Array.isArray(data.data)) ? data.data : [];
+            for (let i = 0; i < list.length; i++) {
+                if (list[i] && list[i].id === model) {
+                    ctx = Number(list[i].loaded_context_length) || 0;
+                    break;
+                }
+            }
+        }
+    } catch (e) { ctx = 0; }
+    xportCtxCache.set(key, { ctx: ctx, at: Date.now() });
+    return ctx;
+}
+
+// 标定常数（tests/transport/calibrate.js 实测，两个模型各 4 个真实批次）：
+// 掩码后 1 个源字符的**往返** token 成本（prompt 里它自己 + completion 里它的译文）
+//   35B：0.526–0.559，均值 0.541 tok/char
+//   1.7b：0.524–0.562，均值 0.538 tok/char
+// 取 0.8 ≈ 最差实测值的 1.4 倍余量。**不要**再用「按 max_tokens 算余量」那套
+// —— 上下文是加载期参数，LM Studio 一重启就回落 4096，必须按现问到的值算。
+const XPORT_TOK_PER_CHAR_ROUNDTRIP = 0.8;
+const XPORT_CTX_USE = 0.35;       // 只用加载期上下文的 35%：批次之外还有系统提示与安全垫
+// 每批 8 段：tests/transport/sweep.js 在 qwen3-1.7b 上实测 4/8/12 段三档的首次通过率
+// 分别是 96.4% / 100% / 96.4%，总耗时几乎相同（13.7s / 13.0s / 13.1s）；35B 三档全 100%。
+// 8 是唯一两个模型都不掉块的档位，且请求数只有 4 段档的一半。
+const XPORT_SEGS_PER_BATCH = 8;
+async function xportLimits(config) {
+    if (config.provider !== 'local') {
+        // 在线模型上下文远大于任何一批，真正的约束是「一次让模型编号多少段还不出错」
+        return { chars: 5000, segs: XPORT_SEGS_PER_BATCH, ph: 60, recovery: 4 };
+    }
+    let ctx = 0;
+    try { ctx = await xportLocalContext(config.localBaseUrl, config.model); } catch (e) { ctx = 0; }
+    // 问不到就按「LM Studio 刚重启、上下文 4096」这个最坏情况算
+    if (!ctx) ctx = 4096;
+    const chars = Math.max(600, Math.min(8000, Math.floor(ctx * XPORT_CTX_USE / XPORT_TOK_PER_CHAR_ROUNDTRIP)));
+    return { chars: chars, segs: XPORT_SEGS_PER_BATCH, ph: 40, recovery: 8 };
+}
+
+// 装批：字符预算、段数、占位符数三条同时约束。任何一条超了就开新批。
+function xportPack(masked, limits) {
+    const batches = [];
+    let cur = [], chars = 0, ph = 0;
+    for (let i = 0; i < masked.length; i++) {
+        const len = masked[i].text.length;
+        const cnt = masked[i].map.length;
+        if (cur.length > 0 && (chars + len > limits.chars || cur.length >= limits.segs || ph + cnt > limits.ph)) {
+            batches.push(cur); cur = []; chars = 0; ph = 0;
+        }
+        cur.push(i); chars += len; ph += cnt;
+    }
+    if (cur.length > 0) batches.push(cur);
+    return batches;
+}
+
+async function xportRequest(items, srcName, tgtName, config, signal) {
+    const user = items.map((it, i) => '@@' + (i + 1) + '@@\n' + it.text).join('\n\n');
+    const sys = xportSystemPrompt(srcName, tgtName, config.provider);
+    const meta = {};   // 出参：finish_reason === 'length' / 'MAX_TOKENS' 时 meta.truncated = true
+    let raw;
+    if (config.provider === 'local') {
+        raw = await callLocalLLM(config.localBaseUrl, config.model,
+            [{ role: 'system', content: sys }, { role: 'user', content: user }], false, signal, meta);
+    } else {
+        raw = await callGeminiAPI(config.model, user,
+            { systemInstruction: sys, temperature: 0.3 }, config.geminiApiKey, signal, meta);
+    }
+    return xportParseBlocks(raw, items.length, meta.truncated === true);
+}
+
+// 阶梯最后一级：退回**现行 JSON 协议**翻这一段。结果最差也就等于今天的已知行为，
+// 不可能更糟；而只要哨兵协议成功，这一级根本不会被触发。
+async function xportLegacyOne(seg, srcName, tgtName, config, signal) {
+    const systemPrompt = `You are a professional academic translator.
+1. Split input into logical sentences/segments.
+2. Translate ${srcName} to ${tgtName}.
+3. Keep LaTeX math/citations intact.
+4. You MUST return ONLY valid JSON: {"translations": [{"src": "Original 1", "tgt": "Translated 1"}]}
+5. Do NOT include any text before or after the JSON.`;
+    let data;
+    if (config.provider === 'local') {
+        const r = await callLocalLLM(config.localBaseUrl, config.model,
+            [{ role: 'system', content: systemPrompt }, { role: 'user', content: seg }], false, signal);
+        data = parseJsonResponse(r);
+    } else {
+        const r = await callGeminiAPI(config.model, seg, {
+            systemInstruction: systemPrompt,
+            responseMimeType: 'application/json',
+            responseSchema: {
+                type: "OBJECT",
+                properties: {
+                    translations: {
+                        type: "ARRAY",
+                        items: { type: "OBJECT", properties: { src: { type: "STRING" }, tgt: { type: "STRING" } }, required: ["src", "tgt"] }
+                    }
+                },
+                required: ["translations"]
+            }
+        }, config.geminiApiKey, signal);
+        data = JSON.parse(r || '{}');
+    }
+    const arr = (data && Array.isArray(data.translations)) ? data.translations : [];
+    const parts = [];
+    for (let i = 0; i < arr.length; i++) {
+        const t = arr[i] && arr[i].tgt;
+        if (typeof t === 'string' && t.trim()) parts.push(t.trim());
+    }
+    return parts.length ? parts.join(' ') : null;
+}
+
+// 单段恢复阶梯。每一级都**改变了请求内容**——实测占位符丢失是确定性的，
+// 重发同样的请求 6/6 次丢同样的 token，所以「原样重试」被刻意排除在外。
+async function xportRecoverSegment(mm, rawSeg, wasBatched, srcName, tgtName, config, signal, spend) {
+    // 级 1：从批次里单独拎出来重发（只有原来确实同批时才算「变了」）
+    if (wasBatched && spend()) {
+        try {
+            const blocks = await xportRequest([mm], srcName, tgtName, config, signal);
+            const body = blocks[1];
+            if (body != null && xportBlockOk(body, mm.map)) return { tgt: xportUnmask(body, mm.map), via: 'isolate' };
+        } catch (err) { if (err && err.name === 'AbortError') throw err; }
+    }
+    // 级 2：把这一段再切开，降低单次请求的占位符密度、换掉边界
+    const parts = xportSplitSegment(rawSeg);
+    if (parts.length > 1 && spend()) {
+        try {
+            const pm = parts.map(xportMask);
+            const blocks = await xportRequest(pm, srcName, tgtName, config, signal);
+            const pieces = [];
+            let ok = true;
+            for (let i = 0; i < pm.length; i++) {
+                const body = blocks[i + 1];
+                if (body != null && xportBlockOk(body, pm[i].map)) pieces.push(xportUnmask(body, pm[i].map));
+                else { ok = false; break; }
+            }
+            if (ok) return { tgt: pieces.join(' '), via: 'split' };
+        } catch (err) { if (err && err.name === 'AbortError') throw err; }
+    }
+    // 级 3：退回旧协议
+    if (spend()) {
+        try {
+            const legacy = await xportLegacyOne(rawSeg, srcName, tgtName, config, signal);
+            if (legacy) return { tgt: legacy, via: 'legacy' };
+        } catch (err) { if (err && err.name === 'AbortError') throw err; }
+    }
+    return null;
+}
+
+// 哨兵协议只对**本次实测过**的两条链路生效：本地 LM Studio 与 Gemini。
+// OpenAI / Claude 保持今天一模一样的行为 —— 上一版正是因为「代码写了但没测」被否，
+// 这里不重复那个错误。开关关掉则全部回到现行协议。
+function xportActive(config) {
+    try {
+        if (!AppState.sentinelTransport) return false;
+        return config.provider === 'local' || config.provider === 'gemini';
+    } catch (e) { return false; }
+}
+
+// 返回值与 translateBulk 完全同形（{translations:[{src,tgt}]}），外加统计字段。
+// 契约：**只要有一段成功就绝不抛异常** —— 已交付的内容永远不会因为后面某一段失败而消失。
+async function translateViaSentinel(text, srcLang, tgtLang, config, signal) {
+    const srcName = srcLang === 'zh' ? 'Chinese' : 'English';
+    const tgtName = tgtLang === 'zh' ? 'Chinese' : 'English';
+    const segs = xportSegments(text);
+    // 切不出任何一段 = 输入是空白/纯注释。**抛**而不是返回空数组：调用方拿到
+    // { translations: [] } 会当成一次成功的翻译，把屏幕上现有的译文整份换成 0 行。
+    if (segs.length === 0) throw new Error('没有可翻译的内容（输入为空或只有空白）');
+
+    const masked = segs.map(xportMask);
+    const limits = await xportLimits(config);
+    const batches = xportPack(masked, limits);
+    const tgts = new Array(segs.length).fill(null);
+    const via = new Array(segs.length).fill('');
+    let firstErr = null;
+    let budget = limits.recovery;
+    const spend = function () { if (budget <= 0) return false; budget--; return true; };
+
+    for (let b = 0; b < batches.length; b++) {
+        if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
+        const batch = batches[b];
+        let blocks = null;
+        try {
+            blocks = await xportRequest(batch.map(i => masked[i]), srcName, tgtName, config, signal);
+        } catch (err) {
+            if (err && err.name === 'AbortError') throw err;
+            firstErr = firstErr || err;
+        }
+        const failed = [];
+        for (let j = 0; j < batch.length; j++) {
+            const si = batch[j];
+            const body = blocks ? blocks[j + 1] : null;
+            if (body != null && xportBlockOk(body, masked[si].map)) {
+                tgts[si] = xportUnmask(body, masked[si].map);
+                via[si] = 'batch';
+            } else {
+                failed.push(si);
+            }
+        }
+        for (let f = 0; f < failed.length; f++) {
+            if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
+            if (budget <= 0) break;
+            const si = failed[f];
+            const r = await xportRecoverSegment(masked[si], segs[si], batch.length > 1,
+                srcName, tgtName, config, signal, spend);
+            if (r) { tgts[si] = r.tgt; via[si] = r.via; }
+        }
+    }
+
+    if (tgts.every(t => t === null)) {
+        // 一段都没成 = 配置 / 连接 / 模型级问题，把原始报错原样上抛（调用方保留旧译文）
+        if (firstErr) throw firstErr;
+        throw new Error('翻译失败：模型没有返回任何可解析的分段（请检查本地服务器与模型设置）');
+    }
+
+    let failedCount = 0;
+    const viaCount = {};
+    const translations = [];
+    for (let i = 0; i < segs.length; i++) {
+        const key = via[i] || 'failed';
+        viaCount[key] = (viaCount[key] || 0) + 1;
+        if (tgts[i] === null) failedCount++;
+        translations.push({ src: segs[i], tgt: tgts[i] === null ? XPORT_FAIL_MARK : tgts[i] });
+    }
+    return { translations: translations, transport: 'sentinel', failedCount: failedCount, viaCount: viaCount, viaRows: via };
+}
+
 // ============= 批量翻译 =============
 async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
 
     // 传输期剥离颜色宏（不改动用户原文，仅改动本次发送给模型的副本）
     text = stripTextColorForModel(text);
+
+    // 哨兵传输协议（详见上方大段注释）。开关关掉、或 provider 不在实测范围内时，
+    // 下面一行之后的代码与改动前逐字一致。
+    if (xportActive(config)) {
+        return await translateViaSentinel(text, srcLang, tgtLang, config, signal);
+    }
 
     const srcName = srcLang === 'zh' ? 'Chinese' : 'English';
     const tgtName = tgtLang === 'zh' ? 'Chinese' : 'English';
@@ -3124,7 +3852,9 @@ async function handleTranslate() {
         const config = getApiConfig();
         const result = await translateBulk(AppState.inputText, srcLang, tgtLang, config, controller.signal);
 
-        if (result?.translations) {
+        // 必须是 length > 0，不能只判 `result?.translations`：空数组也是真值，
+        // 会把屏幕上现有的整份译文换成 0 行 —— 一次「成功」的翻译反而销毁了内容。
+        if (result?.translations?.length > 0) {
             const pairs = result.translations.map(t => ({
                 src: t.src,
                 tgt: t.tgt,
@@ -3133,9 +3863,17 @@ async function handleTranslate() {
                 isUpdating: false,
                 isRegenerating: false
             }));
-            setState({ translationPairs: pairs, isEditingMode: false, viewMode: 'preview', isLoading: false });
+            setState({
+                translationPairs: pairs, isEditingMode: false, viewMode: 'preview', isLoading: false,
+                lastTransportFailures: Number(result.failedCount) || 0
+            });
             // 仅在成功后同步基线：失败时保持旧基线，TRANSLATE 才能重试
             AppState.lastTranslatedText = AppState.inputText;
+            // 逐段失败必须**说出来**：结果已经交付了（其余段都在），但有几行是失败标记。
+            // 静默交付一份缺口文档，正是这次改动要杜绝的那类问题。
+            if (Number(result.failedCount) > 0) {
+                showToast(result.failedCount + ' 段未能翻译，已在对应行标出，可单独点 ↻ 重试', 'warning');
+            }
         }
     } catch (err) {
         if (err.name !== 'AbortError') {
@@ -3859,11 +4597,39 @@ async function refreshOnlineModels(providers) {
 
 // ============= 全局历史管理 =============
 
-function addToGlobalHistory(pairs, sid) {
+// 这一段译文里有几行是「本段翻译失败」的占位标记。0 = 完好。
+// 只做字符串比对，不抛。
+function countFailMarks(pairs) {
+    let n = 0;
+    try {
+        if (!Array.isArray(pairs)) return 0;
+        for (let i = 0; i < pairs.length; i++) {
+            const t = pairs[i] && pairs[i].tgt;
+            if (typeof t === 'string' && t.indexOf(XPORT_FAIL_MARK) !== -1) n++;
+        }
+    } catch (e) { return n; }
+    return n;
+}
+
+// opts.auto = true 表示这是**定时器**发起的自动存档（不是用户点的保存）。
+// 上一版第 6 条最狠的一半就在这里：某一批失败后，自动存档会把一份带缺口的文档
+// 写回同一个 id，把归档里那份完好的覆盖掉，用户连找回的机会都没有。
+// 规则：自动存档绝不用「更破」的版本覆盖归档里「更完好」的版本。手动保存不受限制
+// （用户明确要求保存时，他自己知道自己在存什么）。
+function addToGlobalHistory(pairs, sid, opts) {
     if (pairs.length === 0) return;
 
     let history = [...AppState.globalHistory];
     const existingIndex = history.findIndex(item => item.id === sid);
+    if (opts && opts.auto && existingIndex !== -1) {
+        const incoming = countFailMarks(pairs);
+        const archived = countFailMarks(history[existingIndex].pairs);
+        if (incoming > archived) {
+            console.warn('[history] 自动存档已跳过：当前文档有 ' + incoming +
+                ' 段失败标记，归档里那份只有 ' + archived + ' 段，不覆盖。');
+            return;
+        }
+    }
     const updatedPairs = JSON.parse(JSON.stringify(pairs));
 
     if (existingIndex !== -1) {
@@ -3893,10 +4659,16 @@ function restoreGlobalHistory(item) {
 
     AppState.isRestoringHistory = true;
 
+    const restoredText = item.pairs.map(p => p.src).join('\n');
     setState({
         sessionId: item.id,
         translationPairs: item.pairs,
-        inputText: item.pairs.map(p => p.src).join('\n'),
+        inputText: restoredText,
+        // ⚠️ originalInputText 必须跟着一起换。它是「重新生成所有翻译」的输入源，
+        //    不换的话恢复完历史再点重新生成，会拿**上一份文档**去覆盖刚恢复出来的这份，
+        //    并且随后自动存档会把归档也一起覆盖掉（上一版第 7 条）。
+        originalInputText: restoredText,
+        lastTransportFailures: 0,
         isEditingMode: false,
         showHistoryMenu: false
     });
@@ -4110,6 +4882,44 @@ async function handleRegenerateAll() {
         return;
     }
 
+    // ---- 一致性闸门（上一版第 7 条：从历史恢复后点「重新生成」会用**另一份文档**
+    //      覆盖归档，既不提示也无法找回）----
+    // 根因是 originalInputText 与屏幕上这份译文不是同一份文档。两种真实产生路径：
+    //   ① restoreGlobalHistory 换掉了 translationPairs 但没换 originalInputText；
+    //   ② handleTranslate 在**发请求之前**就更新了 originalInputText，那次翻译却失败了。
+    // ①已在 restoreGlobalHistory 里从根上堵掉；这里再加一道闸门兜住②和任何将来的新路径。
+    const regenSource = AppState.originalInputText || AppState.inputText;
+    const head = (s) => String(s || '').replace(/\s+/g, '').slice(0, 60);
+    const onScreenHead = head(AppState.translationPairs[0] && AppState.translationPairs[0].src);
+    let switchingDoc = false;
+    if (onScreenHead && head(regenSource).slice(0, onScreenHead.length) !== onScreenHead) {
+        let go = false;
+        try {
+            go = window.confirm('「重新生成所有翻译」将用另一份文档的内容替换当前这份译文。\n\n'
+                + '当前第一句：' + String(AppState.translationPairs[0].src).slice(0, 60) + '\n'
+                + '将要翻译的：' + String(regenSource).slice(0, 60) + '\n\n'
+                + '确定要继续吗？（当前这份会先存进历史记录，可从「历史」菜单找回）');
+        } catch (e) { go = false; }
+        if (!go) {
+            setState({ isRegeneratingAll: false });
+            return;
+        }
+        switchingDoc = true;
+    }
+    // 覆盖之前先把现在这份存进历史 —— 「无法恢复」这一条到此为止。
+    if (AppState.translationPairs.length > 0) {
+        addToGlobalHistory(AppState.translationPairs, AppState.sessionId);
+        // 换的是**另一份文档**时，必须同时换会话 id。不换的话马上要生成的新文档会写回
+        // 同一个归档槽位，一个自动存档周期（默认 5 分钟）后就把刚存进去的旧文档原地
+        // 覆盖掉 —— 确认框里「可从历史菜单找回」的承诺只兑现 5 分钟。
+        // 同文档重新生成不换 id：那是同一份稿子的新版本，占两个槽位反而会把历史挤爆。
+        if (switchingDoc) {
+            let nid = String(Date.now());
+            if (nid === AppState.sessionId) nid = String(Date.now() + 1);
+            AppState.sessionId = nid;
+        }
+    }
+
     // 初始化 AbortController
     const controller = new AbortController();
     AppState.regenerateAllAbortController = controller;
@@ -4119,12 +4929,13 @@ async function handleRegenerateAll() {
     try {
         const config = getApiConfig();
         // 使用原始输入内容重新翻译（不是按句拼接的）
-        const originalText = AppState.originalInputText || AppState.inputText;
+        const originalText = regenSource;
 
         // 重新翻译所有内容
         const result = await translateBulk(originalText, AppState.sourceLang, AppState.targetLang, config, controller.signal);
 
-        if (result?.translations) {
+        // 同上：空数组不算成功，绝不用 0 行覆盖现有译文
+        if (result?.translations?.length > 0) {
             // 重新生成时，每个翻译对重置历史记录（不累加每句的历史）
             const pairs = result.translations.map((t) => ({
                 src: t.src,
@@ -4134,7 +4945,13 @@ async function handleRegenerateAll() {
                 isUpdating: false,
                 isRegenerating: false
             }));
-            setState({ translationPairs: pairs, viewMode: 'preview', activeIndex: null });
+            setState({
+                translationPairs: pairs, viewMode: 'preview', activeIndex: null,
+                lastTransportFailures: Number(result.failedCount) || 0
+            });
+            if (Number(result.failedCount) > 0) {
+                showToast(result.failedCount + ' 段未能翻译，已在对应行标出，可单独点 ↻ 重试', 'warning');
+            }
         }
     } catch (err) {
         if (err.name !== 'AbortError') {
@@ -4183,7 +5000,10 @@ async function handleRegenerateTranslation(index) {
         const result = await translateBulk(srcText, AppState.sourceLang, AppState.targetLang, config, controller.signal);
 
         if (result?.translations && result.translations.length > 0) {
-            const newTgt = result.translations[0].tgt;
+            // 只取 [0] 会在「这一行装着不止一句话」时把后面的句子整段丢掉。
+            // 这一行的原文来自用户手改 / 历史恢复，装两三句是常态；哨兵协议又是按句
+            // 切分的，多段返回从边角情况变成了常见情况。全部拼回来才是这一行的完整译文。
+            const newTgt = result.translations.map(t => String((t && t.tgt) || '')).join(' ').trim();
 
             // 只有当新翻译与旧翻译不同时，才添加到历史记录
             if (newTgt !== oldTgt) {
@@ -4524,6 +5344,50 @@ function alignSyncKeepingScroll() {
     }
 }
 
+// ============= 字体落地后补一次对齐（TASK：math-heavy 尾行漂移 25px）=============
+// 症状：源栏含 KaTeX 公式时，最后几行的 |top(src_i) - top(tgt_i)| 会破到 ~25px。
+// 实测根因（main.tex 真实 24 段、1440px 视口）：
+//   renderApp 里 syncBilingualAlignment 是**同步**跑的，那一刻 document.fonts.status
+//   还是 'loading' —— Inter 和 KaTeX 那二十多个 webfont 都还没到。量到的是回退字体的行高。
+//   431ms 后字体落地，文字/公式重新排版换行，最后一行源栏自然高度 239 → 263.9px（+24.9px），
+//   而配对的译文行还钉在 239px 的 min-height 上，这一对就此差 24.9px，后面每一行再累加。
+// 为什么原有的 ResizeObserver 兜不住：它不是可靠兜底 ——
+//   ① 标签页被遮挡/切到后台时浏览器根本不跑渲染步骤，ResizeObserver 一次都不回调（实测）；
+//   ② 文件里那个「连续 30 轮空转就 disconnect」的熔断器一旦触发，它就彻底不再补测。
+// 所以显式挂在 document.fonts.ready 上补一刀。它是 Promise，不依赖 rAF/渲染步骤，
+// 后台标签页里照样兑现，正好补上 ResizeObserver 覆盖不到的那一块。
+//
+// ⚠️ 必须走 alignSyncKeepingScroll 而不是 scheduleAlignSync：
+//    syncBilingualAlignment 的「写 1」阶段会先清空所有 minHeight，矮的那一栏当场塌下去、
+//    scrollTop 被浏览器夹掉（历史上这条路丢过 1230px 的滚动位置）。alignSyncKeepingScroll
+//    是「存 scrollTop → 同步跑完 → 写回」，两栏跑完已等高，写回不会再被夹。
+// ⚠️ 不和 ResizeObserver 打架：这一轮 alignSyncFromObserver 是 false，
+//    syncBilingualAlignment 会照常重挂观察器；写尺寸期间 alignSyncApplying 挡掉观察器回调。
+// ⚠️ 整个函数不可能抛：只有 typeof 判断 + try/catch，且 alignSyncKeepingScroll 自带 try/catch。
+let alignFontSettlePending = false;
+function scheduleAlignAfterFonts(depth) {
+    try {
+        if (alignFontSettlePending) return;              // 已经在等这一轮字体了，别重复挂
+        const fonts = document.fonts;
+        // status !== 'loading' = 没有待加载的字体，稳态下这里直接返回，零开销。
+        if (!fonts || fonts.status !== 'loading') return;
+        if (!fonts.ready || typeof fonts.ready.then !== 'function') return;
+        const next = (depth || 0) + 1;
+        alignFontSettlePending = true;
+        fonts.ready.then(function () {
+            alignFontSettlePending = false;
+            alignSyncKeepingScroll();
+            // 字体可能分批到达（第一批落地后新的字形才触发第二批），最多再等三轮，必然终止。
+            if (next < 4) scheduleAlignAfterFonts(next);
+        }, function () {
+            alignFontSettlePending = false;
+        });
+    } catch (e) {
+        alignFontSettlePending = false;
+        console.warn('[align] 字体落地补测挂载失败：', e && e.message);
+    }
+}
+
 function syncBilingualAlignment() {
     if (alignSyncApplying) return;
     alignSyncApplying = true;
@@ -4640,8 +5504,89 @@ function bindPaneScrollSync() {
     }
 }
 
+// ============= 翻译对形状归一（渲染路径唯一的一道防线）=============
+// 为什么非有不可：renderApp 走 root.innerHTML，外面**没有 try/catch**。
+// translationPairs 里只要混进一个 null / 空洞，renderPairRow 读 pair.src 当场抛，
+// 整页永久冻死在上一帧，之后每次点击再抛一次，不刷新页面救不回来。
+//
+// 已验证的真实产生路径（不是假想）：updateTranslationPair(index, …) 用**过期的行号**回写。
+//   handleRegenerateTranslation / saveRowUpdate 都是「先 await 网络，finally 里再回写」，
+//   而这段等待期间 Regenerate All / 恢复历史快照 完全可能把行数变少。于是
+//       const pairs = [...translationPairs];      // 现在只有 3 行
+//       pairs[7] = { ...pairs[7], ...updates };   // {...undefined} = {}，还顺手把 3~6 填成空洞
+//   下一次渲染读 pairs[3].src → TypeError → 冻页。
+// 次要来源：模型返回的 JSON 直接进状态（handleTranslate/handleRegenerateAll 里
+//   `t.src` / `t.tgt` 一个类型都不查），弱模型漏字段就会得到 src/tgt 是 undefined 的单边行。
+//
+// 修法选**最省的一处**：在渲染入口把整份数组过一遍并写回 AppState，
+// 之后所有读它的地方（复制原文、addHistory、历史导航、attachEventListeners）拿到的也都是干净的。
+// 不在各个使用点分散加判断 —— 这个代码库里「删掉/收敛到一处」的修法成功过，「到处加机制」的没有。
+//
+// 全程不可能抛：只有 typeof / Array.isArray / 算术，不调用任何外部函数。
+// 形状全对时**原样返回同一个数组、不新建任何对象**，所以稳态下开销只是一轮 typeof 检查。
+function normalizePairText(v) {
+    if (typeof v === 'string') return v;
+    if (typeof v === 'number') return Number.isFinite(v) ? String(v) : '';
+    if (typeof v === 'boolean') return v ? 'true' : 'false';
+    return '';   // null / undefined / 对象 / 数组 / Symbol 一律当空串（渲染成空行，不抛）
+}
+
+// 「干净」的判据必须覆盖渲染路径读到的每一个字段：
+// 非编辑态读 pair.src / pair.tgt / pair.isUpdating，编辑态还要读 pair.history.length
+// 和 pair.historyIndex（renderHistoryControls），后两个是编辑态独有的抛点。
+function isCleanPair(p) {
+    return !!p && typeof p === 'object'
+        && typeof p.src === 'string' && typeof p.tgt === 'string'
+        && Array.isArray(p.history) && p.history.length > 0
+        && typeof p.historyIndex === 'number'
+        && p.historyIndex >= 0 && p.historyIndex < p.history.length;
+}
+
+function normalizePair(p) {
+    const o = (p && typeof p === 'object') ? p : {};
+    const src = normalizePairText(o.src);
+    const tgt = normalizePairText(o.tgt);
+    let history = [];
+    if (Array.isArray(o.history)) {
+        for (let i = 0; i < o.history.length; i++) {
+            const h = o.history[i];
+            if (h && typeof h === 'object') {
+                history.push({ src: normalizePairText(h.src), tgt: normalizePairText(h.tgt) });
+            }
+        }
+    }
+    // history 至少要有一条：renderHistoryControls 显示的是 `${historyIndex + 1}/${history.length}`，
+    // 空数组会显示 1/0，撤销/重做两个按钮的 disabled 判据也会失去意义。
+    if (history.length === 0) history = [{ src: src, tgt: tgt }];
+    let hi = (typeof o.historyIndex === 'number' && Number.isFinite(o.historyIndex))
+        ? Math.floor(o.historyIndex) : history.length - 1;
+    if (hi < 0) hi = 0;
+    if (hi > history.length - 1) hi = history.length - 1;
+    return {
+        src: src, tgt: tgt, history: history, historyIndex: hi,
+        isUpdating: !!o.isUpdating, isRegenerating: !!o.isRegenerating
+    };
+}
+
+function normalizeTranslationPairs(list) {
+    if (!Array.isArray(list)) return [];   // null / undefined / 对象 → 空列表，renderSourcePanel 读 .length 才不会抛
+    for (let i = 0; i < list.length; i++) {
+        if (!isCleanPair(list[i])) {
+            const out = new Array(list.length);   // 逐位赋值，顺便把空洞填实
+            for (let j = 0; j < list.length; j++) out[j] = normalizePair(list[j]);
+            return out;
+        }
+    }
+    return list;   // 全干净：原样返回，零分配
+}
+
 // ============= 主渲染函数 =============
 function renderApp(preserveScroll = true) {
+    // ⚠️ 必须是这个函数的第一件事：下面每一行渲染代码都假定 translationPairs 是
+    //    「数组 + 每个元素形状完整」，而这个假定在真实运行中会被打破（见上方注释）。
+    //    归一化本身不可能抛；写回 AppState 让这次修复对后续所有读取者同样生效。
+    AppState.translationPairs = normalizeTranslationPairs(AppState.translationPairs);
+
     // 保存滚动位置。两栏是**联动**的（bindPaneScrollSync），逻辑上只有一个位置，
     // 所以这里只存一个数。分开存两个数会在源栏那侧暂时没有滚动容器的那一轮出事：
     // viewMode 切到 'edit' 时源面板是一个 textarea，选择器选不到东西，存下来的是 0，
@@ -4681,6 +5626,11 @@ function renderApp(preserveScroll = true) {
     // 浏览器夹到自己的上限，等对齐把行撑高时 scrollTop 早就丢了 —— 两栏永久差 224px，
     // 而行高对齐器不碰 scrollTop，之后谁也修不回来。先对齐则两栏高度一致，赋值不会被夹。
     syncBilingualAlignment();
+
+    // 上面这次是同步量的，此刻 webfont（Inter / KaTeX）多半还没到，量到的是回退字体的行高。
+    // 挂一个 document.fonts.ready 的回调，等字体真正落地后再补一次（详见函数上方注释）。
+    // 这里只是**注册回调**，不做任何布局工作，放在恢复滚动位置之前之后都一样安全。
+    scheduleAlignAfterFonts(0);
 
     // 同步恢复滚动位置（不使用 requestAnimationFrame，避免多次渲染时的竞态条件）
     if (preserveScroll) {
@@ -4907,8 +5857,26 @@ function renderSettingsEditingExtraSections() {
                         </div>`;
     };
     return `
-                    <!-- Custom Prompts Section -->
+                    <!-- Transport Protocol Section -->
                     <div class="pb-5 border-b border-slate-100">
+                        <div class="flex items-center gap-2 mb-3" data-tip="${escapeAttr('决定原文用什么形式送给模型。默认的哨兵协议把公式和引用换成占位符、用纯文本往返，模型无法再把 \\ref 变成回车+ef。')}" data-tip-pos="bottom-start">
+                            <div class="w-6 h-6 bg-gradient-to-br from-rose-500 to-orange-500 rounded-lg flex items-center justify-center text-white">
+                                ${Icons.Rocket}
+                            </div>
+                            <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">翻译传输协议</span>
+                        </div>
+                        <p class="text-[10px] text-slate-400 mb-3">${escapeHtml('旧协议要求模型把原文和译文一起塞进 JSON 字符串里回来，而反斜杠在 JSON 里必须转义 —— 模型做不到一致，\\ref 会变成「回车+ef」、\\begin 会变成「退格+egin」，而且这些都是合法转义，界面上不报错。哨兵协议改成纯文本往返：公式/引用/交叉引用先换成 [[1]] 这样的占位符，回来逐个核对，占位符少一个就自动重试，实在不行那一行会标出来。核对范围仅限占位符：\\emph / \\textbf / \\caption 这类花括号里装的是正文、必须让模型看见的命令没有占位符保护，模型漏抄了也查不出来。只对「本地模型」和「Gemini」生效，OpenAI / Claude 不受影响。')}</p>
+                        <label class="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all ${AppState.sentinelTransport ? 'bg-rose-50' : ''}" data-tip="${escapeAttr('关掉后逐字回到旧的 JSON 协议（也就是这次改动之前的行为）。只在怀疑新协议出问题时才需要关。')}" data-tip-pos="bottom-start">
+                            <input type="checkbox" ${AppState.sentinelTransport ? 'checked' : ''} onchange="setSentinelTransport(this.checked)" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-rose-600 focus:ring-rose-500 shrink-0">
+                            <span class="text-xs font-medium text-slate-700 leading-snug min-w-0 flex-1">
+                                使用哨兵传输协议（推荐）
+                                <span class="block text-[10px] text-slate-400 font-normal mt-0.5">${escapeHtml('实测：\\cite / \\ref / $…$ / equation 环境这些被占位符保护的部分零丢失；\\emph / \\textbf 这类未保护命令仍有约 0.2%–2% 的漏抄率（三条链路都测到过），既不会重试也不会标记 —— 需要逐字精确的稿子请自己复核。长文本比旧协议快 2–4 倍（不再要求模型把原文抄一遍）。')}</span>
+                            </span>
+                        </label>
+                    </div>
+
+                    <!-- Custom Prompts Section -->
+                    <div class="py-5 border-b border-slate-100">
                         <div class="flex items-center gap-2 mb-3" data-tip="每行 AI 工具栏上 Grammar / Simplify 两个按钮实际发给模型的指令。改这里等同于改每行 ⋮ 里的那个弹窗，两处共用同一份设置。" data-tip-pos="bottom-start">
                             <div class="w-6 h-6 bg-gradient-to-br from-indigo-500 to-blue-600 rounded-lg flex items-center justify-center text-white">
                                 ${Icons.Wand2}
@@ -6230,6 +7198,15 @@ function resetRowGap() {
 // 刻意**不**走 renderApp：这个勾选框长在设置弹窗里，全量重渲染会把弹窗整块重建，
 // 用户滚到哪、展开了哪几组全都归零。checkbox 自己已经是勾上的状态，
 // 我们只要落盘 + 把可能还挂着的高亮收干净就够了。
+// 哨兵传输协议开关。写 localStorage 失败（隐私模式 / 配额满）也绝不能把设置面板炸掉。
+function setSentinelTransport(enabled) {
+    const on = !!enabled;
+    try { localStorage.setItem('sentinelTransport', on ? 'true' : 'false'); }
+    catch (e) { console.warn('[transport] 开关无法持久化：', e && e.message); }
+    setState({ sentinelTransport: on });
+    showToast(on ? '已启用哨兵传输协议' : '已切回旧的 JSON 传输协议', on ? 'success' : 'warning');
+}
+
 function setCrossHighlightEnabled(enabled) {
     const on = !!enabled;
     AppState.crossHighlightEnabled = on;
@@ -6564,7 +7541,8 @@ document.addEventListener('DOMContentLoaded', function() {
     // 自动保存定时器
     setInterval(function() {
         if (AppState.autoSaveInterval > 0 && AppState.translationPairs.length > 0) {
-            addToGlobalHistory(AppState.translationPairs, AppState.sessionId);
+            // { auto: true }：定时存档不许用带缺口的版本覆盖归档里完好的那份
+            addToGlobalHistory(AppState.translationPairs, AppState.sessionId, { auto: true });
         }
     }, AppState.autoSaveInterval);
 
@@ -6686,6 +7664,12 @@ function loadSavedSettings() {
         const savedCrossHl = localStorage.getItem('crossHighlightEnabled');
         if (savedCrossHl !== null) {
             AppState.crossHighlightEnabled = savedCrossHl !== '0';
+        }
+
+        // 加载哨兵传输协议开关。默认开；只有显式存过 'false' 才回到旧的 JSON 协议。
+        const savedXport = localStorage.getItem('sentinelTransport');
+        if (savedXport !== null) {
+            AppState.sentinelTransport = savedXport !== 'false';
         }
 
         // 加载上次从各家 API 拉到的在线模型目录（纯读缓存，不发任何网络请求）
