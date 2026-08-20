@@ -499,14 +499,10 @@ body.is-resizing-settings-modal * {
 }
 #aiChatRoot .aichat-pending-label { font-style: italic; color: #818cf8; }
 #aiChatRoot .aichat-pending-time { font-variant-numeric: tabular-nums; color: #94a3b8; }
-
-/* ---- 每条回复下面那一行「本轮用量」（C8）——只画实测到的数字，拿不到就明写一句话，绝不估。 ---- */
-#aiChatRoot .aichat-usageline {
-    display: flex; flex-wrap: wrap; gap: 3px 10px; margin-top: 6px;
-    font-size: 10px; color: #94a3b8;
-}
-#aiChatRoot .aichat-usage-kv { cursor: default; }
-#aiChatRoot .aichat-usage-kv b { font-weight: 600; color: #64748b; }
+/* 思考期间按已收到的推理文字实时估的 token 数。空文本节点时不留间隙——tokEl 一开始是空的
+   （还没收到任何 reasoning delta），加了 gap 会在时间和它之间凭空多出一截空白。 */
+#aiChatRoot .aichat-pending-tok { font-variant-numeric: tabular-nums; color: #a5b4fc; }
+#aiChatRoot .aichat-pending-tok:empty { display: none; }
 
 /* ---- 输入区 ---- */
 #aiChatRoot .aichat-footer {
@@ -982,7 +978,7 @@ body[data-aichat-drag="bl"]   { cursor: nesw-resize !important; }
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '01.10.00-preview';        // APP_VERSION_STAMP
+const APP_VERSION = '01.11.00-preview';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-08-20';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -3779,8 +3775,8 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
             meta.promptTokens = Number(data && data.usage && data.usage.prompt_tokens) || 0;
             // C8：同一份 usage 对象里的输出侧两个数，同样就地取值、同样实测（2026-08-20，
             // jump LM Studio，qwen3.6-35b-a3b 关思考 / qwen3.8-27b 开思考各抓过一次真实响应体，
-            // 两次 usage 都带 completion_tokens 和 total_tokens）。回复下面那一行「本轮用量」
-            // 只认这两个字段，拿不到就显示"本轮未提供用量"，不拿字符数估一个填上去。
+            // 两次 usage 都带 completion_tokens 和 total_tokens）。上下文圆环只认这两个字段，
+            // 拿不到就退回估算，不拿字符数估一个冒充实测。
             meta.completionTokens = Number(data && data.usage && data.usage.completion_tokens) || 0;
             meta.totalTokens = Number(data && data.usage && data.usage.total_tokens) || 0;
         }
@@ -14018,11 +14014,12 @@ function chatAppendRow(kind, text, opts) {
 
 // 「正在处理」指示器（C8）。**两种「显示思考过程」模式下都要画**——那个开关只决定
 // 思考正文显不显示，不决定「我还活着」这个信号显不显示；关掉思考正文恰恰最容易让人
-// 以为卡死。内容：动画（纯 CSS，不代表进度）+ "thinking" 字样 + 真实已耗时秒数。
-// 动画和计时是两条独立的线：动画一旦挂上 CSS class 就自己转，不需要 JS 再摸它；
-// 计时由调用方起一个 interval，只改这里返回的 timeEl 的 textContent 一个节点。
-// 绝不在这里画任何「进度」「预计还需 N 秒」「token 数」—— 在请求真正落地之前，
-// 这些数字这个函数一个都不知道，画出来就是编的。
+// 以为卡死。内容：动画（纯 CSS，不代表进度）+ "thinking" 字样 + 真实已耗时秒数 +
+// 按已收到的推理文字实时估的 token 数（tokEl，调用方在收到 reasoning delta 时更新）。
+// 动画、计时、token 三条都是独立的线：动画一旦挂上 CSS class 就自己转，不需要 JS 再摸它；
+// 计时和 token 各自只改自己那一个节点的 textContent。
+// tokEl 上的数字**必须**带 ≈ 前缀：这是按字符数现算的估算，不是 usage 里的实测值——
+// 真实值要等这一轮彻底结束才拿得到，在那之前显示一个不带 ≈ 的数字就是把估算充成实测。
 function chatAppendPendingRow() {
     try {
         const log = document.getElementById('aiChatLog');
@@ -14041,13 +14038,17 @@ function chatAppendPendingRow() {
         const time = document.createElement('span');
         time.className = 'aichat-pending-time';
         time.textContent = '0.0s';
+        const tok = document.createElement('span');
+        tok.className = 'aichat-pending-tok';
+        tok.textContent = '';
         bubble.appendChild(dots);
         bubble.appendChild(label);
         bubble.appendChild(time);
+        bubble.appendChild(tok);
         row.appendChild(bubble);
         log.appendChild(row);
         chatScrollToBottom();
-        return { row: row, timeEl: time };
+        return { row: row, timeEl: time, tokEl: tok };
     } catch (e) {
         console.error('[chat] appendPendingRow failed', e);
         return null;
@@ -14807,57 +14808,6 @@ function chatAppendCopyAnswer(row, answerText) {
     } catch (e) {}
 }
 
-// C8：这条回复下面那一行「本轮用量」。**只用这一次调用自己的 meta**（chatSend 里每轮新建
-// 一个），不读任何跨轮次共享的状态——这就是「连发多轮不会把用量行挂到错的消息上」的
-// 结构性保证：meta 从 chatCallModel 收到响应的那一刻起就已经和这一条 assistant 消息绑死，
-// 不存在"上一轮的用量被下一轮覆盖后显示在旧气泡下面"这种错位。
-// **拿不到就明说，绝不估**：本地流式/非流式两条路都已经把 usage.prompt_tokens /
-// usage.completion_tokens / usage.completion_tokens_details.reasoning_tokens 实测填进 meta；
-// Claude/OpenAI 这条路目前没有接这些字段（前者按硬约束不能碰），所以那两家走到这里时
-// promptTokens 和 completionTokens 都是 0 —— 老老实实显示"本轮未提供用量"，不拿估算数字充数。
-function chatAppendUsageLine(row, meta) {
-    try {
-        if (!row) return;
-        const m = meta || {};
-        const ptok = Number(m.promptTokens) || 0;
-        const ctok = Number(m.completionTokens) || 0;
-        const rtok = Number(m.reasoningTokens) || 0;
-        const ttok = Number(m.totalTokens) || 0;
-        const box = chatBubbleOf(row) || row;
-        const line = document.createElement('div');
-        line.className = 'aichat-usageline';
-        if (ptok <= 0 && ctok <= 0) {
-            line.textContent = '本轮未提供用量';
-            line.setAttribute('data-tip', '这个模型/服务商这一轮的响应里没有可用的 usage 字段'
-                + '（或者请求中途被停止了）。如实说明，不去按字符数估一个填上去——那样会假装它是实测的。');
-            line.setAttribute('data-tip-pos', 'top-start');
-            box.appendChild(line);
-            return;
-        }
-        const kv = function (label, val, tip) {
-            const s = document.createElement('span');
-            s.className = 'aichat-usage-kv';
-            s.innerHTML = '<b>' + escapeHtml(label) + '</b> ' + chatFmtNum(val);
-            s.setAttribute('data-tip', tip);
-            s.setAttribute('data-tip-pos', 'top');
-            return s;
-        };
-        line.appendChild(kv('输入', ptok, '实测 usage.prompt_tokens：服务器报告的这一轮输入 token 数'
-            + '（系统提示 + 文档上下文 + 对话历史 + 你这句话）。'));
-        line.appendChild(kv('输出', ctok, '实测 usage.completion_tokens：服务器报告的这一轮输出 token 数'
-            + '——下面「思考」那个数已经包含在这里面，不是另外加的。'));
-        if (rtok > 0) {
-            line.appendChild(kv('含思考', rtok, '实测 usage.completion_tokens_details.reasoning_tokens：'
-                + '上面「输出」里花在思考过程上的那部分。这正是等回复时你看不到、'
-                + '「显示思考过程」关掉时尤其容易被忽略的那部分开销，但它是真花掉的 token。'));
-        }
-        if (ttok > 0) {
-            line.appendChild(kv('合计', ttok, '实测 usage.total_tokens：服务器自己报告的输入+输出合计。'));
-        }
-        box.appendChild(line);
-    } catch (e) {}
-}
-
 // 助手气泡里的正文。**先 escapeHtml，再 marked.parse**，刻意不走 renderFormattedText：
 //   · escapeHtml 是本文件对「往 HTML 里塞不受控文本」的既有约定（见 escapeAttr 上方的注释），
 //     而气泡里装的是模型自由生成的文本。实测不转义时，回复里的
@@ -15003,8 +14953,9 @@ async function chatSend() {
         }, CHAT_TICK_MS);
 
         const meta = {};
-        // C5：流式的活气泡。第一个 delta 到达时才建行（在那之前「思考中… x.x s」照常跑），
-        // 建行的同时把计时行撤掉 —— 两条同时在屏幕上等于告诉用户「有两件事在发生」。
+        // C5：流式的活气泡。真正的答案文字（text delta）到达时才建行（在那之前
+        // 「thinking… x.x s ≈N tok」照常跑），建行的同时把计时行撤掉 —— 两条同时在屏幕上
+        // 等于告诉用户「有两件事在发生」。
         const killPending = function () {
             try { if (tick) { clearInterval(tick); tick = null; } } catch (e) {}
             try { if (pendingRow && pendingRow.parentNode) pendingRow.parentNode.removeChild(pendingRow); } catch (e) {}
@@ -15012,7 +14963,16 @@ async function chatSend() {
         };
         const sink0 = chatLiveSink();
         live = {
-            reasoning: function (s) { killPending(); sink0.reasoning(s); },
+            // 推理增量**不**撤掉计时行了（这是之前的问题：关掉「显示思考」时，第一条 reasoning
+            // delta 一来就把 thinking 指示器撤了，而 sink0.reasoning 里那句
+            // `if (!ChatState.showThinking) return;` 又什么都不画——用户在整个推理阶段
+            // 什么信号都看不到，跟真卡死了一样）。改成：不管开关开没开，thinking 期间都用
+            // chatEstTokens 按已收到的推理文字实时估一个 token 数、写回 pending 指示器；
+            // 开关只决定要不要**额外**把推理正文本身画成一个实时展开的框。
+            reasoning: function (s) {
+                try { if (pending && pending.tokEl) pending.tokEl.textContent = '≈' + chatFmtNum(chatEstTokens(s)) + ' tok'; } catch (e) {}
+                if (ChatState.showThinking) sink0.reasoning(s);
+            },
             text: function (s) { killPending(); sink0.text(s); },
             destroy: sink0.destroy
         };
@@ -15155,9 +15115,6 @@ function chatRenderAssistant(raw, meta) {
             try { chatAppendThinking(diag, record.reasoning, record.reasoningTokens); }
             finally { ChatState.showThinking = keep; }
         }
-        // C8：这正是「输出全花在思考上」的例证——用量行会直接把 reasoning_tokens 摆在
-        // 「输出」旁边，用户不用猜 token 去哪了。
-        chatAppendUsageLine(errRow, m);
         ChatState.messages.push(record);
         chatUpdateBar();
         chatScrollToBottom();
@@ -15167,11 +15124,10 @@ function chatRenderAssistant(raw, meta) {
     const row = chatAppendRow('assistant', '');
     const bubble = chatBubbleOf(row);
     if (bubble) chatRenderProse(bubble, parsed.prose || String(raw));
-    // 顺序要点：先画正文，再把思考区**插到最前面**，然后「复制答案」，最后「本轮用量」。
+    // 顺序要点：先画正文，再把思考区**插到最前面**，然后「复制答案」。
     chatAppendThinking(row, record.reasoning, record.reasoningTokens);
     // 复制的永远是 parsed.prose（来自 message.content），和思考区读的是两个不同的字段。
     chatAppendCopyAnswer(row, parsed.prose || String(raw));
-    chatAppendUsageLine(row, m);
 
     if (m.truncated) {
         chatAppendRow('system', '⚠ 这条回复被 token 上限截断了（finish_reason=length），下面的内容是半截的。');
@@ -16022,7 +15978,7 @@ async function chatStreamLocal(config, messages, signal, meta, req, sink) {
             // 所以中止时通常是 0 —— 0 就当作「这一轮没量到」，环退回估算，不许拿 0 当实测。
             meta.promptTokens = ptok;
             // C8：同一最后一帧里的输出侧两个数，同样只在收全时才非零——中止时通常也是 0，
-            // 用量行会照 chatAppendUsageLine 的规矩显示"本轮未提供用量"，不去凑一个数字。
+            // 上下文圆环那边遇到 0 就退回估算，不许拿 0 当实测。
             meta.completionTokens = ctok;
             meta.totalTokens = ttok;
         }
