@@ -659,7 +659,7 @@ body[data-aichat-drag="tl"]   { cursor: nwse-resize !important; }
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '01.05.00';        // APP_VERSION_STAMP
+const APP_VERSION = '01.06.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-08-20';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -958,8 +958,23 @@ const AppState = {
         sentenceRange: null, // { start: number, end: number, text: string } | null
         field: null,
         index: null,      // 选中发生在哪一行（= AppState.activeIndex），高亮层据此定位
-        contextSentence: ""
+        contextSentence: "",
+        // 本次结果属于哪一次请求。三个取数入口在 await 之前记下它、在 await 之后核对，
+        // 对不上就把结果丢掉（见 synonymReqSeq 的注释）。
+        reqId: 0
     },
+    // 选词/语法弹窗的请求序号与取消句柄。**不进 localStorage**（synonymAbort 是个
+    // AbortController 对象），也不参与任何序列化。
+    // 【为什么必须有】改动前这条路上既没有序号也没有 AbortController，两次交叠的选择会串线，
+    // 两个方向都实测复现过：
+    //   R1 = 先选 A（慢），300ms 后选 B。终态里 originalText / selectionRange /
+    //        contextSentence 全是 B 的，语法第 0 页装的却是**段落 A 的四条整句改写**。
+    //        isSentenceScopedPage 通过、applySynonym 的子串完整性核对也通过 ——
+    //        于是点一下就把段落 A 拼接到 B 的位置上。这是**改坏正文**，不是显示问题。
+    //   R2 = 慢的旧请求失败(3222ms)落在快的新请求成功(1773ms)之后，把好答案抹成
+    //        「未能获得语法建议」。只看网络抓包永远发现不了。
+    synonymReqSeq: 0,
+    synonymAbort: null,
     // 选词弹窗默认功能：'replace' | 'simplify' | 'grammar'（持久化到 localStorage）
     synonymDefaultMode: "replace",
 
@@ -1088,7 +1103,10 @@ const SYNONYM_MODE_LABEL = { replace: '替换', simplify: '简化', grammar: '�
 const SYNONYM_MODE_TIP = {
     replace: '给选中的词换一批学术同义词，点一个就替换掉选中部分。',
     simplify: '把选中的这段话改写得更直白简短，意思不变。',
-    grammar: '检查选中处所在的「整句」语法：没问题会直接说「语法正确」，有问题给出改写；整句级改写会用琥珀色高亮出将被替换的范围。'
+    // 这条提示原来写「检查选中处所在的『整句』语法：没问题会直接说『语法正确』」。
+    // 两判定契约上线后两句都不成立了：整句仍然会被读，但**判定的是选中的那一段**，
+    // 而屏幕上的字也已经改成「所选部分语法正确」。提示是 UI 文案，同样不许说假话。
+    grammar: '连同整句一起校对，但判定的是你选中的这一段：选中处本身没问题就说「所选部分语法正确」，整句别处的毛病放在下面一行、点了才生效；选中处有问题就给出改写。整句级改写会用琥珀色高亮出将被替换的范围。'
 };
 
 // 脏值一律回落 'replace'。所有读 mode 的地方都必须过这个函数，渲染路径才不会碰到未知键。
@@ -1116,16 +1134,25 @@ function getSynonymPageIndex(state, mode) {
     return (typeof n === 'number' && isFinite(n) && n >= 0) ? Math.floor(n) : 0;
 }
 
-// 语法模式下某一页的判定结果，永远返回一个形状固定的对象
+// 语法模式下某一页的判定结果，永远返回一个形状固定的对象。
+// 渲染路径**只**从这里读 note，所以每一个新键都必须在这里补上防御性默认值 ——
+// renderApp/renderSynonymPopupOnly 都没有 try/catch，读到 undefined 就是整页永久冻结。
 function getGrammarNote(state, pageIndex) {
     const notes = (state && Array.isArray(state.grammarNotes)) ? state.grammarNotes : [];
     const note = notes[pageIndex];
-    if (!note || typeof note !== 'object') return { status: '', issue: '', scope: 'selection' };
+    if (!note || typeof note !== 'object') {
+        return { status: '', issue: '', scope: 'selection', code: '', sentenceIssue: '', sentenceOffer: [] };
+    }
     return {
         status: typeof note.status === 'string' ? note.status : '',
         issue: typeof note.issue === 'string' ? note.issue : '',
         // 作用域只认 'sentence' 这一个特殊值，其它一切（含缺失、脏值）都当词级
-        scope: note.scope === 'sentence' ? 'sentence' : 'selection'
+        scope: note.scope === 'sentence' ? 'sentence' : 'selection',
+        // 失败码（XPORT_FAIL_TEXT 的键）。未知码在弹窗里渲染成空串，绝不能是 undefined。
+        code: typeof note.code === 'string' ? note.code : '',
+        // 附带提议：整句别处的问题 + 整句改写候选。用户点了「看整句改写」才生效。
+        sentenceIssue: typeof note.sentenceIssue === 'string' ? note.sentenceIssue : '',
+        sentenceOffer: Array.isArray(note.sentenceOffer) ? note.sentenceOffer.filter(v => typeof v === 'string' && v) : []
     };
 }
 
@@ -1191,7 +1218,8 @@ function renderSynonymPopupOnly() {
 
     // 语法修正模式的响应形状跟另外两个模式不同：要么「语法正确」，要么「N 条改写」。
     const isGrammar = mode === 'grammar';
-    const note = isGrammar ? getGrammarNote(s, pageIndex) : { status: '', issue: '' };
+    const note = isGrammar ? getGrammarNote(s, pageIndex)
+                           : { status: '', issue: '', scope: 'selection', code: '', sentenceIssue: '', sentenceOffer: [] };
     const grammarChecked = isGrammar && note.status !== '';
     // 判定为「语法正确」且只有这一页时，翻页条没有意义，直接不渲染
     const showPager = (currentSynonyms.length > 0 || history.length > 0)
@@ -1202,6 +1230,21 @@ function renderSynonymPopupOnly() {
     const modeButtonsHtml = SYNONYM_MODES.map(m => `
                 <button onclick="handleSynonymModeSwitch('${m}')" class="flex-1 px-1.5 py-1 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${mode === m ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr(SYNONYM_MODE_TIP[m] || '')}" data-tip-pos="bottom">${SYNONYM_MODE_LABEL[m]}</button>
     `).join('');
+
+    // 附带提议行（「整句别处还有问题」）。**永远是可选的第二行**，用户不点就什么都不发生。
+    // 新 prompt 把「选区对不对」和「句子别处对不对」拆成两个独立判定，这一行就是后者的出口：
+    // 改动前后者会直接顶掉前者，选一个干净的词也能换来一整句改写（实测 22/24 = 91.7%）。
+    // 没有可用整句范围时不渲染 —— 点了也应用不了，给个按钮只是骗人。
+    const offerable = isGrammar && note.scope !== 'sentence'
+        && Array.isArray(note.sentenceOffer) && note.sentenceOffer.length > 0
+        && getValidSentenceRange(s) !== null;
+    const offerHtml = offerable ? `
+                    <div class="mt-1.5 pt-1.5 border-t border-slate-100 flex items-start gap-1.5">
+                        <div class="text-[10px] text-slate-400 leading-snug flex-1 min-w-0">
+                            整句还有问题：${escapeHtml(note.sentenceIssue || '（模型未说明）')}
+                        </div>
+                        <button onclick="handleGrammarOfferAccept(${pageIndex})" class="shrink-0 px-1.5 py-0.5 rounded text-[10px] font-bold text-amber-700 bg-amber-50 border border-amber-200 hover:bg-amber-100 transition-colors" data-tip="${escapeAttr('把这一页换成整句改写候选（' + note.sentenceOffer.length + ' 条）')}" data-tip-pos="top-end">看整句改写</button>
+                    </div>` : '';
 
     // 结果区：三个模式共用一段分支，任何一支都必须能渲染出可见文案，绝不留空
     let bodyHtml;
@@ -1214,10 +1257,16 @@ function renderSynonymPopupOnly() {
         bodyHtml = `
                     <div class="text-xs text-rose-500 text-center py-2 leading-relaxed">${escapeHtml(errorMessage)}</div>`;
     } else if (isGrammar && note.status === 'correct') {
+        // 【文案必须说清楚判的是哪一段】改动前这里写的是光秃秃的「语法正确」。
+        // 那句话在旧 prompt 下是真的（旧 prompt 判的就是整句：「If the whole Sentence is already
+        // grammatically correct, answer correct: true」）；新 prompt 把判定收窄成**只判选区**
+        // （focus_correct），这四个字就成了一句代码根本没有核实过的断言 —— 而且它经常紧挨着
+        // 下面那行「整句还有问题：…」，两行说的是同一段字，实测 24 条 class-ib 里 22 条如此。
+        // 加两个字把作用域写明白，代价为零，说的正好是 note.status==='correct' 真正代表的东西。
         bodyHtml = `
                     <div class="flex items-center gap-1.5 text-xs font-bold text-emerald-600 py-2 justify-center">
-                        ${Icons.CheckCheck} 语法正确
-                    </div>`;
+                        ${Icons.CheckCheck} 所选部分语法正确
+                    </div>${offerHtml}`;
     } else if (currentSynonyms.length > 0) {
         // 语法模式：这一页是整句改写还是词级替换，直接写在弹窗里，
         // 和 textarea 背后那层高亮（整句 = 琥珀色）说的是同一件事。
@@ -1234,14 +1283,27 @@ function renderSynonymPopupOnly() {
                                 <span class="opacity-0 group-hover:opacity-50 text-indigo-400">${Icons.ArrowRightLeftSmall}</span> ${escapeHtml(syn)}
                             </button>
                         `).join('')}
-                    </div>`;
+                    </div>${offerHtml}`;
     } else if (isGrammar) {
+        // 【改动前这里对六个失败码说同一句话】「模型未返回可用结果（响应为空或 JSON 解析失败）」，
+        // 而 status:'empty' 那两种情况根本不是解析失败 —— 模型答了，是客户端把候选全过滤了。
+        // 现在：把 A4 分出来的真码和它自己的补救办法摆出来，再给一颗「重试」
+        //（实测同一句话在两次请求上一次成功一次失败，c23/c25 的 LaTeX 密度完全一样、结果相反）。
+        // 未知码必须渲染成空串，绝不能是 undefined —— 这是 renderApp 没有 try/catch 的直接后果。
+        const failCode = typeof note.code === 'string' ? note.code : '';
+        const failRemedy = (failCode && XPORT_FAIL_TEXT[failCode]) ? XPORT_FAIL_TEXT[failCode] : '';
+        const isEmptyAnswer = note.status === 'empty';
         bodyHtml = `
                     ${note.issue ? `<div class="text-[10px] text-amber-600 bg-amber-50 border border-amber-100 rounded px-2 py-1 mb-1 leading-snug overflow-y-auto custom-scrollbar" style="max-height:56px;">${escapeHtml(note.issue)}</div>` : ''}
                     <div class="text-xs text-slate-400 text-center py-2 leading-relaxed">
-                        ${grammarChecked ? '未能获得语法建议。' : '暂无语法结果。'}
-                        <span class="block text-[10px] text-slate-300 mt-0.5">模型未返回可用结果（响应为空或 JSON 解析失败）</span>
-                    </div>`;
+                        ${isEmptyAnswer ? (offerable ? '模型没有给出可用的选区替换。' : '模型这次没有提出任何改动。') : (grammarChecked ? '未能获得语法建议。' : '暂无语法结果。')}
+                        ${isEmptyAnswer && !offerable ? `<span class="block text-[10px] text-slate-300 mt-0.5">模型有回应，但给出的候选都和原文一样，已全部过滤。</span>` : ''}
+                        ${failRemedy ? `<span class="block text-[10px] text-slate-400 mt-1 text-left leading-snug">${escapeHtml(failRemedy)}</span>` : ''}
+                        ${failCode ? `<span class="block text-[9px] font-mono text-slate-300 mt-0.5">${escapeHtml(failCode)}</span>` : ''}
+                    </div>
+                    <div class="flex justify-center">
+                        <button onclick="handleSynonymRetry()" class="px-2.5 py-1 rounded-md text-[10px] font-bold text-indigo-600 bg-indigo-50 border border-indigo-100 hover:bg-indigo-100 transition-colors" data-tip="${escapeAttr('重新问一次（不带 avoid 列表；这类失败是随机的）')}" data-tip-pos="top">重试</button>
+                    </div>${offerHtml}`;
     } else {
         bodyHtml = `
                     <div class="text-xs text-slate-400 text-center py-2 italic">No context-aware alternatives found.
@@ -2226,7 +2288,21 @@ function renderFormattedText(text) {
     pushPlaceholder(/\\\(([\s\S]*?)\\\)/g, 'inline', (match, p1) => p1);
     pushPlaceholder(/\$([^\$]+?)\$/g, 'inline', (match, p1) => p1);
     
-    let html = window.marked.parse(content);
+    // 【波浪号必须先藏起来】marked 默认开着 GFM 的单波浪号删除线，而 LaTeX 里
+    // `Section~\ref{sec:II}` / `不确定性~\cite{10143419}` 这种不换行空格几乎出现在每一处引用上。
+    // 上面的 pushPlaceholder 只把 $…$ / \[…\] / \begin{…} 里的数学换成了占位符，
+    // `~\ref` `~\cite` 这类**正文里的**波浪号一个都没动，于是
+    // `Section~\ref{sec:II} presents … Section~` 会整段被画上 <del>，波浪号本身被吞掉。
+    // 删除线在中文语境里恰好读作「把这段删掉」，正好是原文意思的反面。
+    // 做法和 chatRenderProse 完全一样（连常量都共用一个）：解析前把 `~` 换成一个私用区码位、
+    // 解析完再换回来，而不是去改全局 marked 配置 —— 聊天气泡和译文预览用的是同一个 marked。
+    // 顺序也有讲究：还原必须排在 KaTeX 占位符回填**之前**，
+    // 这样 katex.renderToString 吐出来的 HTML 不会被这两次 split/join 扫到。
+    // 两个被实测否掉的更"简单"的写法见 CHAT_MD_TILDE 上方的注释（HTML 实体、控制字符），别再试。
+    const mdSource = content.split(CHAT_MD_TILDE).join('').split('~').join(CHAT_MD_TILDE);
+    let html = window.marked.parse(mdSource)
+        .split(CHAT_MD_TILDE).join('~')
+        .split(encodeURI(CHAT_MD_TILDE)).join('~');
     placeholders.forEach(p => { html = html.replace(p.id, p.html); });
     return html;
 }
@@ -2681,8 +2757,64 @@ function xportJsonCandidates(s) {
 const XPORT_JSON_KEYS = ['translations', 'alternatives', 'sentence_alternatives',
     'corrected_sentence', 'correct', 'issue', 'text'];
 
+// ============= A6：非法转义抢救 =============
+// 把不是合法 JSON 转义的反斜杠补成两个。**补不动就返回 null**（见下面的歧义判据）。
+// 【为什么需要它】实测本机默认模型 qwen/qwen3.6-35b-a3b：语法弹窗 86 次调用里
+// 14 次（16.3%）用户看得见的失败，其中 **12 次**是把 LaTeX 反斜杠原样写进 JSON 字符串
+// （\mathcal \eqref \cite \% \pm，JSON.parse 硬失败、措辞全是 "Bad escaped character"），
+// 另外 2 次是 status:'empty' —— 模型答了，是客户端把候选全过滤了，跟转义没关系。
+// 驱动因素是**被发出去的整句里的 LaTeX**，不是用户选中的那几个字：按 LaTeX token 数分层
+// 0 个 0/17=0%、1-3 个 9.4%、4-8 个 21.4%、>=9 个 34.8%。同一句话时好时坏（随机）。
+// 推理不是原因：86/86 次请求 reasoning_effort 都发的 "none"，reasoning_tokens 全 0。
+// 光改 prompt 也没用（实测 20% → 15%，还新添了 2 例空结果）；抢救是 20% → 0%。
+//
+// 【\b \f \n \r \t 有歧义，绝不能一律补】它们既是合法 JSON 转义，又是 LaTeX 命令的开头
+// （\begin \frac \nu \rho \times \theta \text \rightarrow …）。两个方向猜错都是**静默改坏正文**：
+// 当成 LaTeX 补 → 真换行变成正文里两个字符 `\n`（LaTeX 里是未定义控制序列）；
+// 不补 → `\nu` 变成换行加一个 u。唯一经得起实测的判据是「LaTeX 命令名必然是字母」：
+// 后面紧跟字母才敢当 LaTeX；后面不是字母（`\n\` `\n=` `\n}`）说明这份响应里真有控制字符，
+// 两种写法混在同一份里，谁也分不清 —— 这时候**整份放弃**，让它照常报错。
+// 宁可让用户看见「未能获得语法建议」按一下重试，也不能把 \cite{} 悄悄改坏了写进论文。
+// 实测（1830 份历史响应）：没有这条判据时救回 130 份、**改坏 1 份**
+// （thinking-json-evidence/main-exp.jsonl #42：同一份 translations 里，第一对是裸 LaTeX、
+// 第二对是 \\begin{equation} 配真换行，整段被改成字面量 \n，LaTeX 编译不过，
+// 而 xportEquationAudit 一个字都查不出来 —— 环境名还在，只是行没了）。
+// 加上之后：救回 129 份、改坏 0 份，唯一少救的就是那一份。
+function xportRepairEscapes(s0) {
+    const s = String(s0);
+    let out = '';
+    for (let i = 0; i < s.length; i++) {
+        if (s[i] !== '\\') { out += s[i]; continue; }
+        const c = s[i + 1];
+        if (c === '\\') { out += '\\\\'; i++; continue; }
+        if (c === '"' || c === '/') { out += '\\' + c; i++; continue; }
+        if (c === 'u' && /^[0-9a-fA-F]{4}$/.test(s.slice(i + 2, i + 6))) { out += s.slice(i, i + 6); i += 5; continue; }
+        if ((c === 'b' || c === 'f' || c === 'n' || c === 'r' || c === 't')
+            && !/[A-Za-z]/.test(s[i + 2] || '')) return null;      // 歧义：整份放弃，不猜
+        out += '\\\\';
+    }
+    return out;
+}
+// 从右往左找最后一个花括号配平的 {...}。**故意不认字符串**：
+// 坏掉的响应恰恰是引号奇偶被打乱，而那正是 xportJsonCandidates（字符串感知）失效的原因 ——
+// 两者是互补的，不是重复的。
+function xportLastBalancedObject(s) {
+    for (let end = s.length - 1; end >= 0; end--) {
+        if (s[end] !== '}') continue;
+        let depth = 0;
+        for (let i = end; i >= 0; i--) {
+            if (s[i] === '}') depth++;
+            else if (s[i] === '{') { depth--; if (depth === 0) return s.slice(i, end + 1); }
+        }
+    }
+    return null;
+}
+
 // 解析JSON响应（处理可能的markdown包裹）
-function parseJsonResponse(text) {
+// opts.arrayKey：**顶层裸数组**（全字符串）该记到哪个键下。缺省 'translations'，
+// 于是所有既有调用方逐字不变；选词/语法弹窗传 'alternatives'，因为它们读的是那个键。
+function parseJsonResponse(text, opts) {
+    const arrayKey = (opts && typeof opts.arrayKey === 'string') ? opts.arrayKey : 'translations';
     // 检查空响应
     if (!text || text.trim() === '') {
         console.error('parseJsonResponse: Empty response received');
@@ -2717,12 +2849,45 @@ function parseJsonResponse(text) {
         }
         if (keyed !== null) return keyed;
         if (anyObj !== null) return anyObj;
-        // 尝试提取JSON数组
+
+        // A6 抢救：模型已经把答案写出来了，只是转义写错了。改动前这一整份直接丢掉。
+        // 【位置是有讲究的，不能挪】必须在候选扫描**之后**、数组兜底**之前**，而且必须
+        // 长在 parseJsonResponse 自己的 catch 里，**不能**做成"包一层、抛错时再救"的外壳：
+        // 下面那条数组兜底在坏响应上**不抛错**，它会返回一份伪造的成功（见那里的注释），
+        // 外壳永远看不到这些行。实测差别：外壳式实现让智能更新只从 18/20 修到 3/20，
+        // 就地实现是 18/20 → 0/20。
+        // 实测 1286 份历史响应：救回 45 份，0 份变坏。96% 的响应在第一次 JSON.parse 就过了，
+        // 根本走不到这里。
+        const tryObj = function (s) {
+            if (typeof s !== 'string') return null;      // xportRepairEscapes 判定有歧义时返回 null
+            try { const v = JSON.parse(s); return (v && typeof v === 'object' && !Array.isArray(v)) ? v : null; }
+            catch (e4) { return null; }
+        };
+        let salvaged = tryObj(xportRepairEscapes(clean));
+        if (salvaged) return salvaged;
+        const lastObj = xportLastBalancedObject(clean);
+        if (lastObj) {
+            salvaged = tryObj(lastObj);                     if (salvaged) return salvaged;
+            salvaged = tryObj(xportRepairEscapes(lastObj)); if (salvaged) return salvaged;
+        }
+
+        // 尝试提取JSON数组 —— 只认两种**形状**。
+        // 【为什么必须按形状收口】改动前任何能解析出来的数组都会被当成 translations。
+        // 实测：智能更新的译文里有个区间 `\rightarrow[0,1]$`，这条贪婪正则匹配到的是**数学式**，
+        // 于是 parseJsonResponse **不抛错**地返回 { translations: [0,1] }，被上层当成一次成功；
+        // data.text 是 undefined → "" → `||` 静默把原文填回去 → 转圈结束、什么都没发生，
+        // 而且因为没抛错，classifyLocalFailure 一次都没跑，console 里连一行都没有。
+        // 数学密集的行上实测 3/20 = 15%。不删这条兜底（旧翻译链路的形状没人量过），只按形状放行。
         const arrayMatch = clean.match(/\[[\s\S]*\]/);
         if (arrayMatch) {
             try {
                 const arr = JSON.parse(arrayMatch[0]);
-                return { translations: arr };
+                if (Array.isArray(arr) && arr.length > 0) {
+                    const allPair = arr.every(x => x && typeof x === 'object'
+                        && typeof x.src === 'string' && typeof x.tgt === 'string');
+                    if (allPair) return { translations: arr };
+                    if (arr.every(x => typeof x === 'string')) { const r = {}; r[arrayKey] = arr; return r; }
+                }
             } catch (e3) {}
         }
         console.error('parseJsonResponse failed. Raw response:', text.substring(0, 500));
@@ -2758,7 +2923,19 @@ function parseJsonResponse(text) {
 // 用户没有任何入口能改它，写出来只是让人白找一遍。
 const XPORT_FAIL_TEXT = {
     THINKING_ATE_BUDGET: '模型把全部 token 预算用在了推理上，正文为空。请到「设置 → 模型」把该模型的「推理」设为「关」；若那里已是「关」仍然如此，说明是 LM Studio 端开的，请在 LM Studio 里关闭该模型的 Enable Thinking。',
-    BAD_ESCAPE: '模型把 LaTeX 反斜杠写成了单反斜杠，JSON 转义非法 —— 这是推理模式最典型的症状。请到「设置 → 模型」把该模型的「推理」设为「关」；若那里已是「关」，请在 LM Studio 里关闭该模型的 Enable Thinking。',
+    // 【这条文案原来说反了】改动前它断言「这是推理模式最典型的症状」，并让用户去关推理。
+    // 实测把它证伪：语法弹窗的 86 次调用全程 reasoning_effort="none"、reasoning_tokens=0，
+    // 照样有 16.3% 撞上这个错。「推理」两个字仍然留在文案里，但说的是**它不是原因**；
+    // 开着推理会更糟这一点由 classifyLocalFailure 按 meta.reasoningEffortSent 动态补一句，
+    // 不写死在这里。
+    // 【为什么不再推荐换模型】那条建议一度写成「换用 qwen3.8-27b，失败率 2.3% vs 16.3%」。
+    // 两个数都不属于渲染这句话的这一版：16.3% 是 HEAD 的失败率，本次抢救已经把它消掉；
+    // 换模型的收益是 0。同一批 86 个输入跑完整链路（node .claude/tmp/_adv_uservisible.js）：
+    //   qwen3.6-35b-a3b  HEAD 14/86 = 16.3%   本版 2/86 = 2.3%
+    //   qwen3.8-27b      HEAD  2/86 =  2.3%   本版 2/86 = 2.3%
+    // 而代价是真的：27b 把 86 句里的 68 句判成「语法正确」，qwen3.6 只判 27 句 ——
+    // 在用户最需要答案的那一刻，把他推去一个少报 41 处真问题的模型。
+    BAD_ESCAPE: '模型把 LaTeX 反斜杠写成了单反斜杠，JSON 转义非法。这与「推理」开关无关 —— 实测 86 次调用推理全程为关仍然发生。含 $…$ / \\cite / \\ref 的句子最容易触发。同一句话时好时坏，请点「重试」。（换模型帮不上忙：本版抢救之后 qwen3.8-27b 与 qwen3.6-35b-a3b 在同一批输入上都是 2.3%，而 27b 会把其中 68 句判成「语法正确」，比 qwen3.6 少报 41 处真问题。）',
     TRUNCATED: '模型输出被 token 上限截断（finish_reason=length），返回的是半截内容。多半是推理占掉了预算：请到「设置 → 模型」把该模型的「推理」设为「关」，或在 LM Studio 里给该模型加载更大的上下文。',
     EMPTY: '模型返回了空正文。',
     THINKING_LEAK: '模型的推理内容混进了正文。请到「设置 → 模型」把该模型的「推理」设为「关」；若那里已是「关」，请在 LM Studio 里关闭该模型的 Enable Thinking。',
@@ -2782,21 +2959,33 @@ function classifyLocalFailure(res, parseErr) {
     else if (!text.trim()) code = 'EMPTY';
     else if (thinking || /<\/?\s*think\s*>/i.test(text)) code = 'THINKING_LEAK';
     else code = 'UNPARSEABLE';
-    return { code: code, message: '无法解析 JSON 响应（' + code + '）：' + XPORT_FAIL_TEXT[code] };
+    let remedy = XPORT_FAIL_TEXT[code];
+    // BAD_ESCAPE 的文案说的是「推理不是原因」。但**开着**推理确实会让它更糟
+    // （实测 qwen3.6 打开推理，JSON 硬失败 16.7% → 33.3%），所以只在这次请求真的带了
+    // 非 none 的 reasoning_effort 时才补这句 —— 不猜、不写死，照着发出去的值说。
+    const effort = typeof r.reasoningEffortSent === 'string' ? r.reasoningEffortSent : '';
+    if (code === 'BAD_ESCAPE' && effort && effort !== 'none') {
+        remedy += '（本次请求带着 reasoning_effort=' + effort + '；把它设为「关」可以把失败率减半。）';
+    }
+    return { code: code, message: '无法解析 JSON 响应（' + code + '）：' + remedy };
 }
 
 // 本地链路专用的解析入口：解析失败时把 meta 里的 finish_reason / thinking / 正文
 // 一起交给分类器，抛出**带补救办法**的错误。meta 为空时退化成「只看正文」，
 // 与改动前的报错等价，不会更糟。
-function parseLocalJson(text, meta) {
+// opts 原样转交 parseJsonResponse（见那里的 arrayKey 注释）。不传 = 与改动前逐字等价。
+function parseLocalJson(text, meta, opts) {
     try {
-        return parseJsonResponse(text);
+        return parseJsonResponse(text, opts);
     } catch (e) {
         const m = meta || {};
         const res = {
             text: (typeof m.text === 'string') ? m.text : String(text == null ? '' : text),
             thinking: !!m.thinking,
-            truncated: !!m.truncated
+            truncated: !!m.truncated,
+            // 这次请求实际发出去的 reasoning_effort（callLocalLLM 写进 meta）。
+            // BAD_ESCAPE 的补救文案要靠它才能说人话，见 classifyLocalFailure。
+            reasoningEffortSent: (typeof m.reasoningEffortSent === 'string') ? m.reasoningEffortSent : ''
         };
         // parseJsonResponse 把原始 SyntaxError 挂在 .cause 上（见那里的注释）：分类必须
         // 看原始措辞，看包装后的那句固定文案永远只能得到 UNPARSEABLE。
@@ -4677,7 +4866,9 @@ async function getSmartUpdate(prompt, config, signal = null) {
 
 // ============= 获取同义词 =============
 // mode: 'replace'（学术同义替换，默认）| 'simplify'（简化：更常用、更直白的说法）
-async function getSynonyms(sentence, selectedText, lang, config, avoidList = [], mode = 'replace') {
+// signal: 可选的 AbortSignal，只走本地链路的第 5 个位置参数（callLocalLLM 的既有形参）。
+// 在线三家的签名一个字节都没动。
+async function getSynonyms(sentence, selectedText, lang, config, avoidList = [], mode = 'replace', signal = null) {
     const avoidInstruction = avoidList.length > 0
         ? `IMPORTANT: Do NOT include any of the following words/phrases in your output: ${JSON.stringify(avoidList)}. Find DIFFERENT alternatives.`
         : "";
@@ -4713,13 +4904,13 @@ Return JSON: { "alternatives": ["option1", "option2", "option3", "option4"] }`;
             config.model,
             [{ role: "user", content: prompt }],
             false, // 不使用json_mode
-            null,
+            signal,
             meta
         );
         // 同 getSmartUpdate：吞掉失败是既有行为（弹窗显示「没有候选」），
         // A4 的分类只进 console —— 这条链路上 UI 一字不变。
         try {
-            const data = parseLocalJson(response, meta);
+            const data = parseLocalJson(response, meta, { arrayKey: 'alternatives' });
             return data.alternatives || [];
         } catch (e) { console.warn('getSynonyms: ' + (e && e.code ? e.code : '') + ' ' + (e && e.message)); return []; }
     }
@@ -4733,7 +4924,7 @@ Return JSON: { "alternatives": ["option1", "option2", "option3", "option4"] }`;
             config.openaiApiKey
         );
         try {
-            const data = parseJsonResponse(response);
+            const data = parseJsonResponse(response, { arrayKey: 'alternatives' });
             return data.alternatives || [];
         } catch (e) { return []; }
     }
@@ -4749,7 +4940,7 @@ Return JSON: { "alternatives": ["option1", "option2", "option3", "option4"] }`;
             config.claudeProxyUrl
         );
         try {
-            const data = parseJsonResponse(response);
+            const data = parseJsonResponse(response, { arrayKey: 'alternatives' });
             return data.alternatives || [];
         } catch (e) { return []; }
     }
@@ -4793,6 +4984,42 @@ function isSameGrammarText(a, b) {
     return na === nb;
 }
 
+// 只归一化空白。tier-1 判据（选区外逐字未变）用它。
+function collapseWs(s) {
+    return (typeof s === 'string' ? s : '').trim().replace(/\s+/g, ' ');
+}
+// 只保留「承载语法的词序列」：LaTeX 命令名、{}$~\、全部标点、引号/破折号变体、
+// 大小写、空白一律抹平；词的替换/增删会保留下来 —— 那才是「错在选区外」的样子。
+// 三个非 ASCII 字符集刻意写成 \u 转义（同 CHAT_MD_TILDE 的理由：裸字符肉眼查不出来）：
+//   ‐-― = 连字符/各种破折号，‘’ʼ = 弯撇号，“” = 弯双引号。
+function grammarKey(s) {
+    return String(s == null ? '' : s)
+        .replace(/\\textcolor\s*\{[^{}]*\}/g, ' ')   // \textcolor{blue}{X} → X（颜色参数不是语法）
+        .replace(/\\[a-zA-Z]+\s*(\[[^\]]*\])?/g, ' ')
+        .replace(/[{}$~\\]/g, ' ')
+        .toLowerCase()
+        .replace(/[\u2010-\u2015]/g, '-')
+        .replace(/[\u2018\u2019\u02BC]/g, "'")
+        .replace(/[\u201C\u201D]/g, '"')
+        .replace(/[^a-z0-9'\-]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+// derived 是从 corrected_sentence 里裁出来的。模型自己的修正稿偶尔会把选区开头
+// 重复一遍（实测 c25 / p15L：选区 "Willie rewards, $R^{J}$" → derived
+// "Willie rewards, Willie rewards, $R^{W}$"），排在第一位就是把一条看得见的
+// 坏选项推到用户鼻子底下。这种情况**不删只降权**，让模型自己的候选先上。
+// 实测：散文语料 146 条 tier-1 行 0 次误伤；数学语料 12 条里命中 3 条。
+function grammarDerivedLooksDuplicated(sel, der) {
+    const a = collapseWs(sel), b = collapseWs(der);
+    if (!a || !b || b.length <= a.length) return false;
+    for (let L = Math.min(a.length, 12); L >= 6; L--) {
+        const p = a.slice(0, L);
+        if (b.indexOf(p) === 0 && b.indexOf(p, 1) > 0) return true;
+    }
+    return false;
+}
+
 // 去空、去重、压成字符串数组
 function normalizeGrammarList(raw) {
     const arr = Array.isArray(raw) ? raw : [];
@@ -4813,7 +5040,11 @@ function normalizeGrammarList(raw) {
 // baseline: { selectedText, sentenceText, head, tail }
 //   sentenceText 为空串 = 本次没有可用的整句范围 → 整句改写一律丢弃，只允许词级替换。
 //   （没有范围却应用整句改写，就会把一整句塞进一个词的位置。）
-//   head/tail = 整句里选区前后的两截；两者都在时会对词级候选做交叉核对。
+//   head/tail = 整句里选区前后的两截；两者都在时用来判定「模型的修正稿动没动到选区之外」。
+//
+// 返回形状固定为 { status, issue, scope, alternatives, sentenceIssue, sentenceOffer }。
+// 后两个是**附带提议**通道（「整句别处还有问题」），只有新 prompt 的两判定契约会填，
+// 而且永远是二等公民 —— 它绝不会顶掉用户真正问的那段选区的答案。
 function normalizeGrammarPayload(data, baseline) {
     const d = (data && typeof data === 'object') ? data : {};
     const base = (baseline && typeof baseline === 'object') ? baseline : {};
@@ -4827,74 +5058,204 @@ function normalizeGrammarPayload(data, baseline) {
         .filter(v => !isSameGrammarText(v, selectedText));
 
     const corrected = typeof d.corrected_sentence === 'string' ? d.corrected_sentence.trim() : '';
-    const sentenceAlternatives = sentenceText
-        ? normalizeGrammarList(
-            normalizeGrammarList(d.sentence_alternatives != null ? d.sentence_alternatives : d.sentenceAlternatives)
-                .concat(corrected ? [corrected] : [])
-          ).filter(v => !isSameGrammarText(v, sentenceText))
-        : [];
 
-    // 交叉核对：把词级候选塞回选区位置，至少有一条要能还原出模型自己写的整句修正稿。
-    // 一条都对不上 = 这批「词级替换」换的其实是别处的词（实测出现过：焦点是 results，候选却是 show），
-    // 点下去只会把句子改坏 —— 这种情况直接不给词级选项，改用整句改写。
-    // 模型没给 corrected_sentence（弱模型 / 老响应）就无从核对，此时一律放行，行为与核对前一致。
-    let spanVerified = true;
-    if (spanAlternatives.length > 0 && corrected && head !== null && tail !== null) {
-        spanVerified = spanAlternatives.some(alt => isSameGrammarText(head + alt + tail, corrected));
+    // 两判定契约（buildGrammarPrompt 现在要的形状）：focus_correct 只回答「**选区**对不对」，
+    // sentence_issue / sentence_alternatives 说的是句子别处的毛病，改走附带提议通道。
+    // **只有模型真的回了 focus_correct 才启用**：老形状（只有 correct）逐字走下面同一条阶梯，
+    // 这样 1286 份历史响应的离线重放数字仍然可比，Gemini/旧缓存也不会走进没量过的分支。
+    let focusCorrect = null;
+    if (typeof d.focus_correct === 'boolean') focusCorrect = d.focus_correct;
+    else if (typeof d.focus_correct === 'string' && d.focus_correct.trim()) {
+        focusCorrect = /^(true|yes|correct)$/i.test(d.focus_correct.trim());
     }
+    const twoVerdict = focusCorrect !== null;
+
+    const rawSentenceList = normalizeGrammarList(
+        d.sentence_alternatives != null ? d.sentence_alternatives : d.sentenceAlternatives);
+
+    // 附带提议只在两判定契约下存在，而且必须真有整句范围才谈得上「整句改写」
+    const offerList = (twoVerdict && sentenceText)
+        ? rawSentenceList.filter(v => !isSameGrammarText(v, sentenceText))
+        : [];
+    const sentenceIssue = (twoVerdict && typeof d.sentence_issue === 'string') ? d.sentence_issue.trim() : '';
+
+    // 主答案能用的整句池。两判定契约下 sentence_alternatives 已经改走提议通道了，
+    // 主答案只认模型自己的 corrected_sentence。
+    const sentenceAlternatives = sentenceText
+        ? normalizeGrammarList((twoVerdict ? [] : rawSentenceList).concat(corrected ? [corrected] : []))
+            .filter(v => !isSameGrammarText(v, sentenceText))
+        : [];
 
     let issue = '';
     if (typeof d.issue === 'string') issue = d.issue.trim();
     else if (typeof d.reason === 'string') issue = d.reason.trim();
+
+    // 所有出口共用一个收口：主答案已经是整句改写时，附带提议不再挂上去
+    //（同一件事说两遍只会互相打架，而且 applySynonym 的范围只有一个）。
+    const fin = function (status, scope, alternatives) {
+        const sentScope = scope === 'sentence';
+        return {
+            status: status,
+            issue: status === 'correct' ? '' : issue,
+            scope: sentScope ? 'sentence' : 'selection',
+            alternatives: alternatives,
+            sentenceIssue: sentScope ? '' : sentenceIssue,
+            sentenceOffer: sentScope ? [] : offerList
+        };
+    };
 
     // 「语法正确」必须有模型的明确表态才敢下结论。
     // 响应是 null / 数组 / 缺字段时一律算 'empty'——绝不能把一次失败的请求显示成「语法正确」。
     let correct = false;
     if (typeof d.correct === 'boolean') correct = d.correct;
     else if (typeof d.correct === 'string') correct = /^(true|yes|correct)$/i.test(d.correct.trim());
+    if (twoVerdict) correct = focusCorrect;      // 新契约下由 focus_correct 说了算
 
-    if (correct) return { status: 'correct', issue: '', scope: 'selection', alternatives: [] };
+    if (correct) return fin('correct', 'selection', []);
 
-    // 作用域：优先听模型的判断，但必须真有对应的候选才作数；否则退到另一种作用域。
+    // 交叉核对（放宽版）：问题不是「词级候选能不能逐字复现模型的整句修正稿」，
+    // 而是「模型自己的修正稿有没有动到选区**以外**、且是语法意义上的改动」。
+    //   动了 → 这个错必须出选区才能修，整句改写是应得的；
+    //   没动 → 模型的修正稿本身就是一个词级修复，那就留在选区，并且把真正的
+    //          替换串**从 corrected_sentence 里取出来**（实测：模型给的 alternatives
+    //          经常只替换多词选区里的一部分，"these decision" → ["decisions"]，
+    //          把 "these" 悄悄吞掉；corrected_sentence 里的那一段才是完整的）。
+    // 改动前那条严格判据（head + alt + tail === corrected_sentence，逐字比整句）
+    // 实测把 76.5% 的完美词级答案判死（17 条手工构造的载荷里 13 条），
+    // 而且 74.5% 的整句改写就是它逼出来的。
+    let tier = 0, derived = null;
+    if (corrected && head !== null && tail !== null) {
+        const c = collapseWs(corrected), h = collapseWs(head), t = collapseWs(tail);
+        if ((h === '' || c.indexOf(h) === 0) && (t === '' || c.lastIndexOf(t) === c.length - t.length)
+            && c.length >= h.length + t.length) {
+            tier = 1;                                   // 选区外逐字未变
+            derived = collapseWs(c.slice(h.length, c.length - t.length));
+        } else {
+            const kc = grammarKey(corrected), kh = grammarKey(head), kt = grammarKey(tail);
+            // tier 2：抹掉 LaTeX 命令名/标点/大小写之后仍然一致 = 选区外没有**语法**改动。
+            // tier 3：选区外真的换了词 —— 这才是 e3a4a7a 当初要抓的那种（c33 「These works」
+            //         的 corrected_sentence 把选区外的 demonstrates 改成了 demonstrate）。
+            tier = ((kh === '' || kc.indexOf(kh) === 0)
+                 && (kt === '' || kc.lastIndexOf(kt) === kc.length - kt.length)
+                 && kc.length >= kh.length + kt.length) ? 2 : 3;
+        }
+    }
+
     const scopeHint = typeof d.scope === 'string' ? d.scope.trim().toLowerCase() : '';
-    if (scopeHint === 'sentence' && sentenceAlternatives.length > 0) {
-        return { status: 'issues', issue: issue, scope: 'sentence', alternatives: sentenceAlternatives };
+
+    // 两判定契约下「我要改整句」必须先说得出理由：outside_fix 得是选区**之外**真实存在的一段。
+    // 说得出 → 直接升级，附带提议就是主答案；说不出 → 一路往下，最后落回选区。
+    // 有歧义时默认永远是选区，这是整条阶梯的默认方向。
+    const wantsSentence = twoVerdict && scopeHint === 'sentence';
+    const reason = wantsSentence && typeof d.outside_fix === 'string' ? d.outside_fix.trim() : '';
+    const reasonValid = !!reason
+        && ((head === null ? '' : head) + ' ' + (tail === null ? '' : tail)).indexOf(reason) !== -1;
+    if (wantsSentence && reasonValid && offerList.length > 0) return fin('issues', 'sentence', offerList);
+
+    if (tier === 1) {
+        const out = [];
+        const push = function (v) {
+            if (v && !isSameGrammarText(v, selectedText)
+                && !out.some(x => isSameGrammarText(x, v))) out.push(v);
+        };
+        // derived 默认排第一（实测：把还原出正确答案的选项放进第 1 格，44/45 → 40/45 对
+        // 27/30 → 20/30，差 22 个百分点）；只有它看起来是「选区开头被重复了一遍」时才降到末位。
+        const demote = !!derived && grammarDerivedLooksDuplicated(selectedText, derived);
+        if (derived && !demote) push(derived);
+        for (let i = 0; i < spanAlternatives.length; i++) push(spanAlternatives[i]);
+        if (derived && demote) push(derived);
+        if (out.length > 0) return fin('issues', 'selection', out);
     }
-    if (spanAlternatives.length > 0 && spanVerified) {
-        return { status: 'issues', issue: issue, scope: 'selection', alternatives: spanAlternatives };
-    }
-    if (sentenceAlternatives.length > 0) {
-        return { status: 'issues', issue: issue, scope: 'sentence', alternatives: sentenceAlternatives };
-    }
-    return { status: 'empty', issue: issue, scope: 'selection', alternatives: [] };
+    if (tier === 2 && spanAlternatives.length > 0) return fin('issues', 'selection', spanAlternatives);
+    // 说不出理由的整句请求，到这里就被驳回：有词级候选就用词级候选。
+    if (wantsSentence && !reasonValid && spanAlternatives.length > 0) return fin('issues', 'selection', spanAlternatives);
+    if (scopeHint === 'sentence' && sentenceAlternatives.length > 0) return fin('issues', 'sentence', sentenceAlternatives);
+    if (tier === 3 && sentenceAlternatives.length > 0) return fin('issues', 'sentence', sentenceAlternatives);
+    // tier 0（模型压根没给 corrected_sentence）**必须**能走到这条选区出口。
+    // 抢救上线后 48/86 的载荷都是这个形状；把这一条「简化」掉就等于把它们全推去整句改写。
+    if (spanAlternatives.length > 0) return fin('issues', 'selection', spanAlternatives);
+    if (sentenceAlternatives.length > 0) return fin('issues', 'sentence', sentenceAlternatives);
+    return fin('empty', 'selection', []);
 }
 
 // spanOnly = true：没有可用的整句范围，只能要词级替换（模型不许提整句改写）
+//
+// 【为什么整个 prompt 重写了】改动前第一句是
+// 「Check the grammar of the WHOLE "Sentence", paying special attention to the "Focus"」——
+// 于是用户选中一个本身没毛病的词、而错在句子别处时，模型**完全按吩咐办事**，回一份整句改写。
+// 实测这一类 22/24 = 91.7% 被升级成整句，其中 82% 是模型自己选的 scope:"sentence"，
+// 客户端再怎么放宽判据都碰不到它。用户抱怨的就是这一条。
+//
+// 现在的形状（两判定契约）：
+//   focus_correct           —— 整句全部校对之后，只回答「用户选的这段是不是其中一个错、
+//                              或者是某个错的另一半」；这是主答案。**判定的作用域是选区，
+//                              阅读的范围仍然是整句**——这两件事不能一起收窄，见下面第 1 条的实测。
+//   scope / alternatives    —— 选区错了怎么修；默认 selection，sentence 必须「挣来」。
+//   outside_fix             —— 要 sentence 就必须点名选区**之外**那段要改的字，
+//                              说不出来就退回 selection（normalizeGrammarPayload 会核对）。
+//   sentence_issue / sentence_alternatives —— 句子别处的毛病，**附带提议**，
+//                              永远不顶掉 focus 的判定（客户端把它放进第二行，用户点了才生效）。
+// 另外明确列出「什么算语法错误」，把 partial adaptive / adapt its monitor decisions 这类
+// 词形错误钉死为语法问题 —— 少了这一条模型会把它读成用词偏好，直接答「语法正确」。
+//
+// 【第 1 条改过两轮，两轮都是量出来的，别再凭手感动它】
+// 第一版写的是「First judge the FOCUS ONLY … EVEN IF some other part of the Sentence is wrong」。
+// 实测代价：模型干脆不去读句子别处了，于是**选区是错误的另一半**时它照答 focus_correct=true，
+// 屏幕上就是一颗绿勾。24 条 LaTeX 语料 x 2 次 x 自己那一版的构建
+//（node .claude/tmp/combined/verify-prompt-fix.js，原始数据同名 .jsonl / .log）：
+//   假「语法正确」(class ii+iii)     HEAD 0/36    第一版 9/36 (25.0%)   现在 2/36 (5.6%)
+//   不必要的整句升级 (class i+ii)    HEAD 13/32   第一版 2/32           现在 2/32
+//   class-ii 首选项就能修好          HEAD 5/20    第一版 18/20          现在 17/20
+//   class-iii 修复稿就是主答案       HEAD 7/16    第一版 6/16           现在 10/16
+// 两处改动分别对应两个实测出来的洞：
+//   (a) 第 1 条现在**先整句校对、再判选区**（HEAD 的顺序），因为 HEAD 从没漏过错；
+//       只把「判定的作用域」收窄到选区，不把「阅读的范围」也收窄。
+//   (b) 第 4 条的 sentence 分支原来只要 outside_fix，**没说改写稿放哪** ——
+//       而客户端读的是 sentence_alternatives。少这一句，升级上去的那一页拿到的
+//       是第 5 条那个「与选区无关的别处问题」的改写稿，修的往往不是用户问的那个错。
+// 【仍然没修好、且不是客户端能修的】两个错的句子（"The results shows … outperform …"，
+// 选中 "results"）：主答案 0/4 次是完整修复，HEAD 是 3/4。这是两判定契约的**设计后果**
+// 而不是 bug —— 用户问的是 "results"，主答案就只修 "results" 那一处，另一处走
+// 「整句还有问题」那一行（4 次里 2 次可点开拿到完整修复）。要让主答案永远修全句，
+// 就得退回 HEAD 那套「问一个词、改一整句」，而那正是本轮 91.7% 过度升级的来源。
 function buildGrammarPrompt(sentence, selectedText, lang, avoidInstruction, spanOnly) {
     const scopeRules = spanOnly
-        ? `3. Only the "selection" scope is available here: set "scope": "selection" and put 3-5 DISTINCT drop-in replacements for the "Focus" in "alternatives". Each one is substituted for the Focus characters and NOTHING else: the words before and after the Focus stay exactly as they are. Leave "sentence_alternatives" EMPTY - it will be discarded.`
-        : `3. Then pick the SMALLEST scope that can FULLY repair the sentence:
-   - Use "scope": "selection" ONLY IF every error can be repaired by replacing the "Focus" substring alone. Put 3-5 DISTINCT drop-in replacements for the "Focus" in "alternatives". Each one is substituted for the Focus characters and NOTHING else: the words before and after the Focus stay exactly as they are. Also fill "corrected_sentence" with the whole Sentence as it reads after substituting alternatives[0] for the Focus - it must be identical to the Sentence except for the Focus part.
-   - Otherwise use "scope": "sentence" and put 3-5 DISTINCT fully corrected versions of the ENTIRE "Sentence" in "sentence_alternatives". Leave "alternatives" empty.`;
+        ? `4. Only the "selection" scope exists here. If the Focus is wrong, set "scope": "selection" and put 3-5 DISTINCT replacements for the WHOLE Focus string in "alternatives". Leave "sentence_alternatives" and "outside_fix" empty.`
+        : `4. If the Focus is wrong, pick the scope. The DEFAULT is "selection"; "sentence" must be earned.
+   - "scope": "selection" - the error can be repaired by rewriting the Focus alone. Put 3-5 DISTINCT replacements in "alternatives". Each alternative replaces the ENTIRE Focus string, so COPY THROUGH the parts of the Focus that are already correct and change only what is wrong; never return a replacement for a word that is not inside the Focus. Set "corrected_sentence" to the Sentence with alternatives[0] substituted for the Focus and EVERY OTHER CHARACTER copied verbatim. Leave "outside_fix" empty.
+   - "scope": "sentence" - the Focus is PART OF an error that cannot be repaired inside the Focus (for example the Focus is the subject and the verb outside it disagrees). You MUST set "outside_fix" to the exact substring, taken from OUTSIDE the Focus, that has to change, AND put 3-5 DISTINCT fully corrected versions of the ENTIRE Sentence in "sentence_alternatives"; each version must repair EVERY error in the Sentence, not only the one nearest the Focus. If you cannot name an outside_fix, use "selection" instead.`;
 
     return `Sentence: "${sentence}"
-Focus (the part the user selected, inside the Sentence): "${selectedText}"
+Focus (the exact substring the user selected, inside the Sentence): "${selectedText}"
 Language: ${lang === 'zh' ? 'Chinese' : 'English'}
 
-Task: Act as a strict academic proofreader. Check the grammar of the WHOLE "Sentence", paying special attention to the "Focus".
-1. If the whole "Sentence" is already grammatically correct, answer "correct": true, "scope": "none", an empty "issue", an empty "alternatives" and an empty "sentence_alternatives". Do NOT invent stylistic rewrites.
-2. Otherwise answer "correct": false and a SHORT "issue" (one clause naming the error).
+Task: Act as a strict academic proofreader. The user is asking about the "Focus". The rest of the "Sentence" is CONTEXT.
+1. FIRST proofread the WHOLE Sentence and find every grammar error in it - do this even when the Focus looks fine, because the error is often outside the Focus. THEN judge the FOCUS against that list: set "focus_correct": false if the Focus is itself one of those errors, OR is one half of one (a subject whose verb outside the Focus does not agree with it, a verb whose subject does not agree, a noun whose article or number does not match). Set "focus_correct": true ONLY when every error you found lies in a part of the Sentence that the Focus has no grammatical relationship with.
+2. If "focus_correct" is true, set "scope": "none", an empty "issue", an empty "alternatives" and an empty "corrected_sentence". Do NOT invent stylistic rewrites of a correct Focus.
+3. If "focus_correct" is false, give a SHORT "issue" (one clause naming the error in or around the Focus).
 ${scopeRules}
-4. NEVER output an option that is identical to the text it would replace. Keep each option a plain replacement: do not append or drop surrounding punctuation.
-5. Fix grammar only; keep the original meaning and the academic tone. Reproduce LaTeX commands, math and citations exactly as given.
-6. ${avoidInstruction}
+5. SEPARATELY, and ONLY when "scope" is not "sentence": if some OTHER part of the Sentence - a part the Focus is not involved in - has a grammar error, describe it in one clause in "sentence_issue" and put 2-3 fully corrected versions of the ENTIRE Sentence in "sentence_alternatives". If the rest of the Sentence is clean, leave both empty. This is an aside for the user to accept or ignore; it never replaces the Focus verdict.
+6. What counts as a grammar error: subject-verb agreement, number, tense, verb form, article, MISSING OR WRONG WORD FORM (an adjective where an adverb is required - "partial adaptive"; a bare noun where a gerund or participle is required - "adapt its monitor decisions"; a base verb after a modal that needs a participle), and malformed construction. A wrong word FORM is a grammar error even when the intended word is obvious. What does NOT count: stylistic tone, synonym preference, hyphenation preference, pronoun gender, terminology choice and formatting.
+7. NEVER output an option identical to the text it would replace. Keep the original meaning and academic tone. Reproduce LaTeX commands, math and citations exactly as given.
+8. ${avoidInstruction}
 
-Return JSON: { "correct": false, "issue": "...", "scope": "sentence", "alternatives": [], "corrected_sentence": "", "sentence_alternatives": ["option1", "option2"] }`;
+Return JSON: { "focus_correct": true, "issue": "", "scope": "none", "alternatives": [], "corrected_sentence": "", "sentence_issue": "", "sentence_alternatives": [], "outside_fix": "" }`;
+}
+
+// 解析失败的统一出口。**必须把 code 带出去**：改动前六个失败码在弹窗里塌成同一句
+// 「模型未返回可用结果（响应为空或 JSON 解析失败）」，补救办法一个字都没有；
+// BAD_ESCAPE 和 THINKING_ATE_BUDGET 的做法完全不同，混在一起等于什么都没说。
+function grammarParseFailure(e) {
+    const code = (e && typeof e.code === 'string') ? e.code : 'UNPARSEABLE';
+    console.warn('getGrammarSuggestions: ' + code + ' ' + (e && e.message));
+    return { status: 'parse', code: code, issue: '', scope: 'selection',
+             alternatives: [], sentenceIssue: '', sentenceOffer: [] };
 }
 
 // sentence: 拿去分析的那一句（有整句范围时 = 整句；没有时 = 原来的整行上下文，并强制 spanOnly）
 // splice: { head, tail } = 整句里选区前后的两截，用于交叉核对；缺省则不做核对
-async function getGrammarSuggestions(sentence, selectedText, lang, config, avoidList = [], spanOnly = false, splice = null) {
+// signal: 同 getSynonyms —— 只透传给本地链路 callLocalLLM 的第 5 个位置参数。
+async function getGrammarSuggestions(sentence, selectedText, lang, config, avoidList = [], spanOnly = false, splice = null, signal = null) {
     const avoidInstruction = avoidList.length > 0
         ? `IMPORTANT: Do NOT repeat any of the following corrections: ${JSON.stringify(avoidList)}. Propose DIFFERENT wordings of the fix.`
         : "";
@@ -4916,15 +5277,14 @@ async function getGrammarSuggestions(sentence, selectedText, lang, config, avoid
             config.model,
             [{ role: "user", content: prompt }],
             false, // 不使用json_mode（与 getSynonyms 保持一致）
-            null,
+            signal,
             meta
         );
-        // 同上：既有的 status:'parse' 返回值一字不变，A4 的分类只进 console。
+        // A4 分出来的码现在跟着返回值一起走到弹窗（grammarParseFailure），不再只进 console。
         try {
-            return normalizeGrammarPayload(parseLocalJson(response, meta), baseline);
+            return normalizeGrammarPayload(parseLocalJson(response, meta, { arrayKey: 'alternatives' }), baseline);
         } catch (e) {
-            console.warn('getGrammarSuggestions: ' + (e && e.code ? e.code : '') + ' ' + (e && e.message));
-            return { status: 'parse', issue: '', scope: 'selection', alternatives: [] };
+            return grammarParseFailure(e);
         }
     }
 
@@ -4937,8 +5297,8 @@ async function getGrammarSuggestions(sentence, selectedText, lang, config, avoid
             config.openaiApiKey
         );
         try {
-            return normalizeGrammarPayload(parseJsonResponse(response), baseline);
-        } catch (e) { return { status: 'parse', issue: '', scope: 'selection', alternatives: [] }; }
+            return normalizeGrammarPayload(parseJsonResponse(response, { arrayKey: 'alternatives' }), baseline);
+        } catch (e) { return grammarParseFailure(e); }
     }
 
     // Claude Path
@@ -4952,22 +5312,25 @@ async function getGrammarSuggestions(sentence, selectedText, lang, config, avoid
             config.claudeProxyUrl
         );
         try {
-            return normalizeGrammarPayload(parseJsonResponse(response), baseline);
-        } catch (e) { return { status: 'parse', issue: '', scope: 'selection', alternatives: [] }; }
+            return normalizeGrammarPayload(parseJsonResponse(response, { arrayKey: 'alternatives' }), baseline);
+        } catch (e) { return grammarParseFailure(e); }
     }
 
     // Gemini Path
-    // ⚠️ 未经实测：本环境没有 Gemini API Key，下面的 schema 变更（新增 scope /
-    // corrected_sentence / sentence_alternatives 三个字段）只做过代码审查，没有真跑过一次请求。
+    // ⚠️ 未经实测：本环境没有 Gemini API Key，下面的 schema 只做过代码审查，没有真跑过一次请求。
+    // schema 必须跟着 prompt 一起换成两判定形状（focus_correct / outside_fix / sentence_issue），
+    // 否则 responseSchema 会强制模型回一个 prompt 里根本没提的 `correct` 字段。
     // 即使 schema 被 Gemini 拒绝或字段缺失，normalizeGrammarPayload 也只会退回
-    // 'empty' / 词级替换，不会拿不存在的范围去替换文本。
+    // 'empty' / 词级替换（focus_correct 不在场时它逐字走老阶梯），不会拿不存在的范围去替换文本。
     const responseSchema = {
         type: "OBJECT",
         properties: {
-            correct: { type: "BOOLEAN" },
+            focus_correct: { type: "BOOLEAN" },
             issue: { type: "STRING" },
             scope: { type: "STRING" },
             corrected_sentence: { type: "STRING" },
+            outside_fix: { type: "STRING" },
+            sentence_issue: { type: "STRING" },
             alternatives: {
                 type: "ARRAY",
                 items: { type: "STRING" }
@@ -4977,7 +5340,7 @@ async function getGrammarSuggestions(sentence, selectedText, lang, config, avoid
                 items: { type: "STRING" }
             }
         },
-        required: ["correct", "issue", "scope", "corrected_sentence", "alternatives", "sentence_alternatives"]
+        required: ["focus_correct", "issue", "scope", "corrected_sentence", "outside_fix", "sentence_issue", "alternatives", "sentence_alternatives"]
     };
 
     const response = await callGeminiAPI(config.model, prompt, {
@@ -4987,31 +5350,49 @@ async function getGrammarSuggestions(sentence, selectedText, lang, config, avoid
 
     try {
         return normalizeGrammarPayload(JSON.parse(response || "{}"), baseline);
-    } catch (e) { return { status: 'parse', issue: '', scope: 'selection', alternatives: [] }; }
+    } catch (e) { return grammarParseFailure(e); }
 }
 
-// 选词弹窗统一取数入口：三个模式共用一个返回形状 { alternatives: string[], note: {status,issue,scope}|null }。
+// 选词弹窗统一取数入口：三个模式共用一个返回形状
+// { alternatives: string[], note: {status,issue,scope,code,sentenceIssue,sentenceOffer}|null }。
 // note 只有语法模式才有；另外两个模式保持原样走 getSynonyms（返回值契约一个字节都没动）。
 // grammarScope: getGrammarScopeContext() 的产物 { sentence, head, tail }；
 //   传 null 或 sentence 为空 = 没算出可靠的句子范围，语法模式退化成词级分析（等同改动前的行为）。
-async function fetchSynonymOptions(mode, sentence, selectedText, lang, config, avoidList, grammarScope) {
+// signal: 可选的 AbortSignal（三个取数入口各自持有一个，见 AppState.synonymAbort）。
+async function fetchSynonymOptions(mode, sentence, selectedText, lang, config, avoidList, grammarScope, signal) {
     const m = normalizeSynonymMode(mode);
     const avoid = Array.isArray(avoidList) ? avoidList : [];
+    const sig = signal || null;
 
     if (m === 'grammar') {
         const gs = (grammarScope && typeof grammarScope === 'object') ? grammarScope : {};
         const useSentence = (typeof gs.sentence === 'string' && gs.sentence.trim()) ? gs.sentence : null;
         const result = await getGrammarSuggestions(
             useSentence || sentence, selectedText, lang, config, avoid, !useSentence,
-            { head: gs.head, tail: gs.tail }
+            { head: gs.head, tail: gs.tail }, sig
         );
+        // status:'empty' 改动前**连一行 console 都没有** —— 模型明明答了，是客户端把候选
+        // 全过滤掉了（全部与原文相同），而屏幕上写的却是「响应为空或 JSON 解析失败」。
+        // 这里补一行诊断；屏幕上的文案见 renderSynonymPopupOnly。
+        if (result.status === 'empty') {
+            console.warn('getGrammarSuggestions: EMPTY_AFTER_FILTER 模型有回应，但所有候选都与原文相同（选区='
+                + JSON.stringify(selectedText) + '）');
+        }
         return {
             alternatives: Array.isArray(result.alternatives) ? result.alternatives : [],
-            note: { status: result.status, issue: result.issue, scope: result.scope === 'sentence' ? 'sentence' : 'selection' }
+            // 这个投影是唯一的收口：多一个键都要在这里加，不然弹窗永远看不到。
+            note: {
+                status: result.status,
+                issue: result.issue,
+                scope: result.scope === 'sentence' ? 'sentence' : 'selection',
+                code: typeof result.code === 'string' ? result.code : '',
+                sentenceIssue: typeof result.sentenceIssue === 'string' ? result.sentenceIssue : '',
+                sentenceOffer: Array.isArray(result.sentenceOffer) ? result.sentenceOffer : []
+            }
         };
     }
 
-    const alternatives = await getSynonyms(sentence, selectedText, lang, config, avoid, m);
+    const alternatives = await getSynonyms(sentence, selectedText, lang, config, avoid, m, sig);
     return { alternatives: Array.isArray(alternatives) ? alternatives : [], note: null };
 }
 
@@ -5319,6 +5700,28 @@ function showToast(message, type = 'info') {
 }
 
 // 处理文本选择（同义词）
+// ============= 选词/语法弹窗的请求令牌 =============
+// 开一次新的弹窗请求：序号 +1、把上一次还在飞的请求取消掉、发一个新的 AbortController。
+// 三个取数入口（新选中 / 切模式 / 翻页）**都必须**走它，漏掉任何一个，那一个就还会串线。
+function beginSynonymRequest() {
+    AppState.synonymReqSeq = (AppState.synonymReqSeq || 0) + 1;
+    try { if (AppState.synonymAbort) AppState.synonymAbort.abort(); } catch (e) {}
+    const ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+    AppState.synonymAbort = ctl;
+    return { id: AppState.synonymReqSeq, signal: ctl ? ctl.signal : null };
+}
+// 这次请求还是不是「最新的那一次」。不是就必须原地 return —— 结果属于别的选区，
+// 写进 state 就是 R1（把段落 A 的整句改写挂到选区 B 上）。
+function synonymReqStale(myReq) {
+    const s = AppState.synonymState || {};
+    return s.reqId !== myReq;
+}
+// 主动取消不是失败。**这个判断不是可选的**：少了它，S2 会把原本静默的串线换成
+// 每次快速重选都弹一句「请求失败：Aborted」—— 比它修的那个 bug 更烦人。
+function isSynonymAbort(err) {
+    return !!(err && err.name === 'AbortError');
+}
+
 async function handleTextSelect(event, field, index) {
     const target = event.target;
     let start = target.selectionStart;
@@ -5354,6 +5757,10 @@ async function handleTextSelect(event, field, index) {
     // 选区所在的整句：语法模式的分析范围和整句替换范围都来自这里；算不准就是 null
     const sentenceRange = findSentenceRange(text, start, end);
 
+    // 令牌必须在写 state **之前**拿到，并跟着这次 setState 一起落进 synonymState.reqId：
+    // 上一次选择的响应回来时核对的就是它。
+    const req = beginSynonymRequest();
+
     updateSynonymState({
         show: true,
         loading: true,
@@ -5368,7 +5775,8 @@ async function handleTextSelect(event, field, index) {
         sentenceRange,
         field,
         index,
-        contextSentence: text
+        contextSentence: text,
+        reqId: req.id
     });
 
     // 跨栏对应高亮：在另一侧把「意思对应的那一段」也高亮出来。
@@ -5380,8 +5788,11 @@ async function handleTextSelect(event, field, index) {
         const config = getApiConfig();
         const result = await fetchSynonymOptions(
             defaultMode, text, selectedText, lang, config, [],
-            getGrammarScopeContext(AppState.synonymState)
+            getGrammarScopeContext(AppState.synonymState), req.signal
         );
+
+        // 更新的选区赢了：本次结果属于旧选区，一个字节都不能写进 state。
+        if (synonymReqStale(req.id)) return;
 
         const cur = AppState.synonymState;
         const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : emptySynonymHistory();
@@ -5393,6 +5804,8 @@ async function handleTextSelect(event, field, index) {
             ...(cur.mode === defaultMode ? { loading: false } : {})
         });
     } catch (err) {
+        if (isSynonymAbort(err)) return;          // 主动取消：不是失败，不画任何东西
+        if (synonymReqStale(req.id)) return;      // R2：慢的旧失败不许覆盖快的新成功
         console.error(err);
         // 不再直接关掉弹窗：把失败原因显示出来，用户还能切模式重试
         if (AppState.synonymState.show) {
@@ -5427,7 +5840,8 @@ async function handleSynonymModeSwitch(mode) {
     }
 
     // 该模式还没请求过：切换并拉取第 1 页
-    updateSynonymState({ mode: newMode, loading: true, errorMessage: "" });
+    const req = beginSynonymRequest();
+    updateSynonymState({ mode: newMode, loading: true, errorMessage: "", reqId: req.id });
 
     if (!s.field) {
         updateSynonymState({ loading: false });
@@ -5439,8 +5853,10 @@ async function handleSynonymModeSwitch(mode) {
         const config = getApiConfig();
         const result = await fetchSynonymOptions(
             newMode, s.contextSentence, s.originalText, lang, config, [],
-            getGrammarScopeContext(s)
+            getGrammarScopeContext(s), req.signal
         );
+
+        if (synonymReqStale(req.id)) return;
 
         const cur = AppState.synonymState;
         const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : emptySynonymHistory();
@@ -5451,6 +5867,8 @@ async function handleSynonymModeSwitch(mode) {
             ...(normalizeSynonymMode(cur.mode) === newMode ? { loading: false } : {})
         });
     } catch (e) {
+        if (isSynonymAbort(e)) return;
+        if (synonymReqStale(req.id)) return;
         console.error(e);
         if (normalizeSynonymMode(AppState.synonymState.mode) === newMode) {
             updateSynonymState({ loading: false, errorMessage: describeSynonymError(e) });
@@ -5480,15 +5898,18 @@ async function handleSynonymPageChange(direction) {
             if (!field) return;
             const lang = field === 'src' ? AppState.sourceLang : AppState.targetLang;
 
-            updateSynonymState({ loading: true, errorMessage: "" });
+            const req = beginSynonymRequest();
+            updateSynonymState({ loading: true, errorMessage: "", reqId: req.id });
 
             try {
                 const avoidList = history.flat();
                 const config = getApiConfig();
                 const result = await fetchSynonymOptions(
                     mode, contextSentence, originalText, lang, config, avoidList,
-                    getGrammarScopeContext(s)
+                    getGrammarScopeContext(s), req.signal
                 );
+
+                if (synonymReqStale(req.id)) return;
 
                 const cur = AppState.synonymState;
                 const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : emptySynonymHistory();
@@ -5505,10 +5926,92 @@ async function handleSynonymPageChange(direction) {
                     ...(normalizeSynonymMode(cur.mode) === mode ? { loading: false } : {})
                 });
             } catch (e) {
+                if (isSynonymAbort(e)) return;
+                if (synonymReqStale(req.id)) return;
                 console.error(e);
                 updateSynonymState({ loading: false, errorMessage: describeSynonymError(e) });
             }
         }
+    }
+}
+
+// 「重试」：同一模式、同一选区，**空的 avoid 列表**再问一次，结果覆盖当前这一页。
+// 为什么是空 avoid：这类失败（BAD_ESCAPE / empty）是随机的，同一句话两次请求一次成一次败；
+// 把上一次的候选写进 avoid 反而是在逼模型换一个更差的说法。
+// 复用 beginSynonymRequest 的令牌/取消，和另外三个取数入口同一套规则。
+async function handleSynonymRetry() {
+    const s = AppState.synonymState || {};
+    const mode = normalizeSynonymMode(s.mode);
+    if (!s.field) return;
+    const pageIndex = getSynonymPageIndex(s, mode);
+
+    const req = beginSynonymRequest();
+    updateSynonymState({ loading: true, errorMessage: "", reqId: req.id });
+
+    try {
+        const lang = s.field === 'src' ? AppState.sourceLang : AppState.targetLang;
+        const config = getApiConfig();
+        const result = await fetchSynonymOptions(
+            mode, s.contextSentence, s.originalText, lang, config, [],
+            getGrammarScopeContext(s), req.signal
+        );
+
+        if (synonymReqStale(req.id)) return;
+
+        const cur = AppState.synonymState;
+        const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : emptySynonymHistory();
+        const pages = Array.isArray(curHb[mode]) ? curHb[mode].slice() : [];
+        pages[pageIndex] = result.alternatives;
+        curHb[mode] = pages;
+        const curNotes = Array.isArray(cur.grammarNotes) ? cur.grammarNotes.slice() : [];
+        if (result.note) curNotes[pageIndex] = result.note;
+        updateSynonymState({
+            historyByMode: curHb,
+            ...(result.note ? { grammarNotes: curNotes } : {}),
+            ...(normalizeSynonymMode(cur.mode) === mode ? { loading: false } : {})
+        });
+    } catch (e) {
+        if (isSynonymAbort(e)) return;
+        if (synonymReqStale(req.id)) return;
+        console.error(e);
+        updateSynonymState({ loading: false, errorMessage: describeSynonymError(e) });
+    }
+}
+
+// 「看整句改写」：把附带提议（sentence_issue + sentence_alternatives）翻成这一页的正式答案。
+// **纯本地状态改写，不发任何请求** —— 候选早就在 note 里了，只是默认不摆出来。
+// 翻完之后这一页的 scope 变成 'sentence'，琥珀色整句高亮、整句徽标、applySynonym 的替换范围
+// 全都跟着走既有那条路，isSentenceScopedPage / syncSelectionHighlightLayers / applySynonym
+// 一行都不用改。
+function handleGrammarOfferAccept(pageIndex) {
+    try {
+        const s = AppState.synonymState;
+        if (!s || normalizeSynonymMode(s.mode) !== 'grammar') return;
+        const idx = (typeof pageIndex === 'number' && isFinite(pageIndex) && pageIndex >= 0) ? Math.floor(pageIndex) : -1;
+        if (idx < 0) return;
+        const note = getGrammarNote(s, idx);
+        const offer = note.sentenceOffer;
+        if (!offer.length) return;
+        // 没有可核对的整句范围就不许切 —— 整句改写没地方落，applySynonym 会原地中止
+        if (getValidSentenceRange(s) === null) return;
+
+        const hb = (s.historyByMode && typeof s.historyByMode === 'object') ? s.historyByMode : emptySynonymHistory();
+        const pages = Array.isArray(hb.grammar) ? hb.grammar.slice() : [];
+        pages[idx] = offer.slice();
+        hb.grammar = pages;
+
+        const notes = Array.isArray(s.grammarNotes) ? s.grammarNotes.slice() : [];
+        notes[idx] = {
+            status: 'issues',
+            issue: note.sentenceIssue || note.issue,
+            scope: 'sentence',
+            code: '',
+            sentenceIssue: '',
+            sentenceOffer: []
+        };
+        updateSynonymState({ historyByMode: hb, grammarNotes: notes });
+    } catch (e) {
+        console.error(e);
     }
 }
 
@@ -9419,7 +9922,10 @@ const CHAT_TICK_MS = 100;         // 「思考中… x.x s」的刷新间隔
 // 刻意不和哨兵协议的 [[k]]/@@n@@ 转义共用一个 helper：那边保护的是**模型不许改动的 token**，
 // 这边保护的是**我们自己的分帧符**，两者的正确行为在「模型丢了标记怎么办」上正好相反。
 const CHAT_ZWSP = '\u200B';        // 零宽空格。写成转义，别在源码里放裸字符 —— 那种字符肉眼查不出来。
-// 私用区码位，只在 chatRenderProse 里活着：把 `~` 藏过 marked 的 GFM 删除线，解析完就换回来。
+// 私用区码位：把 `~` 藏过 marked 的 GFM 删除线，解析完就换回来。
+// 两个地方用它 —— chatRenderProse（聊天气泡）和 renderFormattedText（原文/译文预览栏，
+// LaTeX 的 `Section~\ref{...}` 在那里同样会被画成删除线）。两边都只在「marked.parse 前后」
+// 这一小段里活着，出了那几行就不存在。
 // 同样写成转义、绝不在源码里放裸字符。它**绝不**参与任何发出去或写进文档的路径。
 const CHAT_MD_TILDE = '\uE000';
 function chatEscapeDelims(s) {
