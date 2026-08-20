@@ -238,6 +238,408 @@ body.is-resizing-settings-modal * {
     transition-property: color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform, filter, -webkit-backdrop-filter, backdrop-filter;
 }
 
+/* ============= 浮动 AI 对话窗（#aiChatRoot）=============
+   为什么整块样式写死在这里，而不是像页面其它部分那样用 Tailwind 类：
+   这个窗口的 DOM 是 JS 直接建到 <body> 上的，不经过 renderApp。Tailwind 是 CDN 版 JIT，
+   靠扫描 DOM 按需生成类 —— 把「窗口能不能看见」押在一个异步扫描器上，等于给
+   「拖到一半突然掉样式」留了口子。写死在这里，零依赖、零时序。
+
+   z-index 2147482000 的取法（实测的 z 预算）：
+     · 页面里最高的应用层是错误横幅 / toast / 同义词弹窗的 z-[100]，原 Insight 抽屉是 z-50；
+     · data-tip 气泡是 2147483000。
+   取它们中间：对话窗压过所有应用面板，但**低于**提示气泡 —— 悬停提示仍然浮在窗口之上。
+
+   选择器一律带 #aiChatRoot 前缀（特异度 0,1,1,0），这样上面 [data-tip]{position:relative}
+   这类等特异度的全局规则不会把手柄的 position:absolute 顶掉，Tailwind 的工具类也压不过来。 */
+#aiChatRoot {
+    position: fixed;
+    z-index: 2147482000;
+    display: none;
+    /* left / top / width / height 全部由 JS 写内联样式，这里只是一个不挡事的初值 */
+    left: 0;
+    top: 0;
+    width: 420px;
+    height: 560px;
+}
+#aiChatRoot.is-open { display: block; }
+
+#aiChatRoot .aichat-frame {
+    position: relative;
+    width: 100%;
+    height: 100%;
+    /* 高度自适应就靠这一组：列向 flex + 消息区 flex:1;min-height:0 —— 内容少时自然收，
+       内容多时消息区自己滚，全程零 JS。min-height:0 不能省，否则 flex 子项的
+       自动最小尺寸会让消息区把整个框撑破而不是滚动。 */
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 16px;
+    box-shadow: 0 24px 60px -12px rgba(15, 23, 42, 0.35);
+    overflow: hidden;
+    font-family: 'Inter', sans-serif;
+    color: #0f172a;
+}
+
+/* ---- 标题栏（= 拖动把手，高度必须和 JS 里的 CHAT_TITLEBAR_H 一致）---- */
+#aiChatRoot .aichat-titlebar {
+    flex: 0 0 auto;
+    height: 40px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 8px 0 12px;
+    background: #f8fafc;
+    border-bottom: 1px solid #e2e8f0;
+    cursor: grab;
+    /* 指针事件拖拽必须关掉浏览器自己的手势，否则触控板/触屏会把 pointermove 抢去做滚动 */
+    touch-action: none;
+    user-select: none;
+}
+#aiChatRoot .aichat-title-icon { display: inline-flex; color: #6366f1; }
+#aiChatRoot .aichat-title-icon svg { width: 15px; height: 15px; }
+#aiChatRoot .aichat-title-text {
+    font-size: 12px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    color: #334155;
+    white-space: nowrap;
+}
+#aiChatRoot .aichat-title-spacer { flex: 1 1 auto; min-width: 0; }
+#aiChatRoot .aichat-iconbtn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: #94a3b8;
+    cursor: pointer;
+    transition: color 0.15s ease, background-color 0.15s ease;
+}
+#aiChatRoot .aichat-iconbtn:hover { color: #0f172a; background: #e2e8f0; }
+#aiChatRoot .aichat-iconbtn svg { width: 13px; height: 13px; }
+
+/* ---- 消息区 ---- */
+#aiChatRoot .aichat-log {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: #ffffff;
+}
+#aiChatRoot .aichat-row { display: flex; }
+#aiChatRoot .aichat-row-user { justify-content: flex-end; }
+#aiChatRoot .aichat-bubble {
+    max-width: 88%;
+    padding: 8px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    word-break: break-word;
+    background: #f1f5f9;
+    color: #334155;
+}
+#aiChatRoot .aichat-row-user .aichat-bubble { background: #eef2ff; color: #3730a3; }
+#aiChatRoot .aichat-row-system .aichat-bubble {
+    background: transparent;
+    color: #94a3b8;
+    font-size: 11px;
+    max-width: 100%;
+    padding: 4px 2px;
+}
+#aiChatRoot .aichat-row-error .aichat-bubble {
+    background: #fff1f2;
+    color: #be123c;
+    border: 1px solid #fecdd3;
+    max-width: 100%;
+}
+
+/* ---- 输入区 ---- */
+#aiChatRoot .aichat-footer {
+    flex: 0 0 auto;
+    border-top: 1px solid #e2e8f0;
+    background: #f8fafc;
+    padding: 8px;
+}
+#aiChatRoot .aichat-inputrow { display: flex; align-items: flex-end; gap: 8px; }
+#aiChatRoot .aichat-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    resize: none;
+    overflow-y: auto;
+    max-height: 132px;
+    padding: 8px 10px;
+    border: 1px solid #e2e8f0;
+    border-radius: 10px;
+    background: #ffffff;
+    font-family: 'Inter', sans-serif;
+    font-size: 12px;
+    line-height: 1.6;
+    color: #0f172a;
+}
+#aiChatRoot .aichat-input:focus { outline: none; border-color: #a5b4fc; box-shadow: 0 0 0 3px rgba(99, 102, 241, 0.15); }
+#aiChatRoot .aichat-send {
+    flex: 0 0 auto;
+    padding: 8px 14px;
+    border: none;
+    border-radius: 10px;
+    background: #4f46e5;
+    color: #ffffff;
+    font-size: 11px;
+    font-weight: 800;
+    letter-spacing: 0.06em;
+    cursor: pointer;
+    transition: background-color 0.15s ease;
+}
+#aiChatRoot .aichat-send:hover { background: #4338ca; }
+/* 模型 / 思考 / 强度控件之后会填进这一条；空着的时候不占任何高度 */
+#aiChatRoot .aichat-bar { margin-top: 6px; }
+#aiChatRoot .aichat-bar:empty { display: none; }
+/* 发送按钮在请求进行中变成「停止」。只换配色和字，不换节点 —— 换节点会丢监听。 */
+#aiChatRoot .aichat-send.is-busy { background: #e11d48; }
+#aiChatRoot .aichat-send.is-busy:hover { background: #be123c; }
+
+/* ---- C4：输入框下面那条参数条 ---- */
+/* 和窗口其它部分同一条纪律：**不使用 Tailwind 工具类**。这一整块 DOM 由 JS 直接建到
+   <body> 下的 #aiChatRoot 里，Tailwind CDN 是运行时扫描 DOM 才生成类的 JIT——
+   把「参数条能不能看见」押在一个异步扫描器上，等于给「刚打开时控件糊成一坨」留口子。
+   （这也是为什么下面的只读芯片不复用设置弹窗里那段带 Tailwind 类的 HTML，而是共用
+     xportCapsChipList() 那份**数据**，各自渲染。） */
+#aiChatRoot .aichat-params { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
+#aiChatRoot .aichat-params:empty { display: none; }
+#aiChatRoot .aichat-prow { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
+#aiChatRoot .aichat-pspacer { flex: 1 1 auto; min-width: 0; }
+#aiChatRoot .aichat-plabel { font-size: 10px; font-weight: 700; color: #64748b; white-space: nowrap; }
+#aiChatRoot .aichat-pgroup { display: inline-flex; align-items: center; gap: 4px; }
+#aiChatRoot .aichat-psel {
+    max-width: 190px;
+    padding: 2px 4px;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    background: #ffffff;
+    font-family: 'Inter', sans-serif;
+    font-size: 10px;
+    font-weight: 700;
+    color: #4f46e5;
+    cursor: pointer;
+    outline: none;
+}
+#aiChatRoot .aichat-psel:focus { border-color: #a5b4fc; }
+#aiChatRoot .aichat-pnum {
+    width: 62px;
+    padding: 2px 4px;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    background: #ffffff;
+    font-family: 'Inter', sans-serif;
+    font-size: 10px;
+    font-weight: 700;
+    color: #0f172a;
+    outline: none;
+}
+#aiChatRoot .aichat-pnum:focus { border-color: #a5b4fc; }
+#aiChatRoot .aichat-seg { display: inline-flex; align-items: center; background: #e2e8f0; border-radius: 8px; padding: 2px; }
+#aiChatRoot .aichat-seg > button {
+    border: none;
+    background: transparent;
+    padding: 1px 7px;
+    border-radius: 6px;
+    font-family: 'Inter', sans-serif;
+    font-size: 10px;
+    font-weight: 800;
+    color: #64748b;
+    cursor: pointer;
+}
+#aiChatRoot .aichat-seg > button.is-on { background: #ffffff; color: #4f46e5; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.12); }
+#aiChatRoot .aichat-pmore {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #94a3b8;
+    cursor: pointer;
+}
+#aiChatRoot .aichat-pmore:hover { color: #0f172a; background: #e2e8f0; }
+#aiChatRoot .aichat-pmore.is-on { color: #4f46e5; background: #e0e7ff; }
+#aiChatRoot .aichat-pmore svg { width: 13px; height: 13px; }
+#aiChatRoot .aichat-pmorebox {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding-top: 6px;
+    border-top: 1px dashed #e2e8f0;
+}
+#aiChatRoot .aichat-pdiv { font-size: 9px; font-weight: 800; letter-spacing: 0.06em; color: #cbd5e1; }
+#aiChatRoot .aichat-pchips { display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; font-size: 9px; color: #94a3b8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+#aiChatRoot .aichat-pchips .aichat-pdot { color: #e2e8f0; }
+#aiChatRoot .aichat-pnote { font-size: 9px; line-height: 1.55; color: #94a3b8; }
+
+/* ---- C3：附加的选段（输入框上方那条 chip）---- */
+#aiChatRoot .aichat-target {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    margin-bottom: 6px;
+    padding: 5px 6px 5px 8px;
+    border: 1px solid #ddd6fe;
+    border-radius: 8px;
+    background: #f5f3ff;
+    font-size: 11px;
+    line-height: 1.5;
+    color: #5b21b6;
+}
+#aiChatRoot .aichat-target-label { flex: 0 0 auto; font-weight: 800; letter-spacing: 0.03em; }
+#aiChatRoot .aichat-target-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    color: #6d28d9;
+    /* 选段里可能带换行/超长 LaTeX：一律截成一行，绝不让 chip 把输入框挤下去 */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+#aiChatRoot .aichat-target-x {
+    flex: 0 0 auto;
+    border: none;
+    background: transparent;
+    color: #a78bfa;
+    cursor: pointer;
+    padding: 0 2px;
+    font-size: 12px;
+    line-height: 1.4;
+}
+#aiChatRoot .aichat-target-x:hover { color: #4c1d95; }
+#aiChatRoot .aichat-status { font-size: 10px; color: #94a3b8; padding: 0 2px; }
+
+/* ---- C3：提案卡片（模型建议的替换）---- */
+#aiChatRoot .aichat-card {
+    width: 100%;
+    max-width: 100%;
+    border: 1px solid #c7d2fe;
+    border-radius: 12px;
+    background: #ffffff;
+    overflow: hidden;
+}
+#aiChatRoot .aichat-card-head {
+    padding: 5px 8px;
+    background: #eef2ff;
+    border-bottom: 1px solid #e0e7ff;
+    font-size: 10px;
+    font-weight: 800;
+    letter-spacing: 0.04em;
+    color: #4338ca;
+}
+#aiChatRoot .aichat-card-body { padding: 8px; display: flex; flex-direction: column; gap: 6px; }
+#aiChatRoot .aichat-pane-label { font-size: 9px; font-weight: 800; letter-spacing: 0.06em; color: #94a3b8; }
+#aiChatRoot .aichat-pane {
+    padding: 6px 8px;
+    border-radius: 8px;
+    font-size: 11px;
+    line-height: 1.6;
+    /* 逐字对照必须保原样：空格、换行、缩进都不许被折叠 */
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 160px;
+    overflow-y: auto;
+    font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+#aiChatRoot .aichat-pane-old { background: #fff1f2; color: #9f1239; border: 1px solid #fecdd3; }
+#aiChatRoot .aichat-pane-new { background: #ecfdf5; color: #065f46; border: 1px solid #a7f3d0; }
+#aiChatRoot .aichat-card-warn {
+    font-size: 10px;
+    line-height: 1.5;
+    color: #b45309;
+    background: #fffbeb;
+    border: 1px solid #fde68a;
+    border-radius: 6px;
+    padding: 4px 6px;
+}
+#aiChatRoot .aichat-card-actions { display: flex; flex-wrap: wrap; gap: 6px; }
+#aiChatRoot .aichat-btn {
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    background: #ffffff;
+    color: #475569;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 4px 10px;
+    cursor: pointer;
+    transition: background-color 0.15s ease, color 0.15s ease;
+}
+#aiChatRoot .aichat-btn:hover { background: #f1f5f9; color: #0f172a; }
+#aiChatRoot .aichat-btn-primary { background: #4f46e5; border-color: #4f46e5; color: #ffffff; }
+#aiChatRoot .aichat-btn-primary:hover { background: #4338ca; color: #ffffff; }
+#aiChatRoot .aichat-btn[disabled] { opacity: 0.45; cursor: default; }
+#aiChatRoot .aichat-card-done { font-size: 11px; font-weight: 700; color: #047857; }
+
+/* ---- 「思考」折叠区：reasoning_content 只能待在这里，绝不能当答案显示 ---- */
+#aiChatRoot .aichat-think { margin-top: 6px; }
+#aiChatRoot .aichat-think > summary {
+    cursor: pointer;
+    font-size: 10px;
+    color: #94a3b8;
+    list-style: none;
+    user-select: none;
+}
+#aiChatRoot .aichat-think > summary::-webkit-details-marker { display: none; }
+#aiChatRoot .aichat-think-body {
+    margin-top: 4px;
+    padding: 6px 8px;
+    background: #f8fafc;
+    border: 1px dashed #e2e8f0;
+    border-radius: 8px;
+    font-size: 10px;
+    line-height: 1.6;
+    color: #94a3b8;
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 180px;
+    overflow-y: auto;
+}
+
+/* 助手气泡里渲染 Markdown/KaTeX 之后，段落间距要收一收，否则一句话占三行高 */
+#aiChatRoot .aichat-md { white-space: normal; }
+#aiChatRoot .aichat-md p { margin: 0 0 6px 0; }
+#aiChatRoot .aichat-md p:last-child { margin-bottom: 0; }
+#aiChatRoot .aichat-md ul, #aiChatRoot .aichat-md ol { margin: 0 0 6px 0; padding-left: 18px; }
+#aiChatRoot .aichat-md code { background: #e2e8f0; border-radius: 4px; padding: 0 3px; font-size: 11px; }
+#aiChatRoot .aichat-md pre { background: #f1f5f9; border-radius: 8px; padding: 6px 8px; overflow-x: auto; }
+#aiChatRoot .aichat-md pre code { background: transparent; padding: 0; }
+
+/* ---- 缩放手柄：只做左边、上边、左上角三个。
+       窗口默认锚在右下角，这三个覆盖了所有有用的手势，也省掉八向命中测试。 ---- */
+#aiChatRoot .aichat-resize { position: absolute; touch-action: none; }
+#aiChatRoot .aichat-resize-l  { left: 0; top: 10px; bottom: 0; width: 10px; cursor: ew-resize; }
+#aiChatRoot .aichat-resize-t  { left: 10px; right: 0; top: 0; height: 10px; cursor: ns-resize; }
+#aiChatRoot .aichat-resize-tl { left: 0; top: 0; width: 12px; height: 12px; cursor: nwse-resize; }
+
+/* 拖动/缩放全程：禁选中，并把光标钉死成对应形状（松手时属性一起摘掉）。
+   照抄 body.is-resizing-settings-modal 的做法，用属性值区分四种手势。 */
+body[data-aichat-drag] { user-select: none !important; }
+body[data-aichat-drag] * { user-select: none !important; }
+body[data-aichat-drag="move"] { cursor: grabbing !important; }
+body[data-aichat-drag="l"]    { cursor: ew-resize !important; }
+body[data-aichat-drag="t"]    { cursor: ns-resize !important; }
+body[data-aichat-drag="tl"]   { cursor: nwse-resize !important; }
+
+/* 顶栏开关按钮在「窗口开着」时的状态。这个类由 chatSyncToggleButton 直接改 DOM 挂上去，
+   不走 setState —— 聊天的任何动作都不许触发整页重渲染。 */
+.is-chat-open { background: #eef2ff !important; border-color: #c7d2fe !important; color: #4338ca !important; }
+
 </style>
 </head>
 <body class="bg-slate-50 text-slate-900">
@@ -257,8 +659,8 @@ body.is-resizing-settings-modal * {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '01.04.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-08-19';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '01.05.00';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-08-20';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -533,9 +935,9 @@ const AppState = {
     // Toast 提示
     toast: null, // { message: string, type: 'info' | 'success' | 'warning' }
 
-    // AI Insight
-    aiInsight: null,
-    isInsightLoading: false,
+    // （原 AI Insight 抽屉的两个状态位已随该功能一起删除：它是无条件的「通读全文出摘要」，
+    //   没法引导，且抽屉渲染在 #root 里、每次 renderApp 重建。取而代之的是浮动对话窗
+    //   #aiChatRoot —— 它的状态在 ChatState 里，不进 AppState，见文件末尾那一段。）
 
     // 同义词状态
     synonymState: {
@@ -1880,12 +2282,24 @@ function readLocalChoice(data) {
     };
 }
 
-async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal = null, meta = null) {
+// opts（第 7 个参数，**可选、纯追加**）：只有对话窗会传。翻译链路一个调用点都不传，
+// 所以三个字段全部缺省时这个函数逐字回到原来的行为（temperature 0.3 / max_tokens 16384 /
+// 推理档位读 AppState.reasoningByModel）。
+//   · temperature / maxTokens：脏值一律无视，回落原默认值，绝不把 NaN 写进请求体。
+//   · reasoningEffort：**必须已经是线上词表的值**（none/low/medium/xhigh）。这里再白名单一次，
+//     因为发 'off' 是 400、'high' 会静默回落、'minimal' 服务端 WARN 着映射成 'low' ——
+//     一个越过映射层的调用点就足以让「界面显示的」和「实际发生的」再次分家。
+const XPORT_WIRE_EFFORTS = ['none', 'low', 'medium', 'xhigh'];
+async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal = null, meta = null, opts = null) {
+    const o = (opts && typeof opts === 'object') ? opts : null;
+    const oTemp = (o && typeof o.temperature === 'number' && isFinite(o.temperature)) ? o.temperature : null;
+    const oMax = (o && typeof o.maxTokens === 'number' && isFinite(o.maxTokens) && o.maxTokens > 0)
+        ? Math.round(o.maxTokens) : null;
     const body = {
         model: model || "local-model",
         messages: messages,
-        temperature: 0.3,
-        max_tokens: 16384
+        temperature: oTemp === null ? 0.3 : oTemp,
+        max_tokens: oMax === null ? 16384 : oMax
     };
 
     // LM Studio的JSON模式
@@ -1897,10 +2311,13 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
     // 哪怕 /api/v1/models 里 capabilities.reasoning.default 写着 "xhigh"。所以「关」也要
     // 老老实实发 "none"（发 "off" 是 400）。映射与禁发值见 XPORT_EFFORT_WIRE 上方注释。
     // 值从每模型持久化设置来，默认 'off'；xportWireEffort 自带兜底，任何异常都退回 'none'。
+    // opts.reasoningEffort 只在对话窗那条路径上出现（对话有自己一套每模型档位，见 ChatState.reasoningByModel）。
     let effortSent = '';
     try {
         if (!xportEffortUnsupported.has(xportCapsOrigin(baseUrl))) {
-            effortSent = xportWireEffort(baseUrl, model);
+            const override = (o && typeof o.reasoningEffort === 'string'
+                && XPORT_WIRE_EFFORTS.indexOf(o.reasoningEffort) !== -1) ? o.reasoningEffort : '';
+            effortSent = override || xportWireEffort(baseUrl, model);
             if (effortSent) body.reasoning_effort = effortSent;
         }
     } catch (e) { effortSent = ''; }
@@ -1958,7 +2375,7 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
         }
         // A3：被动探测。每一次真实响应都顺手判一次「这个模型在推理吗」，
         // 不额外花任何一次调用。判到了就把横幅弹出来（见 xportNoteThinking）。
-        try { xportNoteThinking(model, choice.thinking); } catch (e) {}
+        try { xportNoteThinking(model, choice.thinking, effortSent ? (effortSent !== 'none') : undefined); } catch (e) {}
         return choice.text;
     } catch (error) {
         if (error.name === 'AbortError') throw error;
@@ -3543,8 +3960,10 @@ function xportReasoningRaw(model) {
 }
 
 // 夹到这个模型**真正支持**的档位上。发现数据拿不到就原样返回（默认 'off' 与省略等价，安全）。
-function xportReasoningValue(baseUrl, model) {
-    const raw = xportReasoningRaw(model);
+// 【为什么把 raw 提成参数】翻译和对话各有一套「每模型档位」（AppState.reasoningByModel /
+// ChatState.reasoningByModel），但「这个模型到底支持哪些档位」只有一份事实。
+// 两边共用这一个夹取器，就不可能出现「对话那条路允许了一个模型其实不支持的档位」。
+function xportClampReasoning(baseUrl, model, raw) {
     // 400 闩已经合上：这个 origin 不认 reasoning_effort，callLocalLLM 之后一个字节都不再发。
     // 而实测「省略 = 不推理」，所以这个模型的**实际**档位就是「关」。这里必须跟着收敛到
     // 'off'，否则设置行会一直亮着「开」而线上什么都没带 —— 屏幕上写的和实际发生的不是
@@ -3562,6 +3981,11 @@ function xportReasoningValue(baseUrl, model) {
         }
         return 'off';
     } catch (e) { return raw; }
+}
+
+// 翻译链路的档位：读 AppState.reasoningByModel，再走同一个夹取器。
+function xportReasoningValue(baseUrl, model) {
+    return xportClampReasoning(baseUrl, model, xportReasoningRaw(model));
 }
 
 // 真正写进请求体的值。永远返回一个合法字符串，永远不抛。
@@ -3603,7 +4027,7 @@ function xportThinkingMessage(model) {
 // 记一次观测。on=true 且这个模型还没被用户关掉横幅时，把横幅弹出来。
 // 【绝不进渲染路径】renderApp 没有 try/catch，一次抛异常就把页面永久冻在旧帧上。
 // 所以横幅是挂在 document.body 上的独立节点，renderApp 一行都不碰它。
-function xportNoteThinking(model, on) {
+function xportNoteThinking(model, on, requested) {
     try {
         const id = String(model || '');
         xportThinkState.model = id;
@@ -3612,8 +4036,14 @@ function xportNoteThinking(model, on) {
         // B2：用户自己在「设置 → 模型」里给这个模型开了推理，那推理开着就是**预期行为**，
         // 再弹一个「快去关掉它」的警告就是在对用户撒谎。只有「没人要求它却在推理」才是异常。
         // 拿不到设置（例如测试沙箱里没有这个函数）时按 false 处理，行为与本行加入前逐字一致。
+        // requested（可选）= 「这一次请求到底有没有要求推理」。对话窗有自己一套档位
+        //（ChatState.reasoningByModel），它开着推理时翻译那边可能仍然是「关」——
+        // 那时去读翻译的设置会得出 selfEnabled=false，于是弹一条「没人要求它却在推理」的
+        // 假警报。所以调用方能给出这一次的实际值时一律以它为准；不给才回落读设置
+        //（翻译链路给的值恒等于 xportWireEffort，行为逐字不变）。
         let selfEnabled = false;
-        try { selfEnabled = xportWireEffort(AppState.localBaseUrl, id) !== 'none'; } catch (e2) { selfEnabled = false; }
+        if (typeof requested === 'boolean') selfEnabled = requested;
+        else try { selfEnabled = xportWireEffort(AppState.localBaseUrl, id) !== 'none'; } catch (e2) { selfEnabled = false; }
         xportThinkState.selfEnabled = selfEnabled;
         if (on && !selfEnabled) xportThinkingBanner(id); else xportThinkingBannerHide();
     } catch (e) {}
@@ -4586,6 +5016,13 @@ async function fetchSynonymOptions(mode, sentence, selectedText, lang, config, a
 }
 
 // ============= 文本摘要 =============
+// ⚠️ 唯一的调用者 handleSummary 已随 Insight 功能一起删除，这个函数现在没有人调。
+// 之所以**没有**跟着删：它的第三个分支里有 5 行属于 Claude 调用路径
+// （`// Claude Path` / `if (config.provider === 'claude') {` / `await callClaudeAPI(` /
+//  `config.claudeApiKey,` / `config.claudeProxyUrl`），而本仓库对 Claude 路径的硬约束是
+// 「相对上一次提交零删除、零修改，只允许新增」。删掉它会让这几行的出现次数各少一次，
+// 直接踩线。等 Claude 路径的约束解除、或由维护者显式确认后再删。
+// 新代码请一律用 callModelPlainText（它是这套分支形状的更好版本：全程传 signal 可取消）。
 async function summarizeText(text, config) {
     const prompt = `总结:\n${text}`;
 
@@ -4665,7 +5102,7 @@ async function handleTranslate() {
         tgtLang = AppState.targetLang;
     }
 
-    setState({ isLoading: true, error: null, aiInsight: null });
+    setState({ isLoading: true, error: null });
 
     // 初始化AbortController
     const controller = new AbortController();
@@ -5145,23 +5582,9 @@ function applySynonymOption(pageIndex, optionIndex) {
     }
 }
 
-// 处理摘要
-async function handleSummary() {
-    if (AppState.translationPairs.length === 0) return;
-    
-    setState({ isInsightLoading: true, aiInsight: { type: 'summary', title: 'Loading...', content: '' } });
-    
-    try {
-        const fullText = AppState.translationPairs.map(p => p.src).join('\n');
-        const config = getApiConfig();
-        const summary = await summarizeText(fullText, config);
-        setState({ aiInsight: { type: 'summary', title: '学术摘要', content: summary } });
-    } catch (e) {
-        setState({ aiInsight: null, error: e.message || "Failed to generate summary" });
-    } finally {
-        setState({ isInsightLoading: false });
-    }
-}
+// （原 handleSummary 已删除。它是「把全文拼起来发给模型要一段摘要」的一次性动作，
+//   没有系统提示、没有长度约束、也没法引导，出来的东西固定塞进右栏的抽屉里。
+//   顶栏那颗按钮现在改成 chatToggle()，开的是可自由拖动的浮动对话窗。）
 
 // 连接本地服务器
 async function handleConnectLocal() {
@@ -5619,6 +6042,16 @@ function syncScrollAfterRender(scrollInfo) {
 function handleGlobalClick(event) {
     // 如果没有正在编辑的句子，直接返回
     if (AppState.activeIndex === null) return;
+
+    // 浮动对话窗挂在 <body> 上（不在 #root 里），它内部的点击一律不算「点了空白区域」。
+    // 这是 C1 唯一一处改到聊天代码之外的生产代码，必须留着：
+    // 实测（chat-window.md §2.6）—— 行 3 处于编辑态时，点对话窗的**标题栏**或**消息气泡**
+    // 会一路走到下面的 saveRowUpdate(AppState.activeIndex)：用户这一行被静默提交、退出编辑，
+    // 而且因为「只有一侧变了」还会顺手发一次把另一栏重写掉的网络请求。
+    // 按钮和 textarea 本来就被下面那几个 closest 放行了，标题栏和气泡不是 —— 所以要这一行。
+    // 第一道防线是对话窗根节点上的 stopPropagation（见 chatBindShell），这里是第二道：
+    // 两道都便宜，而这个失败模式一旦漏掉就是直接吞掉用户的编辑。
+    if (event.target && event.target.closest && event.target.closest('#aiChatRoot')) return;
 
     // 检查点击的目标是否在句子行内
     const clickedRow = event.target.closest('[data-idx]');
@@ -6770,19 +7203,29 @@ function renderSettingsEditingExtraSections() {
 // 发现结果回来时只替换这些容器的 innerHTML，弹窗其余部分一个节点都不碰。
 // 整条路径全程 try/catch 且只返回字符串，renderApp（无 try/catch）永远拿不到异常。
 
-// 只读芯片：加载期上下文 / 量化 / 架构 / 参数量 / 视觉 / 工具。
+// 只读芯片的**数据**：加载期上下文 / 量化 / 架构 / 参数量 / 视觉 / 工具。
 // 上下文实测是**加载期**参数，HTTP 改不了，所以只显示不给调 —— 给滑块就是撒谎。
-function xportCapsChipsHtml(caps) {
+// 设置弹窗（Tailwind 类）和对话窗参数条（#aiChatRoot 自带 CSS）共用这一份数据、各自渲染：
+// 对话窗那一侧刻意不依赖 Tailwind 的运行时扫描，理由见 .aichat-params 的样式注释。
+function xportCapsChipList(caps) {
     const chips = [];
+    if (!caps) return chips;
     if (caps.ctx || caps.maxCtx) {
         const ctxTxt = (caps.ctx ? String(caps.ctx) : '?') + ' / ' + (caps.maxCtx ? String(caps.maxCtx) : '?');
-        chips.push('<span data-tip="' + escapeAttr('当前加载的上下文 / 该模型支持的上限（token）。上下文只能在 LM Studio 加载模型时设定，HTTP 改不了，所以这里只读。') + '" data-tip-pos="top-start">ctx ' + escapeAttr(ctxTxt) + '</span>');
+        chips.push({ text: 'ctx ' + ctxTxt, pos: 'top-start', tip: '当前加载的上下文 / 该模型支持的上限（token）。上下文只能在 LM Studio 加载模型时设定，HTTP 改不了（实测发 context_length/num_ctx/n_ctx 返回 200 但实际值纹丝不动），所以这里只读。' });
     }
-    if (caps.quant) chips.push('<span data-tip="' + escapeAttr('量化格式（权重精度）。加载期属性，只读。') + '" data-tip-pos="top">' + escapeAttr(caps.quant) + '</span>');
-    if (caps.arch) chips.push('<span data-tip="' + escapeAttr('模型架构标识。') + '" data-tip-pos="top">' + escapeAttr(caps.arch) + '</span>');
-    if (caps.params) chips.push('<span data-tip="' + escapeAttr('参数规模。') + '" data-tip-pos="top">' + escapeAttr(caps.params) + '</span>');
-    if (caps.vision) chips.push('<span data-tip="' + escapeAttr('该模型声明支持图像输入（本翻译器不使用）。') + '" data-tip-pos="top">视觉 ✓</span>');
-    if (caps.tools) chips.push('<span data-tip="' + escapeAttr('该模型声明经过工具调用训练（本翻译器不使用）。') + '" data-tip-pos="top">工具 ✓</span>');
+    if (caps.quant) chips.push({ text: caps.quant, pos: 'top', tip: '量化格式（权重精度）。加载期属性，只读。' });
+    if (caps.arch) chips.push({ text: caps.arch, pos: 'top', tip: '模型架构标识。' });
+    if (caps.params) chips.push({ text: caps.params, pos: 'top', tip: '参数规模。' });
+    if (caps.vision) chips.push({ text: '视觉 ✓', pos: 'top', tip: '该模型声明支持图像输入（本翻译器不使用）。' });
+    if (caps.tools) chips.push({ text: '工具 ✓', pos: 'top', tip: '该模型声明经过工具调用训练（本翻译器不使用）。' });
+    return chips;
+}
+
+function xportCapsChipsHtml(caps) {
+    const chips = xportCapsChipList(caps).map(function (c) {
+        return '<span data-tip="' + escapeAttr(c.tip) + '" data-tip-pos="' + escapeAttr(c.pos) + '">' + escapeAttr(c.text) + '</span>';
+    });
     if (!chips.length) return '';
     return '<div class="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[9px] text-slate-400 font-mono">' + chips.join('<span class="text-slate-300">·</span>') + '</div>';
 }
@@ -6868,6 +7311,9 @@ function xportCapsPaint() {
             nodes[i].innerHTML = xportCapsRowHtml(nodes[i].getAttribute('data-xport-model'));
         }
     } catch (e) {}
+    // 对话窗那条参数条读的是同一份发现结果（本地模型列表 + capabilities），
+    // 所以发现一回来它也得跟着重画一次。**单独一个 try**：这两块互不背锅。
+    try { chatRenderParamBar(); } catch (e) {}
 }
 
 // 发起一次发现（60 秒内重复调用不会真的再发请求），回来后定点重绘。fire-and-forget，
@@ -7270,8 +7716,8 @@ function renderHeader() {
             </div>
 
             <div class="flex items-center gap-3">
-                <button onclick="handleSummary()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="px-5 py-2.5 bg-white border border-slate-200 text-slate-700 rounded-2xl hover:bg-slate-50 hover:border-indigo-200 transition-all font-semibold flex items-center gap-2 group disabled:opacity-50" data-tip="让模型通读全文，在右侧拉出一个抽屉总结要点、术语和写作建议。不改动任何译文。需要先有译文。" data-tip-pos="bottom-start">
-                    <span class="text-indigo-500 group-hover:animate-pulse">${Icons.Sparkles}</span> Insight
+                <button id="chatToggleBtn" onclick="chatToggle()" aria-pressed="${chatIsOpen() ? 'true' : 'false'}" class="px-5 py-2.5 bg-white border border-slate-200 text-slate-700 rounded-2xl hover:bg-slate-50 hover:border-indigo-200 transition-all font-semibold flex items-center gap-2 group ${chatIsOpen() ? 'is-chat-open' : ''}" data-tip="开/关浮动 AI 对话窗：一个能自由拖动、自己调大小的聊天窗，随便问、也能让模型改左右两栏里的任意一段。窗口挂在页面最外层，界面刷新和自动存档都打断不了你输到一半的内容。" data-tip-pos="bottom-start">
+                    <span class="text-indigo-500 group-hover:animate-pulse">${Icons.MessageSquare}</span> Chat
                 </button>
                 <button onclick="handleTranslate()" ${!AppState.inputText && !AppState.isLoading ? 'disabled' : ''} class="px-10 py-2.5 rounded-2xl font-black text-sm tracking-wider transition-all shadow-xl active:scale-95 flex items-center gap-2 ${!AppState.inputText && !AppState.isLoading ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isLoading ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isLoading ? '正在翻译，点一下立即中断（已翻好的部分保留）。' : '把左边输入框的全文按句拆开翻译，结果逐句出现在右栏。会覆盖当前译文。'}" data-tip-pos="bottom-end">
                     ${AppState.isLoading ? `<span class="animate-pulse">${Icons.StopCircle}</span> STOP` : 'TRANSLATE'}
@@ -7609,36 +8055,14 @@ function renderTargetPanel() {
                     </div>
                 `}
             </div>
-            ${renderAiInsightDrawer()}
         </section>
     `;
 }
 
-// ============= AI Insight抽屉 =============
-function renderAiInsightDrawer() {
-    if (!AppState.aiInsight) return '';
-    return `
-        <div class="absolute inset-y-0 right-0 w-full md:w-[450px] bg-white border-l border-slate-200 shadow-2xl z-50 flex flex-col">
-            <div class="px-6 py-5 border-b border-slate-100 flex items-center justify-between bg-indigo-50/30">
-                <div class="flex items-center gap-3 text-indigo-800 font-black text-sm uppercase tracking-widest">
-                    <span class="text-amber-500">${Icons.Lightbulb}</span>
-                    ${escapeHtml(AppState.aiInsight.title)}
-                </div>
-                <button onclick="setState({aiInsight:null})" class="p-2 text-slate-400 hover:text-slate-900 transition-colors">${Icons.X}</button>
-            </div>
-            <div class="flex-grow p-8 overflow-y-auto custom-scrollbar bg-white">
-                ${AppState.isInsightLoading ? `
-                    <div class="flex flex-col items-center justify-center mt-20 gap-4">
-                        <span class="text-indigo-500">${Icons.LoaderMedium}</span>
-                        <p class="text-slate-400 text-xs font-bold uppercase tracking-widest">Analysing semantic structure...</p>
-                    </div>
-                ` : `
-                    <div class="prose prose-indigo prose-sm max-w-none text-slate-600 leading-relaxed">${renderFormattedText(AppState.aiInsight.content)}</div>
-                `}
-            </div>
-        </div>
-    `;
-}
+// （原 renderAiInsightDrawer 已删除，连同它在上面 <section> 里的调用点。
+//   它渲染在 #root 内部，每次 renderApp 都会被 innerHTML 整个重建 —— 而 renderApp 在用户
+//   什么都没做的时候也会跑（showToast 每次两轮、自动存档定时器 1~5 分钟一轮）。
+//   浮动对话窗故意不走这条路：它挂在 <body> 上，renderApp 一行都碰不到它。）
 
 // ============= 翻译对行渲染 =============
 function renderPairRow(side, pair, idx) {
@@ -7672,6 +8096,12 @@ function renderPairRow(side, pair, idx) {
     } else {
         return `
             <div class="group relative p-4 rounded-xl transition-all border cursor-pointer border-transparent hover:bg-white/80 hover:shadow-md" onclick="handleRowClick(${idx},'${side}')" data-idx="${idx}" data-side="${side}">
+                <!-- 「附到对话」——  绝对定位，脱离文档流，所以它对行高、对左右两栏 1px 对齐不变式
+                     没有任何影响（行高由 syncBilingualAlignment 按 getBoundingClientRect 逐对补齐）。
+                     它也不在 .prose 里面，跨栏高亮的文本节点遍历（findRenderedRowBody → .prose）看不到它。 -->
+                <button onclick="event.stopPropagation();chatAttachRow(${idx},'${side}');" class="absolute top-1.5 right-1.5 z-10 p-1 rounded-md bg-white/95 border border-indigo-100 text-indigo-300 opacity-0 group-hover:opacity-100 focus:opacity-100 hover:text-indigo-700 hover:border-indigo-300 transition-all" data-tip="把这一整行的${side === 'src' ? '原文' : '译文'}附到浮动对话窗，然后用大白话让模型改它。模型给出的改动会先显示前后对照，点「应用」才会写进这一行。" data-tip-pos="left">
+                    ${Icons.MessageSquare}
+                </button>
                 <div class="prose prose-slate prose-sm max-w-none text-slate-700 leading-relaxed transition-all ${pair.isUpdating ? 'opacity-30 blur-[2px]' : ''}">${renderFormattedText(textValue)}</div>
             </div>
         `;
@@ -7728,6 +8158,15 @@ function renderAiToolbar(side, idx) {
                     ${Icons.MoreVertical}
                 </button>
                 ${isSimplifySettingsOpen ? renderSettingsPopover('simplify') : ''}
+            </div>
+
+            <!-- 附到浮动对话窗。有选区就只附选区，没有就附整行 —— 选区在**点这颗按钮的那一刻**
+                 就被整个抄下来（chatCaptureTarget），之后永远不再读实时选区：实测选区能扛住
+                 焦点跑到聊天输入框，但任何一次整页重渲染都会把它清零，而重渲染是定时器驱动的。 -->
+            <div class="flex items-stretch rounded-lg bg-violet-50 border border-violet-100">
+                <button onclick="chatAttachSel(${idx},'${side}')" class="flex items-center gap-1.5 px-2 py-1 hover:bg-violet-100 text-violet-700 rounded-lg text-xs transition-colors" data-tip="把这一段附到浮动对话窗：先在上面选中一段就只附那一段，没选就附整行。之后用大白话说要怎么改，模型给出的改动会先显示前后对照，点「应用」才会写回来。" data-tip-pos="bottom-start">
+                    ${Icons.MessageSquare} 附到对话
+                </button>
             </div>
 
             <!-- Custom Rewrite Input -->
@@ -8505,6 +8944,2450 @@ function applyCustomAutoSave() {
     }
 }
 
+// ==================== 浮动 AI 对话窗 · 外壳（SLICE C1）====================
+// 这一段只有「窗户」本身：挂载、开关、拖动、缩放、边界夹取、几何持久化、消息行追加接口。
+// 模型调用、附加选段、编辑提案都在后续切片里往这里挂，renderApp 一行都不会再动。
+//
+// ⚠️ 唯一的架构硬事实（实测，见 .claude/tmp/chat-window.md §2）：
+//   renderApp() 走 `root.innerHTML = <一整个字符串>`，而且**没有 try/catch**。
+//   于是任何挂在 #root 里的面板都是一次性的：
+//     · 挂 #root 里的面板，一次 renderApp() 之后 {exists:false} —— 整个节点没了；
+//     · 挂 <body> 上的面板，连跑 20 次 renderApp() 之后仍然是
+//       {left:'777px', top:'111px', scrollTop:400, taValue:'USER TYPED THIS, UNSENT',
+//        taSel:[5,10], jsListener:'kept'} —— 一个字节都没变。
+//   而 renderApp() 在用户**完全没有操作**时也会跑：
+//     · showToast() 每次连开两轮（立刻一次 + 3 秒后一次），
+//     · DOMContentLoaded 里的自动存档 setInterval 默认 5 分钟一轮、设置里还能调到 1 分钟。
+//   也就是说：一个挂在 #root 里的聊天窗，会在用户打字打到一半时每 1~5 分钟被抹掉一次。
+//
+// 由此推出这一段的三条纪律，**不许破**：
+//   1) 窗口挂 document.body（ensureChatRoot），renderApp 不知道它存在；
+//   2) 状态放 ChatState，**不放 AppState** —— 聊天的任何更新都不可能触发整页重渲染；
+//   3) 聊天代码**永远不调用 setState**，每个入口自带 try/catch，异常只进控制台和窗口内的错误行。
+//   附带好处：renderApp 里真炸了整页冻死在上一帧时，这个窗口是唯一还活着、还能告诉用户
+//   发生了什么的界面（实测：冻页之后它的点击处理器照样计数）。
+
+// —— 几何常量（取值依据见 chat-window.md §3.2）——
+const CHAT_MIN_W = 320;          // 再窄下面那排控件就要换行了
+const CHAT_MIN_H = 240;          // 标题栏 + 一条消息 + 输入框
+const CHAT_DEFAULT_W = 420;
+const CHAT_DEFAULT_H = 560;
+const CHAT_VIEWPORT_PAD = 16;    // 尺寸上限相对视口留的边
+const CHAT_SCREEN_INSET = 24;    // 首次打开时距视口右下角的距离
+const CHAT_EDGE_KEEP = 48;       // 无论怎么拖，横向至少留这么多像素在屏幕里（永远抓得回来）
+const CHAT_TITLEBAR_H = 40;      // 必须和 CSS 里 .aichat-titlebar 的 height 一致
+const CHAT_RESTORE_PAD = 8;      // 从 localStorage 恢复时，整窗回到视口内所留的边
+
+// 聊天的全部状态。刻意是一个独立对象而不是 AppState 的字段：
+// 放进 AppState 就意味着「改聊天状态 = 可能触发 renderApp」，那正是要躲开的东西。
+const ChatState = {
+    mounted: false,                 // ensureChatRoot 是否已经建过节点（幂等哨兵）
+    open: false,
+    // mode: 'auto' = 用户还没碰过尺寸/位置，每次打开都按当前视口重新自动排一次；
+    //       'free' = 用户拖过了，之后一律尊重用户存下来的几何。
+    geom: { x: 0, y: 0, w: CHAT_DEFAULT_W, h: CHAT_DEFAULT_H, mode: 'auto' },
+    lastFocus: null,                // 关窗时把焦点还回去的那个元素
+
+    // —— C2：对话 ——
+    // messages: 全部轮次，只用于显示和拼历史。assistant 条目形如
+    //   { role, content(原始回复), prose, reasoning, editBody, proposalId }
+    // reasoning **只**进折叠的「思考」区，永远不发回给模型、永远不当答案。
+    messages: [],
+    seq: 0,                         // 单调递增。回来的响应 seq 对不上就是陈旧响应，直接丢弃。
+    abort: null,                    // 当前在飞那一轮的 AbortController
+    busy: false,
+
+    // —— C3：附加选段 → 提案 → 应用 ——
+    // target 在**点「附到对话」的那一刻**整个抄下来，之后绝不再读实时选区
+    // （实测：行内 textarea 的选区能扛住焦点跑到聊天输入框，但任何一次整页重渲染都会把它清零，
+    //   而重渲染是定时器驱动的 —— 用户什么都不做也会发生）。
+    target: null,                   // { rowIndex, side, start, end, text, rowSrcAtCapture, rowTgtAtCapture, whole }
+    proposals: [],                  // { id, rowIndex, side, start, end, text, replacement, rowSrcAtCapture, rowTgtAtCapture, applied }
+    proposalSeq: 0,
+
+    // —— C4：输入框下面那条参数条 ——
+    // 【第一条纪律：对话的模型和翻译的模型是两件事】provider/model **不进 AppState**，
+    // 也永远不写 AppState.selectedModel。空串 = 用户从没在这条参数条上选过模型，
+    // 此时回落到当前翻译模型；一旦选过，翻译那边怎么换都不再跟随。
+    provider: '',
+    model: '',
+    // 【第二条纪律：推理档位也是两件事】翻译用 AppState.reasoningByModel，对话用这一份。
+    // 同一个模型可以「翻译时关推理、对话时开推理」，互不影响。键 = 模型 id，值 = UI 词表。
+    reasoningByModel: {},
+    // Gemini 的推理是另一套合约（thinkingBudget，实测合法集 {0, -1} ∪ [512, 24576]），
+    // 和 reasoning_effort 没有任何共用，所以单独一个字段。'' = 不发 thinkingConfig。
+    geminiThinking: '',
+    temperature: null,              // null = 用各家原本的默认（本地/Claude 0.3、OpenAI 0.3）
+    maxTokens: 0,                   // 0 = 用各家原本的默认（见 chatDefaultMaxTokens）
+    stream: true,                   // 仅 local 生效；其余提供方隐藏这个开关（C5）
+    keepReasoning: false,           // **客户端**行为：要不要把上一轮的思考内容回传（不是模型参数）
+    paramsOpen: false,              // 「⋮」展开与否
+    // 上一次真正发出去的请求参数摘要。给验收和排查用：「界面显示的」和「线上发的」
+    // 对不上时，这是唯一能一眼看穿的地方（callLocalLLM 的 meta.reasoningEffortSent 同理）。
+    lastRequest: null
+};
+
+// 渲染路径（renderHeader）会读这个函数来决定顶栏按钮的样子。
+// renderApp 外面没有 try/catch，所以它自带一层：无论 ChatState 处于什么状态都只返回布尔值。
+function chatIsOpen() {
+    try { return !!(ChatState && ChatState.open); } catch (e) { return false; }
+}
+
+// —— 几何计算 ——
+// 脏值一律回落，绝不把 NaN/Infinity 写进 style（写进去窗口会直接消失且再也算不回来）
+function chatNum(v, fallback) {
+    const n = Number(v);
+    return isFinite(n) ? n : fallback;
+}
+
+function chatViewport() {
+    return {
+        vw: chatNum(window.innerWidth, CHAT_DEFAULT_W + 2 * CHAT_SCREEN_INSET),
+        vh: chatNum(window.innerHeight, CHAT_DEFAULT_H + 2 * CHAT_SCREEN_INSET)
+    };
+}
+
+// 按当前视口算一份「自动尺寸 + 右下角停靠」的几何。用户没碰过窗口时每次打开都重算，
+// 所以从 4K 换到笔记本、或者把浏览器窗口拉窄，下次打开还是一个合身的窗口。
+function chatAutoGeom() {
+    const v = chatViewport();
+    const w = Math.min(CHAT_DEFAULT_W, Math.max(CHAT_MIN_W, v.vw - 2 * CHAT_SCREEN_INSET));
+    const h = Math.min(CHAT_DEFAULT_H, Math.max(CHAT_MIN_H, v.vh - 2 * CHAT_SCREEN_INSET));
+    return { x: v.vw - w - CHAT_SCREEN_INSET, y: v.vh - h - CHAT_SCREEN_INSET, w: w, h: h, mode: 'auto' };
+}
+
+// 宽松档：拖动中和窗口 resize 时用。
+// 位置夹的是**标题栏**而不是整个盒子 —— 用户想把窗口大半推出屏幕是他的自由，
+// 但横向必须至少留 CHAT_EDGE_KEEP 像素、纵向标题栏不许跑到视口上沿之上或下沿之下，
+// 否则那条唯一的拖动把手就没了，窗口再也抓不回来。
+function chatClampGeom(g) {
+    const v = chatViewport();
+    const out = {
+        x: chatNum(g && g.x, 0),
+        y: chatNum(g && g.y, 0),
+        w: chatNum(g && g.w, CHAT_DEFAULT_W),
+        h: chatNum(g && g.h, CHAT_DEFAULT_H),
+        mode: (g && g.mode === 'free') ? 'free' : 'auto'
+    };
+    // 尺寸：下限优先于上限 —— 视口比 CHAT_MIN_W 还窄时宁可溢出，也不要出现 0 宽的窗口
+    out.w = Math.max(CHAT_MIN_W, Math.min(out.w, Math.max(CHAT_MIN_W, v.vw - CHAT_VIEWPORT_PAD)));
+    out.h = Math.max(CHAT_MIN_H, Math.min(out.h, Math.max(CHAT_MIN_H, v.vh - CHAT_VIEWPORT_PAD)));
+    out.x = Math.max(CHAT_EDGE_KEEP - out.w, Math.min(out.x, v.vw - CHAT_EDGE_KEEP));
+    out.y = Math.max(0, Math.min(out.y, Math.max(0, v.vh - CHAT_TITLEBAR_H)));
+    return out;
+}
+
+// 严格档：**只**在从 localStorage 恢复时用。
+// 恢复是一次用户没有参与的移动，所以能整窗放进视口就整窗放进去 ——
+// 4K 显示器上存下的 {x:3000} 在笔记本上必须自己走回来，而不是只露出 48 像素。
+// 放不下（视口比窗口还小）时退回宽松档的结果，至少保证把手还在。
+function chatClampGeomForRestore(g) {
+    const out = chatClampGeom(g);
+    const v = chatViewport();
+    const maxX = v.vw - out.w - CHAT_RESTORE_PAD;
+    const maxY = v.vh - out.h - CHAT_RESTORE_PAD;
+    if (maxX >= CHAT_RESTORE_PAD) out.x = Math.max(CHAT_RESTORE_PAD, Math.min(out.x, maxX));
+    if (maxY >= CHAT_RESTORE_PAD) out.y = Math.max(CHAT_RESTORE_PAD, Math.min(out.y, maxY));
+    return out;
+}
+
+function chatApplyGeom() {
+    const rootEl = document.getElementById('aiChatRoot');
+    if (!rootEl) return;
+    const g = ChatState.geom;
+    rootEl.style.left = Math.round(g.x) + 'px';
+    rootEl.style.top = Math.round(g.y) + 'px';
+    rootEl.style.width = Math.round(g.w) + 'px';
+    rootEl.style.height = Math.round(g.h) + 'px';
+}
+
+// —— 持久化 ——
+// 几何和「开着没开」各自一个 key、各自一个 try/catch。
+// 刻意不和别人共用 try 块：隐私模式/配额爆掉时，别人写失败不能顺手把窗口位置一起弄丢，反之亦然。
+// 也刻意不落盘聊天记录（v1）：globalHistory 已经存着最多 5 份全文，再塞进不设上限的对话
+// 只会更快撞配额。
+function chatSaveGeom() {
+    try {
+        const g = ChatState.geom;
+        localStorage.setItem('chatGeom', JSON.stringify({
+            x: Math.round(g.x), y: Math.round(g.y),
+            w: Math.round(g.w), h: Math.round(g.h),
+            mode: g.mode === 'free' ? 'free' : 'auto'
+        }));
+    } catch (e) {}
+}
+
+function chatLoadGeom() {
+    try {
+        const raw = localStorage.getItem('chatGeom');
+        if (!raw) return null;
+        const g = JSON.parse(raw);
+        return (g && typeof g === 'object') ? g : null;
+    } catch (e) { return null; }
+}
+
+function chatSaveOpen(open) {
+    try { localStorage.setItem('chatOpen', open ? '1' : '0'); } catch (e) {}
+}
+
+function chatLoadOpen() {
+    try { return localStorage.getItem('chatOpen') === '1'; } catch (e) { return false; }
+}
+
+// —— 外壳的 HTML ——
+// 全是字面量，没有任何变量插值，所以这里没有转义面。窗口里**会**出现模型生成的文本，
+// 那些一律走 chatAppendRow 的 textContent 通道（见下面），不拼进 HTML 字符串。
+//
+// data-tip 纪律（见文件头部那段长注释）：带 data-tip 的元素不许再带 title，
+// 而且两个 data-tip 元素不能互为祖先—后代（:hover 会冒泡到祖先，两个气泡会一起浮出来）。
+// 所以标题栏本身**不带** data-tip，提示挂在它里面的标题文字上，和关闭按钮是兄弟关系。
+function chatShellHtml() {
+    return ''
+        + '<div class="aichat-frame">'
+        +   '<div class="aichat-titlebar" id="aiChatTitleBar">'
+        +     '<span class="aichat-title-icon">' + Icons.MessageSquare + '</span>'
+        +     '<span class="aichat-title-text" data-tip="按住这里拖动窗口。窗口挂在页面最外层，界面刷新、自动存档都不会打断你输到一半的内容。" data-tip-pos="bottom-start">AI 对话</span>'
+        +     '<span class="aichat-title-spacer"></span>'
+        +     '<button type="button" class="aichat-iconbtn" id="aiChatCloseBtn" data-tip="关掉对话窗（按 Esc 也一样）。位置和大小会记住，下次打开还在原处。" data-tip-pos="bottom-end">' + Icons.XSmall + '</button>'
+        +   '</div>'
+        +   '<div class="aichat-log" id="aiChatLog"></div>'
+        +   '<div class="aichat-footer">'
+        +     '<div id="aiChatTargetSlot"></div>'
+        +     '<div class="aichat-inputrow">'
+        +       '<textarea class="aichat-input" id="aiChatInput" rows="1" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"></textarea>'
+        +       '<button type="button" class="aichat-send" id="aiChatSendBtn" data-tip="发送（Enter 也一样）。请求进行中这颗按钮变成 STOP，点一下当场中止，已经收到的字会留在窗口里。" data-tip-pos="top-end">SEND</button>'
+        +     '</div>'
+        +     '<div class="aichat-params" id="aiChatParams"></div>'
+        +     '<div class="aichat-bar" id="aiChatBar"></div>'
+        +   '</div>'
+        +   '<div class="aichat-resize aichat-resize-l" id="aiChatResizeL" data-tip="拖左边框改宽度。" data-tip-pos="right"></div>'
+        +   '<div class="aichat-resize aichat-resize-t" id="aiChatResizeT" data-tip="拖上边框改高度。" data-tip-pos="bottom"></div>'
+        +   '<div class="aichat-resize aichat-resize-tl" id="aiChatResizeTL" data-tip="拖左上角同时改宽高。" data-tip-pos="bottom-start"></div>'
+        + '</div>';
+}
+
+// —— 消息行 ——
+// kind: 'system' | 'user' | 'assistant' | 'error'
+// 文本一律走 textContent，不经过任何 HTML 字符串拼接。窗口里显示的是**模型生成的文本**
+// （以及远端返回的错误信息），一个 `<` 都不许被当成标签 —— 这是正确性，不是安全加固。
+// C2 里助手气泡要渲染 Markdown/KaTeX 时，走 renderFormattedText，别把这条通道改成 innerHTML。
+function chatAppendRow(kind, text) {
+    try {
+        const log = document.getElementById('aiChatLog');
+        if (!log) return null;
+        const row = document.createElement('div');
+        row.className = 'aichat-row aichat-row-' + (kind || 'system');
+        const bubble = document.createElement('div');
+        bubble.className = 'aichat-bubble';
+        bubble.textContent = String(text == null ? '' : text);
+        row.appendChild(bubble);
+        log.appendChild(row);
+        chatScrollToBottom();
+        return row;
+    } catch (e) {
+        console.error('[chat] appendRow failed', e);
+        return null;
+    }
+}
+
+// 出错一律写进对话流里的一条玫瑰色行，**绝不**写 AppState.error ——
+// 那会弹顶部横幅并把整页重渲染一遍，正好把用户没发出去的草稿冲掉。
+function chatErrorRow(where, err) {
+    const msg = (err && (err.message || err.toString())) || String(err);
+    return chatAppendRow('error', '出错了（' + where + '）：' + msg);
+}
+
+function chatScrollToBottom() {
+    try {
+        const log = document.getElementById('aiChatLog');
+        if (log) log.scrollTop = log.scrollHeight;
+    } catch (e) {}
+}
+
+// 输入框 1→6 行自增长。和行内 textarea 用的是同一招：先归零再按 scrollHeight 量。
+function chatAutoGrowInput() {
+    try {
+        const ta = document.getElementById('aiChatInput');
+        if (!ta) return;
+        ta.style.height = 'auto';
+        ta.style.height = Math.min(ta.scrollHeight, 132) + 'px';
+    } catch (e) {}
+}
+
+// —— 拖动 / 缩放 ——
+// 用 Pointer Events + setPointerCapture：捕获之后，即使指针跑到浏览器窗口外面，
+// pointerup / pointercancel 也保证送得到，mouse 版那三个兜底大部分就不需要了。
+// 但 buttons===0 和 window blur 两个兜底照样留着 —— 一共 4 行，而这个代码库的注释
+// 记录了这类「mouseup 丢了 → 监听不解绑 → 幽灵拖拽」真实发生过（见 startSettingsModalResize）。
+function chatBeginDrag(ev, kind) {
+    try {
+        if (ev.button != null && ev.button !== 0) return;                       // 只认左键
+        // 标题栏上的关闭按钮不算把手，否则点关闭会先起一次拖拽
+        if (kind === 'move' && ev.target && ev.target.closest && ev.target.closest('button')) return;
+        const capEl = ev.currentTarget || ev.target;
+        if (!capEl) return;
+        ev.preventDefault();
+
+        const startX = chatNum(ev.clientX, 0);
+        const startY = chatNum(ev.clientY, 0);
+        const start = {
+            x: ChatState.geom.x, y: ChatState.geom.y,
+            w: ChatState.geom.w, h: ChatState.geom.h
+        };
+        const pid = ev.pointerId;
+        let finished = false;
+
+        try { if (pid != null && capEl.setPointerCapture) capEl.setPointerCapture(pid); } catch (e) {}
+        try { document.body.setAttribute('data-aichat-drag', kind); } catch (e) {}
+
+        function onMove(e) {
+            try {
+                // 兜底 1：指针其实已经松开了却还在收 move（窗口外松手 / 右键系统菜单吞掉 up /
+                // 拖到一半 Alt-Tab）。buttons===0 是「up 丢了」的确定信号，立刻收尾自愈。
+                if (e.buttons === 0) { onUp(); return; }
+                const dx = chatNum(e.clientX, startX) - startX;
+                const dy = chatNum(e.clientY, startY) - startY;
+                const v = chatViewport();
+                const maxW = Math.max(CHAT_MIN_W, v.vw - CHAT_VIEWPORT_PAD);
+                const maxH = Math.max(CHAT_MIN_H, v.vh - CHAT_VIEWPORT_PAD);
+                const g = { x: start.x, y: start.y, w: start.w, h: start.h, mode: 'free' };
+                if (kind === 'move') {
+                    g.x = start.x + dx;
+                    g.y = start.y + dy;
+                }
+                // 左边框 / 上边框：右下角必须钉死不动，所以宽高先夹到合法区间，
+                // 再由「原右边缘 - 新宽度」反算左上角。先算 x 再夹宽度的话，
+                // 撞到最小宽度时右边缘会开始跟着光标跑。
+                if (kind === 'l' || kind === 'tl') {
+                    const nw = Math.max(CHAT_MIN_W, Math.min(start.w - dx, maxW));
+                    g.x = start.x + (start.w - nw);
+                    g.w = nw;
+                }
+                if (kind === 't' || kind === 'tl') {
+                    const nh = Math.max(CHAT_MIN_H, Math.min(start.h - dy, maxH));
+                    g.y = start.y + (start.h - nh);
+                    g.h = nh;
+                }
+                ChatState.geom = chatClampGeom(g);
+                chatApplyGeom();
+            } catch (err) {
+                console.error('[chat] drag move failed', err);
+                onUp();
+            }
+        }
+
+        function onUp() {
+            if (finished) return;                 // 幂等哨兵：下面两个兜底可能和真 pointerup 撞车
+            finished = true;
+            try { document.removeEventListener('pointermove', onMove); } catch (e) {}
+            try { document.removeEventListener('pointerup', onUp); } catch (e) {}
+            try { document.removeEventListener('pointercancel', onUp); } catch (e) {}
+            try { window.removeEventListener('blur', onUp); } catch (e) {}
+            try { if (pid != null && capEl.hasPointerCapture && capEl.hasPointerCapture(pid)) capEl.releasePointerCapture(pid); } catch (e) {}
+            try { document.body.removeAttribute('data-aichat-drag'); } catch (e) {}
+            chatSaveGeom();                       // 只在松手时落盘，绝不每次 move 都写 localStorage
+        }
+
+        // 监听挂在 document 上：pointer capture 会把事件重定向到 capEl，而 capEl 在 #aiChatRoot 里面，
+        // 事件照常冒泡上来（根节点只拦 click / mousedown / pointerdown，不拦 move / up）。
+        document.addEventListener('pointermove', onMove);
+        document.addEventListener('pointerup', onUp);
+        document.addEventListener('pointercancel', onUp);
+        window.addEventListener('blur', onUp);    // 兜底 2：拖出窗口后 Alt-Tab，浏览器只给 blur
+    } catch (e) {
+        console.error('[chat] beginDrag failed', e);
+        try { document.body.removeAttribute('data-aichat-drag'); } catch (e2) {}
+    }
+}
+
+// 视口变了要重新夹一次，否则把浏览器窗口拉小之后窗口会整个留在视口外面。
+// 刻意**不**并进已有的 scheduleAlignSync：这里抛异常绝不能溅到对齐代码上。
+function chatOnViewportResize() {
+    try {
+        ChatState.geom = chatClampGeom(ChatState.geom);
+        chatApplyGeom();
+    } catch (e) {
+        console.error('[chat] viewport resize handler failed', e);
+    }
+}
+
+// —— 事件绑定（只在第一次建节点时跑一次）——
+function chatStopEvent(e) {
+    // 只截冒泡，不 preventDefault —— 按钮要能点、textarea 要能聚焦、文字要能选中。
+    try { e.stopPropagation(); } catch (err) {}
+}
+
+function chatBindShell(rootEl) {
+    // 第一道防线：对话窗内部的 click / mousedown / pointerdown 一律不冒泡到 document。
+    // 不加这个，行编辑态下点标题栏或消息气泡会被 handleGlobalClick 当成「点了空白区域」，
+    // 直接把用户这一行提交掉、退出编辑，还会触发一次重译另一栏的网络请求（实测 §2.6）。
+    // 第二道防线在 handleGlobalClick 里那一行 closest('#aiChatRoot')。
+    rootEl.addEventListener('click', chatStopEvent);
+    rootEl.addEventListener('mousedown', chatStopEvent);
+    rootEl.addEventListener('pointerdown', chatStopEvent);
+
+    const bar = rootEl.querySelector('#aiChatTitleBar');
+    if (bar) bar.addEventListener('pointerdown', function (e) { chatBeginDrag(e, 'move'); });
+
+    const hL = rootEl.querySelector('#aiChatResizeL');
+    if (hL) hL.addEventListener('pointerdown', function (e) { chatBeginDrag(e, 'l'); });
+    const hT = rootEl.querySelector('#aiChatResizeT');
+    if (hT) hT.addEventListener('pointerdown', function (e) { chatBeginDrag(e, 't'); });
+    const hTL = rootEl.querySelector('#aiChatResizeTL');
+    if (hTL) hTL.addEventListener('pointerdown', function (e) { chatBeginDrag(e, 'tl'); });
+
+    const closeBtn = rootEl.querySelector('#aiChatCloseBtn');
+    if (closeBtn) closeBtn.addEventListener('click', function () { chatClose(); });
+
+    const input = rootEl.querySelector('#aiChatInput');
+    if (input) {
+        input.addEventListener('input', chatAutoGrowInput);
+        // Enter 发送，Shift+Enter 换行。输入法组字过程中的 Enter 不算（isComposing），
+        // 否则中文用户每选一次候选词就发一条。
+        input.addEventListener('keydown', function (e) {
+            try {
+                if (!e || e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+                if (e.isComposing || e.keyCode === 229) return;
+                e.preventDefault();
+                chatSend();
+            } catch (err) { console.error('[chat] enter-to-send failed', err); }
+        });
+    }
+
+    // 这颗按钮在请求进行中就是 STOP，点它 = 中止，绝不当成「再发一条」。
+    // （Enter 的语义不同：草稿里有字就是「不要上一句了，发这一句」，见 chatSend。）
+    const sendBtn = rootEl.querySelector('#aiChatSendBtn');
+    if (sendBtn) sendBtn.addEventListener('click', function () {
+        if (ChatState.busy) chatStop();
+        else chatSend();
+    });
+
+    window.addEventListener('resize', chatOnViewportResize);
+
+    // Esc 关窗。刻意只在「焦点确实在对话窗里」或者「谁都没被聚焦」时才动手 ——
+    // 用户在行内 textarea 里按 Esc 是他和那个 textarea 的事，不许被这里劫走。
+    // 也不 preventDefault，免得挡住浏览器/其它组件对 Esc 的处理。
+    document.addEventListener('keydown', function (e) {
+        try {
+            if (!e || e.key !== 'Escape' || !ChatState.open) return;
+            const active = document.activeElement;
+            const insideChat = !!(active && active.closest && active.closest('#aiChatRoot'));
+            const nothingFocused = (!active || active === document.body);
+            if (insideChat || nothingFocused) chatClose();
+        } catch (err) {}
+    });
+}
+
+// ============================================================================
+// C2 —— 对话本身
+// ============================================================================
+//
+// 线格式是**纯文本信封**，不是 JSON：
+//
+//     ==CHAT==
+//     <给用户看的话>
+//     ==EDIT side=tgt row=4==
+//     <替换后的完整文本>
+//     ==END==
+//
+// 为什么不用 JSON —— 说清楚，因为这件事被误传过：
+// 重跑对照实验之后，**JSON 在两个强模型上也是干净解析、LaTeX 一个 token 都没丢的**。
+// 早先那份「JSON 会毁掉强模型」的结论来自测量脚本自己的 bug（正则切到第一个 '}'，
+// 而 LaTeX 里到处是 '}'）。所以选信封的真实理由只有一条：它对本项目整场都在打的
+// **转义类缺陷天生免疫** —— 反斜杠不进 JSON 字符串字面量，就不存在「\ref 被解析成
+// CR+ef」这一类损坏。另外弱模型（1.7b）在 JSON 上是**全盘失败**（2/2 不可解析，用户
+// 什么都拿不到），在信封上是**降级为白话**（2/2 忽略信封但正文可用）。失败方向不同。
+//
+// 解析铁律：**没有 ==EDIT==/==END== 就当整段是白话，绝不从白话里凑一个修改出来。**
+
+const CHAT_HISTORY_MSGS = 6;      // 每轮最多带 6 条历史（3 个来回），超出的从最老的丢
+const CHAT_MAX_TOKENS = 2048;     // 只对 openai/claude/gemini 生效；本地走 callLocalLLM 自己的 16384
+const CHAT_CTX_NEIGHBORS = 1;     // 目标行上下各带几行
+const CHAT_CHIP_CHARS = 60;       // 附加选段 chip 上显示多少个字
+const CHAT_TICK_MS = 100;         // 「思考中… x.x s」的刷新间隔
+
+// —— 分隔符的进出转义 ——
+// 用户的选段里**本来就可能有一行 `==END==`**。原样发出去、模型再原样抄回来，
+// 解析就会在正文中间截断 —— 而截断后的那段文本是要写进用户文档的。
+// 防线只有一道，而且是这一道：发出去之前把长得像分隔符的整行插一个零宽空格。
+// 模型抄回来的是插过零宽空格的那一行，解析器根本不会把它当成分隔符，正文里的
+// `==END==` 因此天然安全（实测逐字节往返一致）。
+// 【别再改回"取最后一个 ==END=="】那条规则曾经存在，它买不到这道转义没买到的东西，
+// 却把「模型多打了一个 ==END==」这种常见的模型抖动变成了**往用户文档里注入协议标记**：
+// 实测 qwen3.6 回了 body + ==END== + ==END==，取最后一个的结果就是替换文本末尾多出
+// 一行字面量 `==END==`，并被写进了正文和行历史。取**第一个**在所有实测样本上都是逐字节正确的。
+// 刻意不和哨兵协议的 [[k]]/@@n@@ 转义共用一个 helper：那边保护的是**模型不许改动的 token**，
+// 这边保护的是**我们自己的分帧符**，两者的正确行为在「模型丢了标记怎么办」上正好相反。
+const CHAT_ZWSP = '\u200B';        // 零宽空格。写成转义，别在源码里放裸字符 —— 那种字符肉眼查不出来。
+// 私用区码位，只在 chatRenderProse 里活着：把 `~` 藏过 marked 的 GFM 删除线，解析完就换回来。
+// 同样写成转义、绝不在源码里放裸字符。它**绝不**参与任何发出去或写进文档的路径。
+const CHAT_MD_TILDE = '\uE000';
+function chatEscapeDelims(s) {
+    return String(s == null ? '' : s)
+        .replace(/^([ \t]*==)(CHAT|EDIT|END)([^\n]*==[ \t]*)$/gm, '$1' + CHAT_ZWSP + '$2$3');
+}
+function chatUnescapeDelims(s) {
+    return String(s == null ? '' : s)
+        .replace(new RegExp('==' + CHAT_ZWSP + '(CHAT|EDIT|END)', 'g'), '==$1');
+}
+
+function chatSystemPrompt(hasTarget) {
+    const base = ''
+        + '你是学术论文翻译工具里的助手。用户正在逐句校对一篇论文的「原文」(src) 和「译文」(tgt)。\n'
+        + '用中文回答，除非用户用别的语言问。\n\n'
+        + '回复格式（严格遵守，**不要输出 JSON**）：\n'
+        + '==CHAT==\n'
+        + '<给用户看的话，可以用 Markdown>\n\n'
+        + '规则：\n'
+        + '1. LaTeX 命令（\\cite{...}、\\ref{...}、$...$、\\textcolor{..}{..}、\\begin{..}...\\end{..}）'
+        + '必须逐字符原样保留，一个反斜杠都不许增删。\n'
+        + '2. 不要复述用户给你的原文，直接说结论。\n';
+    if (!hasTarget) {
+        return base + '3. 这一轮用户**没有附加选段**，所以**绝对不要**输出 ==EDIT== 块。\n';
+    }
+    return base
+        + '3. 只有当用户明确要求改写「附加的选段」时，才在 ==CHAT== 段之后追加一个修改块：\n'
+        + '==EDIT side=<src|tgt> row=<行号>==\n'
+        + '<替换后的完整文本>\n'
+        + '==END==\n'
+        + '4. ==EDIT== 与 ==END== 之间只放替换后的正文本身：不要引号、不要 diff、不要任何解释，\n'
+        + '   而且必须是**整个选段**替换之后的完整文本，不是片段。\n'
+        + '5. side 和 row 必须与用户附加的选段一致。一轮最多一个 ==EDIT== 块。\n'
+        + '6. 只是回答问题、没有要改的时候，**不要**输出 ==EDIT== 块。\n';
+}
+
+// 解析模型回复。返回 { prose, edit:{side,row,body}|null, hadChatMark, unterminated }
+function chatParseEnvelope(raw) {
+    const text = String(raw == null ? '' : raw);
+    const out = { prose: '', edit: null, hadChatMark: false, unterminated: false, extraEnd: false };
+    const chatMark = /^[ \t]*==CHAT==[ \t]*\r?\n?/m;
+    out.hadChatMark = chatMark.test(text);
+
+    const em = /^[ \t]*==EDIT\b([^\n]*?)==[ \t]*$/m.exec(text);
+    if (!em) {
+        // 没有修改块 = 整段都是白话。**绝不**从白话里推断一个修改出来。
+        out.prose = chatUnescapeDelims(text.replace(chatMark, '')).trim();
+        return out;
+    }
+
+    const bodyStart = em.index + em[0].length;
+    // 终止符取**第一个** ==END==。用户选段里那个 ==END== 已经被 chatEscapeDelims 插了零宽空格，
+    // 不会匹配到这里；而模型多打一个 ==END==、或者一轮里塞了第二个 ==EDIT== 块的时候，
+    // 取第一个才不会把协议标记本身变成写进文档的正文。
+    const endRe = /^[ \t]*==END==[ \t]*$/gm;
+    endRe.lastIndex = bodyStart;
+    const m2 = endRe.exec(text);
+    const endIdx = m2 ? m2.index : -1;
+    // 第一个之后还有 ==END==：这一轮的格式是坏的（模型多打了一个终止符、一轮塞了两个修改块，
+    // 或者把用户选段里那行 ==END== 的零宽空格转义抄丢了 —— 三种实测都见过）。
+    // 我们照旧只取第一个，但**必须说出来**：否则用户只会看到一段莫名其妙被截短的替换文本，
+    // 而截短是会被应用进文档的。（`endRe` 带 g，test 从上一次匹配之后继续找。）
+    out.extraEnd = m2 ? endRe.test(text) : false;
+
+    out.prose = chatUnescapeDelims(text.slice(0, em.index).replace(chatMark, '')).trim();
+    if (endIdx === -1) {
+        // ==EDIT== 开了没关（被 token 上限截断，或者模型自己忘了）。半截的替换文本
+        // 绝不允许长出一颗「应用」按钮。
+        out.unterminated = true;
+        return out;
+    }
+
+    let body = text.slice(bodyStart, endIdx);
+    body = body.replace(/^\r?\n/, '').replace(/\r?\n[ \t]*$/, '');
+    const attrs = String(em[1] || '');
+    const sideM = /\bside\s*=\s*"?(src|tgt)"?/i.exec(attrs);
+    const rowM = /\brow\s*=\s*"?(\d+)"?/i.exec(attrs);
+    out.edit = {
+        side: sideM ? sideM[1].toLowerCase() : null,
+        row: rowM ? parseInt(rowM[1], 10) : null,
+        body: chatUnescapeDelims(body)
+    };
+    return out;
+}
+
+// 把「文档上下文 + 附加选段 + 用户这句话」拼成一条 user 消息。
+// 刻意**不**默认发整篇：目标行 ±1 行就够，一轮落在 2K token 上下，
+// 而三个本地模型的加载期上下文是 32768~65536。在线模型那边这是用户的钱。
+function chatBuildUserTurn(userText) {
+    const t = ChatState.target;
+    const pairs = Array.isArray(AppState.translationPairs) ? AppState.translationPairs : [];
+    let ctx = '';
+    if (t && t.rowIndex >= 0 && t.rowIndex < pairs.length) {
+        const lo = Math.max(0, t.rowIndex - CHAT_CTX_NEIGHBORS);
+        const hi = Math.min(pairs.length - 1, t.rowIndex + CHAT_CTX_NEIGHBORS);
+        const lines = [];
+        for (let i = lo; i <= hi; i++) {
+            const p = pairs[i] || {};
+            lines.push('第 ' + (i + 1) + ' 行' + (i === t.rowIndex ? '（目标行）' : '') + '\n'
+                + '  原文：' + chatEscapeDelims(String(p.src == null ? '' : p.src)) + '\n'
+                + '  译文：' + chatEscapeDelims(String(p.tgt == null ? '' : p.tgt)));
+        }
+        ctx = '【文档上下文】\n' + lines.join('\n') + '\n\n'
+            + '【用户附加的选段】side=' + t.side + ' row=' + (t.rowIndex + 1)
+            + (t.whole ? '（整行）' : '（该行第 ' + t.start + '–' + t.end + ' 个字符）') + '\n'
+            + '==TARGET==\n' + chatEscapeDelims(t.text) + '\n==END==\n\n';
+    }
+    return ctx + '【用户的问题】\n' + chatEscapeDelims(String(userText == null ? '' : userText));
+}
+
+// 发给模型的历史：只带最近 CHAT_HISTORY_MSGS 条，且 assistant 一律**去掉 reasoning**
+// （思考过程是关于答案的自言自语，不是答案，再发回去纯属烧钱烧上下文）。
+// 已经被用户应用的修改块换成一行标记 —— 那段文本此刻已经在文档里、会随上下文重新发出去，
+// 再重复一份没有意义；**还没应用**的提案则原样保留，用户正靠它继续说「再短一点」。
+function chatWireContent(m) {
+    if (!m) return '';
+    if (m.role !== 'assistant') return String(m.content == null ? '' : m.content);
+    let s = String(m.prose == null ? '' : m.prose);
+    // C4：「回传思考」是一个**客户端**开关（ChatState.keepReasoning），不是模型参数 ——
+    // LM Studio 的 preserve_thinking 作为请求参数被静默忽略，所以能诚实提供的只有这个。
+    // 开着的时候把上一轮的思考内容原样放回历史里（会明显增加输入 token，提示里说清楚了）。
+    if (ChatState.keepReasoning && m.reasoning && String(m.reasoning).trim()) {
+        s = '[上一轮的思考过程]\n' + chatEscapeDelims(String(m.reasoning)) + '\n[/上一轮的思考过程]\n' + s;
+    }
+    if (m.editBody) {
+        const p = chatFindProposal(m.proposalId);
+        s += (p && p.applied)
+            ? '\n[上一轮提出的修改已被用户应用]'
+            : '\n==EDIT==\n' + chatEscapeDelims(m.editBody) + '\n==END==';
+    }
+    return s;
+}
+
+function chatWireHistory() {
+    const msgs = ChatState.messages;
+    let start = Math.max(0, msgs.length - CHAT_HISTORY_MSGS);
+    // 窗口切在 assistant 上时往后挪一格：Claude 明确要求第一条必须是 user 角色，
+    // Gemini 的 contents 也应当以 user 开头。少发一条历史，换掉一个 400。
+    while (start < msgs.length && msgs[start].role !== 'user') start++;
+    const out = [];
+    for (let i = start; i < msgs.length; i++) {
+        out.push({ role: msgs[i].role, content: chatWireContent(msgs[i]) });
+    }
+    return out;
+}
+
+// —— 传输 ——
+// local / openai / claude 三家本来就吃 messages 数组，直接把历史透传过去即可。
+// Gemini 不行：callGeminiAPI 的第二个参数是**一个字符串**，而且它读 parts[0]。
+// 所以这里为聊天单写一条 Gemini 通道（实测：真正的多轮 contents 数组 HTTP 200，
+// promptTokenCount 91），**不动** callGeminiAPI 一行，也不把多轮对话拍扁成一个字符串
+// 再假装它是记忆。
+async function chatCallGemini(config, messages, systemPrompt, signal, meta, req) {
+    if (!config.geminiApiKey) {
+        throw new Error('Gemini API Key 没配置。到「设置」里填一个再试。');
+    }
+    const r = req || {};
+    const body = {
+        contents: messages.map(function (m) {
+            return {
+                role: m.role === 'assistant' ? 'model' : 'user',
+                parts: [{ text: String(m.content == null ? '' : m.content) }]
+            };
+        }),
+        generationConfig: {
+            temperature: (typeof r.temperature === 'number' && isFinite(r.temperature)) ? r.temperature : 0.3,
+            maxOutputTokens: (typeof r.maxTokens === 'number' && r.maxTokens > 0) ? r.maxTokens : CHAT_MAX_TOKENS
+        }
+    };
+    // C4：Gemini 的推理是**另一套合约** —— thinkingConfig.thinkingBudget，实测合法集是
+    // {0=关, -1=动态} ∪ [512, 24576]（1–511 一律 400）。和 reasoning_effort 没有一个字节共用。
+    // 与本地那条链路还有一处关键差别，参数条的提示里也照实写了：
+    //   · 本地：**省略** reasoning_effort ≡ 关闭推理，所以那边必须永远显式发；
+    //   · Gemini：省略 thinkingConfig ≡ 用模型自己的默认（flash-lite 实测是关）。
+    // 所以这里保留一个「默认（不发送）」档 —— 它是诚实的，而不是「显示一个值却什么都不发」。
+    if (typeof r.thinkingBudget === 'number') {
+        body.generationConfig.thinkingConfig = (r.thinkingBudget === 0)
+            ? { thinkingBudget: 0 }
+            // 预算非 0 时才要 includeThoughts：不要它的话思考内容根本不回传，
+            // 「思考」折叠区会永远是空的 —— 那就成了一个看得见效果为零的开关。
+            : { thinkingBudget: r.thinkingBudget, includeThoughts: true };
+    }
+    if (systemPrompt) body.systemInstruction = { parts: [{ text: systemPrompt }] };
+
+    const url = `${GEMINI_API_BASE}/${config.model}:generateContent?key=${config.geminiApiKey}`;
+    const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal
+    });
+    if (!resp.ok) {
+        const errText = await resp.text();
+        throw new Error(`Gemini API Error: ${resp.status} - ${errText}`);
+    }
+    const data = await resp.json();
+    const cand = (data && data.candidates && data.candidates[0]) || {};
+    const parts = (cand.content && Array.isArray(cand.content.parts)) ? cand.content.parts : [];
+    const partText = function (p) { return (p && typeof p.text === 'string') ? p.text : ''; };
+    if (meta) {
+        meta.finish = cand.finishReason || '';
+        meta.truncated = meta.finish === 'MAX_TOKENS';
+        // thought:true 的 part 是**思维链**，绝不能当答案（旧 callGeminiAPI 读 parts[0] 就会读到它）
+        meta.reasoning = parts.filter(function (p) { return p && p.thought === true; }).map(partText).join('');
+        meta.thinking = meta.reasoning.trim() !== '';
+    }
+    if (!parts.length) {
+        throw new Error('Gemini 返回了空内容（可能是 thinking 预算耗尽或被安全策略拦截）。');
+    }
+    const answer = parts.filter(function (p) { return !p || p.thought !== true; }).map(partText).join('');
+    if (meta) meta.text = answer;
+    return answer;
+}
+
+// 【C4 的核心一行】这里读的是 chatApiConfig()，**不是** getApiConfig()。
+// 对话的 provider/model 独立于 AppState.apiProvider/selectedModel，见 chatModelChoice。
+// sink 只有开了流式（且 provider==='local'）时才有值。
+async function chatCallModel(messages, systemPrompt, signal, meta, sink) {
+    const config = chatApiConfig();
+    const req = {
+        provider: config.provider,
+        model: config.model,
+        temperature: chatEffectiveTemperature(config.provider, config.model),
+        maxTokens: chatEffectiveMaxTokens(config.provider),
+        reasoningEffort: '',
+        thinkingBudget: null,
+        stream: false
+    };
+    if (config.provider === 'gemini') {
+        const g = chatGeminiOption(ChatState.geminiThinking);
+        if (g && g.budget !== null) req.thinkingBudget = g.budget;
+        ChatState.lastRequest = req;
+        return await chatCallGemini(config, messages, systemPrompt, signal, meta, req);
+    }
+    const full = [{ role: 'system', content: systemPrompt }].concat(messages);
+    if (config.provider === 'local') {
+        req.reasoningEffort = chatWireEffort(config.model);
+        req.stream = !!(sink && ChatState.stream);
+        ChatState.lastRequest = req;
+        if (req.stream) return await chatStreamLocal(config, full, signal, meta, req, sink);
+        // meta 由 callLocalLLM 用 readLocalChoice 填满：text / reasoning / finish / truncated / thinking
+        return await callLocalLLM(config.localBaseUrl, config.model, full, false, signal, meta, {
+            temperature: req.temperature,
+            maxTokens: req.maxTokens,
+            reasoningEffort: req.reasoningEffort
+        }) || '';
+    }
+    // OpenAI / Claude：temperature 为 null 表示「这个模型上这个参数不可设」（新 OpenAI 模型只接受 1），
+    // 那就一个字节都不发 —— 参数条那边同样不画这个控件，两处必须一致，否则就是画了个假控件。
+    const opt = { max_tokens: req.maxTokens };
+    if (req.temperature !== null) opt.temperature = req.temperature;
+    ChatState.lastRequest = req;
+    if (config.provider === 'openai') {
+        return await callOpenAIAPI(config.model, full, opt, config.openaiApiKey, signal) || '';
+    }
+    if (config.provider === 'claude') {
+        return await callClaudeAPI(config.model, full, opt, config.claudeApiKey, signal, config.claudeProxyUrl) || '';
+    }
+    throw new Error('未知的模型提供方：' + String(config.provider));
+}
+
+// —— 窗口内的几个小 DOM 工具 ——
+function chatBubbleOf(row) {
+    try { return row ? row.querySelector('.aichat-bubble') : null; } catch (e) { return null; }
+}
+
+// 「思考」折叠区。reasoning_content 只能出现在这里，永远不当答案。
+function chatAppendThinking(row, reasoning) {
+    try {
+        const text = String(reasoning == null ? '' : reasoning);
+        if (!text.trim() || !row) return;
+        const box = chatBubbleOf(row) || row;
+        const det = document.createElement('details');
+        det.className = 'aichat-think';
+        const sum = document.createElement('summary');
+        sum.textContent = '思考（模型的推理过程，不是答案）';
+        const body = document.createElement('div');
+        body.className = 'aichat-think-body';
+        body.textContent = text;      // textContent：推理里出现的 '<' 一个都不许当标签
+        det.appendChild(sum);
+        det.appendChild(body);
+        box.appendChild(det);
+    } catch (e) {}
+}
+
+// 助手气泡里的正文。**先 escapeHtml，再 marked.parse**，刻意不走 renderFormattedText：
+//   · escapeHtml 是本文件对「往 HTML 里塞不受控文本」的既有约定（见 escapeAttr 上方的注释），
+//     而气泡里装的是模型自由生成的文本。实测不转义时，回复里的
+//     `<img src=x onerror=...>` 会在气泡里变成活的元素并执行 —— 这不是安全加固问题，
+//     是「模型说的话被当成了标记」这种**正确性**问题。
+//   · 实测 escapeHtml→marked 不会把已有实体二次转义（`5 &lt; 6` 原样出来），
+//     Markdown 的加粗/列表/代码块全都照常工作。
+//   · 顺带的取舍：这样 `$\alpha_i$` 会**按源码原样显示**而不是渲染成公式。
+//     对这个工具反而是对的 —— 在讨论 LaTeX 的时候，用户要看的就是那串字节本身，
+//     提案卡的前后两栏也是同一个理由用等宽原样显示。
+//   · **波浪号必须先藏起来。** marked 默认开着 GFM 的单波浪号删除线，而 LaTeX 里
+//     `第~\ref{sec:II}节` / `不确定性~\cite{10143419}` 这种不换行空格几乎出现在每一处引用上。
+//     实测（本地 qwen3.6 与 gemini-2.5-flash-lite 各一次真实对话，第一轮就中）气泡里出现
+//     `<del>\cite{10143419}，如第</del>`：波浪号被吞掉，引用被画上删除线 —— 删除线
+//     在中文语境里恰好读作「把这段删掉」，正好是模型意思的反面。
+//     做法是解析前把 `~` 换成一个私用区码位、解析完再换回来，而不是去改全局 marked 配置
+//     （同一个 marked 还在给译文渲染用，不能因为聊天窗的毛病去动它）。
+//     两个被实测否掉的更"简单"的写法，别再试：
+//       · 换成 HTML 实体 `&#126;`：代码段里 marked 会把 `&` 再转义一次，
+//         `` `inline~code` `` 会**原样显示成** `inline&#126;code`。
+//       · 换成 `U+0001` 之类控制字符：markdown 链接的目标不允许控制字符，
+//         `[文档](http://x/a~b)` 会整个不再是链接。
+//     私用区码位两条都躲开了；唯一要补的是链接目标会被 encodeURI 成 %EE%80%80，所以还原时
+//     把编码后的形式一起换回去（实测 `[主页](http://ece.umass.edu/~lorenzo)` href 逐字正确）。
+function chatRenderProse(bubble, text) {
+    const s = String(text == null ? '' : text);
+    try {
+        if (!window.marked) { bubble.textContent = s; return; }
+        bubble.classList.add('aichat-md');
+        // 先清掉模型自己写出来的哨兵码位，替换才是单射的（U+E000 是私用区，没有任何定义好的
+        // 含义，浏览器本来也只会画一个豆腐块 —— 丢掉它不会丢掉任何可读内容）。
+        const md = escapeHtml(s).split(CHAT_MD_TILDE).join('').split('~').join(CHAT_MD_TILDE);
+        bubble.innerHTML = window.marked.parse(md)
+            .split(CHAT_MD_TILDE).join('~')
+            .split(encodeURI(CHAT_MD_TILDE)).join('~');
+    } catch (e) {
+        bubble.classList.remove('aichat-md');
+        bubble.textContent = s;
+    }
+}
+
+function chatSetBusy(on) {
+    try {
+        ChatState.busy = !!on;
+        const btn = document.getElementById('aiChatSendBtn');
+        if (!btn) return;
+        btn.textContent = on ? 'STOP' : 'SEND';
+        if (on) btn.classList.add('is-busy');
+        else btn.classList.remove('is-busy');
+    } catch (e) {}
+}
+
+// 底部状态条：把「历史怎么裁的」明说出来。历史长了要花的是用户的钱（在线模型），
+// 不告诉他等于替他做决定。
+function chatUpdateBar() {
+    try {
+        const bar = document.getElementById('aiChatBar');
+        if (!bar) return;
+        bar.textContent = '';
+        const n = ChatState.messages.length;
+        if (n === 0) return;
+        const sent = Math.min(n, CHAT_HISTORY_MSGS);
+        const div = document.createElement('div');
+        div.className = 'aichat-status';
+        div.textContent = n > CHAT_HISTORY_MSGS
+            ? '共 ' + n + ' 条消息；每轮只把最近 ' + sent + ' 条发给模型（更早的不再发，但仍留在窗口里）。'
+            : '共 ' + n + ' 条消息，全部会随下一轮发给模型。';
+        bar.appendChild(div);
+    } catch (e) {}
+}
+
+function chatPushUser(text) {
+    ChatState.messages.push({ role: 'user', content: String(text == null ? '' : text) });
+    chatAppendRow('user', text);
+    chatUpdateBar();
+}
+
+// 停止：中止在飞的请求。**不**清空已经收到的东西 —— 取消是预期路径，不是错误。
+function chatStop() {
+    try {
+        if (ChatState.abort) {
+            try { ChatState.abort.abort(); } catch (e) {}
+        }
+    } catch (e) {}
+}
+
+async function chatSend() {
+    let mySeq = 0;
+    let pendingRow = null;
+    let tick = null;
+    let live = null;
+    try {
+        const ta = document.getElementById('aiChatInput');
+        const draft = ta ? String(ta.value || '') : '';
+        if (!draft.trim()) {
+            // 空草稿 + 正在飞 = 用户按 Enter 想中止（按钮那条路径直接走 chatStop）
+            if (ChatState.busy) { chatStop(); return; }
+            chatAppendRow('system', '输入框是空的。');
+            return;
+        }
+
+        // 上一轮还没落地就先掐掉，再发新的这一轮 —— 用户又打了一句，就是不要上一句的答案了。
+        // 光有 abort 不够：两条消息挨得很近时，旧请求可能已经拿到响应正在解析。
+        // 所以还要 seq 守卫（照抄 scheduleCrossHighlight）：mySeq 对不上的响应一律丢弃。
+        chatStop();
+        mySeq = ++ChatState.seq;
+
+        if (ta) { ta.value = ''; chatAutoGrowInput(); }
+        chatPushUser(draft);
+
+        const hasTarget = !!ChatState.target;
+        const sys = chatSystemPrompt(hasTarget);
+        const wire = chatWireHistory();
+        // 最后一条（也就是刚 push 的这条 user）换成带上下文的完整版本
+        if (wire.length) wire[wire.length - 1] = { role: 'user', content: chatBuildUserTurn(draft) };
+
+        const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        ChatState.abort = controller;
+        chatSetBusy(true);
+
+        pendingRow = chatAppendRow('system', '思考中… 0.0s');
+        const t0 = Date.now();
+        tick = setInterval(function () {
+            try {
+                const b = chatBubbleOf(pendingRow);
+                if (b) b.textContent = '思考中… ' + ((Date.now() - t0) / 1000).toFixed(1) + 's';
+            } catch (e) {}
+        }, CHAT_TICK_MS);
+
+        const meta = {};
+        // C5：流式的活气泡。第一个 delta 到达时才建行（在那之前「思考中… x.x s」照常跑），
+        // 建行的同时把计时行撤掉 —— 两条同时在屏幕上等于告诉用户「有两件事在发生」。
+        const killPending = function () {
+            try { if (tick) { clearInterval(tick); tick = null; } } catch (e) {}
+            try { if (pendingRow && pendingRow.parentNode) pendingRow.parentNode.removeChild(pendingRow); } catch (e) {}
+            pendingRow = null;
+        };
+        const sink0 = chatLiveSink();
+        live = {
+            reasoning: function (s) { killPending(); sink0.reasoning(s); },
+            text: function (s) { killPending(); sink0.text(s); },
+            destroy: sink0.destroy
+        };
+        const raw = await chatCallModel(wire, sys, controller ? controller.signal : null, meta, live);
+
+        // 陈旧响应：用户在这期间又发了一条。丢弃，绝不往窗口里写。
+        if (mySeq !== ChatState.seq) return;
+        live.destroy();                 // 活气泡退场，最终那一版由 chatRenderAssistant 统一渲染
+        live = null;
+        if (meta.aborted) {
+            // 流被中止：已经收到的字**留下**（取消是预期路径，不是错误），
+            // 而半截的 ==EDIT== 在 chatParseEnvelope 里就已经被判成 unterminated，长不出「应用」按钮。
+            if (String(raw || '').trim()) {
+                chatRenderAssistant(raw, meta);
+                chatAppendRow('system', '已停止 —— 上面是中止前已经收到的内容。');
+            } else {
+                chatAppendRow('system', '已停止。');
+            }
+            return;
+        }
+        chatRenderAssistant(raw, meta);
+    } catch (e) {
+        if (mySeq !== ChatState.seq) return;               // 陈旧轮次的异常也一并丢弃
+        if (e && e.name === 'AbortError') {
+            chatAppendRow('system', '已停止。');
+        } else {
+            // 出错一律是对话流里的一行，**绝不**写 AppState.error（那会重渲染整页）
+            chatErrorRow('对话', chatDescribeError(e));
+        }
+    } finally {
+        try { if (tick) clearInterval(tick); } catch (e2) {}
+        try { if (pendingRow && pendingRow.parentNode) pendingRow.parentNode.removeChild(pendingRow); } catch (e2) {}
+        // 活气泡也一定要收掉：正常路径上面已经 destroy 过（幂等），异常/陈旧路径靠这一行兜底，
+        // 否则页面上会永远留着一段半截的流式文本，而它下面绝不会有「应用」按钮 —— 更糟的是
+        // 用户会以为那就是最终答案。
+        try { if (live) live.destroy(); } catch (e2) {}
+        if (mySeq === ChatState.seq) {
+            ChatState.abort = null;
+            chatSetBusy(false);
+        }
+        chatScrollToBottom();
+    }
+}
+
+// LM Studio 的报错措辞有时是误导性的（body 稍有不对就一律说 "failed to parse JSON value"），
+// 但 error.code / error.param 是准的。能挖出来就把这两个字段亮出来。
+function chatDescribeError(e) {
+    try {
+        const msg = (e && (e.message || e.toString())) || String(e);
+        const m = /\{[\s\S]*\}$/.exec(msg);
+        if (m) {
+            const j = JSON.parse(m[0]);
+            const err = (j && j.error) || j;
+            if (err && (err.code || err.param || err.message)) {
+                return msg.slice(0, m.index)
+                    + (err.message || '')
+                    + (err.code ? '（code=' + err.code + '）' : '')
+                    + (err.param ? '（param=' + err.param + '）' : '');
+            }
+        }
+        return msg.length > 400 ? msg.slice(0, 400) + '…' : msg;
+    } catch (err) {
+        return (e && (e.message || e.toString())) || String(e);
+    }
+}
+
+function chatRenderAssistant(raw, meta) {
+    const parsed = chatParseEnvelope(raw);
+    const m = meta || {};
+    const record = {
+        role: 'assistant',
+        content: String(raw == null ? '' : raw),
+        prose: parsed.prose,
+        reasoning: String(m.reasoning == null ? '' : m.reasoning),
+        editBody: null,
+        proposalId: null
+    };
+
+    // 正文为空 + 有推理 = 推理吃光了预算。这是本地模型最典型的一种「什么都没返回」。
+    if (!String(raw || '').trim()) {
+        chatErrorRow('对话', m.thinking
+            ? '模型把 token 预算全用在推理上了，正文是空的。到「设置 → 模型」把该模型的「推理」设为「关」再试。'
+            : '模型返回了空正文。');
+        // 推理内容仍然给出来（诊断用），但没有推理时不要留一条空行
+        if (record.reasoning.trim()) chatAppendThinking(chatAppendRow('system', ''), record.reasoning);
+        ChatState.messages.push(record);
+        chatUpdateBar();
+        chatScrollToBottom();
+        return;
+    }
+
+    const row = chatAppendRow('assistant', '');
+    const bubble = chatBubbleOf(row);
+    if (bubble) chatRenderProse(bubble, parsed.prose || String(raw));
+    chatAppendThinking(row, record.reasoning);
+
+    if (m.truncated) {
+        chatAppendRow('system', '⚠ 这条回复被 token 上限截断了（finish_reason=length），下面的内容是半截的。');
+    }
+    if (parsed.unterminated) {
+        chatAppendRow('system', '模型开了 ==EDIT== 却没有写 ==END==（多半是被截断）。半截的替换文本不会长出「应用」按钮。');
+    }
+    if (parsed.extraEnd) {
+        chatAppendRow('system', '这条回复里有不止一个 ==END==（模型多打了一个，或者一轮里塞了两个修改块）。'
+            + '替换文本只取到**第一个** ==END== 为止 —— 后面那些是协议标记，绝不会被写进你的文档。'
+            + '请对照卡片确认这段文本有没有被截短。');
+    }
+
+    if (parsed.edit) {
+        record.editBody = parsed.edit.body;
+        const p = chatMakeProposal(parsed.edit);
+        if (p) record.proposalId = p.id;
+    }
+
+    ChatState.messages.push(record);
+    chatUpdateBar();
+    chatScrollToBottom();
+}
+
+// ============================================================================
+// C4 —— 输入框下面那条参数条
+// ============================================================================
+//
+// 用户要的是三件事：**对话用哪个模型**（和翻译各管各的）、**思考开不开**、**推理强度**，
+// 外加「模型还支持什么就都放上来，太多就收进一个竖排的 ⋮」。
+//
+// 这一段的全部难点不在渲染，在于**不许出现装饰性控件**。所以先把「什么是真的、什么会是谎」
+// 一条条钉死（全部实测，出处见 .claude/tmp/capabilities.md 与 chat-window.md §6）：
+//
+//   1) 选项从哪来：`GET <origin>/api/v1/models`（**不是** /api/v0），顶层键 `models`、
+//      id 键 `key`、非 LLM 条目整个 `capabilities` 缺失。这一份发现已经由 xportModelCaps /
+//      xportCapsPeek 落地并带 60 秒缓存，**这里只消费，绝不再写第二个抓取器**。
+//        · qwen3.8-27b   → ["off","low","medium","xhigh","on"]（唯一有真实档位的）
+//        · qwen3.6-35b-a3b / qwen3-1.7b → ["off","on"]（二值）
+//
+//   2) **永远显式发 reasoning_effort。** capabilities.reasoning.default 是 LM Studio 的
+//      **界面**默认值，不是 API 默认值：实测省略这个字段 = 零推理，哪怕 default 写着 "xhigh"。
+//      屏幕上显示 xhigh 却什么都不发，就是撒谎。
+//
+//   3) **界面词表 ≠ 线上词表。** off→"none"、on→"medium"；永远不发 "high"（3.8 上会回落）、
+//      永远不发 "minimal"（服务端 WARN 着映射成 "low"）、发 "off" 直接 400。
+//      能复现的只有「none=0 推理 token，非 none 一定 >0，三个模型无一 400」这三条。
+//      ⚠ 具体的推理 token 数**跟着提问走，不是模型属性**：同一条链路上 low/medium/xhigh 量到过
+//      56/56/61、84/84/140、376/456/613、27/30/43、107/107/244。任何一组都不许再被当成通用结论
+//      写进界面（曾经写进过推理强度的 data-tip，是一条假的实测声明）。
+//
+//   4) **这两样东西不画控件**，因为按请求根本设不了 —— 画了就是装饰：
+//        · preserve_thinking：只存在于磁盘上的 model.yaml，作为请求参数被静默忽略，
+//          /api/v1/models 里也完全没有它。所以这里提供的是**客户端**的同名效果
+//          （keepReasoning：要不要把上一轮的思考内容回传），并在提示里明说这是我们的行为。
+//        · context length：加载期参数，发 context_length/num_ctx/n_ctx 返回 200 但纹丝不动。
+//          所以只读展示（⋮ 里那排芯片），不给任何可调的东西。
+//
+//   5) capabilities 读不到时**隐藏控件 + 说明原因**，绝不去探测、更不去卸载模型来试
+//      （那台服务器可能有别的工作流在用）。
+//
+//   6) Gemini 是另一套合约：thinkingBudget ∈ {0, -1} ∪ [512, 24576]，且**省略 ≡ 模型自己的
+//      默认**（与本地相反）。所以它的档位表里保留一个诚实的「默认（不发送）」。
+//      OpenAI / Claude 这边没有任何已接线的推理发现，所以**不画推理控件**（不是画一个灰的）。
+
+const CHAT_PARAMS_LS_KEY = 'chatParams';
+const CHAT_TEMP_DEFAULT = 0.3;
+// 刻意用**有限集**而不是自由输入框：参数条上的每一个选项都要被真机逐个跑过一遍才敢发布，
+// 自由输入框做不到「穷尽验证」，而且 0 在 callOpenAIAPI 里会被 `config.temperature || 0.3`
+// 悄悄吃成 0.3（那个既有写法不在本轮改动范围内）—— 不提供 0 就不会踩到它。
+const CHAT_TEMPS = [0.1, 0.3, 0.7, 1.0];
+const CHAT_MAXTOK_CHOICES = [1024, 2048, 4096, 8192, 16384];
+// Gemini 思考档。budget=null 表示**不发送** thinkingConfig。
+const CHAT_GEMINI_THINKING = [
+    { v: '',        label: '默认', budget: null },
+    { v: 'off',     label: '关',   budget: 0 },
+    { v: 'dynamic', label: '动态', budget: -1 },
+    { v: 'max',     label: '最大', budget: 24576 }
+];
+
+function chatGeminiOption(v) {
+    for (let i = 0; i < CHAT_GEMINI_THINKING.length; i++) {
+        if (CHAT_GEMINI_THINKING[i].v === String(v == null ? '' : v)) return CHAT_GEMINI_THINKING[i];
+    }
+    return CHAT_GEMINI_THINKING[0];
+}
+
+// —— 持久化 ——
+// 独立的 key，和翻译的 selectedModel / reasoningByModel 完全不共享一个字节。
+// 单独一个 try/catch（和 chatSaveGeom 同样的理由：别人写失败不能顺手弄丢这一份）。
+function chatParamsSave() {
+    try {
+        localStorage.setItem(CHAT_PARAMS_LS_KEY, JSON.stringify({
+            provider: ChatState.provider,
+            model: ChatState.model,
+            reasoningByModel: ChatState.reasoningByModel,
+            geminiThinking: ChatState.geminiThinking,
+            temperature: ChatState.temperature,
+            maxTokens: ChatState.maxTokens,
+            stream: !!ChatState.stream,
+            keepReasoning: !!ChatState.keepReasoning,
+            paramsOpen: !!ChatState.paramsOpen
+        }));
+    } catch (e) {}
+}
+
+// 逐键校验，脏值一律**不收**（不是回落成别的值）。localStorage 里躺着一个不认识的档位，
+// 结果被当成合法值发出去，正是这个文件反复在防的那类事。
+function chatParamsLoad() {
+    try {
+        const raw = localStorage.getItem(CHAT_PARAMS_LS_KEY);
+        if (!raw) return;
+        const p = JSON.parse(raw);
+        if (!p || typeof p !== 'object' || Array.isArray(p)) return;
+
+        const prov = String(p.provider || '');
+        const mid = sanitizeModelId(p.model);
+        if (mid && (prov === 'local' || MODEL_PROVIDERS.indexOf(prov) !== -1)) {
+            ChatState.provider = prov;
+            ChatState.model = mid;
+        }
+        if (p.reasoningByModel && typeof p.reasoningByModel === 'object' && !Array.isArray(p.reasoningByModel)) {
+            const clean = {};
+            Object.keys(p.reasoningByModel).forEach(function (k) {
+                const id = sanitizeModelId(k);
+                const v = p.reasoningByModel[k];
+                if (id && typeof v === 'string' && Object.prototype.hasOwnProperty.call(XPORT_EFFORT_WIRE, v)) clean[id] = v;
+            });
+            ChatState.reasoningByModel = clean;
+        }
+        if (typeof p.geminiThinking === 'string' && chatGeminiOption(p.geminiThinking).v === p.geminiThinking) {
+            ChatState.geminiThinking = p.geminiThinking;
+        }
+        if (typeof p.temperature === 'number' && CHAT_TEMPS.indexOf(p.temperature) !== -1) {
+            ChatState.temperature = p.temperature;
+        }
+        if (typeof p.maxTokens === 'number' && CHAT_MAXTOK_CHOICES.indexOf(p.maxTokens) !== -1) {
+            ChatState.maxTokens = p.maxTokens;
+        }
+        if (typeof p.stream === 'boolean') ChatState.stream = p.stream;
+        if (typeof p.keepReasoning === 'boolean') ChatState.keepReasoning = p.keepReasoning;
+        if (typeof p.paramsOpen === 'boolean') ChatState.paramsOpen = p.paramsOpen;
+    } catch (e) {}
+}
+
+// —— 模型选择：**独立于翻译** ——
+// ChatState.provider/model 为空 = 用户从没在这条参数条上选过，此时回落到当前翻译模型
+//（这就是「首次打开默认跟翻译一样」）。一旦选过，翻译那边换成什么都不再跟随，
+// 而且这里**永远不写** AppState.apiProvider / AppState.selectedModel。
+function chatModelChoice() {
+    try {
+        const p = String(ChatState.provider || '');
+        const m = sanitizeModelId(ChatState.model);
+        if (m && (p === 'local' || MODEL_PROVIDERS.indexOf(p) !== -1)) return { provider: p, model: m, pinned: true };
+    } catch (e) {}
+    return { provider: AppState.apiProvider, model: AppState.selectedModel, pinned: false };
+}
+
+// 对话专用的 API 配置。和 getApiConfig() 逐字段同形，只有 provider/model 换成对话自己的，
+// 好让 chatCallGemini / callOpenAIAPI / callClaudeAPI 的调用点一个字都不用改形状。
+function chatApiConfig() {
+    const c = chatModelChoice();
+    return {
+        provider: c.provider,
+        model: c.model,
+        localBaseUrl: AppState.localBaseUrl,
+        geminiApiKey: AppState.geminiApiKey,
+        openaiApiKey: AppState.openaiApiKey,
+        claudeApiKey: AppState.claudeApiKey,
+        claudeProxyUrl: AppState.claudeProxyUrl
+    };
+}
+
+function chatModelLabel(provider, id) {
+    try {
+        if (provider === 'local') return String(id);
+        const meta = getModelMeta(id);
+        return (meta && meta.name) ? meta.name : String(id);
+    } catch (e) { return String(id); }
+}
+
+// 下拉里的分组。在线三家复用 getVisibleModels（尊重用户在设置里的模型可见性勾选），
+// 本地直接用 AppState.localModels。最后把「当前选中的那个」钉住 —— 它绝不能从下拉里消失，
+// 否则用户选过一个模型之后就再也切不回来（照抄 getModelCatalog 的钉住纪律）。
+function chatModelGroups() {
+    const groups = [];
+    try {
+        // /v1/models（fetchLocalModels 用的那个）只给 id，分不出 embedding；
+        // /api/v1/models 给了 type，所以这里**只在确实知道它是 embedding 时**才剔除。
+        // 不知道就留着 —— 猜错方向的代价是「用户看不到自己装的模型」，比多一条不能聊的更糟。
+        const cur0 = chatModelChoice();
+        const locals = (Array.isArray(AppState.localModels) ? AppState.localModels : []).filter(function (lm) {
+            const id = String(lm.id);
+            // chatSetModel 会用 sanitizeModelId 把非法 id 拒掉，那么下拉里就不该出现它 ——
+            // 一个点了没反应的选项也是装饰性控件。
+            if (!sanitizeModelId(id)) return false;
+            if (id === cur0.model) return true;              // 当前选中的永不消失
+            try {
+                const c = xportCapsPeek(AppState.localBaseUrl, id);
+                return !(c && /embed/i.test(String(c.type || '')));
+            } catch (e) { return true; }
+        });
+        if (locals.length) {
+            groups.push({
+                label: '本地 LM Studio',
+                items: locals.map(function (lm) { return { provider: 'local', id: String(lm.id) }; })
+            });
+        }
+        MODEL_PROVIDERS.forEach(function (prov) {
+            let list = [];
+            try { list = getVisibleModels(prov) || []; } catch (e) { list = []; }
+            if (!list.length) return;
+            groups.push({
+                label: MODEL_PROVIDER_LABEL[prov] || prov,
+                items: list.map(function (m) { return { provider: prov, id: String(m.id) }; })
+            });
+        });
+    } catch (e) {}
+    const cur = chatModelChoice();
+    let found = false;
+    groups.forEach(function (g) {
+        g.items.forEach(function (it) { if (it.provider === cur.provider && it.id === cur.model) found = true; });
+    });
+    if (!found && cur.model) {
+        groups.unshift({ label: '当前选择（不在列表里，仍可用）', items: [{ provider: cur.provider, id: cur.model }] });
+    }
+    return groups;
+}
+
+// —— 对话自己的推理档位 ——
+// 存在 ChatState.reasoningByModel，**不是** AppState.reasoningByModel。
+// 「这个模型支持哪些档位」的夹取器是共用的（xportClampReasoning），所以对话这条路
+// 不可能给出一个模型其实不支持的档位。
+function chatReasoningRaw(model) {
+    try {
+        const box = ChatState.reasoningByModel;
+        const v = (box && typeof box === 'object') ? box[String(model)] : null;
+        return (typeof v === 'string' && Object.prototype.hasOwnProperty.call(XPORT_EFFORT_WIRE, v))
+            ? v : XPORT_REASONING_DEFAULT;
+    } catch (e) { return XPORT_REASONING_DEFAULT; }
+}
+
+function chatReasoningValue(model) {
+    return xportClampReasoning(AppState.localBaseUrl, model, chatReasoningRaw(model));
+}
+
+function chatWireEffort(model) {
+    try { return XPORT_EFFORT_WIRE[chatReasoningValue(model)] || 'none'; } catch (e) { return 'none'; }
+}
+
+// —— 每次请求真正会用的数值 ——
+// 「新 OpenAI 模型只接受 temperature=1」是既有事实（isNewOpenAIModel），所以那些模型上
+// 这个参数**根本设不了**：返回 null ⇒ 不发送、且参数条上不画这个控件。两处必须同源。
+function chatTemperatureSettable(provider, model) {
+    if (provider === 'openai') { try { return !isNewOpenAIModel(model); } catch (e) { return false; } }
+    return provider === 'local' || provider === 'gemini' || provider === 'claude';
+}
+
+function chatEffectiveTemperature(provider, model) {
+    if (!chatTemperatureSettable(provider, model)) return null;
+    const v = ChatState.temperature;
+    return (typeof v === 'number' && CHAT_TEMPS.indexOf(v) !== -1) ? v : CHAT_TEMP_DEFAULT;
+}
+
+// 「默认」= 这条链路本来就在用的值，改这个功能之前是多少，这里就是多少（本地 16384，
+// 在线 CHAT_MAX_TOKENS）。这样「没动过参数条」的用户逐字保持原行为。
+function chatDefaultMaxTokens(provider) {
+    return provider === 'local' ? 16384 : CHAT_MAX_TOKENS;
+}
+
+function chatEffectiveMaxTokens(provider) {
+    const v = ChatState.maxTokens;
+    return (typeof v === 'number' && CHAT_MAXTOK_CHOICES.indexOf(v) !== -1) ? v : chatDefaultMaxTokens(provider);
+}
+
+// —— 设值。一律：改状态 → 落盘 → 只重画这条参数条。**永远不 setState**。——
+function chatSetModel(value) {
+    try {
+        const s = String(value == null ? '' : value);
+        const i = s.indexOf(':');
+        if (i <= 0) return;
+        const prov = s.slice(0, i);
+        const id = sanitizeModelId(s.slice(i + 1));
+        if (!id || (prov !== 'local' && MODEL_PROVIDERS.indexOf(prov) === -1)) return;
+        ChatState.provider = prov;
+        ChatState.model = id;
+        chatParamsSave();
+        // 本地模型的能力表可能还没拉过（比如用户一上来就在参数条里换了个模型）：
+        // 发一次（60 秒内不会重复请求），回来后 xportCapsPaint + 这里再画一次。
+        if (prov === 'local') chatCapsWarmForBar();
+        chatRenderParamBar();
+        chatAppendRow('system', '对话模型已切到「' + chatModelLabel(prov, id) + '」。'
+            + '这只影响对话窗，翻译仍然用顶栏那个模型。');
+    } catch (e) { console.error('[chat] setModel failed', e); }
+}
+
+function chatSetReasoning(uiValue) {
+    try {
+        const c = chatModelChoice();
+        const v = (typeof uiValue === 'string' && Object.prototype.hasOwnProperty.call(XPORT_EFFORT_WIRE, uiValue))
+            ? uiValue : XPORT_REASONING_DEFAULT;
+        if (!ChatState.reasoningByModel || typeof ChatState.reasoningByModel !== 'object') ChatState.reasoningByModel = {};
+        ChatState.reasoningByModel[c.model] = v;
+        chatParamsSave();
+        chatRenderParamBar();
+    } catch (e) { console.error('[chat] setReasoning failed', e); }
+}
+
+// 二值/多档模型共用的「开」：多档模型开到 medium（它一定在 allowed 里，否则 xportReasoningControl
+// 不会把它列出来；不在就退到第一个可用档），二值模型开就是 'on'。
+function chatReasoningTurnOn() {
+    try {
+        const c = chatModelChoice();
+        const caps = xportCapsPeek(AppState.localBaseUrl, c.model);
+        const ctl = xportReasoningControl(caps && caps.reasoning ? caps.reasoning.allowed : null);
+        if (ctl.kind === 'select') {
+            chatSetReasoning(ctl.levels.indexOf('medium') !== -1 ? 'medium' : ctl.levels[0]);
+        } else {
+            chatSetReasoning('on');
+        }
+    } catch (e) { chatSetReasoning('on'); }
+}
+
+function chatSetGeminiThinking(v) {
+    try {
+        ChatState.geminiThinking = chatGeminiOption(v).v;
+        chatParamsSave();
+        chatRenderParamBar();
+    } catch (e) {}
+}
+
+function chatSetTemperature(v) {
+    try {
+        const n = Number(v);
+        ChatState.temperature = (CHAT_TEMPS.indexOf(n) !== -1) ? n : CHAT_TEMP_DEFAULT;
+        chatParamsSave();
+        chatRenderParamBar();
+    } catch (e) {}
+}
+
+function chatSetMaxTokens(v) {
+    try {
+        const n = Number(v);
+        ChatState.maxTokens = (CHAT_MAXTOK_CHOICES.indexOf(n) !== -1) ? n : 0;   // 0 = 用各家默认
+        chatParamsSave();
+        chatRenderParamBar();
+    } catch (e) {}
+}
+
+function chatSetStream(on) {
+    try { ChatState.stream = !!on; chatParamsSave(); chatRenderParamBar(); } catch (e) {}
+}
+
+function chatSetKeepReasoning(on) {
+    try { ChatState.keepReasoning = !!on; chatParamsSave(); chatRenderParamBar(); } catch (e) {}
+}
+
+function chatToggleParams() {
+    try { ChatState.paramsOpen = !ChatState.paramsOpen; chatParamsSave(); chatRenderParamBar(); } catch (e) {}
+}
+
+// 能力发现是异步的。回来之后**只**重画参数条（和设置弹窗那边的 xportCapsPaint 同一条纪律：
+// 定点重绘，绝不 renderApp —— 那会把用户没保存的 API Key 输入框冲掉）。
+function chatCapsWarmForBar() {
+    try {
+        xportFetchCaps(AppState.localBaseUrl).then(function () {
+            try { xportCapsPaint(); } catch (e) {}
+            chatRenderParamBar();
+        }, function () {});
+    } catch (e) {}
+}
+
+// —— 渲染 ——
+// 纯字符串拼接 + escapeAttr/escapeHtml，画完再按 id 绑监听（每次重画都是新节点，
+// 旧监听随节点一起被回收）。整个函数带 try/catch 且不抛：它虽然在 renderApp 之外，
+// 但抛出去会让参数条永久停在上一帧。
+function chatSegHtml(idOff, idOn, labOff, labOn, on) {
+    return '<span class="aichat-seg">'
+        + '<button type="button" id="' + idOff + '" class="' + (on ? '' : 'is-on') + '">' + labOff + '</button>'
+        + '<button type="button" id="' + idOn + '" class="' + (on ? 'is-on' : '') + '">' + labOn + '</button>'
+        + '</span>';
+}
+
+function chatReasoningBarHtml(choice) {
+    // —— Gemini：另一套合约，给它自己的档位表 ——
+    if (choice.provider === 'gemini') {
+        const cur = chatGeminiOption(ChatState.geminiThinking);
+        const tip = '思考预算（thinkingConfig.thinkingBudget）。实测合法值只有 {0=关, -1=动态} ∪ [512, 24576]，'
+            + '1–511 一律 400，所以这里只给「关 / 动态 / 最大(24576)」三档。'
+            + '「默认」= 不发送 thinkingConfig，让模型用自己的默认（gemini-2.5-flash-lite 实测是关）—— '
+            + '这一点和本地相反：本地省略 reasoning_effort 等于关闭推理，所以那边必须永远显式发。'
+            + '选了非「关」的档时会同时带上 includeThoughts:true，否则思考内容根本不回传，「思考」折叠区会永远是空的。'
+            + '以上数字实测自 gemini-2.5-flash-lite；换别的 Gemini 模型时若被拒，错误会原样显示在对话里。';
+        const opts = CHAT_GEMINI_THINKING.map(function (o) {
+            return '<option value="' + escapeAttr(o.v) + '"' + (o.v === cur.v ? ' selected' : '') + '>'
+                + escapeHtml(o.label) + '</option>';
+        }).join('');
+        return '<span class="aichat-pgroup" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top">'
+            + '<span class="aichat-plabel">思考</span>'
+            + '<select class="aichat-psel" id="aiChatGemSel" style="max-width:82px">' + opts + '</select></span>';
+    }
+
+    // —— OpenAI / Claude：没有任何已接线的推理发现 ⇒ 一个控件都不画 ——
+    // 画一个灰的、或者画一个「看起来能设其实不发」的，都是撒谎。解释放进 ⋮ 里。
+    if (choice.provider !== 'local') return '';
+
+    const caps = xportCapsPeek(AppState.localBaseUrl, choice.model);
+    if (caps === undefined) {
+        return '<span class="aichat-plabel" data-tip="'
+            + escapeAttr('正在读取 ' + xportCapsOrigin(AppState.localBaseUrl) + '/api/v1/models，拿到这个模型支持哪些推理档位之后才画控件。')
+            + '" data-tip-pos="top">推理 读取中…</span>';
+    }
+    if (!caps) {
+        const ok = xportCapsOk(AppState.localBaseUrl);
+        const tip = (ok === false)
+            ? '读不到 ' + xportCapsOrigin(AppState.localBaseUrl) + '/api/v1/models（LM Studio 没在跑，或版本过旧没有这个端点）。'
+              + '没有能力信息就不画控件 —— 宁可不显示，也不显示一个可能是假的开关。'
+            : '模型未加载：LM Studio 的模型列表里没有这一项，拿不到它支持哪些推理档位。在 LM Studio 里加载该模型后重开本页即可。';
+        return '<span class="aichat-plabel" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top">'
+            + (ok === false ? '推理 不可用' : '推理 模型未加载') + '</span>';
+    }
+    const ctl = xportReasoningControl(caps.reasoning ? caps.reasoning.allowed : null);
+    if (ctl.kind === 'none') {
+        return '<span class="aichat-plabel" data-tip="'
+            + escapeAttr('该模型没有声明任何推理档位（capabilities.reasoning 缺失或为空），因此不提供推理开关。')
+            + '" data-tip-pos="top">无推理档位</span>';
+    }
+
+    let latched = false;
+    try { latched = xportEffortUnsupported.has(xportCapsOrigin(AppState.localBaseUrl)); } catch (e) { latched = false; }
+    const cur = chatReasoningValue(choice.model);
+    const on = cur !== 'off';
+    const wire = chatWireEffort(choice.model);
+    const tip = '思考 / 推理（reasoning_effort）。这一档只管对话窗，翻译用的是「设置 → 模型」里那一份，两者互不影响。'
+        + '这个模型声明支持的档位是 [' + (caps.reasoning ? caps.reasoning.allowed.join(', ') : '') + ']；'
+        + '元数据里的默认值「' + (caps.reasoning && caps.reasoning.uiDefault ? caps.reasoning.uiDefault : '未知')
+        + '」是 LM Studio 的「界面」默认值，不是 API 默认值 —— 实测不显式发送时 API 一律不推理，'
+        + '所以选「关」时发的是 reasoning_effort:"none"，而不是靠省略。本次会发出去的是 "' + wire + '"。'
+        + (latched ? '（本地址已经用 400 明确拒绝过 reasoning_effort，这个字段现在不再发送，所以只能停在「关」。）' : '');
+
+    let html = '<span class="aichat-pgroup" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top">'
+        + '<span class="aichat-plabel">思考</span>'
+        + chatSegHtml('aiChatThinkOff', 'aiChatThinkOn', XPORT_EFFORT_LABEL.off, XPORT_EFFORT_LABEL.on, on)
+        + '</span>';
+
+    // 有真实档位的模型（实测只有 qwen3.8）才多一个强度下拉，而且只在「开」的时候出现 ——
+    // 关着的时候显示一个强度值等于暗示它在起作用。
+    if (ctl.kind === 'select' && on) {
+        const opts = ctl.levels.map(function (v) {
+            return '<option value="' + escapeAttr(v) + '"' + (v === cur ? ' selected' : '') + '>'
+                + escapeHtml(XPORT_EFFORT_LABEL[v] || v) + '</option>';
+        }).join('');
+        // 【这段文案改过两次，别再写回带具体数字的版本】曾经写着「实测 qwen3.8：low=56、
+        // medium=56、xhigh=61 个推理 token —— 单调但幅度很小」，那是**假的**：那组数字来自
+        // 某一次实验的某一个提问，换个提问一个都对不上。五组 low/medium/xhigh 实测
+        // （全部走本函数所在的这条链路，reasoning_effort 逐字发出去，stream 关）：
+        //   56/56/61 · 84/84/140 · 376/456/613 · 27/30/43 · 107/107/244
+        // 能站住的只有两条：xhigh 五次全都高于 low（高出 9%~128%，所以"幅度很小"是假的）；
+        // low 和 medium 有三次给出一模一样的数字。绝对值是**跟着提问走**的，把它当成模型属性
+        // 写进界面就是撒谎 —— 这正是 XPORT_PARAM_SPECS 上方那条注释已经禁止过的事。
+        const ltip = '推理强度。只有这个模型支持真实档位（' + ctl.levels.join(' / ') + '）：'
+            + '这三档会原样出现在请求的 reasoning_effort 里，而且确实会改变模型的思考量。'
+            + '但具体多花多少推理 token 完全取决于你问什么 —— 实测同一档在不同问题上从几十到几百都有，'
+            + '所以这里只给档位、不给数字。五组实测里 xhigh 每一次都高于 low（高出 9%~128% 不等），'
+            + 'low 和 medium 则有三组给出一模一样的推理量。'
+            + '二值模型（3.6 / 1.7b）不会出现这个下拉，因为它们的任何非 none 值都塌缩成「开」。';
+        html += '<span class="aichat-pgroup" data-tip="' + escapeAttr(ltip) + '" data-tip-pos="top">'
+            + '<select class="aichat-psel" id="aiChatLevelSel" style="max-width:74px">' + opts + '</select></span>';
+    }
+    return html;
+}
+
+function chatMoreBoxHtml(choice) {
+    const rows = [];
+
+    // —— 温度 ——
+    if (chatTemperatureSettable(choice.provider, choice.model)) {
+        const t = chatEffectiveTemperature(choice.provider, choice.model);
+        const opts = CHAT_TEMPS.map(function (v) {
+            return '<option value="' + escapeAttr(String(v)) + '"' + (v === t ? ' selected' : '') + '>' + escapeHtml(String(v)) + '</option>';
+        }).join('');
+        rows.push('<span class="aichat-pgroup" data-tip="'
+            + escapeAttr('采样温度，按请求生效。这里给的是有限几档而不是自由输入 —— 参数条上的每个选项都要能被真机逐个跑过一遍才敢发布。')
+            + '" data-tip-pos="top-start"><span class="aichat-plabel">温度</span>'
+            + '<select class="aichat-psel" id="aiChatTempSel" style="max-width:64px">' + opts + '</select></span>');
+    }
+
+    // —— 最大生成 token ——
+    const mt = chatEffectiveMaxTokens(choice.provider);
+    const auto = !(typeof ChatState.maxTokens === 'number' && CHAT_MAXTOK_CHOICES.indexOf(ChatState.maxTokens) !== -1);
+    const mtOpts = ['<option value="0"' + (auto ? ' selected' : '') + '>默认 (' + escapeHtml(String(chatDefaultMaxTokens(choice.provider))) + ')</option>']
+        .concat(CHAT_MAXTOK_CHOICES.map(function (v) {
+            return '<option value="' + escapeAttr(String(v)) + '"' + ((!auto && v === mt) ? ' selected' : '') + '>' + escapeHtml(String(v)) + '</option>';
+        })).join('');
+    rows.push('<span class="aichat-pgroup" data-tip="'
+        + escapeAttr('这一轮最多生成多少 token，按请求生效。「默认」= 改这个功能之前这条链路本来就在用的值（本地 16384、在线 '
+            + CHAT_MAX_TOKENS + '），所以没动过这一项的用户行为逐字不变。回复被它截断时窗口里会出现一条明确的提示，'
+            + '而且半截的 ==EDIT== 块永远不会长出「应用」按钮。')
+        + '" data-tip-pos="top-start"><span class="aichat-plabel">上限</span>'
+        + '<select class="aichat-psel" id="aiChatMaxSel" style="max-width:96px">' + mtOpts + '</select></span>');
+
+    // —— 流式（只有本地实测过）——
+    if (choice.provider === 'local') {
+        rows.push('<span class="aichat-pgroup" data-tip="'
+            + escapeAttr('边生成边显示。实测本地 SSE 里 delta.reasoning_content 和 delta.content 是「两个独立字段」、'
+                + '不会交错，所以思考区和答案气泡各自流各自的，不需要任何猜测式解析。'
+                + '不管流不流，==EDIT== 都只在收全之后才解析一次：半截的修改块绝不会长出「应用」按钮。'
+                + 'Gemini / Claude 代理的 SSE 没有人实测过，所以那两家不提供这个开关。')
+            + '" data-tip-pos="top-start"><span class="aichat-plabel">流式</span>'
+            + chatSegHtml('aiChatStreamOff', 'aiChatStreamOn', '关', '开', !!ChatState.stream) + '</span>');
+    }
+
+    // —— 客户端的「保留思考」 ——
+    rows.push('<span class="aichat-pgroup" data-tip="'
+        + escapeAttr('把上一轮的思考内容一起回传给模型。这是我们客户端的行为，不是模型参数 —— '
+            + 'LM Studio 的 preserve_thinking 只存在于磁盘上的 model.yaml，作为请求参数被静默忽略'
+            + '（四组多轮对照的 prompt_tokens 全部相同），/api/v1/models 里也完全没有它，'
+            + '所以这里绝不会假装那是一个能设的模型参数。开着会明显增加每轮的输入 token。默认关。')
+        + '" data-tip-pos="top-start"><span class="aichat-plabel">回传思考</span>'
+        + chatSegHtml('aiChatKeepOff', 'aiChatKeepOn', '关', '开', !!ChatState.keepReasoning) + '</span>');
+
+    let html = '<div class="aichat-pmorebox"><div class="aichat-prow">' + rows.join('') + '</div>';
+
+    // —— 分割线以下：只读 ——
+    html += '<div class="aichat-pdiv">只读 · 来自模型发现</div>';
+    if (choice.provider === 'local') {
+        const caps = xportCapsPeek(AppState.localBaseUrl, choice.model);
+        if (caps === undefined) {
+            html += '<div class="aichat-pnote">正在读取模型能力…</div>';
+        } else if (!caps) {
+            html += '<div class="aichat-pnote">'
+                + escapeHtml(xportCapsOk(AppState.localBaseUrl) === false
+                    ? '读不到 ' + xportCapsOrigin(AppState.localBaseUrl) + '/api/v1/models，所以这里什么都不显示 —— 不猜。'
+                    : '这个 id 不在 LM Studio 的模型列表里（多半没加载），拿不到它的任何能力信息。')
+                + '</div>';
+        } else {
+            const chips = xportCapsChipList(caps).map(function (c) {
+                return '<span data-tip="' + escapeAttr(c.tip) + '" data-tip-pos="' + escapeAttr(c.pos) + '">' + escapeHtml(c.text) + '</span>';
+            });
+            if (chips.length) html += '<div class="aichat-pchips">' + chips.join('<span class="aichat-pdot">·</span>') + '</div>';
+            html += '<div class="aichat-pnote">'
+                + escapeHtml('上下文是「加载期」参数：实测发 context_length / num_ctx / n_ctx 会返回 200 但实际值纹丝不动，所以这里只读，不给任何滑块。')
+                + '</div>';
+        }
+    } else {
+        html += '<div class="aichat-pnote">'
+            + escapeHtml('只有本地 LM Studio 有 /api/v1/models 这种逐模型能力端点。'
+                + (choice.provider === 'gemini'
+                    ? 'Gemini 这边只把实测过的 thinkingBudget 接了出来，其余一律不猜、不画。'
+                    : '这一家没有任何已接线的推理发现，所以上面不画推理控件 —— 画一个灰的或者画一个「看着能设其实不发」的，都是撒谎。'))
+            + '</div>';
+    }
+    return html + '</div>';
+}
+
+function chatParamBarHtml() {
+    const choice = chatModelChoice();
+    const groups = chatModelGroups();
+    const optHtml = groups.map(function (g) {
+        return '<optgroup label="' + escapeAttr(g.label) + '">' + g.items.map(function (it) {
+            const val = it.provider + ':' + it.id;
+            const sel = (it.provider === choice.provider && it.id === choice.model) ? ' selected' : '';
+            return '<option value="' + escapeAttr(val) + '"' + sel + '>' + escapeHtml(chatModelLabel(it.provider, it.id)) + '</option>';
+        }).join('') + '</optgroup>';
+    }).join('');
+
+    const modelTip = '对话用哪个模型。和翻译用的模型是两回事：在这里换模型不会动顶栏那个翻译模型，'
+        + '推理档位也各存各的。' + (choice.pinned
+            ? '（当前是你在这里选定的，翻译那边换成什么都不会跟着变。）'
+            : '（你还没在这里选过，所以暂时跟着翻译模型走；只要选一次，之后就固定下来。）');
+
+    let html = '<div class="aichat-prow">'
+        + '<span class="aichat-pgroup" data-tip="' + escapeAttr(modelTip) + '" data-tip-pos="top-start">'
+        + '<span class="aichat-plabel">模型</span>'
+        + '<select class="aichat-psel" id="aiChatModelSel">' + optHtml + '</select></span>'
+        + chatReasoningBarHtml(choice)
+        + '<span class="aichat-pspacer"></span>'
+        + '<button type="button" class="aichat-pmore' + (ChatState.paramsOpen ? ' is-on' : '') + '" id="aiChatMoreBtn" data-tip="'
+        + escapeAttr('展开其余可按请求设置的参数（温度、生成上限、流式、是否回传上一轮思考），'
+            + '以及分割线以下「只读」的模型信息。只读那部分是这条参数条最重要的诚实之处：'
+            + '上下文长度、preserve_thinking 之类按请求根本设不了，所以它们不会以「可调控件」的样子出现。')
+        + '" data-tip-pos="top-end">' + Icons.MoreVertical + '</button>'
+        + '</div>';
+    if (ChatState.paramsOpen) html += chatMoreBoxHtml(choice);
+    return html;
+}
+
+function chatRenderParamBar() {
+    try {
+        const box = document.getElementById('aiChatParams');
+        if (!box) return;
+        box.innerHTML = chatParamBarHtml();
+        chatBindParamBar(box);
+    } catch (e) {
+        console.error('[chat] param bar render failed', e);
+    }
+}
+
+function chatBindParamBar(box) {
+    const on = function (id, ev, fn) {
+        try {
+            const el = box.querySelector('#' + id);
+            if (el) el.addEventListener(ev, fn);
+        } catch (e) {}
+    };
+    on('aiChatModelSel', 'change', function () { chatSetModel(this.value); });
+    on('aiChatThinkOff', 'click', function () { chatSetReasoning('off'); });
+    on('aiChatThinkOn', 'click', function () { chatReasoningTurnOn(); });
+    on('aiChatLevelSel', 'change', function () { chatSetReasoning(this.value); });
+    on('aiChatGemSel', 'change', function () { chatSetGeminiThinking(this.value); });
+    on('aiChatMoreBtn', 'click', function () { chatToggleParams(); });
+    on('aiChatTempSel', 'change', function () { chatSetTemperature(this.value); });
+    on('aiChatMaxSel', 'change', function () { chatSetMaxTokens(this.value); });
+    on('aiChatStreamOff', 'click', function () { chatSetStream(false); });
+    on('aiChatStreamOn', 'click', function () { chatSetStream(true); });
+    on('aiChatKeepOff', 'click', function () { chatSetKeepReasoning(false); });
+    on('aiChatKeepOn', 'click', function () { chatSetKeepReasoning(true); });
+}
+
+// ============================================================================
+// C5 —— 流式（**只**对本地生效）
+// ============================================================================
+//
+// 实测的 SSE 形状（qwen3.6，stream_options:{include_usage:true}）：
+//   data: {... "delta":{"role":"assistant","reasoning_content":"Here"} ...}
+//   data: {... "delta":{"reasoning_content":"'s"} ...}          ← 思考先流完
+//   data: {... "delta":{"content":"OK"} ...}                    ← 然后才是答案，**另一个字段**
+//   data: {... "delta":{}, "finish_reason":"stop"|"length" ...}
+//   data: {... "choices":[], "usage":{...completion_tokens_details.reasoning_tokens...} ...}
+//   data: [DONE]
+// 两个通道天生分开 ⇒ 思考区和答案气泡各自流各自的，**零解析启发式**。
+//
+// 【铁律】==EDIT== 只在收全之后解析一次。半截的修改块绝不允许长出「应用」按钮 ——
+// 中止一次流就能写坏用户论文的话，这个功能就成了数据丢失缺陷。
+// 中止也不是错误：把已经收到的字留下来，标一句「已停止」，再走**同一个** chatRenderAssistant。
+async function chatStreamLocal(config, messages, signal, meta, req, sink) {
+    const endpoint = String(config.localBaseUrl || '').replace(/\/$/, '') + '/v1/chat/completions';
+    const body = {
+        model: config.model || 'local-model',
+        messages: messages,
+        temperature: (typeof req.temperature === 'number' && isFinite(req.temperature)) ? req.temperature : 0.3,
+        max_tokens: req.maxTokens,
+        stream: true,
+        stream_options: { include_usage: true }
+    };
+    // 和非流式那条路一样：**永远显式发**（省略 ≡ 关闭推理）。400 闩合上过就一个字节都不发。
+    let effortSent = '';
+    try {
+        if (!xportEffortUnsupported.has(xportCapsOrigin(config.localBaseUrl))
+            && XPORT_WIRE_EFFORTS.indexOf(req.reasoningEffort) !== -1) {
+            effortSent = req.reasoningEffort;
+            body.reasoning_effort = effortSent;
+        }
+    } catch (e) { effortSent = ''; }
+
+    let text = '', reasoning = '', finish = '', rtok = 0, aborted = false;
+    const finishUp = function () {
+        if (meta) {
+            meta.text = text;
+            meta.reasoning = reasoning;
+            meta.finish = finish;
+            meta.truncated = finish === 'length';
+            meta.thinking = reasoning.trim() !== '' || rtok > 0;
+            meta.reasoningTokens = rtok;
+            meta.reasoningEffortSent = effortSent;
+            meta.streamed = true;
+            meta.aborted = aborted;
+        }
+        // 被动探测，和 callLocalLLM 里那一次同样的语义：第三个参数说明「这一次到底要没要推理」，
+        // 免得对话开着推理、翻译关着推理时弹出一条「没人要求它却在推理」的假警报。
+        try { xportNoteThinking(config.model, (reasoning.trim() !== '' || rtok > 0), effortSent ? (effortSent !== 'none') : undefined); } catch (e) {}
+        return text;
+    };
+
+    try {
+        const resp = await fetch(endpoint, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            signal: signal
+        });
+        if (!resp.ok) {
+            const errText = await resp.text();
+            throw new Error('API Error: ' + resp.status + ' - ' + errText);
+        }
+        if (!resp.body || typeof resp.body.getReader !== 'function') {
+            throw new Error('这个浏览器/环境不支持读取流式响应。到参数条的 ⋮ 里把「流式」关掉即可。');
+        }
+        const reader = resp.body.getReader();
+        const dec = new TextDecoder();
+        let buf = '';
+        let done = false;
+        for (;;) {
+            const r = await reader.read();
+            if (r.done) break;
+            buf = (buf + dec.decode(r.value, { stream: true })).replace(/\r\n/g, '\n');
+            let idx;
+            while ((idx = buf.indexOf('\n\n')) !== -1) {
+                const frame = buf.slice(0, idx);
+                buf = buf.slice(idx + 2);
+                const lines = frame.split('\n');
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i];
+                    if (line.indexOf('data:') !== 0) continue;          // 注释行 / 事件名一律无视
+                    const payload = line.slice(5).trim();
+                    if (!payload) continue;
+                    if (payload === '[DONE]') { done = true; continue; }
+                    let j = null;
+                    try { j = JSON.parse(payload); } catch (e) { continue; }  // 半截 JSON：丢掉这一帧，绝不猜
+                    const ch = (j && Array.isArray(j.choices) && j.choices[0]) || null;
+                    if (ch) {
+                        const d = ch.delta || {};
+                        if (typeof d.reasoning_content === 'string' && d.reasoning_content) {
+                            reasoning += d.reasoning_content;
+                            if (sink && sink.reasoning) sink.reasoning(reasoning);
+                        }
+                        if (typeof d.content === 'string' && d.content) {
+                            text += d.content;
+                            if (sink && sink.text) sink.text(text);
+                        }
+                        if (ch.finish_reason) finish = String(ch.finish_reason);
+                    }
+                    const det = (j && j.usage && j.usage.completion_tokens_details) || null;
+                    if (det && typeof det.reasoning_tokens === 'number') rtok = det.reasoning_tokens;
+                }
+            }
+            if (done) break;
+        }
+        return finishUp();
+    } catch (e) {
+        // 中止是预期路径，不是错误：把已经收到的字交回去，由 chatSend 正常渲染 + 标一句「已停止」。
+        if (e && e.name === 'AbortError') { aborted = true; return finishUp(); }
+        throw e;
+    }
+}
+
+// 流式时那一行「活的」助手气泡。整场只 mutate **一个文本节点**（思考区再一个），
+// 绝不重建节点、绝不碰 renderApp。
+function chatLiveSink() {
+    const st = { row: null, node: null, thinkBody: null };
+    const ensureRow = function () {
+        if (st.row) return;
+        st.row = chatAppendRow('assistant', '');
+        const b = chatBubbleOf(st.row);
+        st.node = document.createTextNode('');
+        if (b) b.appendChild(st.node);
+    };
+    return {
+        state: st,
+        reasoning: function (full) {
+            try {
+                ensureRow();
+                if (!st.thinkBody) {
+                    const b = chatBubbleOf(st.row);
+                    if (!b) return;
+                    const det = document.createElement('details');
+                    det.className = 'aichat-think';
+                    det.open = true;                      // 流的时候默认展开：正在动的东西看得见才有意义
+                    const sum = document.createElement('summary');
+                    sum.textContent = '思考中（模型的推理过程，不是答案）';
+                    st.thinkBody = document.createElement('div');
+                    st.thinkBody.className = 'aichat-think-body';
+                    det.appendChild(sum);
+                    det.appendChild(st.thinkBody);
+                    b.insertBefore(det, st.node);         // 思考永远排在答案上面
+                }
+                st.thinkBody.textContent = String(full == null ? '' : full);
+                chatScrollToBottom();
+            } catch (e) {}
+        },
+        text: function (full) {
+            try {
+                ensureRow();
+                if (!st.node) return;
+                // 显示层只做两件事：去掉信封头、把 ==EDIT== 之后的内容换成一句提示。
+                // **解析**（以及「要不要长出应用按钮」）一律等收全之后由 chatParseEnvelope 做一次。
+                let s = String(full == null ? '' : full).replace(/^[ \t]*==CHAT==[ \t]*\r?\n?/, '');
+                const cut = s.search(/^[ \t]*==EDIT\b/m);
+                if (cut !== -1) s = s.slice(0, cut) + '\n（正在生成修改内容…收全之后才会给出前后对照和「应用」按钮）';
+                st.node.nodeValue = s;
+                chatScrollToBottom();
+            } catch (e) {}
+        },
+        destroy: function () {
+            try { if (st.row && st.row.parentNode) st.row.parentNode.removeChild(st.row); } catch (e) {}
+            st.row = null; st.node = null; st.thinkBody = null;
+        }
+    };
+}
+
+// ============================================================================
+// C3 —— 附加选段 → 提案 → 应用
+// ============================================================================
+//
+// 这一段会**写进用户的论文**，所以它的默认答案永远是「不写」。
+//
+// 【捕获时机】在点「附到对话」的那一刻把 target 整个抄下来，之后绝不再读实时选区。
+//   实测：行内 textarea 的选区能扛住焦点跑到聊天输入框（{start:7,end:22}、sameNode:true），
+//   但任何一次整页重渲染都会把它清零（{start:0,end:0}、sameNode:false），
+//   而重渲染是定时器驱动的 —— 用户什么都不做，1~5 分钟也会来一次。
+//
+// 【应用前四道闸门，全部必过，一道都不能省】
+//   1. 目标行还在，且行号仍然指向同一行；
+//   2. 这一行自捕获以来没被改过（逐字比 rowSrcAtCapture / rowTgtAtCapture）；
+//   3. 捕获下来的那段文字仍然在原位置逐字对得上；对不上就尝试**唯一**重定位，
+//      不唯一（0 处或 ≥2 处）就中止 —— **有歧义就是中止**；
+//   4. 模型确实给了 ==EDIT== 块。没有 EDIT 块就没有「应用」按钮，绝不从白话里凑一个出来。
+//   任何一道不过：中止 + 在对话里留一条可见的玫瑰色说明 + **一个字节都不写**。
+//   这套纪律是照抄 applySynonym 的（它也是逐字复核 + 可见中止），不另起一套方言。
+
+function chatFindProposal(id) {
+    if (id == null) return null;
+    const list = ChatState.proposals;
+    for (let i = 0; i < list.length; i++) if (list[i].id === id) return list[i];
+    return null;
+}
+
+// 这一行、这一侧此刻的**真值**：正在编辑就是 editValues（textarea 缓冲区），否则是 pair 本身。
+// 读错一个，就是把修改应用到过时的文本上。
+function chatLiveBase(rowIndex, side) {
+    const editing = (AppState.activeIndex === rowIndex);
+    const v = editing ? AppState.editValues[side] : ((AppState.translationPairs[rowIndex] || {})[side]);
+    return (typeof v === 'string') ? v : '';
+}
+
+function chatCountOccurrences(hay, needle) {
+    if (!needle) return 0;
+    let n = 0, i = 0;
+    for (;;) {
+        const k = hay.indexOf(needle, i);
+        if (k === -1) break;
+        n++;
+        i = k + 1;                    // +1 而不是 +len：重叠出现也要算进去，宁可判成「有歧义」
+        if (n > 1) break;
+    }
+    return n;
+}
+
+function chatTargetSummary(t) {
+    const s = String(t.text || '').replace(/\s+/g, ' ').trim();
+    return s.length > CHAT_CHIP_CHARS ? s.slice(0, CHAT_CHIP_CHARS) + '…' : s;
+}
+
+function chatRenderTargetChip() {
+    try {
+        const slot = document.getElementById('aiChatTargetSlot');
+        if (!slot) return;
+        slot.textContent = '';
+        const t = ChatState.target;
+        if (!t) return;
+        const box = document.createElement('div');
+        box.className = 'aichat-target';
+        const label = document.createElement('span');
+        label.className = 'aichat-target-label';
+        label.textContent = (t.side === 'src' ? '原文' : '译文') + ' · 第 ' + (t.rowIndex + 1) + ' 行'
+            + (t.whole ? ' · 整行' : ' · 选中段') + '：';
+        const txt = document.createElement('span');
+        txt.className = 'aichat-target-text';
+        txt.textContent = chatTargetSummary(t);      // textContent：选段里可能有 LaTeX 和 '<'
+        const x = document.createElement('button');
+        x.type = 'button';
+        x.className = 'aichat-target-x';
+        x.textContent = '×';
+        x.setAttribute('data-tip', '取消附加。取消之后模型不会再收到这段文字，也不会再给出「应用」按钮。');
+        x.setAttribute('data-tip-pos', 'top-end');
+        x.addEventListener('click', function () { chatDetach(); });
+        box.appendChild(label);
+        box.appendChild(txt);
+        box.appendChild(x);
+        slot.appendChild(box);
+    } catch (e) {
+        console.error('[chat] target chip failed', e);
+    }
+}
+
+function chatDetach() {
+    try {
+        ChatState.target = null;
+        chatRenderTargetChip();
+        chatAppendRow('system', '已取消附加选段。');
+    } catch (e) {
+        console.error('[chat] detach failed', e);
+    }
+}
+
+// 捕获。useSelection=true 时优先用该侧 textarea 里此刻的选区（点按钮的这一刻就是捕获时刻），
+// 没有选区 / 不在编辑态就退回整行。
+function chatCaptureTarget(rowIndex, side, useSelection) {
+    const pairs = AppState.translationPairs;
+    if (!Array.isArray(pairs)) return null;
+    if (typeof rowIndex !== 'number' || rowIndex < 0 || rowIndex >= pairs.length) return null;
+    if (side !== 'src' && side !== 'tgt') return null;
+    const row = pairs[rowIndex];
+    if (!row || typeof row !== 'object') return null;
+
+    const base = chatLiveBase(rowIndex, side);
+    let start = 0, end = base.length, whole = true;
+    if (useSelection && AppState.activeIndex === rowIndex) {
+        const ta = document.getElementById('editTextarea_' + side + '_' + rowIndex);
+        if (ta && ta.value === base
+            && typeof ta.selectionStart === 'number' && typeof ta.selectionEnd === 'number'
+            && ta.selectionEnd > ta.selectionStart) {
+            start = ta.selectionStart;
+            end = ta.selectionEnd;
+            whole = (start === 0 && end === base.length);
+        }
+    }
+    return {
+        rowIndex: rowIndex,
+        side: side,
+        start: start,
+        end: end,
+        text: base.substring(start, end),
+        baseAtCapture: base,                                    // 该侧缓冲区在捕获那一刻的全文
+        rowSrcAtCapture: String(row.src == null ? '' : row.src), // 已提交值，用于闸门 2
+        rowTgtAtCapture: String(row.tgt == null ? '' : row.tgt),
+        whole: whole,
+        capturedAt: Date.now()
+    };
+}
+
+function chatAttach(rowIndex, side, useSelection) {
+    try {
+        const t = chatCaptureTarget(rowIndex, side, useSelection);
+        if (!t) {
+            chatOpen();
+            chatAppendRow('error', '附加失败：这一行已经不在了。');
+            return;
+        }
+        if (!t.text) {
+            chatOpen();
+            chatAppendRow('error', '附加失败：这一段是空的，没有可改的内容。');
+            return;
+        }
+        ChatState.target = t;
+        chatOpen();
+        chatRenderTargetChip();
+        chatAppendRow('system', '已附加：' + (side === 'src' ? '原文' : '译文') + ' 第 ' + (rowIndex + 1) + ' 行'
+            + (t.whole ? '（整行）' : '（第 ' + t.start + '–' + t.end + ' 个字符）')
+            + '，共 ' + t.text.length + ' 字。现在可以让我改写它。');
+        // <think> 在部分模型上会被**静默删除**（实测：qwen3.8 把 <think>hello</think>DONE
+        // 变成 helloDONE，qwen3-1.7b 连内容一起删，而且删掉的东西哪都没去）。
+        // 这是模型侧的行为，闸门拦不住「改写结果里少了这对标记」，只能事先说明白。
+        if (/<\/?\s*think\s*>/i.test(t.text)) {
+            chatAppendRow('system', '⚠ 这段文字里有 <think> 标记。实测部分本地模型会在输出里**静默删掉**它，'
+                + '应用之前请务必看清下面的前后对照。');
+        }
+        const ta = document.getElementById('aiChatInput');
+        if (ta && ta.focus) { try { ta.focus(); } catch (e) {} }
+    } catch (e) {
+        console.error('[chat] attach failed', e);
+        try { chatErrorRow('附加选段', e); } catch (e2) {}
+    }
+}
+
+// 行内工具栏上那颗按钮：有选区就附选区，没有就附整行。
+function chatAttachSel(rowIndex, side) { chatAttach(rowIndex, side, true); }
+// 非编辑态那颗悬停按钮：整行。
+function chatAttachRow(rowIndex, side) { chatAttach(rowIndex, side, false); }
+
+// —— 提案 ——
+// 提案文本**绝不**内联进 onclick 字符串（\cite{...}、$x_i$、引号会被 JS 字符串字面量吃掉）：
+// 存进 ChatState.proposals，卡片上的按钮用闭包按 id 回查。
+function chatMakeProposal(edit) {
+    try {
+        const t = ChatState.target;
+        if (!t) {
+            chatAppendRow('system', '模型给出了一处修改，但你这一轮没有附加任何选段，所以它被丢弃了。'
+                + '（要改文档，请先在某一行点「附到对话」。）');
+            return null;
+        }
+        // side/row 只是**建议性**的。真正说了算的是客户端捕获的 target。
+        // 模型说的和捕获的对不上，就把这个修改块整个丢掉 —— 绝不让模型来挑
+        // 用户的哪一句会被覆盖。
+        if (edit.side && edit.side !== t.side) {
+            chatAppendRow('error', '模型把修改标成了 side=' + edit.side + '，但你附加的是「'
+                + (t.side === 'src' ? '原文' : '译文') + '」。这处修改已被丢弃，没有「应用」按钮。');
+            return null;
+        }
+        if (edit.row != null && edit.row !== t.rowIndex + 1) {
+            chatAppendRow('error', '模型把修改标成了 row=' + edit.row + '，但你附加的是第 '
+                + (t.rowIndex + 1) + ' 行。这处修改已被丢弃，没有「应用」按钮。');
+            return null;
+        }
+        const replacement = String(edit.body == null ? '' : edit.body);
+        // 会把这一段清空的替换：拒绝。用户要清空有别的路，模型不该有这条路。
+        if (!replacement.trim() && t.text.trim()) {
+            chatAppendRow('error', '模型给出的替换内容是空的（应用下去会把这一段清空）。已拒绝，没有「应用」按钮。');
+            return null;
+        }
+        if (replacement === t.text) {
+            chatAppendRow('system', '模型给出的替换文本和原文逐字一样，没有可应用的改动。');
+            return null;
+        }
+        const p = {
+            id: ++ChatState.proposalSeq,
+            rowIndex: t.rowIndex,
+            side: t.side,
+            start: t.start,
+            end: t.end,
+            text: t.text,
+            baseAtCapture: t.baseAtCapture,
+            rowSrcAtCapture: t.rowSrcAtCapture,
+            rowTgtAtCapture: t.rowTgtAtCapture,
+            replacement: replacement,
+            applied: false,
+            card: null
+        };
+        ChatState.proposals.push(p);
+        chatRenderProposalCard(p);
+        return p;
+    } catch (e) {
+        console.error('[chat] makeProposal failed', e);
+        try { chatErrorRow('生成提案', e); } catch (e2) {}
+        return null;
+    }
+}
+
+function chatRenderProposalCard(p) {
+    const row = document.createElement('div');
+    row.className = 'aichat-row aichat-row-assistant';
+    const card = document.createElement('div');
+    card.className = 'aichat-card';
+
+    const head = document.createElement('div');
+    head.className = 'aichat-card-head';
+    head.textContent = '建议修改 · ' + (p.side === 'src' ? '原文' : '译文') + ' · 第 ' + (p.rowIndex + 1) + ' 行';
+    card.appendChild(head);
+
+    const body = document.createElement('div');
+    body.className = 'aichat-card-body';
+
+    // 前后两栏。逐字对照，一律 textContent + white-space:pre-wrap。
+    // （逐词 diff 更好看，但那是可切掉的装饰；「应用前必须看清会变成什么」这条要求
+    //   前后对照已经满足。）
+    const lab1 = document.createElement('div');
+    lab1.className = 'aichat-pane-label';
+    lab1.textContent = '现在（将被替换的这一段）';
+    const pane1 = document.createElement('div');
+    pane1.className = 'aichat-pane aichat-pane-old';
+    pane1.textContent = p.text;
+
+    const lab2 = document.createElement('div');
+    lab2.className = 'aichat-pane-label';
+    lab2.textContent = '改为';
+    const pane2 = document.createElement('div');
+    pane2.className = 'aichat-pane aichat-pane-new';
+    pane2.textContent = p.replacement;
+
+    body.appendChild(lab1); body.appendChild(pane1);
+    body.appendChild(lab2); body.appendChild(pane2);
+
+    // —— 只附了一段时，上面两栏说的是「那一段」，不是「这一行」——
+    // 实测一次就吃掉了用户的段落：58 字的选区，qwen3.6 把**整行 244 字**当成替换文本还了回来，
+    // 四道闸门全部通过（它们只比对捕获的那一段，替换文本本身不受任何约束），应用之后
+    // 行里多出一句重复的从句，而卡片上一点都看不出来 —— 因为它从头到尾没显示过这一行。
+    // 所以整行预览必须画出来，而且用的是和 chatApplyProposal 里逐字一样的那个拼接表达式。
+    const baseCap = String(p.baseAtCapture == null ? '' : p.baseAtCapture);
+    const partial = !(p.start === 0 && p.end === baseCap.length);
+    if (partial) {
+        const headKeep = baseCap.slice(0, p.start);
+        const tailKeep = baseCap.slice(p.end);
+        const lab3 = document.createElement('div');
+        lab3.className = 'aichat-pane-label';
+        lab3.textContent = '这一行应用后（整行预览）';
+        const pane3 = document.createElement('div');
+        pane3.className = 'aichat-pane aichat-pane-new';
+        pane3.textContent = headKeep + p.replacement + tailKeep;
+        body.appendChild(lab3); body.appendChild(pane3);
+
+        // 「模型把整行还了回来」有一个很干净的指纹：选区**之外**的那截文字又出现在替换文本里。
+        // 命中就直说，不拦 —— 拦不拦由用户看着上面那栏决定，和 LaTeX 体检一个规矩。
+        const echoed = function (s) {
+            const x = s.trim();
+            return x.length >= 16 && p.replacement.indexOf(x.slice(0, 32)) !== -1;
+        };
+        if (echoed(headKeep) || echoed(tailKeep)) {
+            const warn2 = document.createElement('div');
+            warn2.className = 'aichat-card-warn';
+            warn2.textContent = '⚠ 替换文本里含有这一行选区之外的文字（模型很可能把整行还了回来，'
+                + '而你只选了其中一段）。照这样应用会让那部分重复一遍 —— 请先看上面的「整行预览」。';
+            body.appendChild(warn2);
+        }
+    }
+
+    // LaTeX 存活体检：源段里出现过的宏，替换文本里少了哪些，直说。不阻止应用，只提示。
+    const lost = chatLatexLost(p.text, p.replacement);
+    if (lost.length) {
+        const warn = document.createElement('div');
+        warn.className = 'aichat-card-warn';
+        warn.textContent = '⚠ 原文里有、替换文本里没有的记号：' + lost.join('、') + '。应用前请确认这是你要的。';
+        body.appendChild(warn);
+    }
+
+    const actions = document.createElement('div');
+    actions.className = 'aichat-card-actions';
+    const applyBtn = document.createElement('button');
+    applyBtn.type = 'button';
+    applyBtn.className = 'aichat-btn aichat-btn-primary';
+    applyBtn.textContent = '应用';
+    // 这段文案必须和 chatApplyProposal 里的闸门逐条对得上。原来的版本写的是
+    // 「这一行被改过 … 都会当场中止并且一个字节都不写」，那是假的：闸门 2 比的是**已提交值**，
+    // 用户在行内打了字还没提交时它不会拦，闸门 3 会按唯一匹配重定位并照样写进缓冲区。
+    // 行为本身是对的（用户自己打的字一个都没丢），假的是这句话，所以改的是这句话。
+    applyBtn.setAttribute('data-tip', '把上面「改为」那段写回文档。写之前会再逐字核对一遍：'
+        + '行号变了、这一行**已提交**的内容在你提问之后被改过、有一次会覆盖这一行的模型请求正在跑'
+        + '（智能更新 / 重新生成 / 整篇翻译）、或者那段文字在行内已经找不到 / 出现了不止一处 —— '
+        + '任何一条命中都当场中止，一个字节都不写。'
+        + '有一种情况不中止：你正在这一行里打字（还没提交），而那段文字只是挪了位置、在缓冲区里仍然唯一存在；'
+        + '那会按新位置写进你正在编辑的缓冲区（你自己打的字一个都不动），并在下面留一行说明。');
+    applyBtn.setAttribute('data-tip-pos', 'top-start');
+    applyBtn.addEventListener('click', function () { chatApplyProposal(p.id); });
+
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'aichat-btn';
+    copyBtn.textContent = '复制';
+    copyBtn.setAttribute('data-tip', '只把「改为」那段复制到剪贴板，不动文档。');
+    copyBtn.setAttribute('data-tip-pos', 'top');
+    copyBtn.addEventListener('click', function () {
+        try { copyToClipboard(p.replacement); } catch (e) {}
+    });
+
+    const dropBtn = document.createElement('button');
+    dropBtn.type = 'button';
+    dropBtn.className = 'aichat-btn';
+    dropBtn.textContent = '忽略';
+    dropBtn.setAttribute('data-tip', '收起这张卡片，不做任何修改。');
+    dropBtn.setAttribute('data-tip-pos', 'top-end');
+    dropBtn.addEventListener('click', function () {
+        try {
+            actions.textContent = '';
+            const done = document.createElement('span');
+            done.className = 'aichat-card-done';
+            done.textContent = '已忽略';
+            done.style.color = '#94a3b8';
+            actions.appendChild(done);
+        } catch (e) {}
+    });
+
+    actions.appendChild(applyBtn);
+    actions.appendChild(copyBtn);
+    actions.appendChild(dropBtn);
+    body.appendChild(actions);
+    card.appendChild(body);
+    row.appendChild(card);
+
+    const log = document.getElementById('aiChatLog');
+    if (log) log.appendChild(row);
+    p.card = { row: row, actions: actions };
+    chatScrollToBottom();
+}
+
+// 源段里出现、替换文本里消失了的记号。纯提示，不做任何拦截 —— 拦不拦由用户看了对照决定。
+// 除了 LaTeX 宏，**必须**也盯着 <think> / </think>：实测 qwen3.8 会把它们静默删掉、
+// qwen3-1.7b 连里面的内容一起删，而且删掉的东西 reasoning_content 里也没有。
+// 那种情况下四道闸门全都会通过（闸门比的是**捕获时的原文**，模型只影响替换文本），
+// 所以只能在这里明说，而不能指望闸门。
+function chatLatexLost(oldText, newText) {
+    const out = [];
+    try {
+        const seen = Object.create(null);
+        const check = function (tok) {
+            if (!tok || seen[tok]) return;
+            seen[tok] = true;
+            const inOld = oldText.split(tok).length - 1;
+            const inNew = newText.split(tok).length - 1;
+            if (inNew < inOld) out.push(tok + (inOld > 1 ? '（' + inNew + '/' + inOld + '）' : ''));
+        };
+        ['<think>', '</think>'].forEach(check);
+        const re = /\\[A-Za-z]+\*?(?:\{[^{}]*\})?/g;
+        let m;
+        while ((m = re.exec(oldText)) !== null) {
+            check(m[0]);
+            if (out.length >= 6) break;
+        }
+    } catch (e) {}
+    return out.slice(0, 6);
+}
+
+// 中止：可见的一行 + **一个字节都不写**。措辞刻意和 applySynonym 那句对齐。
+function chatAbortApply(msg) {
+    chatAppendRow('error', msg);
+    chatScrollToBottom();
+    return false;
+}
+
+function chatApplyProposal(id) {
+    try {
+        const p = chatFindProposal(id);
+        if (!p || p.applied) return;
+
+        const pairs = AppState.translationPairs;
+        // ---- 闸门 1：目标行还在吗 ----
+        if (!Array.isArray(pairs) || p.rowIndex >= pairs.length || !pairs[p.rowIndex]) {
+            return chatAbortApply('目标行已不存在（行数变了），未做任何修改。');
+        }
+        const row = pairs[p.rowIndex];
+
+        // ---- 闸门 1.5：有没有一次「会覆盖这一行」的模型请求正在飞 ----
+        // 文件里有四处同一个形状：**发请求那一刻把文本抓走 → await → 用抓走的那份覆盖回去**。
+        //   · saveRowUpdate      抓 currentSrc/currentTgt → addHistory(index, finalSrc, finalTgt)
+        //   · handleRegenerateTranslation  抓 pair.src → addHistory(index, srcText, newTgt)
+        //   · handleRegenerateAll / handleTranslate  整个 translationPairs 数组换新
+        // addHistory 还会在 activeIndex 命中时把 AppState.editValues 一起重置回那份快照，
+        // 所以在这个窗口里写下去的东西几秒后会被**静默**抹掉，而卡片上还挂着「已应用 ✓」。
+        // 实测（qwen3.6，两组时间线）：apply 在 t=0.04s 生效，t=12.7s 请求落地，译文回到手改前的样子，
+        // 聊天流里一行提示都没有。
+        // 覆盖本身是那四处的既有行为（手打的编辑在同一窗口里也一样会丢），不在这次的修复范围；
+        // 这里要堵的是「聊天窗口宣称写成功了，而那次写正在被销毁」。
+        // 所以**拒绝**，不去抢救 —— 拒绝是这条路上唯一不撒谎的动作。一个布尔表达式盖住全部四处。
+        const busy = row.isUpdating ? '这一行的智能更新'
+            : row.isRegenerating ? '这一行的重新生成'
+            : AppState.isRegeneratingAll ? '全文重新生成'
+            : AppState.isLoading ? '整篇翻译'
+            : '';
+        if (busy) {
+            return chatAbortApply('「' + busy + '」正在进行中，未做任何修改。'
+                + '它落地时会用发起那一刻抓到的文本覆盖这一行，现在写下去几秒后就会被静默抹掉。'
+                + '等它结束（或点那颗按钮取消它）之后再点「应用」。');
+        }
+
+        // ---- 闸门 2：这一行自捕获以来被改过没有 ----
+        // 比的是**已提交值**。行内还没提交的编辑缓冲区不在比较范围里 —— 所以「用户正在这一行
+        // 里打字但还没提交」的时候这道闸门照样通过，闸门 3 会在那份缓冲区上重新定位。
+        // （按钮的提示文案必须和这一点一致，见 chatRenderProposalCard 里那段 data-tip。）
+        if (String(row.src == null ? '' : row.src) !== p.rowSrcAtCapture
+            || String(row.tgt == null ? '' : row.tgt) !== p.rowTgtAtCapture) {
+            return chatAbortApply('这一行在你提问之后被改过了，未做任何修改。请重新选中后再试。');
+        }
+
+        // ---- 闸门 3：那段文字还在原位置吗；不在就只接受**唯一**重定位 ----
+        const base = chatLiveBase(p.rowIndex, p.side);
+        if (typeof base !== 'string') {
+            return chatAbortApply('选中范围已失效（正文被改动过），未做任何替换。');
+        }
+        let start = p.start, end = p.end;
+        const exact = (base === p.baseAtCapture) && (end <= base.length)
+            && (base.substring(start, end) === p.text);
+        let relocated = false;
+        if (!exact) {
+            const n = chatCountOccurrences(base, p.text);
+            if (n !== 1) {
+                // 0 处 = 没了；≥2 处 = 有歧义。两种都中止 —— 有歧义就是中止。
+                return chatAbortApply('选中范围已失效（正文被改动过），未做任何替换。');
+            }
+            start = base.indexOf(p.text);
+            end = start + p.text.length;
+            relocated = true;
+        }
+
+        // ---- 闸门 4 已经在生成提案时把过了：没有 ==EDIT== 块就根本没有这颗按钮 ----
+        const next = base.slice(0, start) + p.replacement + base.slice(end);
+
+        if (AppState.activeIndex === p.rowIndex) {
+            // —— 情形 A：这一行正在编辑 ——
+            // 照抄 applySynonym：直接写缓冲区和 textarea，**不** setState、**不**记历史。
+            // 它会在用户按 Update / 点走这一行时和手打的修改一样地提交，
+            // 所以逐行撤销、自动存档、归档全都零改动地照常工作。
+            AppState.editValues[p.side] = next;
+            const ta = document.getElementById('editTextarea_' + p.side + '_' + p.rowIndex);
+            if (ta) {
+                ta.value = next;
+                const caret = start + p.replacement.length;
+                try { ta.setSelectionRange(caret, caret); } catch (e) {}
+                // autoResizeTextarea 里带 scheduleAlignSync：行高变了，左右两栏当场重新对齐。
+                // （applySynonym 没有这一步，那是它自己的一个既有缺陷，不在这次范围内。）
+                autoResizeTextarea(ta);
+                try { ta.focus(); } catch (e) {}
+            } else {
+                // 编辑态但 textarea 找不到（视图模式被切走了）：缓冲区已经改了，补一次对齐即可
+                scheduleAlignSync();
+            }
+            chatAppendRow('system', '已应用到「' + (p.side === 'src' ? '原文' : '译文') + ' 第 '
+                + (p.rowIndex + 1) + ' 行」的编辑框。它还没提交 —— 按这一行的 Update（或点到别处）'
+                + '才会写进历史，和你手打的修改完全一样。');
+        } else {
+            // —— 情形 B：这一行不在编辑态 ——
+            // 走 addHistory：追加一条历史、historyIndex 指到最新，逐行的 ↺ n/m 立刻可撤销。
+            // **绝不**走 saveRowUpdate —— 它会把「只有一侧变了」理解成「另一侧要重译」
+            // 并发一次模型请求，那正是「静默改写用户另一栏」的那种失败。
+            const newSrc = p.side === 'src' ? next : String(row.src == null ? '' : row.src);
+            const newTgt = p.side === 'tgt' ? next : String(row.tgt == null ? '' : row.tgt);
+            addHistory(p.rowIndex, newSrc, newTgt);      // 内含 setState → 一次整页重渲染（用户主动动作，可接受）
+            scheduleAlignSync();
+            chatAppendRow('system', '已应用到「' + (p.side === 'src' ? '原文' : '译文') + ' 第 '
+                + (p.rowIndex + 1) + ' 行」，并记入这一行的历史（用行首的 ↺ 可以撤回）。');
+        }
+
+        if (relocated) {
+            chatAppendRow('system', '（这一行有过改动，但那段文字在行内唯一存在，已按新位置应用。）');
+        }
+
+        p.applied = true;
+        if (p.card && p.card.actions) {
+            p.card.actions.textContent = '';
+            const done = document.createElement('span');
+            done.className = 'aichat-card-done';
+            done.textContent = '已应用 ✓';
+            p.card.actions.appendChild(done);
+        }
+
+        // 附加的选段还指着同一处的话，把它挪到替换后的新文本上，用户可以接着说「再短一点」。
+        // 挪不动就干脆取消附加，绝不留一个已经失效的 target。
+        const t = ChatState.target;
+        if (t && t.rowIndex === p.rowIndex && t.side === p.side) {
+            const after = chatCaptureTarget(p.rowIndex, p.side, false);
+            const liveNow = chatLiveBase(p.rowIndex, p.side);
+            const ns = start, ne = start + p.replacement.length;
+            if (after && liveNow.substring(ns, ne) === p.replacement) {
+                after.start = ns;
+                after.end = ne;
+                after.text = p.replacement;
+                after.whole = (ns === 0 && ne === liveNow.length);
+                ChatState.target = after;
+            } else {
+                ChatState.target = null;
+            }
+            chatRenderTargetChip();
+        }
+        chatScrollToBottom();
+    } catch (e) {
+        console.error('[chat] apply failed', e);
+        try { chatErrorRow('应用修改', e); } catch (e2) {}
+    }
+}
+
+// —— 挂载 ——
+// 幂等：已经建过就直接返回那个节点，绝不重建（重建 = 用户没发出去的草稿和滚动位置全没）。
+// 整个函数不允许把异常抛出去：它在 DOMContentLoaded 里被调，抛出去会顺手废掉后面的初始化。
+function ensureChatRoot() {
+    try {
+        let rootEl = document.getElementById('aiChatRoot');
+        if (rootEl) return rootEl;
+        if (!document.body) return null;
+
+        rootEl = document.createElement('div');
+        rootEl.id = 'aiChatRoot';
+        rootEl.innerHTML = chatShellHtml();
+        // ★ 关键的一行：body，不是 #root。文件里已有先例 —— renderSynonymPopupOnly 也是插到 body。
+        document.body.appendChild(rootEl);
+        chatBindShell(rootEl);
+        ChatState.mounted = true;
+
+        // 恢复几何：存过就按严格档拉回视口内，没存过就按当前视口自动排一份。
+        const stored = chatLoadGeom();
+        ChatState.geom = stored ? chatClampGeomForRestore(stored) : chatClampGeom(chatAutoGeom());
+        chatApplyGeom();
+        chatRenderParamBar();
+
+        chatAppendRow('system', '对话窗已就绪。拖标题栏移动，拖左边/上边/左上角改大小，位置和大小会记住。'
+            + '想让我改某一段：在左栏或右栏那一行点「附到对话」（编辑态下先选中一段就只附那一段），'
+            + '我会给出前后对照，改动只有你点「应用」才会写进文档。');
+        return rootEl;
+    } catch (e) {
+        console.error('[chat] ensureChatRoot failed', e);
+        return null;
+    }
+}
+
+// 顶栏那颗开关按钮的「开着」状态：直接改 DOM，不走 setState。
+// renderHeader 里也读 chatIsOpen()，所以下一次任何原因触发的重渲染会自然带上正确状态。
+function chatSyncToggleButton() {
+    try {
+        const btn = document.getElementById('chatToggleBtn');
+        if (!btn) return;
+        btn.setAttribute('aria-pressed', ChatState.open ? 'true' : 'false');
+        if (ChatState.open) btn.classList.add('is-chat-open');
+        else btn.classList.remove('is-chat-open');
+    } catch (e) {}
+}
+
+function chatOpen() {
+    try {
+        const rootEl = ensureChatRoot();
+        if (!rootEl) return;
+        if (!ChatState.open) {
+            // 记住是谁把窗口打开的，关的时候把焦点还回去。不还 = 键盘用户被丢在 <body> 上。
+            const active = document.activeElement;
+            ChatState.lastFocus = (active && active !== document.body) ? active : null;
+        }
+        ChatState.open = true;
+        // 用户还没碰过尺寸/位置（mode 'auto'）时，每次打开都按当前视口重新自动排一次；
+        // 碰过了就尊重存下来的几何，只把它拉回视口内。
+        ChatState.geom = (ChatState.geom.mode === 'free')
+            ? chatClampGeomForRestore(ChatState.geom)
+            : chatClampGeom(chatAutoGeom());
+        chatApplyGeom();
+        rootEl.classList.add('is-open');
+        chatSaveOpen(true);
+        chatSyncToggleButton();
+        chatRenderTargetChip();
+        chatRenderParamBar();
+        // 参数条要显示这个模型支持哪些推理档位，而那份数据是异步发现来的。
+        // 打开窗口时补一次（60 秒缓存内不会真的再发请求），回来后只重画参数条。
+        if (chatModelChoice().provider === 'local') chatCapsWarmForBar();
+        chatUpdateBar();
+        chatAutoGrowInput();
+        chatScrollToBottom();
+        const ta = document.getElementById('aiChatInput');
+        if (ta && ta.focus) { try { ta.focus(); } catch (e) {} }
+    } catch (e) {
+        console.error('[chat] open failed', e);
+    }
+}
+
+function chatClose() {
+    try {
+        ChatState.open = false;
+        const rootEl = document.getElementById('aiChatRoot');
+        if (rootEl) rootEl.classList.remove('is-open');
+        chatSaveOpen(false);
+        chatSyncToggleButton();
+        // 焦点交还：优先还给当初打开它的那个元素（renderApp 之后那个节点可能已经不在文档里，
+        // 所以要 contains 一下），否则给顶栏开关按钮。绝不留在一个已经 display:none 的节点上。
+        const prev = ChatState.lastFocus;
+        ChatState.lastFocus = null;
+        let back = (prev && document.contains && document.contains(prev)) ? prev : null;
+        if (!back) back = document.getElementById('chatToggleBtn');
+        if (back && back.focus) { try { back.focus(); } catch (e) {} }
+    } catch (e) {
+        console.error('[chat] close failed', e);
+    }
+}
+
+function chatToggle() {
+    try {
+        if (ChatState.open) chatClose();
+        else chatOpen();
+    } catch (e) {
+        console.error('[chat] toggle failed', e);
+    }
+}
+
+// 启动：把节点建出来（隐藏态），并按上次关页面时的状态决定要不要直接打开。
+function chatBoot() {
+    try {
+        // 参数（对话模型 / 推理档位 / 温度 …）必须在建节点**之前**恢复，
+        // 否则参数条会先画一遍默认值再跳成用户设定值 —— 而且那一瞬间显示的档位是错的。
+        chatParamsLoad();
+        if (!ensureChatRoot()) return;
+        if (chatLoadOpen()) chatOpen();
+        else chatSyncToggleButton();
+    } catch (e) {
+        console.error('[chat] boot failed', e);
+    }
+}
+
 // ============= 初始化 =============
 document.addEventListener('DOMContentLoaded', function() {
     // 加载保存的设置
@@ -8526,6 +11409,12 @@ document.addEventListener('DOMContentLoaded', function() {
             addToGlobalHistory(AppState.translationPairs, AppState.sessionId, { auto: true });
         }
     }, AppState.autoSaveInterval);
+
+    // 浮动 AI 对话窗：把窗口挂到 <body> 上（默认隐藏），并按上次关页面时的开关状态决定是否打开。
+    // 刻意放在整段初始化的**最后**，而且自带 try/catch —— 走到这里时初始渲染、全局点击、
+    // 窗口 resize、自动存档定时器都已经装好了，这一段无论怎么炸都带不走它们。
+    // renderApp 本身一行都没动，这是这个功能的全部要点。
+    try { chatBoot(); } catch (e) { console.error('[chat] boot threw', e); }
 
     // 自动翻译防抖（在handleInputChange中处理）
 });
