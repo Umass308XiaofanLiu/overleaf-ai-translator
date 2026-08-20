@@ -10926,7 +10926,17 @@ function chatBeginDrag(ev, kind) {
                     g.w = nw;
                 }
                 if (CHAT_HANDLE_T[kind]) {
-                    const nh = Math.max(CHAT_MIN_H, Math.min(start.h - dy, maxH));
+                    // 上界要在 maxH 之外再收一道：新高度最多长到「原来的下边缘」为止。
+                    // 【为什么】setPointerCapture 会照常把 clientY 为负的 move 送进来（指针拖出
+                    // 浏览器窗口上沿）。只夹 maxH 的话 nh 会一路长到 maxH、算出**负的** g.y，
+                    // 随后 chatClampGeom 里那句 `out.y = Math.max(0, …)` 单独把 y 抬回 0
+                    // 却不同步缩 h —— 两次夹取互相不认账，净效果是下边缘跟着往下窜
+                    // （实测 {400,80,500,500} 拖上 300px：下边缘从 580 跑到 800）。
+                    // 而这个手柄的合约（data-tip 原话）就是「下边缘钉住不动」。
+                    // start.y 已经被上一次 chatClampGeom 保证 >= 0，所以 start.y + start.h >= start.h
+                    // >= CHAT_MIN_H，这个上界永远不会和下面的最小高度下限打架。
+                    const topMaxH = Math.min(maxH, start.y + start.h);
+                    const nh = Math.max(CHAT_MIN_H, Math.min(start.h - dy, topMaxH));
                     g.y = start.y + (start.h - nh);
                     g.h = nh;
                 }
@@ -10997,14 +11007,31 @@ function chatBindShell(rootEl) {
 
     const bar = rootEl.querySelector('#aiChatTitleBar');
     if (bar) {
-        bar.addEventListener('pointerdown', function (e) { chatBeginDrag(e, 'move'); });
+        // 【这一下按在哪颗按钮上，必须在 pointerdown 就记住】下面那个 click 处理器**不能**
+        // 只靠 e.target 来判「点的是按钮还是标题栏空白」：按钮自己的处理器会在同一次事件派发里
+        // 把按钮的 innerHTML 整个换掉（chatSyncMinUI 把「−」换成「还原」图标），事件的 target
+        // （按钮里那个 <svg>/<path>）当场脱离文档，等冒泡到标题栏时 closest('button') 返回 null。
+        // 实测（刷新后第一次、dragMoved 还是 false）：点「−」的图标笔画 → 按钮把窗口折叠了，
+        // 紧接着标题栏把它当成「点了空白」又展开，净效果是这颗按钮完全无操作。
+        // pointerdown 那一刻 DOM 还没被任何处理器动过，所以这一笔是可靠的。
+        let downOnBtn = false;
+        bar.addEventListener('pointerdown', function (e) {
+            try {
+                downOnBtn = !!(e && e.target && e.target.closest && e.target.closest('button'));
+            } catch (err) { downOnBtn = false; }
+            chatBeginDrag(e, 'move');
+        });
         // 折叠状态下点标题栏 = 展开。必须挡掉「拖完松手浏览器补的那个 click」
         // （dragMoved），否则把折叠条拖到别处、一松手窗口就自己展开了。
         // 三颗按钮上的点击也要放过去 —— 它们有自己的处理器。
         bar.addEventListener('click', function (e) {
             try {
+                // 无论这一次要不要展开，都得把标记清掉：留着会污染下一次点击。
+                const onBtn = downOnBtn;
+                downOnBtn = false;
                 if (!ChatState.minimized || ChatState.dragMoved) return;
-                if (e && e.target && e.target.closest && e.target.closest('button')) return;
+                if (onBtn) return;                                                  // pointerdown 记下的，扛得住 DOM 被换
+                if (e && e.target && e.target.closest && e.target.closest('button')) return;  // 键盘激活按钮（没有 pointerdown）走这条
                 chatExpand();
             } catch (err) { console.error('[chat] titlebar click failed', err); }
         });
@@ -11024,13 +11051,17 @@ function chatBindShell(rootEl) {
     // 【刻意不写第二套实现】新建对话 = 「清理」，同一个函数。两套实现迟早会分叉，
     // 而分叉出去的那一套一定是漏掉归档的那一套 —— 那就是用户的对话被静默销毁。
     // 空对话的处理也一并继承：chatClearConversation 自己会在没有消息时原地返回、不归档。
-    if (newBtn) newBtn.addEventListener('click', function () { chatClearConversation(); });
+    // 三颗按钮的 click 一律**先** stopPropagation 再干活：它们就在标题栏里面，而标题栏那个
+    // click 处理器在折叠态下的语义是「展开」。不拦住，一次点击会被两个处理器各解释一遍
+    // （上面那段注释里的实测：按钮折叠 → 标题栏又展开）。stopPropagation 放在第一行，
+    // 这样即使下面的动作抛异常，也已经拦住了 —— 顺序反过来就等于没拦。
+    if (newBtn) newBtn.addEventListener('click', function (e) { chatStopEvent(e); chatClearConversation(); });
 
     const minBtn = rootEl.querySelector('#aiChatMinBtn');
-    if (minBtn) minBtn.addEventListener('click', function () { chatToggleMinimize(); });
+    if (minBtn) minBtn.addEventListener('click', function (e) { chatStopEvent(e); chatToggleMinimize(); });
 
     const closeBtn = rootEl.querySelector('#aiChatCloseBtn');
-    if (closeBtn) closeBtn.addEventListener('click', function () { chatClose(); });
+    if (closeBtn) closeBtn.addEventListener('click', function (e) { chatStopEvent(e); chatClose(); });
 
     const input = rootEl.querySelector('#aiChatInput');
     if (input) {
@@ -14235,6 +14266,23 @@ function chatClearConversation() {
                 + '请先到「会话」里删掉几份用不上的旧对话腾出空间，再点一次清理。');
             return;
         }
+        // 【在飞的那一轮必须在这里当场了结】归档已经成功、马上就要清空了。这时候如果上一轮
+        // 请求还在路上，它回来时会往**用户刚刚亲手清空的新对话**里塞一条没有提问的孤儿助手
+        // 消息，然后 chatSend 末尾的自动存档再把这条孤儿单独存成第二份归档 ——
+        // 一问一答被劈成两份，两份都不完整（实测：点 SEND 后 200ms 点「+」，归档变成
+        // ['自动存档' 只有 assistant, '清理' 只有 user]）。
+        // 处理方式和 chatSend 开头对上一轮的处理逐字一致：先 abort，再 ++seq 让陈旧守卫
+        // 认出它。差别只有一处 —— 那边紧接着有新的一轮把 busy 重新点亮，这里没有，
+        // 而被 ++seq 判成陈旧的那一轮走不到自己 finally 里的收尾（`mySeq === ChatState.seq`
+        // 不成立），所以 busy / abort 必须由这里自己收干净，否则 SEND 会永远卡在 STOP。
+        // 放在归档成功之后：归档失败那条路的合约是「一条都没动」，不能顺手把请求掐了。
+        const wasBusy = !!ChatState.busy;
+        if (wasBusy) {
+            chatStop();
+            ChatState.seq = (Number(ChatState.seq) || 0) + 1;
+            ChatState.abort = null;
+            chatSetBusy(false);
+        }
         chatResetConversation();
         ChatState.panel = '';
         // 新对话 ⇒ 采用「设置 → 模型 → 默认模型」里对话那一行。这正是那一行的定义。
@@ -14242,6 +14290,8 @@ function chatClearConversation() {
         chatAppendRow('system', '已开始新对话（' + n + ' 条消息已归档）。'
             + '刚才那段在「会话」里，点进去就能取回；删除是另一个要确认的动作。'
             + '文档上下文不受影响：下一轮照样带整篇最新的译文。'
+            + (wasBusy ? '⚠ 上一轮请求当时还在进行中，已经中止 —— 它的回答不会再落进这段新对话里，'
+                       + '那一轮的提问原样留在刚归档的那段对话里。' : '')
             + (adopted ? '模型与推理档位已回到「设置 → 模型 → 默认模型」里对话那一行的默认值。' : ''));
         chatRenderParamBar();
         chatUpdateBar();
