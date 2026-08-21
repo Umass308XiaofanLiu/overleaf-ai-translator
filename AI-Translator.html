@@ -7302,6 +7302,12 @@ async function handleTranslate(opts) {
             // 5 分钟后自动存档把 A 顶掉 —— 正是这次要根除的那类静默永久损坏。
             // 所以钥匙**无条件换**（下面那行原样不动），尺子只用来决定要不要弹那句提示：
             // 判错的代价是多一条/少一条 toast，不是一份文档。
+            // 【这个选择的代价，实测量过】同一份文档连着翻 N 次（在大输入框里续写再 TRANSLATE，
+            // 或者开着 AUTO SYNC 边写边翻）会留下 N 条归档，而不是 1 条：实测 4 次续写 →
+            // globalHistory 1/2/3/4（Keep Last 默认 5）。被挤掉的永远是**最旧**的那条，
+            // 而且整个过程在历史菜单里看得见、Keep Last 用户自己能调大。
+            // 拿「有界、可见、可调的淘汰」换掉「5 分钟内静默永久毁掉一份已校对的文档」，
+            // 这笔账是刻意这么算的 —— 别为了少几条归档把钥匙改成有条件换。
             const outgoing = Array.isArray(AppState.translationPairs) ? AppState.translationPairs : [];
             if (outgoing.length > 0) {
                 addToGlobalHistory(outgoing, AppState.sessionId);
@@ -7403,6 +7409,9 @@ async function saveRowUpdate(index, manualValues = null) {
     //   一个数没动，error=null；刷新之后那句手打的原文没了。
     // 取消的是**模型那次改写**，不是用户自己打的字 —— 后者必须留下。
     xportPersistSoon();
+    // 原文侧动过、而大输入框正开着（Edit 视图里右栏的行照样能点开编辑）：当场把这处改动
+    // 一起收进大输入框，否则用户回到框里敲一个字就会把上面那面旗抹掉（见 handleInputChange）。
+    if (srcChanged) xportFoldPairsIntoLiveInput();
 
     let prompt = "";
     let updateField = null;
@@ -7487,7 +7496,10 @@ function handleHistoryNav(index, delta) {
     const newIdx = item.historyIndex + delta;
     if (newIdx >= 0 && newIdx < item.history.length) {
         const historic = item.history[newIdx];
-        if (item.src !== historic.src) AppState.srcEditedSinceTranslate = true;   // 撤销/重做也会换原文
+        // 撤销/重做也会换原文 —— 这面旗的语义是「pairs 才是准绳」，所以它必须被真的收回来，
+        // 不能设了之后允许一次击键把它抹掉（那正是本轮 F2 的根因）。收回的动作在下面
+        // xportFoldPairsIntoLiveInput()：大输入框开着就当场收，没开着就交给 setViewMode('edit')。
+        if (item.src !== historic.src) AppState.srcEditedSinceTranslate = true;
         const pairs = [...AppState.translationPairs];
         pairs[index] = { ...item, src: historic.src, tgt: historic.tgt, historyIndex: newIdx };
         
@@ -7507,13 +7519,17 @@ function handleHistoryNav(index, delta) {
         // ============= 撤销/重做也必须落盘 =============
         // 【实测的原始故障】上一版这里没有 xportPersistSoon()。
         // 【上一版这段注释写的是「这是全文件唯一一个会改内容、却不叫 xportPersistSoon() 的
-        //   处理器」——那句话是错的，本轮重新普查过全文所有会写 translationPairs[i].src/.tgt、
-        //   inputText、originalInputText、globalHistory 的地方，另外还有三处也不落盘，
-        //   都已在各自位置补上并写了实测证据：
+        //   处理器」——那句话是错的。上上一版把它改成「本轮重新普查过全文…另外还有三处」，
+        //   那句话**同样是错的**：独立验证随后又抓出两处普查漏掉的（第四、第五处）。
+        //   到目前为止补齐的五处，都在各自位置写了实测证据：
         //     · saveRowUpdate 里 updateTranslationPair 那一处（智能更新被取消 → 手打的原文丢掉）；
         //     · syncInputFromPairs 重建成功那一支（改稿收回大输入框之后没人落盘）；
-        //     · setViewMode（viewMode 本身就在快照里）。
-        //   别再在任何地方写「唯一」——那种断言每次被独立复核都是错的。】
+        //     · setViewMode（viewMode 本身就在快照里）；
+        //     · handleInputChange 的「输入为空」分支（它在 xportPersistSoon() 之前就 return 了，
+        //       而它同时清掉 translationPairs 和 inputText，是全文件改内容改得最狠的一处之一）；
+        //     · toggleAutoDetect（isAutoDetect 在快照里、恢复时也读，就是没人存）。
+        //   别再在任何地方写「唯一」，也别再写「已经普查过全文」——这两种断言在这个文件里
+        //   每一次被独立复核都是错的。要说就说「这一处补上了」。】
         // 逐字复现（真 Chrome，127.0.0.1:8765）：改一行原文+译文 → Update（addHistory 落盘，
         // disk="…ZZUNDOTEST."，savedAt=1787260254382）→ 点这一行的 ↺ 撤销 → 等 4 秒：
         // 内存里是撤销后的文本，盘上还是撤销前的那份，savedAt **一个数都没动**（没写过），
@@ -7523,6 +7539,12 @@ function handleHistoryNav(index, delta) {
         // 别指望 5 分钟自动存档或 pagehide 兜底：前者太晚，后者根本不提交
         //（见 DOMContentLoaded 里注册 pagehide / visibilitychange 那两行上面的注释）。
         xportPersistSoon();
+        // ↺/↻ 换掉了这一行的原文，而右栏这几颗按钮在 **Edit 视图里也照样渲染**
+        //（renderTargetPanel 不看 viewMode，实测撤销按钮和 #mainInput 同帧共存）。
+        // 不当场把它收进大输入框，用户在框里敲一个字就会把上面那面旗抹掉，
+        // 他刚刚亲手撤销掉的那一版会在下一次 TRANSLATE 时静默回到屏幕上（实测
+        // undoSilentlyReverted:true，confirms=[]、toasts=[]、error=null）。
+        xportFoldPairsIntoLiveInput();
     }
 }
 
@@ -8577,10 +8599,31 @@ function xportPersistFail(where, err) {
     }
 }
 
+// ============= open 可能**一个回调都不给** =============
+// 【实测（真 Chrome 150.0.7871.182，headless=new，直接打开一个 file:// 页面）】
+// README 第 4 行说的用法就是「直接用浏览器打开 AI-Translator.html」。那种打开方式下：
+//   location.protocol='file:'、location.origin='file://'、typeof indexedDB==='object'
+//   （所以下面那道 undefined 闸门放行），而 indexedDB.open() 的
+//   onsuccess / onerror / onblocked **一个都不触发** —— 实测 5 秒内零回调（虚拟时间 12 秒）。
+// 于是这个 Promise 永远不 settle，连锁后果全是静默的：
+//   · xportPersistRestore 的 then 和 catch 都不跑 → xportPersistBooted 永远是 false
+//     → xportPersistNow 第一行就 return false，**一个字节都不会写**；
+//   · armAutoSaveTimer() 挂在那个 then 里 → 自动存档定时器从来没被装上；
+//   · persistError 永远是 null → 顶栏角标不亮、历史面板一直写着
+//     「本地存档已就绪，还没写过；内容变化 1.2 秒后自动写入」。
+// 也就是说，本轮修掉的那条「写失败时界面还在承诺自动写入」，在**默认打开方式**下换了个
+// 机制原样存在：那边是 reject 之后角标不亮，这里是根本不 reject。
+// 挂住不是「还没轮到自己」，超时就当失败：报出来，并把 booted 放行 —— xportPersistNow 里
+// 那道 foreign 比对（cur.savedAt > xportPersistSeenAt 且 owner 不是我）会挡住
+// 「没恢复成功却拿空状态覆盖盘上那条」，所以放行写是安全的。
+// 迟到的 onsuccess 仍然会把连接填进 xportPersistDb，下一次写就会成功并自动清掉这条错误。
+const XPORT_DB_OPEN_TIMEOUT = 8000;
+
 function xportPersistOpen() {
     if (xportPersistDb) return Promise.resolve(xportPersistDb);
     return new Promise(function (resolve, reject) {
-        let req;
+        let req, settled = false;
+        const done = function (fn, arg) { if (settled) return; settled = true; fn(arg); };
         try {
             if (typeof indexedDB === 'undefined' || !indexedDB) { reject(new Error('这个浏览器/隐私模式下没有 IndexedDB')); return; }
             req = indexedDB.open(XPORT_DB_NAME, 1);
@@ -8591,9 +8634,19 @@ function xportPersistOpen() {
                 if (!db.objectStoreNames.contains(XPORT_DB_STORE)) db.createObjectStore(XPORT_DB_STORE, { keyPath: 'id' });
             } catch (e) {}
         };
-        req.onsuccess = function () { xportPersistDb = req.result; resolve(xportPersistDb); };
-        req.onerror = function () { reject(req.error || new Error('indexedDB.open 失败')); };
-        req.onblocked = function () { reject(new Error('另一个标签页占住了数据库升级')); };
+        // 赋值放在 done 之外：就算是超时之后才迟到的那次成功，也要把连接留下来给下一次写用。
+        req.onsuccess = function () { xportPersistDb = req.result; done(resolve, xportPersistDb); };
+        req.onerror = function () { done(reject, req.error || new Error('indexedDB.open 失败')); };
+        req.onblocked = function () { done(reject, new Error('另一个标签页占住了数据库升级')); };
+        try {
+            setTimeout(function () {
+                done(reject, new Error('indexedDB.open 等了 ' + XPORT_DB_OPEN_TIMEOUT
+                    + ' 毫秒没有任何回应（用 file:// 直接打开这个页面时 Chrome 实测就是这样）。'
+                    + '这种打开方式下本地存档不可用 —— 请改用一个本地 http 服务打开页面'
+                    + '（任意静态服务器，然后访问 http://127.0.0.1:<端口>/AI-Translator.html）。'
+                    + '在那之前，内容只活在这个标签页里，关掉就没了'));
+            }, XPORT_DB_OPEN_TIMEOUT);
+        } catch (e) {}
     });
 }
 
@@ -9509,11 +9562,61 @@ function syncInputFromPairs() {
     AppState.inputText = reconstructed;
     AppState.originalInputText = reconstructed;
     // 这三个字段刚被整份换掉，屏幕上的内容也跟着变了 —— 那就必须落盘。
-    // （调用点有两个：setViewMode('edit') 和 handleTranslate 的第一行。后者只在**翻译成功**
-    //   之后才落盘，翻译失败/被「和上次一模一样」挡回去的那两条路上一次都不会落。
-    //   放在这里而不是放在两个调用点上：出口只有一个，将来多一个调用点也不会漏。）
+    // （调用点有三个：setViewMode('edit')、handleTranslate 的第一行、
+    //   以及下面的 xportFoldPairsIntoLiveInput。头一个之外的两个都不落盘：
+    //   handleTranslate 只在**翻译成功**之后才落，翻译失败/被「和上次一模一样」挡回去的
+    //   那两条路上一次都不会落。放在这里而不是放在调用点上：出口只有一个，将来多一个
+    //   调用点也不会漏。）
     xportPersistSoon();
     return true;
+}
+
+// ============= 原文栏的逐句改动落下时，大输入框正开着就当场一起更新 =============
+// 【它修的是什么】srcEditedSinceTranslate 这面旗的含义是「pairs 才是这份文档的准绳，
+// 大输入框那份已经过时」。旗被打上的入口全文件只有三处：saveRowUpdate、handleHistoryNav、
+// chatApplyProposal。原来的设计假定「旗打上之后，用户下一次进 Edit 视图时
+// setViewMode('edit') 会来对账」—— 但后两个入口在**用户已经待在 Edit 视图里**时同样可达：
+// 浮动对话窗挂在 <body> 上、不看 viewMode；右栏 Target Panel 的行也不看 viewMode，
+// 实测 `handleHistoryNav(1,-1)` 按钮和 `id="mainInput"` 大输入框同帧共存
+//（domHasUndoButton:true, domHasBigTextarea:true）。这时候没有任何一次 setViewMode('edit')，
+// 而用户在大输入框里敲的第一个字就会把旗抹掉（见 handleInputChange 里那段实测记录），
+// 那几处改动从此没人来收 —— 下一次 TRANSLATE / ⟳ / AUTO SYNC 用旧文本赢，零提示、
+// 逐行撤销栈也被整份换掉，recoverableAnywhere=false。
+//
+// 【为什么在这里做而不是等到击键时做】等到 handleInputChange 就晚了：那时 value 已经是
+// 用户**在旧文本上**改出来的结果，两份没法合并，只能二选一丢一份。旗刚打上的这一刻，
+// 大输入框里的内容逐字等于 AppState.inputText（每一次 input 事件都同步过），把 pairs 收进去
+// 一个字都不会丢 —— 分歧从此不存在，而不是被事后仲裁。
+//
+// 【三道闸门，缺一条就是新的静默损坏】
+//   · viewMode !== 'edit'：大输入框根本没开着，交给 setViewMode('edit') 那条老路（原样不动）。
+//   · inputText !== originalInputText：框里已经是**另一份文本**了（最典型：AUTO SYNC 关掉、
+//     粘了下一段还没翻）。这时候拿 pairs 重建会把那段新文本原地抹掉 —— 正是
+//     handleRegenerateAll 里那段注释记下的实测故障。宁可不收，由 handleInputChange 那条
+//     归档兜底。
+//   · AppState.error 非空：最常见的一种是「粘了 B、TRANSLATE 失败」—— handleTranslate 在
+//     发请求**之前**就把 originalInputText 设成了 B，于是上一条闸门此刻恰好不成立。
+//     ⚠️ 诚实交代：这道闸门只挡住「报错横幅还在」的时段，用户手动关掉横幅之后这个洞还在。
+//     它**不是本轮引入的**：现行 handleTranslate 第一行的 syncInputFromPairs() 一道闸门都
+//     没有，实测同一场景下 B 已经被静默销毁（inputText hasB=false、B recoverable
+//     anywhere=false）。这里没有把它修好，也没有把它变得更宽。
+//
+// 不重画：调用点自己已经 setState 过一次（画的是收编**之前**的 inputText），
+// 所以这里把新文本直接写回 #mainInput.value —— 和 syncTranslateButtonState、
+// xportPersistBadgeSync 同一条「只改这一个节点、不重渲染」的路子。
+function xportFoldPairsIntoLiveInput() {
+    try {
+        if (AppState.viewMode !== 'edit') return false;
+        if (AppState.inputText !== AppState.originalInputText) return false;
+        if (AppState.error) return false;
+        if (!syncInputFromPairs()) return false;
+        const el = document.getElementById('mainInput');
+        if (el) el.value = AppState.inputText;
+        // 收编真的发生了才提示：这一刻才是「被削过的文本写进 inputText / originalInputText」
+        // 的时刻，和 setViewMode('edit') / handleTranslate 那两个调用点逐字同一条规矩。
+        xportWarnColorMacroLoss('大输入框');
+        return true;
+    } catch (e) { return false; }
 }
 
 // ============= 重新生成所有翻译 =============
@@ -13124,9 +13227,19 @@ function toggleAutoTranslate() {
     renderApp();
 }
 
+// 与 setLanguage / swapLanguages 同一条理由、同一个实测故障（见 setLanguage 上面那段）：
+// isAutoDetect 也在 xportPersistSnapshot 里、xportPersistRestore 也读它，而这个开关是
+// 用户改它的第三个入口。
+// 【实测的原始故障（本轮）】屏幕上有译文、盘上 {isAutoDetect:true, sourceLang:'en',
+// targetLang:'zh'}、savedAt=1787266776035。点顶栏 AUTO 芯片关掉自动检测，等 4 秒读盘：
+// 内存 isAutoDetect=false，盘上仍是 true、savedAt 一个数没动，角标不亮、界面写着
+// 「已存到本地（IndexedDB），刷新页面可恢复」。刷新之后 AUTO 被静默打开，零提示。
+// 下游后果和 setLanguage 那条一样：AUTO 一开，TRANSLATE / 重新生成会重新检测方向，
+// 用户为了对付混排文档手动锁定的方向就此失效。
 function toggleAutoDetect() {
     AppState.isAutoDetect = !AppState.isAutoDetect;
     renderApp();
+    xportPersistSoon();
 }
 
 function setAutoSaveInterval(ms) {
@@ -13530,7 +13643,12 @@ function handleConnectLocalClick() {
 
 // ============= 手动锁定的方向必须跟着落盘 =============
 // 【实测的原始故障】xportPersistSnapshot 存了 sourceLang / targetLang / isAutoDetect，
-// xportPersistRestore 也把它们恢复回来 —— 但这两个**唯一**会改方向的函数一个都不落盘。
+// xportPersistRestore 也把它们恢复回来 —— 但会改方向的函数一个都不落盘。
+// 【上一版这里写的是「这两个**唯一**会改方向的函数」，那句话是错的：toggleAutoDetect 是
+//   第三个，它一个字都没提，于是它继续不落盘，被独立验证当场逮住（见它上面那段实测）。
+//   会改 isAutoDetect / sourceLang / targetLang 的用户入口共三个：setLanguage、
+//   swapLanguages、toggleAutoDetect，三个都在这一轮补齐了。别再写「唯一」——
+//   那种断言在这个文件里每次被独立复核都是错的。】
 // 于是（真 Chrome，127.0.0.1:8765，屏幕上有 3 行译文）：
 //   setLanguage('zh','en') → 内存 ["zh","en",false]，等 3.5 秒读盘 ["en","zh",true]、
 //   savedAt 一个数没动 → 刷新 → 回来还是 ["en","zh",true]，顶栏芯片也翻回 EN⇄ZH，
@@ -16717,10 +16835,19 @@ function chatApplyProposal(id) {
             //     （一致性闸门只比第 0 行前 60 个非空白字符，改在第 3 行它一个字都察觉不到；
             //      改在第 1 行倒是会弹一次确认框，但那只是碰巧撞上了尺子。）
             // 这一处和 saveRowUpdate 里 `if (srcChanged) AppState.srcEditedSinceTranslate = true`
-            // 是同一件事：**用户**点了「应用」，这就是他认可的原文改动。标志一打上，
-            // syncInputFromPairs / handleRegenerateAll 就都会拿 pairs 当这份文档的准绳。
+            // 是同一件事：**用户**点了「应用」，这就是他认可的原文改动。
+            // ⚠️ 上一版这段注释的最后一句写的是「标志一打上，syncInputFromPairs /
+            // handleRegenerateAll 就都会拿 pairs 当这份文档的准绳」—— 那句话当时**不成立**：
+            // 对话窗挂在 <body> 上，用户可以在 **Edit 视图里**点「应用」，而
+            // handleInputChange 的第一件事就是无条件把这面旗清掉。实测（真 handler）：
+            // 应用 CHATMARK99 → 在大输入框敲一个词 → TRANSLATE/⟳/AUTO SYNC 三条路都让
+            // CHATMARK99 原地消失，confirms=[]、toasts=[]、error=null，逐行 history 2→1，
+            // recoverableAnywhere=false。现在这句话由下面那行 xportFoldPairsIntoLiveInput()
+            // 兑现：大输入框正开着就当场把改动收进去，收不进去的那种情形由
+            // handleInputChange 那条归档兜底（那两段各自写了闸门和它们挡不住什么）。
             if (p.side === 'src') AppState.srcEditedSinceTranslate = true;
             addHistory(p.rowIndex, newSrc, newTgt);      // 内含 setState → 一次整页重渲染（用户主动动作，可接受）
+            if (p.side === 'src') xportFoldPairsIntoLiveInput();
             scheduleAlignSync();
             chatAppendRow('system', '已应用到「' + (p.side === 'src' ? '原文' : '译文') + ' 第 '
                 + (p.rowIndex + 1) + ' 行」，并记入这一行的历史（用行首的 ↺ 可以撤回）。');
