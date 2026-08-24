@@ -976,24 +976,48 @@ body[data-aichat-drag="bl"]   { cursor: nesw-resize !important; }
    不走 setState —— 聊天的任何动作都不许触发整页重渲染。 */
 .is-chat-open { background: #eef2ff !important; border-color: #c7d2fe !important; color: #4338ca !important; }
 
-/* ==================== OVL.CSS (v2 Overleaf 风格外壳 · M1) ====================
-   手写、#ovlShell/#ovlPortal 前缀，禁用 Tailwind 工具类 —— 动态插进 body 的节点上的
-   Tailwind 类不保证被运行时 JIT 扫到（同一原因聊天窗第 335–347 行也是全手写）。
-   z-index 号段严格照抄规划 §3.3：外壳 1000–1099，外壳菜单 1080，#root 浮层 1500/1510，
+/* ==================== OVL.CSS (v2 Overleaf 风格外壳 · M1 + M1.5) ====================
+   手写、#ovlShell/#ovlPortal/#ovlTransWin 前缀，禁用 Tailwind 工具类 —— 动态插进 body 的
+   节点上的 Tailwind 类不保证被运行时 JIT 扫到（同一原因聊天窗第 335–347 行也是全手写）。
+   z-index 号段严格照抄规划 §3.3（v2 改版）：外壳 1000–1099，外壳菜单 1080，
+   翻译器窗框 #ovlTransWin 1490，翻译器内容 #root 1500，#synonymPopup（浮窗开着时）1505，
    #aiChatRoot 2147482000（不变），[data-tip]::after 2147483000（不变）。 */
 
 /* 默认（外壳未激活，即 ovlBoot 还没成功跑完）：#ovlShell 不存在或不可见，#root 照常显示。
    只有 body.ovl-shell-active 生效时才隐藏 #root，换成外壳；
-   .ovl-translator-open 优先级更高，把 #root 拉回来当全屏浮层。 */
+   .ovl-translator-open 优先级更高，把 #root 拉回来当浮动窗口的内容区（见 §3.6，M1.5）。 */
 body.ovl-shell-active:not(.ovl-translator-open) #root { display: none; }
 
+/* M1.5：#root 不再是 inset:0 的整页浮层，而是 #ovlTransWin 窗框内的内容区，
+   left/top/width/height 全部由 ovlTransApplyGeom() 写内联样式（同一份 OvlTransState.geom）。
+   这里只给不随手势变化的属性，几何初值随便写、一开窗立刻会被 JS 覆盖。 */
 body.ovl-translator-open #root {
     position: fixed;
-    inset: 0;
     z-index: 1500;
     background: #f8fafc;
     overflow: auto;
     display: block;
+}
+
+/* #synonymPopup 挂在 body 上、不在 #root 里，天然逃出 #root 的 1500 层叠上下文（见 §1.8 第 1 条）。
+   特异度 (0,2,0) 已压过 Tailwind 的 .z-\[100\]（0,1,0），!important 是给 Tailwind CDN 的运行时
+   JIT 再上一道保险。不要给 #root 加 transform 之类的东西去"包住"它 —— 包不住，见 §3.6.4 方案 C。 */
+body.ovl-translator-open #synonymPopup { z-index: 1505 !important; }
+
+/* 【M1.5 三条 !important，唯一的技术难点】renderMainWorkspace（约 13048 行）里 <main> 带的
+   行内 style="height: calc(100vh - 220px);" 是视口相对的，浮窗只有几百 px 高时会把内容撑爆、
+   窗口自己滚出竖向滚动条。CSS Cascade Level 4：important author 压得过 normal author（含行内
+   style），所以这三条净新增的 !important 规则能盖过那句没有 !important 的行内样式，13050 行
+   一个字节都不用改。#root 有 JS 写的像素级内联高度，子元素 height:100% 才解析得出来。 */
+body.ovl-translator-open #root > div {
+    min-height: 0 !important;
+    height: 100% !important;
+    max-width: none !important;
+}
+body.ovl-translator-open #root main {
+    height: auto !important;
+    flex: 1 1 auto !important;
+    min-height: 160px !important;
 }
 
 #ovlShell {
@@ -1146,6 +1170,7 @@ body.ovl-shell-active #ovlShell { display: flex; }
 }
 .ovl-mode-toggle {
     display: inline-flex;
+    flex: 0 0 auto;
     background: #495365;
     border-radius: 9999px;
     padding: 2px;
@@ -1208,32 +1233,11 @@ body.ovl-shell-active #ovlShell { display: flex; }
 .ovl-pdf-toolbar { height: 34px; display: flex; align-items: center; padding: 0 10px; color: #E7E9EE; font-size: 12px; background: #1B222C; }
 .ovl-pdf-body { flex: 1 1 auto; display: flex; align-items: center; justify-content: center; color: #9AA4B2; font-size: 13px; text-align: center; padding: 20px; }
 
-/* ---- #ovlPortal：下拉菜单 + 翻译器关闭按钮 ---- */
+/* ---- #ovlPortal：外壳下拉菜单（M1.5 起翻译器关闭按钮已搬进窗口标题栏，不再需要
+   把 #ovlPortal 的层叠上下文整体抬高的那条 hack —— #ovlTransWin 直接是 body 的
+   直接子节点，z-index 1490/1500/1505 三段互相之间不存在"关不进去"的问题，见 §3.6.4 方案 B）。 ---- */
 #ovlPortal { position: fixed; inset: 0; pointer-events: none; z-index: 1080; }
 #ovlPortal > * { pointer-events: auto; }
-/* #ovlPortal 自身的 position:fixed + z-index 会建立层叠上下文，容器内子元素（如关闭按钮）的
-   z-index:1510 只在这个上下文内部生效，永远逃不出去跟外层的 #root（z-index:1500）比较，
-   于是关闭按钮视觉上在最上层、实际点击命中的却是 #root —— 这就是"看得见点不到"的根因。
-   翻译器浮层打开时把 #ovlPortal 自身的层叠上下文整体提到 #root 之上即可；
-   浮层关闭时保持 1080（外壳下拉菜单需要盖住 #ovlShell 的 1000–1099 段，不受影响）。 */
-body.ovl-translator-open #ovlPortal { z-index: 1510; }
-
-.ovl-translator-close-btn {
-    display: none;
-    position: fixed;
-    top: 8px;
-    right: 12px;
-    z-index: 1510;
-    background: #1B222C;
-    color: #F4F5F6;
-    border: none;
-    border-radius: 6px;
-    padding: 6px 12px;
-    font-size: 12px;
-    cursor: pointer;
-}
-.ovl-translator-close-btn:hover { background: #2F3A4C; }
-body.ovl-translator-open .ovl-translator-close-btn { display: block; }
 
 .ovl-layout-menu {
     position: fixed;
@@ -1262,6 +1266,189 @@ body.ovl-translator-open .ovl-translator-close-btn { display: block; }
 .ovl-layout-menu-item.ovl-active { color: #4ade80; }
 .ovl-layout-menu-item.ovl-active::before { content: "\2713  "; }
 
+/* ==================== #ovlTransWin（v2 M1.5：翻译器浮动窗口的窗框）====================
+   机制照抄 #aiChatRoot（335–347 行那段解释同样适用：动态插进 body 的节点，Tailwind JIT
+   靠不住，全手写）。窗框和 #root（窗内容）是两个独立的 fixed 元素，由同一份
+   OvlTransState.geom 驱动，DOM 树不重排（§3.6，方案 A 已被否决）。
+   z=1490，刻意低于 #root 的 1500：#root 盖不住手柄环和标题栏，八个手柄和标题栏按钮
+   永远点得到，不需要 pointer-events 花活；v1 内部那三个 fixed inset-0 z-[100] 浮层
+   （设置弹窗/错误横幅/toast）会正确地盖住窗框——这对"模态框"是想要的行为（§3.6.2）。 */
+#ovlTransWin {
+    position: fixed;
+    z-index: 1490;
+    display: none;
+    left: 0;
+    top: 0;
+    width: 1100px;
+    height: 740px;
+    background: #1B222C;
+    border-radius: 10px;
+    box-shadow: 0 24px 60px -12px rgba(15, 23, 42, 0.5);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+body.ovl-translator-open #ovlTransWin { display: block; }
+
+.ovl-transwin-titlebar {
+    position: absolute;
+    left: 0; top: 0; right: 0;
+    height: 40px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 0 12px;
+    color: #F4F5F6;
+    cursor: grab;
+    touch-action: none;
+    user-select: none;
+    border-bottom: 1px solid #2F3A4C;
+}
+.ovl-transwin-title-icon { display: inline-flex; color: #818cf8; }
+.ovl-transwin-title-icon svg { width: 15px; height: 15px; }
+.ovl-transwin-title-text {
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.02em;
+    white-space: nowrap;
+}
+.ovl-transwin-title-spacer { flex: 1 1 auto; min-width: 0; }
+.ovl-transwin-titlebtns { display: inline-flex; align-items: center; gap: 2px; flex: 0 0 auto; }
+.ovl-transwin-iconbtn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    border: none;
+    background: transparent;
+    color: #E7E9EE;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 14px;
+}
+.ovl-transwin-iconbtn:hover { background: #2F3A4C; color: #ffffff; }
+.ovl-transwin-iconbtn svg { width: 13px; height: 13px; }
+
+/* 八向缩放手柄：几何照抄 933–941 那张表（边 6px、角 12px），选择器换成 #ovlTransWin 前缀。
+   同样必须是 #ovlTransWin 的直接子节点（不是标题栏内部），道理和 .aichat-resize 那段注释一样：
+   圆角会裁掉四角，放进有 overflow/border-radius 的容器里角上的手柄会失效。 */
+#ovlTransWin .ovl-transwin-resize { position: absolute; touch-action: none; }
+#ovlTransWin .ovl-transwin-resize-l  { left: 0;   top: 12px;    bottom: 12px; width: 6px;   cursor: ew-resize; }
+#ovlTransWin .ovl-transwin-resize-r  { right: 0;  top: 12px;    bottom: 12px; width: 6px;   cursor: ew-resize; }
+#ovlTransWin .ovl-transwin-resize-t  { left: 12px; right: 12px; top: 0;       height: 6px;  cursor: ns-resize; }
+#ovlTransWin .ovl-transwin-resize-b  { left: 12px; right: 12px; bottom: 0;    height: 6px;  cursor: ns-resize; }
+#ovlTransWin .ovl-transwin-resize-tl { left: 0;   top: 0;    width: 12px; height: 12px; cursor: nwse-resize; }
+#ovlTransWin .ovl-transwin-resize-tr { right: 0;  top: 0;    width: 12px; height: 12px; cursor: nesw-resize; }
+#ovlTransWin .ovl-transwin-resize-bl { left: 0;   bottom: 0; width: 12px; height: 12px; cursor: nesw-resize; }
+#ovlTransWin .ovl-transwin-resize-br { right: 0;  bottom: 0; width: 12px; height: 12px; cursor: nwse-resize; }
+
+/* ==================== M8a：编辑器命令工具条 + 查找/替换面板 ==================== */
+.ovl-editor-toolbar {
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    gap: 2px;
+    scrollbar-width: thin;
+}
+.ovl-cmdbtn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    min-width: 26px;
+    height: 26px;
+    padding: 0 6px;
+    border: none;
+    background: transparent;
+    color: #E7E9EE;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+    white-space: nowrap;
+}
+.ovl-cmdbtn:hover { background: #2F3A4C; }
+.ovl-cmdbtn:disabled { color: #5b6577; cursor: not-allowed; }
+.ovl-cmdbtn:disabled:hover { background: transparent; }
+.ovl-cmd-sep { width: 1px; align-self: stretch; margin: 6px 4px; background: #2F3A4C; flex: 0 0 auto; }
+.ovl-cmd-select {
+    flex: 0 0 auto;
+    height: 24px;
+    background: #2F3A4C;
+    color: #E7E9EE;
+    border: none;
+    border-radius: 4px;
+    font-size: 11px;
+    padding: 0 4px;
+    cursor: pointer;
+    max-width: 92px;
+}
+.ovl-toolbar-spacer { flex: 1 0 12px; min-width: 12px; }
+
+.ovl-findbar {
+    display: none;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    background: #f1f5f9;
+    border-top: 1px solid #e2e8f0;
+    border-bottom: 1px solid #e2e8f0;
+    font-size: 12px;
+}
+.ovl-editor-panel[data-find="open"] .ovl-findbar { display: flex; }
+.ovl-findbar-row { display: flex; align-items: center; gap: 6px; flex: 1 1 100%; }
+.ovl-findbar input[type="text"] {
+    flex: 1 1 auto;
+    min-width: 100px;
+    height: 24px;
+    padding: 0 6px;
+    border: 1px solid #cbd5e1;
+    border-radius: 4px;
+    font-size: 12px;
+    background: #ffffff;
+    color: #1f2937;
+}
+.ovl-findbar input[type="text"].ovl-find-bad { border-color: #ef4444; background: #fef2f2; }
+.ovl-findtoggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    height: 22px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: #475569;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 11px;
+    font-weight: 700;
+}
+.ovl-findtoggle:hover { background: #e2e8f0; }
+.ovl-findtoggle.ovl-active { background: #c7d2fe; color: #3730a3; border-color: #a5b4fc; }
+.ovl-findcount { font-size: 11px; color: #64748b; min-width: 46px; text-align: center; white-space: nowrap; }
+.ovl-findbtn {
+    height: 24px;
+    padding: 0 8px;
+    border: 1px solid #cbd5e1;
+    background: #ffffff;
+    color: #1f2937;
+    border-radius: 4px;
+    font-size: 11px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.ovl-findbtn:hover { background: #f1f5f9; }
+.ovl-findclose {
+    width: 22px;
+    height: 22px;
+    border: none;
+    background: transparent;
+    color: #64748b;
+    border-radius: 4px;
+    cursor: pointer;
+    font-size: 12px;
+}
+.ovl-findclose:hover { background: #e2e8f0; }
+
 </style>
 </head>
 <body class="bg-slate-50 text-slate-900">
@@ -1282,7 +1469,7 @@ body.ovl-translator-open .ovl-translator-close-btn { display: block; }
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
 const APP_VERSION = '02.00.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-08-23';   // APP_BUILD_DATE_STAMP
+const APP_BUILD_DATE = '2026-08-24';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -19077,9 +19264,55 @@ function ovlShellHtml() {
         +   '<div class="ovl-editor-panel" id="ovlEditorPanel">'
         +     '<div class="ovl-editor-tabbar"><span class="ovl-editor-tab" id="ovlEditorTabName">未打开文件</span></div>'
         +     '<div class="ovl-editor-toolbar">'
+        // 命令工具条：全部是 OvlCmds 注册表的触发器，data-cmd = 注册表的 key（§3.5，M8a）。
+        // ovlBindShell 里用一个通用监听器扫 [data-cmd]，新增一颗按钮不用改绑定代码。
+        +       '<button type="button" class="ovl-cmdbtn" data-cmd="edit.undo" data-tip="撤销（Ctrl+Z，浏览器原生撤销栈）" data-tip-pos="bottom">&#8630;</button>'
+        +       '<button type="button" class="ovl-cmdbtn" data-cmd="edit.redo" data-tip="重做（Ctrl+Shift+Z / Ctrl+Y）" data-tip-pos="bottom">&#8631;</button>'
+        +       '<span class="ovl-cmd-sep"></span>'
+        +       '<select class="ovl-cmd-select" id="ovlHeadingSelect" data-tip="插入标题级别（section/subsection/subsubsection/paragraph）" data-tip-pos="bottom">'
+        +         '<option value="">标题级别…</option>'
+        +         '<option value="section">Section</option>'
+        +         '<option value="subsection">Subsection</option>'
+        +         '<option value="subsubsection">Subsubsection</option>'
+        +         '<option value="paragraph">Paragraph</option>'
+        +       '</select>'
+        +       '<span class="ovl-cmd-sep"></span>'
+        +       '<button type="button" class="ovl-cmdbtn" data-cmd="fmt.bold" data-tip="加粗 \\textbf{}（Ctrl+B）" data-tip-pos="bottom"><b>B</b></button>'
+        +       '<button type="button" class="ovl-cmdbtn" data-cmd="fmt.italic" data-tip="斜体 \\textit{}（Ctrl+I）" data-tip-pos="bottom"><i>I</i></button>'
+        +       '<span class="ovl-cmd-sep"></span>'
+        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.mathInline" data-tip="插入行内公式 $…$" data-tip-pos="bottom">&sum;</button>'
+        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.symbol" data-tip="插入希腊字母 \\alpha" data-tip-pos="bottom">&Omega;</button>'
+        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.link" data-tip="插入链接 \\href{URL}{}" data-tip-pos="bottom">&#128279;</button>'
+        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.xref" data-tip="插入交叉引用 \\ref{}" data-tip-pos="bottom">&#9635;</button>'
+        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.cite" data-tip="插入引文 \\cite{}" data-tip-pos="bottom">&#128214;</button>'
+        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.figure" data-tip="插入图片环境" data-tip-pos="bottom">&#128444;</button>'
+        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.table" data-tip="插入表格环境" data-tip-pos="bottom">&#9638;</button>'
+        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.list" data-tip="插入列表环境" data-tip-pos="bottom">&#9776;</button>'
+        +       '<span class="ovl-toolbar-spacer"></span>'
         +       '<div class="ovl-mode-toggle" id="ovlModeToggle">'
         +         '<label data-mode="code" class="ovl-mode-active">Code</label>'
         +         '<label data-mode="visual">Visual</label>'
+        +       '</div>'
+        +       '<button type="button" class="ovl-cmdbtn" id="ovlFindBtn" data-cmd="edit.find" data-tip="查找/替换（Ctrl+F）" data-tip-pos="bottom-end">&#128269;</button>'
+        +     '</div>'
+        // 查找/替换面板（§2.6.4，M8a）：默认隐藏（.ovl-editor-panel 没有 data-find 属性），
+        // ovlFindOpen/ovlFindClose 只切一个属性，CSS 负责显隐（987 行往下那套写法的同一纪律）。
+        +     '<div class="ovl-findbar" id="ovlFindBar">'
+        +       '<div class="ovl-findbar-row">'
+        +         '<input type="text" id="ovlFindInput" placeholder="Search" autocomplete="off">'
+        +         '<button type="button" class="ovl-findtoggle" id="ovlFindCaseBtn" data-tip="区分大小写" data-tip-pos="bottom">Aa</button>'
+        +         '<button type="button" class="ovl-findtoggle" id="ovlFindRegexBtn" data-tip="正则表达式" data-tip-pos="bottom">[.*]</button>'
+        +         '<button type="button" class="ovl-findtoggle" id="ovlFindWordBtn" data-tip="全字匹配" data-tip-pos="bottom">W</button>'
+        +         '<button type="button" class="ovl-findtoggle" id="ovlFindSelBtn" data-tip="仅在选区内搜索" data-tip-pos="bottom">&#9635;</button>'
+        +         '<span class="ovl-findcount" id="ovlFindCount"></span>'
+        +         '<button type="button" class="ovl-findbtn" id="ovlFindPrevBtn" data-tip="上一个（Shift+Enter）" data-tip-pos="bottom">&#8593;</button>'
+        +         '<button type="button" class="ovl-findbtn" id="ovlFindNextBtn" data-tip="下一个（Enter）" data-tip-pos="bottom">&#8595;</button>'
+        +         '<button type="button" class="ovl-findclose" id="ovlFindCloseBtn" data-tip="关闭（Esc）" data-tip-pos="bottom-end">&times;</button>'
+        +       '</div>'
+        +       '<div class="ovl-findbar-row">'
+        +         '<input type="text" id="ovlReplaceInput" placeholder="Replace with" autocomplete="off">'
+        +         '<button type="button" class="ovl-findbtn" id="ovlReplaceBtn">Replace</button>'
+        +         '<button type="button" class="ovl-findbtn" id="ovlReplaceAllBtn">Replace All</button>'
         +       '</div>'
         +     '</div>'
         +     '<div class="ovl-editor-body">'
@@ -19095,9 +19328,10 @@ function ovlShellHtml() {
         + '</div>';
 }
 
+// M1.5 起翻译器的关闭按钮已搬进 #ovlTransWin 自己的标题栏（ovlTransWinHtml），
+// 这里不再需要 #ovlTranslatorCloseBtn（见 §3.6.8 删除清单第 4 条）。
 function ovlPortalHtml() {
     return ''
-        + '<button type="button" id="ovlTranslatorCloseBtn" class="ovl-translator-close-btn" title="关闭翻译器，返回 Overleaf 外壳视图">&times; 返回外壳</button>'
         + '<div class="ovl-layout-menu" id="ovlLayoutMenu" hidden>'
         +   '<div class="ovl-layout-menu-title">Layout options</div>'
         +   '<div class="ovl-layout-menu-item" data-view="split">Split view</div>'
@@ -19183,12 +19417,426 @@ function ovlToggleTree() {
     }
 }
 
-// 打开 v1 翻译器浮层：只加 class，不动 DOM 树（§3.3）。
+// ==================== M1.5：翻译器浮动窗口（§3.6）====================
+// #ovlTransWin 是窗框（标题栏 + 八向缩放手柄），#root 是窗内容。两个都是 position:fixed，
+// 由同一份 OvlTransState.geom 驱动坐标，DOM 树一个节点都不动（§3.3 方案 A 已被否决）。
+
+// —— 几何常量（§3.6.6，刻意另起一套，不复用 CHAT_*：420×560 和 1100×740 共用会互相拉扯）——
+const OVL_TRANS_MIN_W = 640;
+const OVL_TRANS_MIN_H = 420;
+const OVL_TRANS_TITLEBAR_H = 40;     // 必须和 CSS 里 .ovl-transwin-titlebar 的 height 一致
+const OVL_TRANS_BORDER = 6;          // 手柄环宽度；#root 的盒子按这个内缩（ovlTransApplyGeom）
+const OVL_TRANS_SCREEN_INSET = 24;   // 首次打开时的居中/停靠留边
+const OVL_TRANS_VIEWPORT_PAD = 16;   // 尺寸上限相对视口留的边
+const OVL_TRANS_EDGE_KEEP = 48;      // 横向至少留这么多像素在屏幕里，永远抓得回来
+const OVL_TRANS_RESTORE_PAD = 8;     // 从 localStorage 恢复时，整窗回到视口内所留的边
+
+// 当前正在进行的拖拽/缩放会话的收尾函数（ovlWinBeginDrag 里的 onUp），没有拖拽时为 null。
+// 存在的理由和 chatActiveDragEnd（14169 行）完全一样：ovlCloseTranslator / Esc 要能在关窗前
+// 主动结束一次进行中的拖拽，否则拖到一半关窗，监听器和 data-aichat-drag 会在窗口消失后
+// 继续在后台跑，最终把一个用户没选过的尺寸写进 localStorage。
+let ovlTransActiveDragEnd = null;
+
+const OvlTransState = {
+    mounted: false,
+    geom: { x: 0, y: 0, w: 1100, h: 740, mode: 'auto' },
+    dragMoved: false,
+    maximized: false,
+    preMaxGeom: null
+};
+
+function ovlTransViewport() {
+    return {
+        vw: chatNum(window.innerWidth, 1280 + 2 * OVL_TRANS_SCREEN_INSET),
+        vh: chatNum(window.innerHeight, 860 + 2 * OVL_TRANS_SCREEN_INSET)
+    };
+}
+
+// 按当前视口算一份自动尺寸 + 居中的几何（翻译器是"打开一份工作"的窗口，不像聊天窗
+// 是常驻的角落助手，所以默认居中而不是停靠右下角）。
+// ⚠️ v1 的两栏用的是 Tailwind lg:grid-cols-2（视口宽媒体查询，不是容器查询）：窗口拉窄
+// 不会让它退回单栏，只会把两栏挤扁，所以默认宽度必须给足（§3.6.6）。
+function ovlTransAutoGeom() {
+    const v = ovlTransViewport();
+    const w = Math.min(1280, Math.max(OVL_TRANS_MIN_W, v.vw - 96));
+    const h = Math.min(860, Math.max(OVL_TRANS_MIN_H, v.vh - 96));
+    return { x: Math.max(0, (v.vw - w) / 2), y: Math.max(0, (v.vh - h) / 2), w: w, h: h, mode: 'auto' };
+}
+
+// 宽松档：拖动中和窗口 resize 时用（照抄 chatClampGeom 14306 的语义）。
+function ovlTransClampGeom(g) {
+    const v = ovlTransViewport();
+    const out = {
+        x: chatNum(g && g.x, 0),
+        y: chatNum(g && g.y, 0),
+        w: chatNum(g && g.w, OVL_TRANS_MIN_W),
+        h: chatNum(g && g.h, OVL_TRANS_MIN_H),
+        mode: (g && g.mode === 'free') ? 'free' : 'auto'
+    };
+    out.w = Math.max(OVL_TRANS_MIN_W, Math.min(out.w, Math.max(OVL_TRANS_MIN_W, v.vw - OVL_TRANS_VIEWPORT_PAD)));
+    out.h = Math.max(OVL_TRANS_MIN_H, Math.min(out.h, Math.max(OVL_TRANS_MIN_H, v.vh - OVL_TRANS_VIEWPORT_PAD)));
+    out.x = Math.max(OVL_TRANS_EDGE_KEEP - out.w, Math.min(out.x, v.vw - OVL_TRANS_EDGE_KEEP));
+    out.y = Math.max(0, Math.min(out.y, Math.max(0, v.vh - OVL_TRANS_TITLEBAR_H)));
+    return out;
+}
+
+// 严格档：只在从 localStorage 恢复时用（照抄 chatClampGeomForRestore 14327 的语义）。
+function ovlTransClampGeomForRestore(g) {
+    const out = ovlTransClampGeom(g);
+    const v = ovlTransViewport();
+    const maxX = v.vw - out.w - OVL_TRANS_RESTORE_PAD;
+    const maxY = v.vh - out.h - OVL_TRANS_RESTORE_PAD;
+    if (maxX >= OVL_TRANS_RESTORE_PAD) out.x = Math.max(OVL_TRANS_RESTORE_PAD, Math.min(out.x, maxX));
+    if (maxY >= OVL_TRANS_RESTORE_PAD) out.y = Math.max(OVL_TRANS_RESTORE_PAD, Math.min(out.y, maxY));
+    return out;
+}
+
+// 一次写两个盒子（§3.6.6）：这就是"方案 A 把 #root 挪进窗框当子节点"省下来的那 6 行的代价，
+// 换来的是 DOM 树零改动（§3.3）。
+function ovlTransApplyGeom() {
+    const win = document.getElementById('ovlTransWin');
+    const root = document.getElementById('root');
+    if (!win || !root) return;
+    const g = OvlTransState.geom;
+    const B = OVL_TRANS_BORDER, TB = OVL_TRANS_TITLEBAR_H;
+    win.style.left = Math.round(g.x) + 'px';
+    win.style.top = Math.round(g.y) + 'px';
+    win.style.width = Math.round(g.w) + 'px';
+    win.style.height = Math.round(g.h) + 'px';
+    root.style.left = Math.round(g.x + B) + 'px';
+    root.style.top = Math.round(g.y + TB) + 'px';
+    root.style.width = Math.round(g.w - 2 * B) + 'px';
+    root.style.height = Math.round(g.h - TB - B) + 'px';
+}
+
+function ovlTransSaveGeom() {
+    try {
+        const g = OvlTransState.geom;
+        localStorage.setItem('ovl.transGeom', JSON.stringify({
+            x: Math.round(g.x), y: Math.round(g.y),
+            w: Math.round(g.w), h: Math.round(g.h),
+            mode: g.mode === 'free' ? 'free' : 'auto'
+        }));
+        try { localStorage.setItem('ovl.transMax', OvlTransState.maximized ? '1' : '0'); } catch (e) {}
+    } catch (e) {}
+}
+
+function ovlTransLoadGeom() {
+    try {
+        const raw = localStorage.getItem('ovl.transGeom');
+        if (!raw) return null;
+        const g = JSON.parse(raw);
+        return (g && typeof g === 'object') ? g : null;
+    } catch (e) { return null; }
+}
+
+// 最大化 / 还原：距视口四边各 24px ⇄ 用户自己的几何（§3.6.7）。这一颗是给习惯了 M1
+// 整页体验的用户留的退路。preMaxGeom 只在"要最大化"这一刻抄一份，还原时用它，
+// 绝不覆盖 OvlTransState.geom 本身（否则用户手动调过的尺寸会被最大化污染）。
+function ovlTransToggleMax() {
+    try {
+        const btn = document.getElementById('ovlTransMaxBtn');
+        if (OvlTransState.maximized) {
+            OvlTransState.geom = ovlTransClampGeom(OvlTransState.preMaxGeom || ovlTransAutoGeom());
+            OvlTransState.maximized = false;
+        } else {
+            OvlTransState.preMaxGeom = OvlTransState.geom;
+            const v = ovlTransViewport();
+            const inset = OVL_TRANS_SCREEN_INSET;
+            OvlTransState.geom = ovlTransClampGeom({
+                x: inset, y: inset, w: v.vw - 2 * inset, h: v.vh - 2 * inset, mode: 'free'
+            });
+            OvlTransState.maximized = true;
+        }
+        ovlTransApplyGeom();
+        ovlTransSaveGeom();
+        if (btn) btn.innerHTML = OvlTransState.maximized ? Icons.RestoreSmall : '&#10696;';
+        // 联动（§3.6.9 第 1 条）：几何变了，双栏对齐要重算。
+        try { scheduleAlignSync(); } catch (e) {}
+    } catch (e) {
+        console.error('[ovl-trans] toggleMax failed', e);
+    }
+}
+
+// 联动（§3.6.9 第 2 条）：window.resize 重夹一次，照抄 chatOnViewportResize(14682)。
+// 各自一个监听器、各自一个 try/catch，绝不和聊天窗那个合并（那边抛异常不许溅到这边）。
+function ovlTransOnViewportResize() {
+    try {
+        OvlTransState.geom = ovlTransClampGeom(OvlTransState.geom);
+        ovlTransApplyGeom();
+    } catch (e) {
+        console.error('[ovl-trans] viewport resize handler failed', e);
+    }
+}
+
+// —— 通用拖拽/缩放实现（§3.6.5）——
+// ovlWinBeginDrag 是 chatBeginDrag(约 14545 行) 的通用化版本，逐条移植了它记录的 10 个
+// 实测修复（连注释一起搬，注释里的实测数字是资产）。ctl 是一份几何控制器（形状见 §3.6.5），
+// 让这一份实现同时能服务翻译器窗口和（将来 M8c 时）聊天窗，而不用维护两份拖拽逻辑。
+//
+// 【两份实现的关系 —— 刻意的，不是疏忽】
+// 这一轮**没有**把 chatBeginDrag 改成调用它：聊天窗零自动化测试覆盖（4 个 pre-commit 套件
+// 一个都不测它），而它是用户每天在用的窗口。合并的收益是"少一份副本"，风险是"静默回归一个
+// 每天在用的窗口"——不对等。合并是 M8c，一次独立的、带 12 条手工回归清单的改动。
+function ovlWinBeginDrag(ev, kind, ctl) {
+    try {
+        if (ev.button != null && ev.button !== 0) return;                        // 修复1：只认左键
+        // 修复2：标题栏上的按钮不算把手，否则点它们会先起一次拖拽
+        if (kind === 'move' && ev.target && ev.target.closest && ev.target.closest('button')) return;
+        if (kind !== 'move' && ctl.locked()) return;
+        const capEl = ev.currentTarget || ev.target;
+        if (!capEl) return;
+        ev.preventDefault();
+
+        const startX = chatNum(ev.clientX, 0);
+        const startY = chatNum(ev.clientY, 0);
+        const g0 = ctl.get();
+        const start = { x: g0.x, y: g0.y, w: g0.w, h: g0.h };
+        const pid = ev.pointerId;
+        let finished = false;
+        ctl.setMoved(false);
+
+        // 修复3：rAF 合帧，攒的是结果不是增量
+        let pendingGeom = null;
+        let rafId = 0;
+        const raf = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame : null;
+        const caf = (typeof cancelAnimationFrame === 'function') ? cancelAnimationFrame : null;
+        function flush() {
+            rafId = 0;
+            if (!pendingGeom) return;
+            ctl.set(pendingGeom);
+            pendingGeom = null;
+            ctl.apply();
+        }
+        function schedule(g) {
+            pendingGeom = g;
+            if (!raf) { flush(); return; }        // 没有 rAF 的环境（测试沙箱）退回同步
+            if (!rafId) rafId = raf(flush);
+        }
+
+        // 修复4：setPointerCapture + 监听挂 document，拖出窗口不断
+        try { if (pid != null && capEl.setPointerCapture) capEl.setPointerCapture(pid); } catch (e) {}
+        // 【硬规定，§1.8(2) + §3.6.5】写的属性名必须是 data-aichat-drag（不是新名字）——
+        // handleGlobalClick 第 9551 行只认这个属性名；换名字就得去改那道防"静默吞掉用户
+        // 正在编辑的行"的守卫，而那是 v1 的正确性代码，属于"能不改就一个字节都别改"的那一类。
+        // 名字里带 aichat 是历史包袱：现在它是全站通用的"有窗口正在被拖"旗标，翻译器浮窗
+        // 和聊天窗共用同一个（963–973 行那套 CSS 因此也不用改）。
+        try { document.body.setAttribute('data-aichat-drag', kind); } catch (e) {}
+        const thisDragEnd = function () { onUp(); };
+        ctl.setActiveEnd(thisDragEnd);
+
+        function onMove(e) {
+            try {
+                // 修复5：兜底 buttons===0 → up 丢了，立刻自愈
+                if (e.buttons === 0) { onUp(); return; }
+                const dx = chatNum(e.clientX, startX) - startX;
+                const dy = chatNum(e.clientY, startY) - startY;
+                if (Math.abs(dx) > CHAT_DRAG_SLOP || Math.abs(dy) > CHAT_DRAG_SLOP) ctl.setMoved(true);
+                const v = chatViewport();
+                const maxW = Math.max(ctl.minW, v.vw - ctl.pad);
+                const maxH = Math.max(ctl.minH, v.vh - ctl.pad);
+                const g = { x: start.x, y: start.y, w: start.w, h: start.h, mode: 'free' };
+                if (kind === 'move') {
+                    g.x = start.x + dx;
+                    g.y = start.y + dy;
+                }
+                // 修复8：左/上边框先夹宽高、再由"原右下角 − 新宽高"反算左上角
+                if (CHAT_HANDLE_L[kind]) {
+                    const nw = Math.max(ctl.minW, Math.min(start.w - dx, maxW));
+                    g.x = start.x + (start.w - nw);
+                    g.w = nw;
+                }
+                if (CHAT_HANDLE_T[kind]) {
+                    const topMaxH = Math.min(maxH, start.y + start.h);
+                    const nh = Math.max(ctl.minH, Math.min(start.h - dy, topMaxH));
+                    g.y = start.y + (start.h - nh);
+                    g.h = nh;
+                }
+                if (CHAT_HANDLE_R[kind]) g.w = Math.max(ctl.minW, Math.min(start.w + dx, maxW));
+                if (CHAT_HANDLE_B[kind]) g.h = Math.max(ctl.minH, Math.min(start.h + dy, maxH));
+                schedule(ctl.clamp(g));
+            } catch (err) {
+                console.error('[' + ctl.tag + '] drag move failed', err);
+                onUp();
+            }
+        }
+
+        function onUp() {
+            if (finished) return;                 // 修复7：幂等哨兵
+            finished = true;
+            if (ctl.getActiveEnd() === thisDragEnd) ctl.setActiveEnd(null);
+            try { document.removeEventListener('pointermove', onMove); } catch (e) {}
+            try { document.removeEventListener('pointerup', onUp); } catch (e) {}
+            try { document.removeEventListener('pointercancel', onUp); } catch (e) {}
+            try { window.removeEventListener('blur', onUp); } catch (e) {}
+            try { if (pid != null && capEl.hasPointerCapture && capEl.hasPointerCapture(pid)) capEl.releasePointerCapture(pid); } catch (e) {}
+            try { document.body.removeAttribute('data-aichat-drag'); } catch (e) {}
+            // 修复9：落盘前先把攒着的那一帧写进去，否则快拖一下松手存的是上一帧的尺寸
+            try { if (rafId && caf) caf(rafId); } catch (e) {}
+            rafId = 0;
+            flush();
+            ctl.save();
+            // 联动（§3.6.9 第 1 条，仅翻译器窗口需要）：拖拽/缩放**结束时**（不是每帧）
+            // 重算双栏对齐。每帧调 renderApp/scheduleAlignSync 会让拖动肉眼可见地卡顿。
+            if (ctl.tag === 'ovl-trans') { try { scheduleAlignSync(); } catch (e) {} }
+        }
+
+        // 修复6：window blur 兜底（拖出窗口后 Alt-Tab，浏览器只给 blur）
+        document.addEventListener('pointermove', onMove);
+        document.addEventListener('pointerup', onUp);
+        document.addEventListener('pointercancel', onUp);
+        window.addEventListener('blur', onUp);
+    } catch (e) {
+        console.error('[' + ((ctl && ctl.tag) || 'ovl-win') + '] beginDrag failed', e);
+        try { document.body.removeAttribute('data-aichat-drag'); } catch (e2) {}
+    }
+}
+
+// 翻译器窗口的几何控制器（ctl 形状见 §3.6.5）。没有"最小化"这个概念，locked() 恒为 false。
+const OvlTransDragCtl = {
+    tag: 'ovl-trans',
+    minW: OVL_TRANS_MIN_W,
+    minH: OVL_TRANS_MIN_H,
+    pad: OVL_TRANS_VIEWPORT_PAD,
+    get: function () { return OvlTransState.geom; },
+    set: function (g) { OvlTransState.geom = g; },
+    apply: function () { ovlTransApplyGeom(); },
+    clamp: function (g) { return ovlTransClampGeom(g); },
+    save: function () { ovlTransSaveGeom(); },
+    locked: function () { return false; },
+    setMoved: function (b) { OvlTransState.dragMoved = b; },
+    getActiveEnd: function () { return ovlTransActiveDragEnd; },
+    setActiveEnd: function (fn) { ovlTransActiveDragEnd = fn; }
+};
+
+// —— 窗框 HTML（§3.6.7）——
+// data-tip 纪律：标题栏本身不带 data-tip（会和标题文字的 data-tip 形成祖先—后代），
+// 提示挂在标题文字和两颗按钮各自身上。
+function ovlTransWinHtml() {
+    return ''
+        + '<div class="ovl-transwin-titlebar" id="ovlTransTitleBar">'
+        +   '<span class="ovl-transwin-title-icon">' + Icons.Languages + '</span>'
+        +   '<span class="ovl-transwin-title-text" data-tip="按住这里拖动窗口。四条边和四个角都能拖着改大小（和 Windows 的窗口一样，拖左边或上边时对面那条边钉住不动）。" data-tip-pos="bottom-start">AI 翻译器</span>'
+        +   '<span class="ovl-transwin-title-spacer"></span>'
+        +   '<span class="ovl-transwin-titlebtns">'
+        +     '<button type="button" class="ovl-transwin-iconbtn" id="ovlTransMaxBtn" data-tip="最大化 / 还原" data-tip-pos="bottom-end">&#10696;</button>'
+        +     '<button type="button" class="ovl-transwin-iconbtn" id="ovlTransCloseBtn" data-tip="关闭（Esc 也一样），回到 Overleaf 外壳视图。位置和大小会记住。" data-tip-pos="bottom-end">' + Icons.XSmall + '</button>'
+        +   '</span>'
+        + '</div>'
+        // 八向缩放手柄：必须是 #ovlTransWin 的直接子节点（不是标题栏内部），理由和
+        // .aichat-resize 那段注释一样——圆角容器会裁掉四角，手柄放里面角上会失效。
+        + '<div class="ovl-transwin-resize ovl-transwin-resize-l"  data-h="l"  data-tip="拖左边框改宽度（右边缘钉住不动）。" data-tip-pos="right"></div>'
+        + '<div class="ovl-transwin-resize ovl-transwin-resize-r"  data-h="r"  data-tip="拖右边框改宽度。" data-tip-pos="left"></div>'
+        + '<div class="ovl-transwin-resize ovl-transwin-resize-t"  data-h="t"  data-tip="拖上边框改高度（下边缘钉住不动）。" data-tip-pos="bottom"></div>'
+        + '<div class="ovl-transwin-resize ovl-transwin-resize-b"  data-h="b"  data-tip="拖下边框改高度。" data-tip-pos="top"></div>'
+        + '<div class="ovl-transwin-resize ovl-transwin-resize-tl" data-h="tl" data-tip="拖左上角同时改宽高（右下角钉住不动）。" data-tip-pos="bottom-start"></div>'
+        + '<div class="ovl-transwin-resize ovl-transwin-resize-tr" data-h="tr" data-tip="拖右上角同时改宽高（左下角钉住不动）。" data-tip-pos="bottom-end"></div>'
+        + '<div class="ovl-transwin-resize ovl-transwin-resize-bl" data-h="bl" data-tip="拖左下角同时改宽高（右上角钉住不动）。" data-tip-pos="top-start"></div>'
+        + '<div class="ovl-transwin-resize ovl-transwin-resize-br" data-h="br" data-tip="拖右下角同时改宽高（左上角钉住不动）。" data-tip-pos="top-end"></div>';
+}
+
+// 建节点（幂等，照抄 ensureChatRoot 的范式）：#ovlTransWin 是 <body> 的直接子节点，
+// 永不进 #ovlPortal（会建立层叠上下文，z-index 逃不出去，见 §3.6.4 方案 B）。
+function ovlTransEnsureWin() {
+    try {
+        let win = document.getElementById('ovlTransWin');
+        if (win) return win;
+        if (!document.body) return null;
+
+        win = document.createElement('div');
+        win.id = 'ovlTransWin';
+        win.innerHTML = ovlTransWinHtml();
+        document.body.appendChild(win);
+        ovlTransBindWin(win);
+        OvlTransState.mounted = true;
+
+        let savedMax = false;
+        try { savedMax = localStorage.getItem('ovl.transMax') === '1'; } catch (e) {}
+        const stored = ovlTransLoadGeom();
+        OvlTransState.geom = stored ? ovlTransClampGeomForRestore(stored) : ovlTransClampGeom(ovlTransAutoGeom());
+        OvlTransState.maximized = false;   // 最大化态本身不持久化几何冲突：下次打开先按存的用户几何摆
+        if (savedMax) {
+            // 只在有存过用户几何的前提下把"上次是最大化"的状态还原，preMaxGeom 用刚恢复的那份。
+            OvlTransState.preMaxGeom = OvlTransState.geom;
+            const v = ovlTransViewport();
+            const inset = OVL_TRANS_SCREEN_INSET;
+            OvlTransState.geom = ovlTransClampGeom({ x: inset, y: inset, w: v.vw - 2 * inset, h: v.vh - 2 * inset, mode: 'free' });
+            OvlTransState.maximized = true;
+        }
+        ovlTransApplyGeom();
+        const maxBtn = document.getElementById('ovlTransMaxBtn');
+        if (maxBtn) maxBtn.innerHTML = OvlTransState.maximized ? Icons.RestoreSmall : '&#10696;';
+        return win;
+    } catch (e) {
+        console.error('[ovl-trans] ensureWin failed', e);
+        return null;
+    }
+}
+
+function ovlTransBindWin(win) {
+    // 第一道防线：窗框内部的 click/mousedown/pointerdown 不冒泡到 document —— 道理和
+    // chatBindShell 头三行一样：不拦住的话，行内编辑态下点标题栏会被 handleGlobalClick
+    // 当成"点了空白区域"。第二道防线是 handleGlobalClick 里"在 #root 之外且不是
+    // body/html 本身"那条通用豁免（§1.8 第 3 条），#ovlTransWin 天然吃得到，不用再按 id 补。
+    win.addEventListener('click', chatStopEvent);
+    win.addEventListener('mousedown', chatStopEvent);
+    win.addEventListener('pointerdown', chatStopEvent);
+
+    const bar = win.querySelector('#ovlTransTitleBar');
+    if (bar) {
+        bar.addEventListener('pointerdown', function (e) {
+            ovlWinBeginDrag(e, 'move', OvlTransDragCtl);
+        });
+    }
+
+    const handles = win.querySelectorAll('.ovl-transwin-resize');
+    for (let i = 0; i < handles.length; i++) {
+        (function (h) {
+            const kind = h.getAttribute('data-h') || '';
+            if (!kind) return;
+            h.addEventListener('pointerdown', function (e) { ovlWinBeginDrag(e, kind, OvlTransDragCtl); });
+        })(handles[i]);
+    }
+
+    const maxBtn = win.querySelector('#ovlTransMaxBtn');
+    if (maxBtn) maxBtn.addEventListener('click', function (e) { chatStopEvent(e); ovlTransToggleMax(); });
+
+    const closeBtn = win.querySelector('#ovlTransCloseBtn');
+    if (closeBtn) closeBtn.addEventListener('click', function (e) { chatStopEvent(e); ovlCloseTranslator(); });
+
+    window.addEventListener('resize', ovlTransOnViewportResize);
+
+    // Esc 关窗，照抄 chatBindShell（约 14794 行）那段谨慎写法：只在焦点确实在窗内、
+    // 或者谁都没被聚焦时才动手；用户在 v1 行内 textarea 里按 Esc 是他和那个 textarea 的事。
+    document.addEventListener('keydown', function (e) {
+        try {
+            if (!e || e.key !== 'Escape' || !document.body.classList.contains('ovl-translator-open')) return;
+            const active = document.activeElement;
+            const insideWin = !!(active && active.closest && active.closest('#ovlTransWin'));
+            const insideRoot = !!(active && active.closest && active.closest('#root'));
+            const nothingFocused = (!active || active === document.body);
+            if (insideWin || nothingFocused) ovlCloseTranslator();
+            else if (insideRoot) return; // v1 内部（比如同义词弹窗）自己处理 Esc，不越权抢
+        } catch (err) {}
+    });
+}
+
+// 打开 v1 翻译器浮层：只加 class，不动 DOM 树（§3.3）；#ovlTransWin/#root 的几何由
+// OvlTransState.geom 驱动（§3.6，M1.5 取代了 M1 那版整页 inset:0 的写法）。
 function ovlOpenTranslator() {
     try {
+        const win = ovlTransEnsureWin();
+        if (!win) throw new Error('ovlTransEnsureWin returned null');
         document.body.classList.add('ovl-translator-open');
+        // 用户没碰过窗口（mode 'auto'）时，每次打开都按当前视口重新居中一次；
+        // 碰过了（mode 'free'）就尊重存下来的几何，只把它拉回视口内。
+        OvlTransState.geom = (OvlTransState.geom.mode === 'free' && !OvlTransState.maximized)
+            ? ovlTransClampGeomForRestore(OvlTransState.geom)
+            : ovlTransClampGeom(OvlTransState.geom.mode === 'free' ? OvlTransState.geom : ovlTransAutoGeom());
+        ovlTransApplyGeom();
         // 显示后必须补一次 renderApp：display:none 期间量出来的双栏对齐高度全是 0。
         try { renderApp(false); } catch (e2) { console.error('[ovl] renderApp after open failed', e2); }
+        try { scheduleAlignSync(); } catch (e3) {}
     } catch (e) {
         console.error('[ovl] openTranslator failed', e);
     }
@@ -19196,7 +19844,14 @@ function ovlOpenTranslator() {
 
 function ovlCloseTranslator() {
     try {
+        // 关闭必须是拖拽状态的确定性终点，理由和 chatClose（18743 行）逐字一样：
+        // Esc 在拖拽途中把窗口关掉，若不主动收尾，document/window 上的监听器和
+        // data-aichat-drag 都不会被清，拖拽会在窗口视觉消失之后继续在后台跑。
+        if (typeof ovlTransActiveDragEnd === 'function') { try { ovlTransActiveDragEnd(); } catch (e) {} }
         document.body.classList.remove('ovl-translator-open');
+        // 焦点还给图标栏那颗 ⧉ 按钮（照抄 chatClose 的"焦点交还"纪律）。
+        const back = document.getElementById('ovlOpenTranslatorBtn');
+        if (back && back.focus) { try { back.focus(); } catch (e) {} }
     } catch (e) {
         console.error('[ovl] closeTranslator failed', e);
     }
@@ -19448,6 +20103,347 @@ async function ovlPickFolder() {
     }
 }
 
+// ==================== M8a：命令注册表 + 编辑器工具条 + 查找/替换（§3.5）====================
+// 决策 D：编辑动作只实现一次，工具条（这一轮）和菜单栏（M8b，以后）都只是它的触发器。
+// 命令一律对 #ovlCodeArea 生效；Visual 模式下 enabled() 一律返回 false（M5 之前 Visual 是占位符）。
+
+// 所有往 <textarea> 里插字的命令，必须走 document.execCommand('insertText', ...)，绝不能
+// 直接写 ta.value —— 直接写 value 会清空浏览器原生撤销栈（§3.5 实现铁律第 1 条）。
+function ovlEditableEnabled() {
+    try {
+        if (OvlState.editorMode !== 'code') return false;
+        const ta = document.getElementById('ovlCodeArea');
+        return !!(ta && !ta.disabled);
+    } catch (e) { return false; }
+}
+
+function ovlFocusTa() {
+    const ta = document.getElementById('ovlCodeArea');
+    if (ta && !ta.disabled) { try { ta.focus(); } catch (e) {} }
+    return (ta && !ta.disabled) ? ta : null;
+}
+
+function ovlInsertText(s) {
+    try {
+        const ta = ovlFocusTa();
+        if (!ta) return;
+        document.execCommand('insertText', false, s);
+        ovlRenderGutter(false);
+    } catch (e) { console.error('[ovl] insertText failed', e); }
+}
+
+// 选区非空时把选中文字包起来；选区为空时插入一对空括号并把光标定在中间，方便直接打字。
+function ovlWrapSelection(pre, post) {
+    try {
+        const ta = ovlFocusTa();
+        if (!ta) return;
+        const start = ta.selectionStart, end = ta.selectionEnd;
+        const sel = ta.value.slice(start, end);
+        document.execCommand('insertText', false, pre + sel + post);
+        if (start === end) {
+            const pos = start + pre.length;
+            ta.setSelectionRange(pos, pos);
+        }
+        ovlRenderGutter(false);
+    } catch (e) { console.error('[ovl] wrapSelection failed', e); }
+}
+
+const OVL_FIGURE_SNIPPET = '\\begin{figure}[h]\n  \\centering\n  \\includegraphics[width=0.8\\linewidth]{filename}\n  \\caption{caption}\n  \\label{fig:label}\n\\end{figure}\n';
+const OVL_TABLE_SNIPPET = '\\begin{table}[h]\n  \\centering\n  \\begin{tabular}{cc}\n    a & b \\\\\n    c & d \\\\\n  \\end{tabular}\n  \\caption{caption}\n  \\label{tab:label}\n\\end{table}\n';
+const OVL_LIST_SNIPPET = '\\begin{itemize}\n  \\item \n\\end{itemize}\n';
+const OVL_HEADING_CMD_MAP = { section: '\\section{', subsection: '\\subsection{', subsubsection: '\\subsubsection{', paragraph: '\\paragraph{' };
+
+// 撤销 / 重做：走浏览器原生撤销栈，不是我们自己的。诚实标注（面板 data-tip 里写明）：
+// ovlOpenFile 会写 ta.value（打开新文件），那一刻原生撤销栈会被清空 —— 已知且可接受，
+// 不假装有跨文件的撤销历史（§3.5 实现铁律第 2 条）。
+function ovlCmdUndo() { try { const ta = ovlFocusTa(); if (ta) document.execCommand('undo'); ovlRenderGutter(false); } catch (e) { console.error('[ovl] undo failed', e); } }
+function ovlCmdRedo() { try { const ta = ovlFocusTa(); if (ta) document.execCommand('redo'); ovlRenderGutter(false); } catch (e) { console.error('[ovl] redo failed', e); } }
+
+// 命令注册表（形状照 §3.5 写死）。UI（工具条这一轮 / 菜单栏 M8b）一律只是它的触发器。
+const OvlCmds = {
+    'edit.undo':      { label: '撤销',   key: 'Ctrl+Z',       run: ovlCmdUndo, enabled: () => OvlState.editorMode === 'code' },
+    'edit.redo':      { label: '重做',   key: 'Ctrl+Shift+Z', run: ovlCmdRedo, enabled: () => OvlState.editorMode === 'code' },
+    'edit.find':      { label: '查找/替换', key: 'Ctrl+F',    run: () => ovlFindOpen(), enabled: () => OvlState.editorMode === 'code' },
+    'fmt.bold':       { label: '加粗',   key: 'Ctrl+B', run: () => ovlWrapSelection('\\textbf{', '}'), enabled: ovlEditableEnabled },
+    'fmt.italic':     { label: '斜体',   key: 'Ctrl+I', run: () => ovlWrapSelection('\\textit{', '}'), enabled: ovlEditableEnabled },
+    'fmt.heading':    { label: '标题级别', run: (level) => { const pre = OVL_HEADING_CMD_MAP[level]; if (pre) ovlWrapSelection(pre, '}'); }, enabled: ovlEditableEnabled },
+    'ins.mathInline': { label: '行内公式', run: () => ovlWrapSelection('$', '$'), enabled: ovlEditableEnabled },
+    'ins.symbol':     { label: '希腊字母', run: () => ovlInsertText('\\alpha'), enabled: ovlEditableEnabled },
+    'ins.link':       { label: '链接',   run: () => ovlWrapSelection('\\href{URL}{', '}'), enabled: ovlEditableEnabled },
+    'ins.xref':       { label: '交叉引用', run: () => ovlWrapSelection('\\ref{', '}'), enabled: ovlEditableEnabled },
+    'ins.cite':       { label: '引文',   run: () => ovlWrapSelection('\\cite{', '}'), enabled: ovlEditableEnabled },
+    'ins.figure':     { label: '图',     run: () => ovlInsertText(OVL_FIGURE_SNIPPET), enabled: ovlEditableEnabled },
+    'ins.table':      { label: '表',     run: () => ovlInsertText(OVL_TABLE_SNIPPET), enabled: ovlEditableEnabled },
+    'ins.list':       { label: '列表',   run: () => ovlInsertText(OVL_LIST_SNIPPET), enabled: ovlEditableEnabled }
+};
+
+// 唯一入口：查表 → enabled() → run()，全程 try/catch。
+function ovlRunCmd(id, arg) {
+    try {
+        const cmd = OvlCmds[id];
+        if (!cmd) return;
+        if (typeof cmd.enabled === 'function' && !cmd.enabled()) return;
+        cmd.run(arg);
+    } catch (e) {
+        console.error('[ovl] runCmd failed: ' + id, e);
+    }
+}
+
+// ---- 查找 / 替换（§2.6.4，实现纲要见 §4.0/M8a）----
+const OvlFindState = {
+    caseSensitive: false,
+    regex: false,
+    wholeWord: false,
+    inSelection: false,
+    matches: [],   // [[start,end], ...]
+    idx: -1
+};
+
+function ovlFindBuildRegex(query) {
+    if (!query) return null;
+    try {
+        if (OvlFindState.regex) {
+            return new RegExp(query, 'g' + (OvlFindState.caseSensitive ? '' : 'i'));
+        }
+        let esc = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        if (OvlFindState.wholeWord) esc = '\\b' + esc + '\\b';
+        return new RegExp(esc, 'g' + (OvlFindState.caseSensitive ? '' : 'i'));
+    } catch (e) {
+        // 用户敲了个孤零零的 [ 之类的非法正则，不许让面板炸掉（§4.0 M8a 明文要求）。
+        return null;
+    }
+}
+
+function ovlFindUpdateCount(hadQuery) {
+    const countEl = document.getElementById('ovlFindCount');
+    if (!countEl) return;
+    if (!hadQuery) { countEl.textContent = ''; return; }
+    countEl.textContent = OvlFindState.matches.length
+        ? (OvlFindState.idx + 1) + '/' + OvlFindState.matches.length
+        : '0/0';
+}
+
+// preserveIdx=false：从当前光标位置起找最近一个命中当"当前项"（典型于新查询/切换开关）。
+// preserveIdx=true：尽量保留原 idx（用于 Replace 之后重扫，光标已经移到刚替换的位置）。
+function ovlFindRecompute(preserveIdx) {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        const input = document.getElementById('ovlFindInput');
+        if (!ta || !input) return;
+        const query = input.value;
+        input.classList.remove('ovl-find-bad');
+        OvlFindState.matches = [];
+        if (!query) { OvlFindState.idx = -1; ovlFindUpdateCount(false); return; }
+        const re = ovlFindBuildRegex(query);
+        if (!re) { input.classList.add('ovl-find-bad'); OvlFindState.idx = -1; ovlFindUpdateCount(false); return; }
+
+        let scanText = ta.value;
+        let scanOffset = 0;
+        if (OvlFindState.inSelection && ta.selectionStart !== ta.selectionEnd) {
+            scanOffset = ta.selectionStart;
+            scanText = ta.value.slice(ta.selectionStart, ta.selectionEnd);
+        }
+        let m, guard = 0;
+        while ((m = re.exec(scanText)) !== null) {
+            OvlFindState.matches.push([m.index + scanOffset, m.index + scanOffset + m[0].length]);
+            if (m[0].length === 0) re.lastIndex++;      // 零宽匹配（如 \b\b）防死循环
+            if (++guard > 20000) break;                  // 防炸：极端病态正则不许把标签页锁死
+        }
+        if (!preserveIdx) {
+            const cur = ta.selectionEnd;
+            const idx = OvlFindState.matches.findIndex((r) => r[0] >= cur);
+            OvlFindState.idx = idx === -1 ? (OvlFindState.matches.length ? 0 : -1) : idx;
+        } else if (OvlFindState.idx >= OvlFindState.matches.length) {
+            OvlFindState.idx = OvlFindState.matches.length ? 0 : -1;
+        }
+        ovlFindUpdateCount(true);
+        if (OvlFindState.idx >= 0) ovlFindSelectCurrent();
+    } catch (e) {
+        console.error('[ovl] findRecompute failed', e);
+    }
+}
+
+function ovlFindSelectCurrent() {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        const r = OvlFindState.matches[OvlFindState.idx];
+        if (!ta || !r) return;
+        // 【不 focus ta】查找面板打开期间焦点应该一直留在 #ovlFindInput 里，这样用户能连续
+        // 敲字 / 按 Enter 循环下一个，而不会每次重算命中就把焦点抢走、把接下来敲的字打进
+        // 编辑器正文（实测复现：输入 "alpha" 第一个字符触发 recompute 抢走焦点，剩下
+        // 4 个字符被当成编辑器按键处理，把文档改成了 "lphalpha"）。setSelectionRange 在
+        // 未聚焦的 textarea 上一样生效并显示灰底选中，Replace/ReplaceAll 需要 ta 焦点时
+        // 会在各自的函数体里自己 focus。
+        ta.setSelectionRange(r[0], r[1]);
+        // 把命中行滚进视口：按换行数估算行号 × 行高（.ovl-code-area 是 12px/1.5 ≈ 18px/行）。
+        const before = ta.value.slice(0, r[0]);
+        const line = before.split('\n').length - 1;
+        const lineHeight = 18;
+        ta.scrollTop = Math.max(0, line * lineHeight - ta.clientHeight / 2);
+        const gutter = document.getElementById('ovlGutter');
+        if (gutter) gutter.scrollTop = ta.scrollTop;
+    } catch (e) { console.error('[ovl] findSelectCurrent failed', e); }
+}
+
+function ovlFindNext() {
+    if (!OvlFindState.matches.length) { ovlFindRecompute(false); return; }
+    OvlFindState.idx = (OvlFindState.idx + 1) % OvlFindState.matches.length;
+    ovlFindUpdateCount(true);
+    ovlFindSelectCurrent();
+}
+function ovlFindPrev() {
+    if (!OvlFindState.matches.length) { ovlFindRecompute(false); return; }
+    OvlFindState.idx = (OvlFindState.idx - 1 + OvlFindState.matches.length) % OvlFindState.matches.length;
+    ovlFindUpdateCount(true);
+    ovlFindSelectCurrent();
+}
+
+function ovlFindOpen() {
+    try {
+        const panel = document.getElementById('ovlEditorPanel');
+        const ta = document.getElementById('ovlCodeArea');
+        const input = document.getElementById('ovlFindInput');
+        if (!panel) return;
+        panel.setAttribute('data-find', 'open');
+        if (input) {
+            if (ta && !ta.disabled && ta.selectionStart !== ta.selectionEnd) {
+                input.value = ta.value.slice(ta.selectionStart, ta.selectionEnd);
+            }
+            input.focus();
+            input.select();
+        }
+        ovlFindRecompute(false);
+    } catch (e) { console.error('[ovl] findOpen failed', e); }
+}
+
+function ovlFindClose() {
+    try {
+        const panel = document.getElementById('ovlEditorPanel');
+        if (panel) panel.removeAttribute('data-find');
+        OvlFindState.matches = [];
+        OvlFindState.idx = -1;
+        const ta = document.getElementById('ovlCodeArea');
+        if (ta && !ta.disabled) { try { ta.focus(); } catch (e) {} }
+    } catch (e) { console.error('[ovl] findClose failed', e); }
+}
+
+// 替换走 insertText（保住撤销栈），一次只处理"当前项"。
+function ovlReplaceCurrent() {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        const replaceInput = document.getElementById('ovlReplaceInput');
+        if (!ta || ta.disabled || !replaceInput) return;
+        if (OvlFindState.idx < 0 || !OvlFindState.matches[OvlFindState.idx]) { ovlFindNext(); return; }
+        const r = OvlFindState.matches[OvlFindState.idx];
+        ta.focus();
+        ta.setSelectionRange(r[0], r[1]);
+        document.execCommand('insertText', false, replaceInput.value);
+        ovlRenderGutter(false);
+        ovlFindRecompute(true);
+    } catch (e) { console.error('[ovl] replaceCurrent failed', e); }
+}
+
+// Replace All：一次性算出全部命中、拼出替换后的整段文字，再**一次** insertText 整篇替换
+// （§4.0 M8a 明文要求：4132 行的 main.tex 上不许循环几千次）。代价是占撤销栈一格，这是对的。
+function ovlReplaceAll() {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        const input = document.getElementById('ovlFindInput');
+        const replaceInput = document.getElementById('ovlReplaceInput');
+        if (!ta || ta.disabled || !input || !replaceInput) return;
+        const query = input.value;
+        if (!query) return;
+        const re = ovlFindBuildRegex(query);
+        if (!re) { input.classList.add('ovl-find-bad'); return; }
+        const repl = replaceInput.value;
+        const text = ta.value;
+        let rangeStart = 0, rangeEnd = text.length;
+        if (OvlFindState.inSelection && ta.selectionStart !== ta.selectionEnd) {
+            rangeStart = ta.selectionStart; rangeEnd = ta.selectionEnd;
+        }
+        const before = text.slice(0, rangeStart);
+        const mid = text.slice(rangeStart, rangeEnd);
+        const after = text.slice(rangeEnd);
+        const newMid = mid.replace(re, repl);
+        const newText = before + newMid + after;
+        if (newText === text) { ovlFindRecompute(false); return; }
+        ta.focus();
+        ta.setSelectionRange(0, ta.value.length);
+        document.execCommand('insertText', false, newText);
+        ovlRenderGutter(true);
+        ovlFindRecompute(false);
+    } catch (e) { console.error('[ovl] replaceAll failed', e); }
+}
+
+function ovlBindFindBar() {
+    try {
+        const input = document.getElementById('ovlFindInput');
+        if (input) {
+            input.addEventListener('input', function () { ovlFindRecompute(false); });
+            input.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter') { e.preventDefault(); if (e.shiftKey) ovlFindPrev(); else ovlFindNext(); }
+                else if (e.key === 'Escape') { e.preventDefault(); ovlFindClose(); }
+            });
+        }
+        const replaceInput = document.getElementById('ovlReplaceInput');
+        if (replaceInput) {
+            replaceInput.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter') { e.preventDefault(); ovlReplaceCurrent(); }
+                else if (e.key === 'Escape') { e.preventDefault(); ovlFindClose(); }
+            });
+        }
+        const toggles = [
+            ['ovlFindCaseBtn', 'caseSensitive'],
+            ['ovlFindRegexBtn', 'regex'],
+            ['ovlFindWordBtn', 'wholeWord'],
+            ['ovlFindSelBtn', 'inSelection']
+        ];
+        toggles.forEach(function (pair) {
+            const btn = document.getElementById(pair[0]);
+            if (!btn) return;
+            btn.addEventListener('click', function () {
+                OvlFindState[pair[1]] = !OvlFindState[pair[1]];
+                btn.classList.toggle('ovl-active', OvlFindState[pair[1]]);
+                ovlFindRecompute(false);
+            });
+        });
+        const prevBtn = document.getElementById('ovlFindPrevBtn');
+        if (prevBtn) prevBtn.addEventListener('click', ovlFindPrev);
+        const nextBtn = document.getElementById('ovlFindNextBtn');
+        if (nextBtn) nextBtn.addEventListener('click', ovlFindNext);
+        const closeBtn = document.getElementById('ovlFindCloseBtn');
+        if (closeBtn) closeBtn.addEventListener('click', ovlFindClose);
+        const replaceBtn = document.getElementById('ovlReplaceBtn');
+        if (replaceBtn) replaceBtn.addEventListener('click', ovlReplaceCurrent);
+        const replaceAllBtn = document.getElementById('ovlReplaceAllBtn');
+        if (replaceAllBtn) replaceAllBtn.addEventListener('click', ovlReplaceAll);
+    } catch (e) {
+        console.error('[ovl] bindFindBar failed', e);
+    }
+}
+
+// 编辑器命令快捷键：只在 #ovlCodeArea 或查找面板输入框有焦点时生效，不装成全局 keydown ——
+// 不这样做的话会和 v1 页面里别处的快捷键（以及浏览器自己的）打架。Ctrl+Z 普通撤销交给
+// 浏览器原生行为，这里只接管浏览器默认不处理的那几个（Bold/Italic/Find/Redo 的第二种写法）。
+function ovlBindEditorShortcuts() {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta) return;
+        ta.addEventListener('keydown', function (e) {
+            if (!(e.ctrlKey || e.metaKey)) return;
+            const k = (e.key || '').toLowerCase();
+            if (k === 'f') { e.preventDefault(); ovlRunCmd('edit.find'); }
+            else if (k === 'b') { e.preventDefault(); ovlRunCmd('fmt.bold'); }
+            else if (k === 'i') { e.preventDefault(); ovlRunCmd('fmt.italic'); }
+            else if (k === 'y') { e.preventDefault(); ovlRunCmd('edit.redo'); }
+            else if (k === 'z' && e.shiftKey) { e.preventDefault(); ovlRunCmd('edit.redo'); }
+            // 普通 Ctrl+Z：不 preventDefault，交给浏览器原生撤销栈。
+        });
+    } catch (e) {
+        console.error('[ovl] bindEditorShortcuts failed', e);
+    }
+}
+
 function ovlBindShell() {
     try {
         const treeBtn = document.getElementById('ovlTreeToggleBtn');
@@ -19465,8 +20461,8 @@ function ovlBindShell() {
         const pickBtn = document.getElementById('ovlPickFolderBtn');
         if (pickBtn) pickBtn.addEventListener('click', ovlPickFolder);
 
-        const closeBtn = document.getElementById('ovlTranslatorCloseBtn');
-        if (closeBtn) closeBtn.addEventListener('click', ovlCloseTranslator);
+        // 翻译器关闭按钮已搬进 #ovlTransWin 自己的标题栏（ovlTransBindWin 绑定），
+        // 这里不再需要按 #ovlTranslatorCloseBtn 绑（§3.6.8 删除清单第 5 条）。
 
         const layoutBtn = document.getElementById('ovlLayoutBtn');
         if (layoutBtn) layoutBtn.addEventListener('click', function (e) {
@@ -19512,6 +20508,26 @@ function ovlBindShell() {
                 if (gutter) gutter.scrollTop = ta.scrollTop;
             });
         }
+
+        // M8a：命令工具条通用绑定 —— 扫一遍 [data-cmd]，新增一颗按钮不用改这里一行。
+        const toolbar = document.getElementById('ovlEditorPanel');
+        if (toolbar) {
+            toolbar.addEventListener('click', function (e) {
+                const btn = e.target.closest('[data-cmd]');
+                if (!btn) return;
+                ovlRunCmd(btn.getAttribute('data-cmd'));
+            });
+        }
+        const headingSelect = document.getElementById('ovlHeadingSelect');
+        if (headingSelect) {
+            headingSelect.addEventListener('change', function () {
+                const level = headingSelect.value;
+                if (level) ovlRunCmd('fmt.heading', level);
+                headingSelect.value = '';
+            });
+        }
+        ovlBindFindBar();
+        ovlBindEditorShortcuts();
 
         const dirInput = document.getElementById('ovlWebkitDirInput');
         if (dirInput) {
