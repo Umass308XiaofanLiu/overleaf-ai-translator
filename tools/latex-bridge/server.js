@@ -45,6 +45,9 @@ const ENGINE_BIN = {
     lualatex: path.join(TEXBIN, 'lualatex' + EXE)
 };
 const TEXCOUNT = path.join(TEXBIN, 'texcount' + EXE);
+// v2 Pass E：M10 SyncTeX 正向（源码 → PDF）。真跑 TeX Live 自带的 synctex.exe view 子命令，
+// 不自己解析 .synctex.gz 二进制格式（§0 硬约束纪律的同一条：能用真工具就不要重新发明）。
+const SYNCTEX = path.join(TEXBIN, 'synctex' + EXE);
 
 // 全部编译产物都落在系统临时目录下的这个子目录，绝不碰用户的项目文件夹。
 const WORK_ROOT = path.join(os.tmpdir(), 'ai-translator-latex-bridge');
@@ -425,6 +428,81 @@ function doWordCount(projectDir, mainFile) {
 }
 
 // ---------------------------------------------------------------------------
+// /synctex/forward —— 源码行号 -> PDF 页码+坐标（M10 SyncTeX 正向）。
+// 用真的 `synctex view -i line:col:mainAbs -o outdir/output.pdf`，实测（2026-08-24，本机
+// TeX Live 2025）"-i" 的 input 参数必须是 pdflatex 编译时看到的**那个原样字符串**——
+// 桥编译时传给引擎的是绝对路径（doCompile 里的 mainAbs），所以这里也必须用绝对路径，
+// 传相对文件名会得到 "SyncTeX Warning: No tag for xxx.tex" 且没有 Page/x/y 可解析。
+// ---------------------------------------------------------------------------
+
+function doSyncTexForward(outdir, mainAbs, line, column) {
+    return new Promise((resolve) => {
+        if (!fs.existsSync(SYNCTEX)) {
+            resolve({ ok: false, error: 'synctex 未找到: ' + SYNCTEX + '（检查 LATEX_BRIDGE_TEXBIN / TeX Live 是否安装）' });
+            return;
+        }
+        const pdfPath = path.join(outdir, 'output.pdf');
+        const synctexGz = path.join(outdir, 'output.synctex.gz');
+        if (!fs.existsSync(pdfPath) || !fs.existsSync(synctexGz)) {
+            resolve({ ok: false, error: '这次编译没有产出 output.synctex.gz（先 Recompile 一次成功的编译）' });
+            return;
+        }
+        const args = ['view', '-i', line + ':' + (column || 0) + ':' + mainAbs, '-o', pdfPath];
+        let child;
+        try {
+            child = spawn(SYNCTEX, args, { windowsHide: true });
+        } catch (e) {
+            resolve({ ok: false, error: 'spawn synctex failed: ' + e.message });
+            return;
+        }
+        let resolved = false;
+        const outBuf = [];
+        const timer = setTimeout(() => {
+            if (resolved) return;
+            resolved = true;
+            try { child.kill(); } catch (e) {}
+            resolve({ ok: false, error: 'synctex 超时（10s）' });
+        }, 10000);
+        child.stdout.on('data', (c) => outBuf.push(c));
+        child.on('error', (err) => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timer);
+            resolve({ ok: false, error: 'synctex process error: ' + err.message });
+        });
+        child.on('close', () => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timer);
+            const text = Buffer.concat(outBuf).toString('utf8');
+            // 输出形如：
+            //   SyncTeX result begin
+            //   Output:...\output.pdf
+            //   Page:5
+            //   x:100.0
+            //   y:200.0
+            //   ...
+            //   SyncTeX result end
+            const grab = (re) => { const m = re.exec(text); return m ? parseFloat(m[1]) : null; };
+            const page = grab(/^Page:(\d+)/m);
+            if (page === null) {
+                resolve({ ok: false, error: '没有匹配结果（可能这一行不在正文渲染范围内，比如注释/导言区），synctex 原始输出：' + text.trim() });
+                return;
+            }
+            resolve({
+                ok: true,
+                page: page,
+                x: grab(/^x:([\d.\-]+)/m),
+                y: grab(/^y:([\d.\-]+)/m),
+                h: grab(/^h:([\d.\-]+)/m),
+                v: grab(/^v:([\d.\-]+)/m),
+                raw: text
+            });
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 路由
 // ---------------------------------------------------------------------------
 
@@ -454,7 +532,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, GET /health, GET /output/:id/:file, POST /clear');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, GET /health, GET /output/:id/:file, POST /clear');
             return;
         }
 
@@ -517,6 +595,30 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
             const result = await doWordCount(projectDir, mainFile);
+            sendJson(res, 200, result);
+            return;
+        }
+
+        // M10 SyncTeX 正向：{id, mainFile, projectDir, line, column?} -> {page,x,y,h,v}
+        if (req.method === 'POST' && pathname === '/synctex/forward') {
+            const bodyText = await readBody(req);
+            let body;
+            try { body = JSON.parse(bodyText || '{}'); } catch (e) {
+                sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
+                return;
+            }
+            const outdir = safeOutdirForId(body.id);
+            if (!outdir) { sendJson(res, 400, { ok: false, error: 'invalid id（先成功编译一次）' }); return; }
+            const projectDir = body.projectDir;
+            const mainFile = body.mainFile || 'main.tex';
+            const line = parseInt(body.line, 10);
+            if (!projectDir || typeof projectDir !== 'string') {
+                sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' });
+                return;
+            }
+            if (!line || line < 1) { sendJson(res, 400, { ok: false, error: 'line 必须是正整数' }); return; }
+            const mainAbs = path.isAbsolute(mainFile) ? mainFile : path.join(projectDir, mainFile);
+            const result = await doSyncTexForward(outdir, mainAbs, line, body.column || 0);
             sendJson(res, 200, result);
             return;
         }
