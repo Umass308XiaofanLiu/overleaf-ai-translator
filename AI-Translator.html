@@ -282,6 +282,45 @@ body.is-resizing-settings-modal * {
     left: calc(100% + 8px); bottom: auto; top: 50%; transform: translateY(-50%);
 }
 
+/* ============= .ovl-tip2：设置面板专用悬浮提示 =============
+   现有 [data-tip] 是绝对定位的伪元素，会被任何 overflow 的祖先裁掉——设置面板的
+   .ovl-settings-content 正是 overflow-y:auto（浏览器会把 overflow-x 一并变成 auto），
+   所以气泡在设置面板里必然被裁。这是一套独立的机制：挂在 #ovlPortal 下的
+   position:fixed 层，JS 算好像素坐标后直接贴出来，不受任何祖先 overflow 影响。
+   触发属性用全新的 data-tip2（不复用 data-tip），两套系统不会在同一元素上打架。
+   视觉逐项照抄 [data-tip]::after（229–255 行），只把 max-width 放宽到 320px。 */
+.ovl-tip2 {
+    position: fixed;
+    z-index: 1090; /* 必须 > .ovl-settings-overlay 的 1085 和 .ovl-quickactions 的 1086 */
+    max-width: 320px;
+    width: max-content;
+    padding: 6px 9px;
+    border-radius: 8px;
+    background: #1e293b;
+    color: #f8fafc;
+    font-family: 'Inter', sans-serif;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.55;
+    letter-spacing: normal;
+    text-transform: none;
+    text-align: left;
+    white-space: normal;
+    word-break: break-word;
+    box-shadow: 0 8px 20px -6px rgba(15, 23, 42, 0.45);
+    pointer-events: none;
+}
+.ovl-tip2[hidden] { display: none; }
+.ovl-setrow-help {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 15px; height: 15px; margin-left: 6px; border-radius: 50%;
+    background: #2F3A4C; color: #9AA4B2; font-size: 10px; font-weight: 700;
+    cursor: help; flex-shrink: 0; user-select: none;
+}
+.ovl-setrow-help:hover, .ovl-setrow-help:focus-visible {
+    background: #495365; color: #F4F5F6; outline: none;
+}
+
 /* ============= Settings 分页 =============
    四个页签的内容**全部**渲染进 DOM，切页只切 class（setSettingsTab 直接改 DOM，
    不走 setState/renderApp）。这么做有两个硬理由：
@@ -20857,6 +20896,14 @@ async function autoConnectLocal() {
 //   打开 v1 翻译器浮层只加 CSS class（body.ovl-translator-open），不重新挂载 #root。
 // ovl-shell-active 这个 class 只在 ovlBoot() 成功跑完全部初始化之后、作为最后一步才加到 body 上 ——
 // 万一前面任何一步抛出，body 上不会留下这个 class，页面照旧退回纯 v1（不会白屏）。
+
+// P1 起先落这两个函数（架构 pass §3.4 强制规则）：本轮（弹出窗口功能还没实现）
+// 恒返回 document/window，行为和之前完全一样；等以后弹出窗口落地，任何被搬到子窗口的
+// 节点，经它俩取到的就是节点真正所在的那个文档/窗口，而不是永远的父文档/父窗口。
+// 新代码一律通过这两个函数取 document/window，不要直接写死 `document`/`window`。
+function ovlDocOf(node) { return (node && node.ownerDocument) || document; }
+function ovlWinOf(node) { return ovlDocOf(node).defaultView || window; }
+
 const OvlState = {
     booted: false,
     viewMode: 'split',       // 'split' | 'editor' | 'pdf'
@@ -21126,6 +21173,9 @@ function ovlPortalHtml() {
         + '</div>'
         // M7 Editor「Equation preview」：光标落在 $...$ 里时用既有 KaTeX 渲染一个悬浮预览。
         + '<div class="ovl-eqpreview" id="ovlEqPreview"></div>'
+        // P1：设置面板专用悬浮提示层（data-tip2），挂在 #ovlPortal 里不会被任何
+        // overflow:auto 的祖先裁掉——具体机制见 CSS 里 .ovl-tip2 那一段的注释。
+        + '<div class="ovl-tip2" id="ovlTip2" hidden></div>'
         // M9：文件树右键菜单，内容按点中的是文件/文件夹动态填充（ovlOpenCtxMenu）。
         + '<div class="ovl-ctxmenu" id="ovlCtxMenu" hidden></div>'
         // M2/M9 共用的通用弹窗（重命名/新建文件/新建文件夹/删除确认……），内容动态填充，
@@ -24087,7 +24137,10 @@ const OVL_SETTINGS_DEFAULTS = {
     breadcrumbs: false,
     equationPreview: true,
     spellcheck: false,
-    spellLang: 'en-US'
+    spellLang: 'en-US',
+    transSimpleMode: false,     // P2 消费：翻译器窗口简化模式（只留左右两个框）
+    visualTranslate: 'auto',    // P4 消费：'auto' | 'button' | 'off'
+    visualTransModel: ''        // P4 消费：''=跟随翻译器当前选中的模型
 };
 const OVL_FONT_FAMILIES = {
     'ovl-mono-default': '"SFMono-Regular", Consolas, "Courier New", monospace',
@@ -24231,47 +24284,123 @@ function ovlConfirmSyntaxIssues(issues) {
 // ---- M7 设置弹窗：Overleaf 式左侧分类 + 右侧表单，挂 #ovlSettingsOverlay（#ovlPortal 内）----
 let OvlSettingsState = { cat: 'editor' };
 
+// P1：hint 不再渲染成行下方的小字（会被 .ovl-settings-content 的 overflow-y:auto 裁掉
+// 横向溢出，且占位置），改渲染成 label 后面一颗 `?` 图标，真正的说明文字走 data-tip2
+// 悬浮显示——机制见下面 ovlTip2Show 和 CSS 里的 .ovl-tip2 注释。
 function ovlSetRow(label, controlHtml, hint) {
-    return '<div class="ovl-setrow"><div><div class="ovl-setrow-label">' + escapeHtml(label) + '</div>'
-        + (hint ? ('<div class="ovl-setrow-hint">' + hint + '</div>') : '') + '</div>'
+    return '<div class="ovl-setrow"><div><div class="ovl-setrow-label">' + escapeHtml(label)
+        + (hint ? ('<span class="ovl-setrow-help" data-tip2="' + escapeAttr(hint) + '" tabindex="0" role="button" aria-label="说明">?</span>') : '')
+        + '</div></div>'
         + '<div class="ovl-setrow-control">' + controlHtml + '</div></div>';
 }
 function ovlOptTag(val, label, cur) {
     return '<option value="' + escapeAttr(val) + '"' + (String(val) === String(cur) ? ' selected' : '') + '>' + escapeHtml(label) + '</option>';
 }
 
+// ---- P1：.ovl-tip2 悬浮提示 —— 挂在 #ovlPortal 里的 fixed 层，不受设置面板 overflow 裁切 ----
+// 触发委托绑在 #ovlSettingsOverlay 上（面板内容是动态重建的，逐条 addEventListener 会在
+// 每次切分类后失效）。mouseover/mouseout 而不是 mouseenter/mouseleave，因为 mouseenter 不冒泡。
+let ovlTip2ShowTimer = null;
+function ovlTip2Hide() {
+    if (ovlTip2ShowTimer) { clearTimeout(ovlTip2ShowTimer); ovlTip2ShowTimer = null; }
+    const tip = document.getElementById('ovlTip2');
+    if (tip) tip.hidden = true;
+}
+function ovlTip2PositionFor(anchorEl, tip) {
+    const r = anchorEl.getBoundingClientRect();
+    const w = tip.offsetWidth, h = tip.offsetHeight;
+    const VW = innerWidth, VH = innerHeight, M = 8;
+    // 默认放右侧
+    let x = r.right + 10, y = r.top + r.height / 2 - h / 2;
+    if (x + w > VW - M) {
+        // 右边放不下 → 翻到左侧
+        x = r.left - w - 10;
+        if (x < M) {
+            // 左边也放不下 → 放下方，再不行放上方
+            x = r.left;
+            y = r.bottom + 8;
+            if (y + h > VH - M) y = r.top - h - 8;
+        }
+    }
+    x = Math.max(M, Math.min(x, VW - w - M));
+    y = Math.max(M, Math.min(y, VH - h - M));
+    tip.style.left = x + 'px';
+    tip.style.top = y + 'px';
+}
+function ovlTip2Show(anchorEl) {
+    const tip = document.getElementById('ovlTip2');
+    if (!tip || !anchorEl) return;
+    const text = anchorEl.getAttribute('data-tip2');
+    if (!text) return;
+    tip.textContent = text;
+    tip.style.visibility = 'hidden';
+    tip.hidden = false;
+    ovlTip2PositionFor(anchorEl, tip);
+    tip.style.visibility = '';
+}
+function ovlBindTip2() {
+    const overlay = document.getElementById('ovlSettingsOverlay');
+    if (!overlay) return;
+    overlay.addEventListener('mouseover', function (e) {
+        const el = e.target.closest('[data-tip2]');
+        if (!el) return;
+        if (ovlTip2ShowTimer) clearTimeout(ovlTip2ShowTimer);
+        ovlTip2ShowTimer = setTimeout(function () { ovlTip2Show(el); }, 300);
+    });
+    overlay.addEventListener('mouseout', function (e) {
+        const el = e.target.closest('[data-tip2]');
+        if (!el) return;
+        // 移到 tip2 元素自己的子节点上不算移开（这里没有子节点，但保持和原生 [data-tip] 的
+        // 「移开立即隐藏」行为一致，不做 0.12s 淡出——这是文档里记录过的唯一行为差异）。
+        ovlTip2Hide();
+    });
+    overlay.addEventListener('focusin', function (e) {
+        const el = e.target.closest('[data-tip2]');
+        if (!el) return;
+        ovlTip2Show(el); // 键盘可达性：Tab 聚焦到 `?` 立即出现，不等 300ms
+    });
+    overlay.addEventListener('focusout', function (e) {
+        const el = e.target.closest('[data-tip2]');
+        if (!el) return;
+        ovlTip2Hide();
+    });
+    // 设置面板本身滚动时，气泡的锚点已经跟着滚走了——直接收起，不追着重新定位。
+    overlay.addEventListener('scroll', function () { ovlTip2Hide(); }, true);
+}
+
 function ovlSettingsEditorHtml() {
     const s = OvlSettings;
     let html = '<div class="ovl-set-category-title">Editor</div>';
     html += ovlSetRow('Auto-close brackets', '<input type="checkbox" data-setpath="settings.autoCloseBrackets"' + (s.autoCloseBrackets ? ' checked' : '') + '>',
-        '真的生效：打 ( { [ $ 自动补对应的闭合符，走 insertText（保住撤销栈）。');
+        '打出 (、{、[、$ 时自动补上配对的右半边。补出来的内容可以用 Ctrl+Z 撤销。');
     html += ovlSetRow('Non-blinking cursor', '<input type="checkbox" disabled data-setpath="settings.nonBlinkingCursor"' + (s.nonBlinkingCursor ? ' checked' : '') + '>',
-        '浏览器 &lt;textarea&gt; 不支持控制光标闪烁频率——这项只存到 localStorage，不会真的改变光标行为。');
+        '这一项目前不起作用：网页里的文本框没法控制光标闪不闪。开关的状态会记住，但光标行为不会变。');
     html += ovlSetRow('Tab size', '<select data-setpath="settings.tabSize">' + [2, 4, 8].map(function (v) { return ovlOptTag(v, String(v), s.tabSize); }).join('') + '</select>',
-        '真的生效：改 #ovlCodeArea 的 tab-size。');
+        '按一次 Tab 键在编辑器里显示多宽。只影响显示宽度，不改变文件内容。');
     html += ovlSetRow('PDF Viewer', '<select disabled><option selected>Browser built-in (Chrome PDF Viewer)</option></select>',
-        'M4 用的是浏览器内置 PDF 阅读器（iframe + PDF Open Parameters），没有引入 pdf.js，所以目前只有这一个选项。');
+        '用的是 Chrome 自带的 PDF 阅读器，目前没有别的可选。');
     html += ovlSetRow('Show quick actions on text selection', '<input type="checkbox" data-setpath="settings.quickActions"' + (s.quickActions ? ' checked' : '') + '>',
-        '真的生效：选中编辑器里的文字会冒出一个小工具条（加粗/斜体/引文）。');
+        '在编辑器里选中文字后，旁边会浮出一个小工具条（加粗、斜体、插入引文）。');
     html += ovlSetRow('Breadcrumbs', '<input type="checkbox" data-setpath="settings.breadcrumbs"' + (s.breadcrumbs ? ' checked' : '') + '>',
-        '真的生效：编辑器上方显示光标所在的 \\section/\\subsection 路径。');
+        '在编辑器上方显示光标当前所在的章节位置，方便知道自己在文档的哪一部分。');
     html += ovlSetRow('Equation preview', '<input type="checkbox" data-setpath="settings.equationPreview"' + (s.equationPreview ? ' checked' : '') + '>',
-        '真的生效：光标落在 $...$ 内时，用页面已加载的 KaTeX 渲染一个悬浮预览（不处理跨行/\\[...\\]）。');
+        '光标停在 $...$ 公式里时，浮出一个小窗口显示公式排版后的样子。只支持写在同一行里的公式。');
     html += ovlSetRow('Soft wrap', '<span class="ovl-set-readonly-val">已开启（不可关闭）</span>',
-        'v2 Polish 2 起软换行永久开启：长行视觉折行，行号槽/File outline/Find/日志跳转全部按软换行后的视觉行号对齐（ovlRecomputeLineOffsets 批量算出来的行偏移表），不再是旧版"打开会错位"的半成品，所以也不再需要一个可以关掉它的开关。');
-    html += ovlSetRow('Show line numbers', '<input type="checkbox" data-setpath="settings.showLineNumbers"' + (s.showLineNumbers ? ' checked' : '') + '>', '');
+        '太长的行会自动折到下一行显示，不用左右拖滚动条。这一项固定开启，行号和各种跳转都已经按折行后的位置对齐。');
+    html += ovlSetRow('Show line numbers', '<input type="checkbox" data-setpath="settings.showLineNumbers"' + (s.showLineNumbers ? ' checked' : '') + '>',
+        '在编辑器左边显示行号。');
     return html;
 }
 function ovlSettingsSpellingHtml() {
     const s = OvlSettings;
     let html = '<div class="ovl-set-category-title">Spelling</div>';
     html += ovlSetRow('Spellcheck', '<input type="checkbox" data-setpath="settings.spellcheck"' + (s.spellcheck ? ' checked' : '') + '>',
-        '真的生效：切 #ovlCodeArea 的 spellcheck 属性。');
+        '打开 Chrome 自带的拼写检查，拼错的词下面画红波浪线。');
     const langs = [['en-US', 'English (American)'], ['en-GB', 'English (British)'], ['zh-CN', '中文（简体）'], ['fr-FR', 'Français'], ['de-DE', 'Deutsch']];
     html += ovlSetRow('Spellcheck language', '<select data-setpath="settings.spellLang">' + langs.map(function (p) { return ovlOptTag(p[0], p[1], s.spellLang); }).join('') + '</select>',
-        '用的是 Chrome 自带词典，不是 LaTeX 感知的——它会把每个 \\macro 都标红。Overleaf 那套是 LaTeX 感知的，我们没有。');
+        '拼写检查用哪种语言的词典。注意它不认识 LaTeX 命令，会把每个 \\命令 都标成拼错。');
     html += ovlSetRow('Custom dictionary', '<span class="ovl-set-readonly-val">不支持从网页管理</span>',
-        'Chrome 的自定义词典只能在拼写检查右键菜单里逐个"添加到词典"，网页 API 改不了它——不做一个假的词典编辑框。');
+        '自定义词典只能在红波浪线上点右键、选「添加到词典」来加，网页里改不了它。');
     return html;
 }
 function ovlSettingsCompilerHtml() {
@@ -24281,37 +24410,59 @@ function ovlSettingsCompilerHtml() {
         html += '<div class="ovl-set-banner"><strong>桥接服务未在线。</strong>下面这些设置会照常存起来，但要等 tools/latex-bridge/server.js 在线之后，下一次 Recompile 才会真的用上。</div>';
     }
     html += ovlSetRow('Main document', '<span class="ovl-set-readonly-val">' + escapeHtml(OvlState.mainDocFile || '(未设置，默认用当前打开的 .tex 或 main.tex)') + '</span>',
-        '在文件树里右键某个 .tex 文件 → Set as main document 来改（M9），这里只展示当前值。');
+        '编译时从哪个 .tex 文件开始。要改的话，在左边文件树里右键某个 .tex 文件，选 Set as main document。');
     html += ovlSetRow('Compiler', '<select data-setpath="compile.engine">'
         + ovlOptTag('pdflatex', 'pdfLaTeX', c.engine) + ovlOptTag('xelatex', 'XeLaTeX', c.engine) + ovlOptTag('lualatex', 'LuaLaTeX', c.engine)
-        + '</select>', '真的生效：驱动桥用哪个引擎二进制（latexmk -pdf / -pdfxe / -pdflua，或 draft 模式下直调该引擎单趟）。');
+        + '</select>', '用哪个 LaTeX 引擎来排版。不确定就保持 pdfLaTeX；文档里用了中文字体或 fontspec 就选 XeLaTeX。');
     html += ovlSetRow('TeX Live version', '<select disabled><option selected>2025（本机唯一安装的版本）</option></select>',
-        '本机只装了 TeX Live 2025 一个版本，没有别的可切——如实展示，不假装能选。');
+        '这台电脑只装了 TeX Live 2025 一个版本，没有别的可切。');
     html += ovlSetRow('Compile mode', '<select data-setpath="compile.mode">' + ovlOptTag('normal', 'Normal', c.mode) + ovlOptTag('draft', 'Fast [draft]', c.mode) + '</select>',
-        '真的生效，和 PDF 工具条 Recompile ▾ 菜单里那份是同一个状态（决策 D：只存一份真值，两个入口）。');
-    html += ovlSetRow('Stop on first error', '<input type="checkbox" data-setpath="compile.haltOnError"' + (c.haltOnError ? ' checked' : '') + '>', '真的生效：加 -halt-on-error。');
+        'Fast 模式跳过部分排版工作，出图快但页码和交叉引用可能还没算准；定稿前用 Normal。这里和 PDF 工具条上 Recompile 旁边的菜单是同一个设置。');
+    html += ovlSetRow('Stop on first error', '<input type="checkbox" data-setpath="compile.haltOnError"' + (c.haltOnError ? ' checked' : '') + '>',
+        '遇到第一个错误就停下来，不再往下编译。想快速定位是哪一处写错了的时候好用。');
     html += ovlSetRow('Autocompile', '<input type="checkbox" data-setpath="compile.autoCompile"' + (c.autoCompile ? ' checked' : '') + '>',
-        '真的生效：停止输入约 2.5 秒后，如果桥在线且当前没有编译在跑，会自动触发一次 Recompile。');
+        '停止输入约 2.5 秒后自动编译一次，不用每次手动点 Recompile。');
     return html;
 }
 function ovlSettingsAppearanceHtml() {
     const s = OvlSettings;
     let html = '<div class="ovl-set-category-title">Appearance</div>';
     html += ovlSetRow('Editor theme', '<select data-setpath="settings.editorTheme">' + ovlOptTag('light', '浅色', s.editorTheme) + ovlOptTag('dark', '深色', s.editorTheme) + '</select>',
-        '真的生效：只切 #ovlCodeArea/#ovlGutter 的前景背景色，不做代码高亮（§3.4 明令禁止）。');
+        '编辑器用浅色还是深色底。只改文字和背景颜色，不做语法着色。');
     html += ovlSetRow('Dark mode PDF preview', '<input type="checkbox" data-setpath="settings.darkModePdf"' + (s.darkModePdf ? ' checked' : '') + '>',
-        '真的生效，和 PDF 工具条上的 ◐ 反色按钮是同一个开关。');
+        '把右边的 PDF 反色显示，夜里看不刺眼。和 PDF 工具条上的 ◐ 按钮是同一个开关。');
     html += ovlSetRow('Editor font size', '<select data-setpath="settings.fontSize">' + [10, 11, 12, 13, 14, 16].map(function (v) { return ovlOptTag(v, v + 'px', s.fontSize); }).join('') + '</select>',
-        '真的生效：正文和行号槽一起改，否则行号会和行错位。');
+        '编辑器正文的字号，行号会跟着一起变。');
     html += ovlSetRow('Editor font family', '<select data-setpath="settings.fontFamily">'
         + ovlOptTag('ovl-mono-default', '系统等宽（SFMono/Consolas）', s.fontFamily)
         + ovlOptTag('ovl-mono-menlo', 'Menlo/Monaco', s.fontFamily)
         + ovlOptTag('ovl-mono-cascadia', 'Cascadia Code', s.fontFamily)
-        + '</select>', '不新引入字体文件——三组都是系统里大概率已有的等宽字体族。');
-    html += ovlSetRow('Editor line height', '<select data-setpath="settings.lineHeight">' + ovlOptTag('compact', 'Compact', s.lineHeight) + ovlOptTag('normal', 'Normal', s.lineHeight) + ovlOptTag('wide', 'Wide', s.lineHeight) + '</select>', '');
+        + '</select>', '编辑器用哪种等宽字体。三个选项都是系统里通常已经装了的字体，不会额外下载。');
+    html += ovlSetRow('Editor line height', '<select data-setpath="settings.lineHeight">' + ovlOptTag('compact', 'Compact', s.lineHeight) + ovlOptTag('normal', 'Normal', s.lineHeight) + ovlOptTag('wide', 'Wide', s.lineHeight) + '</select>',
+        '编辑器里每行文字之间的疏密程度。');
     return html;
 }
-const OVL_SETTINGS_RENDERERS = { editor: ovlSettingsEditorHtml, spelling: ovlSettingsSpellingHtml, compiler: ovlSettingsCompilerHtml, appearance: ovlSettingsAppearanceHtml };
+
+// ---- P1（§2.2.2）：把翻译器窗口里的几项设置搬进主设置面板一个新分类，铁律「只存一份真值，
+// 两个入口」——这里的控件全部调既有的 toggleAutoTranslate()/toggleAutoDetect()/
+// setAutoSaveInterval()/setHistoryLimit()，绝不直接写 AppState（那些函数自带
+// setState/持久化/重渲染）。唯一的新状态是 OvlSettings.transSimpleMode（P2 消费）。
+function ovlSettingsTranslatorHtml() {
+    const s = OvlSettings;
+    let html = '<div class="ovl-set-category-title">Translator</div>';
+    html += ovlSetRow('简化模式', '<input type="checkbox" data-setpath="settings.transSimpleMode"' + (s.transSimpleMode ? ' checked' : '') + '>',
+        '只显示左右两个文本框和翻译按钮，把工具栏、面板标题、页脚都收起来。想专心读译文时用。');
+    html += ovlSetRow('自动翻译', '<input type="checkbox" data-transfn="toggleAutoTranslate"' + (AppState.isAutoTranslate ? ' checked' : '') + '>',
+        '在左边输入框停手 1.5 秒就自动翻一次，不用每次点翻译。');
+    html += ovlSetRow('自动判断语种', '<input type="checkbox" data-transfn="toggleAutoDetect"' + (AppState.isAutoDetect ? ' checked' : '') + '>',
+        '自动看输入的是中文还是英文来决定翻译方向。手动点 ZH / EN 会关掉它。');
+    html += ovlSetRow('自动保存间隔', '<select data-transfn="setAutoSaveInterval">' + [1, 3, 5, 10].map(function (min) { return ovlOptTag(min * 60000, min + ' 分钟', AppState.autoSaveInterval); }).join('') + '</select>',
+        '每隔多久自动把当前的原文和译文存一份快照。');
+    html += ovlSetRow('历史保留条数', '<select data-transfn="setHistoryLimit">' + [5, 10, 20].map(function (n) { return ovlOptTag(n, String(n), AppState.historyLimit); }).join('') + '</select>',
+        '最多保留多少份历史快照，超出的会被最旧的顶掉。');
+    return html;
+}
+const OVL_SETTINGS_RENDERERS = { editor: ovlSettingsEditorHtml, spelling: ovlSettingsSpellingHtml, compiler: ovlSettingsCompilerHtml, appearance: ovlSettingsAppearanceHtml, translator: ovlSettingsTranslatorHtml };
 
 function ovlSettingsModalHtml() {
     return ''
@@ -24323,6 +24474,7 @@ function ovlSettingsModalHtml() {
         +       '<div class="ovl-settings-navitem" data-cat="spelling">Spelling</div>'
         +       '<div class="ovl-settings-navitem" data-cat="compiler">Compiler</div>'
         +       '<div class="ovl-settings-navitem" data-cat="appearance">Appearance</div>'
+        +       '<div class="ovl-settings-navitem" data-cat="translator">Translator</div>'
         +     '</div>'
         +     '<div class="ovl-settings-content" id="ovlSettingsContent"></div>'
         +   '</div>'
@@ -24360,6 +24512,21 @@ function ovlBindSettingsModal() {
         if (e.target.closest('#ovlSettingsResetBtn')) { ovlResetSettings(); return; }
     });
     overlay.addEventListener('change', function (e) {
+        // P1（§2.2.2 铁律「只存一份真值，两个入口」）：Translator 分类里那几行读写的是
+        // AppState（翻译器窗口的真值），不是 OvlSettings/OvlCompileSettings，所以走既有的
+        // toggleAutoTranslate()/toggleAutoDetect()/setAutoSaveInterval()/setHistoryLimit()——
+        // 这些函数自带 setState/持久化/renderApp()，renderApp() 重建的是 #root，不会碰
+        // #ovlSettingsOverlay，所以这里改完手动重渲染一次本分类，让勾选框跟着 AppState 同步。
+        const tfEl = e.target.closest('[data-transfn]');
+        if (tfEl) {
+            const fn = tfEl.getAttribute('data-transfn');
+            if (fn === 'toggleAutoTranslate') toggleAutoTranslate();
+            else if (fn === 'toggleAutoDetect') toggleAutoDetect();
+            else if (fn === 'setAutoSaveInterval') setAutoSaveInterval(Number(tfEl.value));
+            else if (fn === 'setHistoryLimit') setHistoryLimit(Number(tfEl.value));
+            ovlRenderSettingsCategory('translator');
+            return;
+        }
         const el = e.target.closest('[data-setpath]');
         if (!el) return;
         const path = el.getAttribute('data-setpath'); // "settings.fontSize" | "compile.engine"
@@ -25193,6 +25360,7 @@ function ovlBindPassD() {
         const settingsBtn = document.getElementById('ovlSettingsBtn');
         if (settingsBtn) settingsBtn.addEventListener('click', ovlOpenSettings);
         ovlBindSettingsModal();
+        ovlBindTip2();
         ovlBindDropMenus();
         ovlBindMenuBar();
         ovlBindVisualPane();
