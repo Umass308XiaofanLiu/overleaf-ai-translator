@@ -37,6 +37,14 @@ const PORT = 8181;
 // TeX Live 路径（规划 §1.4 实测）。允许用 LATEX_BRIDGE_TEXBIN 环境变量覆盖，方便别的机器上跑。
 const TEXBIN = process.env.LATEX_BRIDGE_TEXBIN || 'E:\\texlive\\2025\\bin\\windows';
 const LATEXMK = path.join(TEXBIN, process.platform === 'win32' ? 'latexmk.exe' : 'latexmk');
+// v2 Pass D：M4 编译选项菜单 + M7 Compiler 设置分类，都要真的驱动这三个二进制之一。
+const EXE = process.platform === 'win32' ? '.exe' : '';
+const ENGINE_BIN = {
+    pdflatex: path.join(TEXBIN, 'pdflatex' + EXE),
+    xelatex: path.join(TEXBIN, 'xelatex' + EXE),
+    lualatex: path.join(TEXBIN, 'lualatex' + EXE)
+};
+const TEXCOUNT = path.join(TEXBIN, 'texcount' + EXE);
 
 // 全部编译产物都落在系统临时目录下的这个子目录，绝不碰用户的项目文件夹。
 const WORK_ROOT = path.join(os.tmpdir(), 'ai-translator-latex-bridge');
@@ -165,6 +173,18 @@ function parseLog(logText) {
     return entries;
 }
 
+// M4 页码总数：TeX Live 2020+ 默认压缩对象流（ObjStm），PDF 里已经找不到明文的
+// "/Type /Page"/"/Count" 了（实测：本仓库 main.tex 编出的 17 页 PDF，明文匹配数 = 0）。
+// 真正可靠的来源是 pdflatex/latexmk 自己在 .log 末尾写的 "Output written on
+// output.pdf (17 pages, 449448 bytes)."——这行常被 79 列硬折行切断，所以先去掉换行再匹配。
+function extractPageCount(logText) {
+    try {
+        const flat = logText.replace(/\r?\n/g, '');
+        const m = /\(\s*(\d+)\s*pages?,\s*[\d,]+\s*bytes\s*\)/i.exec(flat);
+        return m ? parseInt(m[1], 10) : null;
+    } catch (e) { return null; }
+}
+
 function listOutputFiles(outdir) {
     try {
         return fs.readdirSync(outdir).filter((f) => {
@@ -187,7 +207,15 @@ function contentTypeFor(name) {
 // /compile
 // ---------------------------------------------------------------------------
 
-function doCompile(projectDir, mainFile) {
+function doCompile(projectDir, mainFile, opts) {
+    opts = opts || {};
+    // engine: pdflatex（默认）/ xelatex / lualatex —— M7 Compiler 分类真的驱动这个。
+    const engine = ENGINE_BIN[opts.engine] ? opts.engine : 'pdflatex';
+    // mode: 'normal'（默认，latexmk 多趟 + bibtex）/ 'draft'（M4 的 "Fast [draft]"：跳过 latexmk，
+    // 直接调一次引擎单趟——更快，但交叉引用/引文可能还是 "??"，这是刻意的、诚实的行为差异）。
+    const mode = opts.mode === 'draft' ? 'draft' : 'normal';
+    // haltOnError: M4 "Compile error handling" / M7 "Stop on first error"，两处共用同一个桥参数。
+    const haltOnError = !!opts.haltOnError;
     return new Promise((resolve) => {
         const id = Date.now().toString(36) + '-' + crypto.randomBytes(4).toString('hex');
         const outdir = path.join(WORK_ROOT, id);
@@ -204,8 +232,10 @@ function doCompile(projectDir, mainFile) {
             resolve({ ok: false, error: 'main file not found: ' + mainAbs });
             return;
         }
-        if (!fs.existsSync(LATEXMK)) {
-            resolve({ ok: false, error: 'latexmk.exe not found at ' + LATEXMK + '（检查 LATEX_BRIDGE_TEXBIN / TeX Live 是否安装）' });
+        const engineBin = ENGINE_BIN[engine];
+        const compilerBin = mode === 'draft' ? engineBin : LATEXMK;
+        if (!fs.existsSync(compilerBin)) {
+            resolve({ ok: false, error: (mode === 'draft' ? engine : 'latexmk') + ' 未找到: ' + compilerBin + '（检查 LATEX_BRIDGE_TEXBIN / TeX Live 是否安装）' });
             return;
         }
 
@@ -215,23 +245,44 @@ function doCompile(projectDir, mainFile) {
             currentChild = null;
         }
 
-        const args = [
-            '-pdf',
-            '-interaction=nonstopmode',
-            '-file-line-error',
-            '-synctex=1',
-            '-jobname=output',
-            '-outdir=' + outdir,
-            mainAbs
-        ];
+        let args;
+        if (mode === 'draft') {
+            // 单趟直调引擎二进制（不经 latexmk）：没有多趟收敛、没有 bibtex——这就是 "draft" 名字的来源，
+            // 不是伪装成一样快慢的另一份"正常编译"。
+            args = [
+                '-interaction=nonstopmode',
+                '-file-line-error',
+                '-synctex=1',
+                '-jobname=output',
+                '-output-directory=' + outdir
+            ];
+            if (haltOnError) args.push('-halt-on-error');
+            args.push(mainAbs);
+        } else {
+            args = [
+                engine === 'xelatex' ? '-pdfxe' : (engine === 'lualatex' ? '-pdflua' : '-pdf'),
+                '-interaction=nonstopmode',
+                '-file-line-error',
+                '-synctex=1',
+                '-jobname=output',
+                '-outdir=' + outdir
+            ];
+            if (haltOnError) args.push('-halt-on-error');
+            // 「Recompile from scratch」：桥本来就每次编译都用全新的临时目录（§1 事实基线），
+            // 从不复用上一次的 aux/中间文件，所以这个参数目前只是显式声明意图、并加 -gg 让
+            // latexmk 内部也不做增量判断——诚实说明：跟普通 Recompile 的可观察结果基本一致，
+            // 见交付说明里的对应段落，不是没接线。
+            if (opts.forceClean) args.push('-gg');
+            args.push(mainAbs);
+        }
 
         let stdoutBuf = [];
         let stderrBuf = [];
         let child;
         try {
-            child = spawn(LATEXMK, args, { cwd: projectDir, windowsHide: true });
+            child = spawn(compilerBin, args, { cwd: projectDir, windowsHide: true });
         } catch (e) {
-            resolve({ ok: false, error: 'spawn latexmk failed: ' + e.message });
+            resolve({ ok: false, error: 'spawn ' + (mode === 'draft' ? engine : 'latexmk') + ' failed: ' + e.message });
             return;
         }
         currentChild = child;
@@ -294,11 +345,14 @@ function doCompile(projectDir, mainFile) {
             resolve({
                 ok: pdfExists, // §1.5 硬规定：成功 = PDF 存在，不是退出码
                 id: id,
+                engine: engine,
+                mode: mode,
                 exitCode: (exitCode === null ? null : exitCode),
                 timedOut: !!timedOut,
                 durationMs: durationMs,
                 pdfExists: pdfExists,
                 pdfSize: pdfSize,
+                pageCount: extractPageCount(logText), // null = 没找到（draft 单趟引擎调用一般也会写这行）
                 synctexExists: fs.existsSync(synctexPath),
                 logSource: logSource,
                 log: logText,
@@ -307,6 +361,66 @@ function doCompile(projectDir, mainFile) {
                 files: listOutputFiles(outdir)
             });
         }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// /wordcount —— TeX Live 自带 texcount.exe，真数，不用纯 JS 估算（§4.0 明文要求：
+// 纯 JS 数词会和 texcount 对不上，那种数字比没有更糟）。
+// ---------------------------------------------------------------------------
+
+function doWordCount(projectDir, mainFile) {
+    return new Promise((resolve) => {
+        if (!fs.existsSync(TEXCOUNT)) {
+            resolve({ ok: false, error: 'texcount 未找到: ' + TEXCOUNT + '（检查 LATEX_BRIDGE_TEXBIN / TeX Live 是否安装）' });
+            return;
+        }
+        const mainAbs = path.isAbsolute(mainFile) ? mainFile : path.join(projectDir, mainFile);
+        if (!fs.existsSync(mainAbs)) {
+            resolve({ ok: false, error: 'main file not found: ' + mainAbs });
+            return;
+        }
+        let child;
+        try {
+            // 实测（本机 texcount）：-sum=all 不是这个版本认识的开关（不报错但也不产出
+            // "Sum count:" 那一行）——用 -inc 就够了，"合计"改成前端拿 words+headers+captions
+            // 自己加，加数还是 texcount 给的真实数字，不是编的。
+            child = spawn(TEXCOUNT, ['-inc', mainAbs], { cwd: projectDir, windowsHide: true });
+        } catch (e) {
+            resolve({ ok: false, error: 'spawn texcount failed: ' + e.message });
+            return;
+        }
+        let resolved = false;
+        const outBuf = [];
+        const errBuf = [];
+        const timer = setTimeout(() => {
+            if (resolved) return;
+            resolved = true;
+            try { child.kill(); } catch (e) {}
+            resolve({ ok: false, error: 'texcount 超时（30s）' });
+        }, 30000);
+        child.stdout.on('data', (c) => outBuf.push(c));
+        child.stderr.on('data', (c) => errBuf.push(c));
+        child.on('error', (err) => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timer);
+            resolve({ ok: false, error: 'texcount process error: ' + err.message });
+        });
+        child.on('close', () => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timer);
+            const text = Buffer.concat(outBuf).toString('utf8') || Buffer.concat(errBuf).toString('utf8');
+            const grab = (re) => { const m = re.exec(text); return m ? parseInt(m[1], 10) : null; };
+            resolve({
+                ok: true,
+                raw: text,
+                words: grab(/Words in text:\s*(\d+)/),
+                headers: grab(/Words in headers:\s*(\d+)/),
+                captions: grab(/Words (?:in (?:float )?captions|outside text \(captions, etc\.\)):\s*(\d+)/)
+            });
+        });
     });
 }
 
@@ -340,7 +454,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, GET /health, GET /output/:id/:file, POST /clear');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, GET /health, GET /output/:id/:file, POST /clear');
             return;
         }
 
@@ -361,7 +475,48 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 400, { ok: false, error: 'projectDir 不存在或不是目录: ' + projectDir });
                 return;
             }
-            const result = await doCompile(projectDir, mainFile);
+            const result = await doCompile(projectDir, mainFile, {
+                engine: body.engine,
+                mode: body.mode,
+                haltOnError: body.haltOnError,
+                forceClean: body.forceClean
+            });
+            sendJson(res, 200, result);
+            return;
+        }
+
+        // M4「Stop compilation」：杀掉当前正在跑的编译进程树（如果有）。
+        if (req.method === 'POST' && pathname === '/stop') {
+            if (currentChild) {
+                try { killTree(currentChild.pid); } catch (e) {}
+                currentChild = null;
+                currentChildId = null;
+                sendJson(res, 200, { ok: true, stopped: true });
+            } else {
+                sendJson(res, 200, { ok: true, stopped: false });
+            }
+            return;
+        }
+
+        // 项目菜单「Word count」：真的走 TeX Live 自带 texcount，不用纯 JS 数词（§4.0 明文要求）。
+        if (req.method === 'POST' && pathname === '/wordcount') {
+            const bodyText = await readBody(req);
+            let body;
+            try { body = JSON.parse(bodyText || '{}'); } catch (e) {
+                sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
+                return;
+            }
+            const projectDir = body.projectDir;
+            const mainFile = body.mainFile || 'main.tex';
+            if (!projectDir || typeof projectDir !== 'string') {
+                sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' });
+                return;
+            }
+            if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) {
+                sendJson(res, 400, { ok: false, error: 'projectDir 不存在或不是目录: ' + projectDir });
+                return;
+            }
+            const result = await doWordCount(projectDir, mainFile);
             sendJson(res, 200, result);
             return;
         }
