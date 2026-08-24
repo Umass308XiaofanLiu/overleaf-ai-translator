@@ -1128,6 +1128,40 @@ body.ovl-popout-child #root {
    按钮是双态开关，照抄翻译器 .ovl-transwin-iconbtn.ovl-active 的靛蓝配色（换成浅色标题栏的版本）。 */
 #aiChatRoot .aichat-iconbtn.ovl-active { color: #4338ca; background: #eef2ff; }
 
+/* ==================== P4：编辑器选词工具 + Visual 选中即译（docs/v2_ux_round_plan.md §2.3/§2.4）====================
+   #ovlQuickActions 新增的 4 颗按钮（HTML 见 ovlPortalHtml）：quickActions 设置只再控制
+   .ovl-qa-fmt 这 3 颗原有格式按钮；.ovl-qa-translate（"译"）只在来源是 Visual 模式选中时
+   出现（ovlShowQuickActionsAt 按 source 挂 .ovl-qa-src-visual），Visual 是只读面板，格式
+   按钮天然不适用，所以来源是 Visual 时 .ovl-qa-fmt 也一起藏起来。 */
+.ovl-quickactions.ovl-qa-nofmt .ovl-qa-fmt,
+.ovl-quickactions.ovl-qa-src-visual .ovl-qa-fmt { display: none; }
+.ovl-quickactions:not(.ovl-qa-src-visual) .ovl-qa-translate,
+.ovl-quickactions.ovl-qa-notranslate .ovl-qa-translate { display: none; }
+
+/* Visual 选中即译的浮框（挂在 #ovlPortal 里，见 ovlPortalHtml）。定位算法 ovlVisTransPlace
+   照抄规划 §2.4.7：四个候选位选放得下的，都放不下就选空间最大的一侧再内部滚动，最后
+   强制夹紧、绝不许压住选区——逻辑全在 JS，这里只放纯展示样式。 */
+.ovl-vistrans {
+    position: fixed; z-index: 1087; display: none; background: #ffffff; color: #1f2937;
+    border: 1px solid #d1d5db; border-radius: 8px; box-shadow: 0 10px 28px rgba(15,23,42,0.28);
+    padding: 10px 12px; min-width: 180px;
+}
+.ovl-vistrans.ovl-open { display: block; }
+.ovl-vistrans-body { font-size: 13px; line-height: 1.65; }
+.ovl-vistrans-loading { font-size: 12px; color: #94a3b8; }
+.ovl-vistrans-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; padding-top: 6px; border-top: 1px solid #e5e7eb; }
+.ovl-vistrans-copy, .ovl-vistrans-close {
+    font-size: 11px; border: none; background: #f1f5f9; color: #475569; border-radius: 5px;
+    padding: 3px 8px; cursor: pointer;
+}
+.ovl-vistrans-copy:hover, .ovl-vistrans-close:hover { background: #e2e8f0; }
+
+/* #synonymPopup 在 v2 编辑器里（Code/Visual 选中触发的替换/简化/语法）挂的还是 <body>，
+   默认 Tailwind z-[100] 会被编辑器工具条(1086)/设置遮罩(1085) 压住——照抄第 1044 行
+   翻译器浮窗那条规则的思路，:not(.ovl-translator-open) 保证跟它互不冲突（一个带这个
+   class 一个不带，选择器互斥）。 */
+body.ovl-shell-active:not(.ovl-translator-open) #synonymPopup { z-index: 1087 !important; }
+
 #ovlShell {
     position: fixed;
     inset: 0;
@@ -3793,6 +3827,27 @@ function renderSynonymPopupOnly() {
     // 这一页的建议是整句改写吗（决定：整句徽标 + 整句高亮 + 应用时的替换范围 + 弹窗限宽）
     const sentenceScoped = isSentenceScopedPage(s, mode, pageIndex);
 
+    // P4（§2.3.5）：Visual 模式的替换/应用建议到源码只在"选中文字在源码里唯一命中"时允许，
+    // 这个判定要在渲染候选按钮**之前**算出来，用来置灰 + 说明原因——不是等用户点了才说
+    // （那是 ovlApplySynonymEditorGuard 的第二道闸，这里是第一道、给眼睛看的）。
+    let visualLock = null;
+    if (s.field === 'ovl-visual') {
+        const codeTa = document.getElementById('ovlCodeArea');
+        const src = codeTa ? codeTa.value : '';
+        const picked = typeof s.originalText === 'string' ? s.originalText : '';
+        // 真实次数，不是"够用就好"的下限——诚实优先于完成度是本仓库的既定原则，
+        // 提示文案报的数字必须经得起用户自己去搜索框验证。split().length-1 对 V8 来说
+        // 是廉价操作（哪怕文档几百 KB），不需要为了省这点开销去撒谎。
+        const n = picked ? (src.split(picked).length - 1) : 0;
+        if (n !== 1) {
+            visualLock = {
+                reason: n === 0
+                    ? '这段文字在源码里不是原样存在（Visual 显示的是排版后的样子），没法自动替换。请切到 Code 模式手动改。'
+                    : '这段文字在源码里出现了 ' + n + ' 次，无法确定改哪一处。请切到 Code 模式手动改。'
+            };
+        }
+    }
+
     // 【为什么不再 flex-1】flex-1 让每个页签的宽度 = 弹窗宽度 ÷ 3，于是**弹窗一变宽页签就横着跑**：
     // 实测同一次选中，加载态弹窗 209px 宽、结果回来 240px 宽，三个页签的中心从
     // 716/736/766 跳到 740/811/882 —— 最右那个横移了 116px。用户在模型思考的那一两秒里
@@ -3844,13 +3899,14 @@ function renderSynonymPopupOnly() {
         bodyHtml = `
                     ${isGrammar && note.issue ? `<div class="text-[10px] text-amber-600 bg-amber-50 border border-amber-100 rounded px-2 py-1 mb-1 leading-snug overflow-y-auto custom-scrollbar" style="max-height:56px;">${escapeHtml(note.issue)}</div>` : ''}
                     ${sentenceScoped ? `<div class="text-[10px] font-bold text-amber-700 flex items-center gap-1 mb-1">${Icons.SparklesSmall} 整句改写 · 将替换高亮的整句</div>` : ''}
+                    ${visualLock ? `<div class="text-[10px] text-amber-600 bg-amber-50 border border-amber-100 rounded px-2 py-1 mb-1 leading-snug">${escapeHtml(visualLock.reason)}</div>` : ''}
                     <div class="flex flex-col gap-1 overflow-y-auto custom-scrollbar" style="max-height:min(320px, 45vh);">
                         ${currentSynonyms.map((syn, i) => isGrammar ? `
-                            <button onclick="applySynonymOption(${pageIndex}, ${i})" class="text-left px-2 py-1.5 rounded hover:bg-indigo-50 text-slate-700 text-xs font-medium hover:text-indigo-700 transition-colors flex items-start gap-2 group">
+                            <button ${visualLock ? 'disabled' : ''} onclick="applySynonymOption(${pageIndex}, ${i})" class="text-left px-2 py-1.5 rounded hover:bg-indigo-50 text-slate-700 text-xs font-medium hover:text-indigo-700 transition-colors flex items-start gap-2 group disabled:opacity-30 disabled:hover:bg-transparent">
                                 <span class="opacity-0 group-hover:opacity-50 text-indigo-400 shrink-0 mt-0.5">${Icons.ArrowRightLeftSmall}</span> <span class="leading-snug">${escapeHtml(syn)}</span>
                             </button>
                         ` : `
-                            <button onclick="applySynonym('${escapeHtml(syn).replace(/'/g, "\\'")}')" class="text-left px-2 py-1.5 rounded hover:bg-indigo-50 text-slate-700 text-xs font-medium hover:text-indigo-700 transition-colors flex items-center gap-2 group">
+                            <button ${visualLock ? 'disabled' : ''} onclick="applySynonym('${escapeHtml(syn).replace(/'/g, "\\'")}')" class="text-left px-2 py-1.5 rounded hover:bg-indigo-50 text-slate-700 text-xs font-medium hover:text-indigo-700 transition-colors flex items-center gap-2 group disabled:opacity-30 disabled:hover:bg-transparent">
                                 <span class="opacity-0 group-hover:opacity-50 text-indigo-400">${Icons.ArrowRightLeftSmall}</span> ${escapeHtml(syn)}
                             </button>
                         `).join('')}
@@ -4040,6 +4096,12 @@ function renderSelectionHighlightLayer(side, idx) {
 // 不必去补 updateSynonymState({show:false}) 那七八个调用点。
 function syncSelectionHighlightLayers() {
     try {
+        // P4（§2.3.3 第 2 点）：field 是 'ovl-code'/'ovl-visual' 时根本没有左右两栏句对可画——
+        // buildSelectionHighlightInner 按 idx 找句对行元素，喂给它一个不存在的 idx 只会白跑。
+        // 这个函数是整个高亮系统唯一的收口（见下面英文原注释），改这一处就够了，不用
+        // 逐个调用点加判断。
+        const s0 = AppState.synonymState;
+        if (s0 && s0.show && (s0.field === 'ovl-code' || s0.field === 'ovl-visual')) return;
         // 选中作废（弹窗关了）→ 跨栏状态清零 + 取消在飞请求。必须在重建镜像层之前做，
         // 否则这一轮还会照着已作废的 fragments 再画一次。
         const ss = AppState.synonymState;
@@ -9989,7 +10051,9 @@ async function handleSynonymModeSwitch(mode) {
     }
 
     try {
-        const lang = s.field === 'src' ? AppState.sourceLang : AppState.targetLang;
+        // P4：field 是 'ovl-code'/'ovl-visual'（编辑器/Visual 选中）时不能按 src/tgt 猜语种，
+        // 走 ovlSynonymLangFor（定义见 P4 quick-actions 一节，纯函数、无副作用，提前调用安全）。
+        const lang = ovlSynonymLangFor(s);
         const config = getApiConfig();
         const result = await fetchSynonymOptions(
             newMode, s.contextSentence, s.originalText, lang, config, [],
@@ -10036,7 +10100,7 @@ async function handleSynonymPageChange(direction) {
             updateSynonymState({ pageIndexByMode: pb, errorMessage: "" });
         } else {
             if (!field) return;
-            const lang = field === 'src' ? AppState.sourceLang : AppState.targetLang;
+            const lang = ovlSynonymLangFor(s); // P4：编辑器/Visual 字段走探测语种，不猜 src/tgt
 
             const req = beginSynonymRequest();
             updateSynonymState({ loading: true, errorMessage: "", reqId: req.id });
@@ -10089,7 +10153,7 @@ async function handleSynonymRetry() {
     updateSynonymState({ loading: true, errorMessage: "", reqId: req.id });
 
     try {
-        const lang = s.field === 'src' ? AppState.sourceLang : AppState.targetLang;
+        const lang = ovlSynonymLangFor(s); // P4：编辑器/Visual 字段走探测语种，不猜 src/tgt
         const config = getApiConfig();
         const result = await fetchSynonymOptions(
             mode, s.contextSentence, s.originalText, lang, config, [],
@@ -10161,6 +10225,9 @@ function handleGrammarOfferAccept(pageIndex) {
 // 作用域是跟着建议一起传进来的，不在这里重新猜。范围核对不上就中止 ——
 // 把一整句改写塞进一个词的位置会直接搅烂正文，宁可什么都不做。
 function applySynonym(synonym, scope) {
+    // P4（§2.3.4/§2.3.5）：编辑器/Visual 选中触发的替换是完全不同的落地方式（改 textarea，
+    // 不是改 translationPairs），前置分支处理完就 return，下面 v1 原有的每一行都不碰。
+    if (ovlApplySynonymEditorGuard(synonym, scope)) return;
     // 【改动前这里是一个光秃秃的 `return`】没有提示、不关弹窗、什么状态都不动。
     // 结果就是一个「悬空的弹窗」：候选项还在，鼠标划过去还变蓝、还出 ⇄ 图标，
     // 点下去**一个字都不会变，而且永远不会变**，用户完全无从知道发生了什么
@@ -21255,13 +21322,30 @@ function ovlPortalHtml() {
         // M7：设置弹窗（§2.6.8），内容由 ovlRenderSettingsCategory 动态填充，见 ovlSettingsModalHtml。
         + '<div class="ovl-settings-overlay" id="ovlSettingsOverlay" hidden></div>'
         // M7 Editor「Show quick actions on text selection」：选中文字时冒出的小工具条。
+        // P4（§2.3.1）：新增 4 颗选词工具按钮（替换/简化/语法/译），跟原来 3 颗格式按钮共用
+        // 同一条工具条，不新建第二套"选中浮出"机制。quickActions 设置只再控制 .ovl-qa-fmt
+        // 这 3 颗；新按钮永远跟着"有没有选中"走。「译」只在 Visual 模式选中时出现（CSS 见
+        // .ovl-qa-translate 那组规则）——需求 6 明确是 Visual 模式的能力。
         + '<div class="ovl-quickactions" id="ovlQuickActions">'
-        +   '<button type="button" data-qa="fmt.bold" data-tip="加粗" data-tip-pos="top"><b>B</b></button>'
-        +   '<button type="button" data-qa="fmt.italic" data-tip="斜体" data-tip-pos="top"><i>I</i></button>'
-        +   '<button type="button" data-qa="ins.cite" data-tip="引文" data-tip-pos="top">&#128214;</button>'
+        +   '<button type="button" class="ovl-qa-fmt" data-qa="fmt.bold" data-tip="加粗" data-tip-pos="top"><b>B</b></button>'
+        +   '<button type="button" class="ovl-qa-fmt" data-qa="fmt.italic" data-tip="斜体" data-tip-pos="top"><i>I</i></button>'
+        +   '<button type="button" class="ovl-qa-fmt" data-qa="ins.cite" data-tip="引文" data-tip-pos="top">&#128214;</button>'
+        +   '<button type="button" data-qa="word.replace" data-tip="替换" data-tip-pos="top">替</button>'
+        +   '<button type="button" data-qa="word.simplify" data-tip="简化" data-tip-pos="top">简</button>'
+        +   '<button type="button" data-qa="word.grammar" data-tip="语法修正" data-tip-pos="top">语</button>'
+        +   '<button type="button" class="ovl-qa-translate" data-qa="word.translate" data-tip="翻译成中文" data-tip-pos="top">译</button>'
         + '</div>'
         // M7 Editor「Equation preview」：光标落在 $...$ 里时用既有 KaTeX 渲染一个悬浮预览。
         + '<div class="ovl-eqpreview" id="ovlEqPreview"></div>'
+        // P4（§2.4.6/§2.4.7）：Visual 模式选中即译的浮框。内容走 renderFormattedText（marked+KaTeX），
+        // 不是原始 LaTeX 源码；定位算法 ovlVisTransPlace 保证不遮住被选中的原文。
+        + '<div class="ovl-vistrans" id="ovlVisTransBox" hidden>'
+        +   '<div class="ovl-vistrans-body" id="ovlVisTransBody"></div>'
+        +   '<div class="ovl-vistrans-actions">'
+        +     '<button type="button" class="ovl-vistrans-copy" id="ovlVisTransCopyBtn">复制译文</button>'
+        +     '<button type="button" class="ovl-vistrans-close" id="ovlVisTransCloseBtn">&times;</button>'
+        +   '</div>'
+        + '</div>'
         // P1：设置面板专用悬浮提示层（data-tip2），挂在 #ovlPortal 里不会被任何
         // overflow:auto 的祖先裁掉——具体机制见 CSS 里 .ovl-tip2 那一段的注释。
         + '<div class="ovl-tip2" id="ovlTip2" hidden></div>'
@@ -22401,6 +22485,10 @@ window.addEventListener('pagehide', function () {
 function ovlSetEditorMode(mode) {
     try {
         if (mode !== 'code' && mode !== 'visual') return;
+        // P4：切模式属于规划里明列的"关闭时机"之一——Code 侧的选词弹窗、quick actions 工具条、
+        // Visual 侧的翻译浮框都是跟着上一个模式的选区走的，切走了留着就是陈旧内容。
+        if (typeof ovlVisTransHide === 'function') ovlVisTransHide();
+        if (typeof ovlHideQuickActions === 'function') ovlHideQuickActions();
         OvlState.editorMode = mode;
         const ta = document.getElementById('ovlCodeArea');
         const gutter = document.getElementById('ovlGutter');
@@ -22884,6 +22972,7 @@ async function ovlOpenFile(fileHandle, name, parentHandle) {
         // M5：换了文件，折叠状态归零，Visual 若开着就重渲一次（不开着就是白做一次，
         // 但比"切回 Visual 时还是上一个文件"的陈旧内容更安全，判断用 editorMode 守一道）。
         OvlVisualState.preambleOpen = false; OvlVisualState.tailOpen = false;
+        if (typeof ovlVisTransHide === 'function') ovlVisTransHide(); // P4：换文件=旧选区作废
         if (OvlState.editorMode === 'visual') ovlVisualRender();
     } catch (e) {
         console.error('[ovl] open file failed', e);
@@ -22984,6 +23073,7 @@ async function ovlOpenFileFromBlob(file, name) {
         if (tabName) tabName.textContent = name + '（只读降级模式）';
         ovlRenderGutter(true);
         OvlVisualState.preambleOpen = false; OvlVisualState.tailOpen = false;
+        if (typeof ovlVisTransHide === 'function') ovlVisTransHide(); // P4：换文件=旧选区作废
         if (OvlState.editorMode === 'visual') ovlVisualRender();
     } catch (e) {
         console.error('[ovl] open fallback file failed', e);
@@ -25047,6 +25137,19 @@ function ovlSettingsTranslatorHtml() {
         '每隔多久自动把当前的原文和译文存一份快照。');
     html += ovlSetRow('历史保留条数', '<select data-transfn="setHistoryLimit">' + [5, 10, 20].map(function (n) { return ovlOptTag(n, String(n), AppState.historyLimit); }).join('') + '</select>',
         '最多保留多少份历史快照，超出的会被最旧的顶掉。');
+    // P4（§2.4.4/§2.4.1）：Visual 模式选中即译用的模型 + 触发方式，走通用 data-setpath
+    // 处理（ovlBindSettingsModal 的 change 委托已经会 store[parts[1]]=val 再存盘+重渲），
+    // 不需要额外的专用函数。
+    html += ovlSetRow('Visual 选中即译', '<select data-setpath="settings.visualTranslate">'
+        + ovlOptTag('auto', '自动弹出', s.visualTranslate) + ovlOptTag('button', '仅按钮触发', s.visualTranslate) + ovlOptTag('off', '关闭', s.visualTranslate)
+        + '</select>',
+        'Visual 模式里选中一段文字后要不要自动弹出中文翻译。"仅按钮触发"只在工具条上留一颗「译」按钮，点了才发；"关闭"两者都不出现。');
+    html += ovlSetRow('Visual 翻译模型', '<select data-setpath="settings.visualTransModel">'
+        + ovlOptTag('', '跟随翻译器当前模型', s.visualTransModel)
+        + DEFAULT_MODEL_CATALOG.map(function (m) { return ovlOptTag(m.id, m.short || m.id, s.visualTransModel); }).join('')
+        + (Array.isArray(AppState.localModels) ? AppState.localModels : []).map(function (lm) { return ovlOptTag(lm.id, lm.id, s.visualTransModel); }).join('')
+        + '</select>',
+        'Visual 模式里选中文字后，用哪个模型翻译。留空就跟着翻译器上方选的模型走。');
     return html;
 }
 const OVL_SETTINGS_RENDERERS = { editor: ovlSettingsEditorHtml, spelling: ovlSettingsSpellingHtml, compiler: ovlSettingsCompilerHtml, appearance: ovlSettingsAppearanceHtml, translator: ovlSettingsTranslatorHtml };
@@ -25599,32 +25702,513 @@ function ovlBindDropMenus() {
 }
 
 // ---- M7 Editor：Quick actions 悬浮工具条 / Breadcrumb / Equation preview / 自动配对括号 ----
+// P4（§2.3.1）：工具条现在两个来源都能唤出——Code 模式的 #ovlCodeArea 选区、Visual 模式的
+// #ovlVisualPane 选区。OvlQaState.source 记着这一次是哪个来源，点击时要按来源分流：
+// word.replace/simplify/grammar 走 ovlEditorSynonymOpen(mode, source)；word.translate
+// 只在来源是 visual 时可点（CSS 已经把它在 Code 来源下藏起来，这里再守一道）；
+// fmt.bold/fmt.italic/ins.cite 照旧走 ovlRunCmd，不受本次改动影响。
+let OvlQaState = { source: 'code' };
 function ovlHideQuickActions() { const qa = document.getElementById('ovlQuickActions'); if (qa) qa.classList.remove('ovl-open'); }
-function ovlShowQuickActionsAt(x, y) {
+function ovlShowQuickActionsAt(x, y, source) {
     const qa = document.getElementById('ovlQuickActions');
     if (!qa) return;
+    OvlQaState.source = (source === 'visual') ? 'visual' : 'code';
+    qa.classList.toggle('ovl-qa-src-visual', OvlQaState.source === 'visual');
+    qa.classList.toggle('ovl-qa-nofmt', !OvlSettings.quickActions);
+    qa.classList.toggle('ovl-qa-notranslate', OvlSettings.visualTranslate === 'off');
     qa.style.left = Math.max(4, x - 40) + 'px';
     qa.style.top = Math.max(4, y - 36) + 'px';
     qa.classList.add('ovl-open');
 }
 function ovlBindQuickActions() {
     const ta = document.getElementById('ovlCodeArea');
-    if (!ta) return;
-    ta.addEventListener('mouseup', function (e) {
-        if (!OvlSettings.quickActions || ta.disabled || ta.selectionStart === ta.selectionEnd) { ovlHideQuickActions(); return; }
-        ovlShowQuickActionsAt(e.clientX, e.clientY);
-    });
-    ta.addEventListener('scroll', ovlHideQuickActions);
+    const visualPane = document.getElementById('ovlVisualPane');
     const qa = document.getElementById('ovlQuickActions');
+
+    if (ta) {
+        ta.addEventListener('mouseup', function (e) {
+            if (ta.disabled || ta.selectionStart === ta.selectionEnd) { ovlHideQuickActions(); return; }
+            ovlShowQuickActionsAt(e.clientX, e.clientY, 'code');
+        });
+        ta.addEventListener('scroll', ovlHideQuickActions);
+    }
+    if (visualPane) {
+        // Visual 是渲染好的 HTML，选区用 Selection API，不是 textarea 的 selectionStart/End。
+        visualPane.addEventListener('mouseup', function (e) {
+            try {
+                const sel = ovlWinOf(visualPane).getSelection();
+                if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { ovlHideQuickActions(); return; }
+                const range = sel.getRangeAt(0);
+                if (!visualPane.contains(range.commonAncestorContainer)) { ovlHideQuickActions(); return; }
+                ovlShowQuickActionsAt(e.clientX, e.clientY, 'visual');
+            } catch (err) { ovlHideQuickActions(); }
+        });
+        visualPane.addEventListener('scroll', ovlHideQuickActions);
+    }
     if (qa) qa.addEventListener('click', function (e) {
         const btn = e.target.closest('[data-qa]');
-        if (!btn) return;
-        ovlRunCmd(btn.getAttribute('data-qa'));
+        if (!btn || btn.disabled) return;
+        const id = btn.getAttribute('data-qa');
+        const src = OvlQaState.source || 'code';
+        if (id === 'word.replace' || id === 'word.simplify' || id === 'word.grammar') {
+            ovlEditorSynonymOpen(id.slice(5), src);
+        } else if (id === 'word.translate') {
+            if (src === 'visual') ovlVisTransFromSelection(true);
+        } else {
+            ovlRunCmd(id);
+        }
         ovlHideQuickActions();
     });
     document.addEventListener('click', function (e) {
-        if (e.target.closest('#ovlQuickActions') || e.target === ta) return;
+        if (e.target.closest('#ovlQuickActions')) return;
+        if (ta && e.target === ta) return;
+        if (visualPane && visualPane.contains(e.target)) return;
         ovlHideQuickActions();
+    });
+}
+
+// ==================== P4：选词工具在编辑器里的落地（需求 5，docs/v2_ux_round_plan.md §2.3）====================
+
+// 选中文本的语种判断：不能用 AppState.sourceLang/targetLang（那是给左右两栏用的），
+// 编辑器/Visual 里选中的可能是任意语言片段。两边字符数都是 0（比如只选中了纯符号/数字）
+// 时判不出，按 'en'（§2.3.3 第 3 点原话）。
+function ovlDetectSelLang(text) {
+    try {
+        const zh = ((text || '').match(/[一-龥]/g) || []).length;
+        const en = ((text || '').match(/[a-zA-Z]/g) || []).length;
+        if (zh === 0 && en === 0) return 'en';
+        return zh >= en ? 'zh' : 'en';
+    } catch (e) { return 'en'; }
+}
+// #synonymPopup 的模式切换/翻页/重试三个入口原来都是「field==='src' 用源语种，否则用目标语种」，
+// 这套假设只对 v1 的左右两栏成立。field 是 'ovl-code'/'ovl-visual' 时改成对选中文本探测。
+function ovlSynonymLangFor(s) {
+    if (s && (s.field === 'ovl-code' || s.field === 'ovl-visual')) return ovlDetectSelLang(s.originalText || '');
+    return (s && s.field === 'src') ? AppState.sourceLang : AppState.targetLang;
+}
+
+// Code 模式：把 textarea 里某个字符位置换算成屏幕像素坐标。复用既有的 .ovl-code-mirror +
+// ovlGetCodeMirror() 基础设施（§2.3.2），不建第二套测量系统。已知既有缺陷（改字号会让
+// lineOffsets/gutter 错位，见 ovlApplySettings 头部注释）本函数不假设 OVL_LINE_H 这个常量
+// 对得上当前字号——用 getComputedStyle(ta) 现测 font/lineHeight/padding，同步到 mirror 上。
+function ovlCodeSelectionRect(ta, pos) {
+    try {
+        const text = ta.value;
+        pos = Math.max(0, Math.min(text.length, pos));
+        const lineStart = text.lastIndexOf('\n', pos - 1) + 1;
+        let lineEnd = text.indexOf('\n', pos);
+        if (lineEnd === -1) lineEnd = text.length;
+        const lineText = text.slice(lineStart, lineEnd);
+        const intra = pos - lineStart;
+        const lineIdx = (text.slice(0, lineStart).match(/\n/g) || []).length;
+
+        const cs = getComputedStyle(ta);
+        const lineH = parseFloat(cs.lineHeight) || OVL_LINE_H;
+        const baseRow = (OvlState.lineOffsets && OvlState.lineOffsets[lineIdx])
+            ? OvlState.lineOffsets[lineIdx].cumRows : lineIdx;
+
+        const mirror = ovlGetCodeMirror();
+        mirror.style.width = ta.clientWidth + 'px';
+        mirror.style.fontSize = cs.fontSize;
+        mirror.style.fontFamily = cs.fontFamily;
+        mirror.style.fontWeight = cs.fontWeight;
+        mirror.style.lineHeight = cs.lineHeight;
+        mirror.style.padding = cs.padding;
+
+        mirror.textContent = '';
+        mirror.appendChild(document.createTextNode(lineText.slice(0, intra)));
+        const marker = document.createElement('span');
+        marker.textContent = '​';
+        mirror.appendChild(marker);
+        mirror.appendChild(document.createTextNode(lineText.slice(intra)));
+
+        const mRect = mirror.getBoundingClientRect();
+        const kRect = marker.getBoundingClientRect();
+        const padTop = parseFloat(cs.paddingTop) || 0;
+        const dx = kRect.left - mRect.left;
+        const dRow = Math.round((kRect.top - mRect.top - padTop) / lineH);
+
+        const taRect = ta.getBoundingClientRect();
+        const x = taRect.left + dx - ta.scrollLeft;
+        const y = taRect.top + padTop + (baseRow + dRow) * lineH - ta.scrollTop;
+        return { x: x, y: y, h: lineH };
+    } catch (e) {
+        // 兜底：量不出来就退化成 textarea 左上角，弹窗仍能显示，只是位置不准——
+        // 比抛错让整个选词工具用不了好。
+        const r = ta.getBoundingClientRect();
+        return { x: r.left + 12, y: r.top + 8, h: OVL_LINE_H };
+    }
+}
+
+// 薄适配层：复用 v1 #synonymPopup 的全部机器（beginSynonymRequest/updateSynonymState/
+// fetchSynonymOptions/…），用一对新哨兵值 'ovl-code'/'ovl-visual' 区分来源（§2.3.3）。
+// source: 'code' | 'visual'
+async function ovlEditorSynonymOpen(mode, source) {
+    try {
+        const nm = normalizeSynonymMode(mode);
+        let selectedText, contextText, selectionRange, sentenceRange, posPoint, field;
+
+        if (source === 'visual') {
+            const pane = document.getElementById('ovlVisualPane');
+            if (!pane) return;
+            const win = ovlWinOf(pane);
+            const sel = win.getSelection();
+            if (!sel || sel.rangeCount === 0) return;
+            const range = sel.getRangeAt(0);
+            if (!pane.contains(range.commonAncestorContainer)) return;
+            selectedText = String(sel).replace(/\s+/g, ' ').trim();
+            if (!selectedText) return;
+            // Visual 没有可寻址的源码位置，"整句"只能退而求其次，找最近的块级祖先当上下文——
+            // 找不到就用选中文本自己（sentenceRange 留 null，见下面 §2.3.5 的唯一命中判定，
+            // applySynonym 的编辑器分支不看 sentenceRange，看的是 originalText 在源码里的命中数）。
+            let block = range.commonAncestorContainer;
+            if (block && block.nodeType !== 1) block = block.parentElement;
+            if (block && block.closest) block = block.closest('p,li,h1,h2,h3,h4,h5,h6,blockquote,td,th') || block;
+            contextText = (block && block.textContent && block.textContent.trim()) ? block.textContent.trim() : selectedText;
+            selectionRange = null;
+            sentenceRange = null;
+            const r = range.getBoundingClientRect();
+            posPoint = { x: r.left, y: r.bottom + 6 };
+            field = 'ovl-visual';
+        } else {
+            const ta = document.getElementById('ovlCodeArea');
+            if (!ta || ta.disabled) return;
+            const start = ta.selectionStart, end = ta.selectionEnd;
+            if (start === end) return;
+            selectedText = ta.value.slice(start, end);
+            if (!selectedText || /^\s*$/.test(selectedText)) return;
+            contextText = ta.value;
+            selectionRange = { start: start, end: end };
+            sentenceRange = findSentenceRange(ta.value, start, end);
+            const r = ovlCodeSelectionRect(ta, end);
+            posPoint = { x: r.x, y: r.y + r.h };
+            field = 'ovl-code';
+        }
+
+        const req = beginSynonymRequest();
+        updateSynonymState({
+            show: true,
+            loading: true,
+            originalText: selectedText,
+            mode: nm,
+            historyByMode: emptySynonymHistory(),
+            pageIndexByMode: emptySynonymPageIndex(),
+            grammarNotes: [],
+            errorMessage: '',
+            position: posPoint,
+            selectionRange: selectionRange,
+            sentenceRange: sentenceRange,
+            field: field,
+            index: null,
+            contextSentence: contextText,
+            reqId: req.id
+        });
+
+        try {
+            const lang = ovlDetectSelLang(selectedText);
+            const config = getApiConfig();
+            const result = await fetchSynonymOptions(
+                nm, contextText, selectedText, lang, config, [],
+                getGrammarScopeContext(AppState.synonymState), req.signal
+            );
+            if (synonymReqStale(req.id)) return;
+            const cur = AppState.synonymState;
+            const curHb = (cur.historyByMode && typeof cur.historyByMode === 'object') ? cur.historyByMode : emptySynonymHistory();
+            curHb[nm] = [result.alternatives];
+            updateSynonymState(Object.assign(
+                { historyByMode: curHb },
+                result.note ? { grammarNotes: [result.note] } : {},
+                cur.mode === nm ? { loading: false } : {}
+            ));
+        } catch (err) {
+            if (isSynonymAbort(err)) return;
+            if (synonymReqStale(req.id)) return;
+            console.error(err);
+            if (AppState.synonymState.show) {
+                updateSynonymState({ loading: false, errorMessage: describeSynonymError(err) });
+            }
+        }
+    } catch (e) {
+        console.error('[ovl] editorSynonymOpen failed', e);
+    }
+}
+
+// execCommand('insertText') 落地一次替换：本项目既有铁律（第 23003 行附近）——直接写
+// ta.value 会清空浏览器原生撤销栈，必须走这条路 Ctrl+Z 才能一步撤销。
+// 调用前再核对一次 [start,end) 处的文字仍然等于 expected（防止异步返回期间用户已经改动正文）。
+// ⚠️ Visual 模式下 #ovlCodeArea 是 display:none（不可聚焦），这里临时切回可见态来 focus，
+// 写完再切回去——全程同步执行，中间不会有渲染帧，用户看不到闪烁。
+function ovlEditorApplyReplace(ta, start, end, expected, replacement) {
+    if (ta.value.substring(start, end) !== expected) return false;
+    const wasHidden = ta.style.display === 'none';
+    if (wasHidden) ta.style.display = '';
+    ta.focus();
+    ta.setSelectionRange(start, end);
+    document.execCommand('insertText', false, replacement);
+    if (wasHidden) ta.style.display = 'none';
+    return true;
+}
+
+// applySynonym 的前置分支：field 是 'ovl-code'/'ovl-visual' 时接管，其余（v1 的 src/tgt）
+// 原样交给 applySynonym 自己后面那一大段，一行都不碰。返回 true=已处理（调用方直接 return）。
+function ovlApplySynonymEditorGuard(synonym, scope) {
+    const s = AppState.synonymState;
+    if (!s || (s.field !== 'ovl-code' && s.field !== 'ovl-visual')) return false;
+
+    const ta = document.getElementById('ovlCodeArea');
+    if (!ta || ta.disabled) { updateSynonymState({ show: false, loading: false, errorMessage: '' }); return true; }
+
+    if (s.field === 'ovl-visual') {
+        // §2.3.5 唯一命中判定：渲染候选按钮时已经算过一次（renderSynonymPopupOnly 的
+        // visualLock，用来置灰），这里点击时再核一次——两次判定必须用同一把尺子，
+        // 不能渲染时说能点、点的时候又用不同逻辑判定。
+        const src = ta.value;
+        const picked = typeof s.originalText === 'string' ? s.originalText : '';
+        const first = picked ? src.indexOf(picked) : -1;
+        // 真实次数（跟 renderSynonymPopupOnly 的 visualLock 用同一把尺子，见那边的注释）。
+        const n = picked ? (src.split(picked).length - 1) : 0;
+        if (n !== 1) {
+            updateSynonymState({
+                loading: false,
+                errorMessage: n === 0
+                    ? '这段文字在源码里不是原样存在（Visual 显示的是排版后的样子），没法自动替换。请切到 Code 模式手动改。'
+                    : '这段文字在源码里出现了 ' + n + ' 次，无法确定改哪一处。请切到 Code 模式手动改。'
+            });
+            return true;
+        }
+        const ok = ovlEditorApplyReplace(ta, first, first + picked.length, picked, synonym);
+        if (!ok) { updateSynonymState({ loading: false, errorMessage: '原文已变动，替换已取消。' }); return true; }
+        updateSynonymState({ show: false, loading: false, errorMessage: '' });
+        ovlVisualRender(); // 源码变了，Visual 面板重渲一次反映新内容
+        return true;
+    }
+
+    // field === 'ovl-code'：和 v1 applySynonym 原有逻辑同一把尺子（sentence/selection 两种
+    // scope、逐字核对、0 处/多处一律中止），只是落地方式换成 execCommand 改 textarea。
+    let start, end, expected;
+    if (scope === 'sentence') {
+        const sr = getValidSentenceRange(s);
+        if (!sr) {
+            updateSynonymState({ loading: false, errorMessage: '整句范围已失效（正文被改动过），未做任何替换。请重新选中后再试。' });
+            return true;
+        }
+        start = sr.start; end = sr.end; expected = sr.text;
+    } else {
+        const range = s.selectionRange;
+        const orig = s.originalText;
+        if (!range || typeof orig !== 'string' || orig === '') {
+            updateSynonymState({ loading: false, errorMessage: '选中范围已失效（正文被改动过），未做任何替换。请重新选中后再试。' });
+            return true;
+        }
+        if (range.start >= 0 && range.end <= ta.value.length && ta.value.substring(range.start, range.end) === orig) {
+            start = range.start; end = range.end; expected = orig;
+        } else {
+            let n = 0, at = ta.value.indexOf(orig), first = at;
+            while (at !== -1) { n++; if (n > 1) break; at = ta.value.indexOf(orig, at + 1); }
+            if (n !== 1) {
+                updateSynonymState({ loading: false, errorMessage: '选中范围已失效（正文被改动过），未做任何替换。请重新选中后再试。' });
+                return true;
+            }
+            start = first; end = first + orig.length; expected = orig;
+        }
+    }
+    const ok = ovlEditorApplyReplace(ta, start, end, expected, synonym);
+    if (!ok) { updateSynonymState({ loading: false, errorMessage: '原文已变动，替换已取消。' }); return true; }
+    updateSynonymState({ show: false, loading: false, errorMessage: '' });
+    return true;
+}
+
+// ==================== P4：Visual 模式选中即译（需求 6，docs/v2_ux_round_plan.md §2.4）====================
+// 复用 callModelPlainText（不建第二套 API 层）；缓存/中断照抄 beginSynonymRequest 那一套
+// （synonymReqSeq 的注释记录的 R1/R2 故障：慢的旧响应覆盖新选区）。
+let OvlVisTransSeq = 0;
+let OvlVisTransAbort = null;
+const OvlVisTransCache = new Map(); // key=归一化文本 -> 译文，LRU 上限 50
+let OvlVisTransDebounceTimer = null;
+
+function ovlVisTransCacheGet(key) {
+    if (!OvlVisTransCache.has(key)) return undefined;
+    const v = OvlVisTransCache.get(key);
+    OvlVisTransCache.delete(key); OvlVisTransCache.set(key, v); // 命中的挪到最后（LRU）
+    return v;
+}
+function ovlVisTransCacheSet(key, val) {
+    if (OvlVisTransCache.has(key)) OvlVisTransCache.delete(key);
+    OvlVisTransCache.set(key, val);
+    if (OvlVisTransCache.size > 50) OvlVisTransCache.delete(OvlVisTransCache.keys().next().value);
+}
+
+// §2.4.4：模型可在设置中调整，默认（空值）跟随翻译器当前选中的模型；存的模型 id 已经
+// 从目录里消失（比如本地模型断线）时静默回退到 base，不报错。
+function ovlVisTransConfig(base) {
+    const id = OvlSettings.visualTransModel;
+    if (!id) return base;
+    const m = DEFAULT_MODEL_CATALOG.find(function (x) { return x.id === id; })
+        || (AppState.localModels || []).find(function (x) { return x.id === id; });
+    if (!m) return base;
+    return Object.assign({}, base, { provider: m.provider || 'local', model: m.id });
+}
+
+// §2.4.7 定位算法：四个候选位选放得下的（下→上→右→左），都放不下就选空间最大的一侧
+// 内部滚动，最后强制夹紧、绝不许压住选区。
+function ovlVisTransPlace(box, selRect) {
+    const M = 10, VW = innerWidth, VH = innerHeight;
+    box.style.maxHeight = '';
+    box.style.overflowY = '';
+    box.hidden = false;
+    box.style.visibility = 'hidden';
+    box.style.maxWidth = Math.min(460, VW - 2 * M) + 'px';
+    const w = box.offsetWidth, h = box.offsetHeight;
+
+    const below = { x: selRect.left, y: selRect.bottom + M, room: VH - selRect.bottom - M };
+    const above = { x: selRect.left, y: selRect.top - h - M, room: selRect.top - M };
+    const right = { x: selRect.right + M, y: selRect.top, room: VW - selRect.right - M };
+    const left = { x: selRect.left - w - M, y: selRect.top, room: selRect.left - M };
+    const cands = [below, above, right, left];
+
+    let pick = cands.find(function (c) {
+        return c.room >= h + M || ((c === right || c === left) && c.room >= w + M);
+    });
+    if (!pick) {
+        pick = cands.slice().sort(function (a, b) { return b.room - a.room; })[0];
+        box.style.maxHeight = Math.max(120, pick.room - M) + 'px';
+        box.style.overflowY = 'auto';
+    }
+    let x = Math.max(M, Math.min(pick.x, VW - w - M));
+    let y = Math.max(M, Math.min(pick.y, VH - h - M));
+    // 最后一道保险：夹紧之后如果又压到选区了，强制推到空间较大的一侧（§2.4.7 第 4 步，
+    // 不是可选的——第 3 步的夹紧经常正好把框推回选区上面）。
+    if (!(y + h <= selRect.top - 2 || y >= selRect.bottom + 2 || x + w <= selRect.left - 2 || x >= selRect.right + 2)) {
+        if (selRect.top - M >= VH - selRect.bottom - M) y = Math.max(M, selRect.top - h - M);
+        else y = Math.min(VH - h - M, selRect.bottom + M);
+    }
+    box.style.left = x + 'px';
+    box.style.top = y + 'px';
+    box.classList.add('ovl-open');
+    box.style.visibility = '';
+}
+
+function ovlVisTransHide() {
+    try { if (OvlVisTransAbort) OvlVisTransAbort.abort(); } catch (e) {}
+    OvlVisTransAbort = null;
+    ++OvlVisTransSeq; // 让任何还在飞的响应变成陈旧响应，回来时一个字节都不会写
+    const box = document.getElementById('ovlVisTransBox');
+    if (box) { box.classList.remove('ovl-open'); box.hidden = true; }
+}
+
+async function ovlVisTransRequest(text, selRect) {
+    const box = document.getElementById('ovlVisTransBox');
+    const body = document.getElementById('ovlVisTransBody');
+    if (!box || !body) return;
+
+    const cached = ovlVisTransCacheGet(text);
+    if (cached !== undefined) {
+        ++OvlVisTransSeq; // 命中缓存也要让上一个还在飞的请求作废，避免它晚一步覆盖这次的显示
+        try { if (OvlVisTransAbort) OvlVisTransAbort.abort(); } catch (e) {}
+        OvlVisTransAbort = null;
+        body.innerHTML = renderFormattedText(cached);
+        ovlVisTransPlace(box, selRect);
+        return;
+    }
+
+    const mySeq = ++OvlVisTransSeq;
+    try { if (OvlVisTransAbort) OvlVisTransAbort.abort(); } catch (e) {}
+    const ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+    OvlVisTransAbort = ctl;
+
+    body.innerHTML = '<div class="ovl-vistrans-loading">翻译中…</div>';
+    ovlVisTransPlace(box, selRect);
+
+    try {
+        const base = getApiConfig();
+        const cfg = ovlVisTransConfig(base);
+        const prompt = '把下面这段学术英文翻译成中文。只输出译文本身，不要解释，不要重复原文。'
+            + '保留其中的 LaTeX 数学公式（$...$）原样不译。\n\n' + text;
+        const out = await callModelPlainText(prompt, cfg, ctl ? ctl.signal : null);
+        if (mySeq !== OvlVisTransSeq) return; // 选区早就换了/框已经关了，陈旧响应一个字节都不写
+        const result = (typeof out === 'string' && out.trim()) ? out.trim() : '（模型未返回可用译文）';
+        ovlVisTransCacheSet(text, result);
+        body.innerHTML = renderFormattedText(result);
+        ovlVisTransPlace(box, selRect); // 内容变了，按新高度重新落一次位
+    } catch (err) {
+        if (mySeq !== OvlVisTransSeq) return;
+        if (err && err.name === 'AbortError') return; // 主动取消不是失败，不显示任何东西
+        console.error('[ovl] visTrans failed', err);
+        body.innerHTML = '<div class="ovl-vistrans-loading">' + escapeHtml(describeSynonymError(err)) + '</div>';
+        ovlVisTransPlace(box, selRect);
+    }
+}
+
+// force=true：来自「译」按钮点击（无视 visualTranslate==='off'/'button' 的门槛和长度下限，
+// 用户主动点了就该有反应）。force=false：来自 mouseup/selectionchange 的自动触发。
+function ovlVisTransFromSelection(force) {
+    try {
+        const pane = document.getElementById('ovlVisualPane');
+        if (!pane || OvlState.editorMode !== 'visual') return;
+        const mode = OvlSettings.visualTranslate;
+        if (!force && mode === 'off') return;
+
+        const win = ovlWinOf(pane);
+        const sel = win.getSelection();
+        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { if (!force) ovlVisTransHide(); return; }
+        const range = sel.getRangeAt(0);
+        if (!pane.contains(range.commonAncestorContainer)) { if (!force) ovlVisTransHide(); return; }
+        const text = String(sel).replace(/\s+/g, ' ').trim();
+        if (!text) { if (!force) ovlVisTransHide(); return; }
+
+        if (!force) {
+            if (mode === 'button') return; // 'button' 档：只有点了「译」按钮才发
+            if (text.length < 8 || text.length > 600) return; // 太短是误触，太长是整段，费钱且没用
+        } else if (text.length > 600) {
+            showToast('选中的文字太长（超过 600 字），请选短一点再试。', 'warning');
+            return;
+        }
+
+        const selRect = range.getBoundingClientRect();
+        ovlVisTransRequest(text, selRect);
+    } catch (e) { console.error('[ovl] visTransFromSelection failed', e); }
+}
+function ovlScheduleVisTransFromSelection() {
+    if (OvlVisTransDebounceTimer) clearTimeout(OvlVisTransDebounceTimer);
+    OvlVisTransDebounceTimer = setTimeout(function () { ovlVisTransFromSelection(false); }, 350);
+}
+function ovlBindVisualTranslate() {
+    const pane = document.getElementById('ovlVisualPane');
+    if (!pane) return;
+    pane.addEventListener('mouseup', ovlScheduleVisTransFromSelection);
+    // selectionchange 不在具体元素上冒泡，只能挂 document；回调自己核对选区是否落在
+    // #ovlVisualPane 里，覆盖键盘选区（Shift+方向键，没有 mouseup 可依赖）。
+    document.addEventListener('selectionchange', function () {
+        if (OvlState.editorMode !== 'visual') return;
+        ovlScheduleVisTransFromSelection();
+    });
+    pane.addEventListener('scroll', ovlVisTransHide);
+
+    const box = document.getElementById('ovlVisTransBox');
+    if (box) box.addEventListener('click', function (e) {
+        if (e.target.closest('#ovlVisTransCloseBtn')) { ovlVisTransHide(); return; }
+        if (e.target.closest('#ovlVisTransCopyBtn')) {
+            const body = document.getElementById('ovlVisTransBody');
+            const text = body ? body.textContent : '';
+            if (text && navigator.clipboard && navigator.clipboard.writeText) {
+                navigator.clipboard.writeText(text).then(function () { showToast('已复制译文', 'success'); }).catch(function () {});
+            }
+        }
+    });
+    document.addEventListener('click', function (e) {
+        const b = document.getElementById('ovlVisTransBox');
+        if (!b || b.hidden) return;
+        // 实测踩到的坑：点工具条上的「译」按钮（force 触发）本身就在 #ovlVisualPane 之外
+        // （#ovlQuickActions 挂在 #ovlPortal 里，不是 pane 的子节点），点击事件冒泡到这里时
+        // 框刚被 ovlVisTransFromSelection 同步打开——如果不排除这个来源，这条"点外面关闭"
+        // 会在同一次点击里把刚开的框立刻关掉、还顺带 abort 掉刚发出去的请求。
+        if (e.target.closest('#ovlVisTransBox') || e.target.closest('#ovlQuickActions') || pane.contains(e.target)) return;
+        ovlVisTransHide();
+    });
+    document.addEventListener('keydown', function (e) {
+        if (e.key !== 'Escape') return;
+        const b = document.getElementById('ovlVisTransBox');
+        if (b && !b.hidden) ovlVisTransHide();
     });
 }
 function ovlUpdateBreadcrumb() {
@@ -25951,6 +26535,7 @@ function ovlBindPassD() {
         ovlBindDropMenus();
         ovlBindMenuBar();
         ovlBindVisualPane();
+        ovlBindVisualTranslate(); // P4：需求 6，Visual 模式选中即译
 
         const syncTexBtn = document.getElementById('ovlSyncTexBtn');
         if (syncTexBtn) syncTexBtn.addEventListener('click', function () {
