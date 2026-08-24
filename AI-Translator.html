@@ -976,6 +976,286 @@ body[data-aichat-drag="bl"]   { cursor: nesw-resize !important; }
    不走 setState —— 聊天的任何动作都不许触发整页重渲染。 */
 .is-chat-open { background: #eef2ff !important; border-color: #c7d2fe !important; color: #4338ca !important; }
 
+/* ==================== OVL.CSS (v2 Overleaf 风格外壳 · M1) ====================
+   手写、#ovlShell/#ovlPortal 前缀，禁用 Tailwind 工具类 —— 动态插进 body 的节点上的
+   Tailwind 类不保证被运行时 JIT 扫到（同一原因聊天窗第 335–347 行也是全手写）。
+   z-index 号段严格照抄规划 §3.3：外壳 1000–1099，外壳菜单 1080，#root 浮层 1500/1510，
+   #aiChatRoot 2147482000（不变），[data-tip]::after 2147483000（不变）。 */
+
+/* 默认（外壳未激活，即 ovlBoot 还没成功跑完）：#ovlShell 不存在或不可见，#root 照常显示。
+   只有 body.ovl-shell-active 生效时才隐藏 #root，换成外壳；
+   .ovl-translator-open 优先级更高，把 #root 拉回来当全屏浮层。 */
+body.ovl-shell-active:not(.ovl-translator-open) #root { display: none; }
+
+body.ovl-translator-open #root {
+    position: fixed;
+    inset: 0;
+    z-index: 1500;
+    background: #f8fafc;
+    overflow: auto;
+    display: block;
+}
+
+#ovlShell {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: none;
+    flex-direction: column;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    color: #F4F5F6;
+}
+body.ovl-shell-active #ovlShell { display: flex; }
+/* 翻译器浮层开着时外壳仍在 DOM 里但盖在下面，不用额外隐藏 —— #root 的 z-index 1500 天然盖住 1000 段。 */
+
+.ovl-topbar {
+    height: 40px;
+    min-height: 40px;
+    background: #1B222C;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 12px;
+    border-bottom: 1px solid #2F3A4C;
+    z-index: 1010;
+}
+.ovl-topbar-title {
+    font-size: 13px;
+    font-weight: 500;
+    color: #F4F5F6;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.ovl-topbar-right { display: flex; align-items: center; gap: 8px; }
+.ovl-layout-btn {
+    background: #2F3A4C;
+    color: #E7E9EE;
+    border: none;
+    border-radius: 4px;
+    padding: 5px 10px;
+    font-size: 12px;
+    cursor: pointer;
+}
+.ovl-layout-btn:hover { background: #3A4760; }
+
+.ovl-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: 40px 188px 1fr 1fr;
+    background: #2F3A4C;
+    z-index: 1000;
+}
+.ovl-body[data-tree="collapsed"] { grid-template-columns: 40px 0px 1fr 1fr; }
+.ovl-body[data-view="editor"] { grid-template-columns: 40px 188px 1fr; }
+.ovl-body[data-view="editor"][data-tree="collapsed"] { grid-template-columns: 40px 0px 1fr; }
+.ovl-body[data-view="editor"] #ovlPdfPanel { display: none; }
+.ovl-body[data-view="pdf"] { grid-template-columns: 40px 188px 1fr; }
+.ovl-body[data-view="pdf"][data-tree="collapsed"] { grid-template-columns: 40px 0px 1fr; }
+.ovl-body[data-view="pdf"] #ovlEditorPanel { display: none; }
+
+.ovl-rail {
+    background: #1B222C;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding-top: 8px;
+    gap: 4px;
+}
+.ovl-rail-btn {
+    width: 32px;
+    height: 32px;
+    border: none;
+    background: transparent;
+    color: #F4F5F6;
+    font-size: 16px;
+    border-radius: 6px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.ovl-rail-btn:hover { background: #2F3A4C; }
+
+.ovl-tree-panel {
+    background: #1B222C;
+    color: #F4F5F6;
+    overflow: hidden;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    border-right: 1px solid #2F3A4C;
+}
+.ovl-body[data-tree="collapsed"] .ovl-tree-panel { border-right: none; }
+.ovl-tree-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    border-bottom: 1px solid #2F3A4C;
+    white-space: nowrap;
+}
+.ovl-tree-pick-btn {
+    background: #2F3A4C;
+    color: #E7E9EE;
+    border: none;
+    border-radius: 4px;
+    padding: 3px 6px;
+    font-size: 11px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.ovl-tree-pick-btn:hover { background: #3A4760; }
+.ovl-tree-body { flex: 1 1 auto; overflow: auto; padding: 6px 4px; font-size: 12px; }
+.ovl-tree-empty, .ovl-tree-loading, .ovl-tree-error { padding: 8px; color: #9AA4B2; font-size: 11px; line-height: 1.5; }
+.ovl-tree-error { color: #f87171; }
+.ovl-tree-ul { list-style: none; margin: 0; padding-left: 14px; }
+.ovl-tree-ul.ovl-tree-root, .ovl-tree-body > .ovl-tree-ul { padding-left: 0; }
+.ovl-tree-node { margin: 0; }
+.ovl-tree-row {
+    padding: 3px 6px;
+    border-radius: 4px;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.ovl-tree-row:hover { background: #2F3A4C; }
+.ovl-tree-children { display: none; }
+.ovl-tree-node.ovl-tree-open > .ovl-tree-children { display: block; }
+
+.ovl-editor-panel {
+    background: #FFFFFF;
+    color: #1f2937;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    border-right: 1px solid #2F3A4C;
+}
+.ovl-editor-tabbar { background: #2F3A4C; height: 30px; display: flex; align-items: center; padding: 0 10px; }
+.ovl-editor-tab { color: #E7E9EE; font-size: 12px; background: #1B222C; padding: 3px 10px; border-radius: 4px 4px 0 0; }
+.ovl-editor-toolbar {
+    background: #1B222C;
+    height: 34px;
+    display: flex;
+    align-items: center;
+    padding: 0 10px;
+}
+.ovl-mode-toggle {
+    display: inline-flex;
+    background: #495365;
+    border-radius: 9999px;
+    padding: 2px;
+}
+.ovl-mode-toggle label {
+    font-size: 12px;
+    font-weight: 400;
+    color: #E7E9EE;
+    padding: 3px 12px;
+    border-radius: 9999px;
+    cursor: pointer;
+}
+.ovl-mode-toggle label.ovl-mode-active { background: #098842; color: #ffffff; }
+
+.ovl-editor-body { flex: 1 1 auto; min-height: 0; display: flex; overflow: hidden; }
+.ovl-gutter {
+    flex: 0 0 auto;
+    width: 48px;
+    background: #F0F0F0;
+    color: #333333;
+    font: 12px/1.5 "SFMono-Regular", Consolas, "Courier New", monospace;
+    text-align: right;
+    padding: 8px 8px 8px 0;
+    overflow: hidden;
+    box-sizing: border-box;
+    user-select: none;
+    white-space: pre;
+}
+.ovl-ln { height: 1.5em; }
+.ovl-code-area {
+    flex: 1 1 auto;
+    border: none;
+    outline: none;
+    resize: none;
+    padding: 8px 12px;
+    font: 12px/1.5 "SFMono-Regular", Consolas, "Courier New", monospace;
+    color: #1f2937;
+    background: #ffffff;
+    /* 明令关闭软换行：main.tex 4,132 行，逐行重刷式高亮/软换行会卡死（§3.4 第 2 条）。 */
+    white-space: pre;
+    overflow: auto;
+}
+.ovl-code-area:disabled { background: #f8fafc; color: #6b7280; }
+.ovl-visual-pane {
+    flex: 1 1 auto;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #6b7280;
+    font-size: 13px;
+    background: #f8fafc;
+}
+
+.ovl-pdf-panel {
+    background: #2F3A4C;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+.ovl-pdf-toolbar { height: 34px; display: flex; align-items: center; padding: 0 10px; color: #E7E9EE; font-size: 12px; background: #1B222C; }
+.ovl-pdf-body { flex: 1 1 auto; display: flex; align-items: center; justify-content: center; color: #9AA4B2; font-size: 13px; text-align: center; padding: 20px; }
+
+/* ---- #ovlPortal：下拉菜单 + 翻译器关闭按钮 ---- */
+#ovlPortal { position: fixed; inset: 0; pointer-events: none; z-index: 1080; }
+#ovlPortal > * { pointer-events: auto; }
+
+.ovl-translator-close-btn {
+    display: none;
+    position: fixed;
+    top: 8px;
+    right: 12px;
+    z-index: 1510;
+    background: #1B222C;
+    color: #F4F5F6;
+    border: none;
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 12px;
+    cursor: pointer;
+}
+.ovl-translator-close-btn:hover { background: #2F3A4C; }
+body.ovl-translator-open .ovl-translator-close-btn { display: block; }
+
+.ovl-layout-menu {
+    position: fixed;
+    z-index: 1080;
+    background: #1B222C;
+    color: #F4F5F6;
+    border-radius: 6px;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.4);
+    min-width: 160px;
+    padding: 4px 0;
+    font-size: 12px;
+}
+.ovl-layout-menu-title {
+    padding: 6px 12px;
+    font-size: 11px;
+    color: #9AA4B2;
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
+}
+.ovl-layout-menu-item {
+    padding: 6px 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.ovl-layout-menu-item:hover { background: #2F3A4C; }
+.ovl-layout-menu-item.ovl-active { color: #4ade80; }
+.ovl-layout-menu-item.ovl-active::before { content: "\2713  "; }
+
 </style>
 </head>
 <body class="bg-slate-50 text-slate-900">
@@ -18547,6 +18827,11 @@ document.addEventListener('DOMContentLoaded', function() {
     // renderApp 本身一行都没动，这是这个功能的全部要点。
     try { chatBoot(); } catch (e) { console.error('[chat] boot threw', e); }
 
+    // v2 Overleaf 风格外壳：同样刻意放在最后、自带 try/catch。ovlBoot 内部把
+    // body.ovl-shell-active 的挂载放在成功路径的最后一步，这里的 catch 兜的是
+    // ovlBoot 之前那几步（理论上不会走到，但和 chatBoot 保持同一纪律）。
+    try { ovlBoot(); } catch (e) { console.error('[ovl] boot threw', e); }
+
     // 自动翻译防抖（在handleInputChange中处理）
 });
 
@@ -18741,6 +19026,533 @@ async function autoConnectLocal() {
         // 显示顶部错误提示
         setState({ error: `无法连接到本地服务器 ${AppState.localBaseUrl}。请确保 LM Studio 正在运行。` });
     }
+}
+
+// ==================== OVL.JS (v2 Overleaf 风格外壳 · M1) ====================
+// 挂载纪律（§3.3，硬约束，不许违反）：
+//   #ovlShell / #ovlPortal 是 <body> 的兄弟节点，永不进 #root，永不碰 renderApp/renderAppCore。
+//   打开 v1 翻译器浮层只加 CSS class（body.ovl-translator-open），不重新挂载 #root。
+// ovl-shell-active 这个 class 只在 ovlBoot() 成功跑完全部初始化之后、作为最后一步才加到 body 上 ——
+// 万一前面任何一步抛出，body 上不会留下这个 class，页面照旧退回纯 v1（不会白屏）。
+const OvlState = {
+    booted: false,
+    viewMode: 'split',       // 'split' | 'editor' | 'pdf'
+    treeOpen: true,
+    dirHandle: null,
+    usingWebkitFallback: false,
+    editorMode: 'code',      // 'code' | 'visual'
+    currentFile: null,       // { name, handle|null }
+    gutterLineCount: 0
+};
+
+function ovlShellHtml() {
+    return ''
+        + '<div class="ovl-topbar">'
+        +   '<div class="ovl-topbar-title">AI-Translator · LaTeX 查看器（v2 · M1）</div>'
+        +   '<div class="ovl-topbar-right">'
+        +     '<button type="button" id="ovlLayoutBtn" class="ovl-layout-btn" data-tip="视图模式：Split view / Editor only / PDF only" data-tip-pos="bottom-end">&#9638; 视图 &#9662;</button>'
+        +   '</div>'
+        + '</div>'
+        + '<div class="ovl-body" id="ovlBody" data-view="split" data-tree="open">'
+        +   '<div class="ovl-rail">'
+        +     '<button type="button" class="ovl-rail-btn" id="ovlTreeToggleBtn" data-tip="显示/隐藏文件树" data-tip-pos="right">&#128196;</button>'
+        +     '<button type="button" class="ovl-rail-btn" id="ovlOpenTranslatorBtn" data-tip="打开 AI 翻译器（v1，功能完整）" data-tip-pos="right">&#10697;</button>'
+        +     '<button type="button" class="ovl-rail-btn" id="ovlChatBtn" data-tip="打开 AI 对话窗" data-tip-pos="right">&#128172;</button>'
+        +   '</div>'
+        +   '<div class="ovl-tree-panel" id="ovlTreePanel">'
+        +     '<div class="ovl-tree-header">'
+        +       '<span class="ovl-tree-header-title">File tree</span>'
+        +       '<button type="button" class="ovl-tree-pick-btn" id="ovlPickFolderBtn">打开项目文件夹…</button>'
+        +     '</div>'
+        +     '<div class="ovl-tree-body" id="ovlTreeBody">'
+        +       '<div class="ovl-tree-empty">点击上方「打开项目文件夹」选择一个本地文件夹。</div>'
+        +     '</div>'
+        +   '</div>'
+        +   '<div class="ovl-editor-panel" id="ovlEditorPanel">'
+        +     '<div class="ovl-editor-tabbar"><span class="ovl-editor-tab" id="ovlEditorTabName">未打开文件</span></div>'
+        +     '<div class="ovl-editor-toolbar">'
+        +       '<div class="ovl-mode-toggle" id="ovlModeToggle">'
+        +         '<label data-mode="code" class="ovl-mode-active">Code</label>'
+        +         '<label data-mode="visual">Visual</label>'
+        +       '</div>'
+        +     '</div>'
+        +     '<div class="ovl-editor-body">'
+        +       '<div class="ovl-gutter" id="ovlGutter"></div>'
+        +       '<textarea class="ovl-code-area" id="ovlCodeArea" spellcheck="false" disabled placeholder="从左侧文件树打开一个 .tex 文件"></textarea>'
+        +       '<div class="ovl-visual-pane" id="ovlVisualPane" style="display:none;">Visual 模式将在 M5 实现</div>'
+        +     '</div>'
+        +   '</div>'
+        +   '<div class="ovl-pdf-panel" id="ovlPdfPanel">'
+        +     '<div class="ovl-pdf-toolbar">PDF</div>'
+        +     '<div class="ovl-pdf-body">PDF 预览需要编译桥接服务（M3）</div>'
+        +   '</div>'
+        + '</div>';
+}
+
+function ovlPortalHtml() {
+    return ''
+        + '<button type="button" id="ovlTranslatorCloseBtn" class="ovl-translator-close-btn" title="关闭翻译器，返回 Overleaf 外壳视图">&times; 返回外壳</button>'
+        + '<div class="ovl-layout-menu" id="ovlLayoutMenu" hidden>'
+        +   '<div class="ovl-layout-menu-title">Layout options</div>'
+        +   '<div class="ovl-layout-menu-item" data-view="split">Split view</div>'
+        +   '<div class="ovl-layout-menu-item" data-view="editor">Editor only</div>'
+        +   '<div class="ovl-layout-menu-item" data-view="pdf">PDF only</div>'
+        + '</div>'
+        + '<input type="file" id="ovlWebkitDirInput" webkitdirectory multiple hidden>';
+}
+
+function ovlEnsureShell() {
+    try {
+        let shell = document.getElementById('ovlShell');
+        if (shell) return shell;
+        if (!document.body) return null;
+
+        shell = document.createElement('div');
+        shell.id = 'ovlShell';
+        shell.innerHTML = ovlShellHtml();
+        document.body.appendChild(shell);
+
+        let portal = document.getElementById('ovlPortal');
+        if (!portal) {
+            portal = document.createElement('div');
+            portal.id = 'ovlPortal';
+            document.body.appendChild(portal);
+        }
+        portal.innerHTML = ovlPortalHtml();
+
+        return shell;
+    } catch (e) {
+        console.error('[ovl] ensureShell failed', e);
+        return null;
+    }
+}
+
+function ovlCloseLayoutMenu() {
+    const menu = document.getElementById('ovlLayoutMenu');
+    if (menu) menu.setAttribute('hidden', '');
+}
+
+function ovlToggleLayoutMenu() {
+    const menu = document.getElementById('ovlLayoutMenu');
+    const btn = document.getElementById('ovlLayoutBtn');
+    if (!menu || !btn) return;
+    const willOpen = menu.hasAttribute('hidden');
+    if (!willOpen) { ovlCloseLayoutMenu(); return; }
+    const r = btn.getBoundingClientRect();
+    menu.style.top = (r.bottom + 4) + 'px';
+    menu.style.right = (window.innerWidth - r.right) + 'px';
+    menu.removeAttribute('hidden');
+}
+
+function ovlSetViewMode(mode, opts) {
+    try {
+        if (mode !== 'split' && mode !== 'editor' && mode !== 'pdf') return;
+        OvlState.viewMode = mode;
+        const body = document.getElementById('ovlBody');
+        if (body) body.setAttribute('data-view', mode);
+        const menu = document.getElementById('ovlLayoutMenu');
+        if (menu) {
+            const items = menu.querySelectorAll('.ovl-layout-menu-item');
+            for (let i = 0; i < items.length; i++) {
+                items[i].classList.toggle('ovl-active', items[i].getAttribute('data-view') === mode);
+            }
+        }
+        if (!opts || !opts.skipSave) {
+            try { localStorage.setItem('ovl.viewMode', mode); } catch (e) {}
+        }
+        ovlCloseLayoutMenu();
+    } catch (e) {
+        console.error('[ovl] setViewMode failed', e);
+    }
+}
+
+function ovlToggleTree() {
+    try {
+        OvlState.treeOpen = !OvlState.treeOpen;
+        const body = document.getElementById('ovlBody');
+        if (body) body.setAttribute('data-tree', OvlState.treeOpen ? 'open' : 'collapsed');
+        try { localStorage.setItem('ovl.treeOpen', OvlState.treeOpen ? '1' : '0'); } catch (e) {}
+    } catch (e) {
+        console.error('[ovl] toggleTree failed', e);
+    }
+}
+
+// 打开 v1 翻译器浮层：只加 class，不动 DOM 树（§3.3）。
+function ovlOpenTranslator() {
+    try {
+        document.body.classList.add('ovl-translator-open');
+        // 显示后必须补一次 renderApp：display:none 期间量出来的双栏对齐高度全是 0。
+        try { renderApp(false); } catch (e2) { console.error('[ovl] renderApp after open failed', e2); }
+    } catch (e) {
+        console.error('[ovl] openTranslator failed', e);
+    }
+}
+
+function ovlCloseTranslator() {
+    try {
+        document.body.classList.remove('ovl-translator-open');
+    } catch (e) {
+        console.error('[ovl] closeTranslator failed', e);
+    }
+}
+
+function ovlSetEditorMode(mode) {
+    try {
+        if (mode !== 'code' && mode !== 'visual') return;
+        OvlState.editorMode = mode;
+        const ta = document.getElementById('ovlCodeArea');
+        const gutter = document.getElementById('ovlGutter');
+        const visual = document.getElementById('ovlVisualPane');
+        const toggle = document.getElementById('ovlModeToggle');
+        if (toggle) {
+            const labels = toggle.querySelectorAll('label');
+            for (let i = 0; i < labels.length; i++) {
+                labels[i].classList.toggle('ovl-mode-active', labels[i].getAttribute('data-mode') === mode);
+            }
+        }
+        if (mode === 'visual') {
+            if (ta) ta.style.display = 'none';
+            if (gutter) gutter.style.display = 'none';
+            if (visual) visual.style.display = 'flex';
+        } else {
+            if (ta) ta.style.display = '';
+            if (gutter) gutter.style.display = '';
+            if (visual) visual.style.display = 'none';
+        }
+    } catch (e) {
+        console.error('[ovl] setEditorMode failed', e);
+    }
+}
+
+// 行号槽：只在行数变化时整体重建（换行/删行才重建），普通敲字不触发重建 —— 避免
+// 对 4,132 行文档每次按键都重刷整块 DOM（§3.4 第 2 条同一条纪律的延伸）。
+function ovlRenderGutter(force) {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        const gutter = document.getElementById('ovlGutter');
+        if (!ta || !gutter) return;
+        const n = ta.value.length ? ta.value.split('\n').length : 1;
+        if (!force && n === OvlState.gutterLineCount) return;
+        OvlState.gutterLineCount = n;
+        const frag = document.createDocumentFragment();
+        for (let i = 1; i <= n; i++) {
+            const d = document.createElement('div');
+            d.className = 'ovl-ln';
+            d.textContent = String(i);
+            frag.appendChild(d);
+        }
+        gutter.textContent = '';
+        gutter.appendChild(frag);
+    } catch (e) {
+        console.error('[ovl] renderGutter failed', e);
+    }
+}
+
+function ovlShowTreeError(msg) {
+    const body = document.getElementById('ovlTreeBody');
+    if (!body) return;
+    body.textContent = '';
+    const d = document.createElement('div');
+    d.className = 'ovl-tree-error';
+    d.textContent = msg;
+    body.appendChild(d);
+}
+
+// ---- File System Access API 路径 ----
+
+// 递归建目录树的 DOM（懒加载子目录：点开才递归读下一层）。
+// 跳过点开头的条目（.git 等）—— 纯性能/可用性考虑，不是安全加固。
+async function ovlBuildTreeDom(dirHandle) {
+    const ul = document.createElement('ul');
+    ul.className = 'ovl-tree-ul';
+    const entries = [];
+    for await (const pair of dirHandle.entries()) {
+        const name = pair[0], h = pair[1];
+        if (name.charAt(0) === '.') continue;
+        entries.push([name, h]);
+    }
+    entries.sort(function (a, b) {
+        const ak = a[1].kind === 'directory' ? 0 : 1;
+        const bk = b[1].kind === 'directory' ? 0 : 1;
+        if (ak !== bk) return ak - bk;
+        return a[0].localeCompare(b[0]);
+    });
+    for (let i = 0; i < entries.length; i++) {
+        const name = entries[i][0], h = entries[i][1];
+        const isDir = h.kind === 'directory';
+        const li = document.createElement('li');
+        li.className = 'ovl-tree-node';
+        const row = document.createElement('div');
+        row.className = 'ovl-tree-row ' + (isDir ? 'ovl-tree-row-dir' : 'ovl-tree-row-file');
+        row.textContent = (isDir ? '▸ ' : '') + name;
+        li.appendChild(row);
+        if (isDir) {
+            const childUl = document.createElement('ul');
+            childUl.className = 'ovl-tree-ul ovl-tree-children';
+            li.appendChild(childUl);
+            row.addEventListener('click', function () {
+                const opening = !li.classList.contains('ovl-tree-open');
+                li.classList.toggle('ovl-tree-open', opening);
+                row.textContent = (opening ? '▾ ' : '▸ ') + name;
+                if (opening && childUl.childElementCount === 0) {
+                    ovlBuildTreeDom(h).then(function (built) {
+                        while (built.firstChild) childUl.appendChild(built.firstChild);
+                    }).catch(function (e) {
+                        console.error('[ovl] list dir failed', e);
+                        const errLi = document.createElement('li');
+                        errLi.className = 'ovl-tree-error';
+                        errLi.textContent = '（读取失败）';
+                        childUl.appendChild(errLi);
+                    });
+                }
+            });
+        } else {
+            row.addEventListener('click', function () { ovlOpenFile(h, name); });
+        }
+        ul.appendChild(li);
+    }
+    return ul;
+}
+
+async function ovlRenderTree(dirHandle) {
+    const body = document.getElementById('ovlTreeBody');
+    if (!body) return;
+    body.textContent = '';
+    const loading = document.createElement('div');
+    loading.className = 'ovl-tree-loading';
+    loading.textContent = '正在读取…';
+    body.appendChild(loading);
+    try {
+        const ul = await ovlBuildTreeDom(dirHandle);
+        body.textContent = '';
+        body.appendChild(ul);
+    } catch (e) {
+        console.error('[ovl] render tree failed', e);
+        ovlShowTreeError('读取文件夹失败：' + (e && e.message ? e.message : String(e)));
+    }
+}
+
+async function ovlOpenFile(fileHandle, name) {
+    try {
+        const file = await fileHandle.getFile();
+        const text = await file.text();
+        OvlState.currentFile = { name: name, handle: fileHandle };
+        const ta = document.getElementById('ovlCodeArea');
+        if (ta) { ta.disabled = false; ta.value = text; }
+        const tabName = document.getElementById('ovlEditorTabName');
+        if (tabName) tabName.textContent = name;
+        ovlRenderGutter(true);
+    } catch (e) {
+        console.error('[ovl] open file failed', e);
+    }
+}
+
+// ---- webkitdirectory 降级路径（FSA 不可用时）----
+
+function ovlBuildTreeFromFileList(fileList) {
+    const root = { dirs: new Map(), files: new Map() };
+    for (let i = 0; i < fileList.length; i++) {
+        const f = fileList[i];
+        const relPath = f.webkitRelativePath || f.name;
+        const parts = String(relPath).split('/').filter(function (p) { return p.length > 0; });
+        if (parts.some(function (p) { return p.charAt(0) === '.'; })) continue;
+        let node = root;
+        for (let j = 0; j < parts.length - 1; j++) {
+            const seg = parts[j];
+            if (!node.dirs.has(seg)) node.dirs.set(seg, { dirs: new Map(), files: new Map() });
+            node = node.dirs.get(seg);
+        }
+        if (parts.length > 0) node.files.set(parts[parts.length - 1], f);
+    }
+    return root;
+}
+
+function ovlDomFromFsNode(node) {
+    const ul = document.createElement('ul');
+    ul.className = 'ovl-tree-ul';
+    const dirNames = Array.from(node.dirs.keys()).sort();
+    const fileNames = Array.from(node.files.keys()).sort();
+    dirNames.forEach(function (name) {
+        const li = document.createElement('li');
+        li.className = 'ovl-tree-node';
+        const row = document.createElement('div');
+        row.className = 'ovl-tree-row ovl-tree-row-dir';
+        row.textContent = '▸ ' + name;
+        li.appendChild(row);
+        const childUl = ovlDomFromFsNode(node.dirs.get(name));
+        childUl.className += ' ovl-tree-children';
+        li.appendChild(childUl);
+        row.addEventListener('click', function () {
+            const opening = !li.classList.contains('ovl-tree-open');
+            li.classList.toggle('ovl-tree-open', opening);
+            row.textContent = (opening ? '▾ ' : '▸ ') + name;
+        });
+        ul.appendChild(li);
+    });
+    fileNames.forEach(function (name) {
+        const li = document.createElement('li');
+        li.className = 'ovl-tree-node';
+        const row = document.createElement('div');
+        row.className = 'ovl-tree-row ovl-tree-row-file';
+        row.textContent = name;
+        row.addEventListener('click', function () { ovlOpenFileFromBlob(node.files.get(name), name); });
+        li.appendChild(row);
+        ul.appendChild(li);
+    });
+    return ul;
+}
+
+async function ovlOpenFileFromBlob(file, name) {
+    try {
+        const text = await file.text();
+        OvlState.currentFile = { name: name, handle: null };
+        const ta = document.getElementById('ovlCodeArea');
+        // webkitdirectory 只读、无持久化 —— 明确禁用编辑，避免用户以为改了会存下去。
+        if (ta) { ta.disabled = true; ta.value = text; }
+        const tabName = document.getElementById('ovlEditorTabName');
+        if (tabName) tabName.textContent = name + '（只读降级模式）';
+        ovlRenderGutter(true);
+    } catch (e) {
+        console.error('[ovl] open fallback file failed', e);
+    }
+}
+
+async function ovlPickFolder() {
+    try {
+        if (window.showDirectoryPicker) {
+            let handle;
+            try {
+                handle = await window.showDirectoryPicker();
+            } catch (e) {
+                // AbortError = 用户在选择器里点了取消，这是正常流程，不是错误。
+                if (e && e.name === 'AbortError') return;
+                throw e;
+            }
+            OvlState.usingWebkitFallback = false;
+            OvlState.dirHandle = handle;
+            await ovlRenderTree(handle);
+        } else {
+            OvlState.usingWebkitFallback = true;
+            const input = document.getElementById('ovlWebkitDirInput');
+            if (input) input.click();
+        }
+    } catch (e) {
+        console.error('[ovl] pick folder failed', e);
+        ovlShowTreeError('打开文件夹失败：' + (e && e.message ? e.message : String(e)));
+    }
+}
+
+function ovlBindShell() {
+    try {
+        const treeBtn = document.getElementById('ovlTreeToggleBtn');
+        if (treeBtn) treeBtn.addEventListener('click', ovlToggleTree);
+
+        const openTBtn = document.getElementById('ovlOpenTranslatorBtn');
+        if (openTBtn) openTBtn.addEventListener('click', ovlOpenTranslator);
+
+        const chatBtn = document.getElementById('ovlChatBtn');
+        // 直接调既有的 chatToggle —— 不复制、不重写聊天窗（§4 M1 范围第 3 条）。
+        if (chatBtn) chatBtn.addEventListener('click', function () {
+            try { chatToggle(); } catch (e) { console.error('[ovl] chatToggle failed', e); }
+        });
+
+        const pickBtn = document.getElementById('ovlPickFolderBtn');
+        if (pickBtn) pickBtn.addEventListener('click', ovlPickFolder);
+
+        const closeBtn = document.getElementById('ovlTranslatorCloseBtn');
+        if (closeBtn) closeBtn.addEventListener('click', ovlCloseTranslator);
+
+        const layoutBtn = document.getElementById('ovlLayoutBtn');
+        if (layoutBtn) layoutBtn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            ovlToggleLayoutMenu();
+        });
+
+        const layoutMenu = document.getElementById('ovlLayoutMenu');
+        if (layoutMenu) {
+            layoutMenu.addEventListener('click', function (e) {
+                const item = e.target.closest('.ovl-layout-menu-item');
+                if (!item) return;
+                ovlSetViewMode(item.getAttribute('data-view'));
+            });
+        }
+
+        // 点菜单外部关闭菜单（捕获阶段挂一次，跟聊天窗的既有做法一样是全局单例监听）。
+        document.addEventListener('click', function (e) {
+            const menu = document.getElementById('ovlLayoutMenu');
+            const btn = document.getElementById('ovlLayoutBtn');
+            if (!menu || menu.hasAttribute('hidden')) return;
+            if (menu.contains(e.target) || (btn && btn.contains(e.target))) return;
+            ovlCloseLayoutMenu();
+        });
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape') ovlCloseLayoutMenu();
+        });
+
+        const modeToggle = document.getElementById('ovlModeToggle');
+        if (modeToggle) {
+            modeToggle.addEventListener('click', function (e) {
+                const label = e.target.closest('label[data-mode]');
+                if (!label) return;
+                ovlSetEditorMode(label.getAttribute('data-mode'));
+            });
+        }
+
+        const ta = document.getElementById('ovlCodeArea');
+        const gutter = document.getElementById('ovlGutter');
+        if (ta) {
+            ta.addEventListener('input', function () { ovlRenderGutter(false); });
+            ta.addEventListener('scroll', function () {
+                if (gutter) gutter.scrollTop = ta.scrollTop;
+            });
+        }
+
+        const dirInput = document.getElementById('ovlWebkitDirInput');
+        if (dirInput) {
+            dirInput.addEventListener('change', function (e) {
+                const files = e.target.files;
+                if (!files || !files.length) return;
+                OvlState.dirHandle = null;
+                const tree = ovlBuildTreeFromFileList(files);
+                const body = document.getElementById('ovlTreeBody');
+                if (body) {
+                    body.textContent = '';
+                    body.appendChild(ovlDomFromFsNode(tree));
+                }
+            });
+        }
+    } catch (e) {
+        console.error('[ovl] bindShell failed', e);
+    }
+}
+
+// 启动入口：DOMContentLoaded 末尾、chatBoot() 之后调用（§4 M1 改动位置②）。
+// 自带 try/catch，且激活 class 只在全部初始化成功之后作为最后一步加上 ——
+// 任何一步炸了，body 都不会带上 ovl-shell-active，页面照旧是纯 v1，不会白屏。
+function ovlBoot() {
+    if (OvlState.booted) return;
+    const shell = ovlEnsureShell();
+    if (!shell) throw new Error('ovlEnsureShell returned null');
+    ovlBindShell();
+
+    let savedView = null;
+    try { savedView = localStorage.getItem('ovl.viewMode'); } catch (e) {}
+    if (savedView === 'split' || savedView === 'editor' || savedView === 'pdf') {
+        OvlState.viewMode = savedView;
+    }
+    ovlSetViewMode(OvlState.viewMode, { skipSave: true });
+
+    let savedTree = null;
+    try { savedTree = localStorage.getItem('ovl.treeOpen'); } catch (e) {}
+    if (savedTree === '0') {
+        OvlState.treeOpen = false;
+        const body = document.getElementById('ovlBody');
+        if (body) body.setAttribute('data-tree', 'collapsed');
+    }
+
+    OvlState.booted = true;
+    // 最后一步：只有走到这里才让外壳生效。
+    document.body.classList.add('ovl-shell-active');
 }
 
 </script>
