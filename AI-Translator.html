@@ -1059,6 +1059,31 @@ body.ovl-translator-open #root main {
     min-height: 160px !important;
 }
 
+/* ==================== P2：简化模式（docs/v2_ux_round_plan.md §2.2.3）====================
+   class 挂在 #root 自己身上，不挂 body —— #root 是将来可能被弹出到子文档的那个节点，
+   而 body 上的 class/属性不跨文档（§3.4 规则 1，架构 pass §1.5 实测）。
+   唯一写手是 ovlTransSetSimple()/ovlTransSyncSimpleUI()（约 21800 行附近）。 */
+#root.ovl-trans-simple .ovl-t-brand,
+#root.ovl-trans-simple .ovl-t-panelhead,
+#root.ovl-trans-simple .ovl-t-footer,
+#root.ovl-trans-simple .ovl-t-regen {
+    display: none !important;
+}
+/* .ovl-t-tools 装着「设置/保存/历史/分隔线/模型选择器/控制条(.ovl-t-langbar)」六个直接子节点，
+   简化模式下只有控制条要部分保留（ZH/⇄/EN），其余五个整个藏起来。
+   不能反过来"先把 .ovl-t-tools 整体 display:none、再指望 .ovl-t-langbar 自己 display:flex 逃出来"
+   ——祖先 display:none 时子元素的 display 值不会生效，CSS 做不到那种"豁免"，
+   所以改用 :not() 只隐藏兄弟节点，.ovl-t-tools 自己从不被隐藏。 */
+#root.ovl-trans-simple .ovl-t-tools > :not(.ovl-t-langbar) {
+    display: none !important;
+}
+/* .ovl-t-langbar 内部：AUTO SYNC / DETECT 两颗按钮 + 它们和 ZH 之间的分隔线已经在 P1
+   迁到主设置 Translator 分类（同一份真值，两个入口），简化模式下原按钮跟着一起藏起来，
+   只留 ZH / ⇄ / EN 三个，用户仍能改翻译方向。 */
+#root.ovl-trans-simple .ovl-t-syncdetect {
+    display: none !important;
+}
+
 #ovlShell {
     position: fixed;
     inset: 0;
@@ -1474,6 +1499,10 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 }
 .ovl-transwin-iconbtn:hover { background: #2F3A4C; color: #ffffff; }
 .ovl-transwin-iconbtn svg { width: 13px; height: 13px; }
+/* P2：简化模式标题栏按钮的「已开」态，照抄 .ovl-findtoggle.ovl-active 的配色套路
+   （靛蓝底 + 深靛蓝字），但换成深色标题栏里能看清的浅色系。 */
+.ovl-transwin-iconbtn.ovl-active { background: #4338ca; color: #ffffff; }
+.ovl-transwin-iconbtn.ovl-active:hover { background: #4f46e5; color: #ffffff; }
 
 /* 八向缩放手柄：几何照抄 933–941 那张表（边 6px、角 12px），选择器换成 #ovlTransWin 前缀。
    同样必须是 #ovlTransWin 的直接子节点（不是标题栏内部），道理和 .aichat-resize 那段注释一样：
@@ -14600,7 +14629,7 @@ function renderSynonymPopup() {
 function renderHeader() {
     return `
         <header class="bg-white rounded-3xl shadow-sm border border-slate-200 mb-4 px-8 py-5 flex flex-wrap items-center justify-between gap-6 relative z-50">
-            <div class="flex items-center gap-4">
+            <div class="flex items-center gap-4 ovl-t-brand">
                 <div class="bg-gradient-to-br from-indigo-600 to-violet-700 p-3 rounded-2xl text-white shadow-xl shadow-indigo-100">
                     ${Icons.Languages}
                 </div>
@@ -14610,7 +14639,7 @@ function renderHeader() {
                 </div>
             </div>
 
-            <div class="flex items-center gap-4">
+            <div class="flex items-center gap-4 ovl-t-tools">
                 ${renderSettingsButton()}
                 ${renderSaveButtonGroup()}
                 ${renderHistoryMenu()}
@@ -14619,7 +14648,7 @@ function renderHeader() {
                 ${renderControlButtons()}
             </div>
 
-            <div class="flex items-center gap-3">
+            <div class="flex items-center gap-3 ovl-t-actions">
                 <button id="chatToggleBtn" onclick="chatToggle()" aria-pressed="${chatIsOpen() ? 'true' : 'false'}" class="px-5 py-2.5 bg-white border border-slate-200 text-slate-700 rounded-2xl hover:bg-slate-50 hover:border-indigo-200 transition-all font-semibold flex items-center gap-2 group ${chatIsOpen() ? 'is-chat-open' : ''}" data-tip="开/关浮动 AI 对话窗：一个能自由拖动、自己调大小的聊天窗，随便问、也能让模型改左栏原文里的任意一段（右栏译文它看不到、也改不了）。窗口挂在页面最外层，界面刷新和自动存档都打断不了你输到一半的内容。" data-tip-pos="bottom-start">
                     <span class="text-indigo-500 group-hover:animate-pulse">${Icons.MessageSquare}</span> Chat
                 </button>
@@ -14629,7 +14658,7 @@ function renderHeader() {
                 <button id="translateBtn" onclick="handleTranslate()" ${!AppState.inputText && !AppState.isLoading ? 'disabled' : ''} class="px-10 py-2.5 rounded-2xl font-black text-sm tracking-wider transition-all shadow-xl active:scale-95 flex items-center gap-2 ${!AppState.inputText && !AppState.isLoading ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isLoading ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isLoading ? '正在翻译，点一下立即中断（已翻好的部分保留）。' : '把左边输入框的全文按句拆开翻译，结果逐句出现在右栏。会覆盖当前译文。'}" data-tip-pos="bottom-end">
                     ${AppState.isLoading ? `<span class="animate-pulse">${Icons.StopCircle}</span> STOP` : 'TRANSLATE'}
                 </button>
-                <button onclick="handleRegenerateAll()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="p-2.5 rounded-2xl transition-all shadow-xl active:scale-95 flex items-center justify-center ${AppState.translationPairs.length === 0 ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isRegeneratingAll ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isRegeneratingAll ? '正在逐句重译，点一下停下来。' : '用当前模型把每一句重新翻一遍（原文不动）。换了模型、或对整体译文不满意时用它；再点一次可中断。'}" data-tip-pos="bottom-end">
+                <button onclick="handleRegenerateAll()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="ovl-t-regen p-2.5 rounded-2xl transition-all shadow-xl active:scale-95 flex items-center justify-center ${AppState.translationPairs.length === 0 ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isRegeneratingAll ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isRegeneratingAll ? '正在逐句重译，点一下停下来。' : '用当前模型把每一句重新翻一遍（原文不动）。换了模型、或对整体译文不满意时用它；再点一次可中断。'}" data-tip-pos="bottom-end">
                     ${AppState.isRegeneratingAll ? `<span class="animate-pulse">${Icons.StopCircle}</span>` : Icons.RefreshCw}
                 </button>
             </div>
@@ -14887,12 +14916,12 @@ function renderModelSelector() {
 // ============= 控制按钮 =============
 function renderControlButtons() {
     return `
-        <div class="flex items-center gap-2 bg-slate-100 p-1.5 rounded-full border border-slate-200 shadow-inner">
-            <button onclick="toggleAutoTranslate()" class="px-4 py-1.5 rounded-full text-[10px] font-bold flex items-center gap-2 transition-all ${AppState.isAutoTranslate ? 'bg-orange-500 text-white shadow-md' : 'text-slate-500'}" data-tip="${AppState.isAutoTranslate ? '已开：在左边输入框停手 1.5 秒就自动翻一次。粘贴长文时会自动开跑，关掉它可以改成只按 TRANSLATE 才翻。' : '已关：只有点 TRANSLATE 才翻译。打开后，停止输入 1.5 秒会自动翻一次。（跟左右两栏的滚动联动无关）'}" data-tip-pos="bottom">
+        <div class="ovl-t-langbar flex items-center gap-2 bg-slate-100 p-1.5 rounded-full border border-slate-200 shadow-inner">
+            <button onclick="toggleAutoTranslate()" class="ovl-t-syncdetect px-4 py-1.5 rounded-full text-[10px] font-bold flex items-center gap-2 transition-all ${AppState.isAutoTranslate ? 'bg-orange-500 text-white shadow-md' : 'text-slate-500'}" data-tip="${AppState.isAutoTranslate ? '已开：在左边输入框停手 1.5 秒就自动翻一次。粘贴长文时会自动开跑，关掉它可以改成只按 TRANSLATE 才翻。' : '已关：只有点 TRANSLATE 才翻译。打开后，停止输入 1.5 秒会自动翻一次。（跟左右两栏的滚动联动无关）'}" data-tip-pos="bottom">
                 ${AppState.isAutoTranslate ? Icons.ZapFilled : Icons.Zap} AUTO SYNC
             </button>
-            <button onclick="toggleAutoDetect()" class="px-4 py-1.5 rounded-full text-[10px] font-bold transition-all ${AppState.isAutoDetect ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-500'}" data-tip="${AppState.isAutoDetect ? '已开：自动判断输入是中文还是英文并决定翻译方向。手动点右边的 ZH / EN 会自动关掉它。' : '已关：翻译方向锁定为右边 ZH / EN 的选择。点开可恢复自动判断语种。'}" data-tip-pos="bottom">DETECT</button>
-            <div class="h-4 w-px bg-slate-300 mx-1"></div>
+            <button onclick="toggleAutoDetect()" class="ovl-t-syncdetect px-4 py-1.5 rounded-full text-[10px] font-bold transition-all ${AppState.isAutoDetect ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-500'}" data-tip="${AppState.isAutoDetect ? '已开：自动判断输入是中文还是英文并决定翻译方向。手动点右边的 ZH / EN 会自动关掉它。' : '已关：翻译方向锁定为右边 ZH / EN 的选择。点开可恢复自动判断语种。'}" data-tip-pos="bottom">DETECT</button>
+            <div class="ovl-t-syncdetect h-4 w-px bg-slate-300 mx-1"></div>
             <button onclick="setLanguage('zh','en')" class="px-5 py-2 rounded-full text-xs font-bold transition-all ${AppState.sourceLang === 'zh' ? 'bg-white shadow-sm text-indigo-700' : 'text-slate-500 hover:text-indigo-600'}" data-tip="源语言设为中文，译成英文（中 → 英）。点它会关掉自动判断语种。" data-tip-pos="bottom">ZH</button>
             <button onclick="swapLanguages()" class="p-2 text-slate-400 hover:bg-white rounded-full transition-colors" data-tip="对调翻译方向（中→英 ⇄ 英→中）。只换方向，不动已有的原文和译文。" data-tip-pos="bottom">${Icons.ArrowRightLeft}</button>
             <button onclick="setLanguage('en','zh')" class="px-5 py-2 rounded-full text-xs font-bold transition-all ${AppState.sourceLang === 'en' ? 'bg-white shadow-sm text-indigo-700' : 'text-slate-500 hover:text-indigo-600'}" data-tip="源语言设为英文，译成中文（英 → 中）。点它会关掉自动判断语种。" data-tip-pos="bottom-end">EN</button>
@@ -14916,7 +14945,7 @@ function renderSourcePanel() {
         <section class="bg-white rounded-[2rem] border border-slate-200 shadow-sm flex flex-col overflow-hidden relative group">
             <!-- min-h-[70px] + shrink-0：两栏表头必须等高，否则两个滚动容器的起点就差几个像素，
                  左右行永远差一个常数。左栏的按钮组比右栏的单个图标按钮高 3px，就是那个常数的来源。 -->
-            <div class="px-6 py-4 min-h-[70px] shrink-0 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+            <div class="ovl-t-panelhead px-6 py-4 min-h-[70px] shrink-0 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
                 <h3 class="text-xs font-black text-slate-400 uppercase tracking-[0.2em] whitespace-nowrap flex items-center gap-2">
                     Source Panel
                     ${AppState.activeIndex !== null ? `<span class="text-indigo-600 bg-indigo-50 px-2 py-0.5 rounded-full text-[9px] flex items-center gap-1.5 animate-pulse">${Icons.PenLineSmall} Editing</span>` : ''}
@@ -14971,7 +15000,7 @@ function renderTargetPanel() {
     return `
         <section class="bg-white rounded-[2rem] border border-slate-200 shadow-sm flex flex-col overflow-hidden relative group">
             <!-- 高度必须和 SOURCE PANEL 表头逐像素一致，见那边的注释 -->
-            <div class="px-6 py-4 min-h-[70px] shrink-0 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
+            <div class="ovl-t-panelhead px-6 py-4 min-h-[70px] shrink-0 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
                 <h3 class="text-xs font-black text-slate-400 uppercase tracking-[0.2em] whitespace-nowrap">Target Panel</h3>
                 <button onclick="copyTargetText()" class="p-2 text-slate-400 hover:text-indigo-600 transition-colors" data-tip="把右栏所有译文按顺序拼起来复制到剪贴板（不含原文）。" data-tip-pos="bottom-end">${Icons.Copy}</button>
             </div>
@@ -15206,7 +15235,7 @@ function renderFooter() {
     }
 
     return `
-        <footer class="mt-4 flex items-center justify-between px-4 text-[10px] text-slate-400 font-mono uppercase tracking-[0.2em] border-t border-slate-200 pt-4">
+        <footer class="ovl-t-footer mt-4 flex items-center justify-between px-4 text-[10px] text-slate-400 font-mono uppercase tracking-[0.2em] border-t border-slate-200 pt-4">
             <div class="flex gap-6 items-center">
                 <span class="flex items-center gap-2 text-indigo-500 font-black">
                     ${AppState.apiProvider === 'local' ? Icons.Server : Icons.Cpu}
@@ -21676,6 +21705,7 @@ function ovlTransWinHtml() {
         +   '<span class="ovl-transwin-title-text" data-tip="按住这里拖动窗口。四条边和四个角都能拖着改大小（和 Windows 的窗口一样，拖左边或上边时对面那条边钉住不动）。" data-tip-pos="bottom-start">AI 翻译器</span>'
         +   '<span class="ovl-transwin-title-spacer"></span>'
         +   '<span class="ovl-transwin-titlebtns">'
+        +     '<button type="button" class="ovl-transwin-iconbtn' + (OvlSettings.transSimpleMode ? ' ovl-active' : '') + '" id="ovlTransSimpleBtn" aria-pressed="' + (OvlSettings.transSimpleMode ? 'true' : 'false') + '" data-tip="简化模式：只留左右两个框" data-tip-pos="bottom-end"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="8" height="14" rx="1.5"></rect><rect x="13" y="5" width="8" height="14" rx="1.5"></rect></svg></button>'
         +     '<button type="button" class="ovl-transwin-iconbtn" id="ovlTransMaxBtn" data-tip="最大化 / 还原" data-tip-pos="bottom-end">&#10696;</button>'
         +     '<button type="button" class="ovl-transwin-iconbtn" id="ovlTransCloseBtn" data-tip="关闭（Esc 也一样），回到 Overleaf 外壳视图。位置和大小会记住。" data-tip-pos="bottom-end">' + Icons.XSmall + '</button>'
         +   '</span>'
@@ -21706,6 +21736,10 @@ function ovlTransEnsureWin() {
         document.body.appendChild(win);
         ovlTransBindWin(win);
         OvlTransState.mounted = true;
+        // P2：窗框刚建出来，标题栏按钮/根节点的简化模式态要按存的值恢复一次
+        // （ovlTransWinHtml 已经在生成 HTML 时读过一次 OvlSettings.transSimpleMode，
+        // 这里是双保险，也是 §2.2.3 明确要求的两处恢复点之一）。
+        ovlTransSyncSimpleUI();
 
         let savedMax = false;
         try { savedMax = localStorage.getItem('ovl.transMax') === '1'; } catch (e) {}
@@ -21755,6 +21789,9 @@ function ovlTransBindWin(win) {
         })(handles[i]);
     }
 
+    const simpleBtn = win.querySelector('#ovlTransSimpleBtn');
+    if (simpleBtn) simpleBtn.addEventListener('click', function (e) { chatStopEvent(e); ovlTransSetSimple(!OvlSettings.transSimpleMode); });
+
     const maxBtn = win.querySelector('#ovlTransMaxBtn');
     if (maxBtn) maxBtn.addEventListener('click', function (e) { chatStopEvent(e); ovlTransToggleMax(); });
 
@@ -21785,6 +21822,7 @@ function ovlOpenTranslator() {
         const win = ovlTransEnsureWin();
         if (!win) throw new Error('ovlTransEnsureWin returned null');
         document.body.classList.add('ovl-translator-open');
+        ovlTransSyncSimpleUI();   // P2：按存的值恢复一次简化模式态（§2.2.3）
         // 用户没碰过窗口（mode 'auto'）时，每次打开都按当前视口重新居中一次；
         // 碰过了（mode 'free'）就尊重存下来的几何，只把它拉回视口内。
         OvlTransState.geom = (OvlTransState.geom.mode === 'free' && !OvlTransState.maximized)
@@ -21811,6 +21849,44 @@ function ovlCloseTranslator() {
         if (back && back.focus) { try { back.focus(); } catch (e) {} }
     } catch (e) {
         console.error('[ovl] closeTranslator failed', e);
+    }
+}
+
+// ==================== P2：简化模式（docs/v2_ux_round_plan.md §2.2.2/§2.2.3）====================
+// 铁律「只存一份真值，两个入口」：唯一的真值是 OvlSettings.transSimpleMode（随
+// ovl.settings 一起持久化，OVL_SETTINGS_DEFAULTS 里已经有默认值）。两个入口——
+// 主设置 Translator 分类里的勾选框（走既有的 data-setpath 通用处理，见 ovlBindSettingsModal
+// 的 change 监听）、和这里的标题栏按钮——都只负责改这一份真值，不各自维护自己的状态。
+// class 挂在 #root 自己身上（见 CSS 里那段注释），不挂 body。
+function ovlTransSetSimple(on) {
+    try {
+        OvlSettings.transSimpleMode = !!on;
+        ovlSaveSettings();
+        ovlTransSyncSimpleUI();
+        // 设置面板如果正开在 Translator 分类，勾选框的 checked 是渲染时就定死在 HTML 里的，
+        // 不会因为这里改了 OvlSettings 自动跟着变，必须手动重渲染这一个分类
+        // （同 ovlBindSettingsModal 里 data-transfn 分支的套路）——这样两个入口才是真的互相同步。
+        const overlay = document.getElementById('ovlSettingsOverlay');
+        if (overlay && !overlay.hidden && OvlSettingsState.cat === 'translator') ovlRenderSettingsCategory('translator');
+    } catch (e) {
+        console.error('[ovl-trans] setSimple failed', e);
+    }
+}
+
+// 把 OvlSettings.transSimpleMode 这份真值刷到 DOM 上：#root 的 class（驱动 §CSS 那组隐藏规则）
+// 和标题栏按钮的按下态。幂等、可以随时多调一次——#root 永远存在（静态 HTML），
+// #ovlTransSimpleBtn 只有窗框建出来之后才存在，找不到就跳过（不是错误，窗口还没开过）。
+function ovlTransSyncSimpleUI() {
+    try {
+        const root = document.getElementById('root');
+        if (root) root.classList.toggle('ovl-trans-simple', !!OvlSettings.transSimpleMode);
+        const btn = document.getElementById('ovlTransSimpleBtn');
+        if (btn) {
+            btn.setAttribute('aria-pressed', OvlSettings.transSimpleMode ? 'true' : 'false');
+            btn.classList.toggle('ovl-active', !!OvlSettings.transSimpleMode);
+        }
+    } catch (e) {
+        console.error('[ovl-trans] syncSimpleUI failed', e);
     }
 }
 
@@ -24192,6 +24268,9 @@ function ovlApplySettings() {
         const bc = document.getElementById('ovlBreadcrumb');
         if (bc) bc.classList.toggle('ovl-show', !!OvlSettings.breadcrumbs);
         ovlUpdatePdfInvertFromSettings();
+        // P2：settings.transSimpleMode 的勾选框走的是通用 data-setpath 处理（改 OvlSettings
+        // 之后统一调 ovlSaveSettings()+ovlApplySettings()），真正把它落到 DOM 上就靠这一行。
+        ovlTransSyncSimpleUI();
     } catch (e) { console.error('[ovl] applySettings failed', e); }
 }
 
