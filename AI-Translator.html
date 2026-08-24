@@ -1084,6 +1084,50 @@ body.ovl-translator-open #root main {
     display: none !important;
 }
 
+/* ==================== P3：弹出到独立 OS 窗口（docs/v2_ux_round_plan.md §3）====================
+   机制在下面 JS 里（ovlPopOut / ovlPopIn 一节，约 21900 行附近）：优先 Document PiP，
+   被占用/不可用时退回 window.open，两者都需要真实用户手势。这里只放纯展示的 CSS。
+
+   1) .ovl-popped 挂在**被搬走的节点自己身上**（§3.4 规则 1：body 的 class/属性不跨文档，
+      §1.5 实测），不挂 body：
+      - 缩放手柄整体消失（不是"看得见但拖不动"——那是在撒谎，§3.5 原话）。
+      - 标题栏的抓手光标关掉；JS 端另有一道判断，弹出期间压根不会启动那次拖拽
+        （ovlWinBeginDrag / chatBeginDrag 调用点，见下面 JS）。
+      - 翻译器窗口的"最大化"按钮没有意义（OS 窗口自己的最大化功能替代了它），隐藏。
+   2) 子窗口里只有这一棵搬进去的子树，不需要像页面里那样避让别的东西，直接填满。
+      用 !important 盖过 JS 写的内联 px（ovlTransApplyGeom / chatApplyGeom 写的那份原样留着，
+      是"收回页面"时要用的几何，弹出期间只是视觉上被这组规则接管，数值本身没被改写）。
+      #root 的 body.ovl-popout-child 由 ovlPopOutBuildDoc 挂在子文档的 <body> 上（§3.4
+      限制表 #5 的处理办法：把同名 class 一并写到子文档 body），照抄第 1033 行那组
+      body.ovl-translator-open #root 的定位/层级，只覆盖 left/top/width/height 四个属性——
+      留出 6px 边框 + 40px 标题栏的空间，数值照抄 OVL_TRANS_BORDER / OVL_TRANS_TITLEBAR_H
+      （约 21400 行），改了那两个常量记得回来同步这里。 */
+#ovlTransWin.ovl-popped .ovl-transwin-resize { display: none !important; }
+#ovlTransWin.ovl-popped .ovl-transwin-titlebar { cursor: default !important; }
+#ovlTransWin.ovl-popped #ovlTransMaxBtn { display: none !important; }
+#ovlTransWin.ovl-popped {
+    left: 0 !important; top: 0 !important;
+    width: 100% !important; height: 100vh !important;
+    border-radius: 0 !important; box-shadow: none !important;
+}
+body.ovl-popout-child #root {
+    left: 6px !important; top: 40px !important;
+    width: calc(100% - 12px) !important;
+    height: calc(100vh - 46px) !important;
+}
+/* #aiChatRoot 自己就是一整棵完整的窗口（标题栏+内容+手柄都在一个节点里，不像翻译器
+   拆成 #ovlTransWin/#root 两个独立节点），填满子窗口不需要额外的内缩计算。 */
+#aiChatRoot.ovl-popped .aichat-resize { display: none !important; }
+#aiChatRoot.ovl-popped .aichat-titlebar { cursor: default !important; }
+#aiChatRoot.ovl-popped {
+    left: 0 !important; top: 0 !important;
+    width: 100% !important; height: 100vh !important;
+    border-radius: 0 !important; box-shadow: none !important;
+}
+/* 对话窗标题栏按钮本来没有"已按下"这个视觉态（三颗按钮都是瞬时动作），P3 新增的弹出
+   按钮是双态开关，照抄翻译器 .ovl-transwin-iconbtn.ovl-active 的靛蓝配色（换成浅色标题栏的版本）。 */
+#aiChatRoot .aichat-iconbtn.ovl-active { color: #4338ca; background: #eef2ff; }
+
 #ovlShell {
     position: fixed;
     inset: 0;
@@ -12128,6 +12172,8 @@ const Icons = {
     Plug: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/></svg>`,
     SparklesSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m12 3-1.912 5.813a2 2 0 0 1-1.275 1.275L3 12l5.813 1.912a2 2 0 0 1 1.275 1.275L12 21l1.912-5.813a2 2 0 0 1 1.275-1.275L21 12l-5.813-1.912a2 2 0 0 1-1.275-1.275L12 3Z"/><path d="M5 3v4"/><path d="M19 17v4"/><path d="M3 5h4"/><path d="M17 19h4"/></svg>`,
     XSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>`,
+    // P3：弹出到独立 OS 窗口那颗标题栏按钮的图标（外链风格：方框 + 右上箭头）。
+    PopOutSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h6v6"/><path d="M10 14 21 3"/><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/></svg>`,
     // 对话窗标题栏那三颗按钮的图标（+ 新建对话 / − 最小化 / ⃞ 还原）。尺寸和 XSmall 对齐，
     // 三颗按钮的视觉重量才一致；stroke-width 也一样，否则 + 会显得比 × 细。
     PlusSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>`,
@@ -16281,6 +16327,8 @@ function chatShellHtml() {
         // 每颗都有中文 data-tip；按 data-tip 纪律，它们互相是兄弟、祖先（.aichat-titlebtns）不带 tip。
         +     '<span class="aichat-titlebtns">'
         +       '<button type="button" class="aichat-iconbtn" id="aiChatNewBtn" data-tip="新建对话：先把当前这段存进「会话」再开一段空的（和面板里的「清理」是同一条代码路径）。文档上下文不受影响 —— 它每轮现生成，新对话第一轮照样带整篇最新原文（左栏，不含译文）。你标出来的关注（黄色高亮 / 勾选框）属于稿子不属于这段对话，**会原样保留**。当前对话是空的时就什么都不做，不会往历史里塞空条目。" data-tip-pos="bottom-end">' + Icons.PlusSmall + '</button>'
+        // P3：弹出到独立 OS 窗口。aria-pressed/data-tip 的"已弹出"态由 ovlPopoutSyncButtons 维护。
+        +       '<button type="button" class="aichat-iconbtn" id="aiChatPopBtn" aria-pressed="false" data-tip="弹出到独立窗口：可以拖到桌面任意位置，和浏览器分开摆。" data-tip-pos="bottom-end">' + Icons.PopOutSmall + '</button>'
         +       '<button type="button" class="aichat-iconbtn" id="aiChatMinBtn" data-tip="最小化到后台：折叠成一条标题栏停在原地，仍然可以拖。和「关闭」不一样 —— 草稿（连同光标选区）、滚动位置、全部消息、关注标记、用量圆环、窗口尺寸全都留着，展开后逐项还原。折叠期间模型回完了，这里会亮出未读数。点这颗按钮或点标题栏都能展开。" data-tip-pos="bottom-end">' + Icons.MinusSmall + '</button>'
         +       '<button type="button" class="aichat-iconbtn" id="aiChatCloseBtn" data-tip="关掉对话窗（按 Esc 也一样）。位置和大小会记住，下次打开还在原处。" data-tip-pos="bottom-end">' + Icons.XSmall + '</button>'
         +     '</span>'
@@ -16639,6 +16687,14 @@ function chatBindShell(rootEl) {
     // （上面那段注释里的实测：按钮折叠 → 标题栏又展开）。stopPropagation 放在第一行，
     // 这样即使下面的动作抛异常，也已经拦住了 —— 顺序反过来就等于没拦。
     if (newBtn) newBtn.addEventListener('click', function (e) { chatStopEvent(e); chatClearConversation(); });
+
+    // P3：弹出/收回，同一颗按钮切两个方向。绑定只跑这一次（rootEl 是幂等创建的），
+    // 元素自身的 addEventListener 跨文档搬迁后照常触发（§1.5 实测），不需要在弹出后重绑。
+    const popBtn = rootEl.querySelector('#aiChatPopBtn');
+    if (popBtn) popBtn.addEventListener('click', function (e) {
+        chatStopEvent(e);
+        if (OvlPopoutState.chat.active) ovlPopIn('chat'); else ovlPopOut('chat');
+    });
 
     const minBtn = rootEl.querySelector('#aiChatMinBtn');
     if (minBtn) minBtn.addEventListener('click', function (e) { chatStopEvent(e); chatToggleMinimize(); });
@@ -20627,6 +20683,10 @@ function chatOpen() {
 
 function chatClose() {
     try {
+        // P3：弹出着的时候，"×"（以及 Esc）的意思是"收回到页面里"，不是真正关掉——#aiChatRoot
+        // 这会儿整个不在这份文档里，下面这些 class/焦点操作全部无的放矢。收回之后对话窗仍然
+        // 是"开着"的（ChatState.open 不变），再点一次 × 才是真关。
+        if (OvlPopoutState.chat.active) { ovlPopIn('chat'); return; }
         // 关闭必须是拖拽状态的确定性终点。不这样做的话：Esc 在拖拽途中把窗口关掉，
         // chatBeginDrag 挂在 document/window 上的监听器和 data-aichat-drag 都不会被清 ——
         // 拖拽会在窗口已经视觉消失之后继续在后台跑，真正松手时算出的尺寸会被当成
@@ -21706,6 +21766,9 @@ function ovlTransWinHtml() {
         +   '<span class="ovl-transwin-title-spacer"></span>'
         +   '<span class="ovl-transwin-titlebtns">'
         +     '<button type="button" class="ovl-transwin-iconbtn' + (OvlSettings.transSimpleMode ? ' ovl-active' : '') + '" id="ovlTransSimpleBtn" aria-pressed="' + (OvlSettings.transSimpleMode ? 'true' : 'false') + '" data-tip="简化模式：只留左右两个框" data-tip-pos="bottom-end"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="5" width="8" height="14" rx="1.5"></rect><rect x="13" y="5" width="8" height="14" rx="1.5"></rect></svg></button>'
+        // P3：弹出到独立 OS 窗口。aria-pressed/data-tip 的"已弹出"态由 ovlPopoutSyncButtons 维护，
+        // 这里只给一个没弹出时的初值（窗框每次都是新建的，不会带着上次弹出的状态重新出现）。
+        +     '<button type="button" class="ovl-transwin-iconbtn" id="ovlTransPopBtn" aria-pressed="false" data-tip="弹出到独立窗口：可以拖到桌面任意位置，和浏览器分开摆。" data-tip-pos="bottom-end">' + Icons.PopOutSmall + '</button>'
         +     '<button type="button" class="ovl-transwin-iconbtn" id="ovlTransMaxBtn" data-tip="最大化 / 还原" data-tip-pos="bottom-end">&#10696;</button>'
         +     '<button type="button" class="ovl-transwin-iconbtn" id="ovlTransCloseBtn" data-tip="关闭（Esc 也一样），回到 Overleaf 外壳视图。位置和大小会记住。" data-tip-pos="bottom-end">' + Icons.XSmall + '</button>'
         +   '</span>'
@@ -21792,6 +21855,14 @@ function ovlTransBindWin(win) {
     const simpleBtn = win.querySelector('#ovlTransSimpleBtn');
     if (simpleBtn) simpleBtn.addEventListener('click', function (e) { chatStopEvent(e); ovlTransSetSimple(!OvlSettings.transSimpleMode); });
 
+    // P3：弹出/收回。绑定只跑这一次（win 是幂等创建的），元素自身的 addEventListener
+    // 跨文档搬迁后照常触发（§1.5 实测），所以这一次绑定在弹出之后依然有效，不需要重绑。
+    const popBtn = win.querySelector('#ovlTransPopBtn');
+    if (popBtn) popBtn.addEventListener('click', function (e) {
+        chatStopEvent(e);
+        if (OvlPopoutState.trans.active) ovlPopIn('trans'); else ovlPopOut('trans');
+    });
+
     const maxBtn = win.querySelector('#ovlTransMaxBtn');
     if (maxBtn) maxBtn.addEventListener('click', function (e) { chatStopEvent(e); ovlTransToggleMax(); });
 
@@ -21839,6 +21910,10 @@ function ovlOpenTranslator() {
 
 function ovlCloseTranslator() {
     try {
+        // P3：弹出着的时候，"×"（以及 Esc）的意思是"收回到页面里"，不是真正关掉——窗框和
+        // #root 这会儿整个不在这份文档里，下面这些 class/焦点操作全部无的放矢。收回之后
+        // 翻译器仍然是"开着"的（body 还留着 ovl-translator-open），再点一次 × 才是真关。
+        if (OvlPopoutState.trans.active) { ovlPopIn('trans'); return; }
         // 关闭必须是拖拽状态的确定性终点，理由和 chatClose（18743 行）逐字一样：
         // Esc 在拖拽途中把窗口关掉，若不主动收尾，document/window 上的监听器和
         // data-aichat-drag 都不会被清，拖拽会在窗口视觉消失之后继续在后台跑。
@@ -21889,6 +21964,439 @@ function ovlTransSyncSimpleUI() {
         console.error('[ovl-trans] syncSimpleUI failed', e);
     }
 }
+
+// ==================== P3：弹出到独立 OS 窗口（docs/v2_ux_round_plan.md §3）====================
+// 两个入口：翻译器窗框标题栏 #ovlTransPopBtn、对话窗标题栏 #aiChatPopBtn（绑定见各自的
+// BindWin/BindShell）。机制（§3.1 实测支持）：优先 Document PiP（真正置顶、可放桌面任意
+// 处），已被占用或这个环境不支持时退回 window.open；两条路都要求真实用户手势，所以
+// ovlPopOut 只能从点击处理器里直接调用，不能延迟到 Promise 回调里才第一次调用。
+//
+// 搬的是哪棵子树：
+//   trans —— #ovlTransWin（窗框/标题栏/手柄）+ #root（v1 内容）两个节点一起搬，
+//            标题栏跟着过去，用户在弹出的窗口里还能看到"AI 翻译器"标题和三颗按钮
+//            （简化模式/弹出.收回/关闭），不用在子文档里另起一套 chrome。
+//   chat  —— #aiChatRoot 一个节点（自带标题栏+内容+手柄），整个搬过去。
+//
+// §3.4 强制规则（P1 已经落好 ovlDocOf/ovlWinOf，这里是第一个真正用到它们的地方）：
+//   1) 作用域 class 挂节点自己身上，不挂 body —— 但 body.ovl-translator-open #root /
+//      #ovlTransWin 这两条既有规则**本来就**是按 body 类写的（M1.5 就这么设计的，不是本轮
+//      能改的），补救办法是弹出时把同名 class 也写到子文档的 body 上（§3.4 限制表 #5 指定
+//      的处理办法），而不是回头去改那两条历史规则。
+//   2/3) 取选区/焦点元素：本节没有新增依赖 document.getSelection()/activeElement 的逻辑，
+//      唯一读 activeElement 的地方（Esc 处理）已经改用子文档自己的（见 ovlPopoutSetupDelegates）。
+//   4) 浮层挂载点：本节新增的浮层只有"无处可弹"的 toast/chatAppendRow 提示，两者都走既有的
+//      状态/DOM 管线（showToast → setState → renderApp 里 document.getElementById('root')，
+//      chatAppendRow → document.getElementById('aiChatLog')），补丁生效后自动落在正确的文档里，
+//      不需要本节自己判断挂哪。已知的例外见下面「已知残留限制」。
+//   5) 造节点：本节不新建任何要塞回父 realm 的节点（用的都是 document.createComment 这种
+//      不参与 instanceof 判断的类型，安全）。
+//   6) 坐标系：本节的"填满子窗口"用纯 CSS（.ovl-popped 那组 !important 规则）实现，不用 JS
+//      算 innerWidth/innerHeight，天然响应子窗口自己的尺寸变化，不踩这条坑。
+//   7) 委托监听器：见 ovlPopoutSetupDelegates —— 把「点空白提交行编辑」「Esc 关窗」这两条
+//      父文档级委托，在弹出时同时绑到子文档，收回时解绑。
+//
+// 已知残留限制（本节没有修，明确报告）：
+//   - #synonymPopup（v1"选词弹窗"，替换/简化/语法）用 document.body.insertAdjacentHTML
+//     直接挂父文档 body（第 3800 行附近），不经过 renderApp 管线。翻译器弹出期间如果在
+//     弹出的窗口里选中文字触发这个弹窗，它会挂到父页面（用户看不见的那个标签页）而不是
+//     弹出的子窗口里——功能上"消失"了。这是既有代码的挂载方式，改法要么改
+//     renderSynonymPopupOnly 自己判断挂哪个文档（要连带弄清楚它的定位坐标此刻是哪个窗口
+//     系下算出来的），要么专门再开一轮——本轮不动它，属于诚实上报的范围，不是本节引入的新问题。
+
+window.OVL_POPOUT_DOCS = [];   // 当前打开的子文档；没有弹出时长度为 0（§3.6.2）
+
+// —— §3.6.2 getElementById / querySelector / querySelectorAll 补丁 ——
+// 只在 window.OVL_POPOUT_DOCS 非空时才会多做任何事；命中路径（parent 文档里就能找到）
+// 的行为和成本和补丁之前完全一样（架构 pass 实测：hit 18.9μs / miss 17.9μs vs 补丁前
+// 15.9μs / 18.5μs，噪声范围内，见 docs/v2_ux_round_plan.md §3.6.3）。
+(function () {
+    // 防御性检查：这份脚本也会被回归测试的 harness（tests/harness/browserenv.js）直接跑，
+    // 那个环境是手搭的最小 DOM 沙箱，没有 `Document` 这个构造函数全局——不加这道检查，
+    // 补丁会在脚本顶层直接抛 ReferenceError，炸掉整个后续的初始化（真实浏览器里
+    // `Document` 恒定存在，这一分支等于永远不会走到，纯粹是兼容测试沙箱）。
+    if (typeof Document === 'undefined' || !Document.prototype) return;
+    const D = Document.prototype;
+    const oGEBI = D.getElementById, oQS = D.querySelector, oQSA = D.querySelectorAll;
+    D.getElementById = function (id) {
+        const r = oGEBI.call(this, id);
+        if (r) return r;
+        const ds = window.OVL_POPOUT_DOCS;
+        if (!ds || !ds.length || this !== document) return r;
+        for (let i = 0; i < ds.length; i++) {
+            const d = ds[i];
+            if (!d || d === this) continue;
+            try { const x = oGEBI.call(d, id); if (x) return x; } catch (e) {}
+        }
+        return r;
+    };
+    D.querySelector = function (sel) {
+        const r = oQS.call(this, sel);
+        if (r) return r;
+        const ds = window.OVL_POPOUT_DOCS;
+        if (!ds || !ds.length || this !== document) return r;
+        for (let i = 0; i < ds.length; i++) {
+            const d = ds[i];
+            if (!d || d === this) continue;
+            try { const x = oQS.call(d, sel); if (x) return x; } catch (e) {}
+        }
+        return r;
+    };
+    D.querySelectorAll = function (sel) {
+        const r = oQSA.call(this, sel);
+        if (r && r.length) return r;
+        const ds = window.OVL_POPOUT_DOCS;
+        if (!ds || !ds.length || this !== document) return r;
+        for (let i = 0; i < ds.length; i++) {
+            const d = ds[i];
+            if (!d || d === this) continue;
+            try { const x = oQSA.call(d, sel); if (x && x.length) return x; } catch (e) {}
+        }
+        return r;
+    };
+})();
+
+// 两个窗口各自的弹出状态。mode 记录走的是哪条路（'pip'|'popup'），因为 §3.5 的持久化/
+// 恢复策略两条路不一样（PiP 记不住位置）；本轮"跑长了先砍"清单里几何持久化本来就在
+// 砍的第一项，所以这里干脆没做——每次弹出都用默认尺寸，mode 字段留着给以后要做持久化
+// 的人一个挂钩，不是死代码。
+const OvlPopoutState = {
+    trans: { active: false, mode: null, win: null, doc: null, anchorWin: null, anchorRoot: null, pollId: 0, clickHandler: null, keyHandler: null },
+    chat: { active: false, mode: null, win: null, doc: null, anchor: null, pollId: 0, clickHandler: null, keyHandler: null }
+};
+
+// §3.2：运行时能力探测，解决 §1.12 的 file:// 不确定性——不猜，探测失败就自动降级，
+// 用户永远不会看到崩溃（§5 第 1 条）。
+function ovlPopoutCapabilities() {
+    let pip = false;
+    try {
+        pip = !!(window.documentPictureInPicture
+            && typeof documentPictureInPicture.requestWindow === 'function'
+            && window.isSecureContext);
+    } catch (e) { pip = false; }
+    return { pip: pip, popup: typeof window.open === 'function' };
+}
+
+// §3.3 实测配方：16 个 <style> 直接复制 textContent、1 个跨域 <link>（KaTeX）整体 cloneNode——
+// 绝不读 cssRules，跨域会抛 SecurityError（架构 pass 实测过）。constructed stylesheet 不能跨
+// 文档共享（同样实测过 NotAllowedError），所以老实复制 textContent，别想那个"优化"。
+function ovlAdoptStyles(doc) {
+    try {
+        const styles = document.querySelectorAll('head style');
+        for (let i = 0; i < styles.length; i++) {
+            const n = doc.createElement('style');
+            n.textContent = styles[i].textContent;
+            doc.head.appendChild(n);
+        }
+        const links = document.querySelectorAll('head link[rel="stylesheet"]');
+        for (let i = 0; i < links.length; i++) {
+            doc.head.appendChild(links[i].cloneNode(true));
+        }
+    } catch (e) {
+        console.error('[ovl-popout] adoptStyles failed', e);
+    }
+}
+
+// 子文档建好之后的公共收尾：抄样式、挂标题、挂 body class。
+// trans 的 body class 一并解决 §3.4 限制表 #5：body.ovl-translator-open #root/#ovlTransWin
+// 这两条既有规则是按 body 类写的，子文档的 body 从空白开始，不补上这个类它们完全不生效
+// （#root 会用不到 position:fixed，#ovlTransWin 会保持 display:none 不可见）。
+// ovl-popout-child 是本节新增的类，只用来在 CSS 里把子窗口内的几何改成"填满"（见 CSS 一节）。
+// chat 不需要任何 body class——#aiChatRoot 的可见性和几何全部挂在它自己身上（is-open /
+// 内联 px），本来就是"跟着节点走"的写法，天生弹出安全。
+function ovlPopOutBuildDoc(doc, kind) {
+    ovlAdoptStyles(doc);
+    try { doc.title = (kind === 'trans') ? 'AI 翻译器' : 'AI 对话'; } catch (e) {}
+    if (kind === 'trans') {
+        try { doc.body.className = 'ovl-translator-open ovl-popout-child'; } catch (e) {}
+    }
+}
+
+// §3.5 弹出前：用注释节点当锚点（架构 pass §1.7 实测过的标准恢复路径，即使子文档已经死了
+// 也能把内容完整搬回来）。搬之前先收尾任何进行中的拖拽——不收尾的话 body[data-aichat-drag]
+// 会在窗口消失后卡死（既有纪律，ovlCloseTranslator/chatClose 头上的同一段注释）。
+function ovlPopOutMoveNodes(doc, kind) {
+    const st = OvlPopoutState[kind];
+    if (kind === 'trans') {
+        const win = document.getElementById('ovlTransWin');
+        const root = document.getElementById('root');
+        if (!win || !root) throw new Error('ovlTransWin/#root 不存在，弹不出去');
+        if (typeof ovlTransActiveDragEnd === 'function') { try { ovlTransActiveDragEnd(); } catch (e) {} }
+        st.anchorWin = document.createComment('ovl-popout:trans:win');
+        st.anchorRoot = document.createComment('ovl-popout:trans:root');
+        win.parentNode.insertBefore(st.anchorWin, win);
+        root.parentNode.insertBefore(st.anchorRoot, root);
+        win.classList.add('ovl-popped');
+        doc.body.appendChild(win);
+        doc.body.appendChild(root);
+    } else {
+        const rootEl = document.getElementById('aiChatRoot');
+        if (!rootEl) throw new Error('aiChatRoot 不存在，弹不出去');
+        if (typeof chatActiveDragEnd === 'function') { try { chatActiveDragEnd(); } catch (e) {} }
+        st.anchor = document.createComment('ovl-popout:chat');
+        rootEl.parentNode.insertBefore(st.anchor, rootEl);
+        rootEl.classList.add('ovl-popped');
+        doc.body.appendChild(rootEl);
+    }
+}
+
+// §3.4 规则 7 + 限制表 #2：绑在父 document 上的委托监听器收不到子窗口的事件
+// （架构 pass §1.5 实测 parentDocSaw:0），必须在弹出时把「必要的」委托同时绑到子文档，
+// 收回时解绑。这里只补两条真正会被用户摸到的：
+//   trans：click → handleGlobalClick（点 #root 内的空白区域提交正在编辑的行）、
+//          keydown Esc → 收回（照抄 ovlTransBindWin 里那段 Esc 处理的判断逻辑，
+//          但 activeElement/body 换成子文档自己的，不是父文档的——§3.4 规则 3）。
+//   chat： keydown Esc → 收回（chatBindShell 里那条 Esc 处理器是绑死在父 document 上的，
+//          子窗口内按 Esc 到不了那里）。chat 没有"点空白提交行编辑"这回事
+//          （handleGlobalClick 一进来就对 #aiChatRoot 内的点击整体放行，不需要搬）。
+function ovlPopoutSetupDelegates(kind, doc) {
+    const st = OvlPopoutState[kind];
+    if (kind === 'trans') {
+        st.clickHandler = function (e) { try { handleGlobalClick(e); } catch (err) { console.error('[ovl-popout] delegated click failed', err); } };
+        doc.addEventListener('click', st.clickHandler);
+        st.keyHandler = function (e) {
+            try {
+                if (!e || e.key !== 'Escape') return;
+                const active = doc.activeElement;
+                const insideWin = !!(active && active.closest && active.closest('#ovlTransWin'));
+                const nothingFocused = (!active || active === doc.body);
+                if (insideWin || nothingFocused) ovlPopIn('trans');
+            } catch (err) { console.error('[ovl-popout] delegated keydown failed', err); }
+        };
+        doc.addEventListener('keydown', st.keyHandler);
+    } else {
+        st.keyHandler = function (e) {
+            try {
+                if (!e || e.key !== 'Escape' || !ChatState.open) return;
+                ovlPopIn('chat');
+            } catch (err) { console.error('[ovl-popout] delegated keydown failed', err); }
+        };
+        doc.addEventListener('keydown', st.keyHandler);
+    }
+}
+
+function ovlPopoutTeardownDelegates(kind) {
+    const st = OvlPopoutState[kind];
+    try {
+        if (st.doc) {
+            if (st.clickHandler) st.doc.removeEventListener('click', st.clickHandler);
+            if (st.keyHandler) st.doc.removeEventListener('keydown', st.keyHandler);
+        }
+    } catch (e) {}
+    st.clickHandler = null;
+    st.keyHandler = null;
+}
+
+// 标题栏那颗按钮的按下态 + 提示文案，两个方向都要同步（弹出成功 / 收回完成）。
+// document.getElementById 在弹出期间会经补丁自动落到子文档里找，这里不用关心按钮此刻
+// 具体在哪份文档里。
+function ovlPopoutSyncButtons(kind, active) {
+    try {
+        if (kind === 'trans') {
+            const btn = document.getElementById('ovlTransPopBtn');
+            if (btn) {
+                btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+                btn.classList.toggle('ovl-active', !!active);
+                btn.setAttribute('data-tip', active
+                    ? '收回到页面里（点这颗图标，或者直接关掉弹出的那个窗口）。'
+                    : '弹出到独立窗口：可以拖到桌面任意位置，和浏览器分开摆。');
+            }
+        } else {
+            const btn = document.getElementById('aiChatPopBtn');
+            if (btn) {
+                btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+                btn.classList.toggle('ovl-active', !!active);
+                btn.setAttribute('data-tip', active
+                    ? '收回到页面里（点这颗图标，或者直接关掉弹出的那个窗口）。'
+                    : '弹出到独立窗口：可以拖到桌面任意位置，和浏览器分开摆。');
+            }
+        }
+    } catch (e) {}
+}
+
+// §3.5：子窗口关闭的两条侦测路径都上——pagehide（子窗口自己关，比如用户点了它的系统关闭键）
+// 和 100ms 轮询 w.closed（兜底：有些关闭路径不一定触发 pagehide，架构 pass §1.10 两条都
+// 实测可靠）。done 哨兵保证两条路径谁先到都只真正收尾一次。
+function ovlPopoutWireClose(kind, win) {
+    const st = OvlPopoutState[kind];
+    let done = false;
+    function onClose() {
+        if (done) return;
+        done = true;
+        ovlPopIn(kind);
+    }
+    try { win.addEventListener('pagehide', onClose); } catch (e) {}
+    st.pollId = setInterval(function () {
+        try {
+            if (win.closed) { clearInterval(st.pollId); st.pollId = 0; onClose(); }
+        } catch (e) { clearInterval(st.pollId); st.pollId = 0; onClose(); }
+    }, 100);
+}
+
+// 走哪条路：PiP 优先；PiP 被占用（documentPictureInPicture.window !== null）或这个环境
+// 不支持时退回 popup。§1.6 铁律：绝不能靠 requestWindow() 报错来判断"占没占用"——
+// 第二次请求不报错，它会成功并把第一个窗口静默杀掉，所以必须自己先查一遍。
+// 必须从真实点击处理器的调用栈里同步跑到 requestWindow()/window.open() 那一行为止
+// （§1.2/§1.8 实测两者都要求 user activation），中间不能有 await/.then 断开调用链。
+function ovlPopOut(kind) {
+    try {
+        if (kind !== 'trans' && kind !== 'chat') return;
+        const st = OvlPopoutState[kind];
+        if (st.active) return;   // 已经弹出，重复点击（比如双击）不做第二次
+
+        // 折叠着的对话窗弹出去意义不大——先展开，弹出的是完整窗口而不是一条窄条。
+        if (kind === 'chat' && ChatState.minimized) { try { chatExpand(); } catch (e) {} }
+
+        const caps = ovlPopoutCapabilities();
+        let pipBusy = false;
+        try { pipBusy = caps.pip && documentPictureInPicture.window !== null; } catch (e) { pipBusy = false; }
+        const usePip = caps.pip && !pipBusy;
+
+        if (usePip) {
+            ovlPopOutViaPip(kind);
+        } else if (caps.popup) {
+            ovlPopOutViaPopup(kind);
+        } else {
+            const msg = '这个浏览器不支持弹出独立窗口。';
+            if (kind === 'trans') { try { showToast(msg, 'warning'); } catch (e) {} }
+            else { try { chatAppendRow('error', msg); } catch (e) {} }
+        }
+    } catch (e) {
+        console.error('[ovl-popout] popOut(' + kind + ') failed', e);
+    }
+}
+
+function ovlPopOutFinish(kind, doc, win, mode) {
+    const st = OvlPopoutState[kind];
+    ovlPopOutBuildDoc(doc, kind);
+    window.OVL_POPOUT_DOCS.push(doc);
+    ovlPopOutMoveNodes(doc, kind);
+    st.active = true;
+    st.mode = mode;
+    st.win = win;
+    st.doc = doc;
+    ovlPopoutWireClose(kind, win);
+    ovlPopoutSetupDelegates(kind, doc);
+    ovlPopoutSyncButtons(kind, true);
+    // 搬完之后几何/渲染要刷新一次：ovlTransApplyGeom/chatApplyGeom 会通过补丁在子文档里
+    // 找到节点并重写内联几何（虽然显示上早被 .ovl-popped 那组 !important 接管了，这一步
+    // 主要是保证 root.style 上留着的仍然是"收回页面"时要用的那份，不被别的代码路径写歪）。
+    try { if (kind === 'trans') ovlTransApplyGeom(); else chatApplyGeom(); } catch (e) {}
+}
+
+function ovlPopOutViaPip(kind) {
+    try {
+        const opts = (kind === 'trans') ? { width: 760, height: 560 } : { width: 420, height: 560 };
+        documentPictureInPicture.requestWindow(opts).then(function (win) {
+            try {
+                ovlPopOutFinish(kind, win.document, win, 'pip');
+            } catch (e2) {
+                console.error('[ovl-popout] pip setup failed', e2);
+                try { win.close(); } catch (e3) {}
+            }
+        }).catch(function (err) {
+            console.error('[ovl-popout] pip requestWindow rejected', err);
+            // §3.2：PiP 这条路失败了不等于弹不出去了，退回 popup 再试一次。
+            if (typeof window.open === 'function') ovlPopOutViaPopup(kind);
+        });
+    } catch (e) {
+        console.error('[ovl-popout] pip request threw', e);
+        if (typeof window.open === 'function') ovlPopOutViaPopup(kind);
+    }
+}
+
+function ovlPopOutViaPopup(kind) {
+    try {
+        const w0 = (kind === 'trans') ? 900 : 440;
+        const h0 = (kind === 'trans') ? 640 : 600;
+        let left = 120, top = 80;
+        try {
+            left = Math.max(0, Math.round(((screen && screen.width) || 1280) / 2 - w0 / 2));
+            top = Math.max(0, Math.round(((screen && screen.height) || 800) / 2 - h0 / 2));
+        } catch (e) {}
+        const features = 'popup=yes,width=' + w0 + ',height=' + h0 + ',left=' + left + ',top=' + top;
+        // 空字符串 name：不用同名捕获（§1.11 第 13 条明确警告过那个坑），每次都是新窗口。
+        const win = window.open('', '', features);
+        if (!win) {
+            const msg = '浏览器拦截了弹出窗口，请允许本站的弹出窗口后重试。';
+            if (kind === 'trans') { try { showToast(msg, 'warning'); } catch (e) {} }
+            else { try { chatAppendRow('error', msg); } catch (e) {} }
+            return;
+        }
+        const doc = win.document;
+        doc.open();
+        doc.write('<!doctype html><html><head><title></title></head><body></body></html>');
+        doc.close();
+        ovlPopOutFinish(kind, doc, win, 'popup');
+    } catch (e) {
+        console.error('[ovl-popout] popup setup failed', e);
+    }
+}
+
+// §3.5 恢复：锚点原地插回，标签清掉，几何按父文档的口径重算一次。done 哨兵（st.active）
+// 保证 pagehide / 轮询 / 用户手动点「收回」三条路径谁先到都只真正收尾一次——同一份纪律
+// ovlWinBeginDrag 的 onUp 也用过（见「修复7：幂等哨兵」那条注释）。
+function ovlPopIn(kind) {
+    try {
+        const st = OvlPopoutState[kind];
+        if (!st.active) return;
+        st.active = false;
+
+        ovlPopoutTeardownDelegates(kind);
+
+        if (kind === 'trans') {
+            const win = document.getElementById('ovlTransWin');
+            const root = document.getElementById('root');
+            if (typeof ovlTransActiveDragEnd === 'function') { try { ovlTransActiveDragEnd(); } catch (e) {} }
+            if (win && st.anchorWin && st.anchorWin.parentNode) {
+                st.anchorWin.parentNode.insertBefore(win, st.anchorWin);
+                st.anchorWin.remove();
+                win.classList.remove('ovl-popped');
+            }
+            if (root && st.anchorRoot && st.anchorRoot.parentNode) {
+                st.anchorRoot.parentNode.insertBefore(root, st.anchorRoot);
+                st.anchorRoot.remove();
+            }
+            st.anchorWin = null;
+            st.anchorRoot = null;
+        } else {
+            const rootEl = document.getElementById('aiChatRoot');
+            if (typeof chatActiveDragEnd === 'function') { try { chatActiveDragEnd(); } catch (e) {} }
+            if (rootEl && st.anchor && st.anchor.parentNode) {
+                st.anchor.parentNode.insertBefore(rootEl, st.anchor);
+                st.anchor.remove();
+                rootEl.classList.remove('ovl-popped');
+            }
+            st.anchor = null;
+        }
+
+        const idx = window.OVL_POPOUT_DOCS.indexOf(st.doc);
+        if (idx >= 0) window.OVL_POPOUT_DOCS.splice(idx, 1);
+
+        if (st.pollId) { clearInterval(st.pollId); st.pollId = 0; }
+        try { if (st.win && !st.win.closed) st.win.close(); } catch (e) {}
+
+        st.mode = null;
+        st.win = null;
+        st.doc = null;
+
+        ovlPopoutSyncButtons(kind, false);
+        try { if (kind === 'trans') ovlTransApplyGeom(); else chatApplyGeom(); } catch (e) {}
+    } catch (e) {
+        console.error('[ovl-popout] popIn(' + kind + ') failed', e);
+    }
+}
+
+// §3.5：父页面要关/刷新时必须遍历所有子窗口 w.close()——这一条不是可选的。架构 pass
+// §1.11 实测：PiP 会随 opener 文档销毁自动关掉（安全），但 window.open 弹窗**会在父页面
+// 刷新后存活**变成孤儿窗口，不主动关就是真的留下一个用户要自己去找、去点 X 的野窗口。
+// 独立的 try/catch、独立的 pagehide 监听器（不并进 23989 行那条 beforeunload——那条已经
+// 有自己的职责，抛异常不该互相溅到对方）。
+window.addEventListener('pagehide', function () {
+    try {
+        if (OvlPopoutState.trans.win) { try { OvlPopoutState.trans.win.close(); } catch (e) {} }
+        if (OvlPopoutState.chat.win) { try { OvlPopoutState.chat.win.close(); } catch (e) {} }
+    } catch (e) {}
+});
 
 function ovlSetEditorMode(mode) {
     try {
