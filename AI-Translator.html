@@ -1212,7 +1212,9 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
     height: 34px;
     display: flex;
     align-items: center;
+    flex-wrap: nowrap;
     padding: 0 10px;
+    gap: 6px;
 }
 .ovl-mode-toggle {
     display: inline-flex;
@@ -1255,11 +1257,35 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
     font: 12px/1.5 "SFMono-Regular", Consolas, "Courier New", monospace;
     color: #1f2937;
     background: #ffffff;
-    /* 明令关闭软换行：main.tex 4,132 行，逐行重刷式高亮/软换行会卡死（§3.4 第 2 条）。 */
-    white-space: pre;
+    /* v2 Polish 2（Bug 2）：软换行重新打开。原先"整篇不切分、逐行重刷式高亮/软换行会卡死"
+       的顾虑还在，但避法换了——不是"干脆不换行"，而是"换行，但 gutter/跳转改吃批量算出来的
+       行偏移表，不再逐键重算"，见下面 .ovl-code-mirror + ovlRecomputeLineOffsets()。
+       overflow-wrap:anywhere 而不是 word-break:break-word：LaTeX 命令/URL 常是无自然断点的
+       长 token（\includegraphics{...}、注释里的链接），anywhere 允许在任意字符间断，
+       不会把整段挤出视口。 */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
     overflow: auto;
 }
 .ovl-code-area:disabled { background: #f8fafc; color: #6b7280; }
+/* 离屏镜像：字体/字号/行高/padding/box-sizing/white-space/overflow-wrap 跟 .ovl-code-area
+   逐项对齐，唯一的差别是宽度由 JS 每次按 ta.clientWidth 现测现设（见 ovlRecomputeLineOffsets）。
+   必须 visibility:hidden 而不是 display:none——display:none 的元素量出来的 Range 矩形全是 0，
+   整套"批量测软换行后每行占几个视觉行"的技术就没法用了。 */
+.ovl-code-mirror {
+    position: absolute;
+    left: -9999px;
+    top: 0;
+    visibility: hidden;
+    box-sizing: border-box;
+    margin: 0;
+    border: none;
+    padding: 8px 12px;
+    font: 12px/1.5 "SFMono-Regular", Consolas, "Courier New", monospace;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    pointer-events: none;
+}
 /* ==================== v2 Pass E：M5 Visual 模式（只读富文本预览）====================
    JS（ovlSetEditorMode）只切 display:flex/none，这里把 flex 方向改成纵向滚动容器——
    §3.4 第 2 条同一条纪律：不整篇 innerHTML 重刷式语法高亮，Visual 也不做，它只是
@@ -1424,12 +1450,29 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 #ovlTransWin .ovl-transwin-resize-br { right: 0;  bottom: 0; width: 12px; height: 12px; cursor: nwse-resize; }
 
 /* ==================== M8a：编辑器命令工具条 + 查找/替换面板 ==================== */
-.ovl-editor-toolbar {
+/* v2 Polish 2（Bug 1："the mode disappeared"）：.ovl-editor-toolbar 本身不再是滚动容器——
+   之前整条工具条（Undo/Redo…插入按钮…spacer…Code/Visual…SyncTeX…Find）挤在一个
+   overflow-x:auto 的行里，列宽被 v2 Polish 的拖拽分栏缩到 260px 最窄时，DOM 序靠后的
+   Code/Visual/Find 就滚出可视区，用户找不到、也没有提示"往右边滚一下"。现在拆成两个 flex
+   子容器：.ovl-toolbar-scroll（Undo/Redo/标题级别/加粗斜体/数学符号链接 + "…" 更多按钮，
+   允许自己溢出滚动）+ .ovl-toolbar-pinned（Code/Visual 切换 + SyncTeX + Find，flex:0 0 auto，
+   永远不进滚动容器，min-width:0 的是滚动区不是它），列宽再窄，Code/Visual/Find 也挤不没。 */
+.ovl-toolbar-scroll {
+    flex: 1 1 auto;
+    min-width: 0;
+    display: flex;
+    align-items: center;
     flex-wrap: nowrap;
     overflow-x: auto;
     overflow-y: hidden;
     gap: 2px;
     scrollbar-width: thin;
+}
+.ovl-toolbar-pinned {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 2px;
 }
 .ovl-cmdbtn {
     display: inline-flex;
@@ -20823,6 +20866,11 @@ const OvlState = {
     editorMode: 'code',      // 'code' | 'visual'
     currentFile: null,       // { name, handle|null, parentHandle|null }（M2 加了 parentHandle，重命名/删除要用）
     gutterLineCount: 0,
+    // ---- v2 Polish 2：软换行下的行偏移表（Bug 2，见 ovlRecomputeLineOffsets）----
+    // lineOffsets[i] = { rows, cumRows }：第 i（0-based）个逻辑行占几个视觉行 + 累计视觉行号。
+    // null 或长度跟当前行数对不上 = 过期/还没算，读它的地方（ovlVisualRowForLineIndex）会自己
+    // 现算一次，不会用错文件/错内容的旧表。
+    lineOffsets: null,
     // ---- M2 ----
     dirty: false,
     lastSavedAt: 0,
@@ -20908,40 +20956,45 @@ function ovlShellHtml() {
         // M7 Editor 分类「Breadcrumbs」：光标所在的 \section/\subsection 路径，默认关（Overleaf 默认也关）。
         +     '<div class="ovl-breadcrumb" id="ovlBreadcrumb"></div>'
         +     '<div class="ovl-editor-toolbar">'
+        // v2 Polish 2（Bug 1）：两个 flex 子容器，见 1427 行附近的 CSS 注释——.ovl-toolbar-scroll
+        // 装会被挤到需要横向滚动的一堆按钮，.ovl-toolbar-pinned 装 Code/Visual/SyncTeX/Find，
+        // 永远不进滚动容器。
+        +       '<div class="ovl-toolbar-scroll">'
         // 命令工具条：全部是 OvlCmds 注册表的触发器，data-cmd = 注册表的 key（§3.5，M8a）。
         // ovlBindShell 里用一个通用监听器扫 [data-cmd]，新增一颗按钮不用改绑定代码。
-        +       '<button type="button" class="ovl-cmdbtn" data-cmd="edit.undo" data-tip="撤销（Ctrl+Z，浏览器原生撤销栈）" data-tip-pos="bottom">&#8630;</button>'
-        +       '<button type="button" class="ovl-cmdbtn" data-cmd="edit.redo" data-tip="重做（Ctrl+Shift+Z / Ctrl+Y）" data-tip-pos="bottom">&#8631;</button>'
-        +       '<span class="ovl-cmd-sep"></span>'
-        +       '<select class="ovl-cmd-select" id="ovlHeadingSelect" data-tip="插入标题级别（section/subsection/subsubsection/paragraph）" data-tip-pos="bottom">'
-        +         '<option value="">标题级别…</option>'
-        +         '<option value="section">Section</option>'
-        +         '<option value="subsection">Subsection</option>'
-        +         '<option value="subsubsection">Subsubsection</option>'
-        +         '<option value="paragraph">Paragraph</option>'
-        +       '</select>'
-        +       '<span class="ovl-cmd-sep"></span>'
-        +       '<button type="button" class="ovl-cmdbtn" data-cmd="fmt.bold" data-tip="加粗 \\textbf{}（Ctrl+B）" data-tip-pos="bottom"><b>B</b></button>'
-        +       '<button type="button" class="ovl-cmdbtn" data-cmd="fmt.italic" data-tip="斜体 \\textit{}（Ctrl+I）" data-tip-pos="bottom"><i>I</i></button>'
-        +       '<span class="ovl-cmd-sep"></span>'
-        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.mathInline" data-tip="插入行内公式 $…$" data-tip-pos="bottom">&sum;</button>'
-        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.symbol" data-tip="插入希腊字母 \\alpha" data-tip-pos="bottom">&Omega;</button>'
-        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.link" data-tip="插入链接 \\href{URL}{}" data-tip-pos="bottom">&#128279;</button>'
-        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.xref" data-tip="插入交叉引用 \\ref{}" data-tip-pos="bottom">&#9635;</button>'
-        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.cite" data-tip="插入引文 \\cite{}" data-tip-pos="bottom">&#128214;</button>'
-        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.figure" data-tip="插入图片环境" data-tip-pos="bottom">&#128444;</button>'
-        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.table" data-tip="插入表格环境" data-tip-pos="bottom">&#9638;</button>'
-        +       '<button type="button" class="ovl-cmdbtn" data-cmd="ins.list" data-tip="插入列表环境" data-tip-pos="bottom">&#9776;</button>'
-        +       '<span class="ovl-toolbar-spacer"></span>'
-        +       '<div class="ovl-mode-toggle" id="ovlModeToggle">'
-        +         '<label data-mode="code" class="ovl-mode-active">Code</label>'
-        +         '<label data-mode="visual">Visual</label>'
+        +         '<button type="button" class="ovl-cmdbtn" data-cmd="edit.undo" data-tip="撤销（Ctrl+Z，浏览器原生撤销栈）" data-tip-pos="bottom">&#8630;</button>'
+        +         '<button type="button" class="ovl-cmdbtn" data-cmd="edit.redo" data-tip="重做（Ctrl+Shift+Z / Ctrl+Y）" data-tip-pos="bottom">&#8631;</button>'
+        +         '<span class="ovl-cmd-sep"></span>'
+        +         '<select class="ovl-cmd-select" id="ovlHeadingSelect" data-tip="插入标题级别（section/subsection/subsubsection/paragraph）" data-tip-pos="bottom">'
+        +           '<option value="">标题级别…</option>'
+        +           '<option value="section">Section</option>'
+        +           '<option value="subsection">Subsection</option>'
+        +           '<option value="subsubsection">Subsubsection</option>'
+        +           '<option value="paragraph">Paragraph</option>'
+        +         '</select>'
+        +         '<span class="ovl-cmd-sep"></span>'
+        +         '<button type="button" class="ovl-cmdbtn" data-cmd="fmt.bold" data-tip="加粗 \\textbf{}（Ctrl+B）" data-tip-pos="bottom"><b>B</b></button>'
+        +         '<button type="button" class="ovl-cmdbtn" data-cmd="fmt.italic" data-tip="斜体 \\textit{}（Ctrl+I）" data-tip-pos="bottom"><i>I</i></button>'
+        +         '<span class="ovl-cmd-sep"></span>'
+        +         '<button type="button" class="ovl-cmdbtn" data-cmd="ins.mathInline" data-tip="插入行内公式 $…$" data-tip-pos="bottom">&sum;</button>'
+        +         '<button type="button" class="ovl-cmdbtn" data-cmd="ins.symbol" data-tip="插入希腊字母 \\alpha" data-tip-pos="bottom">&Omega;</button>'
+        +         '<button type="button" class="ovl-cmdbtn" data-cmd="ins.link" data-tip="插入链接 \\href{URL}{}" data-tip-pos="bottom">&#128279;</button>'
+        // v2 Polish 2：xref/cite/figure/table/list 五颗从平铺按钮收进一个"…"下拉（真实 Overleaf
+        // 工具条也是这么分组的，见 docs 的live-Overleaf 目录记录），单是这一步就已经把滚动区
+        // 缩到绝大多数真实宽度下都不需要再滚——pinned 区是真正兜底，见 CSS 注释。
+        +         '<button type="button" class="ovl-cmdbtn" id="ovlToolbarOverflowBtn" data-tip="More insert options（交叉引用 / 引文 / 图片 / 表格 / 列表）" data-tip-pos="bottom">&#8230;</button>'
         +       '</div>'
+        +       '<div class="ovl-toolbar-pinned">'
+        +         '<div class="ovl-mode-toggle" id="ovlModeToggle">'
+        +           '<label data-mode="code" class="ovl-mode-active">Code</label>'
+        +           '<label data-mode="visual">Visual</label>'
+        +         '</div>'
         // M10 SyncTeX 正向（源码 -> PDF）：真跑 tools/latex-bridge 的 synctex.exe view 子命令
         // （§2.6.10）。没有编译产物时禁用；反向（PDF -> 源码）在当前 iframe+浏览器内置 PDF
         // 阅读器架构下做不到，见交付说明"诚实边界"一节，这里不留一个点了没反应的按钮。
-        +       '<button type="button" class="ovl-cmdbtn" id="ovlSyncTexBtn" disabled data-tip="Go to PDF location（SyncTeX 正向，只做到页级定位）" data-tip-pos="bottom-end">&#8677;</button>'
-        +       '<button type="button" class="ovl-cmdbtn" id="ovlFindBtn" data-cmd="edit.find" data-tip="查找/替换（Ctrl+F）" data-tip-pos="bottom-end">&#128269;</button>'
+        +         '<button type="button" class="ovl-cmdbtn" id="ovlSyncTexBtn" disabled data-tip="Go to PDF location（SyncTeX 正向，只做到页级定位）" data-tip-pos="bottom-end">&#8677;</button>'
+        +         '<button type="button" class="ovl-cmdbtn" id="ovlFindBtn" data-cmd="edit.find" data-tip="查找/替换（Ctrl+F）" data-tip-pos="bottom-end">&#128269;</button>'
+        +       '</div>'
         +     '</div>'
         // 查找/替换面板（§2.6.4，M8a）：默认隐藏（.ovl-editor-panel 没有 data-find 属性），
         // ovlFindOpen/ovlFindClose 只切一个属性，CSS 负责显隐（987 行往下那套写法的同一纪律）。
@@ -21054,6 +21107,10 @@ function ovlPortalHtml() {
         + '<div class="ovl-layout-menu" id="ovlMbMenu_file" hidden></div>'
         + '<div class="ovl-layout-menu" id="ovlMbMenu_edit" hidden></div>'
         + '<div class="ovl-layout-menu" id="ovlMbMenu_insert" hidden></div>'
+        // v2 Polish 2（Bug 1）：编辑器工具条 "…" 更多按钮的下拉——内容是从平铺按钮收进来的
+        // xref/cite/figure/table/list 五项，跟 Insert 菜单栏的对应条目共用同一个
+        // ovlMbCmdItem/OVL_MB_MENUS 机制（ovlRenderMbToolbarInsertMenu，key='toolbarInsert'）。
+        + '<div class="ovl-layout-menu" id="ovlMbMenu_toolbarInsert" hidden></div>'
         + '<div class="ovl-layout-menu" id="ovlMbMenu_view" hidden></div>'
         + '<div class="ovl-layout-menu" id="ovlMbMenu_format" hidden></div>'
         + '<div class="ovl-layout-menu" id="ovlMbMenu_help" hidden></div>'
@@ -21141,6 +21198,9 @@ function ovlSetViewMode(mode, opts) {
             try { localStorage.setItem('ovl.viewMode', mode); } catch (e) {}
         }
         ovlCloseLayoutMenu();
+        // v2 Polish 2（Bug 2）：split/editor/pdf 切换会立刻改变 #ovlCodeArea 的 clientWidth
+        // （'pdf' 模式下它虽然还在但列宽是 0，函数内部的 clientWidth<=0 守卫会自己跳过）。
+        ovlScheduleLineOffsetRecompute(150);
     } catch (e) {
         console.error('[ovl] setViewMode failed', e);
     }
@@ -21237,6 +21297,10 @@ function ovlColSplitterBeginDrag(ev) {
             try { if (rafId && caf) caf(rafId); } catch (e) {}
             rafId = 0;
             flush(); // 落盘前把攒着的那一帧写进去，快拖一下松手不能丢最后一帧
+            // v2 Polish 2（Bug 2）：拖分栏结束 = 编辑器列宽定了，重算软换行点。用防抖而不是
+            // 立刻算，是因为 flush() 里的 DOM 写（--ovl-split-editor-fr）到布局真正稳定之间
+            // 隔着一次浏览器重排，150ms 留够这个余量（跟 window resize 用同一个数字，同一条纪律）。
+            ovlScheduleLineOffsetRecompute(150);
         }
 
         document.addEventListener('pointermove', onMove);
@@ -21725,6 +21789,11 @@ function ovlSetEditorMode(mode) {
             if (ta) ta.style.display = '';
             if (gutter) gutter.style.display = '';
             if (visual) visual.style.display = 'none';
+            // v2 Polish 2（Bug 2）：从 Visual 切回 Code，#ovlCodeArea 刚从 display:none 变回来，
+            // 之前 clientWidth<=0 被 ovlRecomputeLineOffsets 跳过的那次现在能补上了。用防抖
+            // （而不是同步调）是因为 display 切换到布局真正生效之间也隔着一次重排，跟
+            // splitter/resize 是同一个理由。
+            ovlScheduleLineOffsetRecompute(50);
         }
     } catch (e) {
         console.error('[ovl] setEditorMode failed', e);
@@ -21819,8 +21888,229 @@ function ovlBindVisualPane() {
     });
 }
 
+// ==================== v2 Polish 2：软换行 + 行偏移表（Bug 2）====================
+// 1249 行 .ovl-code-area 的注释解释了为什么软换行原来被明令关掉、现在为什么能重开：
+// 不逐键重刷 DOM，而是用一个离屏"镜像" div（字体/字号/行高/padding/box-sizing/
+// white-space/overflow-wrap 跟 .ovl-code-area 逐项对齐，宽度现测现设）批量测，一次性把全部
+// 4,132 行的"占几个视觉行"算完，中途不写 DOM，避免"测一行、写一点、再测下一行"的强制同步
+// 重排连环炸。gutter 渲染 + 三处跳转（file outline / find-replace / 日志跳转）全部改吃这张表
+// 算出来的"累计视觉行号"，不再假设 1 逻辑行 = 18px。
+//
+// 实现踩过两个坑，都是实测数字逼出来的，不是纸面推导：
+// 1) 最初版本是每个逻辑行开一个 Range（框住镜像那个大文本节点里自己的字符区间）再调
+//    Range.getClientRects() 数视觉行数——main.tex 4,132 行实测 4.2 秒，直接把标签页卡死。
+//    根因：在一个 ~18 万字符的单一大文本节点里按任意字符偏移量定位，各浏览器引擎不是 O(1)，
+//    4,000+ 次这么定位叠起来是 O(n²) 级别。改法：镜像里不塞一个大文本节点，每个逻辑行单独
+//    一个块级 <div>（各自独立的文本节点），要几个视觉行直接用该 div 自己的
+//    getBoundingClientRect().height 除以行高——已布局完成的块级盒子尺寸是 O(1) 缓存读。
+//    这一步实测从 4.2s 降到 ~0.68s（main.tex，431px 窄列宽）。
+// 2) 0.68s 对"防抖后单次同步计算"还是偏久。再优化一版：用等宽字体校准出"一行能放几个字符"
+//    （contentWidth / 单字符宽度，等宽字体每个字符宽度一致，一次量出来全篇通用），长度不超过
+//    这个字符预算的行 100% 不可能软换行（不管断词规则怎么走，字符数摆在那，肯定还没到换行
+//    宽度），直接标 rows=1，完全不用进 DOM——只有长度超预算的"候选行"才真的建 div 量
+//    （断词在哪个字符不好纯算，仍然要交给浏览器真排版）。main.tex 在 431px 下候选行只剩
+//    1,594 / 4,133（约 39%），总耗时降到 ~0.18s，且逐行跟纯 div 全量版本交叉验证零差异
+//    （见下面 ovlMeasureRowCount 的实现）。
+const OVL_LINE_H = 18; // 12px/1.5，跟 .ovl-code-area/.ovl-gutter 的 CSS font 是同一个常数
+let OvlLineOffsetEditTimer = null;
+
+function ovlGetCodeMirror() {
+    let mirror = document.getElementById('ovlCodeMirror');
+    if (!mirror) {
+        mirror = document.createElement('div');
+        mirror.id = 'ovlCodeMirror';
+        mirror.className = 'ovl-code-mirror';
+        document.body.appendChild(mirror);
+    }
+    return mirror;
+}
+
+// 校准等宽字体的单字符像素宽度：镜像里量一个 100 个 'M' 的 <span>（position:absolute 让它
+// 脱离文档流按内容自然宽度收缩，不然普通块级子元素 width:auto 默认撑满父容器，量出来的是
+// "父容器宽度/100"而不是真实字符宽度——这是本函数第一版踩过的一个具体的坑）。
+function ovlMeasureCharWidth(mirror) {
+    const calib = document.createElement('span');
+    calib.style.cssText = 'position:absolute; white-space:pre; visibility:hidden;';
+    calib.textContent = 'M'.repeat(100);
+    mirror.appendChild(calib);
+    const w = calib.getBoundingClientRect().width / 100;
+    mirror.removeChild(calib);
+    return w > 0 ? w : 7; // 量不出来（比如字体还没加载完）就退回一个保守估计，不让 charsPerRow 是 Infinity
+}
+
+// 返回 true=算成功（OvlState.lineOffsets 已更新），false=跳过了（比如 Visual 模式下
+// #ovlCodeArea 是 display:none，clientWidth 量出来是 0，量了也白量，等切回 Code 模式再算）。
+function ovlRecomputeLineOffsets() {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || ta.clientWidth <= 0) return false;
+        const text = ta.value;
+        const lines = text.length ? text.split('\n') : [''];
+        const mirror = ovlGetCodeMirror();
+        mirror.style.width = ta.clientWidth + 'px';
+        mirror.textContent = '';
+
+        // 第一步：校准字符宽度，算出"一个视觉行最多能放几个字符"（保守下取整——按这个字符数
+        // 摆一行，实际渲染宽度保证 <= 可用内容宽度，不会已经溢出）。
+        const charW = ovlMeasureCharWidth(mirror);
+        // mirror 是 box-sizing:border-box，clientWidth 含左右 padding（12px+12px=24px，见
+        // .ovl-code-mirror 的 CSS），刨掉才是真正能摆字符的内容宽度。
+        const contentWidthPx = Math.max(0, mirror.clientWidth - 24);
+        const charsPerRow = Math.max(1, Math.floor(contentWidthPx / charW));
+
+        // 第二步：预过滤——长度不超过 charsPerRow 的行，无论断词在哪都不可能被挤到下一个
+        // 视觉行（字符数没到能让它溢出的地步），直接判 rows=1，不用进 DOM。真正可能软换行的
+        // "候选行"（长度超过 charsPerRow）才需要交给浏览器量真实断词点。
+        const offsets = new Array(lines.length);
+        const candidates = [];
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].length <= charsPerRow) offsets[i] = { rows: 1, cumRows: 0 };
+            else candidates.push(i);
+        }
+
+        // 第三步：批量写——候选行各自一个独立 <div>（独立文本节点，不共享一个大文本节点），
+        // 一次性挂进 DOM；这一步之后到下面读 getBoundingClientRect() 之前不再写 DOM。
+        const frag = document.createDocumentFragment();
+        const rowEls = new Array(candidates.length);
+        for (let k = 0; k < candidates.length; k++) {
+            const d = document.createElement('div');
+            d.textContent = lines[candidates[k]];
+            frag.appendChild(d);
+            rowEls[k] = d;
+        }
+        mirror.appendChild(frag);
+
+        // 第四步：批量读——每个候选行 div 自己的高度 / 行高 = 占几个视觉行。读的是已经布局
+        // 完成的块级盒子尺寸，是缓存读，不是在文本节点里现查字符位置。
+        for (let k = 0; k < candidates.length; k++) {
+            const h = rowEls[k].getBoundingClientRect().height;
+            offsets[candidates[k]] = { rows: Math.max(1, Math.round(h / OVL_LINE_H)), cumRows: 0 };
+        }
+
+        // 第五步：补齐累计视觉行号（这一步只是纯数组遍历求前缀和，跟 DOM 无关，很便宜）。
+        let cumRows = 0;
+        for (let i = 0; i < offsets.length; i++) { offsets[i].cumRows = cumRows; cumRows += offsets[i].rows; }
+
+        OvlState.lineOffsets = offsets;
+        return true;
+    } catch (e) {
+        console.error('[ovl] recomputeLineOffsets failed', e);
+        OvlState.lineOffsets = null;
+        return false;
+    }
+}
+
+// 实测发现的第三个坑，来自真实"连续打字"验证（不是纸面分析）：main.tex 在窄列宽下候选行
+// 有 1,594 个，上面那版同步全量测，单次实测在 150ms～800ms 之间波动（受当时浏览器状态影响），
+// 打字中间停顿超过 250ms 防抖触发时，如果正好撞上这一刀，下一个按键的处理会被这刀真实
+// 卡住——实测过一次打字间隙里插了 1 秒停顿，防抖触发后下一次 input 事件延迟了 1129ms，
+// 肉眼可见的卡顿，直接违反"不许有输入卡顿"的硬要求。
+// 解法：编辑防抖触发的重算不再一次性同步跑完，改成按 OVL_LINEOFFSET_CHUNK_BATCH 分片、
+// 每片挂在 setTimeout(0) 上跑（不用 requestAnimationFrame——rAF 在标签页不可见/被切到后台
+// 时会被浏览器整体暂停或降频，setTimeout(0) 不受影响）——每片只建/量一小批候选行的 div（仍然是"批量写、
+// 批量读、读写不交叉"的纪律，只是把"批量"的范围从"全部候选行"缩小到"一片候选行"），片与片
+// 之间让出主线程一帧，输入事件能在片间插进来处理，不会被單次几百毫秒的同步计算堵住。
+// 文件打开 / 三处跳转仍然用上面的同步版本——这两种场景本来就是一次性等待（换文件、
+// 点了要跳转），用户能接受，且跳转要立刻拿到准确结果，等不起跨帧才算完。
+const OVL_LINEOFFSET_CHUNK_BATCH = 80;
+let OvlLineOffsetChunkToken = 0; // 每次新调度 +1；旧的分片任务发现自己的 token 过期就自行放弃，不写脏数据
+function ovlRecomputeLineOffsetsChunked(onDone) {
+    const myToken = ++OvlLineOffsetChunkToken;
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || ta.clientWidth <= 0) { if (onDone) onDone(false); return; }
+        const text = ta.value;
+        const lines = text.length ? text.split('\n') : [''];
+        const mirror = ovlGetCodeMirror();
+        mirror.style.width = ta.clientWidth + 'px';
+        mirror.textContent = '';
+        const charW = ovlMeasureCharWidth(mirror);
+        const contentWidthPx = Math.max(0, mirror.clientWidth - 24);
+        const charsPerRow = Math.max(1, Math.floor(contentWidthPx / charW));
+        const offsets = new Array(lines.length);
+        const candidates = [];
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].length <= charsPerRow) offsets[i] = { rows: 1, cumRows: 0 };
+            else candidates.push(i);
+        }
+        let pos = 0;
+        function step() {
+            // 这次调度被更新的一次顶替了（比如用户又敲了字、又触发了一次 schedule），
+            // 半途的分片任务直接放弃，不跟新任务抢着写 OvlState.lineOffsets。
+            if (myToken !== OvlLineOffsetChunkToken) return;
+            const taNow = document.getElementById('ovlCodeArea');
+            // 内容或宽度在分片跑的过程中变了（理论上不太可能，因为新的 input/resize 会重新
+            // schedule 从而让 token 过期先短路掉——这里是双保险，不信任时序假设）。
+            if (!taNow || taNow.value !== text) { if (onDone) onDone(false); return; }
+            const end = Math.min(candidates.length, pos + OVL_LINEOFFSET_CHUNK_BATCH);
+            if (end > pos) {
+                const frag = document.createDocumentFragment();
+                const rowEls = [];
+                for (let k = pos; k < end; k++) {
+                    const d = document.createElement('div');
+                    d.textContent = lines[candidates[k]];
+                    frag.appendChild(d);
+                    rowEls.push(d);
+                }
+                mirror.appendChild(frag); // 这一片的批量写
+                for (let k = 0; k < rowEls.length; k++) { // 这一片的批量读，读写不交叉
+                    const h = rowEls[k].getBoundingClientRect().height;
+                    offsets[candidates[pos + k]] = { rows: Math.max(1, Math.round(h / OVL_LINE_H)), cumRows: 0 };
+                }
+                mirror.textContent = ''; // 量完这一片就清空，不让 mirror 跨帧越堆越大
+            }
+            pos = end;
+            if (pos < candidates.length) {
+                // 用 setTimeout(0) 让出线程而不是 requestAnimationFrame：rAF 在页面不可见/
+                // 被切到后台的标签页上会被浏览器整个暂停或降到 ~1Hz（实测验证过：本地自动化
+                // 测试标签页 document.visibilityState==="hidden" 时 rAF 分片两秒钟一次都没跑），
+                // setTimeout(0) 不受这个影响、该多快跑多快，效果上一样是"让出一次事件循环，
+                // 输入事件能插进来"，不需要 rAF 特有的"跟显示器刷新对齐"这个属性。
+                setTimeout(step, 0);
+            } else {
+                let cumRows = 0;
+                for (let i = 0; i < offsets.length; i++) { offsets[i].cumRows = cumRows; cumRows += offsets[i].rows; }
+                OvlState.lineOffsets = offsets;
+                if (onDone) onDone(true);
+            }
+        }
+        step();
+    } catch (e) {
+        console.error('[ovl] recomputeLineOffsetsChunked failed', e);
+        if (onDone) onDone(false);
+    }
+}
+
+// 0-based 逻辑行号 -> 累计视觉行号（乘 OVL_LINE_H 就是像素，每个视觉行行高固定一致）。
+// 表过期/缺失时现算一次再读——三处跳转都是用户主动点击触发的低频操作，不心疼这一趟同步计算，
+// 换来的是跳转永远准，不用赌防抖有没有追上。
+function ovlVisualRowForLineIndex(idx) {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        const n = ta ? (ta.value.length ? ta.value.split('\n').length : 1) : 0;
+        if (!OvlState.lineOffsets || OvlState.lineOffsets.length !== n) ovlRecomputeLineOffsets();
+    } catch (e) { console.error('[ovl] visualRowForLineIndex refresh failed', e); }
+    const offs = OvlState.lineOffsets;
+    if (offs && offs[idx]) return offs[idx].cumRows;
+    return idx; // 退化：等价于假设没有软换行，不崩、不跳到别的地方，只是不够精确
+}
+
+// 敲字/resize/拖分栏之后的防抖重算入口——统一一个定时器，不同调用点传不同延迟。
+function ovlScheduleLineOffsetRecompute(delay) {
+    if (OvlLineOffsetEditTimer) clearTimeout(OvlLineOffsetEditTimer);
+    OvlLineOffsetEditTimer = setTimeout(function () {
+        OvlLineOffsetEditTimer = null;
+        // 防抖到时间之后走分片版本（ovlRecomputeLineOffsetsChunked），不是上面那个同步全量版——
+        // 这里是真正会跟用户"继续打字/继续拖"撞车的时机，必须不阻塞；见分片版本头部注释里
+        // 记录的实测数据（1129ms 卡顿）。
+        ovlRecomputeLineOffsetsChunked(function (ok) { if (ok) ovlRenderGutter(true); });
+    }, delay);
+}
+
 // 行号槽：只在行数变化时整体重建（换行/删行才重建），普通敲字不触发重建 —— 避免
-// 对 4,132 行文档每次按键都重刷整块 DOM（§3.4 第 2 条同一条纪律的延伸）。
+// 对 4,132 行文档每次按键都重刷整块 DOM（§3.4 第 2 条同一条纪律的延伸）。force=true 时无视
+// 行数是否变化强制重建，用于"行数没变但软换行点变了"（比如拖窄了列宽）这种 gutter 也得
+// 重画的情况——调用方是 ovlScheduleLineOffsetRecompute 的防抖回调，不是敲键盘的热路径。
 function ovlRenderGutter(force) {
     try {
         const ta = document.getElementById('ovlCodeArea');
@@ -21829,12 +22119,23 @@ function ovlRenderGutter(force) {
         const n = ta.value.length ? ta.value.split('\n').length : 1;
         if (!force && n === OvlState.gutterLineCount) return;
         OvlState.gutterLineCount = n;
+        // lineOffsets 长度跟当前行数对得上才敢用——对不上说明表是上一次内容/上一个文件算的，
+        // 用了会把行号对到错的视觉行，不如退化回"1 逻辑行 = 1 视觉行"（旧行为，起码不跳偏）。
+        const offs = (OvlState.lineOffsets && OvlState.lineOffsets.length === n) ? OvlState.lineOffsets : null;
         const frag = document.createDocumentFragment();
         for (let i = 1; i <= n; i++) {
             const d = document.createElement('div');
             d.className = 'ovl-ln';
             d.textContent = String(i);
             frag.appendChild(d);
+            // 软换行续行：这一逻辑行占的视觉行数 > 1 时，后面几行补空白槽位对齐——跟
+            // Overleaf/CodeMirror 的 gutter 是同一个行为，续行不重复显示行号，只占位置。
+            const rows = offs ? offs[i - 1].rows : 1;
+            for (let k = 1; k < rows; k++) {
+                const blank = document.createElement('div');
+                blank.className = 'ovl-ln ovl-ln-blank';
+                frag.appendChild(blank);
+            }
         }
         gutter.textContent = '';
         gutter.appendChild(frag);
@@ -21940,6 +22241,10 @@ async function ovlOpenFile(fileHandle, name, parentHandle) {
         const ta = document.getElementById('ovlCodeArea');
         if (ta) { ta.disabled = false; ta.value = text; }
         ovlUpdateTabUI();
+        // 换文件：行偏移表是上一个文件的，必须先失效，不许拿旧表给新内容当真（ovlRenderGutter/
+        // ovlVisualRowForLineIndex 的退化路径只保证"不崩、不跳偏"，不保证"跟旧文件对得上"）。
+        OvlState.lineOffsets = null;
+        ovlRecomputeLineOffsets(); // 打开文件必须马上算（§ Bug 2 要求"on file open/switch (always)"）
         ovlRenderGutter(true);
         ovlBuildOutline();
         // M5：换了文件，折叠状态归零，Visual 若开着就重渲一次（不开着就是白做一次，
@@ -22672,7 +22977,9 @@ function ovlBuildOutline() {
                 taEl.setSelectionRange(it.offset, it.offset);
                 const before = taEl.value.slice(0, it.offset);
                 const line = before.split('\n').length - 1;
-                taEl.scrollTop = Math.max(0, line * 18 - taEl.clientHeight / 2);
+                // v2 Polish 2（Bug 2）：软换行下 line*18 不再等价于该行的像素位置，改用视觉行号
+                // （ovlVisualRowForLineIndex 里表过期会自己现算一次，见函数注释）。
+                taEl.scrollTop = Math.max(0, ovlVisualRowForLineIndex(line) * OVL_LINE_H - taEl.clientHeight / 2);
                 const gutter = document.getElementById('ovlGutter');
                 if (gutter) gutter.scrollTop = taEl.scrollTop;
             });
@@ -22897,11 +23204,11 @@ function ovlFindSelectCurrent() {
         // 未聚焦的 textarea 上一样生效并显示灰底选中，Replace/ReplaceAll 需要 ta 焦点时
         // 会在各自的函数体里自己 focus。
         ta.setSelectionRange(r[0], r[1]);
-        // 把命中行滚进视口：按换行数估算行号 × 行高（.ovl-code-area 是 12px/1.5 ≈ 18px/行）。
+        // 把命中行滚进视口：v2 Polish 2（Bug 2）软换行下改用视觉行号 × 固定行高
+        // （ovlVisualRowForLineIndex，见该函数注释），不再是 line × 18 的旧假设。
         const before = ta.value.slice(0, r[0]);
         const line = before.split('\n').length - 1;
-        const lineHeight = 18;
-        ta.scrollTop = Math.max(0, line * lineHeight - ta.clientHeight / 2);
+        ta.scrollTop = Math.max(0, ovlVisualRowForLineIndex(line) * OVL_LINE_H - ta.clientHeight / 2);
         const gutter = document.getElementById('ovlGutter');
         if (gutter) gutter.scrollTop = ta.scrollTop;
     } catch (e) { console.error('[ovl] findSelectCurrent failed', e); }
@@ -23410,7 +23717,8 @@ function ovlRenderLogOtherFiles() {
 
 // 跳到源码那一行 —— 只对当前编辑器里已经打开的那个文件生效（M3 阶段桥只标注被编译文件的
 // 行号，跨文件自动打开是 M9+ 以后的事，见 §2.6.7 的诚实边界）。算法跟 ovlBuildOutline /
-// ovlFindSelectCurrent 是同一套（行高固定 18px，見 §3.4 第 2 条禁软换行的推论）。
+// ovlFindSelectCurrent 是同一套——v2 Polish 2（Bug 2）起改成软换行感知的视觉行号
+// （ovlVisualRowForLineIndex），不再是行高固定 18px 的旧假设。
 function ovlLogJumpToLine(line) {
     if (line == null) return;
     const ta = document.getElementById('ovlCodeArea');
@@ -23422,7 +23730,7 @@ function ovlLogJumpToLine(line) {
     const end = start + (lines[idx] ? lines[idx].length : 0);
     ta.focus();
     ta.setSelectionRange(start, end);
-    ta.scrollTop = Math.max(0, idx * 18 - ta.clientHeight / 2);
+    ta.scrollTop = Math.max(0, ovlVisualRowForLineIndex(idx) * OVL_LINE_H - ta.clientHeight / 2);
     const gutter = document.getElementById('ovlGutter');
     if (gutter) gutter.scrollTop = ta.scrollTop;
     if (OvlState.logView) ovlToggleLogView(); // 跳过去是为了看代码，日志面板挡着就顺手切回去
@@ -23493,6 +23801,10 @@ function ovlBindShell() {
         const colSplitter = document.getElementById('ovlColSplitter');
         if (colSplitter) colSplitter.addEventListener('pointerdown', ovlColSplitterBeginDrag);
 
+        // v2 Polish 2（Bug 2）：窗口 resize 会改变 #ovlCodeArea 的 clientWidth，软换行点跟着变，
+        // 150ms 防抖到停手再重算（拖窗口整个过程可能连续触发几十次 resize，不能每次都重算）。
+        window.addEventListener('resize', function () { ovlScheduleLineOffsetRecompute(150); });
+
         // 点菜单外部关闭菜单（捕获阶段挂一次，跟聊天窗的既有做法一样是全局单例监听）。
         document.addEventListener('click', function (e) {
             const menu = document.getElementById('ovlLayoutMenu');
@@ -23523,6 +23835,10 @@ function ovlBindShell() {
                 // ta 也能被"编辑"但 disabled 挡住了输入，这里额外守一道 currentFile）。
                 if (OvlState.currentFile) { OvlState.dirty = true; ovlUpdateTabUI(); }
                 ovlScheduleOutlineRefresh();
+                // v2 Polish 2（Bug 2）：软换行点可能因为编辑而变，200-300ms 防抖到停手再重算
+                // 行偏移表——跟 M9 outline 的 1s 防抖同一条纪律，这里给短一点，因为 gutter 错位
+                // 比 outline 过期更容易被立刻注意到。
+                ovlScheduleLineOffsetRecompute(250);
             });
             ta.addEventListener('scroll', function () {
                 if (gutter) gutter.scrollTop = ta.scrollTop;
@@ -23639,6 +23955,16 @@ function ovlBindShell() {
                 ovlRunCmd(btn.getAttribute('data-cmd'));
             });
         }
+        // v2 Polish 2（Bug 1）：工具条 "…" 按钮不在 #ovlMenuBar 里，ovlBindMenuBar 的委托绑定
+        // 摸不到它，这里单独绑一下；stopPropagation 道理跟 ovlBindMenuBar 里那六个一样——
+        // 不停传播的话，这次 click 会冒泡到 ovlBindDropMenus 的 document 监听器，把刚打开的
+        // 菜单当"点击外部"立刻关掉（ovlMbMenu_toolbarInsert 在 OVL_DROPMENUS 里 btn 是 null）。
+        const toolbarOverflowBtn = document.getElementById('ovlToolbarOverflowBtn');
+        if (toolbarOverflowBtn) toolbarOverflowBtn.addEventListener('click', function (e) {
+            e.stopPropagation();
+            ovlToggleMbMenu('toolbarInsert', toolbarOverflowBtn);
+        });
+
         const headingSelect = document.getElementById('ovlHeadingSelect');
         if (headingSelect) {
             headingSelect.addEventListener('change', function () {
@@ -23753,7 +24079,6 @@ const OVL_SETTINGS_DEFAULTS = {
     lineHeight: 'normal',       // compact | normal | wide
     editorTheme: 'light',       // light | dark（只切前景背景，不做代码高亮，§3.4 第 2 条）
     darkModePdf: false,         // 和 PDF 工具条的 ◐ 反色按钮共用同一个值
-    softWrap: false,
     showLineNumbers: true,
     tabSize: 4,
     autoCloseBrackets: false,
@@ -23795,9 +24120,11 @@ function ovlApplySettings() {
             el.style.lineHeight = String(lh);
         });
         if (ta) {
-            // ⚠️ 打开软换行后行号会和视觉行对不上（一行折成三行）——§4.0 明文要求"别装作没这回事"，
-            // 这里选择保留行号槽而不是强行同步，代价在设置面板的 data-tip 里写明。
-            ta.style.whiteSpace = OvlSettings.softWrap ? 'pre-wrap' : 'pre';
+            // v2 Polish 2（Bug 2）：软换行不再是设置面板里的一个"开了会错位"的选项——现在
+            // white-space:pre-wrap 是 .ovl-code-area 的固定 CSS（1249 行），gutter/三处跳转
+            // 全部改吃 ovlRecomputeLineOffsets() 算出来的行偏移表，不会错位，所以这里不再需要
+            // 也不应该用内联 style 覆盖它（旧的"Soft wrap"复选框已随之下线，见 M7 设置面板 Editor
+            // 分类的改动）。
             ta.style.tabSize = String(OvlSettings.tabSize);
             ta.spellcheck = !!OvlSettings.spellcheck;
             ta.lang = OvlSettings.spellLang;
@@ -23930,8 +24257,8 @@ function ovlSettingsEditorHtml() {
         '真的生效：编辑器上方显示光标所在的 \\section/\\subsection 路径。');
     html += ovlSetRow('Equation preview', '<input type="checkbox" data-setpath="settings.equationPreview"' + (s.equationPreview ? ' checked' : '') + '>',
         '真的生效：光标落在 $...$ 内时，用页面已加载的 KaTeX 渲染一个悬浮预览（不处理跨行/\\[...\\]）。');
-    html += ovlSetRow('Soft wrap', '<input type="checkbox" data-setpath="settings.softWrap"' + (s.softWrap ? ' checked' : '') + '>',
-        '真的生效，但有代价：长行会视觉折行，行号槽不会跟着重新对齐（§3.4 明令禁止逐行重刷式高亮/软换行同步）。');
+    html += ovlSetRow('Soft wrap', '<span class="ovl-set-readonly-val">已开启（不可关闭）</span>',
+        'v2 Polish 2 起软换行永久开启：长行视觉折行，行号槽/File outline/Find/日志跳转全部按软换行后的视觉行号对齐（ovlRecomputeLineOffsets 批量算出来的行偏移表），不再是旧版"打开会错位"的半成品，所以也不再需要一个可以关掉它的开关。');
     html += ovlSetRow('Show line numbers', '<input type="checkbox" data-setpath="settings.showLineNumbers"' + (s.showLineNumbers ? ' checked' : '') + '>', '');
     return html;
 }
@@ -24273,7 +24600,8 @@ const OVL_DROPMENUS = [
     { menu: 'ovlMbMenu_insert', btn: null },
     { menu: 'ovlMbMenu_view', btn: null },
     { menu: 'ovlMbMenu_format', btn: null },
-    { menu: 'ovlMbMenu_help', btn: null }
+    { menu: 'ovlMbMenu_help', btn: null },
+    { menu: 'ovlMbMenu_toolbarInsert', btn: null }
 ];
 function ovlCloseAllDropMenus() {
     OVL_DROPMENUS.forEach(function (d) { const m = document.getElementById(d.menu); if (m) m.hidden = true; });
@@ -24699,6 +25027,18 @@ function ovlRenderMbInsertMenu() {
     document.getElementById('ovlMbMenu_insert').innerHTML = html;
 }
 
+// v2 Polish 2（Bug 1）：工具条 "…" 下拉——Insert 菜单里 xref/cite/figure/table/list 那五条的
+// 子集，同一个 ovlMbCmdItem/OvlCmds 触发路径（决策 D：不重新实现一份）。
+function ovlRenderMbToolbarInsertMenu() {
+    let html = '';
+    html += ovlMbCmdItem('ins.xref', null, 'Cross reference');
+    html += ovlMbCmdItem('ins.cite', null, 'Citation');
+    html += ovlMbCmdItem('ins.figure', null, 'Figure');
+    html += ovlMbCmdItem('ins.table', null, 'Table');
+    html += ovlMbCmdItem('ins.list', null, 'List');
+    document.getElementById('ovlMbMenu_toolbarInsert').innerHTML = html;
+}
+
 function ovlRenderMbViewMenu() {
     const hasPdf = !!OvlState.pdfObjectUrl;
     let html = '';
@@ -24769,7 +25109,10 @@ const OVL_MB_MENUS = {
     insert: { btn: null, menu: 'ovlMbMenu_insert', render: ovlRenderMbInsertMenu },
     view: { btn: null, menu: 'ovlMbMenu_view', render: ovlRenderMbViewMenu },
     format: { btn: null, menu: 'ovlMbMenu_format', render: ovlRenderMbFormatMenu },
-    help: { btn: null, menu: 'ovlMbMenu_help', render: ovlRenderMbHelpMenu }
+    help: { btn: null, menu: 'ovlMbMenu_help', render: ovlRenderMbHelpMenu },
+    // v2 Polish 2（Bug 1）：工具条 "…" 按钮不在 #ovlMenuBar 里，btn 留 null（跟其它六个一样
+    // 靠调用方自己 stopPropagation，见 ovlBindShell 里 ovlToolbarOverflowBtn 的绑定）。
+    toolbarInsert: { btn: null, menu: 'ovlMbMenu_toolbarInsert', render: ovlRenderMbToolbarInsertMenu }
 };
 
 function ovlToggleMbMenu(key, btnEl) {
