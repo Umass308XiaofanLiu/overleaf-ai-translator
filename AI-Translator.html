@@ -1018,9 +1018,40 @@ body[data-aichat-drag="bl"]   { cursor: nesw-resize !important; }
 /* ==================== OVL.CSS (v2 Overleaf 风格外壳 · M1 + M1.5) ====================
    手写、#ovlShell/#ovlPortal/#ovlTransWin 前缀，禁用 Tailwind 工具类 —— 动态插进 body 的
    节点上的 Tailwind 类不保证被运行时 JIT 扫到（同一原因聊天窗第 335–347 行也是全手写）。
-   z-index 号段严格照抄规划 §3.3（v2 改版）：外壳 1000–1099，外壳菜单 1080，
-   翻译器窗框 #ovlTransWin 1490，翻译器内容 #root 1500，#synonymPopup（浮窗开着时）1505，
-   #aiChatRoot 2147482000（不变），[data-tip]::after 2147483000（不变）。 */
+
+   ---- z-index 号段总表（含"翻译器悬浮窗开着时谁盖得住谁"的核算，P5 修订）----
+   #ovlShell 外壳本体                                          1000
+   #ovlPortal 外壳浮层根（设置弹窗/菜单栏下拉/quickActions/     1080（内部子项 1080–1090，
+     右键菜单/通用弹窗/tip2……全部子浮层共用这一个层叠上下文）        各自定义处不变）
+   #ovlTransWin 翻译器窗框                                      1490
+   #root 翻译器内容（v1 应用整体，含设置弹窗/错误横幅/toast）     1500
+   #synonymPopup（v1 选词弹窗，例外：挂在 body 上，不在 #root 里）1505（翻译器开着）
+                                                                1087（只有外壳，翻译器未开）
+   #ovlPortal（翻译器开着时整体上抬，规则见下方 §escape-hatch）  1510
+   #aiChatRoot                                                 2147482000（不变）
+   [data-tip]::after                                           2147483000（不变）
+
+   关键机制（不是"z-[100] 比 1500 小所以盖不住"这种朴素数值比较，而是层叠上下文包含关系）：
+   #root 一旦拿到 position:fixed + z-index，就成了独立层叠上下文——它在外部序列里的 1500
+   名次是整棵子树共享的下限，子树内部不管用 z-index 10 还是 Tailwind 的 z-[100]，都只在
+   子树内部互相排序，赢家也跳不出这个下限、输不到 1500 以下。所以 v1 内部那三个
+   fixed inset-0 z-[100] 浮层（openSettings 设置弹窗 / renderErrorBanner / renderToast，
+   都是 root.innerHTML 模板里的元素）天生就盖得住 #ovlTransWin(1490) 和 #ovlShell
+   (1000-1099)，不需要专门抬它们的 z-index——P5 轮已用 elementFromPoint 命中测试逐个验证
+   过（设置弹窗/错误横幅/toast 三者在翻译器窗口开着时都实测可见、可点），之前设想过要给
+   它们仨也点对点开洞，验证下来是多余的，加了反而是三套机制互相打架。
+   真正会被 #root(1500) 盖住、需要显式抬高的只有两个跳出 #root 子树的例外：
+     1) #synonymPopup —— 用 document.body.insertAdjacentHTML 直接挂 body，不在 #root
+        子树里，天然逃出上面那条"整棵子树共享下限"的免费保护，见下方专门注释。
+     2) #ovlPortal —— 翻译器悬浮窗开着时，外壳自己的设置按钮（左侧栏）/ 菜单栏仍在窗口
+        范围之外、点得到，一旦点开，产物（.ovl-settings-overlay / #ovlModalOverlay / 各
+        下拉菜单……）全部挂在 #ovlPortal 下，而 #ovlPortal 本身停在外壳的 1080，天生盖不
+        过 #root 的 1500——P5 轮实测复现过：ovlOpenSettings() / ovlConfirmDialog() 在翻译
+        器窗口开着时调用，弹窗确实进了 DOM（hidden=false），但 elementFromPoint 在它自己
+        矩形中心点命中的是 #root 的 <main>，不是它，等于用户点开了一层空气。修法见下方
+        #ovlPortal 规则：翻译器开着时把整个 #ovlPortal 抬到 1510，内部子浮层原有的
+        1080–1090 相对顺序不变，只是这坨作为一个单位相对 #root/#ovlTransWin 的名次变了。
+   ==================================================================================== */
 
 /* 默认（外壳未激活，即 ovlBoot 还没成功跑完）：#ovlShell 不存在或不可见，#root 照常显示。
    只有 body.ovl-shell-active 生效时才隐藏 #root，换成外壳；
@@ -1043,6 +1074,17 @@ body.ovl-translator-open #root {
    JIT 再上一道保险。不要给 #root 加 transform 之类的东西去"包住"它 —— 包不住，见 §3.6.4 方案 C。 */
 body.ovl-translator-open #synonymPopup { z-index: 1505 !important; }
 
+/* §escape-hatch 2/2（见上方 z-index 总表"关键机制"）：#ovlPortal 是外壳全部浮层
+   （设置弹窗/菜单栏下拉/quickActions/右键菜单/通用弹窗/tip2……）唯一的层叠上下文根。
+   翻译器悬浮窗开着时，外壳左侧栏的设置按钮和顶部菜单栏仍在窗口范围之外、点得到，
+   但 #ovlPortal 本身停在外壳的 1080，盖不过 #root 的 1500，点开的东西会「存在但不可见」
+   （P5 轮用 ovlOpenSettings()/ovlConfirmDialog() 实测复现，elementFromPoint 命中的是
+   #root 的 <main>）。这里把 #ovlPortal 整体抬到 1510，内部子浮层原有的 1080–1090
+   相对顺序不受影响——不用 !important：#ovlPortal 的 1080 本来就是不含 !important 的
+   普通规则，这条选择器特异度 (0,2,0) 已经压得过 (0,1,0)。翻译器关闭时这条规则不生效，
+   #ovlPortal 照旧停在 1080，不影响 v2 外壳独立使用时的既有层叠。 */
+body.ovl-translator-open #ovlPortal { z-index: 1510; }
+
 /* 【M1.5 三条 !important，唯一的技术难点】renderMainWorkspace（约 13048 行）里 <main> 带的
    行内 style="height: calc(100vh - 220px);" 是视口相对的，浮窗只有几百 px 高时会把内容撑爆、
    窗口自己滚出竖向滚动条。CSS Cascade Level 4：important author 压得过 normal author（含行内
@@ -1062,15 +1104,19 @@ body.ovl-translator-open #root main {
 /* ==================== P2：简化模式（docs/v2_ux_round_plan.md §2.2.3）====================
    class 挂在 #root 自己身上，不挂 body —— #root 是将来可能被弹出到子文档的那个节点，
    而 body 上的 class/属性不跨文档（§3.4 规则 1，架构 pass §1.5 实测）。
-   唯一写手是 ovlTransSetSimple()/ovlTransSyncSimpleUI()（约 21800 行附近）。 */
-#root.ovl-trans-simple .ovl-t-brand,
+   唯一写手是 ovlTransSetSimple()/ovlTransSyncSimpleUI()（约 21800 行附近）。
+   P5 补记：.ovl-t-brand / .ovl-t-footer 这两个 class 对应的 DOM 节点本轮已经从
+   renderHeader/renderFooter 里整个删除（品牌区+页脚不再渲染），这里的选择器跟着摘掉——
+   留着会一直是零匹配的死选择器，不是"顺手清理"而是不清理就会误导下一个读这条规则的人
+   以为这两块还存在、只是被简化模式藏起来了。.ovl-t-panelhead / .ovl-t-regen 对应的节点
+   还在（面板表头、重译全部按钮），继续保留。 */
 #root.ovl-trans-simple .ovl-t-panelhead,
-#root.ovl-trans-simple .ovl-t-footer,
 #root.ovl-trans-simple .ovl-t-regen {
     display: none !important;
 }
-/* .ovl-t-tools 装着「设置/保存/历史/分隔线/模型选择器/控制条(.ovl-t-langbar)」六个直接子节点，
-   简化模式下只有控制条要部分保留（ZH/⇄/EN），其余五个整个藏起来。
+/* .ovl-t-tools 现在装着「保存/历史/分隔线/模型选择器/控制条(.ovl-t-langbar)」五个直接
+   子节点（设置齿轮已删除，见 renderHeader 顶部注释），简化模式下只有控制条要部分保留
+   （ZH/⇄/EN），其余四个整个藏起来。
    不能反过来"先把 .ovl-t-tools 整体 display:none、再指望 .ovl-t-langbar 自己 display:flex 逃出来"
    ——祖先 display:none 时子元素的 display 值不会生效，CSS 做不到那种"豁免"，
    所以改用 :not() 只隐藏兄弟节点，.ovl-t-tools 自己从不被隐藏。 */
@@ -1157,9 +1203,10 @@ body.ovl-popout-child #root {
 .ovl-vistrans-copy:hover, .ovl-vistrans-close:hover { background: #e2e8f0; }
 
 /* #synonymPopup 在 v2 编辑器里（Code/Visual 选中触发的替换/简化/语法）挂的还是 <body>，
-   默认 Tailwind z-[100] 会被编辑器工具条(1086)/设置遮罩(1085) 压住——照抄第 1044 行
-   翻译器浮窗那条规则的思路，:not(.ovl-translator-open) 保证跟它互不冲突（一个带这个
-   class 一个不带，选择器互斥）。 */
+   默认 Tailwind z-[100] 会被编辑器工具条(1086)/设置遮罩(1085) 压住——跟上方 z-index 总表
+   里"翻译器开着时 1505"是同一个 #synonymPopup 的另一半：那条管翻译器窗口开着的状态，
+   这条管只有外壳、翻译器没开的状态，:not(.ovl-translator-open) 保证两条规则的选择器
+   互斥，不会同时命中、也不用互相比大小。 */
 body.ovl-shell-active:not(.ovl-translator-open) #synonymPopup { z-index: 1087 !important; }
 
 #ovlShell {
@@ -1485,7 +1532,12 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 
 /* ---- #ovlPortal：外壳下拉菜单（M1.5 起翻译器关闭按钮已搬进窗口标题栏，不再需要
    把 #ovlPortal 的层叠上下文整体抬高的那条 hack —— #ovlTransWin 直接是 body 的
-   直接子节点，z-index 1490/1500/1505 三段互相之间不存在"关不进去"的问题，见 §3.6.4 方案 B）。 ---- */
+   直接子节点，z-index 1490/1500/1505 三段互相之间不存在"关不进去"的问题，见 §3.6.4 方案 B）。
+   P5 补记：上面这段说的是"关闭按钮够不着"这个理由已经不成立，但#ovlPortal 整体抬高
+   这件事本身在 P5 因为另一个不相关的理由又被加回来了——见下方 body.ovl-translator-open
+   #ovlPortal 规则和最上方 z-index 总表"关键机制"第 2 点：外壳自己的设置按钮/菜单栏在
+   翻译器窗口开着时还点得到，点开的浮层（设置弹窗/通用弹窗……）挂在这个 1080 的
+   #ovlPortal 下，盖不过 #root 的 1500。两次"抬高"动机不同，不是同一个 hack 复活。 ---- */
 #ovlPortal { position: fixed; inset: 0; pointer-events: none; z-index: 1080; }
 #ovlPortal > * { pointer-events: auto; }
 
@@ -13472,7 +13524,6 @@ function renderAppCore(preserveScroll = true) {
             ${renderToast()}
             ${renderHeader()}
             ${renderMainWorkspace()}
-            ${renderFooter()}
         </div>
     `;
     // 走到这一行说明整块模板字符串**已经拼完并且已经赋进 #root**。
@@ -14742,18 +14793,12 @@ function renderSynonymPopup() {
 function renderHeader() {
     return `
         <header class="bg-white rounded-3xl shadow-sm border border-slate-200 mb-4 px-8 py-5 flex flex-wrap items-center justify-between gap-6 relative z-50">
-            <div class="flex items-center gap-4 ovl-t-brand">
-                <div class="bg-gradient-to-br from-indigo-600 to-violet-700 p-3 rounded-2xl text-white shadow-xl shadow-indigo-100">
-                    ${Icons.Languages}
-                </div>
-                <div>
-                    <h1 class="text-2xl font-extrabold text-slate-900 tracking-tight leading-none">Academic AI</h1>
-                    <p class="text-[11px] text-indigo-500 font-bold tracking-widest uppercase mt-1">LaTeX & Terminology Optimized <span style="color:#94a3b8;font-weight:400;letter-spacing:0.06em;text-transform:none;">· v${APP_VERSION} · ${APP_BUILD_DATE}</span></p>
-                </div>
-            </div>
+            <!-- v2 P5：品牌/Logo/版本号块（原 .ovl-t-brand）整块删除——翻译器窗口是 v2 外壳里
+                 弹出的一个工具窗，不需要自己的品牌区；版本号迁到 v2 主界面设置弹窗的
+                 Translator 分类里（ovlSettingsTranslatorHtml，读的还是同一份 APP_VERSION/
+                 APP_BUILD_DATE 常量，不是抄一份硬编码）。 -->
 
             <div class="flex items-center gap-4 ovl-t-tools">
-                ${renderSettingsButton()}
                 ${renderSaveButtonGroup()}
                 ${renderHistoryMenu()}
                 <div class="h-6 w-px bg-slate-200 mx-2"></div>
@@ -14762,9 +14807,11 @@ function renderHeader() {
             </div>
 
             <div class="flex items-center gap-3 ovl-t-actions">
-                <button id="chatToggleBtn" onclick="chatToggle()" aria-pressed="${chatIsOpen() ? 'true' : 'false'}" class="px-5 py-2.5 bg-white border border-slate-200 text-slate-700 rounded-2xl hover:bg-slate-50 hover:border-indigo-200 transition-all font-semibold flex items-center gap-2 group ${chatIsOpen() ? 'is-chat-open' : ''}" data-tip="开/关浮动 AI 对话窗：一个能自由拖动、自己调大小的聊天窗，随便问、也能让模型改左栏原文里的任意一段（右栏译文它看不到、也改不了）。窗口挂在页面最外层，界面刷新和自动存档都打断不了你输到一半的内容。" data-tip-pos="bottom-start">
-                    <span class="text-indigo-500 group-hover:animate-pulse">${Icons.MessageSquare}</span> Chat
-                </button>
+                <!-- v2 P5：#chatToggleBtn（Chat 开关）整个删除——聊天窗现在从 v2 主界面左侧栏
+                     的 #ovlChatBtn 打开（同一个 chatToggle()，同一个 #aiChatRoot，行为完全
+                     不变），翻译器窗口自己不再重复一个入口。chatSyncToggleButton()/chatClose()
+                     里对 #chatToggleBtn 的引用都已带 null 检查或已改指向 #ovlChatBtn，不会
+                     因为这个节点消失而报错。 -->
                 <!-- id 是给 syncTranslateButtonState() 用的：handleInputChange 刻意不重渲染
                      （避免焦点丢失），所以这颗按钮的 disabled 必须由那边直接改到 DOM 上，
                      否则它会一直停在「输入框还是空的」那一刻算出来的值上。 -->
@@ -14779,16 +14826,10 @@ function renderHeader() {
     `;
 }
 
-// ============= 设置按钮 =============
-function renderSettingsButton() {
-    return `
-        <div class="relative">
-            <button onclick="openSettings()" class="p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-all" data-tip="打开设置：API Key、模型列表、句对行距、提示词与历史都在里面。" data-tip-pos="bottom-start">
-                ${Icons.SettingsGear}
-            </button>
-        </div>
-    `;
-}
+// v2 P5：renderSettingsButton()（翻译器窗口自己的设置齿轮）整个删除——调用点已从
+// renderHeader 的 .ovl-t-tools 里摘掉，v1 设置弹窗改由 v2 主设置弹窗 Translator 分类
+// 里的入口按钮打开（ovlSettingsTranslatorHtml，onclick="openSettings()"，同一个函数，
+// 只是换了个按钮触发）。
 
 // ============= 保存按钮组 =============
 function renderSaveButtonGroup() {
@@ -15326,43 +15367,11 @@ function renderSettingsPopover(type) {
     `;
 }
 
-// ============= 页脚 =============
-function renderFooter() {
-    let statusText, statusDotClass;
-    // ⚠️ 阶段一是纯重构，页脚文案必须与重构前逐字一致，所以这里**仍按写死的 id 判定**。
-    // 计划 步骤 6A 想改成按目录 tier 判定（顺带修掉 'gemini-flash-lite-latest' 这条死分支），
-    // 但那会让 9 个内置模型里 5 个的页脚文案发生变化（含默认的 gemini-2.5-flash-lite：
-    // PRO QUALITY ACTIVE → ULTRA FAST LITE MODE），属于行为变更而非重构，已回退，待用户拍板后再切。
-    if (AppState.apiProvider === 'local') {
-        statusText = 'LOCAL SERVER CONNECTED';
-        statusDotClass = 'bg-indigo-600 shadow-indigo-200';
-    } else if (AppState.selectedModel === 'gemini-flash-lite-latest') {
-        statusText = 'ULTRA FAST LITE MODE';
-        statusDotClass = 'bg-emerald-500 shadow-emerald-200';
-    } else if (AppState.selectedModel === 'gemini-3-flash-preview') {
-        statusText = 'FAST MODE ENABLED';
-        statusDotClass = 'bg-emerald-500 shadow-emerald-200';
-    } else {
-        statusText = 'PRO QUALITY ACTIVE';
-        statusDotClass = 'bg-emerald-500 shadow-emerald-200';
-    }
-
-    return `
-        <footer class="ovl-t-footer mt-4 flex items-center justify-between px-4 text-[10px] text-slate-400 font-mono uppercase tracking-[0.2em] border-t border-slate-200 pt-4">
-            <div class="flex gap-6 items-center">
-                <span class="flex items-center gap-2 text-indigo-500 font-black">
-                    ${AppState.apiProvider === 'local' ? Icons.Server : Icons.Cpu}
-                    ENGINE: <span class="text-slate-600 truncate max-w-[150px]">${escapeHtml(AppState.apiProvider === 'local' ? AppState.selectedModel : AppState.selectedModel.toUpperCase())}</span>
-                </span>
-                <div class="flex items-center gap-2">
-                    <span class="w-2 h-2 rounded-full animate-pulse shadow-lg ${statusDotClass}"></span>
-                    ${statusText}
-                </div>
-            </div>
-            <div class="hidden sm:block">Select text to find academic synonyms • Incremental AI Refine enabled</div>
-        </footer>
-    `;
-}
+// v2 P5：renderFooter()（翻译器窗口自己的页脚——ENGINE/连接状态/"Select text to find
+// academic synonyms" 提示语）按用户要求整个删除，不再拼进 root.innerHTML（原调用点在
+// renderAppCore 的模板里，已摘掉）。这三行信息本轮不迁移到主界面——用户只要求把版本号
+// 迁过去（见 renderHeader 顶部注释 + ovlSettingsTranslatorHtml），页脚其余内容按明确
+// 指示直接删，不留仅存在于历史记录里的"信息展示"。
 
 // ============= 事件绑定 =============
 function attachEventListeners() {
@@ -20770,7 +20779,9 @@ function chatClose() {
         const prev = ChatState.lastFocus;
         ChatState.lastFocus = null;
         let back = (prev && document.contains && document.contains(prev)) ? prev : null;
-        if (!back) back = document.getElementById('chatToggleBtn');
+        // v2 P5：翻译器窗口里那颗 #chatToggleBtn 已删除（迁移到主界面），焦点兜底目标
+        // 改成主界面左侧栏常驻的 #ovlChatBtn —— 同一个 chatToggle()，两个入口之一。
+        if (!back) back = document.getElementById('ovlChatBtn');
         if (back && back.focus) { try { back.focus(); } catch (e) {} }
     } catch (e) {
         console.error('[chat] close failed', e);
@@ -25127,6 +25138,13 @@ function ovlSettingsAppearanceHtml() {
 function ovlSettingsTranslatorHtml() {
     const s = OvlSettings;
     let html = '<div class="ovl-set-category-title">Translator</div>';
+    // v2 P5：翻译器窗口自己的设置齿轮已经删除（renderHeader 顶部注释），API Key / 模型
+    // 列表 / 句对行距 / 提示词与历史这些 v1 设置项没有跟着搬过来重做一遍——那是 Pass 2
+    // 的活——这一轮只保证「还够得着」：点这颗按钮 = 关掉这个 v2 设置弹窗、确保翻译器
+    // 悬浮窗打开、再调用跟原来齿轮完全同一个 openSettings()。三步都是幂等操作，窗口已经
+    // 开着时只是多刷新一次，不会重复开窗。
+    html += ovlSetRow('API / 模型 / 历史（旧版设置）', '<button type="button" class="ovl-modal-btn" onclick="ovlCloseSettings(); ovlOpenTranslator(); openSettings();">打开旧版设置面板</button>',
+        'API Key、在线/本地模型列表、句对行距、历史记录条数上限、提示词模板都还在这个旧版面板里——本轮只是把入口从翻译器窗口自己的齿轮图标搬到了这里，内容和之前完全一样。点一下会顺带打开翻译器悬浮窗（面板挂在窗口内容里，不开窗看不到）。');
     html += ovlSetRow('简化模式', '<input type="checkbox" data-setpath="settings.transSimpleMode"' + (s.transSimpleMode ? ' checked' : '') + '>',
         '只显示左右两个文本框和翻译按钮，把工具栏、面板标题、页脚都收起来。想专心读译文时用。');
     html += ovlSetRow('自动翻译', '<input type="checkbox" data-transfn="toggleAutoTranslate"' + (AppState.isAutoTranslate ? ' checked' : '') + '>',
@@ -25150,6 +25168,11 @@ function ovlSettingsTranslatorHtml() {
         + (Array.isArray(AppState.localModels) ? AppState.localModels : []).map(function (lm) { return ovlOptTag(lm.id, lm.id, s.visualTransModel); }).join('')
         + '</select>',
         'Visual 模式里选中文字后，用哪个模型翻译。留空就跟着翻译器上方选的模型走。');
+    // v2 P5：版本号从翻译器窗口的品牌区（已删除，见 renderHeader 顶部注释）迁到这里。
+    // 直接读全局的 APP_VERSION/APP_BUILD_DATE 常量（约第 3247 行，pre-commit hook 每次
+    // 提交自动改写这两个值），不是在这里另外抄一份写死的字符串——那样两处会迟早不同步。
+    html += ovlSetRow('关于', '<span class="ovl-set-readonly-val">Academic AI Translator · v' + escapeHtml(APP_VERSION) + ' · ' + escapeHtml(APP_BUILD_DATE) + '</span>',
+        '版本号和最近一次构建日期，随每次提交自动更新（见仓库 pre-commit hook）。');
     return html;
 }
 const OVL_SETTINGS_RENDERERS = { editor: ovlSettingsEditorHtml, spelling: ovlSettingsSpellingHtml, compiler: ovlSettingsCompilerHtml, appearance: ovlSettingsAppearanceHtml, translator: ovlSettingsTranslatorHtml };
