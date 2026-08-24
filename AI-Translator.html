@@ -1229,6 +1229,8 @@ body.ovl-shell-active #ovlShell { display: flex; }
     display: flex;
     flex-direction: column;
     min-width: 0;
+    min-height: 0; /* 网格项默认 min-height:auto 会撑破 .ovl-body 那一行，日志列表就滚不动了——
+                       实测踩过：214 条 warning 撑出屏幕外，Raw logs/Clear cached files 够不着。 */
 }
 .ovl-pdf-toolbar { height: 34px; display: flex; align-items: center; padding: 0 10px; color: #E7E9EE; font-size: 12px; background: #1B222C; }
 .ovl-pdf-body { flex: 1 1 auto; display: flex; align-items: center; justify-content: center; color: #9AA4B2; font-size: 13px; text-align: center; padding: 20px; }
@@ -1587,6 +1589,109 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-modal-btn-danger { background: #b91c1c; border-color: #b91c1c; color: #ffffff; }
 .ovl-modal-btn-danger:hover { background: #dc2626; }
 .ovl-modal-btn-danger:disabled, .ovl-modal-btn-primary:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ==================== M3/M10：编译工具条 + PDF 面板 + 日志面板 ====================
+   配色照 §2.2/§2.6.6 实测：Recompile 绿 #098842，PDF 面板底色 #2F3A4C，工具条 #1B222C。 */
+.ovl-recompile-btn {
+    background: #098842; color: #ffffff; border: none; border-radius: 4px;
+    padding: 5px 14px; font-size: 12px; font-weight: 600; cursor: pointer; flex-shrink: 0;
+}
+.ovl-recompile-btn:hover:not(:disabled) { background: #0aa04e; }
+.ovl-recompile-btn:disabled { background: #495365; color: #9AA4B2; cursor: not-allowed; }
+.ovl-pdf-status {
+    margin-left: 10px; font-size: 11px; color: #9AA4B2; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; min-width: 0;
+}
+.ovl-pdf-status.ovl-status-ok { color: #4ade80; }
+.ovl-pdf-status.ovl-status-err { color: #f87171; }
+.ovl-pdf-status.ovl-status-busy { color: #facc15; }
+.ovl-pdf-iconbtn {
+    background: transparent; border: none; color: #E7E9EE; font-size: 14px;
+    cursor: pointer; padding: 4px 7px; border-radius: 4px; flex-shrink: 0;
+}
+.ovl-pdf-iconbtn:hover:not(:disabled) { background: rgba(255,255,255,0.08); }
+.ovl-pdf-iconbtn:disabled { color: #5b6472; cursor: not-allowed; }
+.ovl-pdf-projectrow {
+    display: flex; align-items: center; gap: 6px; padding: 6px 10px;
+    background: #242E3D; border-bottom: 1px solid #1B222C; flex-shrink: 0;
+}
+.ovl-pdf-projectrow label { font-size: 11px; color: #9AA4B2; white-space: nowrap; flex-shrink: 0; }
+.ovl-pdf-projectrow input[type="text"] {
+    flex: 1 1 auto; min-width: 0; background: #1B222C; border: 1px solid #3a4457;
+    color: #E7E9EE; font-size: 11px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    padding: 4px 7px; border-radius: 4px;
+}
+.ovl-pdf-projectrow input[type="text"]:focus { outline: none; border-color: #098842; }
+.ovl-pdf-placeholder { max-width: 480px; line-height: 1.6; }
+.ovl-pdf-body.ovl-pdf-body-filled { padding: 0; display: block; }
+.ovl-pdf-iframe { width: 100%; height: 100%; border: none; background: #ffffff; display: block; }
+
+/* 日志面板与 PDF 区共用 #ovlPdfPanel 的 data-logview 属性切换，不搞第二套挂载策略。 */
+.ovl-pdf-panel[data-logview="closed"] .ovl-log-panel { display: none; }
+.ovl-pdf-panel[data-logview="open"] .ovl-pdf-body,
+.ovl-pdf-panel[data-logview="open"] .ovl-pdf-projectrow { display: none; }
+.ovl-log-panel {
+    flex: 1 1 auto; display: flex; flex-direction: column; min-height: 0;
+    overflow: hidden; color: #E7E9EE; font-size: 12px; height: 100%;
+}
+.ovl-log-toolbar { display: flex; align-items: center; padding: 6px 10px; border-bottom: 1px solid #1B222C; flex-shrink: 0; }
+.ovl-log-backbtn {
+    background: transparent; border: 1px solid #495365; color: #E7E9EE;
+    font-size: 11px; padding: 4px 10px; border-radius: 4px; cursor: pointer;
+}
+.ovl-log-backbtn:hover { background: #495365; }
+.ovl-log-tabs { display: flex; gap: 4px; padding: 6px 10px; border-bottom: 1px solid #1B222C; flex-shrink: 0; flex-wrap: wrap; }
+.ovl-log-tab {
+    background: transparent; border: 1px solid transparent; color: #9AA4B2;
+    font-size: 11px; padding: 4px 10px; border-radius: 9999px; cursor: pointer;
+}
+.ovl-log-tab:hover { background: rgba(255,255,255,0.06); }
+.ovl-log-tab-active { background: #495365; color: #ffffff; }
+.ovl-log-list { flex: 1 1 auto; overflow-y: auto; min-height: 60px; }
+.ovl-log-empty { padding: 20px; text-align: center; color: #9AA4B2; font-size: 12px; }
+.ovl-log-entry { border-bottom: 1px solid rgba(255,255,255,0.06); }
+.ovl-log-entry-head { display: flex; align-items: center; gap: 6px; padding: 6px 10px; cursor: pointer; }
+.ovl-log-entry-head:hover { background: rgba(255,255,255,0.04); }
+.ovl-log-caret { font-size: 10px; color: #9AA4B2; display: inline-block; transition: transform .12s; flex-shrink: 0; }
+.ovl-log-entry-expanded .ovl-log-caret { transform: rotate(90deg); }
+.ovl-log-badge { font-size: 9px; text-transform: uppercase; font-weight: 700; padding: 1px 6px; border-radius: 3px; flex-shrink: 0; }
+.ovl-log-entry-error .ovl-log-badge { background: #7f1d1d; color: #fecaca; }
+.ovl-log-entry-warning .ovl-log-badge { background: #78350f; color: #fde68a; }
+.ovl-log-entry-info .ovl-log-badge { background: #1e3a5f; color: #bfdbfe; }
+.ovl-log-title { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11.5px; }
+.ovl-log-entry-expanded .ovl-log-title { white-space: normal; }
+.ovl-log-entry-loc {
+    display: none; align-items: center; justify-content: space-between; gap: 8px;
+    padding: 0 10px 8px 30px; font-size: 10.5px; color: #9AA4B2;
+    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+}
+.ovl-log-entry-expanded .ovl-log-entry-loc { display: flex; }
+.ovl-log-jumpbtn {
+    background: transparent; border: 1px solid #495365; color: #E7E9EE;
+    border-radius: 4px; padding: 2px 8px; font-size: 10px; cursor: pointer; flex-shrink: 0;
+}
+.ovl-log-jumpbtn:hover { background: #495365; }
+.ovl-log-rawtoggle { padding: 6px 10px; font-size: 11px; color: #9AA4B2; cursor: pointer; border-top: 1px solid #1B222C; flex-shrink: 0; }
+.ovl-log-rawtoggle:hover { color: #E7E9EE; }
+.ovl-log-raw {
+    margin: 0; padding: 8px 10px; max-height: 180px; overflow: auto; background: #1B222C;
+    color: #c9d1d9; font-size: 10.5px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+    white-space: pre-wrap; word-break: break-all; flex-shrink: 0;
+}
+.ovl-log-footer {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 10px;
+    border-top: 1px solid #1B222C; flex-shrink: 0;
+}
+.ovl-log-clearbtn {
+    background: transparent; border: 1px solid #7f1d1d; color: #fca5a5;
+    font-size: 11px; padding: 4px 10px; border-radius: 4px; cursor: pointer;
+}
+.ovl-log-clearbtn:hover { background: #7f1d1d; color: #ffffff; }
+.ovl-log-otherfiles { font-size: 11px; color: #9AA4B2; cursor: pointer; width: 100%; }
+.ovl-log-otherfiles:hover { color: #E7E9EE; }
+.ovl-log-otherfiles-list { display: flex; flex-direction: column; gap: 3px; width: 100%; }
+.ovl-log-otherfile-link { font-size: 10.5px; color: #93c5fd; text-decoration: none; font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
+.ovl-log-otherfile-link:hover { text-decoration: underline; }
 
 </style>
 </head>
@@ -19381,7 +19486,14 @@ const OvlState = {
     // ---- M9 ----
     mainDocFile: null,       // 只存文件名（§M9 的已知简化：M3 之前只是展示用，不驱动编译）
     ctxEntry: null,          // 当前打开的右键菜单对应哪个树节点
-    uploadTargetHandle: null // “上传”点的是哪个目录（header 按钮=项目根，右键菜单=被点中的目录/同级）
+    uploadTargetHandle: null, // “上传”点的是哪个目录（header 按钮=项目根，右键菜单=被点中的目录/同级）
+    // ---- M3：编译桥接服务 + PDF/日志面板 ----
+    bridgeOnline: null,      // null=还没探测过；true/false=探测结果
+    compiling: false,
+    lastCompile: null,       // 桥 POST /compile 的完整返回：{ok,id,exitCode,pdfExists,pdfSize,log,parsed,counts,files,...}
+    pdfObjectUrl: null,      // 当前 <iframe> 用的 blob: URL，换下一版前必须先 URL.revokeObjectURL
+    logView: false,
+    logFilter: 'all'         // 'all' | 'error' | 'warning' | 'info'
 };
 
 function ovlShellHtml() {
@@ -19484,9 +19596,42 @@ function ovlShellHtml() {
         +       '<div class="ovl-visual-pane" id="ovlVisualPane" style="display:none;">Visual 模式将在 M5 实现</div>'
         +     '</div>'
         +   '</div>'
-        +   '<div class="ovl-pdf-panel" id="ovlPdfPanel">'
-        +     '<div class="ovl-pdf-toolbar">PDF</div>'
-        +     '<div class="ovl-pdf-body">PDF 预览需要编译桥接服务（M3）</div>'
+        // M3/M10：PDF 面板 = 编译工具条 + 项目路径输入 + PDF 区/日志区（用 data-logview 切换，
+        // 照 §3.6.3/§3.6.8 一带同一纪律：CSS 属性选择器控显隐，不整段重画）。
+        // 契约见 docs/v2_overleaf_latex_plan.md §3.1：成功 = PDF 存在，不是退出码；
+        // 桥离线时这一块必须显式告知怎么启动，不许静默失败。
+        +   '<div class="ovl-pdf-panel" id="ovlPdfPanel" data-logview="closed">'
+        +     '<div class="ovl-pdf-toolbar">'
+        +       '<button type="button" class="ovl-recompile-btn" id="ovlRecompileBtn" disabled data-tip="桥接服务未启动，见 tools/latex-bridge/README.md" data-tip-pos="bottom">Recompile</button>'
+        +       '<span class="ovl-pdf-status" id="ovlPdfStatus">检测编译桥接服务中…</span>'
+        +       '<span class="ovl-toolbar-spacer"></span>'
+        +       '<button type="button" class="ovl-pdf-iconbtn" id="ovlViewLogsBtn" disabled data-tip="查看日志" data-tip-pos="bottom">&#128220;</button>'
+        +       '<button type="button" class="ovl-pdf-iconbtn" id="ovlDownloadPdfBtn" disabled data-tip="下载 PDF" data-tip-pos="bottom">&#11015;</button>'
+        +     '</div>'
+        +     '<div class="ovl-pdf-projectrow">'
+        +       '<label for="ovlProjectPathInput">项目绝对路径</label>'
+        +       '<input type="text" id="ovlProjectPathInput" placeholder="例如 E:\\...\\AI-Translator（FSA 句柄拿不到绝对路径，需手填，见 §3.2）" autocomplete="off" spellcheck="false">'
+        +     '</div>'
+        +     '<div class="ovl-pdf-body" id="ovlPdfBody"><div class="ovl-pdf-placeholder">检测编译桥接服务中…</div></div>'
+        +     '<div class="ovl-log-panel" id="ovlLogPanel">'
+        +       '<div class="ovl-log-toolbar">'
+        +         '<button type="button" class="ovl-log-backbtn" id="ovlBackToPdfBtn">&#8592; Back to PDF</button>'
+        +       '</div>'
+        +       '<div class="ovl-log-tabs" id="ovlLogTabs">'
+        +         '<button type="button" class="ovl-log-tab ovl-log-tab-active" data-filter="all">All <span id="ovlLogCountAll">0</span></button>'
+        +         '<button type="button" class="ovl-log-tab" data-filter="error">Errors <span id="ovlLogCountError">0</span></button>'
+        +         '<button type="button" class="ovl-log-tab" data-filter="warning">Warnings <span id="ovlLogCountWarning">0</span></button>'
+        +         '<button type="button" class="ovl-log-tab" data-filter="info">Info <span id="ovlLogCountInfo">0</span></button>'
+        +       '</div>'
+        +       '<div class="ovl-log-list" id="ovlLogList"><div class="ovl-log-empty">还没有编译过。</div></div>'
+        +       '<div class="ovl-log-rawtoggle" id="ovlLogRawToggle">&#9656; Raw logs</div>'
+        +       '<pre class="ovl-log-raw" id="ovlLogRaw" style="display:none;"></pre>'
+        +       '<div class="ovl-log-footer">'
+        +         '<button type="button" class="ovl-log-clearbtn" id="ovlClearCacheBtn">&#128465; Clear cached files</button>'
+        +         '<div class="ovl-log-otherfiles" id="ovlLogOtherFilesToggle">&#9656; Other logs and files</div>'
+        +         '<div class="ovl-log-otherfiles-list" id="ovlLogOtherFilesList" style="display:none;"><div class="ovl-log-empty">还没有可下载的文件。</div></div>'
+        +       '</div>'
+        +     '</div>'
         +   '</div>'
         + '</div>';
 }
@@ -21254,6 +21399,307 @@ function ovlBindEditorShortcuts() {
     }
 }
 
+// ==================== M3/M10：编译桥接服务 + PDF 面板 + 日志面板 ====================
+// 契约见 docs/v2_overleaf_latex_plan.md §3.1，实现在 tools/latex-bridge/server.js（零 npm 依赖的
+// Node 原生 http，只监听 127.0.0.1:8181）。§1.5 硬规定：编译成功 = PDF 文件是否产出，绝不是
+// latexmk 的进程退出码——仓库根 main.tex 缺 13 张图 + references.bib，退出码非零但依然产出
+// 多页 PDF，这是预期行为，不是桥坏了。桥没起时，网页其余一切功能照常可用，只有这一块降级成
+// 一句"怎么启动"的提示，不许静默失败、不许抛出未捕获异常。
+
+const OVL_BRIDGE_ORIGIN = 'http://127.0.0.1:8181';
+function ovlBridgeUrl(p) { return OVL_BRIDGE_ORIGIN + p; }
+
+function ovlSetPdfStatus(text, isError, isBusy) {
+    const el = document.getElementById('ovlPdfStatus');
+    if (!el) return;
+    el.textContent = text;
+    el.classList.remove('ovl-status-ok', 'ovl-status-err', 'ovl-status-busy');
+    if (isBusy) el.classList.add('ovl-status-busy');
+    else if (isError) el.classList.add('ovl-status-err');
+    else el.classList.add('ovl-status-ok');
+}
+
+function ovlUpdatePdfToolbarUI() {
+    const btn = document.getElementById('ovlRecompileBtn');
+    const viewLogsBtn = document.getElementById('ovlViewLogsBtn');
+    const dlBtn = document.getElementById('ovlDownloadPdfBtn');
+    const online = OvlState.bridgeOnline === true;
+    if (btn) {
+        btn.disabled = !online || OvlState.compiling;
+        btn.textContent = OvlState.compiling ? '编译中…' : 'Recompile';
+        btn.setAttribute('data-tip', online
+            ? '编译（latexmk -pdf …，见 tools/latex-bridge/README.md）'
+            : '桥接服务未启动，见 tools/latex-bridge/README.md');
+    }
+    const hasPdf = !!(OvlState.lastCompile && OvlState.lastCompile.pdfExists);
+    if (viewLogsBtn) viewLogsBtn.disabled = !OvlState.lastCompile;
+    if (dlBtn) dlBtn.disabled = !hasPdf;
+}
+
+function ovlRenderPdfBody() {
+    const body = document.getElementById('ovlPdfBody');
+    if (!body) return;
+    if (OvlState.pdfObjectUrl) {
+        body.classList.add('ovl-pdf-body-filled');
+        if (!document.getElementById('ovlPdfIframe')) {
+            body.innerHTML = '<iframe class="ovl-pdf-iframe" id="ovlPdfIframe" title="Compiled PDF"></iframe>';
+        }
+        const ifr = document.getElementById('ovlPdfIframe');
+        if (ifr && ifr.getAttribute('src') !== OvlState.pdfObjectUrl) ifr.setAttribute('src', OvlState.pdfObjectUrl);
+        return;
+    }
+    body.classList.remove('ovl-pdf-body-filled');
+    let msg;
+    if (OvlState.compiling) {
+        msg = '正在编译…（main.tex 这种几千行的论文通常几秒到十几秒，取决于文档大小）';
+    } else if (OvlState.lastCompile && !OvlState.lastCompile.pdfExists) {
+        msg = '本次编译没有产出 PDF' + (OvlState.lastCompile.error ? '：' + OvlState.lastCompile.error : '，点右上角查看日志看详情。');
+    } else if (OvlState.bridgeOnline === false) {
+        msg = '桥接服务未启动。运行 node tools/latex-bridge/server.js（或双击 tools/latex-bridge/start-bridge.bat），'
+            + '填好上面的项目绝对路径，再点 Recompile。详见 tools/latex-bridge/README.md。';
+    } else if (OvlState.bridgeOnline === null) {
+        msg = '检测编译桥接服务中…';
+    } else {
+        msg = '填好项目绝对路径，点 Recompile 开始编译。';
+    }
+    body.innerHTML = '';
+    const d = document.createElement('div');
+    d.className = 'ovl-pdf-placeholder';
+    d.textContent = msg;
+    body.appendChild(d);
+}
+
+async function ovlBridgeCheckHealth() {
+    let online = false;
+    let latexmkExists = false;
+    try {
+        const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const timer = ctl ? setTimeout(function () { ctl.abort(); }, 1500) : null;
+        const resp = await fetch(ovlBridgeUrl('/health'), ctl ? { signal: ctl.signal } : {});
+        if (timer) clearTimeout(timer);
+        const data = await resp.json();
+        online = !!(data && data.ok);
+        latexmkExists = !!(data && data.latexmkExists);
+    } catch (e) {
+        online = false;
+    }
+    const wasOnline = OvlState.bridgeOnline;
+    OvlState.bridgeOnline = online;
+    if (!OvlState.compiling && (wasOnline !== online || wasOnline === null)) {
+        if (!online) {
+            ovlSetPdfStatus('桥接服务未启动 —— 见 tools/latex-bridge/README.md', true);
+        } else if (!latexmkExists) {
+            ovlSetPdfStatus('桥接服务在线，但没找到 latexmk.exe（检查 TeX Live 安装）', true);
+            OvlState.bridgeOnline = false; // 找不到 latexmk 等同于不可用，Recompile 也不许点亮
+        } else {
+            ovlSetPdfStatus('桥接服务在线 · 就绪', false);
+        }
+    }
+    ovlUpdatePdfToolbarUI();
+    ovlRenderPdfBody();
+}
+
+async function ovlDoRecompile() {
+    if (OvlState.compiling) return;
+    const pathInput = document.getElementById('ovlProjectPathInput');
+    const projectDir = pathInput ? pathInput.value.trim() : '';
+    if (!projectDir) {
+        ovlSetPdfStatus('请先在上面填写项目绝对路径', true);
+        if (pathInput) pathInput.focus();
+        return;
+    }
+    try { localStorage.setItem('ovl.bridgeProjectPath', projectDir); } catch (e) {}
+    const mainFile = OvlState.mainDocFile || (OvlState.currentFile && OvlState.currentFile.name) || 'main.tex';
+
+    OvlState.compiling = true;
+    if (OvlState.pdfObjectUrl) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} OvlState.pdfObjectUrl = null; }
+    ovlUpdatePdfToolbarUI();
+    ovlRenderPdfBody();
+    ovlSetPdfStatus('正在编译…', false, true);
+
+    let data = null;
+    try {
+        const resp = await fetch(ovlBridgeUrl('/compile'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectDir: projectDir, mainFile: mainFile })
+        });
+        data = await resp.json();
+    } catch (e) {
+        OvlState.compiling = false;
+        OvlState.bridgeOnline = false;
+        ovlSetPdfStatus('连不上桥接服务 —— 见 tools/latex-bridge/README.md', true);
+        ovlUpdatePdfToolbarUI();
+        ovlRenderPdfBody();
+        return;
+    }
+
+    OvlState.compiling = false;
+    OvlState.bridgeOnline = true;
+    OvlState.lastCompile = data;
+
+    if (data && data.ok && data.pdfExists) {
+        try {
+            const pdfResp = await fetch(ovlBridgeUrl('/output/' + data.id + '/output.pdf'));
+            const blob = await pdfResp.blob();
+            OvlState.pdfObjectUrl = URL.createObjectURL(blob);
+        } catch (e) {
+            console.error('[ovl] fetch compiled pdf failed', e);
+        }
+        const kb = Math.round((data.pdfSize || 0) / 1024);
+        const secs = ((data.durationMs || 0) / 1000).toFixed(1);
+        const exitNote = (data.exitCode !== 0 && data.exitCode !== null)
+            ? '（latexmk 退出码 ' + data.exitCode + '，但 PDF 已产出 —— 按 §1.5 判定为成功）'
+            : '';
+        ovlSetPdfStatus('编译成功 · ' + kb + ' KB · ' + secs + 's' + exitNote, false);
+    } else {
+        const reason = (data && data.error) ? data.error : '编译未产出 PDF，点右上角查看日志确认原因。';
+        ovlSetPdfStatus('编译失败：' + reason, true);
+    }
+
+    ovlUpdatePdfToolbarUI();
+    ovlRenderPdfBody();
+    ovlRenderLogCounts();
+    ovlRenderLogList();
+    ovlRenderLogRaw();
+    ovlRenderLogOtherFiles();
+}
+
+function ovlDownloadCompiledPdf() {
+    const data = OvlState.lastCompile;
+    if (!data || !data.pdfExists) return;
+    const a = document.createElement('a');
+    a.href = ovlBridgeUrl('/output/' + data.id + '/output.pdf');
+    a.download = 'output.pdf';
+    a.target = '_blank';
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+}
+
+function ovlToggleLogView() {
+    OvlState.logView = !OvlState.logView;
+    const panel = document.getElementById('ovlPdfPanel');
+    if (panel) panel.setAttribute('data-logview', OvlState.logView ? 'open' : 'closed');
+}
+
+function ovlSetLogFilter(f) {
+    OvlState.logFilter = f;
+    const tabs = document.querySelectorAll('#ovlLogTabs .ovl-log-tab');
+    tabs.forEach(function (t) { t.classList.toggle('ovl-log-tab-active', t.getAttribute('data-filter') === f); });
+    ovlRenderLogList();
+}
+
+function ovlRenderLogCounts() {
+    const data = OvlState.lastCompile;
+    const counts = (data && data.counts) || { error: 0, warning: 0, info: 0 };
+    const total = (counts.error || 0) + (counts.warning || 0) + (counts.info || 0);
+    const setText = function (id, v) { const el = document.getElementById(id); if (el) el.textContent = String(v); };
+    setText('ovlLogCountAll', total);
+    setText('ovlLogCountError', counts.error || 0);
+    setText('ovlLogCountWarning', counts.warning || 0);
+    setText('ovlLogCountInfo', counts.info || 0);
+}
+
+// §2.6.7：每条 = 可展开的 ▸ + 标题 + 副行（"./main.tex, 110"）+ 跳到源码那一行。
+function ovlRenderLogList() {
+    const list = document.getElementById('ovlLogList');
+    if (!list) return;
+    const data = OvlState.lastCompile;
+    if (!data) { list.innerHTML = '<div class="ovl-log-empty">还没有编译过。</div>'; return; }
+    let entries = data.parsed || [];
+    if (OvlState.logFilter !== 'all') entries = entries.filter(function (e) { return e.level === OvlState.logFilter; });
+    if (!entries.length) { list.innerHTML = '<div class="ovl-log-empty">没有匹配的日志条目。</div>'; return; }
+    let html = '';
+    entries.forEach(function (e) {
+        const loc = e.file ? (e.file + ', ' + e.line) : (e.line != null ? ('line ' + e.line) : '');
+        html += '<div class="ovl-log-entry ovl-log-entry-' + escapeAttr(e.level) + '">'
+            + '<div class="ovl-log-entry-head">'
+            +   '<span class="ovl-log-caret">&#9656;</span>'
+            +   '<span class="ovl-log-badge">' + escapeHtml(e.level) + '</span>'
+            +   '<span class="ovl-log-title">' + escapeHtml(e.message) + '</span>'
+            + '</div>'
+            + '<div class="ovl-log-entry-loc">'
+            +   '<span>' + escapeHtml(loc || '（日志没给出源码位置）') + '</span>'
+            +   (e.line != null ? ('<button type="button" class="ovl-log-jumpbtn" data-jump-line="' + e.line + '" data-tip="跳到源码那一行" data-tip-pos="left">&#8982; 跳到源码</button>') : '')
+            + '</div>'
+            + '</div>';
+    });
+    list.innerHTML = html;
+}
+
+function ovlRenderLogRaw() {
+    const pre = document.getElementById('ovlLogRaw');
+    if (!pre) return;
+    const data = OvlState.lastCompile;
+    pre.textContent = data ? (data.log || '（空）') : '';
+}
+
+// §2.6.7 底部 "Other logs and files"：列出本次编译的全部产物（除了 PDF 本身，
+// PDF 已经在面板正中显示、也有专门的下载按钮），点了直接从桥拿。
+function ovlRenderLogOtherFiles() {
+    const wrap = document.getElementById('ovlLogOtherFilesList');
+    if (!wrap) return;
+    const data = OvlState.lastCompile;
+    if (!data || !data.files || !data.files.length) {
+        wrap.innerHTML = '<div class="ovl-log-empty">还没有可下载的文件。</div>';
+        return;
+    }
+    let html = '';
+    data.files.forEach(function (f) {
+        if (f === 'output.pdf') return;
+        const url = ovlBridgeUrl('/output/' + data.id + '/' + encodeURIComponent(f));
+        html += '<a class="ovl-log-otherfile-link" href="' + escapeAttr(url) + '" target="_blank" rel="noopener">' + escapeHtml(f) + '</a>';
+    });
+    wrap.innerHTML = html || '<div class="ovl-log-empty">还没有可下载的文件。</div>';
+}
+
+// 跳到源码那一行 —— 只对当前编辑器里已经打开的那个文件生效（M3 阶段桥只标注被编译文件的
+// 行号，跨文件自动打开是 M9+ 以后的事，见 §2.6.7 的诚实边界）。算法跟 ovlBuildOutline /
+// ovlFindSelectCurrent 是同一套（行高固定 18px，見 §3.4 第 2 条禁软换行的推论）。
+function ovlLogJumpToLine(line) {
+    if (line == null) return;
+    const ta = document.getElementById('ovlCodeArea');
+    if (!ta || ta.disabled) { ovlFlashSaveStatus('请先在文件树打开对应的 .tex 文件', true); return; }
+    const lines = ta.value.split('\n');
+    const idx = Math.max(0, Math.min(lines.length - 1, line - 1));
+    let start = 0;
+    for (let i = 0; i < idx; i++) start += lines[i].length + 1;
+    const end = start + (lines[idx] ? lines[idx].length : 0);
+    ta.focus();
+    ta.setSelectionRange(start, end);
+    ta.scrollTop = Math.max(0, idx * 18 - ta.clientHeight / 2);
+    const gutter = document.getElementById('ovlGutter');
+    if (gutter) gutter.scrollTop = ta.scrollTop;
+    if (OvlState.logView) ovlToggleLogView(); // 跳过去是为了看代码，日志面板挡着就顺手切回去
+}
+
+// §2.6.7："Clear cached files"。清的是桥的临时产物目录，不碰用户的项目文件夹一个字节。
+function ovlClearCachedFiles() {
+    ovlConfirmDialog({
+        title: '清理编译缓存',
+        message: '清空桥接服务临时目录里全部编译产物（PDF/log/aux/…）。当前面板显示的 PDF 和日志也会一并清掉，需要重新点 Recompile。确定继续？',
+        confirmLabel: '清理',
+        danger: true,
+        onConfirm: function () {
+            fetch(ovlBridgeUrl('/clear'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+                .then(function () {
+                    if (OvlState.pdfObjectUrl) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} OvlState.pdfObjectUrl = null; }
+                    OvlState.lastCompile = null;
+                    ovlUpdatePdfToolbarUI();
+                    ovlRenderPdfBody();
+                    ovlRenderLogCounts();
+                    ovlRenderLogList();
+                    ovlRenderLogRaw();
+                    ovlRenderLogOtherFiles();
+                    ovlFlashSaveStatus('已清理编译缓存', false);
+                })
+                .catch(function (e) { ovlFlashSaveStatus('清理失败：' + (e && e.message ? e.message : String(e)), true); });
+        }
+    });
+}
+
 function ovlBindShell() {
     try {
         const treeBtn = document.getElementById('ovlTreeToggleBtn');
@@ -21446,6 +21892,75 @@ function ovlBindShell() {
         ovlBindFindBar();
         ovlBindEditorShortcuts();
 
+        // M3/M10：编译工具条 + PDF/日志面板。
+        const recompileBtn = document.getElementById('ovlRecompileBtn');
+        if (recompileBtn) recompileBtn.addEventListener('click', function () {
+            ovlDoRecompile().catch(function (e) { console.error('[ovl] recompile failed', e); });
+        });
+        const viewLogsBtn = document.getElementById('ovlViewLogsBtn');
+        if (viewLogsBtn) viewLogsBtn.addEventListener('click', function () {
+            if (viewLogsBtn.disabled) return;
+            ovlToggleLogView();
+        });
+        const backToPdfBtn = document.getElementById('ovlBackToPdfBtn');
+        if (backToPdfBtn) backToPdfBtn.addEventListener('click', ovlToggleLogView);
+        const dlPdfBtn = document.getElementById('ovlDownloadPdfBtn');
+        if (dlPdfBtn) dlPdfBtn.addEventListener('click', function () {
+            if (dlPdfBtn.disabled) return;
+            ovlDownloadCompiledPdf();
+        });
+        const projectPathInput = document.getElementById('ovlProjectPathInput');
+        if (projectPathInput) {
+            projectPathInput.addEventListener('change', function () {
+                try { localStorage.setItem('ovl.bridgeProjectPath', projectPathInput.value.trim()); } catch (e) {}
+            });
+            projectPathInput.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter') { e.preventDefault(); ovlDoRecompile().catch(function (e2) { console.error('[ovl] recompile failed', e2); }); }
+            });
+        }
+        const logTabs = document.getElementById('ovlLogTabs');
+        if (logTabs) {
+            logTabs.addEventListener('click', function (e) {
+                const tab = e.target.closest('.ovl-log-tab');
+                if (!tab) return;
+                ovlSetLogFilter(tab.getAttribute('data-filter'));
+            });
+        }
+        const logList = document.getElementById('ovlLogList');
+        if (logList) {
+            logList.addEventListener('click', function (e) {
+                const jumpBtn = e.target.closest('.ovl-log-jumpbtn');
+                if (jumpBtn) {
+                    e.stopPropagation();
+                    const ln = parseInt(jumpBtn.getAttribute('data-jump-line'), 10);
+                    if (!isNaN(ln)) ovlLogJumpToLine(ln);
+                    return;
+                }
+                const head = e.target.closest('.ovl-log-entry-head');
+                if (!head) return;
+                const entry = head.closest('.ovl-log-entry');
+                if (entry) entry.classList.toggle('ovl-log-entry-expanded');
+            });
+        }
+        const rawToggle = document.getElementById('ovlLogRawToggle');
+        if (rawToggle) rawToggle.addEventListener('click', function () {
+            const pre = document.getElementById('ovlLogRaw');
+            if (!pre) return;
+            const open = pre.style.display !== 'none';
+            pre.style.display = open ? 'none' : 'block';
+            rawToggle.innerHTML = (open ? '&#9656; ' : '&#9662; ') + 'Raw logs';
+        });
+        const otherFilesToggle = document.getElementById('ovlLogOtherFilesToggle');
+        if (otherFilesToggle) otherFilesToggle.addEventListener('click', function () {
+            const list = document.getElementById('ovlLogOtherFilesList');
+            if (!list) return;
+            const open = list.style.display !== 'none';
+            list.style.display = open ? 'none' : 'flex';
+            otherFilesToggle.innerHTML = (open ? '&#9656; ' : '&#9662; ') + 'Other logs and files';
+        });
+        const clearCacheBtn = document.getElementById('ovlClearCacheBtn');
+        if (clearCacheBtn) clearCacheBtn.addEventListener('click', ovlClearCachedFiles);
+
         const dirInput = document.getElementById('ovlWebkitDirInput');
         if (dirInput) {
             dirInput.addEventListener('change', function (e) {
@@ -21489,11 +22004,24 @@ function ovlBoot() {
         if (body) body.setAttribute('data-tree', 'collapsed');
     }
 
-    // M9：主文档标记只是个展示用的状态（M3 之前不驱动任何编译），跨会话记一下就好。
+    // M9：主文档标记跨会话记一下就好，现在真的驱动编译了（M3 落地）：Recompile 默认拿这个当 mainFile。
     try {
         const md = localStorage.getItem('ovl.mainDocFile');
         if (md) OvlState.mainDocFile = md;
     } catch (e) {}
+
+    // M3：项目绝对路径记忆值回填 + 探测桥接服务是否在线。探测失败不算 boot 失败——
+    // 桥本来就是可选的，见 §3.1 第 3 条"桥离线不许让任何既有功能失效"。
+    try {
+        const savedPath = localStorage.getItem('ovl.bridgeProjectPath');
+        const pathInput = document.getElementById('ovlProjectPathInput');
+        if (savedPath && pathInput) pathInput.value = savedPath;
+    } catch (e) {}
+    ovlBridgeCheckHealth().catch(function (e) { console.warn('[ovl] bridge health check failed', e); });
+    setInterval(function () {
+        if (OvlState.compiling) return;
+        ovlBridgeCheckHealth().catch(function (e) { console.warn('[ovl] bridge health check failed', e); });
+    }, 5000);
 
     OvlState.booted = true;
     // 最后一步：只有走到这里才让外壳生效。
