@@ -1181,7 +1181,9 @@ body.ovl-popout-child #root {
    按钮天然不适用，所以来源是 Visual 时 .ovl-qa-fmt 也一起藏起来。 */
 .ovl-quickactions.ovl-qa-nofmt .ovl-qa-fmt,
 .ovl-quickactions.ovl-qa-src-visual .ovl-qa-fmt { display: none; }
-.ovl-quickactions:not(.ovl-qa-src-visual) .ovl-qa-translate,
+/* v2 Pass P7：Code 来源（含 gutter 行选、普通拖选）现在也能翻译，「译」不再只认 Visual 来源
+   （docs/v2_editor_focus_lineselect_plan.md §2.6）。ovl-qa-notranslate 仍然是唯一的隐藏开关，
+   对应 OvlSettings.visualTranslate === 'off'。 */
 .ovl-quickactions.ovl-qa-notranslate .ovl-qa-translate { display: none; }
 
 /* Visual 选中即译的浮框（挂在 #ovlPortal 里，见 ovlPortalHtml）。定位算法 ovlVisTransPlace
@@ -1436,7 +1438,15 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
     user-select: none;
     white-space: pre;
 }
-.ovl-ln { height: 1.5em; }
+.ovl-ln { height: 1.5em; cursor: pointer; }
+/* v2 Pass P7：gutter 行号点选（docs/v2_editor_focus_lineselect_plan.md §2.4）。
+   行选用半透明叠加而不是纯色块，浅色/深色两套 gutter 主题（ovlApplySettings）下都看得清，
+   不需要在 JS 里再开一处主题分支。 */
+.ovl-ln.ovl-ln-sel { background: rgba(37, 99, 235, 0.22); }
+/* 关注（P8 用）预留在这里一起声明：inset box-shadow 而不是 border-left —— 后者会把行号
+   往右挤 3px，和正文错位（.ovl-ln 没有 box-sizing:border-box）。P7 阶段不会有任何元素
+   拿到这个 class（ovlPaintGutterMarks 里 foc 数组固定为空），纯声明不影响行为。 */
+.ovl-ln.ovl-ln-focus { box-shadow: inset 3px 0 0 #F59E0B; }
 .ovl-code-area {
     flex: 1 1 auto;
     border: none;
@@ -2124,6 +2134,11 @@ body.ovl-translator-open #ovlTransWin { display: block; }
     border-radius: 4px; cursor: pointer;
 }
 .ovl-quickactions button:hover { background: #2F3A4C; }
+/* v2 Pass P7：Code 来源选区超过翻译长度上限时置灰「译」按钮（docs/…plan.md §2.8）。
+   用 class 而不是 disabled 属性——disabled 按钮能不能触发 :hover::after 这条 tooltip
+   本轮没法实测，用 class 就一定能 hover，解释"为什么点不了"这句话不会哑掉。 */
+.ovl-quickactions button.ovl-qa-off { opacity: .4; cursor: not-allowed; }
+.ovl-quickactions button.ovl-qa-off:hover { background: transparent; }
 .ovl-breadcrumb {
     font-size: 10.5px; color: #9AA4B2; padding: 2px 10px; background: #1B222C;
     border-bottom: 1px solid #2F3A4C; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: none;
@@ -22513,6 +22528,9 @@ function ovlSetEditorMode(mode) {
         // Visual 侧的翻译浮框都是跟着上一个模式的选区走的，切走了留着就是陈旧内容。
         if (typeof ovlVisTransHide === 'function') ovlVisTransHide();
         if (typeof ovlHideQuickActions === 'function') ovlHideQuickActions();
+        // v2 Pass P7：切模式会让行号槽的意义整个变掉（Visual 下 gutter 直接隐藏），留着上一个
+        // 模式的行选锚点就是指错行。
+        if (typeof ovlGutterClearSelection === 'function') ovlGutterClearSelection();
         OvlState.editorMode = mode;
         const ta = document.getElementById('ovlCodeArea');
         const gutter = document.getElementById('ovlGutter');
@@ -22873,6 +22891,11 @@ function ovlRenderGutter(force) {
             const d = document.createElement('div');
             d.className = 'ovl-ln';
             d.textContent = String(i);
+            // v2 Pass P7：0-based 逻辑行号，供 ovlGutterLineAtClientY 用 elementFromPoint 命中查询
+            // （docs/v2_editor_focus_lineselect_plan.md §2.2）。刻意不用 clientY / OVL_LINE_H 换算——
+            // 那条除法在非默认字号下会整体跳偏（既有缺陷，见 ovlCodeSelectionRect 头部注释）；
+            // data-ln 是渲染时算的，天然和用户屏幕上看到的那个数字是同一个真值。
+            d.setAttribute('data-ln', String(i - 1));
             frag.appendChild(d);
             // 软换行续行：这一逻辑行占的视觉行数 > 1 时，后面几行补空白槽位对齐——跟
             // Overleaf/CodeMirror 的 gutter 是同一个行为，续行不重复显示行号，只占位置。
@@ -22880,11 +22903,14 @@ function ovlRenderGutter(force) {
             for (let k = 1; k < rows; k++) {
                 const blank = document.createElement('div');
                 blank.className = 'ovl-ln ovl-ln-blank';
+                blank.setAttribute('data-ln', String(i - 1)); // 续行槽归属同一逻辑行
                 frag.appendChild(blank);
             }
         }
         gutter.textContent = '';
         gutter.appendChild(frag);
+        // 重建之后把行选/关注标记铺回去——重建会整块清空 gutter，之前画的 class 全没了。
+        if (typeof ovlPaintGutterMarks === 'function') ovlPaintGutterMarks();
     } catch (e) {
         console.error('[ovl] renderGutter failed', e);
     }
@@ -22990,6 +23016,8 @@ async function ovlOpenFile(fileHandle, name, parentHandle) {
         // 换文件：行偏移表是上一个文件的，必须先失效，不许拿旧表给新内容当真（ovlRenderGutter/
         // ovlVisualRowForLineIndex 的退化路径只保证"不崩、不跳偏"，不保证"跟旧文件对得上"）。
         OvlState.lineOffsets = null;
+        // v2 Pass P7：换文件=旧文件的行号锚点全部作废（行号还在，指的内容已经变了）。
+        if (typeof ovlGutterClearSelection === 'function') ovlGutterClearSelection();
         ovlRecomputeLineOffsets(); // 打开文件必须马上算（§ Bug 2 要求"on file open/switch (always)"）
         ovlRenderGutter(true);
         ovlBuildOutline();
@@ -24579,6 +24607,8 @@ function ovlBindShell() {
         if (ta) {
             ta.addEventListener('input', function () {
                 ovlRenderGutter(false);
+                // v2 Pass P7：敲字会让存下来的字符偏移全部失效，留着上一次的行选锚点就是指错行。
+                if (typeof ovlGutterClearSelection === 'function') ovlGutterClearSelection();
                 // M2：脏标记只在真的打开着一个文件时才有意义（比如 webkitdirectory 降级模式下
                 // ta 也能被"编辑"但 disabled 挡住了输入，这里额外守一道 currentFile）。
                 if (OvlState.currentFile) { OvlState.dirty = true; ovlUpdateTabUI(); }
@@ -25214,16 +25244,16 @@ function ovlSettingsTranslatorHtml() {
     // P4（§2.4.4/§2.4.1）：Visual 模式选中即译用的模型 + 触发方式，走通用 data-setpath
     // 处理（ovlBindSettingsModal 的 change 委托已经会 store[parts[1]]=val 再存盘+重渲），
     // 不需要额外的专用函数。
-    html += ovlSetRow('Visual 选中即译', '<select data-setpath="settings.visualTranslate">'
+    html += ovlSetRow('选中即译', '<select data-setpath="settings.visualTranslate">'
         + ovlOptTag('auto', '自动弹出', s.visualTranslate) + ovlOptTag('button', '仅按钮触发', s.visualTranslate) + ovlOptTag('off', '关闭', s.visualTranslate)
         + '</select>',
-        'Visual 模式里选中一段文字后要不要自动弹出中文翻译。"仅按钮触发"只在工具条上留一颗「译」按钮，点了才发；"关闭"两者都不出现。');
+        'Visual 模式里选中一段文字后要不要自动弹出中文翻译。"仅按钮触发"只在工具条上留一颗「译」按钮，点了才发；"关闭"两者都不出现。Code 模式（含点行号选行）永远只认那颗「译」按钮，不会自动发——但"关闭"档会把它一起收起来。');
     html += ovlSetRow('Visual 翻译模型', '<select data-setpath="settings.visualTransModel">'
         + ovlOptTag('', '跟随翻译器当前模型', s.visualTransModel)
         + DEFAULT_MODEL_CATALOG.map(function (m) { return ovlOptTag(m.id, m.short || m.id, s.visualTransModel); }).join('')
         + (Array.isArray(AppState.localModels) ? AppState.localModels : []).map(function (lm) { return ovlOptTag(lm.id, lm.id, s.visualTransModel); }).join('')
         + '</select>',
-        'Visual 模式里选中文字后，用哪个模型翻译。留空就跟着翻译器上方选的模型走。');
+        'Visual 或 Code 模式里选中文字后，用哪个模型翻译。留空就跟着翻译器上方选的模型走。');
     // v2 P5：版本号从翻译器窗口的品牌区（已删除，见 renderHeader 顶部注释）迁到这里。
     // 直接读全局的 APP_VERSION/APP_BUILD_DATE 常量（约第 3247 行，pre-commit hook 每次
     // 提交自动改写这两个值），不是在这里另外抄一份写死的字符串——那样两处会迟早不同步。
@@ -25883,6 +25913,26 @@ function ovlShowQuickActionsAt(x, y, source) {
     qa.classList.toggle('ovl-qa-src-visual', OvlQaState.source === 'visual');
     qa.classList.toggle('ovl-qa-nofmt', !OvlSettings.quickActions);
     qa.classList.toggle('ovl-qa-notranslate', OvlSettings.visualTranslate === 'off');
+    // v2 Pass P7（§2.8）：Code 来源选区超过翻译长度上限时把「译」按钮置成不可用状态 + 换一句
+    // tooltip，手势结束时另有一次 toast（见 ovlCodeTransFromSelection）。不阻止选区本身继续
+    // 扩展——行选是通用选区，为了翻译功能去阻断一个和翻译无关的手势是本末倒置。
+    let tooLong = false;
+    if (OvlQaState.source === 'code') {
+        const taQ = document.getElementById('ovlCodeArea');
+        if (taQ && taQ.selectionEnd > taQ.selectionStart) {
+            // 先用字符跨度短路，别对一个几十万字的选区做 slice+regex：归一化只会让长度变短，
+            // 跨度 <= 上限 x4 时才值得真算一次（最坏切 12000 字，很便宜）。
+            tooLong = (taQ.selectionEnd - taQ.selectionStart > OVL_TRANS_MAX_CHARS * 4)
+                   || (ovlCodeTransText(taQ).length > OVL_TRANS_MAX_CHARS);
+        }
+    }
+    const tBtn = qa.querySelector('.ovl-qa-translate');
+    if (tBtn) {
+        tBtn.classList.toggle('ovl-qa-off', tooLong);
+        tBtn.setAttribute('data-tip', tooLong
+            ? ('选中超过 ' + OVL_TRANS_MAX_CHARS + ' 字，翻译不可用；选少几行再试')
+            : '翻译成中文');
+    }
     qa.style.left = Math.max(4, x - 40) + 'px';
     qa.style.top = Math.max(4, y - 36) + 'px';
     qa.classList.add('ovl-open');
@@ -25914,13 +25964,19 @@ function ovlBindQuickActions() {
     }
     if (qa) qa.addEventListener('click', function (e) {
         const btn = e.target.closest('[data-qa]');
-        if (!btn || btn.disabled) return;
+        // v2 Pass P7（§2.8）：置灰守卫纳入既有的 disabled 检查，不另起一套。
+        if (!btn || btn.disabled || btn.classList.contains('ovl-qa-off')) return;
         const id = btn.getAttribute('data-qa');
         const src = OvlQaState.source || 'code';
         if (id === 'word.replace' || id === 'word.simplify' || id === 'word.grammar') {
             ovlEditorSynonymOpen(id.slice(5), src);
         } else if (id === 'word.translate') {
+            // v2 Pass P7：Code 来源（含 gutter 行选、普通拖选）现在也能翻译，走独立的
+            // ovlCodeTransFromSelection——它和 Visual 那条共用同一套浮框/缓存/竞态机器
+            // （ovlVisTransRequest/ovlVisTransPlace 本来就是来源无关的），只是取文本/算矩形的
+            // 方式不同。
             if (src === 'visual') ovlVisTransFromSelection(true);
+            else ovlCodeTransFromSelection();
         } else {
             ovlRunCmd(id);
         }
@@ -25930,6 +25986,10 @@ function ovlBindQuickActions() {
         if (e.target.closest('#ovlQuickActions')) return;
         if (ta && e.target === ta) return;
         if (visualPane && visualPane.contains(e.target)) return;
+        // v2 Pass P7：点 gutter 触发 pointerup 弹出工具条，如果不豁免，这条既有的
+        // document 点击关闭会在同一次点击里把刚弹出的工具条立刻关掉。
+        const gutterEl = document.getElementById('ovlGutter');
+        if (gutterEl && gutterEl.contains(e.target)) return;
         ovlHideQuickActions();
     });
 }
@@ -25952,6 +26012,162 @@ function ovlDetectSelLang(text) {
 function ovlSynonymLangFor(s) {
     if (s && (s.field === 'ovl-code' || s.field === 'ovl-visual')) return ovlDetectSelLang(s.originalText || '');
     return (s && s.field === 'src') ? AppState.sourceLang : AppState.targetLang;
+}
+
+// ==================== v2 Pass P7：gutter 行号点选（docs/v2_editor_focus_lineselect_plan.md §2）====================
+// Code 模式专属——Visual 的 DOM 来自 LatexFilter 的有损投影，和源码行没有 1:1 对应关系，
+// 也没有 gutter（§2.0）。命中查询固定用 ovlRenderGutter 打的 data-ln 属性，不用像素换算，
+// 理由见 ovlRenderGutter 里那条注释。
+
+let OvlGutterSel = {
+    anchorLine: -1,    // 0-based 逻辑行；-1 = 当前没有行选
+    headLine: -1,
+    dragging: false,
+    pointerId: null,
+    lineStarts: null,  // 手势开始时算的一份「每行起始字符偏移」快照
+    textLen: -1        // 快照对应的 ta.value.length（过期判定）
+};
+
+// 一次线性扫描，每次手势只算一次，不在 pointermove 里重算。
+function ovlBuildLineStarts(text) {
+    const out = [0];
+    let i = text.indexOf('\n');
+    while (i !== -1) { out.push(i + 1); i = text.indexOf('\n', i + 1); }
+    return out;
+}
+
+// [lo, hi] 两个 0-based 逻辑行 → textarea 字符区间。end 不含行尾的 \n——选中"第 5 行"就该
+// 正好是第 5 行的字，不吞掉换行（吞了会让 focus 引文和译文都多一个空行）。
+function ovlGutterLineRangeToChars(ta, lo, hi) {
+    const starts = (OvlGutterSel.lineStarts && OvlGutterSel.textLen === ta.value.length)
+        ? OvlGutterSel.lineStarts : ovlBuildLineStarts(ta.value);
+    const n = starts.length;
+    lo = Math.max(0, Math.min(n - 1, lo));
+    hi = Math.max(0, Math.min(n - 1, hi));
+    const start = starts[lo];
+    let end = (hi + 1 < n) ? (starts[hi + 1] - 1) : ta.value.length;
+    if (end < start) end = start;
+    return { start: start, end: end };
+}
+
+// 把 clientY 换算成逻辑行。x 一律取 gutter 的横向中线 ⇒ 拖拽时指针横向飘出 gutter（常态：
+// 一边往下拖一边往右偏）也照样能继续扩展；y 夹在 gutter 盒子里 ⇒ 拖出上/下边界时钉在
+// 第一/最后一个可见行（本轮不做拖拽自动滚动，§5.2）。
+function ovlGutterLineAtClientY(clientY) {
+    const gutter = document.getElementById('ovlGutter');
+    if (!gutter) return -1;
+    const gr = gutter.getBoundingClientRect();
+    const px = gr.left + gr.width / 2;
+    const py = Math.max(gr.top + 1, Math.min(gr.bottom - 1, clientY));
+    const el = ovlDocOf(gutter).elementFromPoint(px, py);
+    const cell = (el && el.closest) ? el.closest('.ovl-ln') : null;
+    if (!cell) return -1;                       // 落在 gutter 的上边距里 → 不响应
+    const n = parseInt(cell.getAttribute('data-ln'), 10);
+    return isFinite(n) ? n : -1;
+}
+
+// gutter 上的两种标记一次刷完（行选蓝底 + P8 的关注黄条），一趟循环。只在「手势里 head 真的
+// 换了一行」和「gutter 重建之后」调用，不是每像素调用。
+function ovlPaintGutterMarks() {
+    try {
+        const gutter = document.getElementById('ovlGutter');
+        if (!gutter) return;
+        const has = OvlGutterSel.anchorLine >= 0;
+        const lo = has ? Math.min(OvlGutterSel.anchorLine, OvlGutterSel.headLine) : -1;
+        const hi = has ? Math.max(OvlGutterSel.anchorLine, OvlGutterSel.headLine) : -2;
+        // P8 会在这里填 focusTexGutterLines()；P7 阶段这个函数还不存在，固定为空数组。
+        const foc = (typeof focusTexGutterLines === 'function') ? focusTexGutterLines() : [];
+        const cells = gutter.children;
+        for (let i = 0; i < cells.length; i++) {
+            const c = cells[i];
+            const ln = parseInt(c.getAttribute('data-ln'), 10);
+            const ok = isFinite(ln);
+            c.classList.toggle('ovl-ln-sel', ok && ln >= lo && ln <= hi);
+            let f = false;
+            for (let k = 0; k < foc.length; k++) { if (ok && ln >= foc[k][0] && ln <= foc[k][1]) { f = true; break; } }
+            c.classList.toggle('ovl-ln-focus', f);
+        }
+    } catch (e) { /* 装饰性：坏了当没有，绝不把异常带回渲染路径 */ }
+}
+
+function ovlGutterClearSelection() {
+    OvlGutterSel.anchorLine = -1; OvlGutterSel.headLine = -1;
+    OvlGutterSel.dragging = false; OvlGutterSel.pointerId = null;
+    OvlGutterSel.lineStarts = null; OvlGutterSel.textLen = -1;
+    ovlPaintGutterMarks();
+}
+
+// 落地一次行选：写 textarea 选区、重画 gutter 标记，可选地弹工具条。不许让浏览器自作主张
+// 滚动——用户点的是屏幕上看得见的那几行，视口不该跳。
+function ovlGutterCommitSelection(showQa) {
+    const ta = document.getElementById('ovlCodeArea');
+    if (!ta || ta.disabled || OvlGutterSel.anchorLine < 0) return;
+    const lo = Math.min(OvlGutterSel.anchorLine, OvlGutterSel.headLine);
+    const hi = Math.max(OvlGutterSel.anchorLine, OvlGutterSel.headLine);
+    const r = ovlGutterLineRangeToChars(ta, lo, hi);
+    const st = ta.scrollTop, sl = ta.scrollLeft;
+    try { ta.focus({ preventScroll: true }); } catch (e) { ta.focus(); }
+    ta.setSelectionRange(r.start, r.end);
+    ta.scrollTop = st; ta.scrollLeft = sl;              // setSelectionRange 可能把光标滚进视口，撤销掉
+    const gutter = document.getElementById('ovlGutter');
+    if (gutter) gutter.scrollTop = ta.scrollTop;         // 和既有几处滚动同步同一条纪律
+    ovlPaintGutterMarks();
+    if (showQa) ovlGutterShowQuickActions(ta, r.start);
+}
+
+// 工具条锚在选区第一行的行首右侧，不压住 gutter，也不飞到编辑器外面。
+function ovlGutterShowQuickActions(ta, startOffset) {
+    const taRect = ta.getBoundingClientRect();
+    const r = ovlCodeSelectionRect(ta, startOffset);          // 复用既有测量，不建第二套
+    const qx = Math.min(Math.max(r.x, taRect.left) + 40, taRect.right - 20);
+    const qy = Math.max(taRect.top + 36, Math.min(r.y, taRect.bottom - 8));
+    ovlShowQuickActionsAt(qx, qy, 'code');
+}
+
+// 事件绑定：pointer capture，零 document 监听器（§3.4 规则 7：不要新增绑在 document 上的
+// 委托监听器来处理可弹出区域内的交互）。
+function ovlBindGutterSelect() {
+    const gutter = document.getElementById('ovlGutter');
+    if (!gutter) return;
+
+    gutter.addEventListener('pointerdown', function (e) {
+        if (e.button !== 0) return;
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || ta.disabled || OvlState.editorMode !== 'code') return;
+        const line = ovlGutterLineAtClientY(e.clientY);
+        if (line < 0) return;
+        e.preventDefault();                       // 不让浏览器起原生拖选 / 抢焦点
+        OvlGutterSel.lineStarts = ovlBuildLineStarts(ta.value);
+        OvlGutterSel.textLen = ta.value.length;
+        if (!(e.shiftKey && OvlGutterSel.anchorLine >= 0)) OvlGutterSel.anchorLine = line;
+        OvlGutterSel.headLine = line;
+        OvlGutterSel.dragging = true;
+        OvlGutterSel.pointerId = e.pointerId;
+        // setPointerCapture 让后续 move/up 全部回到 gutter 上，不需要往 document 挂监听器。
+        // 不支持就退化成"指针留在 gutter 内时能拖"，不报错。
+        try { gutter.setPointerCapture(e.pointerId); } catch (err) {}
+        if (typeof ovlVisTransHide === 'function') ovlVisTransHide(); // 换了行选 ⇒ 上一个译文浮框作废
+        ovlGutterCommitSelection(false);          // 拖拽过程中不弹工具条
+    });
+
+    gutter.addEventListener('pointermove', function (e) {
+        if (!OvlGutterSel.dragging || e.pointerId !== OvlGutterSel.pointerId) return;
+        const line = ovlGutterLineAtClientY(e.clientY);
+        if (line < 0 || line === OvlGutterSel.headLine) return;   // 只在真的换行时才重画
+        OvlGutterSel.headLine = line;
+        ovlGutterCommitSelection(false);
+    });
+
+    function endDrag(e) {
+        if (!OvlGutterSel.dragging) return;
+        OvlGutterSel.dragging = false;
+        OvlGutterSel.pointerId = null;
+        try { gutter.releasePointerCapture(e.pointerId); } catch (err) {}
+        ovlGutterCommitSelection(true);           // 手势结束 → 弹工具条
+    }
+    gutter.addEventListener('pointerup', endDrag);
+    gutter.addEventListener('pointercancel', endDrag);
+    gutter.addEventListener('lostpointercapture', endDrag);   // endDrag 自带幂等哨兵，重复调用无害
 }
 
 // Code 模式：把 textarea 里某个字符位置换算成屏幕像素坐标。复用既有的 .ovl-code-mirror +
@@ -26263,12 +26479,18 @@ function ovlVisTransHide() {
     if (box) { box.classList.remove('ovl-open'); box.hidden = true; }
 }
 
-async function ovlVisTransRequest(text, selRect) {
+// v2 Pass P7：加第 3 参 promptKind（'tex' | 未传/其它 = 'vis'）。函数体内其余部分——缓存 /
+// 竞态 / 中断 / 四候选定位——一个字节不 fork，Visual 分支的行为逐字节保持原样。
+async function ovlVisTransRequest(text, selRect, promptKind) {
     const box = document.getElementById('ovlVisTransBox');
     const body = document.getElementById('ovlVisTransBody');
     if (!box || !body) return;
 
-    const cached = ovlVisTransCacheGet(text);
+    // 缓存键加前缀：tex/vis 两路各算各的，不会互相命中对方的缓存（纯内存 LRU 50，
+    // 没有持久化，不存在迁移问题）。
+    const key = (promptKind === 'tex' ? 'tex ' : 'vis ') + text;
+
+    const cached = ovlVisTransCacheGet(key);
     if (cached !== undefined) {
         ++OvlVisTransSeq; // 命中缓存也要让上一个还在飞的请求作废，避免它晚一步覆盖这次的显示
         try { if (OvlVisTransAbort) OvlVisTransAbort.abort(); } catch (e) {}
@@ -26289,12 +26511,17 @@ async function ovlVisTransRequest(text, selRect) {
     try {
         const base = getApiConfig();
         const cfg = ovlVisTransConfig(base);
-        const prompt = '把下面这段学术英文翻译成中文。只输出译文本身，不要解释，不要重复原文。'
-            + '保留其中的 LaTeX 数学公式（$...$）原样不译。\n\n' + text;
+        // else 那一支必须与原来逐字节相同——Visual 路径不许变。
+        const prompt = (promptKind === 'tex')
+            ? '把下面这段 LaTeX 源码里的正文翻译成中文。只输出译文本身，不要解释，不要重复原文。'
+              + '所有 LaTeX 命令、环境、数学公式（\\cite{}、\\ref{}、$...$、\\begin{}…\\end{} 等）'
+              + '一律原样保留，不要翻译也不要改写；以 % 开头的注释行原样保留。\n\n' + text
+            : '把下面这段学术英文翻译成中文。只输出译文本身，不要解释，不要重复原文。'
+              + '保留其中的 LaTeX 数学公式（$...$）原样不译。\n\n' + text;
         const out = await callModelPlainText(prompt, cfg, ctl ? ctl.signal : null);
         if (mySeq !== OvlVisTransSeq) return; // 选区早就换了/框已经关了，陈旧响应一个字节都不写
         const result = (typeof out === 'string' && out.trim()) ? out.trim() : '（模型未返回可用译文）';
-        ovlVisTransCacheSet(text, result);
+        ovlVisTransCacheSet(key, result);
         body.innerHTML = renderFormattedText(result);
         ovlVisTransPlace(box, selRect); // 内容变了，按新高度重新落一次位
     } catch (err) {
@@ -26326,15 +26553,70 @@ function ovlVisTransFromSelection(force) {
         if (!force) {
             if (mode === 'button') return; // 'button' 档：只有点了「译」按钮才发
             if (text.length > 1200) return; // 太长是整段，费钱且没用；短选区不再拦（Bug 2 修复）
-        } else if (text.length > 3000) {
-            showToast('选中的文字太长（超过 3000 字），请选短一点再试。', 'warning');
+        } else if (!ovlTransLengthOk(text)) {
+            // v2 Pass P7：长度封顶收口成 ovlTransLengthOk（和 Code 来源共用一处），
+            // 输出的 toast 文案与原来逐字节相同。
             return;
         }
 
         const selRect = range.getBoundingClientRect();
-        ovlVisTransRequest(text, selRect);
+        ovlVisTransRequest(text, selRect, 'vis');
     } catch (e) { console.error('[ovl] visTransFromSelection failed', e); }
 }
+
+// v2 Pass P7：Code 来源的译文浮框调用方（docs/v2_editor_focus_lineselect_plan.md §2.7）。
+// 不 fork 浮框机器——ovlVisTransRequest/ovlVisTransPlace 本来就只碰 #ovlVisTransBox 系的
+// DOM 和 selRect 的 4 个数字，没有一行是 Visual 专属的（缓存/竞态/中断/四候选定位/复制/
+// Esc/点外面关闭全部原样复用）。
+
+const OVL_TRANS_MAX_CHARS = 3000;   // P6 定的策略上限，现在 Visual/Code 两个入口共用
+
+// P6 的长度封顶收口成一处。toast 文案一个字都不许改——它已经进了 fd53b09 那次提交。
+function ovlTransLengthOk(text) {
+    if (text.length > OVL_TRANS_MAX_CHARS) {
+        showToast('选中的文字太长（超过 ' + OVL_TRANS_MAX_CHARS + ' 字），请选短一点再试。', 'warning');
+        return false;
+    }
+    return true;
+}
+
+// Code 模式送给模型的文本：只压缩行内连续空白，保留换行。这一条和 Visual 路径的
+// `\s+ -> ' '` 是故意不同的：gutter 多行选区常常整块是 itemize / align / 一段带空行的正文，
+// 压成一行会让译文明显变差，而 Visual 那边拿到的本来就是渲染后的连续文本，压平没有损失。
+function ovlCodeTransText(ta) {
+    const raw = ta.value.slice(ta.selectionStart, ta.selectionEnd);
+    return raw.replace(/[ \t]+/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+// 多行选区在屏幕上的包围盒。textarea 里没有 Range 可取，用既有的 ovlCodeSelectionRect(ta,pos)
+// 量首尾两点；横向直接取整块 textarea（多行选区本来就横跨整列）。必须夹到 textarea 的可见
+// 矩形里：选区被滚出视口时不夹，会算出一个视口外的矩形，ovlVisTransPlace 的四个候选位就
+// 全都判"放得下"，浮框会落到屏幕外面去。
+function ovlCodeSelectionScreenRect(ta) {
+    const taRect = ta.getBoundingClientRect();
+    const r1 = ovlCodeSelectionRect(ta, ta.selectionStart);
+    const r2 = ovlCodeSelectionRect(ta, ta.selectionEnd);
+    let top = Math.max(Math.min(r1.y, r2.y), taRect.top);
+    let bottom = Math.min(Math.max(r1.y + r1.h, r2.y + r2.h), taRect.bottom);
+    if (!(bottom > top)) return taRect;   // 选区整段滚出视口 → 退回整块编辑器当"不许遮挡区"
+    return {
+        left: taRect.left, right: taRect.right, top: top, bottom: bottom,
+        x: taRect.left, y: top, width: taRect.width, height: bottom - top
+    };
+}
+
+function ovlCodeTransFromSelection() {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || ta.disabled || OvlState.editorMode !== 'code') return;
+        if (ta.selectionStart === ta.selectionEnd) return;
+        const text = ovlCodeTransText(ta);
+        if (!text) return;
+        if (!ovlTransLengthOk(text)) return;
+        ovlVisTransRequest(text, ovlCodeSelectionScreenRect(ta), 'tex');
+    } catch (e) { console.error('[ovl] codeTransFromSelection failed', e); }
+}
+
 function ovlScheduleVisTransFromSelection() {
     if (OvlVisTransDebounceTimer) clearTimeout(OvlVisTransDebounceTimer);
     OvlVisTransDebounceTimer = setTimeout(function () { ovlVisTransFromSelection(false); }, 350);
@@ -26350,6 +26632,9 @@ function ovlBindVisualTranslate() {
         ovlScheduleVisTransFromSelection();
     });
     pane.addEventListener('scroll', ovlVisTransHide);
+    // v2 Pass P7：Code 来源的浮框也得跟着滚动消失。
+    const ta2 = document.getElementById('ovlCodeArea');
+    if (ta2) ta2.addEventListener('scroll', ovlVisTransHide);
 
     const box = document.getElementById('ovlVisTransBox');
     if (box) box.addEventListener('click', function (e) {
@@ -26729,6 +27014,7 @@ function ovlBindPassD() {
         if (zoomInBtn) zoomInBtn.addEventListener('click', function () { if (!zoomInBtn.disabled) ovlPdfZoomStep(10); });
 
         ovlBindQuickActions();
+        ovlBindGutterSelect(); // v2 Pass P7：gutter 行号点选 + 拖拽扩选
 
         const ta = document.getElementById('ovlCodeArea');
         if (ta) {
