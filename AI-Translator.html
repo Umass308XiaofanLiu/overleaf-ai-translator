@@ -1080,17 +1080,42 @@ body.ovl-shell-active #ovlShell { display: flex; }
     flex: 1 1 auto;
     min-height: 0;
     display: grid;
-    grid-template-columns: 40px 188px 1fr 1fr;
+    /* v2 Polish：编辑器/PDF 两栏中间插一条 6px 的拖拽分栏（#ovlColSplitter，只在 split
+       视图下出现，见下面 .ovl-col-splitter 那几条）。比例存在这两个 CSS 变量里，JS 拖拽时
+       只改这两个变量，不用整段重算 grid-template-columns 字符串。editor/pdf 单栏模式的
+       grid-template-columns 下面整条覆盖掉（3 栏、没有分栏轨道），跟这条基础规则无关。 */
+    grid-template-columns: 40px 188px var(--ovl-split-editor-fr, 1fr) 6px var(--ovl-split-pdf-fr, 1fr);
     background: #2F3A4C;
     z-index: 1000;
 }
-.ovl-body[data-tree="collapsed"] { grid-template-columns: 40px 0px 1fr 1fr; }
+.ovl-body[data-tree="collapsed"] { grid-template-columns: 40px 0px var(--ovl-split-editor-fr, 1fr) 6px var(--ovl-split-pdf-fr, 1fr); }
 .ovl-body[data-view="editor"] { grid-template-columns: 40px 188px 1fr; }
 .ovl-body[data-view="editor"][data-tree="collapsed"] { grid-template-columns: 40px 0px 1fr; }
 .ovl-body[data-view="editor"] #ovlPdfPanel { display: none; }
 .ovl-body[data-view="pdf"] { grid-template-columns: 40px 188px 1fr; }
 .ovl-body[data-view="pdf"][data-tree="collapsed"] { grid-template-columns: 40px 0px 1fr; }
 .ovl-body[data-view="pdf"] #ovlEditorPanel { display: none; }
+/* v2 Polish：拖拽分栏手柄。editor-only/pdf-only 模式下没有两栏可分，默认 display:none，
+   只有 split 视图（§4.0 同一纪律：属性选择器控显隐，不整段重画）才 display:flex 出来。
+   拖拽状态用独立的 body[data-ovl-splitdrag] 标志，跟翻译器/聊天窗共用的 data-aichat-drag
+   不是同一个属性——两套拖拽互不知道对方存在，不会撞旗标（§ Task 2 硬约束的"sanity-check
+   no collision"）。 */
+.ovl-col-splitter {
+    display: none;
+    position: relative;
+    cursor: col-resize;
+    background: #1B222C;
+    touch-action: none;
+}
+.ovl-col-splitter::after {
+    content: '';
+    position: absolute;
+    top: 0; bottom: 0; left: -2px; right: -2px; /* 视觉 6px、可点中区域再宽 4px，细手柄好抓 */
+}
+.ovl-col-splitter:hover, .ovl-col-splitter.ovl-col-splitter-active { background: #495365; }
+.ovl-body[data-view="split"] .ovl-col-splitter { display: flex; }
+body[data-ovl-splitdrag] { cursor: col-resize !important; user-select: none !important; }
+body[data-ovl-splitdrag] * { user-select: none !important; }
 
 .ovl-rail {
     background: #1B222C;
@@ -1171,6 +1196,13 @@ body.ovl-shell-active #ovlShell { display: flex; }
     display: flex;
     flex-direction: column;
     min-width: 0;
+    min-height: 0; /* 跟 .ovl-pdf-panel 那条注释同一个坑：网格项默认 min-height:auto 会撑破
+                       .ovl-body 那一行——main.tex 4,132 行时 .ovl-code-area/#ovlGutter 撑成
+                       ~74000px 高、整块内容溢出到视口外，导致 #ovlCodeArea 自己的 scrollTop
+                       实际可用范围只剩几像素（日志面板"跳到源码"就是靠 ta.scrollTop 把目标行
+                       滚进视口——范围没了，选区/光标本身是对的，但视觉上永远停在原地，看着像
+                       "跳去了 EOF"）。这里补上当年 .ovl-pdf-panel 那次修的同一行，编辑器这边
+                       之前漏补。 */
     border-right: 1px solid #2F3A4C;
 }
 .ovl-editor-tabbar { background: #2F3A4C; height: 30px; display: flex; align-items: center; padding: 0 10px; }
@@ -20806,7 +20838,10 @@ const OvlState = {
     logView: false,
     logFilter: 'all',        // 'all' | 'error' | 'warning' | 'info'
     // ---- v2 Pass D：M4 翻页/缩放（iframe + PDF Open Parameters，不是 pdf.js） ----
-    pdfView: { page: 1, totalPages: 1, zoomMode: 'value', zoomPct: 100 } // zoomMode: 'value'|'fitwidth'|'fitheight'
+    pdfView: { page: 1, totalPages: 1, zoomMode: 'value', zoomPct: 100 }, // zoomMode: 'value'|'fitwidth'|'fitheight'
+    // ---- v2 Polish：编辑器/PDF 拖拽分栏比例（只存内存，刷新复位，见 ovlColSplitterBeginDrag）----
+    splitEditorFr: 1,
+    splitPdfFr: 1
 };
 
 function ovlShellHtml() {
@@ -20936,6 +20971,9 @@ function ovlShellHtml() {
         +       '<div class="ovl-visual-pane" id="ovlVisualPane" style="display:none;"><div class="ovl-visual-empty">打开一个 .tex 文件后这里会显示只读预览。</div></div>'
         +     '</div>'
         +   '</div>'
+        // v2 Polish：编辑器/PDF 两栏之间的拖拽分栏手柄，只在 split 视图下可见（CSS 已经挡了
+        // editor-only/pdf-only），ovlBindColSplitter() 挂 pointerdown。
+        +   '<div class="ovl-col-splitter" id="ovlColSplitter" data-tip="拖拽调整宽度比例" data-tip-pos="top" role="separator" aria-orientation="vertical"></div>'
         // M3/M10：PDF 面板 = 编译工具条 + 项目路径输入 + PDF 区/日志区（用 data-logview 切换，
         // 照 §3.6.3/§3.6.8 一带同一纪律：CSS 属性选择器控显隐，不整段重画）。
         // 契约见 docs/v2_overleaf_latex_plan.md §3.1：成功 = PDF 存在，不是退出码；
@@ -21086,6 +21124,9 @@ function ovlToggleLayoutMenu() {
 function ovlSetViewMode(mode, opts) {
     try {
         if (mode !== 'split' && mode !== 'editor' && mode !== 'pdf') return;
+        // 离开 split 视图前先把进行中的分栏拖拽收尾——跟 ovlWinBeginDrag 那条注释同一个坑：
+        // 拖到一半切视图，监听器/data-ovl-splitdrag 不会自己消失。
+        if (mode !== 'split') ovlColSplitterEndActive();
         OvlState.viewMode = mode;
         const body = document.getElementById('ovlBody');
         if (body) body.setAttribute('data-view', mode);
@@ -21102,6 +21143,109 @@ function ovlSetViewMode(mode, opts) {
         ovlCloseLayoutMenu();
     } catch (e) {
         console.error('[ovl] setViewMode failed', e);
+    }
+}
+
+// ==================== v2 Polish：编辑器/PDF 拖拽分栏 ====================
+// 只调两个 CSS 变量（--ovl-split-editor-fr / --ovl-split-pdf-fr），不碰 grid-template-columns
+// 整串字符串——同一条 fr 单位的比例在窗口 resize 时自动保持，不用另外挂 resize 监听器。
+// 比例只存内存（OvlState.splitEditorFr/splitPdfFr），刷新页面复位，符合任务"session 内
+// 即可，跨刷新是 nice-to-have"的要求。
+const OVL_SPLIT_MIN_COL = 260; // 两边各自的最小宽度，小于这个就不好用了（编辑器放不下几个字/PDF 看不清）
+let OvlSplitActiveEnd = null;  // 跟 ovlWinBeginDrag 同一纪律：有拖拽在跑，切视图/开翻译器窗前先收尾
+
+function ovlColSplitterApplyRatio() {
+    const body = document.getElementById('ovlBody');
+    if (!body) return;
+    body.style.setProperty('--ovl-split-editor-fr', OvlState.splitEditorFr.toFixed(4) + 'fr');
+    body.style.setProperty('--ovl-split-pdf-fr', OvlState.splitPdfFr.toFixed(4) + 'fr');
+}
+
+function ovlColSplitterEndActive() {
+    if (OvlSplitActiveEnd) { try { OvlSplitActiveEnd(); } catch (e) {} }
+}
+
+function ovlColSplitterBeginDrag(ev) {
+    try {
+        if (ev.button != null && ev.button !== 0) return; // 只认左键，跟 ovlWinBeginDrag 修复1同一条
+        if (OvlState.viewMode !== 'split') return;         // CSS 已经把手柄藏了，这里再守一道
+        const handle = ev.currentTarget || ev.target;
+        const editorPanel = document.getElementById('ovlEditorPanel');
+        const pdfPanel = document.getElementById('ovlPdfPanel');
+        if (!handle || !editorPanel || !pdfPanel) return;
+        ev.preventDefault();
+
+        const startX = (typeof ev.clientX === 'number') ? ev.clientX : 0;
+        // 拖拽期间窗口不太可能同时被 resize，起手量一次总宽度就够（跟 ovlWinBeginDrag 的
+        // start 快照是同一个思路：算增量，不是每帧重新量全部祖先）。
+        const availW = editorPanel.getBoundingClientRect().width + pdfPanel.getBoundingClientRect().width;
+        const startEditorW = editorPanel.getBoundingClientRect().width;
+        const pid = ev.pointerId;
+        let finished = false;
+
+        handle.classList.add('ovl-col-splitter-active');
+        try { if (pid != null && handle.setPointerCapture) handle.setPointerCapture(pid); } catch (e) {}
+        try { document.body.setAttribute('data-ovl-splitdrag', '1'); } catch (e) {}
+
+        // rAF 合帧，跟 ovlWinBeginDrag 的 schedule/flush 同一套（main.tex 4132 行时 grid
+        // 一次重排不便宜，逐 pointermove 同步写变量会在快拖时肉眼可见地卡）。
+        let pendingRatio = null;
+        let rafId = 0;
+        const raf = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame : null;
+        const caf = (typeof cancelAnimationFrame === 'function') ? cancelAnimationFrame : null;
+        function flush() {
+            rafId = 0;
+            if (pendingRatio == null) return;
+            OvlState.splitEditorFr = pendingRatio;
+            OvlState.splitPdfFr = 1 - pendingRatio;
+            pendingRatio = null;
+            ovlColSplitterApplyRatio();
+        }
+        function schedule(ratio) {
+            pendingRatio = ratio;
+            if (!raf) { flush(); return; } // 没有 rAF 的环境（测试沙箱）退回同步
+            if (!rafId) rafId = raf(flush);
+        }
+
+        const thisEnd = function () { onUp(); };
+        OvlSplitActiveEnd = thisEnd;
+
+        function onMove(e) {
+            try {
+                if (e.buttons === 0) { onUp(); return; } // 兜底 pointerup 丢失，跟 ovlWinBeginDrag 修复5同一条
+                const dx = (typeof e.clientX === 'number' ? e.clientX : startX) - startX;
+                const rawEditorW = startEditorW + dx;
+                const clampedEditorW = Math.max(OVL_SPLIT_MIN_COL, Math.min(availW - OVL_SPLIT_MIN_COL, rawEditorW));
+                schedule(clampedEditorW / availW);
+            } catch (err) {
+                console.error('[ovl] col splitter drag move failed', err);
+                onUp();
+            }
+        }
+
+        function onUp() {
+            if (finished) return; // 幂等哨兵，跟 ovlWinBeginDrag 修复7同一条
+            finished = true;
+            if (OvlSplitActiveEnd === thisEnd) OvlSplitActiveEnd = null;
+            try { document.removeEventListener('pointermove', onMove); } catch (e) {}
+            try { document.removeEventListener('pointerup', onUp); } catch (e) {}
+            try { document.removeEventListener('pointercancel', onUp); } catch (e) {}
+            try { window.removeEventListener('blur', onUp); } catch (e) {}
+            try { if (pid != null && handle.hasPointerCapture && handle.hasPointerCapture(pid)) handle.releasePointerCapture(pid); } catch (e) {}
+            try { document.body.removeAttribute('data-ovl-splitdrag'); } catch (e) {}
+            handle.classList.remove('ovl-col-splitter-active');
+            try { if (rafId && caf) caf(rafId); } catch (e) {}
+            rafId = 0;
+            flush(); // 落盘前把攒着的那一帧写进去，快拖一下松手不能丢最后一帧
+        }
+
+        document.addEventListener('pointermove', onMove);
+        document.addEventListener('pointerup', onUp);
+        document.addEventListener('pointercancel', onUp);
+        window.addEventListener('blur', onUp);
+    } catch (e) {
+        console.error('[ovl] col splitter beginDrag failed', e);
+        try { document.body.removeAttribute('data-ovl-splitdrag'); } catch (e2) {}
     }
 }
 
@@ -23343,6 +23487,11 @@ function ovlBindShell() {
                 ovlSetViewMode(item.getAttribute('data-view'));
             });
         }
+
+        // v2 Polish：编辑器/PDF 拖拽分栏，跟 chatBeginDrag/ovlWinBeginDrag 同一套纪律
+        // （pointerdown 起手、pointermove/pointerup 挂 document，见 ovlColSplitterBeginDrag）。
+        const colSplitter = document.getElementById('ovlColSplitter');
+        if (colSplitter) colSplitter.addEventListener('pointerdown', ovlColSplitterBeginDrag);
 
         // 点菜单外部关闭菜单（捕获阶段挂一次，跟聊天窗的既有做法一样是全局单例监听）。
         document.addEventListener('click', function (e) {
