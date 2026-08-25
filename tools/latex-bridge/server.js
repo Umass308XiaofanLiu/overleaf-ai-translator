@@ -22,6 +22,14 @@
  *
  * 启动：node tools/latex-bridge/server.js
  * 用法见同目录 README.md。
+ *
+ * v2 Pass P17 追加两块（跟上面 M3 契约不冲突，"零 npm 依赖"那条只管 HTTP 编译主链路；
+ * WebSocket 握手手写起来容易在边界情况上出岔子，这里用 package.json 里声明的小依赖
+ * "ws" 而不是自己实现，见交付说明）：
+ *   - POST /pick-folder：弹原生 Windows 文件夹选择框（System.Windows.Forms.FolderBrowserDialog），
+ *     子进程里跑，不阻塞 Node 事件循环处理其他并发请求。
+ *   - WebSocket（同一个 127.0.0.1:8181，跟 HTTP 共用同一个 http.Server 实例升级）：前端订阅
+ *     一个绝对路径，磁盘上那个文件一变就推 {type:'changed', path, mtimeMs}，不带文件内容。
  */
 
 const http = require('http');
@@ -30,6 +38,8 @@ const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
 const { spawn, execSync } = require('child_process');
+let WebSocket = null;
+try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化处的兜底说明 */ }
 
 const HOST = '127.0.0.1';
 const PORT = 8181;
@@ -614,6 +624,92 @@ function doSyncTexEdit(outdir, page, x, y) {
 }
 
 // ---------------------------------------------------------------------------
+// /pick-folder —— v2 Pass P17：原生 Windows 文件夹选择框，用户明确表示不想手填/粘贴路径。
+// FolderBrowserDialog 是同步 API（ShowDialog() 会阻塞调用它的线程直到用户关掉对话框），但
+// 这里从来没有在 Node 主线程里调用它——spawn() 起一个独立的 powershell.exe 子进程去跑，
+// Node 事件循环全程不受影响，用户把对话框开着晾一整天，其间其他并发请求（/compile、
+// /health、WebSocket……）照样正常处理，唯一等待的是发起 /pick-folder 请求的那一个 HTTP 响应。
+// 脚本走 -EncodedCommand（UTF-16LE base64）传给 powershell.exe，是固定脚本、不拼用户输入，
+// 用它单纯是为了避开引号转义的坑，不是安全边界；spawn 走参数数组，不是 shell 字符串拼接。
+// -----------------------------------------------------------------------------
+const PICK_FOLDER_TIMEOUT_MS = 5 * 60 * 1000; // 5 分钟：给用户充分时间挑文件夹，又不至于真的永久挂着子进程
+
+function doPickFolder() {
+    return new Promise((resolve) => {
+        if (process.platform !== 'win32') {
+            resolve({ ok: false, error: '/pick-folder 只支持 Windows（FolderBrowserDialog 是 WinForms API）' });
+            return;
+        }
+        // 用一个隐藏但 TopMost 的宿主 Form 当 owner，不然对话框有时会开在其他窗口后面、
+        // 用户以为没反应——实测（本机 Windows 10）不挂 owner 偶发这个问题。
+        const psScript = [
+            'Add-Type -AssemblyName System.Windows.Forms',
+            '$owner = New-Object System.Windows.Forms.Form',
+            '$owner.TopMost = $true',
+            '$owner.ShowInTaskbar = $false',
+            '$owner.StartPosition = "CenterScreen"',
+            '$owner.Width = 0; $owner.Height = 0',
+            '$owner.Show()',
+            '$owner.Activate()',
+            '$dialog = New-Object System.Windows.Forms.FolderBrowserDialog',
+            '$dialog.Description = "选择 LaTeX 项目文件夹（AI-Translator）"',
+            '$dialog.ShowNewFolderButton = $false',
+            '$result = $dialog.ShowDialog($owner)',
+            '$owner.Close()',
+            'if ($result -eq [System.Windows.Forms.DialogResult]::OK) {',
+            '  Write-Output ("SELECTED:" + $dialog.SelectedPath)',
+            '} else {',
+            '  Write-Output "CANCELLED"',
+            '}'
+        ].join("\r\n");
+        const encoded = Buffer.from(psScript, 'utf16le').toString('base64');
+        const args = ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded];
+        let child;
+        try {
+            child = spawn('powershell.exe', args, { windowsHide: false });
+        } catch (e) {
+            resolve({ ok: false, error: 'spawn powershell failed: ' + e.message });
+            return;
+        }
+        let resolved = false;
+        const outBuf = [];
+        const errBuf = [];
+        const timer = setTimeout(() => {
+            if (resolved) return;
+            resolved = true;
+            try { killTree(child.pid); } catch (e) {}
+            resolve({ ok: false, error: '选择文件夹超时（' + (PICK_FOLDER_TIMEOUT_MS / 1000) + 's 没有响应，对话框可能被系统吞了，重试一次）' });
+        }, PICK_FOLDER_TIMEOUT_MS);
+        child.stdout.on('data', (c) => outBuf.push(c));
+        child.stderr.on('data', (c) => errBuf.push(c));
+        child.on('error', (err) => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timer);
+            resolve({ ok: false, error: 'powershell process error: ' + err.message });
+        });
+        child.on('close', () => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timer);
+            const text = Buffer.concat(outBuf).toString('utf8').trim();
+            if (!text || text.indexOf('CANCELLED') !== -1) {
+                resolve({ ok: true, cancelled: true, path: null });
+                return;
+            }
+            const m = /SELECTED:([\s\S]*)$/.exec(text);
+            const picked = m ? m[1].trim() : '';
+            if (!picked) {
+                const errText = Buffer.concat(errBuf).toString('utf8').trim();
+                resolve({ ok: false, error: '没有解析出路径，原始输出：' + text + (errText ? ('；stderr: ' + errText) : '') });
+                return;
+            }
+            resolve({ ok: true, cancelled: false, path: picked });
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 路由
 // ---------------------------------------------------------------------------
 
@@ -643,7 +739,14 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, GET /health, GET /output/:id/:file, POST /clear');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, POST /clear. WebSocket on same host:port for disk-change push.');
+            return;
+        }
+
+        // v2 Pass P17：原生文件夹选择框（POST，不带 body）——见 doPickFolder 头部注释。
+        if (req.method === 'POST' && pathname === '/pick-folder') {
+            const result = await doPickFolder();
+            sendJson(res, 200, result);
             return;
         }
 
@@ -805,6 +908,79 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 500, { ok: false, error: 'internal error: ' + (err && err.message) });
     }
 });
+
+// ---------------------------------------------------------------------------
+// WebSocket —— v2 Pass P17：磁盘外部改动推送。跟 HTTP 共用同一个 http.Server 实例/端口
+// （ws 库靠监听 'upgrade' 事件挂在同一个 server 上，不另开端口），前端把 http:// 换成 ws://
+// 连同一个 host:port 即可。协议：
+//   客户端 -> 服务端：{type:'watch', path:'<绝对路径>'}（切换/首次订阅一个文件，自动替换掉
+//                      这条连接之前订阅的文件——不允许同一条连接叠加多个 watcher）
+//                     {type:'unwatch'}（明确取消订阅，比如关闭文件/切到只读降级模式）
+//   服务端 -> 客户端：{type:'changed', path, mtimeMs}（不带文件内容，前端自己用已有的
+//                      FSA 句柄重读；自身写入触发的回声由前端拿 mtimeMs 去过滤，桥这边
+//                      不掺和"这是不是我们自己刚写的"这个判断——桥根本不知道谁写的）
+// 每条连接最多一个 fs.watch()：collectionOf(ws) 才是 leak 高发点，这里干脆把 watcher 直接
+// 挂在 ws 对象自己身上（ws._watcher/ws._watchPath），连接关闭/切换文件/出错都统一走
+// detachWatcher() 一条路径清掉，不另建一个全局 Map 去对账。
+// ---------------------------------------------------------------------------
+
+function detachWatcher(ws) {
+    if (ws._watchDebounce) { clearTimeout(ws._watchDebounce); ws._watchDebounce = null; }
+    if (ws._watcher) {
+        try { ws._watcher.close(); } catch (e) {}
+        ws._watcher = null;
+    }
+    ws._watchPath = null;
+}
+
+function attachWatcher(ws, filePath) {
+    detachWatcher(ws);
+    if (typeof filePath !== 'string' || !filePath || !path.isAbsolute(filePath)) return; // 只认绝对路径，静默忽略，不报错断连接
+    if (!fs.existsSync(filePath)) return; // 文件还没建好/项目路径填错——静默不订阅，等前端下次换文件/路径再试
+    try {
+        const watcher = fs.watch(filePath, { persistent: false }, function () {
+            // Windows 上一次保存常常连续触发好几个 fs.watch 事件（写内容 + 改 mtime 分开算），
+            // 轻量 debounce 一下再读一次最新 mtimeMs 合并成一条推送，不然前端会收到好几条
+            // 内容其实一样的 'changed'。
+            if (ws._watchDebounce) clearTimeout(ws._watchDebounce);
+            ws._watchDebounce = setTimeout(function () {
+                ws._watchDebounce = null;
+                let stat;
+                try { stat = fs.statSync(filePath); } catch (e) { return; } // 原子替换类写入期间文件短暂不存在，跳过等下一次事件
+                if (ws.readyState !== WebSocket.OPEN) return;
+                try { ws.send(JSON.stringify({ type: 'changed', path: filePath, mtimeMs: stat.mtimeMs })); } catch (e) {}
+            }, 80);
+        });
+        watcher.on('error', function (e) {
+            console.warn('[latex-bridge] fs.watch error for ' + filePath + ': ' + (e && e.message));
+            detachWatcher(ws);
+        });
+        ws._watcher = watcher;
+        ws._watchPath = filePath;
+    } catch (e) {
+        console.warn('[latex-bridge] fs.watch failed for ' + filePath + ': ' + (e && e.message));
+    }
+}
+
+if (WebSocket && WebSocket.Server) {
+    const wss = new WebSocket.Server({ server: server });
+    wss.on('connection', function (ws) {
+        ws.on('message', function (raw) {
+            let msg;
+            try { msg = JSON.parse(raw.toString('utf8')); } catch (e) { return; } // 畸形消息直接丢弃，不断连接
+            if (!msg || typeof msg !== 'object') return;
+            if (msg.type === 'watch') {
+                attachWatcher(ws, msg.path);
+            } else if (msg.type === 'unwatch') {
+                detachWatcher(ws);
+            }
+        });
+        ws.on('close', function () { detachWatcher(ws); });
+        ws.on('error', function () { detachWatcher(ws); });
+    });
+} else {
+    console.warn('[latex-bridge] "ws" 模块没装上（npm install 到 tools/latex-bridge 下），磁盘外部改动推送这一块会不可用，其余 HTTP 功能不受影响');
+}
 
 server.listen(PORT, HOST, () => {
     console.log('[latex-bridge] listening on http://' + HOST + ':' + PORT);

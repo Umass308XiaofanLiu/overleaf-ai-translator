@@ -2017,6 +2017,14 @@ body.ovl-translator-open #ovlTransWin { display: block; }
     padding: 4px 7px; border-radius: 4px;
 }
 .ovl-pdf-projectrow input[type="text"]:focus { outline: none; border-color: #098842; }
+/* v2 Pass P17：原生文件夹选择按钮，跟输入框同一行——用户明确不想手填/粘贴路径，
+   这个按钮才是主入口，输入框留着当兜底（桥不在 Windows 上/对话框失败时还能手填）。*/
+.ovl-browse-btn {
+    background: #3a4457; color: #E7E9EE; border: none; border-radius: 4px;
+    padding: 4px 10px; font-size: 11px; cursor: pointer; flex-shrink: 0; white-space: nowrap;
+}
+.ovl-browse-btn:hover:not(:disabled) { background: #4a5568; }
+.ovl-browse-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 .ovl-pdf-placeholder { max-width: 480px; line-height: 1.6; }
 .ovl-pdf-body.ovl-pdf-body-filled { padding: 0; display: block; }
 /* v2 Pass P16：iframe 换成 pdf.js canvas——外层是可滚动、可能比画布大的容器（画布是"实际
@@ -21642,6 +21650,9 @@ const OvlState = {
     uploadTargetHandle: null, // “上传”点的是哪个目录（header 按钮=项目根，右键菜单=被点中的目录/同级）
     // ---- M3：编译桥接服务 + PDF/日志面板 ----
     bridgeOnline: null,      // null=还没探测过；true/false=探测结果
+    // ---- v2 Pass P17：桥 WebSocket 磁盘改动推送的自触发回声过滤，见 ovlBridgeHandleExternalChange ----
+    lastSelfWriteMtimeMs: null, // 自己上一次真的写盘成功后，FSA File.lastModified 读回来的值
+    lastSelfWritePath: null,    // 上面那次写盘对应的绝对路径（ovlBridgeAbsPathFor 算出来的）
     compiling: false,
     lastCompile: null,       // 桥 POST /compile 的完整返回：{ok,id,exitCode,pdfExists,pdfSize,log,parsed,counts,files,...}
     pdfObjectUrl: null,      // 当前 <canvas> 渲染用的 blob: URL，换下一版前必须先 URL.revokeObjectURL
@@ -21826,6 +21837,10 @@ function ovlShellHtml() {
         +     '<div class="ovl-pdf-projectrow">'
         +       '<label for="ovlProjectPathInput">项目绝对路径</label>'
         +       '<input type="text" id="ovlProjectPathInput" placeholder="例如 E:\\...\\AI-Translator（FSA 句柄拿不到绝对路径，需手填，见 §3.2）" autocomplete="off" spellcheck="false">'
+        // v2 Pass P17：原生文件夹选择框（桥的 POST /pick-folder）—— 用户明确表示不想手填/
+        // 粘贴路径两次；输入框保留当兜底（桥不在/对话框失败/非 Windows 时还能手填），
+        // 见 ovlBrowseProjectFolder。
+        +       '<button type="button" class="ovl-browse-btn" id="ovlBrowseFolderBtn" data-tip="用原生文件夹选择框设置项目路径（需要桥接服务在线）" data-tip-pos="bottom">浏览…</button>'
         +     '</div>'
         +     '<div class="ovl-pdf-body" id="ovlPdfBody"><div class="ovl-pdf-placeholder">检测编译桥接服务中…</div></div>'
         +     '<div class="ovl-log-panel" id="ovlLogPanel">'
@@ -24082,6 +24097,9 @@ async function ovlOpenFile(fileHandle, name, parentHandle) {
         OvlVisualState.preambleOpen = false; OvlVisualState.tailOpen = false;
         if (typeof ovlVisTransHide === 'function') ovlVisTransHide(); // P4：换文件=旧选区作废
         if (OvlState.editorMode === 'visual') ovlVisualRender();
+        // v2 Pass P17：换文件=之前订阅的那个文件的 watch 不再有意义，改订阅这一个（路径缺失/桥
+        // 离线时 ovlBridgeUpdateWatch 自己会静默跳过，不影响这里的打开流程）。
+        if (typeof ovlBridgeUpdateWatch === 'function') { try { ovlBridgeUpdateWatch(); } catch (e) {} }
     } catch (e) {
         console.error('[ovl] open file failed', e);
     }
@@ -24183,6 +24201,9 @@ async function ovlOpenFileFromBlob(file, name) {
         OvlVisualState.preambleOpen = false; OvlVisualState.tailOpen = false;
         if (typeof ovlVisTransHide === 'function') ovlVisTransHide(); // P4：换文件=旧选区作废
         if (OvlState.editorMode === 'visual') ovlVisualRender();
+        // v2 Pass P17：只读降级模式没有 FSA 句柄，ovlBridgeUpdateWatch 内部的 cf.handle 判断会
+        // 自动跳过订阅——这里调用纯粹是为了关掉上一个文件（如果是正常 FSA 模式打开的）留下的 watch。
+        if (typeof ovlBridgeUpdateWatch === 'function') { try { ovlBridgeUpdateWatch(); } catch (e) {} }
     } catch (e) {
         console.error('[ovl] open fallback file failed', e);
     }
@@ -24428,6 +24449,15 @@ async function ovlSaveCurrentFile(opts) {
         await writable.close();
         OvlState.dirty = false;
         OvlState.lastSavedAt = Date.now();
+        // v2 Pass P17：自触发回声过滤——记一下这次真写盘之后磁盘上的实际 mtime（FSA
+        // File.lastModified，跟桥用 fs.statSync().mtimeMs 读到的是同一台机器同一个时钟），
+        // 桥推 WebSocket 'changed' 事件回来时拿这个去比对，命中就判定"这是我们自己刚写的"，
+        // 不重新加载（见 ovlBridgeHandleExternalChange）。这一步失败不影响保存本身已经成功。
+        try {
+            const savedFile = await cf.handle.getFile();
+            OvlState.lastSelfWriteMtimeMs = savedFile.lastModified;
+            OvlState.lastSelfWritePath = (typeof ovlBridgeAbsPathFor === 'function') ? ovlBridgeAbsPathFor(cf.name) : null;
+        } catch (e) {}
         ovlUpdateTabUI();
         if (!opts.silent) ovlFlashSaveStatus('已保存 ' + new Date(OvlState.lastSavedAt).toLocaleTimeString(), false);
     } catch (e) {
@@ -25506,6 +25536,142 @@ function ovlDownloadCompiledPdf() {
     a.remove();
 }
 
+// ==================== v2 Pass P17：原生文件夹选择框 + 桥 WebSocket 磁盘改动推送 ====================
+
+// 用户明确表示（说了两次）不想手填/粘贴项目路径——这个按钮调桥的 POST /pick-folder，
+// 弹原生 Windows 文件夹选择框，选完直接回填输入框 + 存 localStorage，跟原来手填走
+// 完全同一份持久化（key 不变），输入框本身继续保留当兜底（桥不在线/非 Windows 时还能手填）。
+async function ovlBrowseProjectFolder() {
+    const btn = document.getElementById('ovlBrowseFolderBtn');
+    const pathInput = document.getElementById('ovlProjectPathInput');
+    if (btn) btn.disabled = true;
+    try {
+        const resp = await fetch(ovlBridgeUrl('/pick-folder'), { method: 'POST' });
+        const data = await resp.json();
+        if (!data || !data.ok) {
+            ovlFlashSaveStatus('选择文件夹失败：' + ((data && data.error) || '桥接服务未启动，见 tools/latex-bridge/README.md'), true);
+            return;
+        }
+        if (data.cancelled) return; // 用户自己关掉了对话框，什么都不用做，不算错误
+        if (pathInput && data.path) {
+            pathInput.value = data.path;
+            try { localStorage.setItem('ovl.bridgeProjectPath', data.path); } catch (e) {}
+            ovlFlashSaveStatus('项目路径已设置为：' + data.path, false);
+            ovlBridgeUpdateWatch(); // 路径刚补上，之前"缺路径所以没订阅"的情况这下可能解除了
+        }
+    } catch (e) {
+        ovlFlashSaveStatus('连不上桥接服务 —— 见 tools/latex-bridge/README.md', true);
+    } finally {
+        if (btn) btn.disabled = false;
+    }
+}
+
+// ---- WebSocket：磁盘外部改动推送（协议见 tools/latex-bridge/server.js 头部注释）----
+// 绝对路径怎么拼：projectDir（"项目绝对路径"输入框，跟 ovlDoRecompile 用的是同一个 DOM 元素/
+// 同一个 localStorage key）+ 当前打开文件的 name（FSA 句柄拿不到绝对路径，永久的浏览器沙箱
+// 限制，见 §3.2）。/compile 请求把这两块分开发给桥、让桥自己 path.join——这里前端要自己拼一份
+// 字符串塞进 WebSocket 订阅消息，逻辑镜像桥端 doCompile 里的
+// `path.isAbsolute(mainFile) ? mainFile : path.join(projectDir, mainFile)` 那一句。
+function ovlBridgeAbsPathFor(name) {
+    const pathInput = document.getElementById('ovlProjectPathInput');
+    const projectDir = pathInput ? pathInput.value.trim() : '';
+    if (!projectDir || !name) return null;
+    if (/^[a-zA-Z]:[\\/]|^\\\\/.test(name)) return name; // name 本身已经是绝对路径（跟 Node path.isAbsolute 同一条件的 Windows 简化版）
+    const sep = (projectDir.indexOf('\\') === -1 && projectDir.indexOf('/') !== -1) ? '/' : '\\';
+    return projectDir.replace(/[\\/]+$/, '') + sep + name;
+}
+
+let OvlBridgeWs = null;
+let OvlBridgeWsPath = null;      // 当前这条连接订阅的绝对路径（null = 没在订阅）
+let OvlBridgeWsReconnectTimer = null;
+let OvlBridgeWsReconnectDelay = 1000; // 简单指数退避，封顶 15s——桥离线/重启不是错误，安静重试
+
+function ovlBridgeWsUrl() { return OVL_BRIDGE_ORIGIN.replace(/^http/, 'ws'); }
+
+function ovlBridgeCloseWatch() {
+    if (OvlBridgeWsReconnectTimer) { clearTimeout(OvlBridgeWsReconnectTimer); OvlBridgeWsReconnectTimer = null; }
+    if (OvlBridgeWs) {
+        try {
+            OvlBridgeWs.onopen = OvlBridgeWs.onmessage = OvlBridgeWs.onclose = OvlBridgeWs.onerror = null;
+            OvlBridgeWs.close();
+        } catch (e) {}
+        OvlBridgeWs = null;
+    }
+    OvlBridgeWsPath = null;
+}
+
+function ovlBridgeConnectWs(absPath) {
+    let ws;
+    try { ws = new WebSocket(ovlBridgeWsUrl()); } catch (e) { return; } // 浏览器层面建不出来——安静放弃，不影响核心编辑
+    OvlBridgeWs = ws;
+    ws.onopen = function () {
+        OvlBridgeWsReconnectDelay = 1000; // 连上了，退避计时器归零
+        try { ws.send(JSON.stringify({ type: 'watch', path: absPath })); } catch (e) {}
+    };
+    ws.onmessage = function (ev) {
+        let msg;
+        try { msg = JSON.parse(ev.data); } catch (e) { return; }
+        if (msg && msg.type === 'changed') {
+            ovlBridgeHandleExternalChange(msg).catch(function (e) { console.error('[ovl] external change reload failed', e); });
+        }
+    };
+    ws.onclose = function () {
+        if (OvlBridgeWs !== ws) return; // 已经被 ovlBridgeUpdateWatch 换成新连接了，这是旧连接的收尾事件，不重复处理
+        OvlBridgeWs = null;
+        if (OvlBridgeWsPath === absPath) { // 还是同一个订阅目标——桥可能只是重启了一下，退避重连
+            const delay = Math.min(OvlBridgeWsReconnectDelay, 15000);
+            OvlBridgeWsReconnectDelay = Math.min(OvlBridgeWsReconnectDelay * 2, 15000);
+            OvlBridgeWsReconnectTimer = setTimeout(function () {
+                OvlBridgeWsReconnectTimer = null;
+                if (OvlBridgeWsPath === absPath) ovlBridgeConnectWs(absPath);
+            }, delay);
+        }
+    };
+    ws.onerror = function () { /* onclose 紧跟着会触发，退避重连逻辑都在那边，这里不用重复处理 */ };
+}
+
+// 文件打开/切换、项目路径变化（含浏览按钮选完）都调这个——桥离线/路径还没填全都只是"暂时不
+// 推送"，静默降级，不报错、不挡核心编辑（§3.1 第 3 条同一条纪律）。
+function ovlBridgeUpdateWatch() {
+    const cf = OvlState.currentFile;
+    if (!cf || !cf.name || !cf.handle || OvlState.usingWebkitFallback) { ovlBridgeCloseWatch(); return; }
+    const absPath = ovlBridgeAbsPathFor(cf.name);
+    if (!absPath) { ovlBridgeCloseWatch(); return; } // 项目路径还没填/还没用过浏览按钮——安静跳过，等填了再订阅
+    if (OvlBridgeWsPath === absPath && OvlBridgeWs && OvlBridgeWs.readyState === WebSocket.OPEN) return; // 已经订阅着同一个文件
+    ovlBridgeCloseWatch();
+    OvlBridgeWsPath = absPath;
+    ovlBridgeConnectWs(absPath);
+}
+
+// 自触发回声过滤：OvlState.lastSelfWriteMtimeMs/lastSelfWritePath 由 ovlSaveCurrentFile 每次
+// 真写完盘后记一下（从 FSA File.lastModified 读回来的，跟桥 fs.statSync().mtimeMs 是同一台机器
+// 同一个时钟），±1.5s 容差内且同一路径就认成"这是我们自己刚写的回声"，不重新加载——不用做到
+// 完全精确，见任务描述原话。
+const OVL_SELF_WRITE_TOLERANCE_MS = 1500;
+
+async function ovlBridgeHandleExternalChange(msg) {
+    const cf = OvlState.currentFile;
+    if (!cf || !cf.handle || OvlState.usingWebkitFallback) return; // 没有可重读的 FSA 句柄，安静忽略
+    const absPath = ovlBridgeAbsPathFor(cf.name);
+    if (!absPath || absPath !== msg.path) return; // 推送对应的不是当前打开的这个文件（比如刚切换文件，旧订阅还没关掉就来了一条）
+    if (typeof OvlState.lastSelfWriteMtimeMs === 'number' && OvlState.lastSelfWritePath === absPath
+        && Math.abs((msg.mtimeMs || 0) - OvlState.lastSelfWriteMtimeMs) < OVL_SELF_WRITE_TOLERANCE_MS) {
+        return; // 自己刚落盘触发的回声，不是外部改动
+    }
+    if (OvlState.dirty) return; // 有未保存的本地改动，不许覆盖（§ 任务描述明文要求）——等本地改动落盘/撤销后下一条 changed 事件再说
+    const file = await cf.handle.getFile();
+    const text = await file.text();
+    const ta = document.getElementById('ovlCodeArea');
+    if (!ta) return;
+    ta.value = text;
+    OvlState.lineOffsets = null;
+    ovlRecomputeLineOffsets();
+    ovlRenderGutter(true);
+    ovlBuildOutline();
+    if (OvlState.editorMode === 'visual') ovlVisualRender();
+    ovlFlashSaveStatus('已从磁盘同步外部改动', false);
+}
+
 // ---- M10 SyncTeX 正向（源码 -> PDF），§2.6.10 ----
 // 真跑桥的 /synctex/forward（桥内部调 TeX Live 自带的 synctex.exe view，本机 2026-08-24 实测
 // 走通，见 tools/latex-bridge/server.js 的 doSyncTexForward）。只做到页级跳转——v2 Pass D 那时
@@ -25918,11 +26084,19 @@ function ovlBindShell() {
             try { projectPathInput.value = localStorage.getItem('ovl.bridgeProjectPath') || ''; } catch (e) {}
             projectPathInput.addEventListener('change', function () {
                 try { localStorage.setItem('ovl.bridgeProjectPath', projectPathInput.value.trim()); } catch (e) {}
+                // v2 Pass P17：路径手改了，之前"缺路径没订阅"可能解除，或者要订阅换成新路径下的同名文件。
+                if (typeof ovlBridgeUpdateWatch === 'function') { try { ovlBridgeUpdateWatch(); } catch (e) {} }
             });
             projectPathInput.addEventListener('keydown', function (e) {
                 if (e.key === 'Enter') { e.preventDefault(); ovlDoRecompile().catch(function (e2) { console.error('[ovl] recompile failed', e2); }); }
             });
         }
+        // v2 Pass P17：原生文件夹选择框——用户明确表示两次不想手填/粘贴路径，输入框继续
+        // 保留当兜底（桥不在线/对话框失败/非 Windows 时还能手填），见 ovlBrowseProjectFolder。
+        const browseFolderBtn = document.getElementById('ovlBrowseFolderBtn');
+        if (browseFolderBtn) browseFolderBtn.addEventListener('click', function () {
+            ovlBrowseProjectFolder().catch(function (e) { console.error('[ovl] browse folder failed', e); });
+        });
         const logTabs = document.getElementById('ovlLogTabs');
         if (logTabs) {
             logTabs.addEventListener('click', function (e) {
