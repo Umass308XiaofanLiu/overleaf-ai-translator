@@ -27849,25 +27849,61 @@ function ovlClipboardWriteFallback(text) {
     } catch (e) { return false; }
 }
 
-// 「复制」按钮：跟「关注」共用同一个 focusOvlSelectionRange()——它已经按
-// OvlState.editorMode 分流了 Code textarea 选区 / Visual DOM Range，quote 是逐字对应的
-// 原始 LaTeX 源码（Visual 模式下不是渲染后的文字）。只读操作，没有任何正文改动，不需要
-// ovlEditorApplyReplace 那套 [start,end) 复核。
+// 「复制」按钮。
+// ⚠️ 2026-08-25 修：最初直接复用 focusOvlSelectionRange() 的 quote，结果选一个词/一句话
+// 点复制，复制出来的是所在整段——那是「关注」故意要的语义（focusOvlSelectionRange 为了
+// 让「关注」定位到唯一源码位置，会把选区扩展/对齐到整块/整行边界），不是「复制」该有的
+// 语义：选多少复制多少。
+// Code 模式：ta.value 本来就是源码，selectionStart/End 直接切片，不做任何扩展，逐字节精确。
+// Visual 模式：复用 P22 替换功能治「渲染重排」那套定位技术——ovlLocateVisualPick 先把
+// 搜索范围收窄到 focusOvlSelectionRange() 求出的所在块（不是拿它的 quote，只借用它的
+// {start,end} 当范围），再在范围内做空白容忍匹配，找到选中文字对应的精确原始片段。定位不到
+// 唯一匹配（渲染差异太大，比如复杂公式内部）才退回复制所在整段，并明确提示，而不是静默扩大。
 function ovlCopyLatexSource() {
     try {
-        const r = focusOvlSelectionRange();
-        if (!r.ok) { try { showToast(r.why || '没有选中内容。', 'warning'); } catch (e) {} return; }
-        const quote = r.quote;
+        let quote = '';
+        let fellBack = false;
+        if (OvlState.editorMode === 'code') {
+            const ta = document.getElementById('ovlCodeArea');
+            if (!ta || ta.disabled || ta.selectionStart === ta.selectionEnd) {
+                try { showToast('没有选中内容。', 'warning'); } catch (e) {}
+                return;
+            }
+            quote = ta.value.substring(ta.selectionStart, ta.selectionEnd);
+        } else {
+            const pane = document.getElementById('ovlVisualPane');
+            if (!pane) { try { showToast('没有选中内容。', 'warning'); } catch (e) {} return; }
+            const win = ovlWinOf(pane);
+            const sel = win.getSelection();
+            if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+                try { showToast('没有选中内容。', 'warning'); } catch (e) {} return;
+            }
+            const range = sel.getRangeAt(0);
+            if (!pane.contains(range.commonAncestorContainer)) {
+                try { showToast('没有选中内容。', 'warning'); } catch (e) {} return;
+            }
+            const pickedText = String(sel).replace(/\s+/g, ' ').trim();
+            if (!pickedText) { try { showToast('没有选中内容。', 'warning'); } catch (e) {} return; }
+            const scopeR = focusOvlSelectionRange();
+            if (!scopeR.ok) { try { showToast(scopeR.why || '没有选中内容。', 'warning'); } catch (e) {} return; }
+            const loc = ovlLocateVisualPick({ originalText: pickedText, visualScope: { start: scopeR.start, end: scopeR.end } });
+            if (loc.n === 1) {
+                quote = loc.text;
+            } else {
+                quote = scopeR.quote;
+                fellBack = true;
+            }
+        }
+        const afterCopy = function (ok) {
+            const msg = !ok ? '复制失败，剪贴板不可用。' : (fellBack ? '未能精确定位选中范围，已复制所在整段' : '已复制 LaTeX 原文');
+            try { showToast(msg, ok ? (fellBack ? 'warning' : 'success') : 'warning'); } catch (e) {}
+        };
         if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-            navigator.clipboard.writeText(quote).then(function () {
-                try { showToast('已复制 LaTeX 原文', 'success'); } catch (e) {}
-            }, function () {
-                const ok = ovlClipboardWriteFallback(quote);
-                try { showToast(ok ? '已复制 LaTeX 原文' : '复制失败，剪贴板不可用。', ok ? 'success' : 'warning'); } catch (e) {}
+            navigator.clipboard.writeText(quote).then(function () { afterCopy(true); }, function () {
+                afterCopy(ovlClipboardWriteFallback(quote));
             });
         } else {
-            const ok = ovlClipboardWriteFallback(quote);
-            try { showToast(ok ? '已复制 LaTeX 原文' : '复制失败，剪贴板不可用。', ok ? 'success' : 'warning'); } catch (e) {}
+            afterCopy(ovlClipboardWriteFallback(quote));
         }
     } catch (e) { console.error('[ovl] copyLatexSource failed', e); try { showToast('复制失败。', 'warning'); } catch (e2) {} }
 }
