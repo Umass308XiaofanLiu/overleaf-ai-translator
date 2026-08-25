@@ -210,6 +210,43 @@ function contentTypeFor(name) {
 // /compile
 // ---------------------------------------------------------------------------
 
+// bibtex 在 Windows/TeX Live 2025 + latexmk -outdir 组合下有个实测坑：latexmk 为了让 bibtex
+// 在 outdir 里写 .bbl/.blg，会先 "Change directory to" outdir，再靠它自己算出来的 BIBINPUTS
+// 环境变量指回 projectDir 让 bibtex 找到 .bib —— 但它算出来的是 Cygwin/MSYS 风格的路径
+// （形如 /e/OneDrive - University of Massachusetts/...），本机装的是原生 Windows bibtex.exe，
+// kpathsea 认不出这种 /e/ 盘符写法，于是 "I couldn't open database file"，bibtex 直接报错，
+// latexmk 把这当成致命错误，整条 rerun 链（多趟 pdflatex 收敛交叉引用）也跟着放弃 ——
+// 一份真实论文实测：全篇 \ref/\label 显示 ??、\cite 显示 [?]，根因是这一步，不是没编译够趟数。
+// 绕过办法不去掰 latexmk 内部的 Perl 路径转换（脆弱、版本相关），而是从根上让 bibtex 压根不
+// 需要跨目录找文件：编译前把 .tex 里 \bibliography{...}/\addbibresource{...} 点名的 .bib
+// 文件本身复制一份到这次编译专用的 outdir 里，bibtex 在自己 cwd 就能找到，BIBINPUTS 那条路
+// 径翻译错不错就无所谓了。只在 normal 模式（会跑 bibtex）时做；draft 模式单趟引擎调用，
+// 压根不碰 bibtex，不需要这一步。
+function copyBibResourcesToOutdir(mainAbs, projectDir, outdir) {
+    let text;
+    try { text = fs.readFileSync(mainAbs, 'utf8'); } catch (e) { return; }
+    const names = [];
+    const reClassic = /\\bibliography\{([^}]*)\}/g;
+    const reBiblatex = /\\addbibresource(?:\[[^\]]*\])?\{([^}]*)\}/g;
+    let m;
+    while ((m = reClassic.exec(text))) {
+        m[1].split(',').forEach((n) => { n = n.trim(); if (n) names.push(n.endsWith('.bib') ? n : n + '.bib'); });
+    }
+    while ((m = reBiblatex.exec(text))) {
+        const n = m[1].trim();
+        if (n) names.push(n.endsWith('.bib') ? n : n + '.bib');
+    }
+    names.forEach((name) => {
+        const src = path.join(projectDir, name);
+        if (!fs.existsSync(src)) return; // 找不到就跳过，交给 bibtex 自己按原样报错，不装作成功
+        const dest = path.join(outdir, name);
+        try {
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
+            fs.copyFileSync(src, dest);
+        } catch (e) { /* 复制失败不算致命：最坏情况退回旧行为（BIBINPUTS 路径翻译问题依旧） */ }
+    });
+}
+
 function doCompile(projectDir, mainFile, opts) {
     opts = opts || {};
     // engine: pdflatex（默认）/ xelatex / lualatex —— M7 Compiler 分类真的驱动这个。
@@ -241,6 +278,7 @@ function doCompile(projectDir, mainFile, opts) {
             resolve({ ok: false, error: (mode === 'draft' ? engine : 'latexmk') + ' 未找到: ' + compilerBin + '（检查 LATEX_BRIDGE_TEXBIN / TeX Live 是否安装）' });
             return;
         }
+        if (mode !== 'draft') copyBibResourcesToOutdir(mainAbs, projectDir, outdir);
 
         // 同一时间只允许一个编译在跑；新请求来了先杀掉旧的（§3.1 契约）。
         if (currentChild) {
