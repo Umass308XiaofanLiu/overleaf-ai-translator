@@ -30,6 +30,12 @@
  *     子进程里跑，不阻塞 Node 事件循环处理其他并发请求。
  *   - WebSocket（同一个 127.0.0.1:8181，跟 HTTP 共用同一个 http.Server 实例升级）：前端订阅
  *     一个绝对路径，磁盘上那个文件一变就推 {type:'changed', path, mtimeMs}，不带文件内容。
+ *
+ * v2 Pass P18 追加：GET /project-asset —— Visual 模式 \includegraphics 真缩略图的资源来源。
+ * projectDir 照样是前端每次请求带来的那个"项目绝对路径"输入框的值（跟 /compile 同一个
+ * 概念、同一种"桥不自己记状态"的传参方式，没有另起一套服务器端"当前项目路径"）；
+ * path 是相对路径，做一次真正的路径穿越防护（见 safeProjectAssetPath）后按扩展名给
+ * Content-Type 原样吐字节。
  */
 
 const http = require('http');
@@ -215,6 +221,42 @@ function contentTypeFor(name) {
     if (ext === '.log' || ext === '.txt' || ext === '.stdout' || ext === '.stderr' || ext === '.out') return 'text/plain; charset=utf-8';
     return 'application/octet-stream';
 }
+
+// ---------------------------------------------------------------------------
+// /project-asset —— v2 Pass P18：Visual 模式 \includegraphics 缩略图资源。
+//
+// 路径穿越防护镜像 safeOutdirForId 同一条防御纪律（"真的 resolve 出绝对路径以后拿字符串
+// 前缀比对，跑出边界一律拒绝"，不是靠 relPath 里"看起来有没有 .."这种字符串猜测）：
+//   - path.resolve(base, relPath)：relPath 如果本身是绝对路径（比如 query 里塞
+//     "C:\Windows\System32\xxx" 或 "/etc/passwd"），Node 的 path.resolve() 语义是直接
+//     无视 base、返回那个绝对路径本身——所以必须在 resolve 之后再比一次前缀，不能只信
+//     "看起来是相对路径"。
+//   - 前缀比较用 "base + 分隔符" 而不是裸 base，防止 "C:\proj-evil" 这种同前缀但其实是
+//     兄弟目录的假阳性（"C:\proj" 是 "C:\proj-evil" 的字符串前缀，但不是同一个目录）。
+// ---------------------------------------------------------------------------
+function safeProjectAssetPath(projectDir, relPath) {
+    if (typeof projectDir !== 'string' || !projectDir) return null;
+    if (typeof relPath !== 'string' || !relPath) return null;
+    let base;
+    try { base = path.resolve(projectDir); } catch (e) { return null; }
+    let resolved;
+    try { resolved = path.resolve(base, relPath); } catch (e) { return null; }
+    const baseWithSep = base.endsWith(path.sep) ? base : base + path.sep;
+    if (resolved !== base && resolved.indexOf(baseWithSep) !== 0) return null; // 跑出项目目录，一律拒绝
+    return resolved;
+}
+
+const ASSET_CONTENT_TYPES = {
+    '.pdf': 'application/pdf',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.svg': 'image/svg+xml'
+};
+// 100MB：简单的"荒谬大小"防御（一份论文的示意图/图表不会真的这么大），不是精细限流，
+// 单纯不让一个放错位置的巨型文件（比如整份数据集 .csv 被误传成 .pdf 扩展名）拖住响应。
+const ASSET_MAX_BYTES = 100 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // /compile
@@ -739,7 +781,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, POST /clear. WebSocket on same host:port for disk-change push.');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear. WebSocket on same host:port for disk-change push.');
             return;
         }
 
@@ -876,6 +918,52 @@ const server = http.createServer(async (req, res) => {
                 'Content-Type': contentTypeFor(filename),
                 'Content-Length': data.length,
                 'Content-Disposition': 'inline; filename="' + filename + '"'
+            });
+            res.end(data);
+            return;
+        }
+
+        // v2 Pass P18：Visual 模式 \includegraphics 真缩略图资源。GET（不是 POST）——纯读取，
+        // 前端 <img src=...> / pdfjsLib.getDocument(url) 都需要能直接当 URL 用，不能带 body。
+        if (req.method === 'GET' && pathname === '/project-asset') {
+            const projectDir = u.searchParams.get('projectDir');
+            const relPath = u.searchParams.get('path');
+            if (!projectDir || !relPath) {
+                sendJson(res, 400, { ok: false, error: 'projectDir 和 path 都是必填 query 参数' });
+                return;
+            }
+            if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) {
+                sendJson(res, 404, { ok: false, error: 'projectDir 不存在或不是目录: ' + projectDir });
+                return;
+            }
+            const resolved = safeProjectAssetPath(projectDir, relPath);
+            if (!resolved) {
+                sendJson(res, 404, { ok: false, error: 'invalid path（跑出项目目录范围）' });
+                return;
+            }
+            let st;
+            try { st = fs.statSync(resolved); } catch (e) {
+                sendJson(res, 404, { ok: false, error: 'file not found: ' + relPath });
+                return;
+            }
+            if (!st.isFile()) {
+                sendJson(res, 404, { ok: false, error: 'file not found: ' + relPath });
+                return;
+            }
+            if (st.size > ASSET_MAX_BYTES) {
+                sendJson(res, 400, { ok: false, error: '文件过大（' + Math.round(st.size / 1024 / 1024) + 'MB > ' + (ASSET_MAX_BYTES / 1024 / 1024) + 'MB），拒绝提供' });
+                return;
+            }
+            const contentType = ASSET_CONTENT_TYPES[path.extname(resolved).toLowerCase()] || 'application/octet-stream';
+            let data;
+            try { data = fs.readFileSync(resolved); } catch (e) {
+                sendJson(res, 404, { ok: false, error: 'read failed: ' + e.message });
+                return;
+            }
+            res.writeHead(200, {
+                'Content-Type': contentType,
+                'Content-Length': data.length,
+                'Cache-Control': 'no-store'
             });
             res.end(data);
             return;

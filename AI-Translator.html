@@ -1591,6 +1591,10 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 }
 .ovl-visual-fig-icon { font-size: 22px; opacity: 0.6; }
 .ovl-visual-fig-name { margin-top: 6px; font-size: 11.5px; color: #6b7280; word-break: break-all; text-align: center; }
+/* v2 Pass P18：真缩略图（<img>，raster/svg 直连 /project-asset，PDF 是 pdf.js 渲染出的
+   data URL）替换掉图标那一格，文件名说明文字保持不变——跟旧占位框视觉上是"同一个盒子
+   升级"，不是另起一套样式。 */
+.ovl-visual-fig-thumb { max-width: 100%; max-height: 120px; object-fit: contain; border-radius: 2px; }
 .ovl-visual-float-fallback { white-space: pre-wrap; }
 
 .ovl-pdf-panel {
@@ -23443,19 +23447,29 @@ function ovlRenderVisualAlgorithm(tex) {
 }
 
 // ---- 3) 图片 ----
-// 故意不真的去磁盘加载/解码 \includegraphics 引用的资源（任务原话："Deliberately DO NOT
-// attempt to actually load/decode the referenced image/PDF asset from disk"）——路径是相对
-// LaTeX 工程目录的、还有的直接是 PDF，真加载是比这次任务大得多的另一件事。只画一个占位框
-// + 取路径最后一段文件名当说明文字。
-function ovlExtractIncludegraphicsBasename(str) {
+// P15 原始行为：故意不真的去磁盘加载/解码 \includegraphics 引用的资源——只画一个占位框
+// + 取路径最后一段文件名当说明文字。v2 Pass P18 在此基础上升级：配好项目路径 + 桥在线时，
+// 异步把占位框里的图标换成真缩略图（见 ovlVisualLoadFigureThumbnails），但"占位框先立刻
+// 显示、图标+文件名兜底"这条 P15 行为原样保留——没有项目路径/桥不在线/文件缺失/格式不支持
+// 都会静默停在这个占位框上，不是错误状态。
+function ovlExtractIncludegraphicsPath(str) {
     const m = /\\includegraphics\s*(?:\[[^\]]*\])?\s*\{([^{}]*)\}/.exec(str);
     if (!m) return null;
-    const path = m[1].trim();
-    const parts = path.split(/[\\/]/);
-    return parts[parts.length - 1] || path;
+    return m[1].trim();
 }
-function ovlRenderFigurePlaceholder(basename) {
-    return '<div class="ovl-visual-fig-box">'
+function ovlExtractIncludegraphicsBasename(str) {
+    const p = ovlExtractIncludegraphicsPath(str);
+    if (!p) return null;
+    const parts = p.split(/[\\/]/);
+    return parts[parts.length - 1] || p;
+}
+// relPath：\includegraphics{...} 里原样的相对路径（用来向桥要真缩略图）；basename 只用来
+// 显示。relPath 为 null（正则没匹配到）时退化成纯 "(no image)" 占位，不带 data-fig-src，
+// ovlVisualLoadFigureThumbnails 天然跳过它。
+function ovlRenderFigurePlaceholder(relPath) {
+    const basename = relPath ? (relPath.split(/[\\/]/).pop() || relPath) : null;
+    const srcAttr = relPath ? (' data-fig-src="' + escapeHtml(relPath) + '"') : '';
+    return '<div class="ovl-visual-fig-box"' + srcAttr + '>'
         + '<div class="ovl-visual-fig-icon">&#128444;</div>'
         + '<div class="ovl-visual-fig-name">' + (basename ? escapeHtml(basename) : '(no image)') + '</div>'
         + '</div>';
@@ -23476,12 +23490,12 @@ function ovlRenderVisualFigure(tex) {
     const boxes = [];
     let mm;
     while ((mm = minipageRe.exec(inner))) {
-        boxes.push(ovlRenderFigurePlaceholder(ovlExtractIncludegraphicsBasename(mm[1])));
+        boxes.push(ovlRenderFigurePlaceholder(ovlExtractIncludegraphicsPath(mm[1])));
     }
     if (!boxes.length) {
         // 没有 minipage 子图——直接在整个 figure 体里找一张 \includegraphics。
-        const basename = ovlExtractIncludegraphicsBasename(inner);
-        if (basename) boxes.push(ovlRenderFigurePlaceholder(basename));
+        const relPath = ovlExtractIncludegraphicsPath(inner);
+        if (relPath) boxes.push(ovlRenderFigurePlaceholder(relPath));
     }
     let html = '<div class="ovl-visual-figure-wrap">';
     html += '<div class="ovl-visual-fig-row">' + boxes.join('') + '</div>';
@@ -23490,6 +23504,121 @@ function ovlRenderVisualFigure(tex) {
     }
     html += '</div>';
     return html;
+}
+
+// ==================== v2 Pass P18：\includegraphics 真缩略图（图标占位框的优雅升级）====================
+// 契约：占位框（图标+文件名）永远先同步画出来（就是上面 ovlRenderFigurePlaceholder 那份 P15
+// 行为，一个字节没变），缩略图是"资源解析完之后再异步换上去"的增强——不阻塞 Visual 渲染，
+// 没有项目路径/桥离线/文件缺失/格式不支持这几种情况一律安静地维持占位框原状，不报错、
+// 不显示浏览器原生的"图片裂开"图标。调用入口是 ovlVisualRender() 里 pane.innerHTML = html
+// 之后紧跟的 ovlVisualLoadFigureThumbnails(pane) 一行。
+//
+// 缓存 key = 项目路径 + 原始相对路径（项目路径变了要重新拉，没变、同一张图在文档里出现
+// 多次或者 Visual 面板因为敲字反复整篇重渲染，都只真正 fetch/pdf.js 渲染一次）。value 三态：
+//   Promise   —— 正在解析中，并发的同一个 key 直接拿同一个 promise 对齐，不重复发请求
+//   {ok:true,url} —— 解析成功，url 可以直接当 <img src> 用（raster/svg 是 blob object URL，
+//                     PDF 是 pdf.js 渲出页 1 后 canvas.toDataURL 出来的小图，两种统一成
+//                     "一个能当图片源的字符串"，应用逻辑不用分种类）
+//   {ok:false} —— 优雅降级：不支持的格式/404/渲染失败，调用方原样保留占位框，不动 DOM
+const OvlFigThumbCache = new Map();
+const OVL_FIG_THUMB_RASTER_EXTS = ['png', 'jpg', 'jpeg', 'gif', 'svg'];
+const OVL_FIG_THUMB_MAX_DIM = 160; // 缩略图目标边长（px）——不是主预览，PDF 再大也按这个尺度渲染，保持快
+
+function ovlFigThumbExt(relPath) {
+    const m = /\.([a-zA-Z0-9]+)$/.exec(relPath || '');
+    return m ? m[1].toLowerCase() : '';
+}
+
+async function ovlResolveFigureThumb(projectDir, relPath) {
+    const assetUrl = ovlBridgeUrl('/project-asset?projectDir=' + encodeURIComponent(projectDir) + '&path=' + encodeURIComponent(relPath));
+    const ext = ovlFigThumbExt(relPath);
+    if (OVL_FIG_THUMB_RASTER_EXTS.indexOf(ext) !== -1) {
+        try {
+            const resp = await fetch(assetUrl);
+            if (!resp.ok) return { ok: false }; // 404（文件不存在/穿越被拒）或桥端其他错误——原样退化
+            const blob = await resp.blob();
+            if (!blob || !blob.size) return { ok: false };
+            return { ok: true, url: URL.createObjectURL(blob) };
+        } catch (e) {
+            return { ok: false }; // 桥没起来/网络层失败——安静退化，不抛给调用方
+        }
+    }
+    if (ext === 'pdf') {
+        // 复用 P16 已经加载好的全局 pdfjsLib；这里的 doc 跟 OvlState.pdfDoc（编译结果主预览）
+        // 是完全独立的两份文档对象，各自 getDocument/destroy，互不相干，不共用那份缓存
+        // （那份缓存是"当前编译输出"专用的，语义不一样，混用会在切文档/重编译时互相踩）。
+        if (typeof pdfjsLib === 'undefined') return { ok: false };
+        let doc = null;
+        try {
+            doc = await pdfjsLib.getDocument(assetUrl).promise;
+            const page = await doc.getPage(1);
+            const unitViewport = page.getViewport({ scale: 1 });
+            const longest = Math.max(unitViewport.width, unitViewport.height) || 1;
+            const scale = Math.max(0.05, Math.min(3, OVL_FIG_THUMB_MAX_DIM / longest));
+            const viewport = page.getViewport({ scale: scale });
+            const canvas = document.createElement('canvas');
+            canvas.width = Math.max(1, Math.round(viewport.width));
+            canvas.height = Math.max(1, Math.round(viewport.height));
+            const ctx = canvas.getContext('2d');
+            await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+            return { ok: true, url: canvas.toDataURL('image/png') };
+        } catch (e) {
+            return { ok: false }; // 损坏的 PDF / 桥离线 / 404——原样退化到占位框
+        } finally {
+            if (doc) { try { doc.destroy(); } catch (e2) {} }
+        }
+    }
+    return { ok: false }; // 不认识的扩展名（.eps/.tikz 之类），P15 原始占位框就是给这种情况兜底的
+}
+
+function ovlGetFigureThumb(projectDir, relPath) {
+    const key = projectDir + ' ' + relPath;
+    const cached = OvlFigThumbCache.get(key);
+    if (cached) return cached; // Promise 或终态对象，直接复用，不重新发起
+    const p = ovlResolveFigureThumb(projectDir, relPath).then(function (result) {
+        OvlFigThumbCache.set(key, result); // 用终态对象替换 Promise：以后同 key 的调用同步命中缓存
+        return result;
+    });
+    OvlFigThumbCache.set(key, p);
+    return p;
+}
+
+function ovlApplyFigureThumb(box, result) {
+    if (!box || !result || !result.ok || !result.url) return; // 失败/不支持——占位框保持原状，这就是优雅降级
+    if (box.querySelector('.ovl-visual-fig-thumb')) return; // 已经换过图了（比如缓存同步命中 + 异步回调都触发了一次），不重复插入
+    const icon = box.querySelector('.ovl-visual-fig-icon');
+    if (!icon) return;
+    const img = document.createElement('img');
+    img.className = 'ovl-visual-fig-thumb';
+    img.alt = '';
+    img.src = result.url;
+    // 万一 objectURL/dataURL 本身在插入之后失效（极端情况），静默移除，露出下面的文件名
+    // 文字兜底，不换回图标（图标已经被替换掉了），也绝不抛出未捕获异常。
+    img.onerror = function () { try { img.remove(); } catch (e) {} };
+    icon.replaceWith(img);
+}
+
+// Visual 面板整篇重渲染之后调用一次：扫一遍这次渲染里所有待解析的占位框，异步补真缩略图。
+// 不阻塞——ovlVisualRender() 已经把占位框同步画完并返回了，这里全是 fire-and-forget 的
+// then() 回调，回调触发时该 box 如果因为用户又敲了字导致整篇重渲染而已经不在 DOM 里
+// （box.isConnected === false），直接跳过，不做无意义的 DOM 操作。
+function ovlVisualLoadFigureThumbnails(root) {
+    if (!root) return;
+    const boxes = root.querySelectorAll('.ovl-visual-fig-box[data-fig-src]');
+    if (!boxes.length) return;
+    const pathInput = document.getElementById('ovlProjectPathInput');
+    const projectDir = pathInput ? pathInput.value.trim() : '';
+    if (!projectDir) return; // 没配置项目路径——保持 P15 原样的图标+文件名占位框，这本身就是预期降级
+    boxes.forEach(function (box) {
+        const relPath = box.getAttribute('data-fig-src');
+        if (!relPath) return;
+        const outcome = ovlGetFigureThumb(projectDir, relPath);
+        if (outcome && typeof outcome.then === 'function') {
+            outcome.then(function (result) { if (box.isConnected) ovlApplyFigureThumb(box, result); });
+        } else {
+            ovlApplyFigureThumb(box, outcome);
+        }
+    });
 }
 
 // v2 Pass P10/P11：Visual 模式行号。LatexFilter 是整篇多趟定点宏展开的纯文本变换
@@ -23663,6 +23792,8 @@ function ovlVisualRender() {
         if (preEl) preEl.textContent = preamble;
         const tailEl = pane.querySelector('.ovl-visual-tail');
         if (tailEl) tailEl.textContent = tail;
+        // v2 Pass P18：占位框已经同步画完，这里异步补真缩略图（图片/PDF），不阻塞上面这次渲染。
+        if (typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(pane);
         // getBoundingClientRect 会强制走一次同步布局，量到的是刚写进去的这份真实渲染结果，
         // 不需要等 rAF/setTimeout。放在 innerHTML 赋值之后的最后一步，任何调用 ovlVisualRender
         // 的地方（切模式/换文件/折叠导言区）都自动带上正确的 gutter，不用每个调用点各自记得再调一次。
