@@ -1428,6 +1428,7 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 .ovl-gutter {
     flex: 0 0 auto;
     width: 48px;
+    position: relative; /* v2 Pass P11：Visual 模式的行号格子靠这个当定位基准，见 .ovl-ln-visual */
     background: #F0F0F0;
     color: #333333;
     font: 12px/1.5 "SFMono-Regular", Consolas, "Courier New", monospace;
@@ -1439,6 +1440,15 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
     white-space: pre;
 }
 .ovl-ln { height: 1.5em; cursor: pointer; }
+/* v2 Pass P11：Visual 模式复用同一根 #ovlGutter，但行号格子改绝对定位——每块渲染高度
+   本来就不一致（标题矮、公式/表格可能很高），没法像 Code 模式那样靠固定行高的正常流堆叠。
+   ovlRenderVisualGutter() 会在填 Visual 内容时把 gutter 的 padding-top 临时清零，
+   这里的 top 值才能跟量出来的块偏移直接对应，不用另外在 JS 里补偿一个常数偏移。 */
+.ovl-ln-visual {
+    position: absolute; left: 0; right: 0;
+    display: flex; align-items: flex-start; justify-content: flex-end;
+    padding-right: 8px; box-sizing: border-box; cursor: pointer;
+}
 /* v2 Pass P7：gutter 行号点选（docs/v2_editor_focus_lineselect_plan.md §2.4）。
    行选用半透明叠加而不是纯色块，浅色/深色两套 gutter 主题（ovlApplySettings）下都看得清，
    不需要在 JS 里再开一处主题分支。 */
@@ -1517,18 +1527,12 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 /* 正文这一段走 marked.parse 出来的普通 HTML（h1..h6/ul/ol/p/strong/em），照 Overleaf
    的字号/间距给一套朴素的学术论文排版观感——不追求跟 pdflatex 的真实排版像素对齐。 */
 .ovl-visual-body { line-height: 1.7; max-width: 860px; }
-/* v2 Pass P10：Visual 行号。每个段落块一行 flex：左边固定宽度的行号列（视觉上跟 Code 模式
-   的 .ovl-gutter 呼应，但不是一根连续的侧栏——块高度本来就不一致，硬做成连续侧栏得算每块
-   像素位置，历史上这条路正是"位置算错"那次事故的成因，这里不重蹈）。pointer-events:none +
-   user-select:none：拖选正文翻译文字时手不该被行号数字挡住或被带进选区。 */
-.ovl-visual-block { display: flex; align-items: flex-start; }
-.ovl-visual-linetag {
-    flex: 0 0 40px; text-align: right; padding-right: 10px; margin-top: 0.35em;
-    font: 11px/1.4 "SFMono-Regular", Consolas, "Courier New", monospace;
-    color: #b0b7c3; user-select: none; pointer-events: none;
-}
-.ovl-visual-blockbody { flex: 1 1 auto; min-width: 0; }
-.ovl-visual-blockbody > *:first-child { margin-top: 0; }
+/* v2 Pass P11：Visual 行号改成跟 Code 模式共用同一根 #ovlGutter 竖列（用户明确要的是
+   "同一根横轴"，块内联小字那版对不上 Code 模式的 gutter 列位置，已弃用）。这里的块本身
+   只是量高度用的锚点，不再自己承担排版——行号格子的绝对定位/画法在 ovlRenderVisualGutter()
+   里，跟着 .ovl-gutter 现有的样式规则走（1428 行附近），不在这里重复定义一套。 */
+.ovl-visual-block { display: block; }
+.ovl-visual-block > *:first-child { margin-top: 0; }
 .ovl-visual-body h1, .ovl-visual-body h2, .ovl-visual-body h3,
 .ovl-visual-body h4, .ovl-visual-body h5, .ovl-visual-body h6 {
     font-weight: 700; margin: 1.2em 0 0.5em; color: #111827;
@@ -22888,20 +22892,25 @@ function ovlSetEditorMode(mode) {
         }
         if (mode === 'visual') {
             if (ta) ta.style.display = 'none';
-            if (gutter) gutter.style.display = 'none';
+            // v2 Pass P11：gutter 不再隐藏——用户明确要 Visual 模式也有行号，而且要跟 Code
+            // 模式"同一根横轴"，所以两种模式共用同一个 #ovlGutter，只是格子的画法/定位方式
+            // 不一样（ovlRenderVisualGutter 里绝对定位）。gutter.style.display 保持原样即可。
             if (visual) visual.style.display = 'flex';
             // M5：每次切进 Visual 才重新渲染一次（不跟着敲键盘走，本来就是只读，见下方
             // ovlVisualRender 头部的注释）——切模式时编辑器缓冲区可能比上次渲染时新。
+            // ovlVisualRender() 末尾会自己调 ovlRenderVisualGutter()，这里不用再调一次。
             ovlVisualRender();
         } else {
             if (ta) ta.style.display = '';
             if (gutter) gutter.style.display = '';
+            if (gutter) gutter.style.paddingTop = ''; // 撤销 ovlRenderVisualGutter 为对齐而清零的 padding
             if (visual) visual.style.display = 'none';
             // v2 Polish 2（Bug 2）：从 Visual 切回 Code，#ovlCodeArea 刚从 display:none 变回来，
             // 之前 clientWidth<=0 被 ovlRecomputeLineOffsets 跳过的那次现在能补上了。用防抖
             // （而不是同步调）是因为 display 切换到布局真正生效之间也隔着一次重排，跟
             // splitter/resize 是同一个理由。
             ovlScheduleLineOffsetRecompute(50);
+            ovlRenderGutter(true); // 把 gutter 内容从 Visual 的绝对定位格子换回 Code 的正常流格子
         }
     } catch (e) {
         console.error('[ovl] setEditorMode failed', e);
@@ -22993,6 +23002,7 @@ function ovlVisualRender() {
         const src = ta ? ta.value : '';
         if (!src) {
             pane.innerHTML = '<div class="ovl-visual-empty">打开一个 .tex 文件后这里会显示只读预览。</div>';
+            if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter(); // 没内容=没块，清空 gutter
             return;
         }
         // LatexFilter/marked/KaTeX 任何一个没就绪都不假装能渲染——直接显示原始源码，
@@ -23001,6 +23011,7 @@ function ovlVisualRender() {
             pane.innerHTML = '<div class="ovl-visual-empty">Visual 预览暂不可用（LatexFilter/marked/KaTeX 未就绪），已显示原始源码：</div><pre class="ovl-visual-raw"></pre>';
             const pre = pane.querySelector('.ovl-visual-raw');
             if (pre) pre.textContent = src;
+            if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
             return;
         }
 
@@ -23045,10 +23056,15 @@ function ovlVisualRender() {
         if (preEl) preEl.textContent = preamble;
         const tailEl = pane.querySelector('.ovl-visual-tail');
         if (tailEl) tailEl.textContent = tail;
+        // getBoundingClientRect 会强制走一次同步布局，量到的是刚写进去的这份真实渲染结果，
+        // 不需要等 rAF/setTimeout。放在 innerHTML 赋值之后的最后一步，任何调用 ovlVisualRender
+        // 的地方（切模式/换文件/折叠导言区）都自动带上正确的 gutter，不用每个调用点各自记得再调一次。
+        if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
     } catch (e) {
         console.error('[ovl] visualRender failed', e);
         const pane = document.getElementById('ovlVisualPane');
         if (pane) pane.innerHTML = '<div class="ovl-visual-empty">Visual 预览渲染失败，请切回 Code 模式查看源码。</div>';
+        if (typeof ovlRenderVisualGutter === 'function') { try { ovlRenderVisualGutter(); } catch (e2) {} }
     }
 }
 
@@ -25377,10 +25393,12 @@ function ovlApplySettings() {
             else { ta.style.background = ''; ta.style.color = ''; }
         }
         if (gutter) {
-            // Bug 1 修复：Visual 模式是完全不同的渲染面板，跟源码行没有 1:1 对应关系，
-            // gutter 的显隐不能只看 showLineNumbers——还得看当前是不是 Visual 模式，
-            // 否则任何设置变更（包括跟行号毫无关系的）都会把 gutter 錯位地叠回 Visual 面板上。
-            gutter.style.display = (OvlSettings.showLineNumbers && OvlState.editorMode !== 'visual') ? '' : 'none';
+            // v2 Pass P11：Visual 模式现在也用同一根 gutter（见 ovlSetEditorMode/
+            // ovlRenderVisualGutter），显隐只看 showLineNumbers 这一个开关就够了——不用再
+            // 按 editorMode 单独排除 Visual。P6 那次"改设置 gutter 错位地叠回 Visual 面板"
+            // 的 bug，根因是内容画法本身在猜位置（已经用绝对定位+实测高度换掉了），不是显隐
+            // 判断的问题，不需要靠"Visual 下强制隐藏"这种迂回方式来避免。
+            gutter.style.display = OvlSettings.showLineNumbers ? '' : 'none';
             if (OvlSettings.editorTheme === 'dark') { gutter.style.background = '#252526'; gutter.style.color = '#858585'; }
             else { gutter.style.background = ''; gutter.style.color = ''; }
         }
@@ -26543,23 +26561,33 @@ function ovlGutterLineAtClientY(clientY) {
 
 // gutter 上的两种标记一次刷完（行选蓝底 + P8 的关注黄条），一趟循环。只在「手势里 head 真的
 // 换了一行」和「gutter 重建之后」调用，不是每像素调用。
+// v2 Pass P11：现在 #ovlGutter 两种模式共用，这里按 OvlState.editorMode 分流——Code 模式
+// 的格子用 data-ln 直接就是选区判定用的 index；Visual 模式的格子还是有 data-ln（画黄色关注
+// 条要用，语义是"这块的起始源码行"），但选区判定得看 data-block（块的序号，不是行号，
+// 块与块之间不是逐行连续的）。两套 anchor/head 状态分开存在 OvlGutterSel/OvlVisualGutterSel，
+// 不共用一份，避免切模式时把上一个模式的选区语义带过来用错。
 function ovlPaintGutterMarks() {
     try {
         const gutter = document.getElementById('ovlGutter');
         if (!gutter) return;
-        const has = OvlGutterSel.anchorLine >= 0;
-        const lo = has ? Math.min(OvlGutterSel.anchorLine, OvlGutterSel.headLine) : -1;
-        const hi = has ? Math.max(OvlGutterSel.anchorLine, OvlGutterSel.headLine) : -2;
+        const visual = OvlState.editorMode === 'visual';
+        const sel = visual ? OvlVisualGutterSel : OvlGutterSel;
+        const anchor = visual ? sel.anchorBlock : sel.anchorLine;
+        const head = visual ? sel.headBlock : sel.headLine;
+        const has = anchor >= 0;
+        const lo = has ? Math.min(anchor, head) : -1;
+        const hi = has ? Math.max(anchor, head) : -2;
         // P8 会在这里填 focusTexGutterLines()；P7 阶段这个函数还不存在，固定为空数组。
         const foc = (typeof focusTexGutterLines === 'function') ? focusTexGutterLines() : [];
         const cells = gutter.children;
         for (let i = 0; i < cells.length; i++) {
             const c = cells[i];
             const ln = parseInt(c.getAttribute('data-ln'), 10);
-            const ok = isFinite(ln);
-            c.classList.toggle('ovl-ln-sel', ok && ln >= lo && ln <= hi);
+            const idx = visual ? parseInt(c.getAttribute('data-block'), 10) : ln;
+            const ok = isFinite(idx);
+            c.classList.toggle('ovl-ln-sel', ok && idx >= lo && idx <= hi);
             let f = false;
-            for (let k = 0; k < foc.length; k++) { if (ok && ln >= foc[k][0] && ln <= foc[k][1]) { f = true; break; } }
+            if (isFinite(ln)) { for (let k = 0; k < foc.length; k++) { if (ln >= foc[k][0] && ln <= foc[k][1]) { f = true; break; } } }
             c.classList.toggle('ovl-ln-focus', f);
         }
     } catch (e) { /* 装饰性：坏了当没有，绝不把异常带回渲染路径 */ }
@@ -26569,6 +26597,8 @@ function ovlGutterClearSelection() {
     OvlGutterSel.anchorLine = -1; OvlGutterSel.headLine = -1;
     OvlGutterSel.dragging = false; OvlGutterSel.pointerId = null;
     OvlGutterSel.lineStarts = null; OvlGutterSel.textLen = -1;
+    OvlVisualGutterSel.anchorBlock = -1; OvlVisualGutterSel.headBlock = -1;
+    OvlVisualGutterSel.dragging = false; OvlVisualGutterSel.pointerId = null;
     ovlPaintGutterMarks();
 }
 
@@ -26643,6 +26673,181 @@ function ovlBindGutterSelect() {
     gutter.addEventListener('pointerup', endDrag);
     gutter.addEventListener('pointercancel', endDrag);
     gutter.addEventListener('lostpointercapture', endDrag);   // endDrag 自带幂等哨兵，重复调用无害
+}
+
+// ==================== v2 Pass P11：Visual 模式的 gutter（跟 Code 模式共用同一个
+// #ovlGutter，用户明确要的是"同一根横轴"，不是另起一条对不齐的列）====================
+//
+// 每块渲染高度天生不一致（标题矮、公式/表格可能很高），没法像 Code 模式那样靠固定行高
+// 正常流堆叠，所以这里的格子是 position:absolute，Y 位置从 .ovl-visual-block 的真实渲染
+// 高度量出来——量的时候临时把 gutter 的 padding-top 清零，这样"块相对 pane 内容顶端的
+// 偏移"和"格子的 top 值"就是同一个数，不用在 JS 里另外补偿两边 padding 不一致的常数。
+let OvlVisualBlockRects = [];
+let OvlVisualGutterSel = { anchorBlock: -1, headBlock: -1, dragging: false, pointerId: null };
+
+function ovlRenderVisualGutter() {
+    try {
+        const gutter = document.getElementById('ovlGutter');
+        const pane = document.getElementById('ovlVisualPane');
+        if (!gutter || !pane) return;
+        if (OvlState.editorMode !== 'visual') return; // Code 模式下这根 gutter 不归这个函数管
+        const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+        gutter.style.paddingTop = '0px';
+        OvlVisualBlockRects = [];
+        if (!blocks.length) { gutter.innerHTML = ''; return; }
+        const paneRect = pane.getBoundingClientRect();
+        // gutter 和 pane 是同一个 flex 行里的两个兄弟节点，边框盒的顶边天然对齐（同一个 Y）。
+        // gutter 自己的 padding-top 已经清零，所以"cell.style.top = X"就是 X 像素落在
+        // gutter 边框顶边下方——要跟 pane 里的块对齐，X 就该是"块边框盒顶边相对 pane 边框盒
+        // 顶边的距离"，不能再额外减 pane 自己的 padding-top（块本来就已经画在 pane 的
+        // padding 里面，r.top 相对 paneRect.top 的差值天然已经含着这段 padding，再减一次
+        // 就是把整列行号硬拔高了 20px——上一版实测的那个恒定 20px 偏差，根就在这里多减了
+        // 一次，不是字体加载的问题（那个是另一个真问题，也一并修了，见下面 fonts.ready）。
+        const frag = document.createDocumentFragment();
+        blocks.forEach(function (blk, i) {
+            const r = blk.getBoundingClientRect();
+            const top = (r.top - paneRect.top) + pane.scrollTop;
+            const h = Math.max(r.height, 16);
+            const ln = parseInt(blk.getAttribute('data-src-line'), 10);
+            const cell = document.createElement('div');
+            cell.className = 'ovl-ln ovl-ln-visual';
+            cell.setAttribute('data-ln', String(ln));
+            cell.setAttribute('data-block', String(i));
+            cell.style.top = Math.max(0, top) + 'px';
+            cell.style.height = h + 'px';
+            cell.textContent = String(ln + 1);
+            frag.appendChild(cell);
+            OvlVisualBlockRects.push({ line: ln, el: blk });
+        });
+        gutter.innerHTML = '';
+        gutter.appendChild(frag);
+        gutter.scrollTop = pane.scrollTop;
+        ovlPaintGutterMarks();
+        ovlScheduleVisualGutterAfterFonts(0);
+    } catch (e) { console.error('[ovl] renderVisualGutter failed', e); }
+}
+
+// 12931 行附近那次"math-heavy 尾行漂移 25px"事故的同一个根因，这里又踩了一次：KaTeX 那
+// 二十多个 webfont 是异步落地的，量块高度那一刻很可能字体还在 'loading'，量到的是回退字体
+// 的行高，公式一多的段落字体落地后会重新排版长高，越往后累积偏差越大（实测 main.tex 抽样
+// 最大到 64px）。同一套修法：挂 document.fonts.ready，落地后照原样重新量一遍，不新造一套。
+let ovlVisualGutterFontSettlePending = false;
+function ovlScheduleVisualGutterAfterFonts(depth) {
+    try {
+        if (ovlVisualGutterFontSettlePending) return;
+        const fonts = document.fonts;
+        if (!fonts || fonts.status !== 'loading') return;
+        if (!fonts.ready || typeof fonts.ready.then !== 'function') return;
+        const next = (depth || 0) + 1;
+        ovlVisualGutterFontSettlePending = true;
+        fonts.ready.then(function () {
+            ovlVisualGutterFontSettlePending = false;
+            if (OvlState.editorMode === 'visual') ovlRenderVisualGutter();
+            // 字体可能分批到达，最多再等三轮，必然终止（跟 scheduleAlignAfterFonts 同一个上限）。
+            if (next < 4) ovlScheduleVisualGutterAfterFonts(next);
+        }, function () {
+            ovlVisualGutterFontSettlePending = false;
+        });
+    } catch (e) {}
+}
+
+// pane 滚动时 gutter 跟着滚——和 Code 模式 `gutter.scrollTop = ta.scrollTop` 同一条纪律，
+// 只是源头换成了 .ovl-visual-pane。只在 Visual 模式下才生效，Code 模式下这个监听器空转。
+function ovlSyncVisualGutterScroll() {
+    if (OvlState.editorMode !== 'visual') return;
+    const gutter = document.getElementById('ovlGutter');
+    const pane = document.getElementById('ovlVisualPane');
+    if (gutter && pane) gutter.scrollTop = pane.scrollTop;
+}
+
+// clientY → 块序号（elementFromPoint 命中测试，跟 Code 模式的 ovlGutterLineAtClientY 同一
+// 套路子）；x 取 gutter 横向中线，y 夹在 gutter 盒子内，拖出上下边界钉在首/末块。
+function ovlVisualBlockAtClientY(clientY) {
+    const gutter = document.getElementById('ovlGutter');
+    if (!gutter) return -1;
+    const gr = gutter.getBoundingClientRect();
+    const px = gr.left + gr.width / 2;
+    const py = Math.max(gr.top + 1, Math.min(gr.bottom - 1, clientY));
+    const el = document.elementFromPoint(px, py);
+    const cell = (el && el.closest) ? el.closest('.ovl-ln-visual') : null;
+    if (!cell) return -1;
+    const n = parseInt(cell.getAttribute('data-block'), 10);
+    return isFinite(n) ? n : -1;
+}
+
+// 把 [lo, hi] 两个块序号变成浏览器 Selection，覆盖这几块渲染出来的全部内容——下游的
+// #ovlQuickActions/翻译/关注全部读的是这份 Selection，不需要给 Visual 模式另建一套判定。
+function ovlVisualGutterSelectRange(lo, hi) {
+    const pane = document.getElementById('ovlVisualPane');
+    if (!pane || !OvlVisualBlockRects.length) return null;
+    lo = Math.max(0, Math.min(OvlVisualBlockRects.length - 1, lo));
+    hi = Math.max(0, Math.min(OvlVisualBlockRects.length - 1, hi));
+    const startEl = OvlVisualBlockRects[lo].el, endEl = OvlVisualBlockRects[hi].el;
+    try {
+        const range = document.createRange();
+        range.setStartBefore(startEl);
+        range.setEndAfter(endEl);
+        const win = ovlWinOf(pane);
+        const sel = win.getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return range;
+    } catch (e) { return null; }
+}
+
+function ovlVisualGutterCommitSelection(showQa) {
+    if (OvlVisualGutterSel.anchorBlock < 0) return;
+    const lo = Math.min(OvlVisualGutterSel.anchorBlock, OvlVisualGutterSel.headBlock);
+    const hi = Math.max(OvlVisualGutterSel.anchorBlock, OvlVisualGutterSel.headBlock);
+    const range = ovlVisualGutterSelectRange(lo, hi);
+    ovlPaintGutterMarks();
+    if (showQa && range) {
+        const r = range.getBoundingClientRect();
+        // 工具条锚在选中内容的左上角附近，跟 ovlGutterShowQuickActions（Code 模式那版）
+        // 同一个"别压住 gutter"的分寸，往右让开 gutter 的宽度。
+        const gutter = document.getElementById('ovlGutter');
+        const minX = gutter ? gutter.getBoundingClientRect().right + 8 : 8;
+        ovlShowQuickActionsAt(Math.max(r.left + 20, minX), Math.max(r.top, 36), 'visual');
+    }
+}
+
+function ovlBindVisualGutterSelect() {
+    const gutter = document.getElementById('ovlGutter');
+    if (!gutter) return;
+
+    gutter.addEventListener('pointerdown', function (e) {
+        if (e.button !== 0 || OvlState.editorMode !== 'visual') return;
+        const b = ovlVisualBlockAtClientY(e.clientY);
+        if (b < 0) return;
+        e.preventDefault();
+        if (!(e.shiftKey && OvlVisualGutterSel.anchorBlock >= 0)) OvlVisualGutterSel.anchorBlock = b;
+        OvlVisualGutterSel.headBlock = b;
+        OvlVisualGutterSel.dragging = true;
+        OvlVisualGutterSel.pointerId = e.pointerId;
+        try { gutter.setPointerCapture(e.pointerId); } catch (err) {}
+        if (typeof ovlVisTransHide === 'function') ovlVisTransHide();
+        if (typeof ovlHideQuickActions === 'function') ovlHideQuickActions();
+        ovlVisualGutterCommitSelection(false);
+    });
+
+    gutter.addEventListener('pointermove', function (e) {
+        if (!OvlVisualGutterSel.dragging || e.pointerId !== OvlVisualGutterSel.pointerId || OvlState.editorMode !== 'visual') return;
+        const b = ovlVisualBlockAtClientY(e.clientY);
+        if (b < 0 || b === OvlVisualGutterSel.headBlock) return;
+        OvlVisualGutterSel.headBlock = b;
+        ovlVisualGutterCommitSelection(false);
+    });
+
+    function endDrag(e) {
+        if (!OvlVisualGutterSel.dragging) return;
+        OvlVisualGutterSel.dragging = false;
+        OvlVisualGutterSel.pointerId = null;
+        try { gutter.releasePointerCapture(e.pointerId); } catch (err) {}
+        ovlVisualGutterCommitSelection(true);
+    }
+    gutter.addEventListener('pointerup', endDrag);
+    gutter.addEventListener('pointercancel', endDrag);
+    gutter.addEventListener('lostpointercapture', endDrag);
 }
 
 // Code 模式：把 textarea 里某个字符位置换算成屏幕像素坐标。复用既有的 .ovl-code-mirror +
@@ -27493,6 +27698,9 @@ function ovlBindPassD() {
 
         ovlBindQuickActions();
         ovlBindGutterSelect(); // v2 Pass P7：gutter 行号点选 + 拖拽扩选
+        ovlBindVisualGutterSelect(); // v2 Pass P11：同一根 gutter，Visual 模式那一半点选
+        const visPane = document.getElementById('ovlVisualPane');
+        if (visPane) visPane.addEventListener('scroll', ovlSyncVisualGutterScroll);
 
         const ta = document.getElementById('ovlCodeArea');
         if (ta) {
