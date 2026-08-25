@@ -2252,6 +2252,12 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-quickactions .ovl-qa-focus:hover { background: #2F3A4C; }
 .ovl-quickactions .ovl-qa-focus.is-on { background: #3A2E10; color: #FBBF24; }
 .ovl-quickactions .ovl-qa-focus input { margin: 0; accent-color: #FBBF24; }
+/* v2 Pass P22：「复制」标签是两个汉字，通用的 26px 定宽按钮（给单字 替/简/语/译 设计的）
+   会挤得很紧——单独放宽到 auto 宽度 + 固定内边距，跟 .ovl-qa-focus 的字号一致。 */
+.ovl-quickactions button[data-qa="word.copysrc"] {
+    width: auto; padding: 0 8px; font-size: 11px; margin-left: 2px;
+    border-left: 1px solid #2F3A4C; border-radius: 0 4px 4px 0;
+}
 .ovl-breadcrumb {
     font-size: 10.5px; color: #9AA4B2; padding: 2px 10px; background: #1B222C;
     border-bottom: 1px solid #2F3A4C; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: none;
@@ -3740,6 +3746,11 @@ const AppState = {
         // 选区所在的整句范围（findSentenceRange 算出）。语法模式用它做分析范围和整句替换范围。
         // 算不准时为 null —— 此时语法模式只允许词级替换，绝不会拿整句改写去动一个词的位置。
         sentenceRange: null, // { start: number, end: number, text: string } | null
+        // v2 Pass P22：field==='ovl-visual' 时，open 那一刻用 focusOvlSelectionRange() 顺手
+        // 求出的源码行区间 { start, end }（原始 ta.value 上的绝对偏移）。apply 时把 indexOf/
+        // split 的搜索范围从整份文档收窄到这个区间，见 ovlLocateVisualPick。求不出来时为 null，
+        // 退回整份文档（不比改动前更差，只是没有收窄这一层好处）。
+        visualScope: null,
         field: null,
         index: null,      // 选中发生在哪一行（= AppState.activeIndex），高亮层据此定位
         contextSentence: "",
@@ -4031,18 +4042,18 @@ function renderSynonymPopupOnly() {
     // （那是 ovlApplySynonymEditorGuard 的第二道闸，这里是第一道、给眼睛看的）。
     let visualLock = null;
     if (s.field === 'ovl-visual') {
-        const codeTa = document.getElementById('ovlCodeArea');
-        const src = codeTa ? codeTa.value : '';
-        const picked = typeof s.originalText === 'string' ? s.originalText : '';
-        // 真实次数，不是"够用就好"的下限——诚实优先于完成度是本仓库的既定原则，
-        // 提示文案报的数字必须经得起用户自己去搜索框验证。split().length-1 对 V8 来说
-        // 是廉价操作（哪怕文档几百 KB），不需要为了省这点开销去撒谎。
-        const n = picked ? (src.split(picked).length - 1) : 0;
+        // v2 Pass P22：跟 ovlApplySynonymEditorGuard 共用 ovlLocateVisualPick 这一把尺子——
+        // 收窄到 open 时记下的源码行区间（s.visualScope）+ 空白容忍匹配，不再是整份文档的
+        // 字面 indexOf/split（旧尺子在渲染重排空白、或短语在别处段落合理出现第二次时几乎
+        // 必然误判，见该函数注释）。真实次数——诚实优先于完成度是本仓库的既定原则，
+        // 提示文案报的数字必须经得起用户自己去核实。
+        const loc = ovlLocateVisualPick(s);
+        const n = loc.n;
         if (n !== 1) {
             visualLock = {
                 reason: n === 0
-                    ? '这段文字在源码里不是原样存在（Visual 显示的是排版后的样子），没法自动替换。请切到 Code 模式手动改。'
-                    : '这段文字在源码里出现了 ' + n + ' 次，无法确定改哪一处。请切到 Code 模式手动改。'
+                    ? '这段文字在选中段落附近的源码里没有找到（Visual 显示的是排版后的样子），没法自动替换。请切到 Code 模式手动改。'
+                    : '这段文字在选中段落附近的源码里出现了 ' + n + ' 次，无法确定改哪一处。请切到 Code 模式手动改。'
             };
         }
     }
@@ -21956,6 +21967,9 @@ function ovlPortalHtml() {
         +     '<input type="checkbox" onclick="event.stopPropagation();focusToggleOvlSelection(this);">'
         +     '<span>关注</span>'
         +   '</label>'
+        // v2 Pass P22：「关注」右侧新增「复制」——把当前选区（Code/Visual 都行）对应的
+        // LaTeX 原文复制到剪贴板。只读、不改正文，走 data-qa 委托即可，不需要单独绑事件。
+        +   '<button type="button" data-qa="word.copysrc" data-tip="复制 LaTeX 原文" data-tip-pos="top">复制</button>'
         + '</div>'
         // M7 Editor「Equation preview」：光标落在 $...$ 里时用既有 KaTeX 渲染一个悬浮预览。
         + '<div class="ovl-eqpreview" id="ovlEqPreview"></div>'
@@ -27814,6 +27828,49 @@ function ovlBindDropMenus() {
 // fmt.bold/fmt.italic/ins.cite 照旧走 ovlRunCmd，不受本次改动影响。
 let OvlQaState = { source: 'code' };
 function ovlHideQuickActions() { const qa = document.getElementById('ovlQuickActions'); if (qa) qa.classList.remove('ovl-open'); }
+
+// v2 Pass P22：navigator.clipboard.writeText 在非安全上下文/被浏览器拒绝时的兜底——文件里
+// 目前没有现成的 execCommand('copy') 兜底可抄（唯一的既有写剪贴板调用点 #ovlVisTransCopyBtn
+// 没带兜底），这里就地起一个最小的：临时插一个不可见 textarea，选中后走 execCommand('copy')。
+function ovlClipboardWriteFallback(text) {
+    try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.style.position = 'fixed';
+        ta.style.top = '-9999px';
+        ta.style.left = '-9999px';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.focus();
+        ta.select();
+        const ok = document.execCommand('copy');
+        document.body.removeChild(ta);
+        return !!ok;
+    } catch (e) { return false; }
+}
+
+// 「复制」按钮：跟「关注」共用同一个 focusOvlSelectionRange()——它已经按
+// OvlState.editorMode 分流了 Code textarea 选区 / Visual DOM Range，quote 是逐字对应的
+// 原始 LaTeX 源码（Visual 模式下不是渲染后的文字）。只读操作，没有任何正文改动，不需要
+// ovlEditorApplyReplace 那套 [start,end) 复核。
+function ovlCopyLatexSource() {
+    try {
+        const r = focusOvlSelectionRange();
+        if (!r.ok) { try { showToast(r.why || '没有选中内容。', 'warning'); } catch (e) {} return; }
+        const quote = r.quote;
+        if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            navigator.clipboard.writeText(quote).then(function () {
+                try { showToast('已复制 LaTeX 原文', 'success'); } catch (e) {}
+            }, function () {
+                const ok = ovlClipboardWriteFallback(quote);
+                try { showToast(ok ? '已复制 LaTeX 原文' : '复制失败，剪贴板不可用。', ok ? 'success' : 'warning'); } catch (e) {}
+            });
+        } else {
+            const ok = ovlClipboardWriteFallback(quote);
+            try { showToast(ok ? '已复制 LaTeX 原文' : '复制失败，剪贴板不可用。', ok ? 'success' : 'warning'); } catch (e) {}
+        }
+    } catch (e) { console.error('[ovl] copyLatexSource failed', e); try { showToast('复制失败。', 'warning'); } catch (e2) {} }
+}
 function ovlShowQuickActionsAt(x, y, source) {
     const qa = document.getElementById('ovlQuickActions');
     if (!qa) return;
@@ -27896,6 +27953,10 @@ function ovlBindQuickActions() {
             // 方式不同。
             if (src === 'visual') ovlVisTransFromSelection(true);
             else ovlCodeTransFromSelection();
+        } else if (id === 'word.copysrc') {
+            // v2 Pass P22：Code/Visual 都走 focusOvlSelectionRange()——它本来就按
+            // OvlState.editorMode 内部分流，这里不用关心 src 是哪个来源。
+            ovlCopyLatexSource();
         } else {
             ovlRunCmd(id);
         }
@@ -28377,7 +28438,7 @@ function ovlCodeSelectionRect(ta, pos) {
 async function ovlEditorSynonymOpen(mode, source) {
     try {
         const nm = normalizeSynonymMode(mode);
-        let selectedText, contextText, selectionRange, sentenceRange, posPoint, field;
+        let selectedText, contextText, selectionRange, sentenceRange, posPoint, field, visualScope;
 
         if (source === 'visual') {
             const pane = document.getElementById('ovlVisualPane');
@@ -28398,10 +28459,21 @@ async function ovlEditorSynonymOpen(mode, source) {
             contextText = (block && block.textContent && block.textContent.trim()) ? block.textContent.trim() : selectedText;
             selectionRange = null;
             sentenceRange = null;
+            // v2 Pass P22：Selection/Range 此刻还活着（弹窗打开后用户挑建议是异步的，届时
+            // 这份 Range 早就可能没了）——现在就用 focusOvlSelectionRange() 顺手求出这次选区
+            // 触碰到的 .ovl-visual-block 覆盖的源码行区间，存起来给 apply 时收窄搜索范围用。
+            // 直接复用 P13 那套块相交算法，不重新发明一遍；求不出来（比如选区太长）就留 null，
+            // apply 时退回整份文档搜索（不比改动前更差）。
+            visualScope = null;
+            try {
+                const scopeR = focusOvlSelectionRange();
+                if (scopeR && scopeR.ok) visualScope = { start: scopeR.start, end: scopeR.end };
+            } catch (e) {}
             const r = range.getBoundingClientRect();
             posPoint = { x: r.left, y: r.bottom + 6 };
             field = 'ovl-visual';
         } else {
+            visualScope = null;
             const ta = document.getElementById('ovlCodeArea');
             if (!ta || ta.disabled) return;
             const start = ta.selectionStart, end = ta.selectionEnd;
@@ -28429,6 +28501,7 @@ async function ovlEditorSynonymOpen(mode, source) {
             position: posPoint,
             selectionRange: selectionRange,
             sentenceRange: sentenceRange,
+            visualScope: visualScope,
             field: field,
             index: null,
             contextSentence: contextText,
@@ -28483,6 +28556,76 @@ function ovlEditorApplyReplace(ta, start, end, expected, replacement) {
     return true;
 }
 
+// v2 Pass P22：把一段原始文本按 /\s+/ 折叠成单空格（跟 ovlEditorSynonymOpen 捕获
+// originalText 用的同一条正则），同时记下折叠后每个字符对应的原始字符串 [start,end) 区间——
+// 命中之后要拿这份映射把「归一化文本里的位置」换算回「原始文本里的精确位置」，落地永远是
+// 未经改写的原始字节，不会因为查找过程本身而挪动任何格式。
+function ovlNormalizeForMatch(raw) {
+    let text = '';
+    const starts = [];
+    const ends = [];
+    let i = 0;
+    const n = raw.length;
+    while (i < n) {
+        const ch = raw[i];
+        if (/\s/.test(ch)) {
+            const runStart = i;
+            while (i < n && /\s/.test(raw[i])) i++;
+            text += ' ';
+            starts.push(runStart);
+            ends.push(i);
+        } else {
+            text += ch;
+            starts.push(i);
+            ends.push(i + 1);
+            i++;
+        }
+    }
+    return { text: text, starts: starts, ends: ends };
+}
+
+// v2 Pass P22：Visual 模式「替/简/语」应用到源码时，picked（渲染文字，已经空白折叠过）
+// 该落在源码的哪个精确 [start,end)。跟 P13 治「关注」同一个病因——marked/KaTeX 渲染会重排
+// 空白、折行，逐字节 indexOf 在大文档里两头都不可靠：假的「0 处」（真实存在但空白被重排）
+// 和假的「N 处」（同一个短语在别的段落合理地出现第二次）。这里做两件事，缺一个都治不好：
+//   1) 把搜索范围从整份文档收窄到 s.visualScope（open 那一刻用 focusOvlSelectionRange()
+//      求出的、这次选区触碰到的 .ovl-visual-block 覆盖的源码行区间）；没有 scope 时退回
+//      整份文档（不比改动前更差）。
+//   2) 范围内部再用 ovlNormalizeForMatch 做空白容忍匹配，命中后用位置映射换算回真实源码坐标。
+// 命中数不是 1 就原样拒绝——不猜测，唯一命中才算数，这把尺子供渲染置灰（renderSynonymPopupOnly
+// 的 visualLock）和真正落地（ovlApplySynonymEditorGuard）共用，避免两处判定各算一套。
+function ovlLocateVisualPick(s) {
+    const out = { n: 0, start: -1, end: -1, text: '' };
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        const full = ta ? ta.value : '';
+        const picked = (s && typeof s.originalText === 'string') ? s.originalText : '';
+        if (!picked) return out;
+        const vs = s && s.visualScope;
+        const scope = (vs && typeof vs.start === 'number' && typeof vs.end === 'number'
+            && vs.start >= 0 && vs.end <= full.length && vs.start <= vs.end)
+            ? vs : { start: 0, end: full.length };
+        const raw = full.slice(scope.start, scope.end);
+        const norm = ovlNormalizeForMatch(raw);
+        const hay = norm.text;
+        let n = 0, firstNormIdx = -1;
+        let idx = hay.indexOf(picked);
+        while (idx !== -1) {
+            n++;
+            if (firstNormIdx === -1) firstNormIdx = idx;
+            idx = hay.indexOf(picked, idx + picked.length); // 非重叠计数，跟 split().length-1 同一把尺子
+        }
+        out.n = n;
+        if (n === 1) {
+            const lastNormIdx = firstNormIdx + picked.length - 1;
+            out.start = scope.start + norm.starts[firstNormIdx];
+            out.end = scope.start + norm.ends[lastNormIdx];
+            out.text = full.slice(out.start, out.end); // 真实、未折叠的源码原文，供后面的核对+落地用
+        }
+        return out;
+    } catch (e) { return out; }
+}
+
 // applySynonym 的前置分支：field 是 'ovl-code'/'ovl-visual' 时接管，其余（v1 的 src/tgt）
 // 原样交给 applySynonym 自己后面那一大段，一行都不碰。返回 true=已处理（调用方直接 return）。
 function ovlApplySynonymEditorGuard(synonym, scope) {
@@ -28494,23 +28637,19 @@ function ovlApplySynonymEditorGuard(synonym, scope) {
 
     if (s.field === 'ovl-visual') {
         // §2.3.5 唯一命中判定：渲染候选按钮时已经算过一次（renderSynonymPopupOnly 的
-        // visualLock，用来置灰），这里点击时再核一次——两次判定必须用同一把尺子，
-        // 不能渲染时说能点、点的时候又用不同逻辑判定。
-        const src = ta.value;
-        const picked = typeof s.originalText === 'string' ? s.originalText : '';
-        const first = picked ? src.indexOf(picked) : -1;
-        // 真实次数（跟 renderSynonymPopupOnly 的 visualLock 用同一把尺子，见那边的注释）。
-        const n = picked ? (src.split(picked).length - 1) : 0;
-        if (n !== 1) {
+        // visualLock，用来置灰），这里点击时再核一次——两次判定必须用同一把尺子（都是
+        // ovlLocateVisualPick），不能渲染时说能点、点的时候又用不同逻辑判定。
+        const loc = ovlLocateVisualPick(s);
+        if (loc.n !== 1) {
             updateSynonymState({
                 loading: false,
-                errorMessage: n === 0
-                    ? '这段文字在源码里不是原样存在（Visual 显示的是排版后的样子），没法自动替换。请切到 Code 模式手动改。'
-                    : '这段文字在源码里出现了 ' + n + ' 次，无法确定改哪一处。请切到 Code 模式手动改。'
+                errorMessage: loc.n === 0
+                    ? '这段文字在选中段落附近的源码里没有找到（Visual 显示的是排版后的样子），没法自动替换。请切到 Code 模式手动改。'
+                    : '这段文字在选中段落附近的源码里出现了 ' + loc.n + ' 次，无法确定改哪一处。请切到 Code 模式手动改。'
             });
             return true;
         }
-        const ok = ovlEditorApplyReplace(ta, first, first + picked.length, picked, synonym);
+        const ok = ovlEditorApplyReplace(ta, loc.start, loc.end, loc.text, synonym);
         if (!ok) { updateSynonymState({ loading: false, errorMessage: '原文已变动，替换已取消。' }); return true; }
         updateSynonymState({ show: false, loading: false, errorMessage: '' });
         ovlVisualRender(); // 源码变了，Visual 面板重渲一次反映新内容
