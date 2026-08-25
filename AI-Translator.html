@@ -2139,6 +2139,17 @@ body.ovl-translator-open #ovlTransWin { display: block; }
    本轮没法实测，用 class 就一定能 hover，解释"为什么点不了"这句话不会哑掉。 */
 .ovl-quickactions button.ovl-qa-off { opacity: .4; cursor: not-allowed; }
 .ovl-quickactions button.ovl-qa-off:hover { background: transparent; }
+/* v2 Pass P8（docs/v2_editor_focus_lineselect_plan.md §3.9）：#ovlQuickActions 是深色工具条
+   #1B222C，v1 的 .focus-chip 是浅色 UI 的样式，所以这里给一套作用域内的对应物，配色取
+   focus 高亮同一支黄（跟 .ovl-ln-focus 的 #F59E0B 呼应）。 */
+.ovl-quickactions .ovl-qa-focus {
+    display: flex; align-items: center; gap: 4px; height: 26px; padding: 0 7px;
+    margin-left: 2px; border-left: 1px solid #2F3A4C; border-radius: 4px;
+    color: #E7E9EE; font-size: 11px; cursor: pointer; user-select: none;
+}
+.ovl-quickactions .ovl-qa-focus:hover { background: #2F3A4C; }
+.ovl-quickactions .ovl-qa-focus.is-on { background: #3A2E10; color: #FBBF24; }
+.ovl-quickactions .ovl-qa-focus input { margin: 0; accent-color: #FBBF24; }
 .ovl-breadcrumb {
     font-size: 10.5px; color: #9AA4B2; padding: 2px 10px; background: #1B222C;
     border-bottom: 1px solid #2F3A4C; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: none;
@@ -4608,6 +4619,10 @@ function applyCrossHighlightToRendered() {
 const FOCUS_LS_KEY = 'focusEntries';
 const FOCUS_MAX = 40;               // 上限。再多列表就看不过来了，而且提示里会喧宾夺主
 const FOCUS_QUOTE_MAX = 600;        // 片段引文的字符上限（整行条目不受此限，它带的就是整行）
+// v2 Pass P8（docs/v2_editor_focus_lineselect_plan.md §3.2）：编辑器源码行范围（kind:'tex'）的
+// 引文上限。整行 pair 条目不设上限，是因为一"行"就是一个句子；.tex 的"几行"可以是 200 行
+// 20KB，会喧宾夺主，而 FOCUS_MAX=40 条同时存在时提示词直接爆掉。
+const FOCUS_TEX_QUOTE_MAX = 2000;
 
 // 四套高亮的优先级。**写死在这里**，不是「谁后画谁赢」那种涌现出来的顺序。
 // 数字越小越优先，同一批字符只会被优先级最高的那一套包住，绝不套两层 mark。
@@ -4646,6 +4661,12 @@ function focusMakeEntry(o) {
         sentence: o.sentence == null ? '' : String(o.sentence),
         sentOffset: Math.max(0, Math.floor(Number(o.sentOffset) || 0)),   // 片段在所在句里的偏移
         sentFallback: !!o.sentFallback,                                   // findSentenceRange 拿不准 → 退回整行
+        // v2 Pass P8（§3.2）：'pair' = 既有的句对条目（行为一个字节不变）；
+        // 'tex' = 编辑器源码行范围。tex 条目固定 rowIndex:-1、side:'src'、whole:true（§3.2 理由）。
+        kind: (o.kind === 'tex') ? 'tex' : 'pair',
+        file: o.file == null ? '' : String(o.file),                      // 显示 + 换文件判定用
+        lineFrom: Math.max(0, Math.floor(Number(o.lineFrom) || 0)),      // 0-based，只用于显示
+        lineTo: Math.max(0, Math.floor(Number(o.lineTo) || 0)),          // 0-based 含端点，只用于显示
         at: Date.now()
     };
 }
@@ -4675,6 +4696,9 @@ function focusLiveBase(rowIndex, side) {
 //                              一个指错地方的关注比没有关注糟糕得多。
 function focusResolve(e) {
     const out = { ok: false, start: 0, end: 0, text: '', why: '' };
+    // v2 Pass P8（§3.3）：tex 条目（编辑器源码行范围）走独立的重新锚定逻辑——
+    // 它的真值来源是 #ovlCodeArea，不是 AppState.translationPairs。
+    if (e && e.kind === 'tex') return focusResolveTex(e);
     try {
         const pairs = AppState.translationPairs;
         if (!Array.isArray(pairs) || !pairs.length) { out.why = '当前没有已翻译的内容'; return out; }
@@ -4709,8 +4733,60 @@ function focusResolve(e) {
     }
 }
 
+// v2 Pass P8（§3.3）：tex 条目的重新锚定。范围是整个文件（不是"存下来的那几行"）——
+// 只认那几行的话，在文件开头插一行就会让全文件的关注同时失效，而 pair 的整行条目在
+// 别的行被编辑时是不会失效的。三种结局，和 focusResolve 逐条对应：
+//   ① 原位（存下来的 offset）还是那段字 → 留在原位
+//   ② 全文件里只有一处是那段字         → 挪过去
+//   ③ 一处都没有 / 有好几处             → 作废
+// 解出来之后再对齐到整行边界并把 quote 重新盖成此刻的整行——这是 pair whole=true 那条
+// "一行被追加/微调之后标记跟着走"的同构版本：存下来的 quote 仍然是当前内容的前缀时
+// ①命中，随后 quote 被刷成加长后的整行。
+function focusResolveTex(e) {
+    const out = { ok: false, start: 0, end: 0, text: '', why: '' };
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || ta.disabled || !ta.value) { out.why = '编辑器里现在没有打开文件'; return out; }
+        const base = ta.value;
+        const cur = (OvlState && OvlState.currentFile && OvlState.currentFile.name) ? OvlState.currentFile.name : '';
+        if (e.file && cur && e.file !== cur) {
+            out.why = '这条关注属于文件「' + e.file + '」，编辑器现在打开的是「' + cur + '」';
+            return out;
+        }
+        const q = String(e.quote || '');
+        if (!q) { out.why = '标记的文字是空的'; return out; }
+        let at = -1;
+        if (base.slice(e.offset, e.offset + q.length) === q) at = e.offset;
+        else {
+            const first = base.indexOf(q);
+            if (first === -1) { out.why = '这几行的内容已经不在这个文件里了（被改写或删掉了）'; return out; }
+            if (base.indexOf(q, first + 1) !== -1) {
+                out.why = '这几行的内容现在在文件里出现了不止一处，无法确定你标的是哪一处'; return out;
+            }
+            at = first;
+        }
+        const ls = base.lastIndexOf('\n', at - 1) + 1;
+        let le = base.indexOf('\n', at + q.length);
+        if (le === -1) le = base.length;
+        out.ok = true; out.start = ls; out.end = le; out.text = base.slice(ls, le);
+        return out;
+    } catch (err) { out.why = '复核时出错'; return out; }
+}
+
+// 0-based 逻辑行号。只在建条目/复核时调（低频），不进任何热路径。
+function focusTexLineIndexAt(base, pos) {
+    let n = 0, at = base.indexOf('\n');
+    while (at !== -1 && at < pos) { n++; at = base.indexOf('\n', at + 1); }
+    return n;
+}
+
 function focusLabel(e) {
     try {
+        // v2 Pass P8（§3.4 表第 7 条）：tex 条目的标签。
+        if (e.kind === 'tex') {
+            return '源码' + (e.file ? ('「' + e.file + '」') : '') + ' 第 ' + (e.lineFrom + 1)
+                + (e.lineTo > e.lineFrom ? ('–' + (e.lineTo + 1)) : '') + ' 行';
+        }
         return (e.side === 'src' ? '原文' : '译文') + ' 第 ' + (e.rowIndex + 1) + ' 行 · '
             + (e.whole ? '整行' : ('「' + focusEllipsis(e.quote, 18) + '」'));
     } catch (err) { return '一条关注'; }
@@ -4725,6 +4801,9 @@ function focusEllipsis(s, n) {
 function focusIndexOfWhole(rowIndex, side) {
     for (let i = 0; i < FocusState.entries.length; i++) {
         const e = FocusState.entries[i];
+        // v2 Pass P8（§3.4 表第 2 条）：tex 条目 rowIndex 固定 -1，天然匹配不上任何真实
+        // rowIndex——这里再显式跳过一道，双保险。
+        if (e.kind === 'tex') continue;
         if (e.whole && e.rowIndex === rowIndex && e.side === side) return i;
     }
     return -1;
@@ -4735,6 +4814,9 @@ function focusIndexOfWhole(rowIndex, side) {
 function focusIndexOfSpan(rowIndex, side, quote, start) {
     for (let i = 0; i < FocusState.entries.length; i++) {
         const e = FocusState.entries[i];
+        // v2 Pass P8（§3.4 表第 3 条）：tex 条目 whole 恒为 true，已经被下面那条 e.whole
+        // 挡掉了；这里再显式写一遍是为了和别处的双保险纪律一致，不依赖隐含推导。
+        if (e.kind === 'tex') continue;
         if (e.whole || e.rowIndex !== rowIndex || e.side !== side || e.quote !== quote) continue;
         const r = focusResolve(e);
         if (r.ok && r.start === start) return i;
@@ -4754,6 +4836,9 @@ function focusAfterChange() {
     try { syncSelectionHighlightLayers(); } catch (e) {}
     try { focusRenderChip(); } catch (e) {}
     try { if (typeof chatUpdateBar === 'function' && ChatState && ChatState.open) chatUpdateBar(); } catch (e) {}
+    // v2 Pass P8（§3.4 表第 12 条 / §3.8）：勾/取消关注之后 gutter 上的黄条立刻跟着变。
+    // ovlPaintGutterMarks 是装饰性的（P7 落的），坏了当没有，绝不把异常带回这里。
+    try { if (typeof ovlPaintGutterMarks === 'function') ovlPaintGutterMarks(); } catch (e) {}
 }
 
 function focusAdd(entry) {
@@ -4903,6 +4988,9 @@ function focusSyncCheckboxes() {
             let on = false;
             if (key === 'pop') {
                 on = focusPopupChecked();
+            } else if (key === 'ovl') {
+                // v2 Pass P8（§3.4 表第 11 条 / §3.9）：#ovlQuickActions 里那颗「关注」复选框。
+                on = (typeof focusOvlChecked === 'function') ? focusOvlChecked() : false;
             } else {
                 const parts = key.split('|');
                 on = focusHasWholeRow(Number(parts[0]), parts[1]);
@@ -4924,6 +5012,9 @@ function focusLiveRanges(rowIndex, side, text) {
         if (!n) return out;
         for (let i = 0; i < FocusState.entries.length; i++) {
             const e = FocusState.entries[i];
+            // v2 Pass P8（§3.4 表第 4 条）：tex 条目 rowIndex 固定 -1，已经匹配不上真实
+            // rowIndex——这里再显式挡一道，双保险。
+            if (e.kind === 'tex') continue;
             if (e.rowIndex !== rowIndex || e.side !== side) continue;
             if (e.whole) { out.push({ start: 0, end: n }); continue; }
             const q = String(e.quote || '');
@@ -5029,6 +5120,10 @@ function focusPaintRendered() {
         const groups = {};
         for (let i = 0; i < entries.length; i++) {
             const e = entries[i];
+            // v2 Pass P8（§3.4 表第 5 条）：tex 条目不进「已渲染正文」这套画法——它压根不
+            // 对应任何 (rowIndex, side) 分组，画到这里只会污染别的分组（rowIndex:-1 会撞成
+            // 同一个 key）。它自己的可视化在 gutter 上（§3.8 的 ovl-ln-focus），不在这里。
+            if (e.kind === 'tex') continue;
             if (AppState.activeIndex === e.rowIndex) continue;      // 编辑行归镜像层管
             const k = e.rowIndex + '|' + e.side;
             (groups[k] || (groups[k] = [])).push(e);
@@ -5181,11 +5276,31 @@ function focusRevalidate(reason) {
         // 一份文档都没有的时候什么都不作废：刚刷新完页面、还没恢复历史，
         // 此刻「解不出来」说明的是文档没加载，不是用户的标记失效了。
         const pairs = AppState.translationPairs;
-        if (!Array.isArray(pairs) || !pairs.length) return dropped;
+        const havePairs = Array.isArray(pairs) && pairs.length > 0;
+        // v2 Pass P8（§1.6 第 5 条 + §3.4 表第 6 条）：原来这里只看 pairs——编辑器场景下
+        // pairs 常常是空的（用户没在翻译器里翻过任何内容），tex 条目就会永远复核不到。
+        const taR = document.getElementById('ovlCodeArea');
+        const haveTex = !!(taR && !taR.disabled && taR.value);
+        if (!havePairs && !haveTex) return dropped;
 
         const keep = [];
         for (let i = 0; i < FocusState.entries.length; i++) {
             const e = FocusState.entries[i];
+            if (e.kind === 'tex') {
+                // 「文件还没打开」≠「你的标记失效了」—— 和下面 pair 那条"一份文档都没有就
+                // 什么都不作废"是同一条纪律，不是新规矩。
+                if (!haveTex) { keep.push(e); continue; }
+                const rt = focusResolveTex(e);
+                if (rt.ok) {
+                    e.offset = rt.start;
+                    e.quote = rt.text;                                  // 整行条目：引文刷成此刻的整行
+                    e.lineFrom = focusTexLineIndexAt(taR.value, rt.start);
+                    e.lineTo = focusTexLineIndexAt(taR.value, rt.end);
+                    keep.push(e);
+                } else dropped.push({ e: e, why: rt.why });
+                continue;
+            }
+            if (!havePairs) { keep.push(e); continue; }               // pair 条目的既有守卫，原样保留
             // 这一行正在编辑：用户可能正打到一半，此刻判「找不到」并不代表标记失效。
             // 提交之后 renderApp 会再来一遍，那时候才结算。
             if (AppState.activeIndex === e.rowIndex) { keep.push(e); continue; }
@@ -5248,6 +5363,19 @@ function focusLoad() {
             const e = j.entries[i];
             // 逐键校验，脏值一律**不收**（和 chatParamsLoad 同一条纪律）
             if (!e || typeof e !== 'object') continue;
+            // v2 Pass P8（§3.4 表第 10 条 / §1.6 第 7 条）：tex 条目 rowIndex 固定 -1，必须在
+            // 下面那条 rowIndex 校验之前单独收纳，否则会被 `rowIndex < 0` 一律吃掉——
+            // 「关注属于文档、活过刷新」是第 4590 行写死的不变量，tex 条目不能是例外。
+            if (e.kind === 'tex') {
+                if (typeof e.quote !== 'string' || !e.quote) continue;
+                if (e.quote.length > FOCUS_TEX_QUOTE_MAX) continue;
+                out.push(focusMakeEntry({
+                    kind: 'tex', rowIndex: -1, side: 'src', whole: true,
+                    quote: e.quote, offset: e.offset, file: e.file,
+                    lineFrom: e.lineFrom, lineTo: e.lineTo
+                }));
+                continue;
+            }
             if (typeof e.rowIndex !== 'number' || !isFinite(e.rowIndex) || e.rowIndex < 0) continue;
             // C7（对话上下文收窄）：只收左栏（原文/src）。旧版本允许在右栏（译文/tgt）打关注，
             // localStorage 里可能还留着那时候存下的条目——这里就是迁移点：不是 src 的一律
@@ -5290,17 +5418,32 @@ function focusWireBlock() {
         const entries = FocusState.entries;
         if (!entries.length) return '';
         const pairs = Array.isArray(AppState.translationPairs) ? AppState.translationPairs : [];
-        if (!pairs.length) return '';
+        // v2 Pass P8（§3.4 表第 9 条 / §3.7）：原来 pairs 为空就整体提前返回——tex 条目不
+        // 依赖 pairs，得单独判一次「这一批条目里到底有没有 tex」，否则纯编辑器场景（没有
+        // 任何已翻译内容）里 tex 关注永远发不出去。
+        let hasTex = false;
+        for (let i = 0; i < entries.length; i++) { if (entries[i].kind === 'tex') { hasTex = true; break; } }
+        if (!pairs.length && !hasTex) return '';
 
         const items = [];
+        let hasTexItems = false;   // 循环里实际发出去的条目中有没有 tex 的（解不出来的已经 continue 掉了）
         for (let i = 0; i < entries.length; i++) {
             const e = entries[i];
             const r = focusResolve(e);
             if (!r.ok) continue;                       // 解不出来的一律不发（陈旧的东西一个字节都不许出门）
+            const n = items.length + 1;
+            if (e.kind === 'tex') {
+                hasTexItems = true;
+                items.push('[关注 ' + n + ']  LaTeX 源码 · 文件「' + chatEscapeDelims(e.file || '(未命名)') + '」'
+                    + ' · 第 ' + (e.lineFrom + 1) + (e.lineTo > e.lineFrom ? ('–' + (e.lineTo + 1)) : '') + ' 行\n'
+                    + '  ⚠ 这几行来自**用户正在编辑的 .tex 源文件**，不是上面 ==DOC== 里那份按 [n] 编号的原文。'
+                    + '不要用 [n] 行号去指认它，也不要为它输出 ==EDIT== 块 —— 这个工具改不了编辑器里的文件。\n'
+                    + '  内容：' + chatEscapeDelims(r.text));
+                continue;
+            }
             // C7（对话上下文收窄）：走到这里的条目 side 只可能是 'src'（焦点入口已经收窄，
             // focusLoad 也会把旧版本留下的 tgt 条目滤掉）——所以不再需要「对侧（译文）」那一段：
             // 那一段本来就是把右栏内容塞进上下文，和「只关联左边输入内容」直接冲突。
-            const n = items.length + 1;
             if (e.whole) {
                 items.push('[关注 ' + n + ']  整行 · 原文 · 第 ' + (e.rowIndex + 1) + ' 行\n'
                     + '  文本：' + chatEscapeDelims(r.text));
@@ -5320,6 +5463,8 @@ function focusWireBlock() {
             + '用户额外标出了以下 ' + items.length + ' 处，请在回答时重点留意它们。\n'
             + '⚠ 这是**关注**，不是修改授权：没有被明确要求改动之前，一个字都不要改，也不要因为'
             + '它们被标出来就输出 ==EDIT== 块。\n'
+            + (hasTexItems ? '其中标着「LaTeX 源码」的几处来自用户正在编辑的 .tex 文件，**不在**上面的 ==DOC== 编号体系里；'
+                + '你看不到那个文件的其余内容，不要假装看过，也不要为它们输出 ==EDIT== 块。\n' : '')
             + items.join('\n')
             + '\n==FOCUSEND==';
     } catch (e) {
@@ -5400,14 +5545,17 @@ function focusRenderChip() {
             const row = document.createElement('div');
             row.className = 'aichat-focus-item';
             const kind = document.createElement('span');
+            // v2 Pass P8（§3.4 表第 8 条）：tex 条目的种类标签是"源码"，跟 pair 的"整行/片段"分开。
             kind.className = 'aichat-focus-kind' + (e.whole ? ' is-row' : '');
-            kind.textContent = e.whole ? '整行' : '片段';
+            kind.textContent = (e.kind === 'tex') ? '源码' : (e.whole ? '整行' : '片段');
             const txt = document.createElement('span');
             txt.className = 'aichat-focus-text';
             // textContent：标出来的可能是 LaTeX，可能含 '<'
-            txt.textContent = (e.side === 'src' ? '原文' : '译文') + ' 第 ' + (e.rowIndex + 1) + ' 行'
-                + (e.whole ? '' : '：' + focusEllipsis(e.quote, 24))
-                + (okById[e.id] ? '' : ' · 现在解不出来，这一轮不发');
+            txt.textContent = (e.kind === 'tex')
+                ? (focusLabel(e) + '：' + focusEllipsis(e.quote, 24) + (okById[e.id] ? '' : ' · 现在解不出来，这一轮不发'))
+                : ((e.side === 'src' ? '原文' : '译文') + ' 第 ' + (e.rowIndex + 1) + ' 行'
+                    + (e.whole ? '' : '：' + focusEllipsis(e.quote, 24))
+                    + (okById[e.id] ? '' : ' · 现在解不出来，这一轮不发'));
             const x = document.createElement('button');
             x.type = 'button';
             x.className = 'aichat-focus-x';
@@ -5482,6 +5630,175 @@ function focusPopupRowHtml() {
     } catch (e) {
         return '';
     }
+}
+
+// ==================== v2 Pass P8：「关注」联动编辑器内容（docs/v2_editor_focus_lineselect_plan.md §3）====================
+// 能力边界（§3.1，必须原样保留在报告里）：这是一条从编辑器到对话窗的**引文通道**——
+// 模型能看见、能讨论用户标出来的那几行 .tex 源码，但看不到这个文件的其余任何内容，
+// 也不能被问"第 400 行写了什么"、"帮我改第 12 行"（那个 .tex 文件没有进入任何编号体系，
+// 见 focusWireBlock 里的 tex 分支）。==DOC== 块本轮不接 .tex 源码（§5.1 四条结构性理由，
+// 本轮不重复推导）。
+
+// 「此刻编辑器里选中的那几行 .tex 源码」。Code 和 Visual 在这里收口成同一个答案，于是
+// 复选框显示的状态和点下去会发生的事永远是同一次判定的结果（和 focusIndexOfSpan 那条
+// "用解出来的位置而不是存下来的 offset"同一条纪律）。
+// 返回 { ok, start, end, quote, lineFrom, lineTo, why }
+function focusOvlSelectionRange() {
+    const out = { ok: false, start: 0, end: 0, quote: '', lineFrom: 0, lineTo: 0, why: '' };
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || ta.disabled || !ta.value) { out.why = '编辑器里没有打开文件。'; return out; }
+        const base = ta.value;
+        let s, e2;
+        if (OvlState.editorMode === 'visual') {
+            const pane = document.getElementById('ovlVisualPane');
+            if (!pane) { out.why = '没有 Visual 面板。'; return out; }
+            const sel = ovlWinOf(pane).getSelection();
+            if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { out.why = '没有选中内容。'; return out; }
+            const range = sel.getRangeAt(0);
+            if (!pane.contains(range.commonAncestorContainer)) { out.why = '选区不在 Visual 面板里。'; return out; }
+            const picked = String(sel);
+            if (!picked.trim()) { out.why = '没有选中内容。'; return out; }
+            // 和 ovlApplySynonymEditorGuard 的 visual 分支同一把尺子：唯一命中才算数，
+            // 0 处 / 多处一律拒绝，绝不猜位置。
+            const first = base.indexOf(picked);
+            const n = (first === -1) ? 0 : (base.indexOf(picked, first + 1) === -1 ? 1 : 2);
+            if (n !== 1) {
+                out.why = (n === 0)
+                    ? 'Visual 显示的是排版后的文字，这一段在 .tex 源码里不是原样存在，没法定位。切到 Code 模式选中对应的行再试。'
+                    : '这段文字在 .tex 源码里出现了不止一处，无法确定你指的是哪一处。切到 Code 模式选中对应的行再试。';
+                return out;
+            }
+            s = first; e2 = first + picked.length;
+        } else {
+            if (ta.selectionStart === ta.selectionEnd) { out.why = '没有选中内容。'; return out; }
+            s = ta.selectionStart; e2 = ta.selectionEnd;
+        }
+        // 对齐到整行边界：关注的单位是「这几行」。le 用 e2-1 起算 ⇒ 选区正好吞掉了行尾换行时
+        // （从第 5 行首拖到第 6 行首），落在第 5 行的行尾，不会把第 6 行也算进来。
+        const ls = base.lastIndexOf('\n', s - 1) + 1;
+        let le = base.indexOf('\n', e2 - 1);
+        if (le === -1) le = base.length;
+        if (le < ls) le = ls;
+        const quote = base.slice(ls, le);
+        if (!quote.trim()) { out.why = '选中的都是空行，没有可关注的内容。'; return out; }
+        if (quote.length > FOCUS_TEX_QUOTE_MAX) {
+            out.why = '选中的内容太长（超过 ' + FOCUS_TEX_QUOTE_MAX + ' 字），关注请少选几行。';
+            return out;
+        }
+        out.ok = true; out.start = ls; out.end = le; out.quote = quote;
+        out.lineFrom = focusTexLineIndexAt(base, ls);
+        out.lineTo = focusTexLineIndexAt(base, le);
+        return out;
+    } catch (err) { out.why = '读取编辑器选区时出错。'; return out; }
+}
+
+// 「就是这一条」：用解出来的位置比对，行被改过之后复选框才不会显示成没勾。
+function focusIndexOfTexAt(start, end) {
+    for (let i = 0; i < FocusState.entries.length; i++) {
+        const e = FocusState.entries[i];
+        if (e.kind !== 'tex') continue;
+        const r = focusResolveTex(e);
+        if (r.ok && r.start === start && r.end === end) return i;
+        if (!r.ok && e.offset === start) return i;
+    }
+    return -1;
+}
+
+function focusOvlChecked() {
+    try {
+        const r = focusOvlSelectionRange();
+        return r.ok && focusIndexOfTexAt(r.start, r.end) !== -1;
+    } catch (e) { return false; }
+}
+
+// C4 同一条纪律：这是状态开关不是动作 —— 不关工具条、不发请求、立刻显示状态。
+function focusToggleOvlSelection(el) {
+    try {
+        const r = focusOvlSelectionRange();
+        if (!r.ok) {
+            if (el) el.checked = false;
+            try { showToast(r.why || '这里没有可关注的内容。', 'warning'); } catch (e) {}
+            return;
+        }
+        const at = focusIndexOfTexAt(r.start, r.end);
+        const want = el ? !!el.checked : (at === -1);
+        if (want && at === -1) {
+            // 建条目时就要求全文件唯一。这是把「有歧义就是中止」提前到用户还能做点什么的
+            // 时刻——否则一条只选了 \end{itemize} 的关注会在下一次复核时静默消失，而用户
+            // 根本不知道自己做错了什么。
+            const base = document.getElementById('ovlCodeArea').value;
+            const first = base.indexOf(r.quote);
+            if (first === -1 || base.indexOf(r.quote, first + 1) !== -1) {
+                if (el) el.checked = false;
+                try { showToast('这几行的内容在文件里出现了不止一处，无法唯一定位。多选一两行相邻内容再试。', 'warning'); } catch (e) {}
+                return;
+            }
+            const f = (OvlState.currentFile && OvlState.currentFile.name) ? OvlState.currentFile.name : '';
+            if (!focusAdd(focusMakeEntry({
+                kind: 'tex', rowIndex: -1, side: 'src', whole: true,
+                quote: r.quote, offset: r.start, file: f,
+                lineFrom: r.lineFrom, lineTo: r.lineTo
+            }))) { if (el) el.checked = false; return; }
+            try { __focusTexSig = focusTexDocSig(); } catch (e) {}
+        } else if (!want && at !== -1) {
+            focusRemoveAt(at);
+        }
+        // 立刻把这颗 label 自己的高亮态同步成 el.checked——不等下一次 focusSyncCheckboxes
+        // 跑到（§1.6 第 8 条：那条路径在 v2 外壳里不保证会跑）。
+        try { if (el) { const lab = el.closest('.ovl-qa-focus'); if (lab) lab.classList.toggle('is-on', !!el.checked); } } catch (e) {}
+        FocusState.seq++;
+        focusAfterChange();
+    } catch (e) { console.error('[focus] toggleOvlSelection failed', e); }
+}
+
+// —— 编辑器缓冲区变了 → 复核（既有的 focusNoteDocumentChanged 只盯 pairs）——
+let __focusTexSig = null;
+
+function focusTexDocSig() {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta) return '';
+        const name = (OvlState && OvlState.currentFile && OvlState.currentFile.name) ? OvlState.currentFile.name : '';
+        return name + ':' + ta.value.length + ':' + chatRowHash(ta.value);
+    } catch (e) { return ''; }
+}
+
+// 和 focusNoteDocumentChanged 同构。第一行的短路很重要：没有任何 tex 条目时一个字节都
+// 不 hash，于是"从没用过这个功能的用户"完全零开销。
+function focusNoteTexChanged() {
+    try {
+        let has = false;
+        for (let i = 0; i < FocusState.entries.length; i++) { if (FocusState.entries[i].kind === 'tex') { has = true; break; } }
+        if (!has) return;
+        const sig = focusTexDocSig();
+        if (sig === __focusTexSig) return;
+        __focusTexSig = sig;
+        setTimeout(function () {
+            try { focusRevalidate('编辑器里的文件变了'); } catch (e) {}
+            try { if (ChatState && ChatState.open) chatUpdateBar(); } catch (e) {}
+        }, 0);
+    } catch (e) {}
+}
+
+// —— gutter 上的关注标记（§3.8）——
+// 被关注的源码行区间（0-based，含端点），给 ovlPaintGutterMarks 用。只解 tex 条目
+// （通常 0–3 条），解不出来的不画——和 focusPaintRendered「整行条目解不出来就一笔都不画」
+// 同一条纪律。
+function focusTexGutterLines() {
+    const out = [];
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || ta.disabled || !ta.value) return out;
+        for (let i = 0; i < FocusState.entries.length; i++) {
+            const e = FocusState.entries[i];
+            if (e.kind !== 'tex') continue;
+            const r = focusResolveTex(e);
+            if (!r.ok) continue;
+            out.push([focusTexLineIndexAt(ta.value, r.start), focusTexLineIndexAt(ta.value, r.end)]);
+        }
+    } catch (err) {}
+    return out;
 }
 
 // ============= 跨栏高亮：第一级 —— 确定性锚点（零延迟、零模型调用）=============
@@ -21326,6 +21643,12 @@ function ovlShellHtml() {
 // M1.5 起翻译器的关闭按钮已搬进 #ovlTransWin 自己的标题栏（ovlTransWinHtml），
 // 这里不再需要 #ovlTranslatorCloseBtn（见 §3.6.8 删除清单第 4 条）。
 function ovlPortalHtml() {
+    // v2 Pass P8（§3.9）：先把提示文案拼成一个局部常量再用，不在下面那串 `+ '...'` 的续行里
+    // 直接展开多段字符串——续行的行首 `+` 会和字符串自己的 `+` 连成 `+ +`（一元加号，结果 NaN）。
+    const OVL_QA_FOCUS_TIP = '把选中的这几行 .tex 源码登记成「额外关注」，之后每一轮问话都会把这几行原样发给对话窗的模型。'
+        + '⚠ 对话窗**看不到**这个文件的其余内容 —— 它只会收到你标出来的这几行，别问它「第 400 行写了什么」。'
+        + '这只是「请多留意」，不是修改授权，模型也改不了编辑器里的文件。'
+        + '勾选不会关闭工具条，关掉工具条也不会取消已经勾上的关注。';
     return ''
         + '<div class="ovl-layout-menu" id="ovlLayoutMenu" hidden>'
         +   '<div class="ovl-layout-menu-title">Layout options</div>'
@@ -21373,6 +21696,15 @@ function ovlPortalHtml() {
         +   '<button type="button" data-qa="word.simplify" data-tip="简化" data-tip-pos="top">简</button>'
         +   '<button type="button" data-qa="word.grammar" data-tip="语法修正" data-tip-pos="top">语</button>'
         +   '<button type="button" class="ovl-qa-translate" data-qa="word.translate" data-tip="翻译成中文" data-tip-pos="top">译</button>'
+        // v2 Pass P8（§3.9）：「关注」是状态开关，不是动作——沿用既有的复选框语言（C4），
+        // 不发明第三套范式。<label> 不是 <button>，且不带 data-qa（带了会被 qa 点击委托的
+        // closest('[data-qa]') 捞走，和 <input> 自己的 handler 撞成双重切换）。
+        +   '<label class="ovl-qa-focus" data-focus-cb data-focus-key="ovl"'
+        +     ' data-tip="' + escapeAttr(OVL_QA_FOCUS_TIP) + '" data-tip-pos="top"'
+        +     ' onclick="event.stopPropagation();">'
+        +     '<input type="checkbox" onclick="event.stopPropagation();focusToggleOvlSelection(this);">'
+        +     '<span>关注</span>'
+        +   '</label>'
         + '</div>'
         // M7 Editor「Equation preview」：光标落在 $...$ 里时用既有 KaTeX 渲染一个悬浮预览。
         + '<div class="ovl-eqpreview" id="ovlEqPreview"></div>'
@@ -22677,6 +23009,7 @@ function ovlBindVisualPane() {
 //    （见下面 ovlMeasureRowCount 的实现）。
 const OVL_LINE_H = 18; // 12px/1.5，跟 .ovl-code-area/.ovl-gutter 的 CSS font 是同一个常数
 let OvlLineOffsetEditTimer = null;
+let OvlFocusTexTimer = null; // v2 Pass P8（§3.6）：ta input → focusNoteTexChanged 的 600ms 去抖
 
 function ovlGetCodeMirror() {
     let mirror = document.getElementById('ovlCodeMirror');
@@ -23018,6 +23351,9 @@ async function ovlOpenFile(fileHandle, name, parentHandle) {
         OvlState.lineOffsets = null;
         // v2 Pass P7：换文件=旧文件的行号锚点全部作废（行号还在，指的内容已经变了）。
         if (typeof ovlGutterClearSelection === 'function') ovlGutterClearSelection();
+        // v2 Pass P8（§3.6）：换文件是"一件事做完了"的时刻，直接同步复核——上一个文件的
+        // tex 关注这时候多半已经解不出来了（引文对不上新内容/换了文件名），该可见地作废。
+        if (typeof focusNoteTexChanged === 'function') { try { focusNoteTexChanged(); } catch (e) {} }
         ovlRecomputeLineOffsets(); // 打开文件必须马上算（§ Bug 2 要求"on file open/switch (always)"）
         ovlRenderGutter(true);
         ovlBuildOutline();
@@ -24617,6 +24953,13 @@ function ovlBindShell() {
                 // 行偏移表——跟 M9 outline 的 1s 防抖同一条纪律，这里给短一点，因为 gutter 错位
                 // 比 outline 过期更容易被立刻注意到。
                 ovlScheduleLineOffsetRecompute(250);
+                // v2 Pass P8（§3.6）：600ms 去抖，比 gutter 那条 250ms 长，永远不和布局关键
+                // 路径抢帧。focusNoteTexChanged 自己有「没有 tex 条目就零开销」的短路。
+                if (OvlFocusTexTimer) clearTimeout(OvlFocusTexTimer);
+                OvlFocusTexTimer = setTimeout(function () {
+                    OvlFocusTexTimer = null;
+                    if (typeof focusNoteTexChanged === 'function') focusNoteTexChanged();
+                }, 600);
             });
             ta.addEventListener('scroll', function () {
                 if (gutter) gutter.scrollTop = ta.scrollTop;
@@ -25933,6 +26276,17 @@ function ovlShowQuickActionsAt(x, y, source) {
             ? ('选中超过 ' + OVL_TRANS_MAX_CHARS + ' 字，翻译不可用；选少几行再试')
             : '翻译成中文');
     }
+    // v2 Pass P8（§1.6 第 8 条 + §3.9）：定点刷新「关注」复选框的勾选态。不能指望
+    // focusSyncCheckboxes 的唯一调用点（syncSelectionHighlightLayers 内部）一定会跑到——
+    // 那个函数开头有两条提前 return，在 v2 外壳里经常一次都不经过；这里每次弹出工具条都
+    // 现算一次，跟 tooLong 那段同一条纪律。
+    const fLab = qa.querySelector('[data-focus-key="ovl"]');
+    if (fLab) {
+        const on = (typeof focusOvlChecked === 'function') ? focusOvlChecked() : false;
+        const fIn = fLab.querySelector('input[type="checkbox"]');
+        if (fIn) fIn.checked = on;
+        fLab.classList.toggle('is-on', on);
+    }
     qa.style.left = Math.max(4, x - 40) + 'px';
     qa.style.top = Math.max(4, y - 36) + 'px';
     qa.classList.add('ovl-open');
@@ -26329,6 +26683,9 @@ function ovlEditorApplyReplace(ta, start, end, expected, replacement) {
     ta.setSelectionRange(start, end);
     document.execCommand('insertText', false, replacement);
     if (wasHidden) ta.style.display = 'none';
+    // v2 Pass P8（§3.6）：选词替换真的改了缓冲区——这是本函数唯一的落地点，两个调用方
+    // （Visual/ Code、sentence/selection）都经过这里，挂一处覆盖全部。
+    if (typeof focusNoteTexChanged === 'function') { try { focusNoteTexChanged(); } catch (e) {} }
     return true;
 }
 
