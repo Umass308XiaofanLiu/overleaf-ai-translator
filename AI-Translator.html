@@ -3352,7 +3352,7 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
 const APP_VERSION = '02.02.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-08-24';   // APP_BUILD_DATE_STAMP
+const APP_BUILD_DATE = '2026-08-25';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -6294,6 +6294,15 @@ function renderFormattedText(text) {
             formula = cleanLatex(formula);
             formula = stripCommand(formula, 'label');
             formula = stripCommand(formula, 'tag');
+            // v2 Pass P14：这个版本的 KaTeX 压根没实现 \ref/\eqref/\autoref（跨文档交叉引用，
+            // 依赖 LaTeX 编译时的 aux 文件，单条公式独立渲染天生做不到，KaTeX 直接
+            // "Undefined control sequence"）——实测一条引用了自己文档内其他公式 label 的
+            // equation（`\text{if \eqref{eq:x} ... hold}`）整条公式渲染失败。这几个命令跟
+            // \label/\tag 是同一类"渲染这一步用不上、删掉不影响读懂公式本身"的东西，用
+            // 同一条 stripCommand 处理，不新开一套逻辑。
+            formula = stripCommand(formula, 'eqref');
+            formula = stripCommand(formula, 'autoref');
+            formula = stripCommand(formula, 'ref');
             try {
                 const rendered = window.katex.renderToString(formula, {
                     displayMode: type === 'display',
@@ -6310,16 +6319,19 @@ function renderFormattedText(text) {
         });
     };
     
-    pushPlaceholder(/\\begin\{([\w\*]+)\}([\s\S]*?)\\end\{\1\}/g, 'display', (match, env, body) => {
-        // 将带编号的环境转换为不带编号的版本
-        const envMap = {
-            'equation': 'equation*',
-            'align': 'align*',
-            'gather': 'gather*',
-            'multline': 'multline*',
-            'eqnarray': 'eqnarray*'
-        };
-        const noNumberEnv = envMap[env] || env;
+    // v2 Pass P14：这里原来是 `[\w\*]+`——不管环境名是什么，只要是 `\begin{X}...\end{X}`
+    // 配对就整段扔给 KaTeX 渲染。真实文档里 `\begin{proposition}`/`\begin{algorithm}`/
+    // `\begin{minipage}`（LatexFilter 认不出的自定义/结构环境，按设计原样保留原始标记，
+    // 见 ovlSplitVisualBlocks 上方注释"照抄 Overleaf Visual 模式不认识的环境照样显示
+    // 原始标记的行为"）也会被这条正则捞进来，而 KaTeX 压根不认识这些环境名，
+    // 直接抛 "No such environment"——catch 到之后把原始 match 整段（含反斜杠源码）塞进
+    // 一个红色错误 span 里，导致 Visual 模式里这些内容变成一坨转义乱码而不是"看得懂的
+    // 原始标记"。改成只匹配 KaTeX 真的支持、且合理出现在最外层的数学显示环境——
+    // 名单跟下面 envMap 本来就有的 5 个一致，不引入这条正则从没验证过的新环境。
+    pushPlaceholder(/\\begin\{(equation|align|gather|multline|eqnarray)(\*?)\}([\s\S]*?)\\end\{\1\2\}/g, 'display', (match, env, star, body) => {
+        // 未加星号（带编号）的一律转换成加星号版本——Visual 模式是只读预览，公式编号跟
+        // 正文里的 \eqref/\ref 没有意义，且编号状态在这里维护不了。
+        const noNumberEnv = env + (star || '*');
         return `\\begin{${noNumberEnv}}${body}\\end{${noNumberEnv}}`;
     });
     pushPlaceholder(/\\\[([\s\S]*?)\\\]/g, 'display', (match, p1) => p1);
@@ -22968,14 +22980,27 @@ function ovlVisualRenderChunk(tex) {
 // P11：\section/\subsection/.../\title/\author 这类标题命令强制单独成块，即使跟下一段
 // 正文之间没有空行——原来"标题跟紧邻正文粘成一块、只在块首标一个号"，被用户实测指出
 // "标题附近的文字段不显示行号"，根因就在这（一整块只有一个行号，视觉上像是漏标）。
+// v2 Pass P14：上面这个"深度计数器"原来不分环境种类，一律拦下内部空行——对
+// proposition/theorem/algorithm 这类"本质是一大段带段落分隔的正文，只是套了个环境壳"
+// 的内容，这一刀切出了真 bug：实测一个 47 行的 \begin{proposition}...\end{proposition}
+// 被硬揉成一整块（2029 字），超过 FOCUS_TEX_QUOTE_MAX（2000）导致"关注"直接被拒，
+// gutter 点选粒度也粗到没法只选其中一段。真正"内部空行绝对不能被切"的只有数学公式类
+// 环境——equation/align 这些一旦从中间断开，两半各自送去 KaTeX 时 \begin/\end 都不再
+// 配对，整条公式直接变回一堆裸反斜杠命令的纯文本，是实打实的渲染倒退；而 proposition/
+// theorem/algorithm 这类环境即使被空行切成几块，无非是 \begin{proposition} 和
+// \end{proposition} 分别落单在两块里——按本文件的既定设计，未知环境本来就是"原样保留
+// raw 标记"（ovlSplitVisualBlocks 上面这段大注释开头就是这句话），落单的 \begin/\end
+// 一样是"原样保留"，不会报错也不会变得比现在更难看，反而换来了段落级别的行号和"关注"
+// 粒度。因此把"挡空行"的判断从"深度计数器 > 0"收窄成"数学专用环境的深度计数器 > 0"。
+const OVL_VISUAL_MATH_ATOMIC_ENV_RE = /^(equation|align|gather|multline|eqnarray|alignat|flalign|IEEEeqnarray|cases|dcases|rcases|matrix|pmatrix|bmatrix|vmatrix|Vmatrix|smallmatrix|array|split|subarray|CD)\*?$/;
 function ovlSplitVisualBlocks(body, baseLine) {
     const lines = body.split('\n');
     const blocks = [];
-    let depth = 0;
+    let mathDepth = 0;
     let cur = [];
     let curStart = 0;
-    const beginRe = /\\begin\{[^}]*\}/g;
-    const endRe = /\\end\{[^}]*\}/g;
+    const beginRe = /\\begin\{([^}]*)\}/g;
+    const endRe = /\\end\{([^}]*)\}/g;
     const headingRe = /^\s*\\(part|chapter|section|subsection|subsubsection|paragraph|title|author)\*?(\[[^\]]*\])?\{/;
     function flush() {
         const text = cur.join('\n');
@@ -22985,8 +23010,20 @@ function ovlSplitVisualBlocks(body, baseLine) {
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         const isBlank = line.trim() === '';
-        const isHeading = depth === 0 && !isBlank && headingRe.test(line);
-        if (depth === 0 && (isBlank || isHeading) && cur.length) flush();
+        const isHeading = mathDepth === 0 && !isBlank && headingRe.test(line);
+        // v2 Pass P14：光靠空行还不够——用户实测的那个 47 行 proposition 内部压根没有一个
+        // 空行（学术写作里常见：一个环境内部段落之间只用普通换行，不留空行），单靠"放开
+        // 空行拦截"这一刀切不动它。真正稳定存在、且天然是"这一段到此为止"的边界，是数学
+        // 专用环境自己的起止——公式前的正文和公式本身、公式和公式后的正文，本来就是三种
+        // 不同性质的内容，理应各自成块。这里探一下这一行会不会让 mathDepth 从 0 迈进 1，
+        // 是的话在推进这一行之前先把之前攒的内容切走，让公式自己起一块新的。
+        let beginsMath = 0, endsMath = 0, m;
+        beginRe.lastIndex = 0;
+        while ((m = beginRe.exec(line))) { if (OVL_VISUAL_MATH_ATOMIC_ENV_RE.test(m[1])) beginsMath++; }
+        endRe.lastIndex = 0;
+        while ((m = endRe.exec(line))) { if (OVL_VISUAL_MATH_ATOMIC_ENV_RE.test(m[1])) endsMath++; }
+        const entersMathHere = mathDepth === 0 && beginsMath > 0;
+        if (mathDepth === 0 && (isBlank || isHeading || entersMathHere) && cur.length) flush();
         if (isBlank) {
             curStart = i + 1;
         } else {
@@ -22994,9 +23031,10 @@ function ovlSplitVisualBlocks(body, baseLine) {
             cur.push(line);
             if (isHeading) { flush(); curStart = i + 1; } // 标题行单独落地成一块，不等下一个空行
         }
-        const begins = (line.match(beginRe) || []).length;
-        const ends = (line.match(endRe) || []).length;
-        depth = Math.max(0, depth + begins - ends);
+        mathDepth = Math.max(0, mathDepth + beginsMath - endsMath);
+        // 公式刚闭合（mathDepth 归零）：让公式自己收尾成一块，别把它后面紧跟着的正文焊
+        // 进同一块——否则"公式 + 后面一大段话"又会重新长成下一个超长块。
+        if (mathDepth === 0 && endsMath > 0 && cur.length) { flush(); curStart = i + 1; }
     }
     flush();
     return blocks;
@@ -23833,16 +23871,25 @@ function ovlUpdateTreeToolbtnsVisibility() {
 }
 
 // ---- Ctrl+S：真的落盘 ----
-async function ovlSaveCurrentFile() {
+// v2 Pass P14：自动保存/编译前保存都会跑这个函数，用 opts.silent 区分"用户主动 Ctrl+S"
+// （要反馈：闪一下"已保存 HH:MM:SS"）和"背后自动帮你存的"（安静地存，不用每次都弹一下，
+// 敲字停顿 1.5 秒就闪一次反而是噪音）——脏点消失本身已经是够用的视觉反馈。
+// OvlSaveInFlight 防的是：自动保存的防抖计时器和用户手动 Ctrl+S 前后脚一起触发，两次
+// 同时对同一个 handle 调 createWritable() 会互相踩（FSA 同一个 handle 不支持并发写流）。
+let OvlSaveInFlight = false;
+async function ovlSaveCurrentFile(opts) {
+    opts = opts || {};
+    if (OvlSaveInFlight) return;
+    OvlSaveInFlight = true;
     try {
         const cf = OvlState.currentFile;
-        if (!cf || !cf.handle) { ovlFlashSaveStatus('没有打开的文件可保存', true); return; }
+        if (!cf || !cf.handle) { if (!opts.silent) ovlFlashSaveStatus('没有打开的文件可保存', true); return; }
         if (OvlState.usingWebkitFallback || typeof cf.handle.createWritable !== 'function') {
-            ovlFlashSaveStatus('只读降级模式（webkitdirectory）下无法写回磁盘', true);
+            if (!opts.silent) ovlFlashSaveStatus('只读降级模式（webkitdirectory）下无法写回磁盘', true);
             return;
         }
         const ok = await ovlEnsureRW(cf.handle);
-        if (!ok) { ovlFlashSaveStatus('没有写入权限，保存失败', true); return; }
+        if (!ok) { if (!opts.silent) ovlFlashSaveStatus('没有写入权限，保存失败', true); return; }
         const ta = document.getElementById('ovlCodeArea');
         if (!ta) return;
         const writable = await cf.handle.createWritable();
@@ -23851,11 +23898,26 @@ async function ovlSaveCurrentFile() {
         OvlState.dirty = false;
         OvlState.lastSavedAt = Date.now();
         ovlUpdateTabUI();
-        ovlFlashSaveStatus('已保存 ' + new Date(OvlState.lastSavedAt).toLocaleTimeString(), false);
+        if (!opts.silent) ovlFlashSaveStatus('已保存 ' + new Date(OvlState.lastSavedAt).toLocaleTimeString(), false);
     } catch (e) {
         console.error('[ovl] save failed', e);
-        ovlFlashSaveStatus('保存失败：' + (e && e.message ? e.message : String(e)), true);
+        if (!opts.silent) ovlFlashSaveStatus('保存失败：' + (e && e.message ? e.message : String(e)), true);
+    } finally {
+        OvlSaveInFlight = false;
     }
+}
+
+// 敲字停手 OVL_AUTOSAVE_DELAY 之后自动落盘一次——用户明确要求"改了就自动同步回磁盘文件"，
+// 不用每次都记得按 Ctrl+S。复用 ovlSaveCurrentFile 同一条写入路径（同一份只读降级/权限
+// 判断），只是 silent:true 不打扰。
+const OVL_AUTOSAVE_DELAY = 1500;
+let ovlAutoSaveTimer = null;
+function ovlScheduleAutoSaveToDisk() {
+    if (ovlAutoSaveTimer) clearTimeout(ovlAutoSaveTimer);
+    ovlAutoSaveTimer = setTimeout(function () {
+        ovlAutoSaveTimer = null;
+        if (OvlState.dirty) ovlSaveCurrentFile({ silent: true });
+    }, OVL_AUTOSAVE_DELAY);
 }
 
 // ==================== M9：文件树写操作（右键菜单 + 头部图标 + File outline）====================
@@ -24818,6 +24880,15 @@ async function ovlDoRecompile(opts) {
     try { localStorage.setItem('ovl.bridgeProjectPath', projectDir); } catch (e) {}
     const mainFile = OvlState.mainDocFile || (OvlState.currentFile && OvlState.currentFile.name) || 'main.tex';
 
+    // v2 Pass P14：桥接服务是直接读磁盘上的文件去编译的，请求体里压根没带编辑器内容
+    // （见下面 fetch body，只有 projectDir/mainFile）——编辑框里的改动如果还没落盘，编译出来
+    // 就是没改之前的旧版本。这里补一道保险：真有未落盘的改动就先存一次再编译，Autocompile
+    // （敲字防抖后自动触发这个函数）和手动点 Recompile 都走这一条，不用各自记一遍。
+    if (OvlState.dirty && OvlState.currentFile && OvlState.currentFile.handle && !OvlState.usingWebkitFallback) {
+        if (ovlAutoSaveTimer) { clearTimeout(ovlAutoSaveTimer); ovlAutoSaveTimer = null; }
+        await ovlSaveCurrentFile({ silent: true });
+    }
+
     OvlState.compiling = true;
     if (OvlState.pdfObjectUrl) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} OvlState.pdfObjectUrl = null; }
     ovlUpdatePdfToolbarUI();
@@ -25138,6 +25209,8 @@ function ovlBindShell() {
                 // M2：脏标记只在真的打开着一个文件时才有意义（比如 webkitdirectory 降级模式下
                 // ta 也能被"编辑"但 disabled 挡住了输入，这里额外守一道 currentFile）。
                 if (OvlState.currentFile) { OvlState.dirty = true; ovlUpdateTabUI(); }
+                // v2 Pass P14：改完自动同步回磁盘文件，不用记得按 Ctrl+S。
+                ovlScheduleAutoSaveToDisk();
                 ovlScheduleOutlineRefresh();
                 // v2 Polish 2（Bug 2）：软换行点可能因为编辑而变，200-300ms 防抖到停手再重算
                 // 行偏移表——跟 M9 outline 的 1s 防抖同一条纪律，这里给短一点，因为 gutter 错位
