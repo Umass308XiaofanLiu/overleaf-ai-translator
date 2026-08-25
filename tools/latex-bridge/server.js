@@ -541,6 +541,79 @@ function doSyncTexForward(outdir, mainAbs, line, column) {
 }
 
 // ---------------------------------------------------------------------------
+// /synctex/edit —— PDF 页码+坐标 -> 源码行号（M11 SyncTeX 反向，pdf.js 双击画布触发）。
+// 用真的 `synctex edit -o page:x:y:pdfPath`，跟 doSyncTexForward 同一套 spawn/超时/解析纪律，
+// 镜像它的参数数组写法（不拼 shell 字符串）。坐标约定见 `synctex help edit`：page 1-based，
+// x/y 是"从页面左上角量起、单位 big point (72dpi)"——跟 doSyncTexForward 返回的 x/y 是同一个
+// 坐标系（2026-08-25 本机用 scratch 文档实测过 view 的输出直接喂给 edit 能精确 round-trip
+// 回同一行），前端负责把 pdf.js 的画布点击坐标换算成这个坐标系，这里只管照原样传给 synctex。
+// ---------------------------------------------------------------------------
+
+function doSyncTexEdit(outdir, page, x, y) {
+    return new Promise((resolve) => {
+        if (!fs.existsSync(SYNCTEX)) {
+            resolve({ ok: false, error: 'synctex 未找到: ' + SYNCTEX + '（检查 LATEX_BRIDGE_TEXBIN / TeX Live 是否安装）' });
+            return;
+        }
+        const pdfPath = path.join(outdir, 'output.pdf');
+        const synctexGz = path.join(outdir, 'output.synctex.gz');
+        if (!fs.existsSync(pdfPath) || !fs.existsSync(synctexGz)) {
+            resolve({ ok: false, error: '这次编译没有产出 output.synctex.gz（先 Recompile 一次成功的编译）' });
+            return;
+        }
+        const args = ['edit', '-o', page + ':' + x + ':' + y + ':' + pdfPath];
+        let child;
+        try {
+            child = spawn(SYNCTEX, args, { windowsHide: true });
+        } catch (e) {
+            resolve({ ok: false, error: 'spawn synctex failed: ' + e.message });
+            return;
+        }
+        let resolved = false;
+        const outBuf = [];
+        const timer = setTimeout(() => {
+            if (resolved) return;
+            resolved = true;
+            try { child.kill(); } catch (e) {}
+            resolve({ ok: false, error: 'synctex 超时（10s）' });
+        }, 10000);
+        child.stdout.on('data', (c) => outBuf.push(c));
+        child.on('error', (err) => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timer);
+            resolve({ ok: false, error: 'synctex process error: ' + err.message });
+        });
+        child.on('close', () => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timer);
+            const text = Buffer.concat(outBuf).toString('utf8');
+            // 输出形如：
+            //   SyncTeX result begin
+            //   Output:...\output.pdf
+            //   Input:.../main.tex
+            //   Line:5
+            //   Column:-1
+            //   Offset:0
+            //   Context:
+            //   SyncTeX result end
+            const fileM = /^Input:(.+)$/m.exec(text);
+            const lineM = /^Line:(-?\d+)/m.exec(text);
+            const line = lineM ? parseInt(lineM[1], 10) : null;
+            if (line === null || line < 1 || !fileM) {
+                resolve({ ok: false, error: '没有匹配结果（可能点在页面空白处），synctex 原始输出：' + text.trim() });
+                return;
+            }
+            // synctex 在 Windows 上照样吐 "/e/..." 或带 "./" 的路径分隔风格，统一 normalize 一下
+            // 方便前端直接按 basename 比对当前打开的文件。
+            const file = path.normalize(fileM[1].trim());
+            resolve({ ok: true, file: file, line: line, raw: text });
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 路由
 // ---------------------------------------------------------------------------
 
@@ -570,7 +643,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, GET /health, GET /output/:id/:file, POST /clear');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, GET /health, GET /output/:id/:file, POST /clear');
             return;
         }
 
@@ -657,6 +730,26 @@ const server = http.createServer(async (req, res) => {
             if (!line || line < 1) { sendJson(res, 400, { ok: false, error: 'line 必须是正整数' }); return; }
             const mainAbs = path.isAbsolute(mainFile) ? mainFile : path.join(projectDir, mainFile);
             const result = await doSyncTexForward(outdir, mainAbs, line, body.column || 0);
+            sendJson(res, 200, result);
+            return;
+        }
+
+        // M11 SyncTeX 反向：{id, page, x, y} -> {file, line}
+        if (req.method === 'POST' && pathname === '/synctex/edit') {
+            const bodyText = await readBody(req);
+            let body;
+            try { body = JSON.parse(bodyText || '{}'); } catch (e) {
+                sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
+                return;
+            }
+            const outdir = safeOutdirForId(body.id);
+            if (!outdir) { sendJson(res, 400, { ok: false, error: 'invalid id（先成功编译一次）' }); return; }
+            const page = parseInt(body.page, 10);
+            const x = Number(body.x);
+            const y = Number(body.y);
+            if (!page || page < 1) { sendJson(res, 400, { ok: false, error: 'page 必须是正整数' }); return; }
+            if (!isFinite(x) || !isFinite(y)) { sendJson(res, 400, { ok: false, error: 'x/y 必须是有限数字' }); return; }
+            const result = await doSyncTexEdit(outdir, page, x, y);
             sendJson(res, 200, result);
             return;
         }

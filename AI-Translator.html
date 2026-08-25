@@ -8,6 +8,14 @@
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
     <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <!-- v2 Pass P16：M4 PDF 面板换渲染器用的 pdf.js（Mozilla），跟 KaTeX/marked 同一种引入方式
+         （公共 CDN script 标签，不是新架构）。workerSrc 的设置挪到下面主内联 script 块顶部
+         去做（见 "pdf.js workerSrc" 注释），不在这里单开一个小 script 块——tests/latex/
+         textcolor-suite.js 靠"第一个不带 src 的内联 script 标签就是主脚本"这个假设去抽取
+         stripTextColorOnce/stripTextColorForModel 做回归测试，这里单开一个内联块会让它抽到
+         这段 6 行代码而不是主脚本，误报"函数不存在"（2026-08-25 pre-commit 钩子实测踩到，
+         另外这条注释本身也不能直接写尖括号形式的标签字面量，同一个原因，正则不认注释）。 -->
+    <script src="https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js"></script>
     <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
 
@@ -2011,7 +2019,14 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-pdf-projectrow input[type="text"]:focus { outline: none; border-color: #098842; }
 .ovl-pdf-placeholder { max-width: 480px; line-height: 1.6; }
 .ovl-pdf-body.ovl-pdf-body-filled { padding: 0; display: block; }
-.ovl-pdf-iframe { width: 100%; height: 100%; border: none; background: #ffffff; display: block; }
+/* v2 Pass P16：iframe 换成 pdf.js canvas——外层是可滚动、可能比画布大的容器（画布是"实际
+   页面像素尺寸"，缩放/翻页会让它比容器窄/宽/高/矮），深灰底色模仿常见 PDF 阅读器的"页面外"
+   底色，让白色页面边界看得清楚（原来的 iframe 是浏览器内置阅读器自己管这层，现在得自己画）。*/
+.ovl-pdf-canvas-wrap {
+    width: 100%; height: 100%; overflow: auto; background: #525659;
+    display: flex; justify-content: center; padding: 16px 0; box-sizing: border-box;
+}
+.ovl-pdf-canvas { background: #ffffff; box-shadow: 0 1px 4px rgba(0,0,0,0.35); display: block; cursor: pointer; height: fit-content; }
 
 /* 日志面板与 PDF 区共用 #ovlPdfPanel 的 data-logview 属性切换，不搞第二套挂载策略。 */
 .ovl-pdf-panel[data-logview="closed"] .ovl-log-panel { display: none; }
@@ -2105,8 +2120,8 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 }
 .ovl-pdf-zoombtn:hover { background: #2F3A4C; }
 .ovl-pdf-iconbtn.ovl-active { color: #4ade80; }
-/* 反色预览：滤镜加在 iframe 本体上（Overleaf 是加在 PDF 渲染层，我们只有 iframe 可加）。 */
-.ovl-pdf-iframe.ovl-pdf-inverted { filter: invert(1) hue-rotate(180deg); }
+/* 反色预览：滤镜加在 canvas 本体上（v2 Pass P16 起换成 pdf.js，之前是加在 iframe 上）。 */
+.ovl-pdf-canvas.ovl-pdf-inverted { filter: invert(1) hue-rotate(180deg); }
 
 /* ---- 编译选项菜单 / 缩放菜单 / 项目菜单：复用 .ovl-layout-menu 的外壳，只加内容专用的小件 ---- */
 .ovl-menu-section-label {
@@ -2223,6 +2238,12 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 <body class="bg-slate-50 text-slate-900">
     <div id="root"></div>
     <script>
+// v2 Pass P16：pdf.js 的页面渲染在一个独立 Worker 里做，必须先指好 workerSrc 才能
+// getDocument()——版本号跟 <head> 里的 pdf.min.js 锁死一致，两边各自更新会直接在控制台
+// 报版本不匹配。放在主脚本最顶上执行（不单开一个内联 <script> 块，见 <head> 里那条注释）。
+if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+}
 // ==================== LATEX-FILTER.JS（v2 Pass E：M5 Visual 模式用，原样内联自
 //   tools/latex-filter/filter.js，一个字节不改——README 记载它已过 237/237 单测 + fuzz 归零 +
 //   21 份真实语料零截断压测（docs/latex_filter_integration_spec.md）。挂到全局 LatexFilter，
@@ -21623,11 +21644,18 @@ const OvlState = {
     bridgeOnline: null,      // null=还没探测过；true/false=探测结果
     compiling: false,
     lastCompile: null,       // 桥 POST /compile 的完整返回：{ok,id,exitCode,pdfExists,pdfSize,log,parsed,counts,files,...}
-    pdfObjectUrl: null,      // 当前 <iframe> 用的 blob: URL，换下一版前必须先 URL.revokeObjectURL
+    pdfObjectUrl: null,      // 当前 <canvas> 渲染用的 blob: URL，换下一版前必须先 URL.revokeObjectURL
     logView: false,
     logFilter: 'all',        // 'all' | 'error' | 'warning' | 'info'
-    // ---- v2 Pass D：M4 翻页/缩放（iframe + PDF Open Parameters，不是 pdf.js） ----
+    // ---- v2 Pass D：M4 翻页/缩放；v2 Pass P16 起渲染器从 iframe+PDF Open Parameters 换成
+    // pdf.js 画到 <canvas>（见 ovlPdfApplyView），字段含义不变，只是不再靠 URL hash 遥控。 ----
     pdfView: { page: 1, totalPages: 1, zoomMode: 'value', zoomPct: 100 }, // zoomMode: 'value'|'fitwidth'|'fitheight'
+    // ---- v2 Pass P16：pdf.js 文档/页面缓存，服务 M4 渲染 + M11 反向 SyncTeX 的坐标换算 ----
+    pdfDoc: null,            // 当前 pdfjsLib PDFDocumentProxy（跟 pdfObjectUrl 对应，见 pdfDocUrl）
+    pdfDocUrl: null,         // pdfDoc 是从哪个 pdfObjectUrl 加载的——用来判断新一轮编译后是否要重新 getDocument()
+    pdfRenderTask: null,     // 当前正在跑的 page.render() 任务，切页/缩放/resize 太快时用来 cancel() 上一个
+    pdfActivePage: null,     // 当前画到 canvas 上那一页的 PDFPageProxy（双击反向 SyncTeX 用 .view 取页高）
+    pdfActiveViewport: null, // 渲染那一页时用的 viewport（双击反向 SyncTeX 用 convertToPdfPoint 换算坐标）
     // ---- v2 Polish：编辑器/PDF 拖拽分栏比例（只存内存，刷新复位，见 ovlColSplitterBeginDrag）----
     splitEditorFr: 1,
     splitPdfFr: 1
@@ -21731,9 +21759,10 @@ function ovlShellHtml() {
         +           '<label data-mode="visual">Visual</label>'
         +         '</div>'
         // M10 SyncTeX 正向（源码 -> PDF）：真跑 tools/latex-bridge 的 synctex.exe view 子命令
-        // （§2.6.10）。没有编译产物时禁用；反向（PDF -> 源码）在当前 iframe+浏览器内置 PDF
-        // 阅读器架构下做不到，见交付说明"诚实边界"一节，这里不留一个点了没反应的按钮。
-        +         '<button type="button" class="ovl-cmdbtn" id="ovlSyncTexBtn" disabled data-tip="Go to PDF location（SyncTeX 正向，只做到页级定位）" data-tip-pos="bottom-end">&#8677;</button>'
+        // （§2.6.10）。没有编译产物时禁用。v2 Pass P16 起反向（PDF -> 源码）也做出来了——
+        // 换了 pdf.js 渲染器之后双击 PDF 画布上的文字就能跳回源码那一行，见 ovlPdfHandleDblClick，
+        // 不需要在这里再放一个按钮（Overleaf 本身也是靠双击，不是按钮触发反向）。
+        +         '<button type="button" class="ovl-cmdbtn" id="ovlSyncTexBtn" disabled data-tip="Go to PDF location（SyncTeX 正向，只做到页级定位；反向双击 PDF 里的文字即可）" data-tip-pos="bottom-end">&#8677;</button>'
         +         '<button type="button" class="ovl-cmdbtn" id="ovlFindBtn" data-cmd="edit.find" data-tip="查找/替换（Ctrl+F）" data-tip-pos="bottom-end">&#128269;</button>'
         +       '</div>'
         +     '</div>'
@@ -25296,11 +25325,12 @@ function ovlRenderPdfBody() {
     if (!body) return;
     if (OvlState.pdfObjectUrl) {
         body.classList.add('ovl-pdf-body-filled');
-        if (!document.getElementById('ovlPdfIframe')) {
-            body.innerHTML = '<iframe class="ovl-pdf-iframe" id="ovlPdfIframe" title="Compiled PDF"></iframe>';
+        if (!document.getElementById('ovlPdfCanvasWrap')) {
+            body.innerHTML = '<div class="ovl-pdf-canvas-wrap" id="ovlPdfCanvasWrap"><canvas class="ovl-pdf-canvas" id="ovlPdfCanvas"></canvas></div>';
+            ovlBindPdfCanvasEvents();
         }
-        // M4：翻页/缩放/反色都靠 ovlPdfApplyView() 统一写 iframe.src 的 hash（PDF Open Parameters），
-        // 不在这里单独设一次 src——否则两处各写一半，容易互相踩。
+        // M4：翻页/缩放/反色都靠 ovlPdfApplyView() 统一驱动 pdf.js 渲染，不在这里单独渲染一次——
+        // 否则两处各画一半，容易互相踩（跟旧 iframe 版本同一条纪律，只是介质从 src 换成 canvas）。
         ovlPdfApplyView();
         return;
     }
@@ -25478,12 +25508,12 @@ function ovlDownloadCompiledPdf() {
 
 // ---- M10 SyncTeX 正向（源码 -> PDF），§2.6.10 ----
 // 真跑桥的 /synctex/forward（桥内部调 TeX Live 自带的 synctex.exe view，本机 2026-08-24 实测
-// 走通，见 tools/latex-bridge/server.js 的 doSyncTexForward）。只做到页级跳转：iframe + 浏览器
-// 内置 PDF 阅读器的 PDF Open Parameters 只认 #page=N，拿不到 x/y 坐标去画高亮框或精确滚动，
-// 这是 M4 选择"不上 pdf.js，用内置阅读器"时就注定的边界（见 22196 行附近那段渲染器选择说明），
-// 不是这一轮没做完。反向（PDF -> 源码，双击 PDF 定位源码）在这个架构下做不到——原生 PDF 阅读器
-// 跑在 iframe 里的另一个渲染进程，没有 postMessage 协议能把点击坐标传回父页面（这也是当初
-// 不选 pdf.js 换来的代价）。诚实起见，不留一个"看起来能双击但其实没绑事件"的假交互。
+// 走通，见 tools/latex-bridge/server.js 的 doSyncTexForward）。只做到页级跳转——v2 Pass D 那时
+// 用 iframe + 浏览器内置 PDF 阅读器，PDF Open Parameters 只认 #page=N，拿不到 x/y 去画高亮框。
+// v2 Pass P16 起渲染器换成 pdf.js（见 ovlPdfApplyView），反向（PDF -> 源码，双击 PDF 定位源码）
+// 已经做出来了，见下面 ovlPdfHandleDblClick + 桥的 /synctex/edit（doSyncTexEdit）。这里的正向
+// 跳转本可以顺手也做到 x/y 级（pdf.js 拿得到坐标），但没在这一轮范围内改——保持只做页级跳转，
+// 跟按钮 tooltip 说的一致，不擅自扩大改动范围。
 async function ovlSyncTexForward() {
     try {
         if (!OvlState.lastCompile || !OvlState.lastCompile.pdfExists || !OvlState.lastCompile.synctexExists) {
@@ -25957,10 +25987,18 @@ function ovlBindShell() {
 
 // ==================== v2 Pass D：M4 PDF 工具条全套 + M7 设置面板 + 项目菜单 ====================
 // 见 docs/v2_overleaf_latex_plan.md §2.6.6/§2.6.7/§2.6.8/§2.6.1，Pass D 的具体范围写在
-// 分发这一轮任务的 prompt 里。渲染器选择：不引入 pdf.js（避免新增 CDN <script>，见硬约束），
-// 用 <iframe> + Chrome 内置 PDF 阅读器，靠 PDF Open Parameters（#page=/#zoom=/#view=FitH|FitV）
-// 遥控翻页缩放——代价见交付说明「渲染器选择」一节：拿不到"手动滚动时的当前页"回报、
-// 每次翻页/缩放都是整帧重导航（软件层面等价，观感上有一次极短的重绘）。
+// 分发这一轮任务的 prompt 里。
+//
+// v2 Pass P16 更新：渲染器从"<iframe> + Chrome 内置 PDF 阅读器 + PDF Open Parameters"
+// 换成了 pdf.js（Mozilla）画到 <canvas>——旧版本靠 #page=/#zoom= 遥控翻页缩放，拿不到点击坐标，
+// 反向 SyncTeX（双击 PDF 定位源码）在那套架构下做不到（内置阅读器是独立渲染进程，没有
+// postMessage 协议）。pdf.js 是公开 CDN <script>，跟 KaTeX/marked 同一种引入方式，不是新架构，
+// 之前"不引入 pdf.js"那句话是过时的顾虑，不是真实的硬约束（新增 CDN 库本身不违反任何硬约束，
+// 见任务说明）。现在：
+//   - ovlPdfApplyView() 驱动真正的 page.render() 到 canvas，不再是"整帧重导航"；
+//   - 反向 SyncTeX 见 ovlPdfHandleDblClick + ovlBindPdfCanvasEvents；
+//   - "手动滚动时的当前页"依旧拿不到——本轮只做"当前激活页"单页渲染（跟旧版本同一个简化，
+//     没有做成多页连续滚动 + 滚动位置回报当前页，那是另一轮范围之外的功能，不是这里漏做）。
 
 // ---- M7 Editor/Spelling/Appearance：立刻生效的设置 ----
 const OVL_SETTINGS_DEFAULTS = {
@@ -26546,8 +26584,8 @@ function ovlBindSettingsModal() {
 
 // ---- M4：反色 / 停止编译 ----
 function ovlUpdatePdfInvertFromSettings() {
-    const ifr = document.getElementById('ovlPdfIframe');
-    if (ifr) ifr.classList.toggle('ovl-pdf-inverted', !!OvlSettings.darkModePdf);
+    const canvas = document.getElementById('ovlPdfCanvas');
+    if (canvas) canvas.classList.toggle('ovl-pdf-inverted', !!OvlSettings.darkModePdf);
     const btn = document.getElementById('ovlInvertBtn');
     if (btn) btn.classList.toggle('ovl-active', !!OvlSettings.darkModePdf);
 }
@@ -26566,9 +26604,12 @@ async function ovlStopCompilation() {
     }
 }
 
-// ---- M4：翻页 / 缩放（iframe + PDF Open Parameters，见本节顶部说明） ----
+// ---- M4：翻页 / 缩放（v2 Pass P16 起用 pdf.js 画到 canvas，见本节顶部说明） ----
 // 兜底用：桥没给 pageCount 时才走这条路。实测 TeX Live 2020+ 默认压缩对象流（ObjStm），
 // 明文扫描在真实 pdflatex 输出上经常数到 0——主路径是桥从 .log 挖 "N pages"（见 ovlDoRecompile）。
+// pdf.js 加载完文档后 doc.numPages 是真数字，ovlPdfEnsureDocLoaded 里会用它覆盖这个估算值，
+// 这个函数留着只当"文档还没加载完之前"的临时兜底，不删掉是因为总页数在拿到真实 PDF 字节后、
+// pdf.js 文档对象加载完成前那段时间也要显示点什么。
 function ovlEstimatePdfPageCount(buf) {
     try {
         const bytes = new Uint8Array(buf);
@@ -26615,24 +26656,138 @@ function ovlPdfSetZoomMode(mode) {
     ovlPdfApplyView();
 }
 function ovlPdfPresentation() {
-    const ifr = document.getElementById('ovlPdfIframe');
-    if (!ifr || !OvlState.pdfObjectUrl) return;
+    const wrap = document.getElementById('ovlPdfCanvasWrap');
+    if (!wrap || !OvlState.pdfObjectUrl) return;
     OvlState.pdfView.zoomMode = 'fitheight';
     ovlPdfApplyView();
-    try { if (ifr.requestFullscreen) ifr.requestFullscreen(); } catch (e) { console.warn('[ovl] presentation fullscreen failed', e); }
+    try { if (wrap.requestFullscreen) wrap.requestFullscreen(); } catch (e) { console.warn('[ovl] presentation fullscreen failed', e); }
 }
-function ovlPdfHashString() {
+
+// pdf.js 文档缓存：同一个 pdfObjectUrl 只 getDocument() 一次，换编译（pdfObjectUrl 变了）才
+// 重新加载并 destroy() 旧文档（不 destroy 会攒 worker 内存，编译几十次之后能看出来）。
+//
+// 2026-08-25 本机实测踩到的真事故：ovlRenderPdfBody（编译成功那一刻）和紧接着的一次
+// ovlPdfSetPage 几乎同时各自触发一次 ovlPdfRenderCurrentPage，两边都在"OvlState.pdfDoc 还是
+// null"这个窗口内并发调用了这个函数——如果只护"OvlState.pdfDoc 有没有"，两边都会各自真的
+// 调一次 pdfjsLib.getDocument(url)，得到两个不同的文档对象；先返回的那个把自己挂到
+// OvlState.pdfDoc 上，后返回的那个看到"OvlState.pdfDoc 已经有值了"就把先返回的那个 destroy()
+// 掉——但先返回的那个此时可能正在被另一个还没走完的 getPage()/render() 用着，直接
+// "Transport destroyed" 崩掉（控制台实测复现）。修法：把"正在加载中的 promise 本身"缓存住
+// （不是只缓存已经加载完的 doc），同一个 url 的并发调用全部 await 同一个 promise，保证
+// pdfjsLib.getDocument(url) 对同一个 url 只真正调一次。
+let ovlPdfLoadingPromise = null;
+let ovlPdfLoadingUrl = null;
+function ovlPdfEnsureDocLoaded() {
+    if (!OvlState.pdfObjectUrl) return Promise.resolve(null);
+    if (OvlState.pdfDoc && OvlState.pdfDocUrl === OvlState.pdfObjectUrl) return Promise.resolve(OvlState.pdfDoc);
+    const url = OvlState.pdfObjectUrl;
+    if (ovlPdfLoadingPromise && ovlPdfLoadingUrl === url) return ovlPdfLoadingPromise; // 已经有一份同 url 的加载在跑，跟它对齐
+    if (typeof pdfjsLib === 'undefined') { console.error('[ovl] pdfjsLib 没加载成功（CDN 被挡？）'); return Promise.resolve(null); }
+    ovlPdfLoadingUrl = url;
+    ovlPdfLoadingPromise = (async () => {
+        let doc;
+        try {
+            doc = await pdfjsLib.getDocument(url).promise;
+        } catch (e) {
+            console.error('[ovl] pdf.js getDocument failed', e);
+            ovlPdfLoadingPromise = null; ovlPdfLoadingUrl = null;
+            return null;
+        }
+        // 加载这段 await 期间可能又换了一版编译（pdfObjectUrl 已经不是当初那个了）——这一份
+        // 文档已经过期，销毁掉，改去加载最新的那个，不把旧文档挂到 State 上。
+        if (OvlState.pdfObjectUrl !== url) {
+            try { doc.destroy(); } catch (e) {}
+            ovlPdfLoadingPromise = null; ovlPdfLoadingUrl = null;
+            return ovlPdfEnsureDocLoaded();
+        }
+        if (OvlState.pdfDoc && OvlState.pdfDoc !== doc) { try { OvlState.pdfDoc.destroy(); } catch (e) {} }
+        OvlState.pdfDoc = doc;
+        OvlState.pdfDocUrl = url;
+        // doc.numPages 是 pdf.js 真解析出来的页数，比桥从 .log 挖的正则/ovlEstimatePdfPageCount
+        // 明文扫描都可靠——文档一加载完就纠正一次，不用等用户翻到最后一页才发现总数不对。
+        if (doc.numPages) OvlState.pdfView.totalPages = doc.numPages;
+        ovlPdfLoadingPromise = null; ovlPdfLoadingUrl = null;
+        return doc;
+    })();
+    return ovlPdfLoadingPromise;
+}
+
+// 计算这一页要用的 CSS 像素/PDF-point 缩放比例。zoomPct=100 时 scale=1（1 pt = 1 CSS px，
+// 是 PDF 自己的"真实大小"语义，不是刻意选的"填满面板"的值）——fitwidth/fitheight 才会按
+// 容器实际尺寸算，跟旧 iframe 版本里 #view=FitH/FitV 的直觉一致。
+function ovlPdfComputeScale(page, wrap) {
     const v = OvlState.pdfView;
-    const parts = ['page=' + v.page];
-    if (v.zoomMode === 'fitwidth') parts.push('view=FitH');
-    else if (v.zoomMode === 'fitheight') parts.push('view=FitV');
-    else parts.push('zoom=' + v.zoomPct);
-    return parts.join('&');
+    const unitViewport = page.getViewport({ scale: 1 });
+    const PAD = 24; // 跟 .ovl-pdf-canvas-wrap 的左右留白/滚动条粗略对齐，不做到像素级精确
+    if (v.zoomMode === 'fitwidth') {
+        const w = wrap.clientWidth - PAD;
+        return w > 0 ? Math.max(0.1, w / unitViewport.width) : 1;
+    }
+    if (v.zoomMode === 'fitheight') {
+        const h = wrap.clientHeight - PAD;
+        return h > 0 ? Math.max(0.1, h / unitViewport.height) : 1;
+    }
+    return Math.max(0.1, (v.zoomPct || 100) / 100);
 }
+
+// 真正把"当前激活页"画到 canvas 上。只渲染 pdfView.page 这一页（跟旧 iframe 版本一样是
+// "单页视图"，不是连续滚动全部页——见本节顶部 v2 Pass P16 说明里的已知简化）。
+//
+// ovlPdfRenderGen：翻页/缩放/resize 触发的调用可能重叠（本函数中间有好几处 await），单纯
+// "谁最后调用 page.render() 谁的 task 赢"在两次调用的 await doc.getPage() 用不同耗时结束时
+// 会反过来——先发起的那次如果后 resolve，反而会把后发起、已经开始画的那次的 render task
+// 当成"上一次没画完的"取消掉，画面倒退回旧页。用一个单调递增的世代号在每个 await 点后都
+// 检查一遍"我还是不是最新那次调用"，不是就直接放弃，不动 canvas/State，交给最新那次收尾。
+let ovlPdfRenderGen = 0;
+async function ovlPdfRenderCurrentPage() {
+    if (!OvlState.pdfObjectUrl) return;
+    const myGen = ++ovlPdfRenderGen;
+    const doc = await ovlPdfEnsureDocLoaded();
+    if (!doc || myGen !== ovlPdfRenderGen) return;
+    const wrap = document.getElementById('ovlPdfCanvasWrap');
+    const canvas = document.getElementById('ovlPdfCanvas');
+    if (!wrap || !canvas) return;
+    const pageNum = ovlPdfClampPage(OvlState.pdfView.page);
+    OvlState.pdfView.page = pageNum;
+    let page;
+    try {
+        page = await doc.getPage(pageNum);
+    } catch (e) {
+        console.error('[ovl] pdf.js getPage failed', e);
+        return;
+    }
+    if (myGen !== ovlPdfRenderGen) return; // 等 getPage() 的这段时间里又来了更新的一次调用，让位
+    // 换页/缩放/resize 可能比上一次渲染跑得还快——取消上一个还没画完的 render task，
+    // 不然两次渲染的输出会在同一块 canvas 上撞车（pdf.js 官方文档明确写了这个坑）。
+    if (OvlState.pdfRenderTask) { try { OvlState.pdfRenderTask.cancel(); } catch (e) {} OvlState.pdfRenderTask = null; }
+    const cssScale = ovlPdfComputeScale(page, wrap);
+    const viewport = page.getViewport({ scale: cssScale });
+    const outputScale = window.devicePixelRatio || 1; // HiDPI 屏幕下画布内部分辨率要更高，CSS 尺寸不变
+    canvas.width = Math.max(1, Math.floor(viewport.width * outputScale));
+    canvas.height = Math.max(1, Math.floor(viewport.height * outputScale));
+    canvas.style.width = Math.floor(viewport.width) + 'px';
+    canvas.style.height = Math.floor(viewport.height) + 'px';
+    const ctx = canvas.getContext('2d');
+    const transform = outputScale !== 1 ? [outputScale, 0, 0, outputScale, 0, 0] : null;
+    const task = page.render({ canvasContext: ctx, viewport: viewport, transform: transform });
+    OvlState.pdfRenderTask = task;
+    try {
+        await task.promise;
+    } catch (e) {
+        if (e && e.name === 'RenderingCancelledException') return; // 正常取消，不是错误
+        console.error('[ovl] pdf.js page.render failed', e);
+        return;
+    }
+    if (OvlState.pdfRenderTask === task) OvlState.pdfRenderTask = null;
+    if (myGen !== ovlPdfRenderGen) return; // 画完了，但已经不是最新一次——不缓存成"当前激活页"
+    // 反向 SyncTeX（ovlPdfHandleDblClick）要用这一页的 page/viewport 做坐标换算，缓存住
+    // 这一次真正画出来的那一份（不是随便哪个 getPage 结果——万一被取消了坐标就对不上画面）。
+    OvlState.pdfActivePage = page;
+    OvlState.pdfActiveViewport = viewport;
+}
+
 function ovlPdfApplyView() {
-    const ifr = document.getElementById('ovlPdfIframe');
-    if (!ifr || !OvlState.pdfObjectUrl) return;
-    ifr.src = OvlState.pdfObjectUrl + '#' + ovlPdfHashString();
+    if (!OvlState.pdfObjectUrl) return;
     const pageInput = document.getElementById('ovlPdfPageInput');
     if (pageInput && document.activeElement !== pageInput) pageInput.value = OvlState.pdfView.page;
     const pageTotal = document.getElementById('ovlPdfPageTotal');
@@ -26645,6 +26800,99 @@ function ovlPdfApplyView() {
         zoomBtn.innerHTML = escapeHtml(label) + ' &#9662;';
     }
     ovlUpdatePdfInvertFromSettings();
+    // 真正的画布渲染是异步的（getDocument/getPage/render 都是 promise）——不 await，调用方
+    // （ovlPdfSetPage/ovlPdfZoomStep/…）都是同步函数，这里 fire-and-forget，跟旧版本"设一次
+    // iframe.src 就不管了、剩下交给浏览器"的调用习惯一致。
+    ovlPdfRenderCurrentPage().catch(function (e) { console.error('[ovl] pdf render failed', e); });
+}
+
+// canvas 双击 -> 反向 SyncTeX（M11，见 tools/latex-bridge/server.js 的 doSyncTexEdit）。
+// 坐标换算：viewport.convertToPdfPoint(cssX, cssY) 把"渲染视口里的 CSS 像素坐标"换算回
+// PDF 原生坐标系（左下角原点，向上为正，单位 = point，不受渲染 scale/旋转影响——pdf.js 内部
+// 就是拿渲染变换矩阵的逆矩阵做这一步）。synctex edit 要的是"左上角原点、向下为正"（见
+// `synctex help edit`："counted from the top left corner"，doSyncTexEdit 头部注释也记了这条），
+// 所以还要用页高做一次 y 轴翻转：synY = pageHeightPt - pdfY。
+// 2026-08-25 本机用 scratch 文档实测核对过这套换算：双击渲染出来的某一行文字，命中的源码行号
+// 跟那行文字实际所在的 \section 完全对上（不是差一行/镜像颠倒），见交付说明的实测记录。
+async function ovlPdfHandleDblClick(ev) {
+    try {
+        const canvas = ev.currentTarget;
+        const page = OvlState.pdfActivePage;
+        const viewport = OvlState.pdfActiveViewport;
+        if (!page || !viewport) return;
+        if (!OvlState.lastCompile || !OvlState.lastCompile.pdfExists || !OvlState.lastCompile.synctexExists) {
+            ovlFlashSaveStatus('还没有可用的 SyncTeX 数据，请先 Recompile 一次成功的编译', true);
+            return;
+        }
+        const rect = canvas.getBoundingClientRect();
+        const cssX = ev.clientX - rect.left;
+        const cssY = ev.clientY - rect.top;
+        const pdfPt = viewport.convertToPdfPoint(cssX, cssY); // [x, y]，左下角原点，向上为正
+        const pageHeightPt = page.view[3] - page.view[1]; // page.view = [x0,y0,x1,y1]，未旋转的原生 MediaBox
+        const synX = pdfPt[0];
+        const synY = pageHeightPt - pdfPt[1];
+        const pageNum = OvlState.pdfView.page;
+        ovlFlashSaveStatus('正在定位源码…', false);
+        const resp = await fetch(ovlBridgeUrl('/synctex/edit'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ id: OvlState.lastCompile.id, page: pageNum, x: synX, y: synY })
+        });
+        const data = await resp.json();
+        if (!data || !data.ok) { ovlFlashSaveStatus('反向 SyncTeX 定位失败：' + (data && data.error ? data.error : '未知错误'), true); return; }
+        // M3 阶段桥只认单文件项目（跟 ovlLogJumpToLine 头部注释同一条边界）：跳转只对"当前
+        // 编辑器里已经打开的这个文件"生效，返回的文件名对不上就诚实告知、不假装跳对了。
+        const curName = OvlState.currentFile && OvlState.currentFile.name;
+        const gotBase = data.file ? data.file.split(/[\\/]/).pop() : '';
+        if (!curName || gotBase !== curName) {
+            ovlFlashSaveStatus('该位置对应「' + (gotBase || '未知文件') + '」，跟当前打开的文件不是同一个，暂不支持自动跨文件跳转（已知限制）', true);
+            return;
+        }
+        if (OvlState.viewMode === 'pdf') ovlSetViewMode('split'); // 编辑器面板得先可见，跳过去才看得见
+        const lineIdx = Math.max(0, data.line - 1);
+        if (OvlState.editorMode === 'visual') {
+            ovlVisualScrollToLine(lineIdx);
+        } else {
+            ovlCodeScrollToLine(lineIdx);
+            // 顺手选中整行（跟 ovlLogJumpToLine 同一个习惯），双击后一眼能看出具体是哪一行，
+            // 不用只看到"卷到了大概那个位置"。
+            const ta = document.getElementById('ovlCodeArea');
+            if (ta && !ta.disabled) {
+                const lines = ta.value.split('\n');
+                const idx = Math.max(0, Math.min(lines.length - 1, lineIdx));
+                let start = 0;
+                for (let i = 0; i < idx; i++) start += lines[i].length + 1;
+                const end = start + (lines[idx] ? lines[idx].length : 0);
+                ta.focus();
+                ta.setSelectionRange(start, end);
+            }
+        }
+        ovlFlashSaveStatus('已跳到源码第 ' + data.line + ' 行', false);
+    } catch (e) {
+        console.error('[ovl] pdf reverse syncTex failed', e);
+        ovlFlashSaveStatus('反向 SyncTeX 定位失败：连不上桥接服务', true);
+    }
+}
+
+// canvas/wrap 只在第一次真的有 PDF 时创建（见 ovlRenderPdfBody），事件只用绑一次——不用
+// 每次 ovlPdfApplyView() 重绑，canvas 元素本身在同一份 PDF 存在期间不会被换掉。
+function ovlBindPdfCanvasEvents() {
+    const wrap = document.getElementById('ovlPdfCanvasWrap');
+    const canvas = document.getElementById('ovlPdfCanvas');
+    if (!canvas) return;
+    canvas.addEventListener('dblclick', function (ev) {
+        ovlPdfHandleDblClick(ev).catch(function (e) { console.error('[ovl] pdf dblclick handler failed', e); });
+    });
+    // fitwidth/fitheight 模式下容器尺寸一变（拖分栏/开关文件树/窗口 resize）就得重新算 scale
+    // 重画一次，否则页面还是按旧容器尺寸缩放的，会跟容器错位——value 模式不受容器尺寸影响，
+    // 不用跟着重画（省掉多余的 page.render()）。
+    if (typeof ResizeObserver !== 'undefined' && wrap) {
+        const ro = new ResizeObserver(function () {
+            if (OvlState.pdfView.zoomMode === 'fitwidth' || OvlState.pdfView.zoomMode === 'fitheight') {
+                ovlPdfApplyView();
+            }
+        });
+        ro.observe(wrap);
+    }
 }
 function ovlRenderZoomMenu() {
     const menu = document.getElementById('ovlZoomMenu');
