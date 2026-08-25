@@ -1545,6 +1545,46 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 .ovl-visual-body li { margin: 0.15em 0; }
 .ovl-visual-body code { background: #f1f5f9; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
 
+/* v2 Overleaf 预览 Pass：表格 / 算法 / 图片近似渲染的样式——只求"看得出结构"，不追求跟
+   pdflatex 真实排版像素对齐（见 ovlRenderVisualTable/Algorithm/Figure 上方注释）。 */
+.ovl-visual-caption { font-size: 12.5px; color: #374151; }
+.ovl-visual-caption-above { margin-bottom: 6px; font-weight: 600; }
+.ovl-visual-caption-below { margin-top: 8px; }
+.ovl-visual-caption p { margin: 0; }
+.ovl-visual-table-wrap { margin: 10px 0; }
+.ovl-visual-table { border-collapse: collapse; font-size: 12.5px; max-width: 100%; }
+.ovl-visual-table th, .ovl-visual-table td {
+    border: 1px solid #cbd5e1; padding: 4px 8px; text-align: center; vertical-align: middle;
+}
+.ovl-visual-table-head th { background: #f1f5f9; font-weight: 700; }
+.ovl-visual-table td p, .ovl-visual-table th p { margin: 0; display: inline; }
+.ovl-visual-algo-wrap {
+    margin: 10px 0; border: 1px solid #d1d5db; border-radius: 4px; padding: 10px 14px;
+    background: #fafafa;
+}
+.ovl-visual-algo-caption { font-weight: 700; font-size: 13px; margin-bottom: 6px; color: #111827; }
+.ovl-visual-algo-caption p { margin: 0; display: inline; }
+.ovl-visual-algo-body {
+    font: 12.5px/1.6 "SFMono-Regular", Consolas, monospace; color: #1f2937;
+}
+.ovl-algo-line { white-space: normal; }
+.ovl-algo-line p { margin: 0; display: inline; }
+.ovl-algo-lineno { display: inline-block; min-width: 1.6em; color: #9ca3af; }
+.ovl-algo-kw { font-weight: 700; color: #7c3aed; margin-right: 0.3em; }
+.ovl-algo-cond p { display: inline; margin: 0; }
+.ovl-algo-call { background: #eef2ff; padding: 0 3px; border-radius: 3px; }
+.ovl-algo-comment { color: #6b7280; font-style: italic; }
+.ovl-visual-figure-wrap { margin: 10px 0; }
+.ovl-visual-fig-row { display: flex; flex-wrap: wrap; gap: 10px; }
+.ovl-visual-fig-box {
+    flex: 1 1 220px; max-width: 100%; min-height: 90px; border: 1px dashed #9ca3af;
+    border-radius: 4px; background: #f8fafc; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; padding: 14px; box-sizing: border-box;
+}
+.ovl-visual-fig-icon { font-size: 22px; opacity: 0.6; }
+.ovl-visual-fig-name { margin-top: 6px; font-size: 11.5px; color: #6b7280; word-break: break-all; text-align: center; }
+.ovl-visual-float-fallback { white-space: pre-wrap; }
+
 .ovl-pdf-panel {
     background: #2F3A4C;
     display: flex;
@@ -6279,13 +6319,94 @@ function cleanLatex(formula) {
     return clean;
 }
 
+// \textcolor{name}{...} 的近似 CSS 映射表——不追求跟 xcolor 色值色准，Overleaf 预览级别的
+// "看得出是这个颜色"就够（见 overleaf-preview 任务第 4 项）。未登记的颜色名原样当 CSS
+// 颜色值尝试（真实论文里出现的大多数 xcolor 基础名本身就是合法 CSS 关键字）。
+const OVL_TEXTCOLOR_CSS = {
+    black: '#000000', white: '#ffffff', red: '#d32f2f', green: '#2e7d32', blue: '#1565c0',
+    cyan: '#00acc1', magenta: '#c2185b', yellow: '#f9a825', gray: '#757575', grey: '#757575',
+    darkgray: '#4d4d4d', darkgrey: '#4d4d4d', lightgray: '#bfbfbf', lightgrey: '#bfbfbf',
+    brown: '#795548', lime: '#8bc34a', olive: '#808000', orange: '#ef6c00', pink: '#e91e63',
+    purple: '#7b1fa2', teal: '#00796b', violet: '#8e24aa'
+};
+
+// 花括号配平扫描：从 str[openIdx]==='{' 开始，找到与之配对的 '}' 的下标；找不到返回 -1。
+// 跟 stripCommand 里内联的那段扫描是同一个手法，这里单独抽出来是因为 ovlRenderTextColor
+// （保留参数、还要拿到参数边界去掉外层壳）和后面 v2 Overleaf 预览的表格/算法/图片解析
+// 都要复用同一段"配平找右括号"逻辑，不想抄三遍。
+function ovlFindMatchingBrace(str, openIdx) {
+    let depth = 1;
+    for (let k = openIdx + 1; k < str.length; k++) {
+        if (str[k] === '{') depth++;
+        else if (str[k] === '}') { depth--; if (depth === 0) return k; }
+    }
+    return -1;
+}
+
+// \textcolor{color}{content} -> <span style="color:...">content</span>，花括号配平扫描
+// （嵌套花括号/嵌套行内数学必须原样带过去，不能用不配平的正则），content 递归喂回
+// renderFormattedText 自己渲染（这样 \textcolor{blue}{$P_i^b$} 这种颜色包着数学的写法，
+// 数学部分照样能正确渲染）。返回值里的占位符全部塞进调用方传入的 placeholders 数组，
+// 用法和下面 pushPlaceholder 那套一致：先拿 id 占位，marked.parse 跑完之后再统一替换回真
+// HTML，不能直接把渲染好的 HTML 塞进 marked 要解析的源文本——marked 会把 KaTeX 吐出来的
+// HTML 里的 `_`/`*` 当成 markdown 强调语法解析，字面上验证过这个坑，不能省。
+function ovlRenderTextColor(str, placeholders) {
+    let out = '';
+    let i = 0;
+    const openRe = /\\textcolor\s*(?:\[[^\]]*\])?\{/g;
+    while (i < str.length) {
+        openRe.lastIndex = i;
+        const m = openRe.exec(str);
+        if (!m) { out += str.slice(i); break; }
+        out += str.slice(i, m.index);
+        const nameOpen = m.index + m[0].length - 1; // 指向颜色名参数组的 '{'
+        const nameClose = ovlFindMatchingBrace(str, nameOpen);
+        if (nameClose === -1) { out += str.slice(m.index); i = str.length; break; } // 花括号不配平：原样放过，不装懂
+        const colorName = str.slice(nameOpen + 1, nameClose);
+        let p = nameClose + 1;
+        while (p < str.length && /\s/.test(str[p])) p++;
+        if (str[p] !== '{') { out += str.slice(m.index, nameClose + 1); i = nameClose + 1; continue; } // 没有内容组：不是合法的两参数 \textcolor，原样放过颜色名这一段
+        const contentOpen = p;
+        const contentClose = ovlFindMatchingBrace(str, contentOpen);
+        if (contentClose === -1) { out += str.slice(m.index); i = str.length; break; }
+        const inner = str.slice(contentOpen + 1, contentClose);
+        let css = OVL_TEXTCOLOR_CSS[colorName.trim().toLowerCase()];
+        if (!css) css = colorName.trim().replace(/[^a-zA-Z0-9#(),.%\s-]/g, '') || 'inherit'; // 未登记颜色名：按纯 CSS 颜色值字符集过滤后原样试一次，过滤不掉的字符（比如反斜杠）直接不让它进 style 属性
+        let innerHtml = renderFormattedText(inner);
+        innerHtml = innerHtml.replace(/^\s*<p>([\s\S]*)<\/p>\s*$/, '$1'); // \textcolor 是行内构造，marked 给单段落套的 <p> 外壳要拆掉，不然嵌进行内内容里变成块级元素
+        const id = `%%LATEX_${placeholders.length}%%`;
+        placeholders.push({ id, html: '<span style="color:' + css + '">' + innerHtml + '</span>' });
+        out += id;
+        i = contentClose + 1;
+    }
+    return out;
+}
+
 // 渲染格式化文本（支持Markdown和LaTeX）
 function renderFormattedText(text) {
     if (!text || !window.marked || !window.katex) return text || '';
     
     let content = String(text).replace(/[\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000\uFEFF]/g, ' ');
+
+    // v2 Overleaf \u9884\u89C8 Pass\uFF1A\label/\tag/\eqref/\autoref/\ref \u66FE\u7ECF\u53EA\u5728\u4E0B\u9762 pushPlaceholder
+    // \u62BD\u51FA\u7684\u6570\u5B66\u516C\u5F0F\u4F53\u5185\u90E8\u88AB stripCommand \u6389\u2014\u2014\u666E\u901A\u6B63\u6587\uFF08\u542B figure/table \u7684 \caption{...}\uFF0C
+    // \u54EA\u6015\u5916\u9762\u8FD8\u5957\u4E00\u5C42 \textcolor{...}{...}\uFF09\u4ECE\u6CA1\u8D70\u8FC7\u8FD9\u4E94\u4E2A stripCommand\uFF0CKaTeX/\u516C\u5F0F\u62BD\u53D6\u90FD
+    // \u770B\u4E0D\u5230\u5B83\u4EEC\uFF0C\u4E8E\u662F\u539F\u6837\u6F0F\u6210\u88F8\u6587\u672C\uFF0C\u6BD4\u5982\u4E00\u6761 \caption \u91CC\u7684 \eqref{eq:covert_outage_prob}
+    // \u4F1A\u5728 Visual \u6A21\u5F0F\u6E32\u67D3\u7ED3\u679C\u91CC\u9010\u5B57\u9732\u51FA\u6765\uFF08\u5B9E\u6D4B\u590D\u73B0\uFF0C\u89C1 tools/e2e/test_visual_overleaf_preview.js\uFF09\u3002
+    // \u5728\u8FD9\u91CC\u5BF9\u6574\u6BB5\u8F93\u5165\u5148\u505A\u4E00\u6B21\u5168\u5C40 strip\u2014\u2014\u6BD4\u5728\u6BCF\u4E2A\u65B0\u589E\u7684 caption/\u8868\u683C/\u7B97\u6CD5\u8C03\u7528\u70B9\u5404\u81EA\u8865\u4E00\u904D
+    // \u66F4\u5F7B\u5E95\uFF0C\u6563\u6587\u8DEF\u5F84\u548C\u6570\u5B66\u62BD\u53D6\u8DEF\u5F84\u5171\u7528\u540C\u4E00\u4EFD"\u8FD9\u4E94\u4E2A\u547D\u4EE4\u4E00\u5F8B\u5220\u9664"\u7684\u89C4\u5219\uFF0C\u4E0D\u4F1A\u6709\u7B2C\u4E8C\u5904\u9057\u6F0F\u3002
+    // \u987A\u5E8F\u653E\u5728\u6570\u5B66\u5360\u4F4D\u7B26\u62BD\u53D6\u4E4B\u524D\u4E5F\u662F\u5B89\u5168\u7684\uFF1A\begin{equation}...\end{equation} \u4E4B\u7C7B\u7684\u5339\u914D\u9760
+    // \begin/\end \u5B9A\u754C\uFF0C\u4E0D\u53D7\u5185\u90E8\u6587\u672C\u88AB\u5220\u51CF\u5F71\u54CD\uFF1B\u88AB\u62BD\u51FA\u7684\u516C\u5F0F\u4F53\u91CC\u540C\u4E00\u6279\u547D\u4EE4\u8FD9\u91CC\u5DF2\u7ECF\u5220\u8FC7\u4E00\u6B21\uFF0C
+    // \u4E0B\u9762 pushPlaceholder \u5185\u90E8\u5BF9 formula \u53D8\u91CF\u7684\u540C\u540D stripCommand \u8C03\u7528\u5BF9\u5DF2\u7ECF\u5E72\u51C0\u7684\u6587\u672C\u662F\u7A7A\u64CD\u4F5C\uFF0C
+    // \u4E0D\u4F1A\u4E8C\u6B21\u8BEF\u4F24\u6216\u4EA7\u751F\u526F\u4F5C\u7528\u3002
+    content = stripCommand(content, 'label');
+    content = stripCommand(content, 'tag');
+    content = stripCommand(content, 'eqref');
+    content = stripCommand(content, 'autoref');
+    content = stripCommand(content, 'ref');
+
     const placeholders = [];
-    
+
     const pushPlaceholder = (regex, type, getFormula) => {
         content = content.replace(regex, (...args) => {
             const match = args[0];
@@ -6338,7 +6459,18 @@ function renderFormattedText(text) {
     pushPlaceholder(/\$\$([\s\S]*?)\$\$/g, 'display', (match, p1) => p1);
     pushPlaceholder(/\\\(([\s\S]*?)\\\)/g, 'inline', (match, p1) => p1);
     pushPlaceholder(/\$([^\$]+?)\$/g, 'inline', (match, p1) => p1);
-    
+
+    // v2 Overleaf 预览 Pass：\textcolor{name}{...} 内联上色。必须放在上面这几个数学占位符
+    // 之后——\begin{equation}/$...$ 内部出现的 \textcolor（比如
+    // \mathbb{E}_{(\textcolor{blue}{t'},...)}）这时已经被整条公式一起提成占位符了，KaTeX
+    // 原生支持 \textcolor，交给它渲染就行，不需要（也不能）在这里重新处理一遍。这里扫到的
+    // 都是数学占位符提取剩下的正文级 \textcolor，包括包住行内数学的写法
+    // （\textcolor{blue}{the ... $t'$ ...}——这里的 $t'$ 在上面几行已经被替换成
+    // %%LATEX_N%% token，ovlRenderTextColor 原样带走这个 token 不认识它，等它整个被包进
+    // 新的颜色 span 占位符之后，还得靠下面 placeholders 数组"倒序"回填才能被正确解开，
+    // 见下面 for 循环的注释）。
+    content = ovlRenderTextColor(content, placeholders);
+
     // 【波浪号必须先藏起来】marked 默认开着 GFM 的单波浪号删除线，而 LaTeX 里
     // `Section~\ref{sec:II}` / `不确定性~\cite{10143419}` 这种不换行空格几乎出现在每一处引用上。
     // 上面的 pushPlaceholder 只把 $…$ / \[…\] / \begin{…} 里的数学换成了占位符，
@@ -6354,7 +6486,18 @@ function renderFormattedText(text) {
     let html = window.marked.parse(mdSource)
         .split(CHAT_MD_TILDE).join('~')
         .split(encodeURI(CHAT_MD_TILDE)).join('~');
-    placeholders.forEach(p => { html = html.replace(p.id, p.html); });
+    // 倒序回填（不是 forEach 正序）：\textcolor 的颜色 span 占位符是在上面数学占位符之后才
+    // push 进 placeholders 的，下标天然更大，而它的 html 里可能原样嵌着一个更早（下标更小）
+    // 的数学占位符 token（见上面 ovlRenderTextColor 调用处的注释）。正序回填会先处理数学
+    // token——那时它还没被"生出来"（颜色 span 自己都还没塞进 html），替换找不到目标，
+    // 之后处理颜色占位符才把这个数学 token 字面量塞进 html，正序循环已经走过去了，不会再
+    // 回头补一次，最终会在页面上露出一段裸的 %%LATEX_N%% 文本。倒序先展开外层（颜色）
+    // 占位符，把内层数学 token 真正"露出来"之后，循环走到那个更小的下标时才能找到并替换掉。
+    // 旧版没有嵌套占位符，正序/倒序结果一样；现在两种占位符会嵌套，必须倒序。
+    for (let pi = placeholders.length - 1; pi >= 0; pi--) {
+        const p = placeholders[pi];
+        html = html.replace(p.id, p.html);
+    }
     return html;
 }
 
@@ -22962,9 +23105,347 @@ function ovlSetEditorMode(mode) {
 // 是数据丢失，本仓库一票否决（README"工作方式"）。§4.0 映射表也是这么定的。
 let OvlVisualState = { preambleOpen: false, tailOpen: false, lastSrc: null };
 
+// \textcolor 在正式发给模型前会被 LatexFilter 的 MACRO_TABLE 当成"颜色标注壳"直接拆掉
+// （非 red/magenta/orange 的颜色统一 UNWRAP 成裸文字，色彩信息整个丢掉；见 2312 行附近
+// MACRO_TABLE 定义、buildCommentColors 的取舍注释）——这是翻译前处理该有的行为，不能动
+// （§“一个字节没改”）。但 Visual 模式要的是"像 Overleaf 一样把颜色显示出来"，跟"发给
+// 模型前要不要保留颜色标注"完全是两回事。所以在喂给 LatexFilter 之前，先把 \textcolor{
+// 颜色}{内容} 整体抠成一个 LatexFilter 绝对不会当成任何宏名的哑元 token（私用区字符，
+// LatexFilter 自己的内部哨兵 MARK 是 NUL 字节，跟这里用的字符不会撞），LatexFilter 处理完
+// 剩下的正文之后，再把 token 换回原始的 \textcolor{...}{...} 文本（还没渲染，仍是源码），
+// 交给 renderFormattedText——它内部的 ovlRenderTextColor 才是真正渲染颜色 span 的地方（连
+// 表格/算法/图片里的单元格/行/caption 文本也是走同一条 ovlVisualRenderChunk，颜色处理只
+// 用写这一处）。
+const OVL_TC_TOKEN_MARK = '';
+function ovlProtectTextColorForFilter(tex) {
+    const tokens = [];
+    let out = '';
+    let i = 0;
+    const openRe = /\\textcolor\s*(?:\[[^\]]*\])?\{/g;
+    while (i < tex.length) {
+        openRe.lastIndex = i;
+        const m = openRe.exec(tex);
+        if (!m) { out += tex.slice(i); break; }
+        out += tex.slice(i, m.index);
+        const nameOpen = m.index + m[0].length - 1;
+        const nameClose = ovlFindMatchingBrace(tex, nameOpen);
+        if (nameClose === -1) { out += tex.slice(m.index); i = tex.length; break; }
+        let p = nameClose + 1;
+        while (p < tex.length && /\s/.test(tex[p])) p++;
+        if (tex[p] !== '{') { out += tex.slice(m.index, nameClose + 1); i = nameClose + 1; continue; }
+        const contentClose = ovlFindMatchingBrace(tex, p);
+        if (contentClose === -1) { out += tex.slice(m.index); i = tex.length; break; }
+        const whole = tex.slice(m.index, contentClose + 1);
+        const token = OVL_TC_TOKEN_MARK + tokens.length + OVL_TC_TOKEN_MARK;
+        tokens.push(whole);
+        out += token;
+        i = contentClose + 1;
+    }
+    return { text: out, tokens: tokens };
+}
+function ovlRestoreTextColorAfterFilter(text, tokens) {
+    let out = text;
+    for (let idx = 0; idx < tokens.length; idx++) {
+        out = out.split(OVL_TC_TOKEN_MARK + idx + OVL_TC_TOKEN_MARK).join(tokens[idx]);
+    }
+    return out;
+}
+
+// marked 给单段落输出套的 <p>...</p> 外壳，在表格单元格/算法行/图片说明这些行内语境里
+// 要拆掉——不然一个 <td> 里嵌一个块级 <p> 视觉上会多出一圈段落间距，跟 Overleaf 的紧凑
+// 单元格观感不符。只拆"整段输出恰好是一个 <p>...</p>"这一种情况，多段落/带其它块级元素
+// 的输出原样放过（没法安全拆的就不拆）。
+function ovlUnwrapSingleParagraph(html) {
+    return html.replace(/^\s*<p>([\s\S]*)<\/p>\s*$/, '$1');
+}
+
+// 普通正文块的渲染入口：保护 \textcolor -> LatexFilter -> 还原 \textcolor -> renderFormattedText。
+// 表格/算法/图片这三种 float 环境需要完全不同的解析方式（行列/伪代码缩进/占位图），不能
+// 走这条把整段当散文处理的通用路径——命中就直接分派给各自的渲染函数，不再往下走
+// LatexFilter（\hline/\STATE/\includegraphics 这些结构性标记不是"翻译用的散文"，用
+// LatexFilter 处理只会拆出乱码或被 DELETE 规则整段吃掉，比如 includegraphics 就在
+// MACRO_TABLE 的 DELETE 名单里）。
+const OVL_VISUAL_FLOAT_DISPATCH_RE = /^\s*\\begin\{(table|algorithm|figure)\*?\}/;
 function ovlVisualRenderChunk(tex) {
-    const filtered = LatexFilter.filterLatexForTranslation(tex, { comments: 'auto', structure: true });
-    return renderFormattedText(filtered.text);
+    const floatMatch = OVL_VISUAL_FLOAT_DISPATCH_RE.exec(tex);
+    if (floatMatch) {
+        try {
+            if (floatMatch[1] === 'table') return ovlRenderVisualTable(tex);
+            if (floatMatch[1] === 'algorithm') return ovlRenderVisualAlgorithm(tex);
+            if (floatMatch[1] === 'figure') return ovlRenderVisualFigure(tex);
+        } catch (e) {
+            console.error('[ovl-visual] float 环境渲染失败，退回原有的散文渲染路径', e);
+        }
+    }
+    const protectedInput = ovlProtectTextColorForFilter(tex);
+    const filtered = LatexFilter.filterLatexForTranslation(protectedInput.text, { comments: 'auto', structure: true });
+    const restored = ovlRestoreTextColorAfterFilter(filtered.text, protectedInput.tokens);
+    return renderFormattedText(restored);
+}
+
+// ---- v2 Overleaf 预览 Pass：表格 / 算法 / 图片近似渲染 ----
+// 用户原话："我希望的是在visual模式下，这些内容能够像overleaf那样显示出一个预览的效果
+// ...没必要像正式编译的pdf那样完整的编译出来，但至少能看出基本的内容"——这三个渲染函数
+// 都只求"看得出结构和内容"，不追求跟 pdflatex 真实排版像素对齐（列宽对齐方式、缩进磅值、
+// 图片真实渲染这些一律不做，见任务里明确列出的取舍）。
+
+// 从 str 里摘出 \cmd{...}（花括号配平），返回 { found, arg, rest }：rest 是把这段 \cmd{...}
+// 整体删掉之后剩下的文本。跟 stripCommand 是同一种"配平扫描"手法，区别是这里要把摘出来的
+// 参数内容也交回调用方（caption/label 都要「摘出来 + 从原文里去掉」，stripCommand 只做
+// 后一半）。只摘第一处命中；\label 这种预期只出现一次的场景够用，不需要循环摘全部。
+function ovlExtractBraceCommand(str, cmd) {
+    const re = new RegExp('\\\\' + cmd + '\\s*\\{');
+    const m = re.exec(str);
+    if (!m) return { found: false, arg: '', rest: str };
+    const openIdx = m.index + m[0].length - 1;
+    const closeIdx = ovlFindMatchingBrace(str, openIdx);
+    if (closeIdx === -1) return { found: false, arg: '', rest: str };
+    const arg = str.slice(openIdx + 1, closeIdx);
+    const rest = str.slice(0, m.index) + str.slice(closeIdx + 1);
+    return { found: true, arg: arg, rest: rest };
+}
+
+// table/algorithm/figure 外壳本身的排版噪声——\centering、字号切换、\setlength、
+// \renewcommand{\arraystretch}{..} 这些跟"看得出内容"无关，任务原话说了"不用照顾这些
+// 排版指令的精确语义，但不能让它们原样泄漏成正文里的乱码"，这里统一清空。
+function ovlStripFloatLayoutNoise(str) {
+    return str
+        .replace(/\\centering\b/g, '')
+        .replace(/\\(tiny|scriptsize|footnotesize|small|normalsize|large|Large|LARGE|huge|Huge)\b/g, '')
+        .replace(/\\setlength\s*\{[^{}]*\}\s*\{[^{}]*\}/g, '')
+        .replace(/\\renewcommand\s*\{[^{}]*\}\s*\{[^{}]*\}/g, '')
+        .replace(/\\hfill\b/g, '')
+        .replace(/\\looseness\s*=\s*-?\d+/g, '');
+}
+
+// ---- 1) 表格 ----
+// \\ 行分隔（容忍 \\[2mm] 这种可选间距参数）+ & 列分隔，都要做花括号深度感知——真实论文里
+// 单元格内容常有 \textbf{...}/\textcolor{...}{...} 这类带花括号的宏，深度不为 0 时的 & / \\
+// 不能被当分隔符，即使这份 fixture 里没有这种情况也要做对（任务原话要求）。
+function ovlSplitTableRows(body) {
+    const s = body
+        .replace(/\\hline\b/g, '')
+        .replace(/\\cline\s*\{[^{}]*\}/g, '')
+        .replace(/\\toprule\b|\\midrule\b|\\bottomrule\b/g, '');
+    const rows = [];
+    let depth = 0, cur = '';
+    for (let i = 0; i < s.length; i++) {
+        const ch = s[i];
+        if (ch === '{') { depth++; cur += ch; continue; }
+        if (ch === '}') { depth--; cur += ch; continue; }
+        if (ch === '\\' && depth === 0 && s[i + 1] === '\\') {
+            rows.push(cur); cur = '';
+            i++; // 跳过第二个反斜杠
+            const spacing = /^\s*\[[^\]]*\]/.exec(s.slice(i + 1));
+            if (spacing) i += spacing[0].length;
+            continue;
+        }
+        cur += ch;
+    }
+    if (cur.trim()) rows.push(cur);
+    return rows.map(r => r.trim()).filter(r => r.length > 0);
+}
+function ovlSplitTableCells(row) {
+    const cells = [];
+    let depth = 0, cur = '';
+    for (let i = 0; i < row.length; i++) {
+        const ch = row[i];
+        if (ch === '{') { depth++; cur += ch; continue; }
+        if (ch === '}') { depth--; cur += ch; continue; }
+        if (ch === '&' && depth === 0) { cells.push(cur); cur = ''; continue; }
+        cur += ch;
+    }
+    cells.push(cur);
+    return cells.map(c => c.trim());
+}
+function ovlRenderVisualTable(tex) {
+    const outerM = /\\begin\{table\*?\}(?:\[[^\]]*\])?([\s\S]*)\\end\{table\*?\}/.exec(tex);
+    let inner = outerM ? outerM[1] : tex;
+    const capExtract = ovlExtractBraceCommand(inner, 'caption');
+    inner = capExtract.rest;
+    // \caption{...} 参数本身也可能夹排版噪声（fixture 两处 figure caption 都是
+    // "\caption{\looseness=-1\n\textcolor{...}{...}..."——\looseness 不是 MACRO_TABLE 认识的
+    // 宏，LatexFilter 会把它当 CLASS 3 原样放过，直接在预览里露出一段"\looseness=-1"裸文字）。
+    // 跟外层 inner 用同一条清洗规则，在渲染之前就处理掉。
+    if (capExtract.found) capExtract.arg = ovlStripFloatLayoutNoise(capExtract.arg);
+    inner = ovlExtractBraceCommand(inner, 'label').rest;
+    inner = ovlStripFloatLayoutNoise(inner);
+    const tabularM = /\\begin\{tabular\}\s*(?:\[[^\]]*\])?\{[^{}]*\}([\s\S]*)\\end\{tabular\}/.exec(inner);
+    let html = '<div class="ovl-visual-table-wrap">';
+    if (capExtract.found && capExtract.arg.trim()) {
+        html += '<div class="ovl-visual-caption ovl-visual-caption-above">' + ovlUnwrapSingleParagraph(ovlVisualRenderChunk(capExtract.arg)) + '</div>';
+    }
+    if (tabularM) {
+        const rows = ovlSplitTableRows(tabularM[1]);
+        if (rows.length) {
+            html += '<table class="ovl-visual-table"><tbody>';
+            rows.forEach((row, ri) => {
+                const cells = ovlSplitTableCells(row);
+                html += '<tr' + (ri === 0 ? ' class="ovl-visual-table-head"' : '') + '>';
+                cells.forEach(cell => {
+                    const cellHtml = cell.trim() ? ovlUnwrapSingleParagraph(ovlVisualRenderChunk(cell)) : '';
+                    html += (ri === 0 ? '<th>' : '<td>') + cellHtml + (ri === 0 ? '</th>' : '</td>');
+                });
+                html += '</tr>';
+            });
+            html += '</tbody></table>';
+        }
+    } else {
+        // 没找到 tabular——诚实退化：不假装解析出了表格，把清过噪声的原文当散文显示。
+        html += '<div class="ovl-visual-float-fallback">' + ovlUnwrapSingleParagraph(renderFormattedText(inner)) + '</div>';
+    }
+    html += '</div>';
+    return html;
+}
+
+// ---- 2) 算法 ----
+// algorithmicx 的行级关键字：STATE 不打印关键字本身（只显示语句正文，照抄真实 Overleaf/
+// algorithmicx 的排版），FOR/IF/WHILE 一族打印 "for ... do" / "if ... then" / "end for" 等
+// 标签并参与缩进深度计算。
+const OVL_ALGO_KW_LABEL = {
+    FOR: 'for', ENDFOR: 'end for',
+    IF: 'if', ELSE: 'else', ENDIF: 'end if',
+    WHILE: 'while', ENDWHILE: 'end while',
+    REQUIRE: 'Require:', ENSURE: 'Ensure:', RETURN: 'return'
+};
+function ovlParseAlgorithmicLines(body) {
+    const kwRe = /\\(STATE|ENDFOR|FOR|ENDIF|ELSE|IF|ENDWHILE|WHILE|REQUIRE|ENSURE|RETURN)\b/g;
+    const matches = [];
+    let m;
+    while ((m = kwRe.exec(body))) matches.push({ kw: m[1], start: m.index, kwEnd: kwRe.lastIndex });
+    const lines = [];
+    for (let idx = 0; idx < matches.length; idx++) {
+        const cur = matches[idx];
+        let pos = cur.kwEnd;
+        let arg = '';
+        if ((cur.kw === 'FOR' || cur.kw === 'IF' || cur.kw === 'WHILE') && body[pos] === '{') {
+            const close = ovlFindMatchingBrace(body, pos);
+            if (close !== -1) { arg = body.slice(pos + 1, close); pos = close + 1; }
+        }
+        const nextStart = (idx + 1 < matches.length) ? matches[idx + 1].start : body.length;
+        lines.push({ kw: cur.kw, arg: arg, text: body.slice(pos, nextStart).trim() });
+    }
+    return lines;
+}
+// \CALL{name}{args} / \Comment{...} /\COMMENT{...} 是嵌在某一行文本里的行内宏（不像
+// STATE/FOR 那样是整行的起点），任务里只要求"如果出现，视觉上区分出来"——这份 fixture
+// 没有用到，按最小实现处理：花括号配平摘出参数、渲染完之后再拼回可视化的样式，不追求
+// 处理它们内部还嵌套别的宏的极端情况。
+function ovlAlgoInlineCallComment(html) {
+    return html
+        .replace(/\\CALL\s*\{([^{}]*)\}\s*\{([^{}]*)\}/g, '<code class="ovl-algo-call">$1($2)</code>')
+        .replace(/\\(?:Comment|COMMENT)\s*\{([^{}]*)\}/g, '<span class="ovl-algo-comment">// $1</span>');
+}
+function ovlRenderAlgorithmicLines(lines, numbered) {
+    let depth = 0;
+    let stateNo = 0;
+    let html = '';
+    for (let li = 0; li < lines.length; li++) {
+        const ln = lines[li];
+        const kw = ln.kw;
+        let thisDepth = depth;
+        if (kw === 'ENDFOR' || kw === 'ENDIF' || kw === 'ENDWHILE') {
+            depth = Math.max(0, depth - 1);
+            thisDepth = depth;
+        } else if (kw === 'ELSE') {
+            thisDepth = Math.max(0, depth - 1);
+        }
+        let lineNo = '';
+        if (numbered && kw === 'STATE') { stateNo++; lineNo = String(stateNo); }
+        let bodyHtml = '';
+        if (ln.arg) {
+            bodyHtml += ' <span class="ovl-algo-cond">' + ovlAlgoInlineCallComment(ovlUnwrapSingleParagraph(ovlVisualRenderChunk(ln.arg))) + '</span>';
+            if (kw === 'FOR' || kw === 'WHILE') bodyHtml += ' <span class="ovl-algo-kw">do</span>';
+            if (kw === 'IF') bodyHtml += ' <span class="ovl-algo-kw">then</span>';
+        }
+        if (ln.text) {
+            bodyHtml += ' ' + ovlAlgoInlineCallComment(ovlUnwrapSingleParagraph(ovlVisualRenderChunk(ln.text)));
+        }
+        const kwLabel = OVL_ALGO_KW_LABEL[kw];
+        html += '<div class="ovl-algo-line" style="padding-left:' + (thisDepth * 1.5) + 'em">'
+            + '<span class="ovl-algo-lineno">' + (lineNo ? lineNo + ':' : '') + '</span>'
+            + (kwLabel ? '<span class="ovl-algo-kw">' + kwLabel + '</span>' : '')
+            + bodyHtml
+            + '</div>';
+        if (kw === 'FOR' || kw === 'IF' || kw === 'WHILE') depth++;
+    }
+    return html;
+}
+function ovlRenderVisualAlgorithm(tex) {
+    const outerM = /\\begin\{algorithm\*?\}(?:\[[^\]]*\])?([\s\S]*)\\end\{algorithm\*?\}/.exec(tex);
+    let inner = outerM ? outerM[1] : tex;
+    const capExtract = ovlExtractBraceCommand(inner, 'caption');
+    inner = capExtract.rest;
+    // \caption{...} 参数本身也可能夹排版噪声（fixture 两处 figure caption 都是
+    // "\caption{\looseness=-1\n\textcolor{...}{...}..."——\looseness 不是 MACRO_TABLE 认识的
+    // 宏，LatexFilter 会把它当 CLASS 3 原样放过，直接在预览里露出一段"\looseness=-1"裸文字）。
+    // 跟外层 inner 用同一条清洗规则，在渲染之前就处理掉。
+    if (capExtract.found) capExtract.arg = ovlStripFloatLayoutNoise(capExtract.arg);
+    inner = ovlExtractBraceCommand(inner, 'label').rest;
+    let html = '<div class="ovl-visual-algo-wrap">';
+    if (capExtract.found && capExtract.arg.trim()) {
+        html += '<div class="ovl-visual-algo-caption">' + ovlUnwrapSingleParagraph(ovlVisualRenderChunk(capExtract.arg)) + '</div>';
+    }
+    const algoM = /\\begin\{algorithmic\}\s*(\[[^\]]*\])?([\s\S]*)\\end\{algorithmic\}/.exec(inner);
+    if (algoM) {
+        const numbered = !!(algoM[1] && /\[\s*1\s*\]/.test(algoM[1]));
+        const lines = ovlParseAlgorithmicLines(algoM[2]);
+        html += '<div class="ovl-visual-algo-body">' + ovlRenderAlgorithmicLines(lines, numbered) + '</div>';
+    } else {
+        html += '<div class="ovl-visual-float-fallback">' + ovlUnwrapSingleParagraph(renderFormattedText(ovlStripFloatLayoutNoise(inner))) + '</div>';
+    }
+    html += '</div>';
+    return html;
+}
+
+// ---- 3) 图片 ----
+// 故意不真的去磁盘加载/解码 \includegraphics 引用的资源（任务原话："Deliberately DO NOT
+// attempt to actually load/decode the referenced image/PDF asset from disk"）——路径是相对
+// LaTeX 工程目录的、还有的直接是 PDF，真加载是比这次任务大得多的另一件事。只画一个占位框
+// + 取路径最后一段文件名当说明文字。
+function ovlExtractIncludegraphicsBasename(str) {
+    const m = /\\includegraphics\s*(?:\[[^\]]*\])?\s*\{([^{}]*)\}/.exec(str);
+    if (!m) return null;
+    const path = m[1].trim();
+    const parts = path.split(/[\\/]/);
+    return parts[parts.length - 1] || path;
+}
+function ovlRenderFigurePlaceholder(basename) {
+    return '<div class="ovl-visual-fig-box">'
+        + '<div class="ovl-visual-fig-icon">&#128444;</div>'
+        + '<div class="ovl-visual-fig-name">' + (basename ? escapeHtml(basename) : '(no image)') + '</div>'
+        + '</div>';
+}
+function ovlRenderVisualFigure(tex) {
+    const outerM = /\\begin\{figure\*?\}(?:\[[^\]]*\])?([\s\S]*)\\end\{figure\*?\}/.exec(tex);
+    let inner = outerM ? outerM[1] : tex;
+    const capExtract = ovlExtractBraceCommand(inner, 'caption');
+    inner = capExtract.rest;
+    // \caption{...} 参数本身也可能夹排版噪声（fixture 两处 figure caption 都是
+    // "\caption{\looseness=-1\n\textcolor{...}{...}..."——\looseness 不是 MACRO_TABLE 认识的
+    // 宏，LatexFilter 会把它当 CLASS 3 原样放过，直接在预览里露出一段"\looseness=-1"裸文字）。
+    // 跟外层 inner 用同一条清洗规则，在渲染之前就处理掉。
+    if (capExtract.found) capExtract.arg = ovlStripFloatLayoutNoise(capExtract.arg);
+    inner = ovlExtractBraceCommand(inner, 'label').rest;
+    inner = ovlStripFloatLayoutNoise(inner);
+    const minipageRe = /\\begin\{minipage\}\s*(?:\[[^\]]*\])?\s*\{[^{}]*\}([\s\S]*?)\\end\{minipage\}/g;
+    const boxes = [];
+    let mm;
+    while ((mm = minipageRe.exec(inner))) {
+        boxes.push(ovlRenderFigurePlaceholder(ovlExtractIncludegraphicsBasename(mm[1])));
+    }
+    if (!boxes.length) {
+        // 没有 minipage 子图——直接在整个 figure 体里找一张 \includegraphics。
+        const basename = ovlExtractIncludegraphicsBasename(inner);
+        if (basename) boxes.push(ovlRenderFigurePlaceholder(basename));
+    }
+    let html = '<div class="ovl-visual-figure-wrap">';
+    html += '<div class="ovl-visual-fig-row">' + boxes.join('') + '</div>';
+    if (capExtract.found && capExtract.arg.trim()) {
+        html += '<div class="ovl-visual-caption ovl-visual-caption-below">' + ovlUnwrapSingleParagraph(ovlVisualRenderChunk(capExtract.arg)) + '</div>';
+    }
+    html += '</div>';
+    return html;
 }
 
 // v2 Pass P10/P11：Visual 模式行号。LatexFilter 是整篇多趟定点宏展开的纯文本变换
@@ -22993,10 +23474,22 @@ function ovlVisualRenderChunk(tex) {
 // 一样是"原样保留"，不会报错也不会变得比现在更难看，反而换来了段落级别的行号和"关注"
 // 粒度。因此把"挡空行"的判断从"深度计数器 > 0"收窄成"数学专用环境的深度计数器 > 0"。
 const OVL_VISUAL_MATH_ATOMIC_ENV_RE = /^(equation|align|gather|multline|eqnarray|alignat|flalign|IEEEeqnarray|cases|dcases|rcases|matrix|pmatrix|bmatrix|vmatrix|Vmatrix|smallmatrix|array|split|subarray|CD)\*?$/;
+// v2 Overleaf 预览 Pass：table/algorithm/figure 三个 float 环境要跟数学环境一样"整段自成
+// 一块"——任务原话："a table/algorithm/figure should stay as one coherent block ... Reuse/
+// extend the existing mathDepth-style boundary-forcing mechanism"。这里选的是"加一个平行的
+// 深度计数器"这条路（相对"把这三个环境名塞进 OVL_VISUAL_MATH_ATOMIC_ENV_RE 复用同一个
+// mathDepth"更小、更干净）：mathDepth 这个名字和它上面一大段注释通篇讲的都是"数学专用
+// 环境"，语义上 table/algorithm/figure 不是数学，硬塞进同一个正则和同一个计数器会让那段
+// 注释名不副实；而两个独立计数器只需要照抄 mathDepth 现成的"进入/退出即强制切块"这套逻辑
+// 再来一遍，不需要引入新概念。只登记外层 float 壳的环境名——内部套的 tabular/algorithmic/
+// minipage 不需要单独跟踪，因为合法文档里它们必然在外层 table/algorithm/figure 闭合之前
+// 就已经闭合，只要外层不被提前切开，内部这几层天然完整。
+const OVL_VISUAL_FLOAT_ATOMIC_ENV_RE = /^(table|algorithm|figure)\*?$/;
 function ovlSplitVisualBlocks(body, baseLine) {
     const lines = body.split('\n');
     const blocks = [];
     let mathDepth = 0;
+    let floatDepth = 0;
     let cur = [];
     let curStart = 0;
     const beginRe = /\\begin\{([^}]*)\}/g;
@@ -23010,20 +23503,27 @@ function ovlSplitVisualBlocks(body, baseLine) {
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         const isBlank = line.trim() === '';
-        const isHeading = mathDepth === 0 && !isBlank && headingRe.test(line);
+        const isHeading = mathDepth === 0 && floatDepth === 0 && !isBlank && headingRe.test(line);
         // v2 Pass P14：光靠空行还不够——用户实测的那个 47 行 proposition 内部压根没有一个
         // 空行（学术写作里常见：一个环境内部段落之间只用普通换行，不留空行），单靠"放开
         // 空行拦截"这一刀切不动它。真正稳定存在、且天然是"这一段到此为止"的边界，是数学
         // 专用环境自己的起止——公式前的正文和公式本身、公式和公式后的正文，本来就是三种
         // 不同性质的内容，理应各自成块。这里探一下这一行会不会让 mathDepth 从 0 迈进 1，
         // 是的话在推进这一行之前先把之前攒的内容切走，让公式自己起一块新的。
-        let beginsMath = 0, endsMath = 0, m;
+        let beginsMath = 0, endsMath = 0, beginsFloat = 0, endsFloat = 0, m;
         beginRe.lastIndex = 0;
-        while ((m = beginRe.exec(line))) { if (OVL_VISUAL_MATH_ATOMIC_ENV_RE.test(m[1])) beginsMath++; }
+        while ((m = beginRe.exec(line))) {
+            if (OVL_VISUAL_MATH_ATOMIC_ENV_RE.test(m[1])) beginsMath++;
+            if (OVL_VISUAL_FLOAT_ATOMIC_ENV_RE.test(m[1])) beginsFloat++;
+        }
         endRe.lastIndex = 0;
-        while ((m = endRe.exec(line))) { if (OVL_VISUAL_MATH_ATOMIC_ENV_RE.test(m[1])) endsMath++; }
+        while ((m = endRe.exec(line))) {
+            if (OVL_VISUAL_MATH_ATOMIC_ENV_RE.test(m[1])) endsMath++;
+            if (OVL_VISUAL_FLOAT_ATOMIC_ENV_RE.test(m[1])) endsFloat++;
+        }
         const entersMathHere = mathDepth === 0 && beginsMath > 0;
-        if (mathDepth === 0 && (isBlank || isHeading || entersMathHere) && cur.length) flush();
+        const entersFloatHere = floatDepth === 0 && beginsFloat > 0;
+        if (mathDepth === 0 && floatDepth === 0 && (isBlank || isHeading || entersMathHere || entersFloatHere) && cur.length) flush();
         if (isBlank) {
             curStart = i + 1;
         } else {
@@ -23032,9 +23532,11 @@ function ovlSplitVisualBlocks(body, baseLine) {
             if (isHeading) { flush(); curStart = i + 1; } // 标题行单独落地成一块，不等下一个空行
         }
         mathDepth = Math.max(0, mathDepth + beginsMath - endsMath);
-        // 公式刚闭合（mathDepth 归零）：让公式自己收尾成一块，别把它后面紧跟着的正文焊
-        // 进同一块——否则"公式 + 后面一大段话"又会重新长成下一个超长块。
+        floatDepth = Math.max(0, floatDepth + beginsFloat - endsFloat);
+        // 公式/float 刚闭合（对应深度归零）：让它自己收尾成一块，别把后面紧跟着的正文焊
+        // 进同一块——否则"公式/表格/算法/图片 + 后面一大段话"又会重新长成下一个超长块。
         if (mathDepth === 0 && endsMath > 0 && cur.length) { flush(); curStart = i + 1; }
+        if (floatDepth === 0 && endsFloat > 0 && cur.length) { flush(); curStart = i + 1; }
     }
     flush();
     return blocks;
