@@ -5673,19 +5673,30 @@ function focusOvlSelectionRange() {
             if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { out.why = '没有选中内容。'; return out; }
             const range = sel.getRangeAt(0);
             if (!pane.contains(range.commonAncestorContainer)) { out.why = '选区不在 Visual 面板里。'; return out; }
-            const picked = String(sel);
-            if (!picked.trim()) { out.why = '没有选中内容。'; return out; }
-            // 和 ovlApplySynonymEditorGuard 的 visual 分支同一把尺子：唯一命中才算数，
-            // 0 处 / 多处一律拒绝，绝不猜位置。
-            const first = base.indexOf(picked);
-            const n = (first === -1) ? 0 : (base.indexOf(picked, first + 1) === -1 ? 1 : 2);
-            if (n !== 1) {
-                out.why = (n === 0)
-                    ? 'Visual 显示的是排版后的文字，这一段在 .tex 源码里不是原样存在，没法定位。切到 Code 模式选中对应的行再试。'
-                    : '这段文字在 .tex 源码里出现了不止一处，无法确定你指的是哪一处。切到 Code 模式选中对应的行再试。';
-                return out;
+            if (!String(sel).trim()) { out.why = '没有选中内容。'; return out; }
+            // P13：不再拿渲染后的文字去源码里找字面匹配——marked/KaTeX 渲染会重排空白、
+            // 折行、转义符号，就算这段内容没被 LatexFilter 动过，逐字节也几乎对不上（实测：
+            // author 行原文 8 格缩进，渲染出来的 textContent 变成 4 格 + 不同的折行位置），
+            // "唯一命中才算数" 的旧尺子在这个前提下等于"几乎永远拒绝"。
+            // 改成跟 P11 gutter 拖拽选块同一个粒度：每个 .ovl-visual-block 在切块时就记了
+            // 自己对应的源码起始行（data-src-line，切块时数出来的整数，不是猜的），选区
+            // 触碰到哪些块，关注的就是这些块覆盖的源码行区间——不基于文字内容做任何查找，
+            // 天生不会有"找不到/找到不止一处"的歧义。
+            const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+            if (!blocks.length) { out.why = '这里没有可关注的内容。'; return out; }
+            let si = -1, ei = -1;
+            for (let i = 0; i < blocks.length; i++) {
+                if (range.intersectsNode(blocks[i])) { if (si === -1) si = i; ei = i; }
             }
-            s = first; e2 = first + picked.length;
+            if (si === -1) { out.why = '没有选中内容。'; return out; }
+            const starts = ovlBuildLineStarts(base);
+            const nLines = starts.length;
+            const lineFrom = Math.max(0, Math.min(nLines - 1, parseInt(blocks[si].getAttribute('data-src-line'), 10) || 0));
+            const nextLine = (ei + 1 < blocks.length) ? parseInt(blocks[ei + 1].getAttribute('data-src-line'), 10) : nLines;
+            const lineTo = Math.max(lineFrom, Math.min(nLines - 1, nextLine - 1));
+            s = starts[lineFrom];
+            e2 = (lineTo + 1 < nLines) ? (starts[lineTo + 1] - 1) : base.length;
+            if (e2 < s) e2 = s;
         } else {
             if (ta.selectionStart === ta.selectionEnd) { out.why = '没有选中内容。'; return out; }
             s = ta.selectionStart; e2 = ta.selectionEnd;
@@ -22879,6 +22890,14 @@ function ovlSetEditorMode(mode) {
         // v2 Pass P7：切模式会让行号槽的意义整个变掉（Visual 下 gutter 直接隐藏），留着上一个
         // 模式的行选锚点就是指错行。
         if (typeof ovlGutterClearSelection === 'function') ovlGutterClearSelection();
+        // v2 Pass P13：切模式前先把"现在卷到源码第几行了"记下来——旧行为是 Visual 每次
+        // 都从文档最开头渲染起，Code 也是停在上次的 scrollTop，两边各卷各的，互不知道
+        // 对方卷到哪。必须在这里（隐藏旧模式之前、覆盖 editorMode 之前）就读，因为
+        // Visual 面板一旦 display:none，getBoundingClientRect 全部塌成 0，读不出来了。
+        const fromMode = OvlState.editorMode;
+        let syncLine = -1;
+        if (fromMode === 'code' && mode === 'visual') syncLine = ovlCodeTopVisibleLine();
+        else if (fromMode === 'visual' && mode === 'code') syncLine = ovlVisualTopVisibleLine();
         OvlState.editorMode = mode;
         const ta = document.getElementById('ovlCodeArea');
         const gutter = document.getElementById('ovlGutter');
@@ -22900,6 +22919,7 @@ function ovlSetEditorMode(mode) {
             // ovlVisualRender 头部的注释）——切模式时编辑器缓冲区可能比上次渲染时新。
             // ovlVisualRender() 末尾会自己调 ovlRenderVisualGutter()，这里不用再调一次。
             ovlVisualRender();
+            if (syncLine >= 0) ovlVisualScrollToLine(syncLine);
         } else {
             if (ta) ta.style.display = '';
             if (gutter) gutter.style.display = '';
@@ -22911,6 +22931,9 @@ function ovlSetEditorMode(mode) {
             // splitter/resize 是同一个理由。
             ovlScheduleLineOffsetRecompute(50);
             ovlRenderGutter(true); // 把 gutter 内容从 Visual 的绝对定位格子换回 Code 的正常流格子
+            // P13：跟上面同一个"display 刚翻转、布局还没落地"的理由，卷动也得等这次重排
+            // 结束——ovlCodeScrollToLine 内部会按需重算 lineOffsets，太早调会拿到旧尺寸。
+            if (syncLine >= 0) setTimeout(function () { ovlCodeScrollToLine(syncLine); }, 60);
         }
     } catch (e) {
         console.error('[ovl] setEditorMode failed', e);
@@ -23284,6 +23307,40 @@ function ovlVisualRowForLineIndex(idx) {
     const offs = OvlState.lineOffsets;
     if (offs && offs[idx]) return offs[idx].cumRows;
     return idx; // 退化：等价于假设没有软换行，不崩、不跳到别的地方，只是不够精确
+}
+
+// v2 Pass P13：ovlVisualRowForLineIndex 的反方向——当前 scrollTop 对应源码第几行（0-based，
+// 顶部第一个可见/部分可见的那行）。cumRows 是单调递增的累计表，线性扫一遍找"最后一个
+// cumRows 仍 <= 当前卷动到的视觉行"就是答案；几千行的表扫一次也就几十微秒，只在切模式
+// 这种低频操作上跑，不值得为它建二分查找。
+function ovlCodeTopVisibleLine() {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta) return -1;
+        const n = ta.value.length ? ta.value.split('\n').length : 1;
+        if (!OvlState.lineOffsets || OvlState.lineOffsets.length !== n) ovlRecomputeLineOffsets();
+        const offs = OvlState.lineOffsets;
+        if (!offs || !offs.length) return -1;
+        const targetRow = ta.scrollTop / OVL_LINE_H;
+        let lo = 0;
+        for (let i = 0; i < offs.length; i++) {
+            if (offs[i].cumRows <= targetRow) lo = i; else break;
+        }
+        return lo;
+    } catch (e) { return -1; }
+}
+
+// 把 Code 编辑器卷到指定源码行的顶部（不居中——这里要的是"跟 Visual 那边刚才看到的
+// 对齐"，居中会让画面跳一下，且和 ovlFindSelectCurrent 等"跳转去看某一行"的居中语义
+// 混在一起会让人分不清是哪种操作触发的）。
+function ovlCodeScrollToLine(line) {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        const gutter = document.getElementById('ovlGutter');
+        if (!ta) return;
+        ta.scrollTop = Math.max(0, ovlVisualRowForLineIndex(line) * OVL_LINE_H);
+        if (gutter) gutter.scrollTop = ta.scrollTop;
+    } catch (e) { console.error('[ovl] codeScrollToLine failed', e); }
 }
 
 // 敲字/resize/拖分栏之后的防抖重算入口——统一一个定时器，不同调用点传不同延迟。
@@ -26725,6 +26782,48 @@ function ovlRenderVisualGutter() {
         ovlPaintGutterMarks();
         ovlScheduleVisualGutterAfterFonts(0);
     } catch (e) { console.error('[ovl] renderVisualGutter failed', e); }
+}
+
+// v2 Pass P13：切模式前读"Visual 现在卷到源码第几行了"——找最后一个顶边仍在 pane 视口
+// 顶边之上（或压线）的块，即视口顶边此刻正穿过的那一块。必须在 pane 还是 display:flex、
+// 还没被切走的时候调用（ovlSetEditorMode 里排在覆盖 editorMode/隐藏 pane 之前），
+// display:none 之后所有块的 getBoundingClientRect 都会塌成 0。
+function ovlVisualTopVisibleLine() {
+    try {
+        const pane = document.getElementById('ovlVisualPane');
+        if (!pane) return -1;
+        const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+        if (!blocks.length) return -1;
+        const paneTop = pane.getBoundingClientRect().top;
+        let best = blocks[0];
+        for (let i = 0; i < blocks.length; i++) {
+            const r = blocks[i].getBoundingClientRect();
+            if (r.top - paneTop <= 1) best = blocks[i]; else break;
+        }
+        const ln = parseInt(best.getAttribute('data-src-line'), 10);
+        return isFinite(ln) ? ln : -1;
+    } catch (e) { return -1; }
+}
+
+// 把 Visual 面板卷到指定源码行对应的块。直接复用 ovlRenderVisualGutter 刚算出来的
+// gutter 格子 top（那个值本来就是"块相对 pane 内容顶部的像素偏移"，见上面那段大注释），
+// 不用再对 DOM 做一次 getBoundingClientRect——省一次强制重排，而且这时候 gutter 已经是
+// 渲染完的最新状态（ovlSetEditorMode 里排在 ovlVisualRender() / ovlRenderVisualGutter()
+// 之后调用）。
+function ovlVisualScrollToLine(line) {
+    try {
+        const pane = document.getElementById('ovlVisualPane');
+        const gutter = document.getElementById('ovlGutter');
+        if (!pane || !gutter || !OvlVisualBlockRects.length) return;
+        let idx = 0;
+        for (let i = 0; i < OvlVisualBlockRects.length; i++) {
+            if (OvlVisualBlockRects[i].line <= line) idx = i; else break;
+        }
+        const cell = gutter.children[idx];
+        if (!cell) return;
+        pane.scrollTop = Math.max(0, parseFloat(cell.style.top) || 0);
+        gutter.scrollTop = pane.scrollTop;
+    } catch (e) { console.error('[ovl] visualScrollToLine failed', e); }
 }
 
 // 12931 行附近那次"math-heavy 尾行漂移 25px"事故的同一个根因，这里又踩了一次：KaTeX 那
