@@ -1267,7 +1267,7 @@ body.ovl-shell-active #ovlShell { display: flex; }
     user-select: none; pointer-events: none;
 }
 .ovl-layout-menu-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.ovl-topbar-right { display: flex; align-items: center; gap: 8px; }
+.ovl-topbar-right { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .ovl-layout-btn {
     background: #2F3A4C;
     color: #E7E9EE;
@@ -1278,6 +1278,19 @@ body.ovl-shell-active #ovlShell { display: flex; }
     cursor: pointer;
 }
 .ovl-layout-btn:hover { background: #3A4760; }
+.ovl-layout-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+/* v2 Pass P25：拉取/推送按钮从 PDF 面板搬到顶栏「项目」左侧后，状态文案（例如"本地和
+   Overleaf 版本分叉，需手动处理"）可能很长——顶栏 40px 高、flex、没有 flex-wrap，必须
+   截断成省略号，完整文案放 title 属性里（见 ovlOverleafSetSyncStatus()）。 */
+.ovl-topbar-syncstatus {
+    max-width: 200px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 11px;
+    flex-shrink: 1;
+    min-width: 0;
+}
 
 .ovl-body {
     flex: 1 1 auto;
@@ -2026,9 +2039,6 @@ body.ovl-translator-open #ovlTransWin { display: block; }
     background: #242E3D; border-bottom: 1px solid #1B222C; flex-shrink: 0;
 }
 .ovl-pdf-projectrow label { font-size: 11px; color: #9AA4B2; white-space: nowrap; flex-shrink: 0; }
-/* v2 Pass P24：Overleaf 同步那一行的标签——不是 <label for=...>（不对应单个 input），
-   视觉照抄上面那条已有的 .ovl-pdf-projectrow label 规则，不发明新样式体系。 */
-.ovl-overleaf-label { font-size: 11px; color: #9AA4B2; white-space: nowrap; flex-shrink: 0; margin-right: 2px; }
 .ovl-pdf-projectrow input[type="text"] {
     flex: 1 1 auto; min-width: 0; background: #1B222C; border: 1px solid #3a4457;
     color: #E7E9EE; font-size: 11px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
@@ -21728,6 +21738,13 @@ function ovlShellHtml() {
         +     '<span class="ovl-version-watermark" title="Academic AI Translator">v' + escapeHtml(APP_VERSION) + '</span>'
         +   '</div>'
         +   '<div class="ovl-topbar-right">'
+        // v2 Pass P25：拉取/推送从 PDF 面板搬到顶栏「项目」按钮左侧（用户明确要求）。地址/
+        // token/自动拉取间隔仍在设置面板的「Overleaf 同步」分类里填，见 ovlSettingsOverleafHtml；
+        // 按钮的 disabled/data-tip 由 ovlOverleafUpdateButtonsUI() 动态维护，跟 DOM 位置无关。
+        // 原来的"Overleaf 同步"文字 label 顶栏放不下，去掉了——语义放进两个按钮各自的 data-tip。
+        +     '<span class="ovl-pdf-status ovl-topbar-syncstatus" id="ovlOverleafSyncStatus">未配置 Overleaf 同步</span>'
+        +     '<button type="button" class="ovl-layout-btn" id="ovlOverleafPullBtn" disabled data-tip="先在设置里填 Overleaf token 和项目地址" data-tip-pos="bottom-end">拉取</button>'
+        +     '<button type="button" class="ovl-layout-btn" id="ovlOverleafPushBtn" disabled data-tip="先在设置里填 Overleaf token 和项目地址" data-tip-pos="bottom-end">推送</button>'
         // 项目菜单（§2.6.1 项目标题 ▾）：Download as PDF / Download as source (.zip) / Make a copy /
         // Rename（灰，见 ovlOpenProjectMenu 的说明）/ Word count。
         +     '<button type="button" id="ovlProjectMenuBtn" class="ovl-layout-btn" data-tip="项目操作" data-tip-pos="bottom-end">项目 &#9662;</button>'
@@ -21881,15 +21898,8 @@ function ovlShellHtml() {
         // 见 ovlBrowseProjectFolder。
         +       '<button type="button" class="ovl-browse-btn" id="ovlBrowseFolderBtn" data-tip="用原生文件夹选择框设置项目路径（需要桥接服务在线）" data-tip-pos="bottom">浏览…</button>'
         +     '</div>'
-        // v2 Pass P24：Overleaf git 同步——手动拉取/推送两个按钮 + 一句话状态。地址/token/
-        // 自动拉取间隔在设置面板的「Overleaf 同步」分类里填，见 ovlSettingsOverleafHtml；
-        // 按钮的 disabled/data-tip 由 ovlOverleafUpdateButtonsUI() 动态维护。
-        +     '<div class="ovl-pdf-projectrow ovl-overleaf-syncrow">'
-        +       '<span class="ovl-overleaf-label">Overleaf 同步</span>'
-        +       '<button type="button" class="ovl-browse-btn" id="ovlOverleafPullBtn" disabled data-tip="先在设置里填 Overleaf token 和项目地址" data-tip-pos="bottom">拉取</button>'
-        +       '<button type="button" class="ovl-browse-btn" id="ovlOverleafPushBtn" disabled data-tip="先在设置里填 Overleaf token 和项目地址" data-tip-pos="bottom">推送</button>'
-        +       '<span class="ovl-pdf-status" id="ovlOverleafSyncStatus">未配置 Overleaf 同步</span>'
-        +     '</div>'
+        // v2 Pass P25：拉取/推送两个按钮 + 状态 span 已搬到顶栏「项目」按钮左侧（见上面
+        // .ovl-topbar-right 那段），这里不再重复渲染。
         +     '<div class="ovl-pdf-body" id="ovlPdfBody"><div class="ovl-pdf-placeholder">检测编译桥接服务中…</div></div>'
         +     '<div class="ovl-log-panel" id="ovlLogPanel">'
         +       '<div class="ovl-log-toolbar">'
@@ -25801,6 +25811,9 @@ function ovlOverleafSetSyncStatus(text, isError) {
     const el = document.getElementById('ovlOverleafSyncStatus');
     if (!el) return;
     el.textContent = text;
+    // v2 Pass P25：顶栏空间有限，.ovl-topbar-syncstatus 会把长文案截成省略号——完整文案放
+    // title 里，鼠标悬停能看到全文。
+    el.title = text;
     el.classList.toggle('ovl-status-err', !!isError);
     el.classList.toggle('ovl-status-ok', !isError);
 }
@@ -25938,12 +25951,20 @@ async function ovlOverleafPush() {
             showToast(msg, 'error');
             return;
         }
+        // untrackedCount：add -u 从不扫本地未跟踪文件（drawio 源文件/预览图/构建产物……），
+        // 这里只是告知用户还有多少个没被这次推送带上——不据此改变任何行为、不询问、不自动添加。
+        const untrackedSuffix = (typeof data.untrackedCount === 'number' && data.untrackedCount > 0)
+            ? '（另有 ' + data.untrackedCount + ' 个本地新文件未推送）' : '';
         if (data.action === 'pushed') {
             ovlOverleafSetSyncStatus('已推送到 Overleaf', false);
-            showToast('已推送到 Overleaf', 'success');
+            showToast('已推送到 Overleaf' + untrackedSuffix, 'success');
         } else if (data.action === 'nothing-to-push') {
             ovlOverleafSetSyncStatus('没有改动，无需推送', false);
-            showToast('没有改动，无需推送', 'info');
+            showToast('没有改动，无需推送' + untrackedSuffix, 'info');
+        } else if (data.action === 'behind-remote') {
+            const behind = (typeof data.behind === 'number') ? data.behind : '';
+            ovlOverleafSetSyncStatus('Overleaf 上有 ' + behind + ' 个更新，已中止推送', true);
+            showToast(data.error || ('Overleaf 上有 ' + behind + ' 个更新，已中止推送，请先点「拉取」'), 'error');
         } else if (data.action === 'rejected-non-fastforward') {
             ovlOverleafSetSyncStatus('推送被拒绝：请先点拉取', true);
             showToast(data.error || '推送被拒绝：Overleaf 上有你本地还没有的新修改，请先点“拉取”同步之后再推送。', 'error');

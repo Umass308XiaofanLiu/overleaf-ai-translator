@@ -982,6 +982,14 @@ async function doOverleafPull(projectDir, gitUrl, token) {
 
 // POST /overleaf/push —— 见文件头安全设计注释。绝不 force push：非快进被拒绝时提交本身
 // 已经落在本地历史里（不回滚），只是没推上去，安全、不丢用户的本地工作。
+// push 前数一下工作区里还有多少未跟踪文件（?? 开头）——只用于告知，不影响任何行为。
+// 失败就当 0（这只是个提示性数字，不能因为它查询失败就搞坏整个 push 的返回）。
+async function countUntrackedFiles(projectDir, token) {
+    const statusResult = await runGitCommand(['status', '--porcelain'], projectDir, token);
+    if (!statusResult.ok) return 0;
+    return statusResult.stdout.split(/\r?\n/).filter((line) => line.indexOf('??') === 0).length;
+}
+
 async function doOverleafPush(projectDir, gitUrl, token, message) {
     try {
         const gitDir = path.join(projectDir, '.git');
@@ -989,25 +997,6 @@ async function doOverleafPush(projectDir, gitUrl, token, message) {
         try { hasGitDir = fs.existsSync(gitDir); } catch (e) { hasGitDir = false; }
         if (!hasGitDir) {
             return { ok: false, error: '这个目录还不是 git 仓库，请先拉取一次' };
-        }
-
-        const addResult = await runGitCommand(['add', '-A'], projectDir, token);
-        if (!addResult.ok) {
-            return { ok: false, error: redactToken(addResult.stderr || addResult.stdout || 'git add 失败', token) };
-        }
-
-        const stagedResult = await runGitCommand(['diff', '--cached', '--name-only'], projectDir, token);
-        if (!stagedResult.ok) {
-            return { ok: false, error: redactToken(stagedResult.stderr || stagedResult.stdout || 'git diff --cached 失败', token) };
-        }
-        if (stagedResult.stdout.trim().length === 0) {
-            return { ok: true, action: 'nothing-to-push' }; // 没有改动，不做空提交
-        }
-
-        const commitMessage = (message && String(message).trim()) || ('AI-Translator sync ' + new Date().toISOString());
-        const commitResult = await runGitCommand(['commit', '-m', commitMessage], projectDir, token);
-        if (!commitResult.ok) {
-            return { ok: false, error: redactToken(commitResult.stderr || commitResult.stdout || 'git commit 失败', token) };
         }
 
         const remoteResult = await ensureOriginRemote(projectDir, gitUrl, token);
@@ -1021,10 +1010,56 @@ async function doOverleafPush(projectDir, gitUrl, token, message) {
         }
         const branch = branchResult.stdout.trim();
 
+        // 在任何 add/commit 之前先查是否落后于远程——落后就立刻拒绝，绝不先 commit 再让 push
+        // 失败。origin/<branch> 不存在（远程还没有这个分支，比如首次推送新分支）时 rev-list
+        // 会失败，这不算"落后"，按 behind=0 正常往下走。
+        const fetchResult = await runGitCommand(['fetch', 'origin'], projectDir, token);
+        if (!fetchResult.ok) {
+            return { ok: false, action: 'fetch-failed', error: redactToken(fetchResult.stderr || fetchResult.stdout || 'git fetch 失败', token) };
+        }
+
+        const behindResult = await runGitCommand(['rev-list', '--count', 'HEAD..origin/' + branch], projectDir, token);
+        if (behindResult.ok) {
+            const behind = parseInt(behindResult.stdout.trim(), 10) || 0;
+            if (behind > 0) {
+                return {
+                    ok: true,
+                    action: 'behind-remote',
+                    behind: behind,
+                    error: 'Overleaf 上有 ' + behind + ' 个你本地还没有的更新，为避免产生分叉，已中止推送。请先点「拉取」同步之后再推送。'
+                };
+            }
+        }
+        // behindResult 失败（多半是 origin/<branch> 不存在）——不算落后，继续往下走。
+
+        // 只暂存已被 git 跟踪的文件的修改/删除，绝不把本地新增的未跟踪文件（drawio 源文件、
+        // 预览图、构建产物……）扫进去——Overleaf 项目里该有什么文件由用户在 Overleaf 上决定，
+        // 本工具只负责同步"Overleaf 已经知道的那些文件"的本地修改。见本轮头部注释。
+        const addResult = await runGitCommand(['add', '-u'], projectDir, token);
+        if (!addResult.ok) {
+            return { ok: false, error: redactToken(addResult.stderr || addResult.stdout || 'git add 失败', token) };
+        }
+
+        const stagedResult = await runGitCommand(['diff', '--cached', '--name-only'], projectDir, token);
+        if (!stagedResult.ok) {
+            return { ok: false, error: redactToken(stagedResult.stderr || stagedResult.stdout || 'git diff --cached 失败', token) };
+        }
+        if (stagedResult.stdout.trim().length === 0) {
+            const untrackedCount = await countUntrackedFiles(projectDir, token);
+            return { ok: true, action: 'nothing-to-push', untrackedCount: untrackedCount }; // 没有改动，不做空提交
+        }
+
+        const commitMessage = (message && String(message).trim()) || ('AI-Translator sync ' + new Date().toISOString());
+        const commitResult = await runGitCommand(['commit', '-m', commitMessage], projectDir, token);
+        if (!commitResult.ok) {
+            return { ok: false, error: redactToken(commitResult.stderr || commitResult.stdout || 'git commit 失败', token) };
+        }
+
         const pushResult = await runGitCommand(['push', 'origin', branch], projectDir, token);
         if (!pushResult.ok) {
             const combined = (pushResult.stderr || '') + '\n' + (pushResult.stdout || '');
             if (/non-fast-forward|fetch first|rejected/i.test(combined)) {
+                // fetch 之后、push 之前远程又有新提交的竞态——最后一道保险，仍然保留。
                 return {
                     ok: true,
                     action: 'rejected-non-fastforward',
@@ -1034,7 +1069,8 @@ async function doOverleafPush(projectDir, gitUrl, token, message) {
             return { ok: false, error: redactToken(combined, token) };
         }
 
-        return { ok: true, action: 'pushed' };
+        const untrackedCount = await countUntrackedFiles(projectDir, token);
+        return { ok: true, action: 'pushed', untrackedCount: untrackedCount };
     } catch (e) {
         return { ok: false, error: redactToken('内部错误: ' + (e && e.message), token) };
     }
