@@ -1557,13 +1557,31 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 }
 /* 正文这一段走 marked.parse 出来的普通 HTML（h1..h6/ul/ol/p/strong/em），照 Overleaf
    的字号/间距给一套朴素的学术论文排版观感——不追求跟 pdflatex 的真实排版像素对齐。 */
-.ovl-visual-body { line-height: 1.7; max-width: 860px; }
+.ovl-visual-body { line-height: 1.7; max-width: 860px; padding-bottom: 0.6em; }
+/* ↑ padding-bottom：块间距改成 margin-top 驱动之后，最后一块自己的底 margin 被
+   > *:last-child 规则清零了，不再像旧版那样靠它在正文末尾撑出一点收尾空白——这里补回来，
+   数值跟段落间距一致，不然内容会贴着 Visual 面板底边，逐像素跟旧版不一致。 */
 /* v2 Pass P11：Visual 行号改成跟 Code 模式共用同一根 #ovlGutter 竖列（用户明确要的是
    "同一根横轴"，块内联小字那版对不上 Code 模式的 gutter 列位置，已弃用）。这里的块本身
    只是量高度用的锚点，不再自己承担排版——行号格子的绝对定位/画法在 ovlRenderVisualGutter()
    里，跟着 .ovl-gutter 现有的样式规则走（1428 行附近），不在这里重复定义一套。 */
-.ovl-visual-block { display: block; }
+/* v2 Pass：Visual 按源码行断行——块粒度从"一段"细到"一行"之后，块与块之间的间距不能
+   再靠"子元素自己的 margin 冒泡碰撞取大值"这套默认折叠规则来决定了（那套规则算出来的
+   永远是 max(上一块底 margin, 这一块顶 margin)，同一段落里两个相邻行块就算把顶 margin
+   清零，底 margin 还留着 0.6em，撞出来还是 0.6em 的段间距，整段话照样被撑散）。改成让
+   .ovl-visual-block 自己的 margin-top 说了算：子元素顶/底 margin 一律清零（不再参与折叠），
+   段落起点（data-para-start="1"，含全部原子块/断行关掉时的整段块）的块自己顶上留
+   0.6em——跟旧版子元素折叠出来的段间距视觉上等价；续行（data-para-start="0"）顶上留 0，
+   紧贴上一行。 */
+.ovl-visual-block { display: block; margin-top: 0; }
 .ovl-visual-block > *:first-child { margin-top: 0; }
+.ovl-visual-block > *:last-child { margin-bottom: 0; }
+.ovl-visual-block[data-para-start="1"] { margin-top: 0.6em; }
+.ovl-visual-block[data-para-start="0"] { margin-top: 0; }
+/* 整个 Visual 正文的第一块永远紧贴顶部，不管它是不是"段落起点"——旧版靠子元素顶 margin
+   清零天然免费拿到这条，现在改由 margin-top 驱动间距了，要显式补一条覆盖掉上面
+   [data-para-start="1"] 给的 0.6em（选择器优先级 0,3,0 > 0,2,0，天然赢，不用 !important）。 */
+.ovl-visual-body > .ovl-visual-block:first-child { margin-top: 0; }
 .ovl-visual-body h1, .ovl-visual-body h2, .ovl-visual-body h3,
 .ovl-visual-body h4, .ovl-visual-body h5, .ovl-visual-body h6 {
     font-weight: 700; margin: 1.2em 0 0.5em; color: #111827;
@@ -23850,13 +23868,19 @@ function ovlSplitVisualBlocks(body, baseLine) {
     let floatDepth = 0;
     let cur = [];
     let curStart = 0;
+    // v2 Pass（Visual 按源码行断行）：这一组攒的内容有没有碰过数学/float 原子环境——决定它
+    // 是不是"原子块"。原子块（公式/表格/算法/图片）下游 ovlVisualRenderBodyWithLines 永远
+    // 整块渲染、不会再交给 ovlSplitVisualLines 按行细分；普通正文块才会被细分。见下面
+    // 那一行"这一行涉不涉及原子环境"的判定紧跟在 begins/endsMath/Float 算出来之后。
+    let curAtomic = false;
     const beginRe = /\\begin\{([^}]*)\}/g;
     const endRe = /\\end\{([^}]*)\}/g;
     const headingRe = /^\s*\\(part|chapter|section|subsection|subsubsection|paragraph|title|author)\*?(\[[^\]]*\])?\{/;
     function flush() {
         const text = cur.join('\n');
-        if (text.trim()) blocks.push({ text: text, line: baseLine + curStart });
+        if (text.trim()) blocks.push({ text: text, line: baseLine + curStart, atomic: curAtomic });
         cur = [];
+        curAtomic = false;
     }
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
@@ -23889,6 +23913,10 @@ function ovlSplitVisualBlocks(body, baseLine) {
             cur.push(line);
             if (isHeading) { flush(); curStart = i + 1; } // 标题行单独落地成一块，不等下一个空行
         }
+        // 这一行只要沾了原子环境的边——不管是刚进入、正呆在里面、还是刚离开（同一行开
+        // 又同一行闭，比如 "\begin{equation}x=1\end{equation}"，闭合那一刻 mathDepth 已经
+        // 归零，只看 mathDepth>0 会漏判）——这一组就是原子块，标记下来。
+        if (beginsMath > 0 || endsMath > 0 || beginsFloat > 0 || endsFloat > 0 || mathDepth > 0 || floatDepth > 0) curAtomic = true;
         mathDepth = Math.max(0, mathDepth + beginsMath - endsMath);
         floatDepth = Math.max(0, floatDepth + beginsFloat - endsFloat);
         // 公式/float 刚闭合（对应深度归零）：让它自己收尾成一块，别把后面紧跟着的正文焊
@@ -23900,17 +23928,129 @@ function ovlSplitVisualBlocks(body, baseLine) {
     return blocks;
 }
 
+// ==================== v2 Pass：Visual 模式按源码行断行 ====================
+// 用户原话："visual 模式下不同分行的句子会直接被渲染为和 pdf 中类似的一整段文字。但我希望
+// visual 模式和 code 模式一样，都是不同行的句子渲染在不同行上……这样也方便 code/visual
+// 模式切换下的行标记的对齐。" ovlSplitVisualBlocks 切出来的是"段"，这里再把一个正文段
+// 按源码行细分成"行"——但不能见换行就切：\textbf{foo 断在行末、bar} 在下一行这种写法在
+// 学术 LaTeX 里很常见，切开会把残缺的 LaTeX（缺右花括号/环境没收尾/公式没闭合）扔给
+// ovlVisualRenderChunk，渲出破碎结果。所以只在"到这一行末为止，花括号/环境/$/$$ 三样
+// 都已配平"的行边界才真的切一刀，没配平就把下一行并进来继续攒。
+
+// 反斜杠转义判定：s[idx] 前面有奇数个连续反斜杠 ⇒ s[idx] 被转义（\{、\}、\%、\$ 这类），
+// 偶数个（含 0 个）⇒ 没被转义，是真正起作用的字符。跟 TeX 自己的转义规则同一套算法。
+function ovlLatexEscapedAt(s, idx) {
+    let n = 0, i = idx - 1;
+    while (i >= 0 && s[i] === '\\') { n++; i--; }
+    return (n % 2) === 1;
+}
+
+// 摘出一行里"生效"的那一段（% 注释开始之前）。% 本身要用上面那个转义判定跳过 \%。
+// LaTeX 的行内注释到物理行末为止，不会跨行，所以只需要按单行处理。
+function ovlLatexActiveText(line) {
+    for (let i = 0; i < line.length; i++) {
+        if (line[i] === '%' && !ovlLatexEscapedAt(line, i)) return line.slice(0, i);
+    }
+    return line;
+}
+
+// 数一行"生效文本"里花括号净变化 + $/$$ 各出现几次（配对与否交给调用方按累计数取模 2
+// 判断——$ 不能嵌套，出现次数的奇偶性就是"当前是不是还开着"）。\begin{/\end{ 的配对单独用
+// 全局正则数，跟 ovlSplitVisualBlocks 数 beginsMath/endsMath 同一个手法，不在这个字符级
+// 循环里做（两者不冲突：\begin{xxx} 里的 { 和 } 一样会被这个循环当普通花括号计入，这正是
+// 需要的——环境名的花括号本来就该参与花括号配平）。
+function ovlLatexLineBalanceDelta(activeText) {
+    let brace = 0, dollar = 0, dd = 0;
+    for (let i = 0; i < activeText.length; i++) {
+        const ch = activeText[i];
+        if ((ch === '{' || ch === '}') && ovlLatexEscapedAt(activeText, i)) continue;
+        if (ch === '{') { brace++; continue; }
+        if (ch === '}') { brace--; continue; }
+        if (ch === '$' && !ovlLatexEscapedAt(activeText, i)) {
+            if (activeText[i + 1] === '$') { dd++; i++; } else { dollar++; }
+        }
+    }
+    let env = 0;
+    const beginRe = /\\begin\{/g, endRe = /\\end\{/g;
+    while (beginRe.exec(activeText)) env++;
+    while (endRe.exec(activeText)) env--;
+    return { brace: brace, env: env, dollar: dollar, dd: dd };
+}
+
+// 把一个"正文块"（ovlSplitVisualBlocks 判定过 atomic:false 的块，保证内部没有空行）
+// 按源码行进一步切细。返回 [{ text, line, lineEnd, paraStart }]：
+//   line/lineEnd  —— 这个子块覆盖的源码行区间（绝对行号，含首尾），单行子块 line===lineEnd
+//   paraStart     —— true=块内第一个子块（段落起点），false=续行（同一段落接着上一个子块）
+// 安全规则（三者都配平才切）：到该行末为止 (1) { } 净差为 0 (2) \begin{ 净差为 0
+// （没有未闭合的环境）(3) $ 出现次数是偶数、$$ 出现次数也是偶数。任何一条没满足就把下一行
+// 并进来继续攒，直到平衡——宁可少切一刀，也不切出残缺 LaTeX。
+function ovlSplitVisualLines(blockText, blockStartLine) {
+    const lines = blockText.split('\n');
+    const out = [];
+    let brace = 0, env = 0, dollarCount = 0, ddCount = 0;
+    let cur = [];
+    let curStart = 0;
+    let paraStart = true;
+    function flush(endIdx) {
+        if (!cur.length) return;
+        out.push({
+            text: cur.join('\n'),
+            line: blockStartLine + curStart,
+            lineEnd: blockStartLine + endIdx,
+            paraStart: paraStart
+        });
+        paraStart = false;
+        cur = [];
+    }
+    for (let i = 0; i < lines.length; i++) {
+        if (cur.length === 0) curStart = i;
+        cur.push(lines[i]);
+        const d = ovlLatexLineBalanceDelta(ovlLatexActiveText(lines[i]));
+        brace = Math.max(0, brace + d.brace);
+        env = Math.max(0, env + d.env);
+        dollarCount += d.dollar;
+        ddCount += d.dd;
+        const balanced = brace === 0 && env === 0 && (dollarCount % 2 === 0) && (ddCount % 2 === 0);
+        if (balanced) flush(i);
+    }
+    flush(lines.length - 1); // 兜底：到块尾都没配平（残缺/畸形源码）就把攒的内容整块吐出去，
+                              // 不丢内容——比切碎成半截 LaTeX 强，也比死等下去安全。
+    return out;
+}
+
 // 按块渲染。行号不再内联在块里（那样列不齐、跟 Code 模式的 gutter 也对不上同一根竖线），
 // 改由 ovlRenderVisualGutter() 量出每块的真实渲染高度后统一画进 #ovlGutter——见该函数。
 // 切不出任何块（比如整段就是一堆空白）就退化回整篇一次性渲染 ovlVisualRenderChunk，
 // 不假装有行号可标。
+//
+// v2 Pass：每个 .ovl-visual-block 现在都带三个数据属性——
+//   data-src-line / data-src-line-end：这个块覆盖的源码行区间（绝对行号，含首尾）。
+//     原子块（数学/float）和"开关关掉时"的整段块，区间就是 ovlSplitVisualBlocks 给的
+//     那一整段；正文块打开断行开关后，区间收窄到 ovlSplitVisualLines 切出来的那个子块。
+//   data-para-start：1=段落起点（这个块自己或者它是某段的第一个子块），0=续行（同一段落
+//     接着上一个子块）。CSS 靠这个决定块间要不要留段间距，见 .ovl-visual-block 那组规则。
 function ovlVisualRenderBodyWithLines(body, baseLine) {
     const blocks = ovlSplitVisualBlocks(body, baseLine);
     if (!blocks.length) return ovlVisualRenderChunk(body);
     let html = '';
     for (let i = 0; i < blocks.length; i++) {
         const b = blocks[i];
-        html += '<div class="ovl-visual-block" data-src-line="' + b.line + '">' + ovlVisualRenderChunk(b.text) + '</div>';
+        const blockLineCount = b.text.split('\n').length;
+        const blockLineEnd = b.line + blockLineCount - 1;
+        const splitEnabled = !b.atomic && OvlSettings.ovlVisualLineBreaks !== false;
+        const subs = splitEnabled ? ovlSplitVisualLines(b.text, b.line) : null;
+        if (!subs || !subs.length) {
+            // 原子块，或断行开关关掉/切不出子块（比如块只有一行）：整块渲染一个
+            // .ovl-visual-block，永远是"段落起点"——跟旧行为（切分前）逐像素一致。
+            html += '<div class="ovl-visual-block" data-src-line="' + b.line + '" data-src-line-end="' + blockLineEnd
+                + '" data-para-start="1">' + ovlVisualRenderChunk(b.text) + '</div>';
+            continue;
+        }
+        for (let j = 0; j < subs.length; j++) {
+            const sb = subs[j];
+            html += '<div class="ovl-visual-block" data-src-line="' + sb.line + '" data-src-line-end="' + sb.lineEnd
+                + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '">' + ovlVisualRenderChunk(sb.text) + '</div>';
+        }
     }
     return html;
 }
@@ -28292,6 +28432,7 @@ const OVL_SETTINGS_DEFAULTS = {
     transSimpleMode: false,     // P2 消费：翻译器窗口简化模式（只留左右两个框）
     visualTranslate: 'auto',    // P4 消费：'auto' | 'button' | 'off'
     visualTransModel: '',       // P4 消费：''=跟随翻译器当前选中的模型
+    ovlVisualLineBreaks: true,  // Visual 断行 Pass 消费：true=按源码行切细渲染，false=退回整段渲染
     // ---- v2 Pass P24：Overleaf git 同步 ----
     overleafProjectAddr: '',    // 用户粘贴的 Overleaf 项目地址（git URL / web URL / 纯 ID 都行，见 ovlOverleafResolveGitUrl）
     overleafToken: '',          // Overleaf 项目 Git Token（明文存 localStorage，跟这个 App 里其它凭证同一存储方式，不是这次新引入的安全水位）
@@ -28361,6 +28502,10 @@ function ovlApplySettings() {
         // P2：settings.transSimpleMode 的勾选框走的是通用 data-setpath 处理（改 OvlSettings
         // 之后统一调 ovlSaveSettings()+ovlApplySettings()），真正把它落到 DOM 上就靠这一行。
         ovlTransSyncSimpleUI();
+        // Visual 断行开关：走的也是通用 data-setpath 处理，改完要立刻重渲染 Visual 面板才能
+        // 看到效果——只在当前正开着 Visual 模式时才重渲，Code 模式下这个设置暂时用不上，
+        // 等下次切到 Visual 时 ovlSetEditorMode 自己会调 ovlVisualRender()，不用现在白渲一次。
+        if (OvlState.editorMode === 'visual' && typeof ovlVisualRender === 'function') ovlVisualRender();
         // v2 Pass P24：设置一改（含 token/地址/自动拉取间隔）立刻反映到按钮态 + 重设定时器
         // ——overleafAutoPullMinutes 走的也是通用 data-setpath 处理，不用单独接线。
         if (typeof ovlOverleafUpdateButtonsUI === 'function') ovlOverleafUpdateButtonsUI();
@@ -28693,6 +28838,8 @@ function ovlSettingsTranslatorHtml() {
         + (Array.isArray(AppState.localModels) ? AppState.localModels : []).map(function (lm) { return ovlOptTag(lm.id, lm.id, s.visualTransModel); }).join('')
         + '</select>',
         'Visual 或 Code 模式里选中文字后，用哪个模型翻译。留空就跟着翻译器上方选的模型走。');
+    html += ovlSetRow('Visual 模式按源码行断行', '<input type="checkbox" data-setpath="settings.ovlVisualLineBreaks"' + (s.ovlVisualLineBreaks ? ' checked' : '') + '>',
+        '开启后 Visual 预览里每个源码行单独渲染一行（跟 Code 模式的行号对得上，方便切模式时对照）；关闭则退回按段落整段渲染。');
     // v2 P5：版本号从翻译器窗口的品牌区（已删除，见 renderHeader 顶部注释）迁到这里。
     // 直接读全局的 APP_VERSION/APP_BUILD_DATE 常量（约第 3247 行，pre-commit hook 每次
     // 提交自动改写这两个值），不是在这里另外抄一份写死的字符串——那样两处会迟早不同步。
