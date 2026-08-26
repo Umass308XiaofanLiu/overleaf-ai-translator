@@ -1542,8 +1542,44 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
     background: #ffffff;
     overflow-y: auto;
     padding: 20px 28px;
+    /* Pass Sel-Outline：#ovlVisualSelOverlay 挂在这个元素内部，position:absolute 相对它的
+       padding box 定位——补 relative 让它当containing block。这个元素本来就没设 top/left/
+       right/bottom，加 relative 不改变它在外层 flex 布局里的占位，不影响既有布局。 */
+    position: relative;
 }
 .ovl-visual-empty { margin: auto; color: #6b7280; }
+/* ==================== Pass Sel-Outline：Visual 选区从"原生填充高亮"换成"自绘描边方框" ====================
+   起因：KaTeX 把一条公式渲成大量嵌套 inline span（各自带 padding/vertical-align/height），
+   浏览器原生 ::selection 对每个片段单独填底色，公式区域会碎成一节一节对不齐的小方块，跟
+   周围整齐的文字高亮条明显不对齐（用户截图复现的场景）。这里只换呈现——真实的
+   Selection/Range 对象一个字节不碰，focusOvlSelectionRange()/ovlLocateVisualPick() 继续读
+   同一个原生 Selection，跟下面这层纯展示的叠加物完全无关。方框的计算逻辑见
+   ovlRecomputeVisualSelOverlay()（约 24140 行附近）。
+   关掉原生高亮的作用域严格限定在 #ovlVisualPane 内部——self + descendant 双写是因为理论上
+   不会有文本节点直接挂在 #ovlVisualPane 自己身上（渲染内容永远包在 .ovl-visual-body 等
+   子元素里），但显式覆盖一下不吃亏，别指望这个假设永远成立。color:inherit 保证选中时
+   文字颜色不跟着变，只关掉背景色这一项。 */
+#ovlVisualPane::selection, #ovlVisualPane *::selection { background: transparent; color: inherit; }
+#ovlVisualPane::-moz-selection, #ovlVisualPane *::-moz-selection { background: transparent; color: inherit; }
+/* 叠加层本身：top/left:0 对齐 #ovlVisualPane 的 padding box 原点，自身不设宽高（out-of-flow
+   的 .ovl-sel-box 子节点不会撑开它，父节点保持 0x0 也不影响子节点照样能画到任何位置——
+   overflow 默认 visible，不裁切）。挂在滚动内容内部，容器一起滚它就跟着走，不用监听 scroll
+   重算坐标。z-index 只要盖过同级 .ovl-visual-body 的静态内容——position:absolute 元素本来就
+   比同一层叠上下文里未定位的正文晚画（CSS2.1 §E 画法顺序），这里写个小整数纯为可读性/给
+   以后加东西留余量。快捷工具条 #ovlQuickActions、悬浮翻译框 #ovlVisTransBox 都挂在
+   #ovlPortal 下（z-index 1080 起，另一棵 DOM 子树），天然盖得住，不需要互相比大小。 */
+#ovlVisualSelOverlay { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 5; }
+.ovl-sel-box {
+    position: absolute;
+    border: 1.5px solid var(--ovl-sel-outline, #1d4ed8);
+    background: transparent;
+    border-radius: 2px;
+    pointer-events: none;
+}
+/* Visual 面板目前没有深色皮肤（editorTheme=dark 只切 #ovlCodeArea/#ovlGutter 的前景背景，
+   见 ovlApplySettings 里的注释；.ovl-visual-pane 背景写死 #ffffff），所以这里不加一条
+   "深色下更清楚"的覆盖值——加了也用不上、还可能反过来在白底上显得突兀。以后 Visual 面板
+   真的有了深色皮肤，只需要在那套规则里覆盖 --ovl-sel-outline 这一个变量。 */
 .ovl-visual-raw { white-space: pre-wrap; word-break: break-word; font: 12px/1.5 "SFMono-Regular", Consolas, monospace; color: #374151; }
 .ovl-visual-bar {
     background: #eef1f5; color: #475569; font-size: 12px; padding: 6px 10px;
@@ -23329,6 +23365,9 @@ function ovlSetEditorMode(mode) {
             if (gutter) gutter.style.display = '';
             if (gutter) gutter.style.paddingTop = ''; // 撤销 ovlRenderVisualGutter 为对齐而清零的 padding
             if (visual) visual.style.display = 'none';
+            // Pass Sel-Outline（规格 §5"切到 Code 模式 → 清空"）：面板本身已经 display:none，
+            // 留着旧方框不会被看见，这里主动清空纯粹是卫生——不依赖"反正看不见"这种隐式假设。
+            if (typeof ovlClearVisualSelOverlay === 'function') ovlClearVisualSelOverlay();
             // v2 Polish 2（Bug 2）：从 Visual 切回 Code，#ovlCodeArea 刚从 display:none 变回来，
             // 之前 clientWidth<=0 被 ovlRecomputeLineOffsets 跳过的那次现在能补上了。用防抖
             // （而不是同步调）是因为 display 切换到布局真正生效之间也隔着一次重排，跟
@@ -24063,6 +24102,7 @@ function ovlVisualRender() {
         const src = ta ? ta.value : '';
         if (!src) {
             pane.innerHTML = '<div class="ovl-visual-empty">打开一个 .tex 文件后这里会显示只读预览。</div>';
+            ovlVisualSelOverlayReset(pane); // Pass Sel-Outline：innerHTML 冲掉了旧叠加层，重挂一个空的
             if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter(); // 没内容=没块，清空 gutter
             return;
         }
@@ -24072,6 +24112,7 @@ function ovlVisualRender() {
             pane.innerHTML = '<div class="ovl-visual-empty">Visual 预览暂不可用（LatexFilter/marked/KaTeX 未就绪），已显示原始源码：</div><pre class="ovl-visual-raw"></pre>';
             const pre = pane.querySelector('.ovl-visual-raw');
             if (pre) pre.textContent = src;
+            ovlVisualSelOverlayReset(pane); // Pass Sel-Outline
             if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
             return;
         }
@@ -24113,6 +24154,7 @@ function ovlVisualRender() {
             if (OvlVisualState.tailOpen) html += '<pre class="ovl-visual-tail"></pre>';
         }
         pane.innerHTML = html;
+        ovlVisualSelOverlayReset(pane); // Pass Sel-Outline：innerHTML 冲掉了旧叠加层，重挂一个空的
         const preEl = pane.querySelector('.ovl-visual-preamble');
         if (preEl) preEl.textContent = preamble;
         const tailEl = pane.querySelector('.ovl-visual-tail');
@@ -24126,7 +24168,7 @@ function ovlVisualRender() {
     } catch (e) {
         console.error('[ovl] visualRender failed', e);
         const pane = document.getElementById('ovlVisualPane');
-        if (pane) pane.innerHTML = '<div class="ovl-visual-empty">Visual 预览渲染失败，请切回 Code 模式查看源码。</div>';
+        if (pane) { pane.innerHTML = '<div class="ovl-visual-empty">Visual 预览渲染失败，请切回 Code 模式查看源码。</div>'; ovlVisualSelOverlayReset(pane); }
         if (typeof ovlRenderVisualGutter === 'function') { try { ovlRenderVisualGutter(); } catch (e2) {} }
     }
 }
@@ -24139,6 +24181,112 @@ function ovlBindVisualPane() {
         if (e.target.closest('#ovlVisualPreambleBar')) { OvlVisualState.preambleOpen = !OvlVisualState.preambleOpen; ovlVisualRender(); return; }
         if (e.target.closest('#ovlVisualTailBar')) { OvlVisualState.tailOpen = !OvlVisualState.tailOpen; ovlVisualRender(); return; }
     });
+}
+
+// ==================== Pass Sel-Outline：Visual 选区描边叠加层（呈现层，不碰 Selection 本身）====================
+// pane.innerHTML 每次整篇重写（换文件/切模式/折叠导言区……），旧的 #ovlVisualSelOverlay 节点
+// 跟着一起被冲掉。ovlVisualRender() 的每一条 pane.innerHTML = ... 之后都调这个函数重新挂一个
+// 全新的空节点回去——天然不残留任何 .ovl-sel-box（规格 §5"重新渲染 → 清空"这条免费拿到，
+// 不用另外判断），下一次 selectionchange 触发时才会重新画。
+function ovlVisualSelOverlayReset(pane) {
+    if (!pane) return;
+    const overlay = document.createElement('div');
+    overlay.id = 'ovlVisualSelOverlay';
+    pane.appendChild(overlay);
+}
+
+function ovlClearVisualSelOverlay() {
+    const overlay = document.getElementById('ovlVisualSelOverlay');
+    if (overlay) overlay.innerHTML = '';
+}
+
+let OvlVisualSelOverlayRaf = null;
+function ovlScheduleVisualSelOverlay() {
+    // selectionchange 在一次拖拽/键盘扩选里会连续触发很多次，rAF 合并成每帧最多重算一次——
+    // 已经排了队的这一帧还没画完，后续事件不重复排队。
+    if (OvlVisualSelOverlayRaf !== null) return;
+    OvlVisualSelOverlayRaf = requestAnimationFrame(function () {
+        OvlVisualSelOverlayRaf = null;
+        ovlRecomputeVisualSelOverlay();
+    });
+}
+
+// 选中整篇这种极端情况，getClientRects() 能有几千个矩形——下面的分组是 O(n·行数)，超过这个
+// 上限就直接砍掉多出来的部分，避免在超大选区上卡主线程（规格 §3 最后一条）。
+const OVL_SEL_OVERLAY_MAX_RECTS = 400;
+
+// 把 range.getClientRects() 按视觉行合并成方框：竖直方向重叠超过"较矮那个矩形一半高度"的
+// 归为同一行。这是解决"公式碎成一节一节"的关键——KaTeX 一条公式里，上标/下标/主体几个
+// span 顶部高低不齐，但只要还在同一条视觉行上，跟同行相邻文字矩形的竖直重叠必然远超半个
+// 字高；真正换行之后的下一行，矩形之间通常隔着接近一整行行高的竖直间隙，重叠不到一半，
+// 不会被误并。合并后的方框取这一组矩形 left/top/right/bottom 各自的极值。
+function ovlGroupSelRectsIntoRows(rects) {
+    const rows = [];
+    for (let i = 0; i < rects.length; i++) {
+        const r = rects[i];
+        let merged = false;
+        for (let j = 0; j < rows.length; j++) {
+            const row = rows[j];
+            const overlap = Math.min(r.bottom, row.bottom) - Math.max(r.top, row.top);
+            const minH = Math.min(r.bottom - r.top, row.bottom - row.top);
+            if (minH > 0 && overlap > minH / 2) {
+                row.top = Math.min(row.top, r.top);
+                row.bottom = Math.max(row.bottom, r.bottom);
+                row.left = Math.min(row.left, r.left);
+                row.right = Math.max(row.right, r.right);
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) rows.push({ top: r.top, bottom: r.bottom, left: r.left, right: r.right });
+    }
+    return rows;
+}
+
+// 清空时机（规格 §5）：选区折叠 / 不在面板内 / 面板不可见 / 设置关掉 / 不在 Visual 模式 ——
+// 这几条判定分支全部走同一条路径清空叠加层，不单独开小灶。"面板不可见"用两道判定叠加：
+// 内联 style（ovlSetEditorMode 切模式时直接写的那个 display:none/flex）+ offsetParent
+// （更通用的兜底，覆盖祖先节点被隐藏之类内联 style 判定不到的情况）。
+function ovlRecomputeVisualSelOverlay() {
+    try {
+        if (!OvlSettings.ovlVisualOutlineSelection || OvlState.editorMode !== 'visual') { ovlClearVisualSelOverlay(); return; }
+        const pane = document.getElementById('ovlVisualPane');
+        const overlay = document.getElementById('ovlVisualSelOverlay');
+        if (!pane || !overlay || pane.style.display === 'none' || !pane.offsetParent) { ovlClearVisualSelOverlay(); return; }
+        const sel = ovlWinOf(pane).getSelection();
+        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { overlay.innerHTML = ''; return; }
+        const range = sel.getRangeAt(0);
+        if (!pane.contains(range.commonAncestorContainer)) { overlay.innerHTML = ''; return; }
+        let rects = Array.from(range.getClientRects()).filter(function (r) { return r.width > 0 && r.height > 0; });
+        if (!rects.length) { overlay.innerHTML = ''; return; }
+        if (rects.length > OVL_SEL_OVERLAY_MAX_RECTS) rects = rects.slice(0, OVL_SEL_OVERLAY_MAX_RECTS);
+        const rows = ovlGroupSelRectsIntoRows(rects);
+        // 转成叠加层坐标系：叠加层 top:0/left:0 对齐 pane 的 padding box 原点（pane 没有
+        // border，padding box 和 getBoundingClientRect() 的原点重合），减去 pane 当前的
+        // bounding rect 再加 scrollLeft/scrollTop，跟 pane 本身的 padding 值无关——viewport
+        // 矩形本来就已经把 pane 的 padding 算在内了，这里只是纯坐标平移。
+        const paneRect = pane.getBoundingClientRect();
+        const offX = pane.scrollLeft - paneRect.left;
+        const offY = pane.scrollTop - paneRect.top;
+        let html = '';
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            html += '<div class="ovl-sel-box" style="left:' + (row.left + offX) + 'px;top:' + (row.top + offY)
+                + 'px;width:' + (row.right - row.left) + 'px;height:' + (row.bottom - row.top) + 'px;"></div>';
+        }
+        overlay.innerHTML = html;
+    } catch (e) { console.error('[ovl] recomputeVisualSelOverlay failed', e); }
+}
+
+function ovlBindVisualSelOverlay() {
+    // selectionchange 不在具体元素上冒泡，只能挂 document（跟 ovlBindVisualTranslate 里
+    // 那条同一个理由）；resize 按规格 §5 要"重算"而不是单纯清空——窗口一变宽，同一段文字
+    // 折行位置会变，方框跟着重新量才不会画在旧位置上。blur 单独处理"面板失焦"里
+    // selectionchange 覆盖不到的那种情况：普通文字选区在窗口切到后台时大多数浏览器不会自动
+    // collapse（不像 <input>/<textarea> 那样），不主动清空就会有一份过时的方框在后台常驻。
+    document.addEventListener('selectionchange', ovlScheduleVisualSelOverlay);
+    window.addEventListener('resize', ovlScheduleVisualSelOverlay);
+    window.addEventListener('blur', ovlClearVisualSelOverlay);
 }
 
 // ==================== v2 Polish 2：软换行 + 行偏移表（Bug 2）====================
@@ -28433,6 +28581,7 @@ const OVL_SETTINGS_DEFAULTS = {
     visualTranslate: 'auto',    // P4 消费：'auto' | 'button' | 'off'
     visualTransModel: '',       // P4 消费：''=跟随翻译器当前选中的模型
     ovlVisualLineBreaks: true,  // Visual 断行 Pass 消费：true=按源码行切细渲染，false=退回整段渲染
+    ovlVisualOutlineSelection: true, // Pass Sel-Outline 消费：true=方框描边选区，false=退回浏览器原生高亮
     // ---- v2 Pass P24：Overleaf git 同步 ----
     overleafProjectAddr: '',    // 用户粘贴的 Overleaf 项目地址（git URL / web URL / 纯 ID 都行，见 ovlOverleafResolveGitUrl）
     overleafToken: '',          // Overleaf 项目 Git Token（明文存 localStorage，跟这个 App 里其它凭证同一存储方式，不是这次新引入的安全水位）
@@ -28506,6 +28655,15 @@ function ovlApplySettings() {
         // 看到效果——只在当前正开着 Visual 模式时才重渲，Code 模式下这个设置暂时用不上，
         // 等下次切到 Visual 时 ovlSetEditorMode 自己会调 ovlVisualRender()，不用现在白渲一次。
         if (OvlState.editorMode === 'visual' && typeof ovlVisualRender === 'function') ovlVisualRender();
+        // Pass Sel-Outline：选区描边开关不需要重渲染整个面板（只是选区呈现层，不是内容本身）——
+        // 关掉要立刻清空叠加层换回原生高亮，开启则立刻按当前选区重算一次，两者都不等下一次
+        // 自然触发的 selectionchange（用户刚点完设置框，选区多半原封不动还在，不该表现成
+        // "改了个寂寞"）。上面那行 ovlVisualRender() 若也跑了会先重挂一个空叠加层，这里的
+        // 重算排在下一帧，互不冲突。
+        if (OvlState.editorMode === 'visual' && typeof ovlScheduleVisualSelOverlay === 'function') {
+            if (OvlSettings.ovlVisualOutlineSelection) ovlScheduleVisualSelOverlay();
+            else if (typeof ovlClearVisualSelOverlay === 'function') ovlClearVisualSelOverlay();
+        }
         // v2 Pass P24：设置一改（含 token/地址/自动拉取间隔）立刻反映到按钮态 + 重设定时器
         // ——overleafAutoPullMinutes 走的也是通用 data-setpath 处理，不用单独接线。
         if (typeof ovlOverleafUpdateButtonsUI === 'function') ovlOverleafUpdateButtonsUI();
@@ -28840,6 +28998,8 @@ function ovlSettingsTranslatorHtml() {
         'Visual 或 Code 模式里选中文字后，用哪个模型翻译。留空就跟着翻译器上方选的模型走。');
     html += ovlSetRow('Visual 模式按源码行断行', '<input type="checkbox" data-setpath="settings.ovlVisualLineBreaks"' + (s.ovlVisualLineBreaks ? ' checked' : '') + '>',
         '开启后 Visual 预览里每个源码行单独渲染一行（跟 Code 模式的行号对得上，方便切模式时对照）；关闭则退回按段落整段渲染。');
+    html += ovlSetRow('Visual 模式用方框标示选区', '<input type="checkbox" data-setpath="settings.ovlVisualOutlineSelection"' + (s.ovlVisualOutlineSelection ? ' checked' : '') + '>',
+        '开启后选中文字显示为深蓝色描边方框、不填充背景色，公式（KaTeX 渲染）区域也是整行一个框，不会碎成一节一节；关闭则恢复浏览器原生的填色高亮。');
     // v2 P5：版本号从翻译器窗口的品牌区（已删除，见 renderHeader 顶部注释）迁到这里。
     // 直接读全局的 APP_VERSION/APP_BUILD_DATE 常量（约第 3247 行，pre-commit hook 每次
     // 提交自动改写这两个值），不是在这里另外抄一份写死的字符串——那样两处会迟早不同步。
@@ -31437,6 +31597,7 @@ function ovlBindPassD() {
         ovlBindMenuBar();
         ovlBindVisualPane();
         ovlBindVisualTranslate(); // P4：需求 6，Visual 模式选中即译
+        ovlBindVisualSelOverlay(); // Pass Sel-Outline：Visual 选区描边叠加层
 
         const syncTexBtn = document.getElementById('ovlSyncTexBtn');
         if (syncTexBtn) syncTexBtn.addEventListener('click', function () {
