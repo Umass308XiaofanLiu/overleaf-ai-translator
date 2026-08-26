@@ -787,7 +787,9 @@ const GIT_ASKPASS_HELPER = path.join(__dirname, 'git-askpass-helper.bat');
 
 // 跑一条 git 命令，token 只走环境变量（GIT_ASKPASS），绝不拼进 args/URL——见文件头注释。
 // 不抛异常：spawn 失败、超时、非零退出码统统汇总成 {ok, code, stdout, stderr, timedOut} 返回。
-function runGitCommand(args, cwd, token) {
+// timeoutMs 可选：不传时保持原来的 OVERLEAF_GIT_TIMEOUT_MS（pull/push 现有行为完全不变），
+// clone 一个带图片的论文仓库可能远超 30 秒，调用方会显式传一个更长的值。
+function runGitCommand(args, cwd, token, timeoutMs) {
     return new Promise((resolve) => {
         let child;
         try {
@@ -817,7 +819,7 @@ function runGitCommand(args, cwd, token) {
                 stderr: Buffer.concat(errBuf).toString('utf8'),
                 timedOut: true
             });
-        }, OVERLEAF_GIT_TIMEOUT_MS);
+        }, timeoutMs || OVERLEAF_GIT_TIMEOUT_MS);
         child.stdout.on('data', (c) => outBuf.push(c));
         child.stderr.on('data', (c) => errBuf.push(c));
         child.on('error', (err) => {
@@ -846,6 +848,12 @@ function runGitCommand(args, cwd, token) {
 function normalizeGitUrlForCompare(url) {
     if (typeof url !== 'string') return '';
     let s = url.trim();
+    // 剥掉 URL 里的 userinfo 段（user:pass@ 或 user@）——只影响"是不是同一个仓库"这一步比较，
+    // 绝不改写任何落盘的 remote URL（ensureOriginRemote 仍然绝不自动 set-url，那是 P24 特意
+    // 加的保护，这里不碰）。origin 从别的机器搬过来、或者当初是用
+    // `git clone https://git@git.overleaf.com/<id>` 这种带用户名的地址克隆的，都会导致"同一个
+    // 仓库"的两个 URL 只差这一段——不剥掉就会被误判成 origin-mismatch，挡住正常的拉取。
+    s = s.replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^@/]*@/, '$1');
     s = s.replace(/\/+$/, '');
     s = s.replace(/\.git$/i, '');
     return s.toLowerCase();
@@ -881,8 +889,51 @@ async function ensureOriginRemote(projectDir, gitUrl, token) {
     return { ok: true };
 }
 
+// 解析 `git status --porcelain`（v1 格式）的一行为 {status, path}——status 是原始两字符
+// code（保留原样，含空格，例如 " M"/"M "/"??"/"UU"），path 从第 4 个字符开始到行尾（重命名
+// 的情况下是 "旧路径 -> 新路径" 整段原样带出，不单独拆分，前端只是展示用，不解析这段）。
+// pull 的 dirty 检查（-uno）和 stash-pop 冲突之后的现场检查都靠它，避免各自重复写一遍解析。
+function parseGitStatusPorcelain(stdout) {
+    return stdout.split(/\r?\n/)
+        .filter((line) => line.length > 3)
+        .map((line) => ({ status: line.slice(0, 2), path: line.slice(3) }));
+}
+
+// 冲突状态判定：两字符里只要出现 'U'（未合并）就是冲突；'AA'（双方都新增同名文件）、
+// 'DD'（双方都删除）这两种不含 'U' 的组合也算冲突。用于 stash pop 冲突后过滤 conflictFiles。
+function isConflictStatus(status) {
+    return status.indexOf('U') !== -1 || status === 'AA' || status === 'DD';
+}
+
+// stash pop 冲突后用来判断这条 stash 记录是否还在——git 在 apply 冲突时按设计不会自动
+// drop stash（保留在 stash list 里"以防万一"），但这里不假设，实测一遍给用户一个确定的
+// 答案。查询失败（几乎不会）时返回 null，调用方保守地当作"还没 drop"。
+async function stashStillPresent(projectDir, token, message) {
+    const listResult = await runGitCommand(['stash', 'list'], projectDir, token);
+    if (!listResult.ok) return null;
+    return listResult.stdout.indexOf(message) !== -1;
+}
+
+const OVERLEAF_STASH_MESSAGE = 'AI-Translator 自动暂存';
+
 // POST /overleaf/pull —— 见文件头安全设计注释 + 交付说明里的分支逻辑表。
-async function doOverleafPull(projectDir, gitUrl, token) {
+// v2 Pass P27：strategy 参数（'abort' | 'stash' | 'discard'，缺省 'abort'，白名单校验，
+// 非法值直接 ok:false）决定遇到"本地有已跟踪文件改动"时怎么办：
+//   - abort（默认，向后兼容旧行为）：不动手，原样把改动文件清单报给前端，交给用户在弹窗里选。
+//   - stash：先 `git stash push --no-include-untracked` 把已跟踪文件的改动存起来，拉完再
+//     `git stash pop` 恢复；pop 冲突就保持仓库在冲突状态，不自动回滚、不自动二选一。
+//   - discard：`git checkout -- .` 丢弃已跟踪文件的改动（不可逆，前端要求走过二次确认才会
+//     带这个 strategy 进来），然后正常拉取。
+// dirty 判定统一用 `git status --porcelain -uno`，只看已跟踪文件——未跟踪文件不可能被 pull
+// 覆盖（唯一例外是远程新增同名文件，那种情况 git 自己会在 merge/checkout 时报错拒绝，不需要
+// 在这里提前挡），旧版裸 --porcelain 把未跟踪文件也算成"脏"是这一轮要修的根因 bug。
+// countUntrackedFiles() 单独用不带 -uno 的 --porcelain 去数 ?? 开头的未跟踪文件，两件事分开
+// 做，任何 strategy 都绝不碰未跟踪文件一根汗毛（不 stash、不 discard、更不会 clean/删除）。
+async function doOverleafPull(projectDir, gitUrl, token, strategy) {
+    if (strategy === undefined || strategy === null || strategy === '') strategy = 'abort';
+    if (['abort', 'stash', 'discard'].indexOf(strategy) === -1) {
+        return { ok: false, error: '非法的 strategy 参数: ' + strategy + '（只接受 abort/stash/discard）' };
+    }
     try {
         const gitDir = path.join(projectDir, '.git');
         let hasGitDir = false;
@@ -913,35 +964,77 @@ async function doOverleafPull(projectDir, gitUrl, token) {
             if (!cloneResult.ok) {
                 return { ok: false, action: 'clone-failed', error: redactToken(cloneResult.stderr || cloneResult.stdout || 'git clone 失败', token) };
             }
-            return { ok: true, action: 'cloned' };
+            // 走到这一步之前已经确认目录是空的（entries.length === 0）或者是本函数刚新建的，
+            // clone 只会写入远程仓库里已有的文件，不可能凭空冒出未跟踪文件，不必再花一次
+            // git 进程去查，直接给 0。
+            return { ok: true, action: 'cloned', untrackedCount: 0 };
         }
 
-        // 已经是 git 仓库：dirty 检查必须先于任何网络操作。
-        const statusResult = await runGitCommand(['status', '--porcelain'], projectDir, token);
+        // 已经是 git 仓库：dirty 检查必须先于任何网络操作。只看已跟踪文件（-uno）。
+        const statusResult = await runGitCommand(['status', '--porcelain', '-uno'], projectDir, token);
         if (!statusResult.ok) {
             return { ok: false, action: 'status-failed', error: redactToken(statusResult.stderr || statusResult.stdout || 'git status 失败', token) };
         }
-        if (statusResult.stdout.trim().length > 0) {
+        const dirtyFiles = parseGitStatusPorcelain(statusResult.stdout);
+        const isDirty = dirtyFiles.length > 0;
+
+        if (isDirty && strategy === 'abort') {
             return {
                 ok: true,
                 action: 'skipped-dirty',
+                dirtyFiles: dirtyFiles,
                 error: '本地有未提交的改动，跳过本次同步（不会自动覆盖），建议先点“推送”或手动处理后再拉取。'
             };
         }
 
+        let stashPushed = false;
+        if (isDirty && strategy === 'stash') {
+            const stashResult = await runGitCommand(
+                ['stash', 'push', '--no-include-untracked', '-m', OVERLEAF_STASH_MESSAGE],
+                projectDir, token
+            );
+            if (!stashResult.ok) {
+                return { ok: false, action: 'stash-failed', error: redactToken(stashResult.stderr || stashResult.stdout || 'git stash push 失败', token) };
+            }
+            stashPushed = true;
+        }
+
+        let discardedFiles = [];
+        if (isDirty && strategy === 'discard') {
+            // 只丢弃已跟踪文件的改动——绝不用 git clean，一个未跟踪文件都不许删。
+            const discardResult = await runGitCommand(['checkout', '--', '.'], projectDir, token);
+            if (!discardResult.ok) {
+                return { ok: false, action: 'discard-failed', error: redactToken(discardResult.stderr || discardResult.stdout || 'git checkout -- . 失败', token) };
+            }
+            discardedFiles = dirtyFiles;
+        }
+
+        // stash 分支专用：往下任何一步失败都要先把 stash pop 回来再报错，兑现前端弹窗里
+        // "拉取完成后自动恢复，不会丢失"的承诺——不能让用户的改动只是因为比如 fetch 超时
+        // 就悄无声息地扔在 stash 里（对 strategy !== 'stash' 是安全的空操作）。
+        async function bailOut(result) {
+            if (stashPushed) {
+                // 这里不检查 pop 是否成功——工作区此时应该跟 stash push 之前完全一致（还没有
+                // 任何 fetch/merge 动过工作区），正常不会冲突；万一意外冲突，用户至少能在
+                // `git stash list` 里把改动找回来，不算真的丢失，也不在这个失败路径上二次报告。
+                await runGitCommand(['stash', 'pop'], projectDir, token);
+            }
+            return result;
+        }
+
         const remoteResult = await ensureOriginRemote(projectDir, gitUrl, token);
         if (!remoteResult.ok) {
-            return { ok: false, action: remoteResult.action || 'remote-failed', error: redactToken(remoteResult.error, token) };
+            return await bailOut({ ok: false, action: remoteResult.action || 'remote-failed', error: redactToken(remoteResult.error, token) });
         }
 
         const fetchResult = await runGitCommand(['fetch', 'origin'], projectDir, token);
         if (!fetchResult.ok) {
-            return { ok: false, action: 'fetch-failed', error: redactToken(fetchResult.stderr || fetchResult.stdout || 'git fetch 失败', token) };
+            return await bailOut({ ok: false, action: 'fetch-failed', error: redactToken(fetchResult.stderr || fetchResult.stdout || 'git fetch 失败', token) });
         }
 
         const branchResult = await runGitCommand(['rev-parse', '--abbrev-ref', 'HEAD'], projectDir, token);
         if (!branchResult.ok) {
-            return { ok: false, action: 'branch-failed', error: redactToken(branchResult.stderr || 'git rev-parse 获取当前分支名失败', token) };
+            return await bailOut({ ok: false, action: 'branch-failed', error: redactToken(branchResult.stderr || 'git rev-parse 获取当前分支名失败', token) });
         }
         const branch = branchResult.stdout.trim();
 
@@ -953,28 +1046,54 @@ async function doOverleafPull(projectDir, gitUrl, token) {
             // 非快进（本地和远程各自有新提交）或 origin/<branch> 压根不存在（比如远程默认分支
             // 是 master，本地却在别的分支上）——两种情况都不尝试自动合并/rebase/瞎猜分支名重试，
             // 统一归类为"分叉"，原样报告给用户自己判断。
-            return {
+            return await bailOut({
                 ok: true,
                 action: 'diverged',
                 error: '本地和 Overleaf 上的版本出现分叉，无法自动合并，请手动处理（打开终端 cd 到项目目录执行 git status / git log 检查，必要时手动 git merge 或 git reset）。如果 Overleaf 上的默认分支名和本地当前分支（' + branch + '）不一致，也会出现这个提示，请手动确认分支名。'
-            };
+            });
         }
 
         const newHeadResult = await runGitCommand(['rev-parse', 'HEAD'], projectDir, token);
         const newHead = newHeadResult.ok ? newHeadResult.stdout.trim() : null;
-
-        if (oldHead && newHead && oldHead === newHead) {
-            return { ok: true, action: 'up-to-date' };
-        }
+        const upToDate = !!(oldHead && newHead && oldHead === newHead);
 
         let changedFiles = [];
-        if (oldHead && newHead) {
+        if (!upToDate && oldHead && newHead) {
             const diffResult = await runGitCommand(['diff', '--name-only', oldHead, newHead], projectDir, token);
             if (diffResult.ok) {
                 changedFiles = diffResult.stdout.split(/\r?\n/).filter((s) => s.length > 0);
             }
         }
-        return { ok: true, action: 'fast-forward', changedFiles: changedFiles };
+
+        if (strategy === 'discard' && isDirty) {
+            const untrackedCount = await countUntrackedFiles(projectDir, token);
+            return { ok: true, action: 'pulled-with-discard', discardedFiles: discardedFiles, changedFiles: changedFiles, untrackedCount: untrackedCount };
+        }
+
+        if (stashPushed) {
+            const popResult = await runGitCommand(['stash', 'pop'], projectDir, token);
+            const untrackedCount = await countUntrackedFiles(projectDir, token);
+            if (popResult.ok) {
+                return { ok: true, action: 'pulled-with-stash', changedFiles: changedFiles, untrackedCount: untrackedCount };
+            }
+            // pop 冲突：保持仓库在冲突状态，不自动回滚、不自动二选一——这是 P28（AI 协助合并）
+            // 的入口。
+            const conflictStatusResult = await runGitCommand(['status', '--porcelain', '-uno'], projectDir, token);
+            const conflictFiles = conflictStatusResult.ok
+                ? parseGitStatusPorcelain(conflictStatusResult.stdout).filter((f) => isConflictStatus(f.status))
+                : [];
+            const stillPresent = await stashStillPresent(projectDir, token, OVERLEAF_STASH_MESSAGE);
+            return {
+                ok: true,
+                action: 'stash-pop-conflict',
+                conflictFiles: conflictFiles,
+                stashDropped: stillPresent === false,
+                error: '暂存的改动在恢复时和拉取下来的新内容冲突，仓库现在处于冲突状态，需要手动解决（查看 git status，编辑冲突文件后 git add，再自行决定 git stash drop 或保留）。'
+            };
+        }
+
+        const untrackedCount = await countUntrackedFiles(projectDir, token);
+        return { ok: true, action: upToDate ? 'up-to-date' : 'fast-forward', changedFiles: changedFiles, untrackedCount: untrackedCount };
     } catch (e) {
         return { ok: false, error: redactToken('内部错误: ' + (e && e.message), token) };
     }
@@ -984,6 +1103,11 @@ async function doOverleafPull(projectDir, gitUrl, token) {
 // 已经落在本地历史里（不回滚），只是没推上去，安全、不丢用户的本地工作。
 // push 前数一下工作区里还有多少未跟踪文件（?? 开头）——只用于告知，不影响任何行为。
 // 失败就当 0（这只是个提示性数字，不能因为它查询失败就搞坏整个 push 的返回）。
+// v2 Pass P27 审计结论：这里特意不加 -uno——这个函数存在的唯一目的就是数 ?? 开头的未跟踪
+// 文件，跟 doOverleafPull 里 dirty 判定用 -uno（只看已跟踪文件）是两件相反的事，不要改成
+// 一样。push 本身也没有另一处用 --porcelain 当"脏"的判断闸门：它靠 `git add -u`（本来就只碰
+// 已跟踪文件，不会动未跟踪文件）之后 `git diff --cached --name-only` 是否为空来决定有没有
+// 东西要提交，跟这里的 --porcelain 查询完全独立，不受这个函数改动影响。
 async function countUntrackedFiles(projectDir, token) {
     const statusResult = await runGitCommand(['status', '--porcelain'], projectDir, token);
     if (!statusResult.ok) return 0;
@@ -1076,7 +1200,168 @@ async function doOverleafPush(projectDir, gitUrl, token, message) {
     }
 }
 
-// 只用于 /overleaf/* 这两个能动用户真实 git 仓库的路由：拒绝来自任意网页的跨域驱动。
+// v2 Pass P24（追加）：POST /overleaf/clone —— 首次从 Overleaf 整体拉一个新项目下来。
+// 目标目录 180 秒超时（clone 一个带图片的论文仓库可能远超 pull 的 30 秒）。
+const OVERLEAF_CLONE_TIMEOUT_MS = 180000;
+
+// 在 text 里找第一处 "\cmdName{...}"，花括号手动配对（支持嵌套，不用贪婪正则），
+// 返回花括号内部的原文；找不到或花括号不闭合就返回 null。供 extractSuggestedProjectName
+// 提取 \title{...} 用。
+function extractBracedArg(text, cmdName) {
+    const marker = '\\' + cmdName;
+    const idx = text.indexOf(marker);
+    if (idx === -1) return null;
+    let i = idx + marker.length;
+    while (i < text.length && /\s/.test(text[i])) i++;
+    if (text[i] !== '{') return null;
+    let depth = 0, start = -1, end = -1;
+    for (let j = i; j < text.length; j++) {
+        const ch = text[j];
+        if (ch === '{') { depth++; if (depth === 1) start = j + 1; }
+        else if (ch === '}') { depth--; if (depth === 0) { end = j; break; } }
+    }
+    if (start === -1 || end === -1) return null;
+    return text.slice(start, end);
+}
+
+// 清洗标题用：找出 text 里所有 "\cmdName{...}"（同样手动配对花括号），keepInner=true 时
+// 替换成花括号内部的文字（\textbf{...} 之类"命令壳"只留文字），keepInner=false 时整体删掉
+// （\thanks{...} 这种脚注不该出现在标题里）。花括号不闭合就放弃剩余部分的清洗、原样拼回去，
+// 不死循环、不丢内容。
+function stripBracedCommand(text, cmdName, keepInner) {
+    const marker = '\\' + cmdName + '{';
+    let result = '';
+    let i = 0;
+    while (i < text.length) {
+        const idx = text.indexOf(marker, i);
+        if (idx === -1) { result += text.slice(i); break; }
+        result += text.slice(i, idx);
+        let depth = 0, start = -1, end = -1;
+        for (let j = idx + marker.length - 1; j < text.length; j++) {
+            const ch = text[j];
+            if (ch === '{') { depth++; if (depth === 1) start = j + 1; }
+            else if (ch === '}') { depth--; if (depth === 0) { end = j; break; } }
+        }
+        if (start === -1 || end === -1) { result += text.slice(idx); break; }
+        if (keepInner) result += text.slice(start, end);
+        i = end + 1;
+    }
+    return result;
+}
+
+// clone 成功后尽力从项目里挑一个可读名字，纯锦上添花：任何一步失败都吞掉异常返回 null，
+// 绝不能让这一步拖垮整个 clone（见路由处的分支 4-6）。顶层找 main.tex，没有就取第一个
+// .tex 文件（不递归，只看顶层）；读 \title{...}（花括号手动配对，支持嵌套）；清洗掉
+// \thanks{...}、\\、\textbf{} 之类命令壳；压缩空白；截断到 60 字符。
+function extractSuggestedProjectName(targetDir) {
+    try {
+        let entries = [];
+        try { entries = fs.readdirSync(targetDir); } catch (e) { return null; }
+        const texFiles = entries.filter((name) => /\.tex$/i.test(name)).filter((name) => {
+            try { return fs.statSync(path.join(targetDir, name)).isFile(); } catch (e) { return false; }
+        });
+        let texFile = null;
+        if (texFiles.indexOf('main.tex') !== -1) texFile = 'main.tex';
+        else if (texFiles.length > 0) texFile = texFiles[0];
+        if (!texFile) return null;
+
+        let content;
+        try { content = fs.readFileSync(path.join(targetDir, texFile), 'utf8'); } catch (e) { return null; }
+
+        let title = extractBracedArg(content, 'title');
+        if (title === null) return null;
+
+        title = stripBracedCommand(title, 'thanks', false);
+        title = title.replace(/\\\\/g, ' ');
+        ['textbf', 'textit', 'textrm', 'texttt', 'emph', 'text', 'mathrm'].forEach((cmd) => {
+            title = stripBracedCommand(title, cmd, true);
+        });
+        title = title.replace(/\s+/g, ' ').trim();
+        if (!title) return null;
+        if (title.length > 60) title = title.slice(0, 60);
+        return title;
+    } catch (e) {
+        return null;
+    }
+}
+
+// POST /overleaf/clone —— 首次从 Overleaf 整体拉一个新项目下来建本地副本。目标目录不接受
+// 调用方指定（故意的，见路由处校验注释），完全由服务端按 projectId 算出，避免任意页面借
+// 这个接口让桥往任意路径写文件；凭据同 pull/push，走 GIT_ASKPASS + OVL_GIT_TOKEN，URL 里
+// 绝不带 token。
+//
+// OVL_TEST_CLONE_ROOT / OVL_TEST_GIT_BASE 两个环境变量仅供 e2e 测试使用：分别让测试把 clone
+// 目标根目录、Overleaf git 服务地址重定向到临时目录 / file:// 假仓库，避免测试写进真实的
+// %LOCALAPPDATA%\AI-Translator。能设环境变量的人本来就能直接改代码，这不构成新的攻击面。
+async function doOverleafClone(projectId, token) {
+    const cloneRoot = process.env.OVL_TEST_CLONE_ROOT
+        || (process.platform === 'win32' && process.env.LOCALAPPDATA
+              ? path.join(process.env.LOCALAPPDATA, 'AI-Translator', 'overleaf')
+              : path.join(os.homedir(), '.ai-translator', 'overleaf'));
+    const targetDir = path.join(cloneRoot, projectId);
+    const gitBase = process.env.OVL_TEST_GIT_BASE || 'https://git.overleaf.com';
+    const gitUrl = gitBase.replace(/\/+$/, '') + '/' + projectId;
+
+    try {
+        let dirExists = false;
+        try { dirExists = fs.existsSync(targetDir); } catch (e) { dirExists = false; }
+
+        let entries = null;
+        if (dirExists) {
+            try {
+                entries = fs.readdirSync(targetDir);
+            } catch (e) {
+                // 存在但读不了（比如其实是个文件、或权限问题）——保护性中止，绝不当"不存在"处理，
+                // 免得后面误判成"本次调用新建"，进而把本来就存在的东西删掉。
+                return { ok: true, action: 'target-occupied', dir: targetDir };
+            }
+        }
+        const isMissing = !dirExists;
+        const isEmpty = dirExists && entries.length === 0;
+
+        if (isMissing || isEmpty) {
+            // 分支 a：目标目录不存在，或存在但为空——可以安全 clone。
+            let createdByUs = false;
+            if (isMissing) {
+                try {
+                    fs.mkdirSync(cloneRoot, { recursive: true });
+                    createdByUs = true;
+                } catch (e) {
+                    return { ok: false, action: 'mkdir-failed', error: '创建目标目录失败: ' + e.message };
+                }
+            }
+            const cloneResult = await runGitCommand(['clone', gitUrl, targetDir], cloneRoot, token, OVERLEAF_CLONE_TIMEOUT_MS);
+            if (!cloneResult.ok) {
+                if (createdByUs) {
+                    // 只删自己刚建的半成品目录，绝不删本来就存在的目录（哪怕它当初是空的）。
+                    try { fs.rmSync(targetDir, { recursive: true, force: true }); } catch (e2) {}
+                }
+                return { ok: false, error: redactToken(cloneResult.stderr || cloneResult.stdout || 'git clone 失败', token) };
+            }
+            return { ok: true, action: 'cloned', dir: targetDir, suggestedName: extractSuggestedProjectName(targetDir) };
+        }
+
+        // 分支 b/c：目标目录已存在且非空——先判断它是不是"这个" Overleaf 项目自己的仓库。
+        const gitDir = path.join(targetDir, '.git');
+        let hasGitDir = false;
+        try { hasGitDir = fs.existsSync(gitDir); } catch (e) { hasGitDir = false; }
+        if (hasGitDir) {
+            const urlResult = await runGitCommand(['remote', 'get-url', 'origin'], targetDir, token);
+            const curUrl = urlResult.ok ? urlResult.stdout.trim() : null;
+            if (curUrl !== null && normalizeGitUrlForCompare(curUrl) === normalizeGitUrlForCompare(gitUrl)) {
+                // 分支 b：已经是这个项目的本地副本，不做任何写操作。
+                return { ok: true, action: 'already-cloned', dir: targetDir, suggestedName: extractSuggestedProjectName(targetDir) };
+            }
+        }
+        // 分支 c：非空但不是该仓库（不是 git 仓库，或 origin 取不到/不匹配）——保护性中止，
+        // 不删除任何东西，原样报告给前端自己处理。
+        return { ok: true, action: 'target-occupied', dir: targetDir };
+    } catch (e) {
+        return { ok: false, error: redactToken('内部错误: ' + (e && e.message), token) };
+    }
+}
+
+// 只用于 /overleaf/* 这三个能动用户真实 git 仓库的路由：拒绝来自任意网页的跨域驱动。
 // 浏览器发起跨域 fetch 时一定会带 Origin 头且不可伪造，所以白名单足以挡住恶意页面；
 // 没有 Origin 头的（curl / node 脚本 / 本地测试）放行，因为那本来就不是这条攻击链。
 function ovlOriginAllowed(req) {
@@ -1116,7 +1401,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push. WebSocket on same host:port for disk-change push.');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone. WebSocket on same host:port for disk-change push.');
             return;
         }
 
@@ -1342,10 +1627,14 @@ const server = http.createServer(async (req, res) => {
             const projectDir = body.projectDir;
             const gitUrl = body.gitUrl;
             const token = body.token;
+            // v2 Pass P27：可选，缺省 'abort'（向后兼容旧前端/旧行为）。白名单校验放在
+            // doOverleafPull 内部（跟其它业务性 ok:false 一样走 200 + {ok:false}，不是 400——
+            // 这条路由对所有业务结果统一用 200，只有请求体本身不合法才用 400，见下面三行）。
+            const strategy = body.strategy;
             if (!projectDir || typeof projectDir !== 'string') { sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' }); return; }
             if (!gitUrl || typeof gitUrl !== 'string') { sendJson(res, 400, { ok: false, error: 'gitUrl is required' }); return; }
             if (!token || typeof token !== 'string') { sendJson(res, 400, { ok: false, error: 'token is required' }); return; }
-            const result = await doOverleafPull(projectDir, gitUrl, token);
+            const result = await doOverleafPull(projectDir, gitUrl, token, strategy);
             sendJson(res, 200, result);
             return;
         }
@@ -1370,6 +1659,33 @@ const server = http.createServer(async (req, res) => {
             if (!gitUrl || typeof gitUrl !== 'string') { sendJson(res, 400, { ok: false, error: 'gitUrl is required' }); return; }
             if (!token || typeof token !== 'string') { sendJson(res, 400, { ok: false, error: 'token is required' }); return; }
             const result = await doOverleafPush(projectDir, gitUrl, token, body.message);
+            sendJson(res, 200, result);
+            return;
+        }
+
+        // v2 Pass P24（追加）：Overleaf git 集成——首次把一个 Overleaf 项目整体 clone 下来。
+        // 见 doOverleafClone 头部注释：故意不接受调用方传目标路径，目标目录完全由服务端按
+        // projectId 自己算，防止任意页面借这个接口让桥往任意路径写文件。
+        if (req.method === 'POST' && pathname === '/overleaf/clone') {
+            if (!ovlOriginAllowed(req)) {
+                sendJson(res, 403, { ok: false, action: 'forbidden-origin',
+                    error: '拒绝来自外部网页的同步请求。这两个接口只接受 AI-Translator 页面本身的调用。' });
+                return;
+            }
+            const bodyText = await readBody(req);
+            let body;
+            try { body = JSON.parse(bodyText || '{}'); } catch (e) {
+                sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
+                return;
+            }
+            const projectId = body.projectId;
+            const token = body.token;
+            if (!projectId || typeof projectId !== 'string' || !/^[0-9a-f]{24}$/i.test(projectId)) {
+                sendJson(res, 400, { ok: false, error: '项目 ID 格式不对，应为 24 位十六进制字符' });
+                return;
+            }
+            if (!token || typeof token !== 'string') { sendJson(res, 400, { ok: false, error: '缺少 Overleaf token' }); return; }
+            const result = await doOverleafClone(projectId, token);
             sendJson(res, 200, result);
             return;
         }
