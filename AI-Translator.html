@@ -365,7 +365,14 @@ body.is-resizing-settings-modal * {
    top 差会沿页面向下累加 —— 那正是这个变量必须挂在 :root 而不是各栏自己身上的原因。
    行本身的 mb-2 / my-4 已经从 renderPairRow 里删掉，space-y-2 也已从两个内容盒删掉，
    所以行距只有这一个来源，滑块能一路调到 0。 */
-:root { --pair-gap: 8px; }
+/* Pass Sel-Fill：Visual 选区描边框的颜色，跟 --pair-gap 共用这一个 :root（全文件唯一一处
+   真正声明的全局 CSS 变量集中地，--ovl-split-editor-fr/--ovl-split-pdf-fr 那两个是运行时
+   JS setProperty 写的、不在这里静态声明，不算）。用途见下面 .ovl-sel-box（约 1572 行）。 */
+:root {
+    --pair-gap: 8px;
+    --ovl-sel-fill: rgba(59, 130, 246, 0.18);
+    --ovl-sel-outline: rgba(59, 130, 246, 0.55);
+}
 [data-align-content] > * + * { margin-top: var(--pair-gap); }
 /* 每行都带 Tailwind 的 transition-all（0.15s），它会把 margin-top 一起做补间动画。
    实测后果：拖动行距滑块时行距是「渐变」到位的，而 syncBilingualAlignment 在这 150ms 内
@@ -1212,6 +1219,27 @@ body.ovl-popout-child #root {
 }
 .ovl-vistrans-copy:hover, .ovl-vistrans-close:hover { background: #e2e8f0; }
 
+/* v2 Pass P33：「编辑」改成就地源码编辑器——P32 那版浮框（.ovl-editsrc，靠 ovlPlaceFloating
+   贴着选区飘）已整套删除，不再是"选中 -> 弹一个框"，而是"选中的 .ovl-visual-block 本身
+   原地变成一个 <textarea>"。挂在 .ovl-visual-body 内部，跟被它顶替的 .ovl-visual-block 是
+   同一层兄弟节点，走正常文档流——block 级元素默认宽度就是父容器内容宽度，天然撑满，不用
+   像浮框那样再算一遍定位。字体照抄 .ovl-code-area（约 1249 行）：白色等宽字体 + 相同的
+   pre-wrap/overflow-wrap 组合，用户看到的就是"code 模式里的原文"，字体/折行不一致会造成
+   "内容被转换过"的错觉。定位/行区间算法见 JS 里 OvlInlineSrcEdit 那组函数头的注释
+   （约 30546 行附近，ovlInlineSrcEditOpen 起）。 */
+.ovl-inline-src-wrap { display: block; margin: 0.4em 0; }
+.ovl-inline-src {
+    display: block; width: 100%; box-sizing: border-box; resize: none;
+    min-height: 2.4em; border: 1px solid #6366f1; border-radius: 5px;
+    padding: 6px 8px; font: 12px/1.5 "SFMono-Regular", Consolas, "Courier New", monospace;
+    color: #1f2937; background: #f8fafc;
+    white-space: pre-wrap; overflow-wrap: anywhere; overflow: hidden;
+    outline: none;
+}
+.ovl-inline-src:focus { background: #ffffff; border-color: #4338ca; }
+/* 极简提示条，不是弹窗——比正文小两号、灰色，跟编辑框贴在一起就够了，不需要边框/背景。 */
+.ovl-inline-src-hint { font-size: 11px; color: #94a3b8; margin-top: 2px; user-select: none; }
+
 /* #synonymPopup 在 v2 编辑器里（Code/Visual 选中触发的替换/简化/语法）挂的还是 <body>，
    默认 Tailwind z-[100] 会被编辑器工具条(1086)/设置遮罩(1085) 压住——跟上方 z-index 总表
    里"翻译器开着时 1505"是同一个 #synonymPopup 的另一半：那条管翻译器窗口开着的状态，
@@ -1571,15 +1599,21 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 #ovlVisualSelOverlay { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 5; }
 .ovl-sel-box {
     position: absolute;
-    border: 1.5px solid var(--ovl-sel-outline, #1d4ed8);
-    background: transparent;
+    border: 1px solid var(--ovl-sel-outline, rgba(59, 130, 246, 0.55));
+    background: var(--ovl-sel-fill, rgba(59, 130, 246, 0.18));
     border-radius: 2px;
     pointer-events: none;
 }
-/* Visual 面板目前没有深色皮肤（editorTheme=dark 只切 #ovlCodeArea/#ovlGutter 的前景背景，
+/* Pass Sel-Fill：用户反馈原来的深蓝描边太重，改成"浅蓝半透明填充 + 稍深一点的浅蓝描边"。
+   填充画在下面 ovlRecomputeVisualSelOverlay 按视觉行合并之后的整框上（一整条 .ovl-sel-box
+   矩形），不是逐个原始 getClientRects() 片段各画各的——含行内公式的一行仍然是一条干净的
+   浅蓝底，不会因为加了填充就退回 Pass Sel-Outline 之前"公式碎成一节一节"那种效果。
+   加了填充之后，上面 #ovlVisualPane::selection { background: transparent } 这条更不能丢——
+   原生选区一旦漏出真实的（未合并、逐片段的）背景色，会跟这里的整框填充在视觉上叠成两层。
+   Visual 面板目前没有深色皮肤（editorTheme=dark 只切 #ovlCodeArea/#ovlGutter 的前景背景，
    见 ovlApplySettings 里的注释；.ovl-visual-pane 背景写死 #ffffff），所以这里不加一条
    "深色下更清楚"的覆盖值——加了也用不上、还可能反过来在白底上显得突兀。以后 Visual 面板
-   真的有了深色皮肤，只需要在那套规则里覆盖 --ovl-sel-outline 这一个变量。 */
+   真的有了深色皮肤，只需要在 :root（约 368 行）那两个变量上覆盖新的深色值。 */
 .ovl-visual-raw { white-space: pre-wrap; word-break: break-word; font: 12px/1.5 "SFMono-Regular", Consolas, monospace; color: #374151; }
 .ovl-visual-bar {
     background: #eef1f5; color: #475569; font-size: 12px; padding: 6px 10px;
@@ -2444,6 +2478,12 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-quickactions button[data-qa="word.copysrc"] {
     width: auto; padding: 0 8px; font-size: 11px; margin-left: 2px;
     border-left: 1px solid #2F3A4C; border-radius: 0 4px 4px 0;
+}
+/* v2 Pass P32：「编辑」紧跟在「复制」右边，同样是两个汉字，照抄同一条宽度/字号规则——
+   区别只是它不需要再起一条分组分隔线（复制已经画了那条 border-left），也不再是工具条
+   最后一颗（不用强行给右侧圆角），跟其余按钮一样用默认的四角 4px 圆角即可。 */
+.ovl-quickactions button[data-qa="word.edit"] {
+    width: auto; padding: 0 8px; font-size: 11px; margin-left: 2px;
 }
 .ovl-breadcrumb {
     font-size: 10.5px; color: #9AA4B2; padding: 2px 10px; background: #1B222C;
@@ -21875,6 +21915,11 @@ const OvlState = {
     lastSelfWriteMtimeMs: null, // 自己上一次真的写盘成功后，FSA File.lastModified 读回来的值
     lastSelfWritePath: null,    // 上面那次写盘对应的绝对路径（ovlBridgeAbsPathFor 算出来的）
     compiling: false,
+    // v2 Pass P33：拉取/推送/克隆 Overleaf 期间置 true（ovlOverleafPullRun/
+    // ovlOverleafCloneSetBusy 里设），单纯给「编辑」的互斥判定用——那几个操作本来就已经
+    // 靠各自禁用按钮防并发了，这里只是多一个供 ovlInlineSrcEditOpen 读的信号，不改变
+    // 拉取/推送/克隆自己的任何行为。
+    ovlSyncBusy: false,
     lastCompile: null,       // 桥 POST /compile 的完整返回：{ok,id,exitCode,pdfExists,pdfSize,log,parsed,counts,files,...}
     pdfObjectUrl: null,      // 当前 <canvas> 渲染用的 blob: URL，换下一版前必须先 URL.revokeObjectURL
     logView: false,
@@ -22172,6 +22217,13 @@ function ovlPortalHtml() {
         // v2 Pass P22：「关注」右侧新增「复制」——把当前选区（Code/Visual 都行）对应的
         // LaTeX 原文复制到剪贴板。只读、不改正文，走 data-qa 委托即可，不需要单独绑事件。
         +   '<button type="button" data-qa="word.copysrc" data-tip="复制 LaTeX 原文" data-tip-pos="top">复制</button>'
+        // v2 Pass P32（用户需求：「复制」右边加「编辑」——选中一段/一个词/一行，能就地改
+        // 那段源码）：跟「替/简/语」一样不分 Code/Visual 来源，出现条件不额外收紧。
+        // v2 Pass P33：点击后走 ovlInlineSrcEditOpen(src)——Visual 来源不再弹浮框/走
+        // ovlLocateVisualPick 的文字匹配，改成按 .ovl-visual-block 的 data-src-line 行区间
+        // 就地把选中的块变成一个 <textarea>（见该函数头注释，约 30546 行）；Code 来源本来
+        // 就是在编辑可编辑源码，没有"渲染态 -> 源码"的转换要做，退化成把焦点带回文本框。
+        +   '<button type="button" data-qa="word.edit" data-tip="编辑选中片段的源码" data-tip-pos="top">编辑</button>'
         + '</div>'
         // M7 Editor「Equation preview」：光标落在 $...$ 里时用既有 KaTeX 渲染一个悬浮预览。
         + '<div class="ovl-eqpreview" id="ovlEqPreview"></div>'
@@ -22184,6 +22236,10 @@ function ovlPortalHtml() {
         +     '<button type="button" class="ovl-vistrans-close" id="ovlVisTransCloseBtn">&times;</button>'
         +   '</div>'
         + '</div>'
+        // v2 Pass P33：「编辑」不再需要 #ovlPortal 里的静态占位——就地编辑器是
+        // ovlInlineSrcEditOpen 用 document.createElement 现造的 <textarea>，直接插进
+        // #ovlVisualPane 里被替换的 .ovl-visual-block 原来的位置，不是挂在 portal 下的浮层，
+        // 没有固定 HTML 骨架可以预先声明（P32 那版 #ovlEditSrcBox 已整块删除）。
         // P1：设置面板专用悬浮提示层（data-tip2），挂在 #ovlPortal 里不会被任何
         // overflow:auto 的祖先裁掉——具体机制见 CSS 里 .ovl-tip2 那一段的注释。
         + '<div class="ovl-tip2" id="ovlTip2" hidden></div>'
@@ -23323,6 +23379,11 @@ window.addEventListener('pagehide', function () {
 function ovlSetEditorMode(mode) {
     try {
         if (mode !== 'code' && mode !== 'visual') return;
+        // v2 Pass P33：就地编辑源码也是一种"跟着上一个模式走的陈旧内容"——切模式前先取消
+        // （不是保存：没有用户明确的 Ctrl+Enter/失焦确认，不该替用户做主把没敲完的内容
+        // 落地），原块原样恢复。放在最前面，早于下面 ovlVisualTopVisibleLine 量 Visual
+        // 滚动位置那一步——编辑器占位的高度跟原块不一样，不先恢复的话量出来的行会偏。
+        if (typeof ovlInlineSrcCancel === 'function' && OvlInlineSrcEdit) ovlInlineSrcCancel();
         // P4：切模式属于规划里明列的"关闭时机"之一——Code 侧的选词弹窗、quick actions 工具条、
         // Visual 侧的翻译浮框都是跟着上一个模式的选区走的，切走了留着就是陈旧内容。
         if (typeof ovlVisTransHide === 'function') ovlVisTransHide();
@@ -24247,6 +24308,17 @@ function ovlGroupSelRectsIntoRows(rects) {
 // 这几条判定分支全部走同一条路径清空叠加层，不单独开小灶。"面板不可见"用两道判定叠加：
 // 内联 style（ovlSetEditorMode 切模式时直接写的那个 display:none/flex）+ offsetParent
 // （更通用的兜底，覆盖祖先节点被隐藏之类内联 style 判定不到的情况）。
+// 从一个 Range 算出「按视觉行合并」的矩形数组，viewport 坐标系——跟 ovlRecomputeVisualSelOverlay
+// 原来内联的那段"取 getClientRects → 砍上限 → 合并"逻辑一字不差，只是抽出来给 Pass P31 的
+// 浮层避让布局器复用（障碍物要的正是转成 pane 局部坐标之前的这份 viewport 矩形）。下面
+// ovlRecomputeVisualSelOverlay 渲染描边时自己再转一次坐标，跟这里互不干扰、不重复计算。
+function ovlSelectionRowRectsViewport(range) {
+    let rects = Array.from(range.getClientRects()).filter(function (r) { return r.width > 0 && r.height > 0; });
+    if (!rects.length) return [];
+    if (rects.length > OVL_SEL_OVERLAY_MAX_RECTS) rects = rects.slice(0, OVL_SEL_OVERLAY_MAX_RECTS);
+    return ovlGroupSelRectsIntoRows(rects);
+}
+
 function ovlRecomputeVisualSelOverlay() {
     try {
         if (!OvlSettings.ovlVisualOutlineSelection || OvlState.editorMode !== 'visual') { ovlClearVisualSelOverlay(); return; }
@@ -24257,10 +24329,8 @@ function ovlRecomputeVisualSelOverlay() {
         if (!sel || sel.rangeCount === 0 || sel.isCollapsed) { overlay.innerHTML = ''; return; }
         const range = sel.getRangeAt(0);
         if (!pane.contains(range.commonAncestorContainer)) { overlay.innerHTML = ''; return; }
-        let rects = Array.from(range.getClientRects()).filter(function (r) { return r.width > 0 && r.height > 0; });
-        if (!rects.length) { overlay.innerHTML = ''; return; }
-        if (rects.length > OVL_SEL_OVERLAY_MAX_RECTS) rects = rects.slice(0, OVL_SEL_OVERLAY_MAX_RECTS);
-        const rows = ovlGroupSelRectsIntoRows(rects);
+        const rows = ovlSelectionRowRectsViewport(range);
+        if (!rows.length) { overlay.innerHTML = ''; return; }
         // 转成叠加层坐标系：叠加层 top:0/left:0 对齐 pane 的 padding box 原点（pane 没有
         // border，padding box 和 getBoundingClientRect() 的原点重合），减去 pane 当前的
         // bounding rect 再加 scrollLeft/scrollTop，跟 pane 本身的 padding 值无关——viewport
@@ -26430,7 +26500,11 @@ async function ovlBridgeCheckHealth() {
     }
     const wasOnline = OvlState.bridgeOnline;
     OvlState.bridgeOnline = online;
-    if (!OvlState.compiling && (wasOnline !== online || wasOnline === null)) {
+    // 桥在线状态没有翻转的这一轮（绝大多数 5 秒轮询）不重渲 PDF body——ovlRenderPdfBody()
+    // 末尾会无条件调 ovlPdfApplyView() 重画当前页 canvas，每轮都跑就是"PDF 每隔几秒闪一下"
+    // 的根因。只在状态真的变化（或首次探测）时才需要重渲，跟下面状态文案用同一个判断。
+    const bridgeStatusChanged = !OvlState.compiling && (wasOnline !== online || wasOnline === null);
+    if (bridgeStatusChanged) {
         if (!online) {
             ovlSetPdfStatus('桥接服务未启动 —— 见 tools/latex-bridge/README.md', true);
         } else if (!latexmkExists) {
@@ -26441,7 +26515,7 @@ async function ovlBridgeCheckHealth() {
         }
     }
     ovlUpdatePdfToolbarUI();
-    ovlRenderPdfBody();
+    if (bridgeStatusChanged) ovlRenderPdfBody();
     // v2 Pass P24：桥上线/离线状态是 Overleaf 拉取/推送按钮能不能点的另一半判断条件
     // （另一半是 ovlOverleafConfigured()），这里是"桥上线检测逻辑"本体，每次探测完都要跟着刷新。
     if (typeof ovlOverleafUpdateButtonsUI === 'function') ovlOverleafUpdateButtonsUI();
@@ -26863,6 +26937,7 @@ async function ovlOverleafPullRun(projectDir, gitUrl, strategy, opts) {
     const pushBtn = document.getElementById('ovlOverleafPushBtn');
     if (pullBtn) pullBtn.disabled = true;
     if (pushBtn) pushBtn.disabled = true; // 拉取推送不许并发碰同一个 git 工作目录
+    OvlState.ovlSyncBusy = true; // v2 Pass P33：供「编辑」的互斥判定读，见 OvlState.ovlSyncBusy 字段注释
     ovlOverleafSetSyncStatus('拉取中…', false);
     try {
         const resp = await fetch(ovlBridgeUrl('/overleaf/pull'), {
@@ -26882,6 +26957,7 @@ async function ovlOverleafPullRun(projectDir, gitUrl, strategy, opts) {
         ovlOverleafSetSyncStatus('拉取失败：连不上桥接服务', true);
         showToast('拉取失败：连不上桥接服务', 'error');
     } finally {
+        OvlState.ovlSyncBusy = false;
         ovlOverleafUpdateButtonsUI();
     }
 }
@@ -26899,6 +26975,16 @@ async function ovlOverleafPull(opts) {
     if (OvlState.dirty) {
         ovlOverleafSetSyncStatus('当前文件有未保存的修改，请先保存后再拉取', true);
         showToast('当前文件有未保存的修改，请先保存后再拉取', 'error');
+        return;
+    }
+    // v2 Pass P33：就地编辑源码正在进行（还没 Ctrl+Enter/失焦保存）——这一刻文档往往还是
+    // OvlState.dirty===false（真正的落地要等保存那一步才发生），上面那道 dirty 挡不住这
+    // 一轮拉取，这里单独再挡一道，跟 ovlBridgeHandleExternalChange 里的同名判定是同一条
+    // 顾虑，处理方式不同纯粹因为一个是用户主动点的按钮（要有 toast 反馈），一个是后台推送
+    // （静默跳过，见那边的注释）。
+    if (OvlInlineSrcEdit) {
+        ovlOverleafSetSyncStatus('正在就地编辑源码，请先保存或取消后再拉取', true);
+        showToast('正在就地编辑源码，请先保存或取消后再拉取', 'error');
         return;
     }
     if (!ovlOverleafConfigured()) {
@@ -27775,6 +27861,7 @@ function ovlOverleafExtractProjectId(input) {
 // 克隆过程中顶栏三个按钮全部 disabled（拉取/推送/克隆挤同一条 git 命令通道，不许并发）；
 // 恢复时统一交给 ovlOverleafUpdateButtonsUI() 按"配置好了没/桥在不在线"重新算一遍。
 function ovlOverleafCloneSetBusy(busy) {
+    OvlState.ovlSyncBusy = !!busy; // v2 Pass P33：供「编辑」的互斥判定读，见 OvlState.ovlSyncBusy 字段注释
     const cloneBtn = document.getElementById('ovlOverleafCloneBtn');
     const pullBtn = document.getElementById('ovlOverleafPullBtn');
     const pushBtn = document.getElementById('ovlOverleafPushBtn');
@@ -28021,6 +28108,10 @@ async function ovlBridgeHandleExternalChange(msg) {
         return; // 自己刚落盘触发的回声，不是外部改动
     }
     if (OvlState.dirty) return; // 有未保存的本地改动，不许覆盖（§ 任务描述明文要求）——等本地改动落盘/撤销后下一条 changed 事件再说
+    // v2 Pass P33：就地编辑源码正在进行时同一条顾虑——这一刻可能还没触发 dirty（真正的
+    // 落地要等保存那一步），这一轮外部改动推送先跳过，等编辑结束（保存/取消）后重新触发
+    // 的下一条 changed 事件再接手，不吞事件、只是错开这一轮。
+    if (OvlInlineSrcEdit) return;
     const file = await cf.handle.getFile();
     const text = await file.text();
     const ta = document.getElementById('ovlCodeArea');
@@ -30112,6 +30203,260 @@ function ovlBindDropMenus() {
 let OvlQaState = { source: 'code' };
 function ovlHideQuickActions() { const qa = document.getElementById('ovlQuickActions'); if (qa) qa.classList.remove('ovl-open'); }
 
+// ==================== v2 Pass P31：浮层避让选区统一布局器 ====================
+// 用户反馈（附截图）：黑色工具条 #ovlQuickActions、译文浮框 #ovlVisTransBox 会压在选中的
+// 文字上——工具条原来直接贴鼠标点（下面 ovlShowQuickActionsAt 原来是 x-40/y-36），翻译框
+// 原来的 ovlVisTransPlace 虽然会挑四个候选位，但拿的是选区的整体包围盒（对多行选区不准——
+// 某一行短、右侧有空当，包围盒会把这块空当也算成"被选区占用"），而且两个框互相都不认对方
+// 是障碍物，会自己叠自己。
+//
+// 这里做一个两个浮层共用的通用布局器，以后再加新浮层也是同一套接口：
+//   ovlSelectionAnchorRows(source)      —— 选区这个障碍物/候选锚点：Visual 来源复用 P30
+//                                          ovlGroupSelRectsIntoRows 的逐行合并结果（见下方
+//                                          ovlSelectionRowRectsViewport，同一份代码，没有第
+//                                          二套合并逻辑）；Code 来源没有 DOM Range，退回
+//                                          ovlCodeSelectionScreenRect 给的单个包围矩形。
+//   ovlOtherFloatObstacles(skipId)      —— 另一个已经显示着的浮层也算障碍物。
+//   ovlPlaceFloating(el, rows, obstacles, opts) —— 通用落点算法，见函数体内注释。
+const OVL_FLOAT_GAP = 8;     // 规格 §2f：离选区留出的间隙
+const OVL_FLOAT_MIN_H = 160; // 规格 §2d：压缩策略的最小可用高度
+const OVL_FLOAT_MIN_W = 240; // 规格 §2d：压缩策略的宽度下限——工具条自身天然小于这个数，
+                              // 压缩台阶起点（自然宽度）< 下限时 ovlCompressSteps 直接不产生
+                              // 台阶，等于自动跳过压缩，不用单独给工具条关掉这一步。
+
+function ovlRectsOverlapArea(a, b) {
+    const w = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+    if (w <= 0) return 0;
+    const h = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+    if (h <= 0) return 0;
+    return w * h;
+}
+
+function ovlSelBBoxFromRows(rows) {
+    let left = Infinity, top = Infinity, right = -Infinity, bottom = -Infinity;
+    for (let i = 0; i < rows.length; i++) {
+        const r = rows[i];
+        if (r.left < left) left = r.left;
+        if (r.top < top) top = r.top;
+        if (r.right > right) right = r.right;
+        if (r.bottom > bottom) bottom = r.bottom;
+    }
+    return { left: left, top: top, right: right, bottom: bottom };
+}
+
+// 候选位置，按规格 §2b 的优先级：下(左/中/右) → 上(左/中/右) → 右(贴最右一行 / 贴最短一行，
+// 多行选区才加第二个) → 左(贴最左一行)。上/下两组的左右对齐基准是选区整体包围盒；左右两组
+// 各自贴着触发那一行自己的边沿，不是整体包围盒——避免横向留出选区本来就没占用的空当。
+function ovlBuildPlacementCandidates(rows, w, h, gap) {
+    const bbox = ovlSelBBoxFromRows(rows);
+    let firstRow = rows[0], lastRow = rows[0], rightmostRow = rows[0], leftmostRow = rows[0], shortestRow = rows[0];
+    for (let i = 1; i < rows.length; i++) {
+        const r = rows[i];
+        if (r.top < firstRow.top) firstRow = r;
+        if (r.bottom > lastRow.bottom) lastRow = r;
+        if (r.right > rightmostRow.right) rightmostRow = r;
+        if (r.left < leftmostRow.left) leftmostRow = r;
+        if ((r.right - r.left) < (shortestRow.right - shortestRow.left)) shortestRow = r;
+    }
+    const belowY = lastRow.bottom + gap;
+    const aboveY = firstRow.top - h - gap;
+    const cands = [
+        { x: bbox.left, y: belowY },
+        { x: bbox.left + (bbox.right - bbox.left - w) / 2, y: belowY },
+        { x: bbox.right - w, y: belowY },
+        { x: bbox.left, y: aboveY },
+        { x: bbox.left + (bbox.right - bbox.left - w) / 2, y: aboveY },
+        { x: bbox.right - w, y: aboveY },
+        { x: rightmostRow.right + gap, y: rightmostRow.top }
+    ];
+    if (rows.length > 1 && shortestRow !== rightmostRow) {
+        cands.push({ x: shortestRow.right + gap, y: shortestRow.top });
+    }
+    cands.push({ x: leftmostRow.left - w - gap, y: leftmostRow.top });
+    return cands;
+}
+
+// 压缩台阶：从自然尺寸每次降 40px，直到 min；natural<=min 时返回空数组（等于不压缩——工具条
+// 这种本来就小的元素天然走这条分支，不需要单独判断"是不是工具条"）。
+function ovlCompressSteps(natural, min, step) {
+    if (natural <= min) return [];
+    const steps = [];
+    let v = natural - step;
+    while (v > min) { steps.push(v); v -= step; }
+    steps.push(min);
+    return steps;
+}
+
+// 统一避让布局器（规格 §2）。
+//   el        —— 待放置的浮层元素。
+//   rows      —— 选区锚点矩形数组（viewport 坐标，至少 1 个；Visual 来源是逐行矩形，Code
+//                 来源是单个包围矩形），既用来生成候选位置，也算作障碍物之一。
+//   obstacles —— 全部要避开的矩形（调用方直接传 rows.concat(其它浮层)）。
+//   opts.reveal(el) —— 把元素切到"可测量但不可见"的状态（各浮层显示机制不同：quickActions
+//                 只靠 .ovl-open 切 display，vistrans 还多一个 hidden 属性，布局器本身不关心
+//                 这层差异）。opts.gap/minHeight/minWidth/bounds/maxWidth 均可选。
+// 返回 {left, top, overlap}（overlap>0 时已经在 el 上写了 data-overlap，规格 §2e 的诊断信息）；
+// 内部任何一步出错都被 try/catch 兜住返回 null，交给调用方走既有兜底定位（规格 §5）。
+function ovlPlaceFloating(el, rows, obstacles, opts) {
+    try {
+        opts = opts || {};
+        if (!el || !rows || !rows.length) return null;
+        const gap = (typeof opts.gap === 'number') ? opts.gap : OVL_FLOAT_GAP;
+        const bounds = opts.bounds || { left: 0, top: 0, right: window.innerWidth, bottom: window.innerHeight };
+        const minH = (typeof opts.minHeight === 'number') ? opts.minHeight : OVL_FLOAT_MIN_H;
+        const minW = (typeof opts.minWidth === 'number') ? opts.minWidth : OVL_FLOAT_MIN_W;
+
+        // a) 先让元素可测量但不可见，别产生闪烁。
+        const prevVisibility = el.style.visibility;
+        el.style.visibility = 'hidden';
+        if (typeof opts.reveal === 'function') opts.reveal(el);
+        el.style.maxHeight = '';
+        el.style.overflowY = '';
+        el.style.width = '';
+        if (typeof opts.maxWidth === 'number') {
+            el.style.maxWidth = Math.max(minW, Math.min(opts.maxWidth, bounds.right - bounds.left - 2 * gap)) + 'px';
+        }
+
+        // b)+c) 候选位置逐个 clamp 进可用区域，clamp 之后再判定重叠（顺序不能反）；第一个
+        // 零重叠的直接采用，否则记下重叠面积最小的那个备用。
+        function evalCurrentSize() {
+            const w = el.offsetWidth, h = el.offsetHeight;
+            const cands = ovlBuildPlacementCandidates(rows, w, h, gap);
+            let best = null;
+            for (let i = 0; i < cands.length; i++) {
+                const c = cands[i];
+                const left = Math.max(bounds.left + gap, Math.min(c.x, bounds.right - w - gap));
+                const top = Math.max(bounds.top + gap, Math.min(c.y, bounds.bottom - h - gap));
+                let overlap = 0;
+                const rect = { left: left, top: top, right: left + w, bottom: top + h };
+                for (let k = 0; k < obstacles.length; k++) overlap += ovlRectsOverlapArea(rect, obstacles[k]);
+                if (overlap === 0) return { left: left, top: top, overlap: 0 };
+                if (!best || overlap < best.overlap) best = { left: left, top: top, overlap: overlap };
+            }
+            return best;
+        }
+
+        let best = evalCurrentSize();
+        let bestCfg = { maxHeight: el.style.maxHeight, width: el.style.width };
+
+        // d) 全部候选都有重叠：压缩再重试——先降高度（内部滚动），不行再降宽度。
+        if (best.overlap > 0) {
+            const naturalH = el.offsetHeight;
+            const hSteps = ovlCompressSteps(naturalH, minH, 40);
+            for (let i = 0; i < hSteps.length && best.overlap > 0; i++) {
+                el.style.maxHeight = hSteps[i] + 'px';
+                el.style.overflowY = 'auto';
+                const r = evalCurrentSize();
+                if (r.overlap < best.overlap) { best = r; bestCfg = { maxHeight: el.style.maxHeight, width: el.style.width }; }
+            }
+            if (best.overlap > 0) {
+                const naturalW = el.offsetWidth;
+                const wSteps = ovlCompressSteps(naturalW, minW, 40);
+                for (let i = 0; i < wSteps.length && best.overlap > 0; i++) {
+                    el.style.width = wSteps[i] + 'px';
+                    const r = evalCurrentSize();
+                    if (r.overlap < best.overlap) { best = r; bestCfg = { maxHeight: el.style.maxHeight, width: el.style.width }; }
+                }
+            }
+        }
+
+        // e) 兜底：回填产生 best 的那组尺寸设置，保证最终视觉尺寸和算重叠时用的一致；仍有
+        // 重叠时写 data-overlap 诊断属性——正常路径不该走到这里。
+        el.style.maxHeight = bestCfg.maxHeight;
+        el.style.width = bestCfg.width;
+        el.style.overflowY = bestCfg.maxHeight ? 'auto' : '';
+        el.style.left = best.left + 'px';
+        el.style.top = best.top + 'px';
+        if (best.overlap > 0) el.setAttribute('data-overlap', String(Math.round(best.overlap)));
+        else el.removeAttribute('data-overlap');
+        el.style.visibility = prevVisibility || '';
+        return best;
+    } catch (e) {
+        console.error('[ovl] placeFloating failed', e);
+        try { el.style.visibility = ''; } catch (e2) {}
+        return null;
+    }
+}
+
+// 选区这个障碍物/候选锚点：Visual 来源复用 P30 的逐行合并结果（ovlSelectionRowRectsViewport，
+// 定义见 P30 选区描边那一段——同一份 ovlGroupSelRectsIntoRows，不重造）；Code 来源没有 DOM
+// Range 可用，退回 ovlCodeSelectionScreenRect 给的单个包围矩形。
+function ovlSelectionAnchorRows(source) {
+    try {
+        if (source === 'visual') {
+            const pane = document.getElementById('ovlVisualPane');
+            if (!pane) return [];
+            const sel = ovlWinOf(pane).getSelection();
+            if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return [];
+            const range = sel.getRangeAt(0);
+            if (!pane.contains(range.commonAncestorContainer)) return [];
+            return ovlSelectionRowRectsViewport(range);
+        }
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || ta.selectionEnd <= ta.selectionStart) return [];
+        return [ovlCodeSelectionScreenRect(ta)];
+    } catch (e) { return []; }
+}
+
+// 另一个已经显示着的浮层也要算进障碍物——两个框互不遮挡（规格 §1 第二条）。skipId 是正在
+// 放置的那个元素自己的 id，不把自己当自己的障碍物。
+function ovlOtherFloatObstacles(skipId) {
+    const out = [];
+    try {
+        if (skipId !== 'ovlQuickActions') {
+            const qa = document.getElementById('ovlQuickActions');
+            if (qa && qa.classList.contains('ovl-open')) out.push(qa.getBoundingClientRect());
+        }
+        if (skipId !== 'ovlVisTransBox') {
+            const vb = document.getElementById('ovlVisTransBox');
+            if (vb && !vb.hidden && vb.classList.contains('ovl-open')) out.push(vb.getBoundingClientRect());
+        }
+    } catch (e) {}
+    return out;
+}
+
+// 重新布局的触发时机（规格 §3）：选区变化 / 浮层内容变化 / Visual 面板滚动 / 窗口 resize，
+// 全部走这一个 rAF 合并入口，同一帧内多次触发只重算一次。只挪已经显示着的浮层的位置，不
+// 改变它们"什么时候出现/隐藏"（规格 §4 第二条——出现/隐藏的触发点一个字节不动）。
+let OvlFloatRelayoutRaf = null;
+function ovlScheduleFloatRelayout() {
+    if (OvlFloatRelayoutRaf !== null) return;
+    OvlFloatRelayoutRaf = requestAnimationFrame(function () {
+        OvlFloatRelayoutRaf = null;
+        ovlRelayoutFloats();
+    });
+}
+
+function ovlRelayoutFloats() {
+    try {
+        const qa = document.getElementById('ovlQuickActions');
+        if (qa && qa.classList.contains('ovl-open')) {
+            const rows = ovlSelectionAnchorRows(OvlQaState.source);
+            if (rows.length) ovlPlaceFloating(qa, rows, rows.concat(ovlOtherFloatObstacles('ovlQuickActions')), { reveal: function () {} });
+        }
+        const vb = document.getElementById('ovlVisTransBox');
+        if (vb && !vb.hidden && vb.classList.contains('ovl-open')) {
+            const src = (OvlState.editorMode === 'visual') ? 'visual' : 'code';
+            const rows = ovlSelectionAnchorRows(src);
+            if (rows.length) ovlPlaceFloating(vb, rows, rows.concat(ovlOtherFloatObstacles('ovlVisTransBox')), { reveal: function () {}, maxWidth: 460 });
+        }
+    } catch (e) { console.error('[ovl] relayoutFloats failed', e); }
+}
+
+// resize/selectionchange 是通用触发器；#ovlVisTransBody 的内容是异步塞进去的译文（含 KaTeX/
+// 字体加载可能引起的二次 reflow），额外挂一个 ResizeObserver 兜底——显式的 ovlVisTransPlace
+// 调用已经覆盖了"loading→结果"这次已知的尺寸变化，这里只兜没预料到的。
+function ovlBindFloatRelayout() {
+    try {
+        window.addEventListener('resize', ovlScheduleFloatRelayout);
+        document.addEventListener('selectionchange', ovlScheduleFloatRelayout);
+        const box = document.getElementById('ovlVisTransBox');
+        if (box && typeof ResizeObserver === 'function') {
+            new ResizeObserver(function () { ovlScheduleFloatRelayout(); }).observe(box);
+        }
+    } catch (e) { console.error('[ovl] bindFloatRelayout failed', e); }
+}
+
 // v2 Pass P22：navigator.clipboard.writeText 在非安全上下文/被浏览器拒绝时的兜底——文件里
 // 目前没有现成的 execCommand('copy') 兜底可抄（唯一的既有写剪贴板调用点 #ovlVisTransCopyBtn
 // 没带兜底），这里就地起一个最小的：临时插一个不可见 textarea，选中后走 execCommand('copy')。
@@ -30190,7 +30535,283 @@ function ovlCopyLatexSource() {
         }
     } catch (e) { console.error('[ovl] copyLatexSource failed', e); try { showToast('复制失败。', 'warning'); } catch (e2) {} }
 }
+
+// ==================== v2 Pass P33：「编辑」——就地把选中的 .ovl-visual-block 变成源码
+// 编辑器（用户反馈两条：① P32 那版靠 ovlLocateVisualPick 文字反查源码位置，n!==1 就整体
+// 拒绝，选中 the/channel 这类常见词、或者选中文本被 ovlNormalizeForMatch 折叠空白后对不上，
+// 天天被拒——"很多时候会失灵"；② 用户明确不要弹出的编辑框，要选中的部分原地变成可编辑
+// 对象，显示 code 模式的原版源码）====================
+//
+// 换一把完全不同的尺子：P29 起每个 .ovl-visual-block 本来就带着自己精确覆盖的源码行区间
+// （data-src-line/data-src-line-end，切块时数出来的整数，不是猜的）——选区触碰到哪些块，
+// 行区间就是这些块的并集，永远唯一，常见词/重复词/公式里的变量名都不影响，根本用不上
+// ovlLocateVisualPick 那套"唯一命中才算数"的文字匹配（那把尺子对「替/简/语」仍然是对的，
+// 这里只是换一个问题、换一把尺子，ovlLocateVisualPick 本身一个字节不碰）。
+// 落地是纯行区间 splice：算出 [lineFrom, lineTo] 对应 #ovlCodeArea 里的字符区间（复用 P7
+// gutter 拖拽选块的 ovlGutterLineRangeToChars，不重新发明换算公式），execCommand
+// insertText 整段替换掉——跟 ovlEditorApplyReplace 同一条撤销栈纪律，且天然触发 #ovlCodeArea
+// 现成的 input 监听器（约 28360 行）：脏标记/gutter/大纲/自动落盘/focus 复核，一个字节不用
+// 在这里重新挂一遍。
+let OvlInlineSrcEdit = null; // null=未在编辑；打开时是 { wrap, ta, blocks, parent, lineFrom, lineTo, firstParaStart, closing }
+
+function ovlInlineSrcAutoGrow(ta) {
+    try { ta.style.height = 'auto'; ta.style.height = Math.max(ta.scrollHeight, 1) + 'px'; } catch (e) {}
+}
+
+function ovlInlineSrcOnInput() {
+    try { if (OvlInlineSrcEdit) ovlInlineSrcAutoGrow(OvlInlineSrcEdit.ta); } catch (e) {}
+}
+
+function ovlInlineSrcOnKeydown(e) {
+    try {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); ovlInlineSrcSave(); return; }
+        if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); ovlInlineSrcCancel(); }
+    } catch (err) { console.error('[ovl] inlineSrcOnKeydown failed', err); }
+}
+
+// 失焦即保存（§3 明文要求）。closing 是防重入闸门：save/cancel 一开始就把它摆成 true，
+// 挪走焦点/整个把 <textarea> 从 DOM 里摘掉都会连带触发一次原生 blur，没有这道闸门会变成
+// "Esc 取消"又反过来触发"失焦保存"，把刚恢复的原块又悄悄存一遍。
+function ovlInlineSrcOnBlur() {
+    try {
+        if (!OvlInlineSrcEdit || OvlInlineSrcEdit.closing) return;
+        ovlInlineSrcSave();
+    } catch (e) { console.error('[ovl] inlineSrcOnBlur failed', e); }
+}
+
+// 只管把编辑器的 <textarea>+提示条从 DOM 里摘掉、清空状态——原来那几块是恢复显示还是已经
+// 被换掉，调用方（save/cancel）各自处理，这里只做"收尾"这一件事，不重复。
+function ovlInlineSrcTeardown() {
+    try {
+        const st = OvlInlineSrcEdit;
+        if (st && st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap);
+    } catch (e) {}
+    OvlInlineSrcEdit = null;
+}
+
+// Esc 取消：原块原样恢复显示（只是取消 display:none，DOM 节点本身从头到尾没被删过），
+// 源码一个字节没碰——不像 P32 那版要处理 applySynonym 的失败态，这里连"失败"这个概念
+// 都不存在，取消永远成功。
+function ovlInlineSrcCancel() {
+    try {
+        const st = OvlInlineSrcEdit;
+        if (!st || st.closing) return;
+        st.closing = true;
+        st.blocks.forEach(function (b) { b.style.display = ''; });
+        ovlInlineSrcTeardown();
+    } catch (e) {
+        console.error('[ovl] inlineSrcCancel failed', e);
+        OvlInlineSrcEdit = null;
+    }
+}
+
+// 行数没变：只重渲这一段——用 ovlVisualRenderBodyWithLines(newText, st.lineFrom) 现算一份
+// 新的 .ovl-visual-block 列表（跟整篇渲染是同一个函数，baseLine 换成这段的起始行，算法
+// 本身不关心自己是被整篇调用还是被一段调用），拿新块换掉旧块，只重排这一小段 DOM，
+// 其余块、滚动位置、gutter 之外的东西都不动。firstParaStart 是进editor 前第一块自己的
+// data-para-start——如果选区从某个段落中间开始（比如选中的是段落第二行起），新渲染出来
+// 的第一块默认会被当成"段落起点"（多一段 0.6em 顶部间距），这里按原值覆盖回去，不让编辑
+// 前后视觉上多长/少长一条空白。任何一步出错都不重新抛出，退回整篇 ovlVisualRender()兜底
+// （它本来就是这个模块最成熟、测得最多的一条路，永远正确，只是没有"只重渲一段"这个优化）。
+function ovlInlineSrcRerenderLocal(st, newText) {
+    try {
+        const html = ovlVisualRenderBodyWithLines(newText, st.lineFrom);
+        const tmp = document.createElement('div');
+        tmp.innerHTML = html;
+        const newBlocks = Array.from(tmp.children);
+        if (!newBlocks.length) throw new Error('本地重渲染没有产出任何块');
+        if (st.firstParaStart != null) newBlocks[0].setAttribute('data-para-start', st.firstParaStart);
+        const parent = st.parent;
+        const anchor = st.blocks[0];
+        newBlocks.forEach(function (nb) { parent.insertBefore(nb, anchor); });
+        st.blocks.forEach(function (b) { if (b.parentNode) b.parentNode.removeChild(b); });
+        if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap);
+        const pane = document.getElementById('ovlVisualPane');
+        if (pane && typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(pane);
+        if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
+    } catch (e) {
+        console.error('[ovl] inlineSrcRerenderLocal failed, falling back to full re-render', e);
+        try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e2) {}
+        try { st.blocks.forEach(function (b) { if (b.parentNode) b.parentNode.removeChild(b); }); } catch (e3) {}
+        if (typeof ovlVisualRender === 'function') ovlVisualRender();
+    }
+}
+
+// Ctrl+Enter / 失焦：把 [lineFrom,lineTo] 整体 splice 成编辑框里的新内容——纯行区间替换，
+// 不做任何文本匹配（跟 ovlLocateVisualPick 那条"唯一命中"的尺子彻底两条路）。spliced 标记
+// 两段失败域：splice 之前出错＝源码还没被动过，原样恢复；splice 之后出错（重渲染那一段
+// 自己已经兜了底，理论上不会再抛到这里）＝源码已经变了，不能再假装"什么都没发生"，改用
+// 整篇 ovlVisualRender() 收场。
+function ovlInlineSrcSave() {
+    const st = OvlInlineSrcEdit;
+    if (!st || st.closing) return;
+    st.closing = true;
+    let spliced = false;
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || ta.disabled) throw new Error('编辑器未就绪');
+        const chars = ovlGutterLineRangeToChars(ta, st.lineFrom, st.lineTo);
+        const newText = st.ta.value;
+        const oldLineCount = st.lineTo - st.lineFrom + 1;
+        const newLineCount = newText.split('\n').length;
+
+        // ⚠️ Visual 模式下 #ovlCodeArea 是 display:none（不可聚焦）——跟 ovlEditorApplyReplace
+        // 同一条铁律：临时切回可见态才能 focus/setSelectionRange，写完再切回去，全程同步
+        // 执行，用户看不到闪烁。
+        const wasHidden = ta.style.display === 'none';
+        if (wasHidden) ta.style.display = '';
+        ta.focus();
+        ta.setSelectionRange(chars.start, chars.end);
+        document.execCommand('insertText', false, newText);
+        if (wasHidden) ta.style.display = 'none';
+        spliced = true;
+        // #ovlCodeArea 的 input 监听器已经在 execCommand 这一步同步跑完了（脏标记/gutter/
+        // 大纲/自动落盘全部到位），这里只补一下它没管的 focusNoteTexChanged（跟
+        // ovlEditorApplyReplace 尾巴那句一样，600ms 防抖，没有 tex 关注条目时零开销）。
+        if (typeof focusNoteTexChanged === 'function') { try { focusNoteTexChanged(); } catch (e) {} }
+
+        if (newLineCount === oldLineCount) {
+            ovlInlineSrcRerenderLocal(st, newText);
+        } else {
+            try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e) {}
+            if (typeof ovlVisualRender === 'function') ovlVisualRender();
+        }
+    } catch (e) {
+        console.error('[ovl] inlineSrcSave failed', e);
+        try { showToast(spliced ? '保存后重渲染出错，已用整篇重渲染兜底。' : ('保存失败：' + (e && e.message ? e.message : String(e))), 'error'); } catch (e2) {}
+        if (!spliced) {
+            try { st.blocks.forEach(function (b) { b.style.display = ''; }); } catch (e3) {}
+            try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e4) {}
+        } else {
+            try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e3) {}
+            try { if (typeof ovlVisualRender === 'function') ovlVisualRender(); } catch (e5) {}
+        }
+    } finally {
+        OvlInlineSrcEdit = null;
+    }
+}
+
+// 入口：跟 ovlEditorSynonymOpen(mode, source) 同一个调用形状。source: 'code' | 'visual'。
+// Code 来源选中的本来就是可编辑源码原文，没有"渲染态 -> 源码"这层转换要做——「编辑」在
+// 这里退化成把焦点带回文本框，不新开任何东西（这就是六颗按钮之外唯一改动行为的按钮，但
+// Code 分支刻意什么都不做，不去动 ta.selectionStart/End 已经天然精确这件事）。
+function ovlInlineSrcEditOpen(source) {
+    try {
+        if (OvlInlineSrcEdit) {
+            try { showToast('已经有一处在就地编辑，请先保存（Ctrl+Enter）或取消（Esc）。', 'warning'); } catch (e) {}
+            return;
+        }
+        if (OvlState.compiling) {
+            try { showToast('正在编译，请等编译结束后再编辑。', 'warning'); } catch (e) {}
+            return;
+        }
+        if (OvlState.ovlSyncBusy) {
+            try { showToast('正在与 Overleaf 同步，请等同步结束后再编辑。', 'warning'); } catch (e) {}
+            return;
+        }
+
+        if (source !== 'visual') {
+            const ta = document.getElementById('ovlCodeArea');
+            if (ta && !ta.disabled) { try { ta.focus(); } catch (e) {} }
+            return;
+        }
+
+        const pane = document.getElementById('ovlVisualPane');
+        if (!pane) return;
+        const win = ovlWinOf(pane);
+        const sel = win.getSelection();
+        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+        const range = sel.getRangeAt(0);
+        if (!pane.contains(range.commonAncestorContainer)) return;
+        const rawSelText = String(sel);
+        if (!rawSelText.trim()) return;
+
+        // 找出选区触及的所有 .ovl-visual-block——跟 focusOvlSelectionRange（P13"关注"功能）
+        // 读 Visual 选区块区间同一个算法：range.intersectsNode 逐块判定，first/last 之间的
+        // 块天然全部落在选区里（块是 .ovl-visual-body 下的一列平铺兄弟节点，按源码行顺序
+        // 排列，不需要额外收集"中间的块"，first..last 这个切片本身就是"所有触及的块"）。
+        const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+        if (!blocks.length) return;
+        let si = -1, ei = -1;
+        for (let i = 0; i < blocks.length; i++) {
+            if (range.intersectsNode(blocks[i])) { if (si === -1) si = i; ei = i; }
+        }
+        if (si === -1) return;
+        const touched = Array.from(blocks).slice(si, ei + 1);
+
+        // 合并行区间：lineFrom = 触及块里最小的 data-src-line，lineTo = 最大的
+        // data-src-line-end——逐块取 min/max 而不是只看首尾两块，防御任何非单调的边界情况。
+        let lineFrom = Infinity, lineTo = -Infinity;
+        touched.forEach(function (b) {
+            const a = parseInt(b.getAttribute('data-src-line'), 10);
+            const z = parseInt(b.getAttribute('data-src-line-end'), 10);
+            if (isFinite(a)) lineFrom = Math.min(lineFrom, a);
+            if (isFinite(z)) lineTo = Math.max(lineTo, z); else if (isFinite(a)) lineTo = Math.max(lineTo, a);
+        });
+        if (!isFinite(lineFrom) || !isFinite(lineTo)) return;
+        if (lineTo < lineFrom) lineTo = lineFrom;
+
+        const codeTa = document.getElementById('ovlCodeArea');
+        if (!codeTa || codeTa.disabled) {
+            try { showToast('编辑器未就绪，无法编辑。', 'warning'); } catch (e) {}
+            return;
+        }
+        // 复用 P7 gutter 拖拽选块换算行区间->字符区间的同一个函数，不重新发明一遍。
+        const chars = ovlGutterLineRangeToChars(codeTa, lineFrom, lineTo);
+        const text = codeTa.value.slice(chars.start, chars.end);
+
+        const parent = touched[0].parentNode;
+        if (!parent) return;
+
+        const wrap = document.createElement('div');
+        wrap.className = 'ovl-inline-src-wrap';
+        const ta = document.createElement('textarea');
+        ta.className = 'ovl-inline-src';
+        ta.spellcheck = false;
+        ta.value = text;
+        const hint = document.createElement('div');
+        hint.className = 'ovl-inline-src-hint';
+        hint.textContent = 'Ctrl+Enter 保存 · Esc 取消';
+        wrap.appendChild(ta);
+        wrap.appendChild(hint);
+
+        // 插在原来的位置、原块隐藏而不是删掉——取消时原样恢复用得上，不留空洞。
+        const firstParaStart = touched[0].getAttribute('data-para-start');
+        touched.forEach(function (b) { b.style.display = 'none'; });
+        parent.insertBefore(wrap, touched[0]);
+
+        OvlInlineSrcEdit = {
+            wrap: wrap, ta: ta, blocks: touched, parent: parent,
+            lineFrom: lineFrom, lineTo: lineTo, firstParaStart: firstParaStart,
+            closing: false
+        };
+
+        ta.addEventListener('input', ovlInlineSrcOnInput);
+        ta.addEventListener('keydown', ovlInlineSrcOnKeydown);
+        ta.addEventListener('blur', ovlInlineSrcOnBlur);
+
+        ovlInlineSrcAutoGrow(ta);
+        ta.focus();
+        // 尽量把光标落在用户原来选中的那段附近——找不到（渲染文字跟源码原文不是逐字节
+        // 对应，比如公式/引用命令）就退到编辑框末尾，不是硬性要求，纯体验加分项。
+        try {
+            const idx = rawSelText ? text.indexOf(rawSelText) : -1;
+            if (idx !== -1) ta.setSelectionRange(idx, idx + rawSelText.length);
+            else ta.setSelectionRange(text.length, text.length);
+        } catch (e) {}
+
+        if (typeof ovlHideQuickActions === 'function') ovlHideQuickActions();
+    } catch (e) {
+        console.error('[ovl] inlineSrcEditOpen failed', e);
+        try { showToast('打开就地编辑失败：' + (e && e.message ? e.message : String(e)), 'error'); } catch (e2) {}
+    }
+}
+
 function ovlShowQuickActionsAt(x, y, source) {
+    // v2 Pass P33：就地编辑源码进行中时，工具条（含「替/简/语/译/关注/复制」六颗按钮）
+    // 整体不弹出——不跟就地编辑器抢焦点/抢屏幕空间，用户要用那六颗就先保存/取消当前编辑。
+    // 只在这里短路一次，不去改六颗按钮自己的任何逻辑。
+    if (OvlInlineSrcEdit) return;
     const qa = document.getElementById('ovlQuickActions');
     if (!qa) return;
     OvlQaState.source = (source === 'visual') ? 'visual' : 'code';
@@ -30228,9 +30849,20 @@ function ovlShowQuickActionsAt(x, y, source) {
         if (fIn) fIn.checked = on;
         fLab.classList.toggle('is-on', on);
     }
-    qa.style.left = Math.max(4, x - 40) + 'px';
-    qa.style.top = Math.max(4, y - 36) + 'px';
-    qa.classList.add('ovl-open');
+    // Pass P31：落点从"贴鼠标点"改成"避开选区逐行矩形 + 避开翻译框"，x/y 只在算不出选区
+    // 矩形时（理论上不会发生——调用方都是在确认选区非空之后才调这个函数）当兜底锚点用，
+    // 绝不让工具条不显示（规格 §5）。
+    const qaRows = ovlSelectionAnchorRows(OvlQaState.source);
+    const qaPlaced = qaRows.length
+        ? ovlPlaceFloating(qa, qaRows, qaRows.concat(ovlOtherFloatObstacles('ovlQuickActions')), {
+            reveal: function (el) { el.classList.add('ovl-open'); }
+        })
+        : null;
+    if (!qaPlaced) {
+        qa.style.left = Math.max(4, x - 40) + 'px';
+        qa.style.top = Math.max(4, y - 36) + 'px';
+        qa.classList.add('ovl-open');
+    }
 }
 function ovlBindQuickActions() {
     const ta = document.getElementById('ovlCodeArea');
@@ -30255,7 +30887,9 @@ function ovlBindQuickActions() {
                 ovlShowQuickActionsAt(e.clientX, e.clientY, 'visual');
             } catch (err) { ovlHideQuickActions(); }
         });
-        visualPane.addEventListener('scroll', ovlHideQuickActions);
+        // Pass P31：滚动不再直接关掉工具条——选区随滚动移动时，重新算一次落点跟上去
+        // （规格 §3：Visual 面板滚动是重新布局的触发点之一，rAF 合并见 ovlScheduleFloatRelayout）。
+        visualPane.addEventListener('scroll', ovlScheduleFloatRelayout);
     }
     if (qa) qa.addEventListener('click', function (e) {
         const btn = e.target.closest('[data-qa]');
@@ -30276,6 +30910,10 @@ function ovlBindQuickActions() {
             // v2 Pass P22：Code/Visual 都走 focusOvlSelectionRange()——它本来就按
             // OvlState.editorMode 内部分流，这里不用关心 src 是哪个来源。
             ovlCopyLatexSource();
+        } else if (id === 'word.edit') {
+            // v2 Pass P33：不再弹浮框——Visual 来源就地把选中的 .ovl-visual-block 换成
+            // <textarea>，见 ovlInlineSrcEditOpen 函数头注释（约 30546 行附近）。
+            ovlInlineSrcEditOpen(src);
         } else {
             ovlRunCmd(id);
         }
@@ -31041,43 +31679,27 @@ function ovlVisTransConfig(base) {
     return Object.assign({}, base, { provider: m.provider || 'local', model: m.id });
 }
 
-// §2.4.7 定位算法：四个候选位选放得下的（下→上→右→左），都放不下就选空间最大的一侧
-// 内部滚动，最后强制夹紧、绝不许压住选区。
-function ovlVisTransPlace(box, selRect) {
-    const M = 10, VW = innerWidth, VH = innerHeight;
-    box.style.maxHeight = '';
-    box.style.overflowY = '';
-    box.hidden = false;
-    box.style.visibility = 'hidden';
-    box.style.maxWidth = Math.min(460, VW - 2 * M) + 'px';
-    const w = box.offsetWidth, h = box.offsetHeight;
-
-    const below = { x: selRect.left, y: selRect.bottom + M, room: VH - selRect.bottom - M };
-    const above = { x: selRect.left, y: selRect.top - h - M, room: selRect.top - M };
-    const right = { x: selRect.right + M, y: selRect.top, room: VW - selRect.right - M };
-    const left = { x: selRect.left - w - M, y: selRect.top, room: selRect.left - M };
-    const cands = [below, above, right, left];
-
-    let pick = cands.find(function (c) {
-        return c.room >= h + M || ((c === right || c === left) && c.room >= w + M);
+// §2.4.7 定位算法：Pass P31 改吃统一避让布局器 ovlPlaceFloating——选区现在是逐行矩形（不是
+// 单个包围盒，多行选区里较短的那一行右侧空当不会被浪费掉），并且把还开着的 #ovlQuickActions
+// 也算作障碍物，两个框不会再互相叠。rows 的形状见 ovlSelectionAnchorRows：Visual 来源是 P30
+// 逐行合并结果，Code 来源是 ovlCodeSelectionScreenRect 给的单个包围矩形（数组长度 1）。
+function ovlVisTransPlace(box, rows) {
+    if (!rows || !rows.length) { box.hidden = true; box.classList.remove('ovl-open'); return; }
+    const obstacles = rows.concat(ovlOtherFloatObstacles('ovlVisTransBox'));
+    const placed = ovlPlaceFloating(box, rows, obstacles, {
+        reveal: function (el) { el.hidden = false; el.classList.add('ovl-open'); },
+        maxWidth: 460
     });
-    if (!pick) {
-        pick = cands.slice().sort(function (a, b) { return b.room - a.room; })[0];
-        box.style.maxHeight = Math.max(120, pick.room - M) + 'px';
-        box.style.overflowY = 'auto';
+    if (!placed) {
+        // 兜底（规格 §5）：布局器整体失败时退回最简单的结果——贴在选区整体包围盒下方，
+        // 绝不让浮层不显示或抛异常影响主功能。
+        const M = 10, VW = innerWidth, VH = innerHeight;
+        const bbox = ovlSelBBoxFromRows(rows);
+        box.hidden = false;
+        box.classList.add('ovl-open');
+        box.style.left = Math.max(M, Math.min(bbox.left, VW - box.offsetWidth - M)) + 'px';
+        box.style.top = Math.max(M, Math.min(bbox.bottom + M, VH - box.offsetHeight - M)) + 'px';
     }
-    let x = Math.max(M, Math.min(pick.x, VW - w - M));
-    let y = Math.max(M, Math.min(pick.y, VH - h - M));
-    // 最后一道保险：夹紧之后如果又压到选区了，强制推到空间较大的一侧（§2.4.7 第 4 步，
-    // 不是可选的——第 3 步的夹紧经常正好把框推回选区上面）。
-    if (!(y + h <= selRect.top - 2 || y >= selRect.bottom + 2 || x + w <= selRect.left - 2 || x >= selRect.right + 2)) {
-        if (selRect.top - M >= VH - selRect.bottom - M) y = Math.max(M, selRect.top - h - M);
-        else y = Math.min(VH - h - M, selRect.bottom + M);
-    }
-    box.style.left = x + 'px';
-    box.style.top = y + 'px';
-    box.classList.add('ovl-open');
-    box.style.visibility = '';
 }
 
 function ovlVisTransHide() {
@@ -31090,7 +31712,7 @@ function ovlVisTransHide() {
 
 // v2 Pass P7：加第 3 参 promptKind（'tex' | 未传/其它 = 'vis'）。函数体内其余部分——缓存 /
 // 竞态 / 中断 / 四候选定位——一个字节不 fork，Visual 分支的行为逐字节保持原样。
-async function ovlVisTransRequest(text, selRect, promptKind) {
+async function ovlVisTransRequest(text, selRows, promptKind) {
     const box = document.getElementById('ovlVisTransBox');
     const body = document.getElementById('ovlVisTransBody');
     if (!box || !body) return;
@@ -31105,7 +31727,7 @@ async function ovlVisTransRequest(text, selRect, promptKind) {
         try { if (OvlVisTransAbort) OvlVisTransAbort.abort(); } catch (e) {}
         OvlVisTransAbort = null;
         body.innerHTML = renderFormattedText(cached);
-        ovlVisTransPlace(box, selRect);
+        ovlVisTransPlace(box, selRows);
         return;
     }
 
@@ -31115,7 +31737,7 @@ async function ovlVisTransRequest(text, selRect, promptKind) {
     OvlVisTransAbort = ctl;
 
     body.innerHTML = '<div class="ovl-vistrans-loading">翻译中…</div>';
-    ovlVisTransPlace(box, selRect);
+    ovlVisTransPlace(box, selRows);
 
     try {
         const base = getApiConfig();
@@ -31132,13 +31754,13 @@ async function ovlVisTransRequest(text, selRect, promptKind) {
         const result = (typeof out === 'string' && out.trim()) ? out.trim() : '（模型未返回可用译文）';
         ovlVisTransCacheSet(key, result);
         body.innerHTML = renderFormattedText(result);
-        ovlVisTransPlace(box, selRect); // 内容变了，按新高度重新落一次位
+        ovlVisTransPlace(box, selRows); // 内容变了，按新高度重新落一次位
     } catch (err) {
         if (mySeq !== OvlVisTransSeq) return;
         if (err && err.name === 'AbortError') return; // 主动取消不是失败，不显示任何东西
         console.error('[ovl] visTrans failed', err);
         body.innerHTML = '<div class="ovl-vistrans-loading">' + escapeHtml(describeSynonymError(err)) + '</div>';
-        ovlVisTransPlace(box, selRect);
+        ovlVisTransPlace(box, selRows);
     }
 }
 
@@ -31168,8 +31790,11 @@ function ovlVisTransFromSelection(force) {
             return;
         }
 
-        const selRect = range.getBoundingClientRect();
-        ovlVisTransRequest(text, selRect, 'vis');
+        // Pass P31：拿逐行矩形而不是整体包围盒——多行选区里某一行短、右侧有空当，包围盒会把
+        // 这块空当也算成"被选区占用"，浪费掉本可以放浮层的位置（规格 §1 第一条）。
+        const selRows = ovlSelectionRowRectsViewport(range);
+        if (!selRows.length) { if (!force) ovlVisTransHide(); return; }
+        ovlVisTransRequest(text, selRows, 'vis');
     } catch (e) { console.error('[ovl] visTransFromSelection failed', e); }
 }
 
@@ -31222,7 +31847,7 @@ function ovlCodeTransFromSelection() {
         const text = ovlCodeTransText(ta);
         if (!text) return;
         if (!ovlTransLengthOk(text)) return;
-        ovlVisTransRequest(text, ovlCodeSelectionScreenRect(ta), 'tex');
+        ovlVisTransRequest(text, [ovlCodeSelectionScreenRect(ta)], 'tex');
     } catch (e) { console.error('[ovl] codeTransFromSelection failed', e); }
 }
 
@@ -31240,8 +31865,12 @@ function ovlBindVisualTranslate() {
         if (OvlState.editorMode !== 'visual') return;
         ovlScheduleVisTransFromSelection();
     });
-    pane.addEventListener('scroll', ovlVisTransHide);
-    // v2 Pass P7：Code 来源的浮框也得跟着滚动消失。
+    // Pass P31：Visual 面板滚动不再直接关掉翻译框——选区随滚动移动时，重新算一次落点跟
+    // 上去（规格 §3），不能让选区滑到浮层底下。
+    pane.addEventListener('scroll', ovlScheduleFloatRelayout);
+    // v2 Pass P7：Code 来源的浮框还是跟着滚动消失——textarea 的滚动量跟 Visual 面板是两套
+    // 独立坐标系，本 Pass 的重新布局验证场景（P30 描边/多行选区）只针对 Visual，Code 来源
+    // 这条维持原样，不在本 Pass 扩大范围。
     const ta2 = document.getElementById('ovlCodeArea');
     if (ta2) ta2.addEventListener('scroll', ovlVisTransHide);
 
@@ -31624,6 +32253,10 @@ function ovlBindPassD() {
         if (zoomInBtn) zoomInBtn.addEventListener('click', function () { if (!zoomInBtn.disabled) ovlPdfZoomStep(10); });
 
         ovlBindQuickActions();
+        // v2 Pass P33：「编辑」不再需要独立的 bind——就地编辑器的 input/keydown/blur 三个
+        // 监听器是 ovlInlineSrcEditOpen 在创建 <textarea> 那一刻现场挂的（P32 那版
+        // ovlBindEditSrc 挂在固定 DOM 骨架上的做法，这里没有固定骨架可挂）。
+        ovlBindFloatRelayout(); // Pass P31：工具条/翻译框统一避让布局器的重新布局触发器
         ovlBindGutterSelect(); // v2 Pass P7：gutter 行号点选 + 拖拽扩选
         ovlBindVisualGutterSelect(); // v2 Pass P11：同一根 gutter，Visual 模式那一半点选
         const visPane = document.getElementById('ovlVisualPane');
