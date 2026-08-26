@@ -752,6 +752,305 @@ function doPickFolder() {
 }
 
 // ---------------------------------------------------------------------------
+// Overleaf git 集成 —— v2 Pass P24：POST /overleaf/pull、POST /overleaf/push。
+//
+// 安全设计（务必维持，不要为了"省事"抄近路——这条链路能直接读写用户真实的 Overleaf 论文
+// 项目，风险等级跟本文件其余接口不是一个量级）：
+//   - Overleaf 项目级 Git Token 绝不允许以任何形式落盘到本地文件系统的持久化位置：
+//       · 不能拼进会被 `git remote add`/`git clone <url>` 持久化保存的 remote URL 里——
+//         那样会把完整 URL（含 token）明文写进目标目录的 .git/config。origin remote 只
+//         指向不带 token 的干净 URL（形如 https://git.overleaf.com/<projectId>）。
+//       · 不能直接拼进 spawn() 的 argv 数组（例如 `git fetch https://TOKEN@...`）——
+//         Windows 上任何进程都能用 `Get-CimInstance Win32_Process` 之类的方式看到别的
+//         进程完整的命令行参数，这是真实风险，不是假设。
+//   - 正确做法：GIT_ASKPASS + 环境变量。git-askpass-helper.bat/.js 让 token 只活在子进程的
+//     环境变量 OVL_GIT_TOKEN 里（环境变量不会出现在 Win32_Process.CommandLine 里），git
+//     需要密码时会调这个 helper、从环境变量读，token 本身从不出现在磁盘或进程参数里。
+//   - 任何要返回给前端的文本（尤其是失败时的 stderr/stdout 原文）在塞进 sendJson 之前，
+//     一律先用 redactToken() 把 token 字面量替换掉——防止它意外出现在 git 的错误输出里
+//     又被原样透传回前端/浏览器控制台/将来的测试记录。
+//   - 所有网络操作（clone/fetch/push）都有超时（30s），超时就 kill 掉子进程、返回明确的
+//     "…超时…" 错误，不让请求无限挂着。
+//   - 遇到"本地有未提交改动"（dirty）、"本地和远程分叉"（无法快进合并）、"推送被非快进拒绝"
+//     这几种情况，一律停手、原样报告，绝不自动合并/rebase/force push、绝不猜测覆盖——
+//     这是本轮任务里反复强调的纪律：宁可什么都不做，也不能静默丢用户的 Overleaf 内容。
+// ---------------------------------------------------------------------------
+
+function redactToken(text, token) {
+    if (typeof text !== 'string' || !text) return text;
+    if (typeof token !== 'string' || !token) return text;
+    return text.split(token).join('***');
+}
+
+const OVERLEAF_GIT_TIMEOUT_MS = 30000;
+const GIT_ASKPASS_HELPER = path.join(__dirname, 'git-askpass-helper.bat');
+
+// 跑一条 git 命令，token 只走环境变量（GIT_ASKPASS），绝不拼进 args/URL——见文件头注释。
+// 不抛异常：spawn 失败、超时、非零退出码统统汇总成 {ok, code, stdout, stderr, timedOut} 返回。
+function runGitCommand(args, cwd, token) {
+    return new Promise((resolve) => {
+        let child;
+        try {
+            child = spawn('git', args, {
+                cwd: cwd,
+                windowsHide: true,
+                env: Object.assign({}, process.env, {
+                    GIT_ASKPASS: GIT_ASKPASS_HELPER,
+                    OVL_GIT_TOKEN: token || '',
+                    GIT_TERMINAL_PROMPT: '0' // askpass 出问题时不许卡在交互式输入等待上
+                })
+            });
+        } catch (e) {
+            resolve({ ok: false, code: null, stdout: '', stderr: 'spawn git failed: ' + e.message, timedOut: false });
+            return;
+        }
+        let resolved = false;
+        const outBuf = [];
+        const errBuf = [];
+        const timer = setTimeout(() => {
+            if (resolved) return;
+            resolved = true;
+            try { killTree(child.pid); } catch (e) {}
+            resolve({
+                ok: false, code: null,
+                stdout: Buffer.concat(outBuf).toString('utf8'),
+                stderr: Buffer.concat(errBuf).toString('utf8'),
+                timedOut: true
+            });
+        }, OVERLEAF_GIT_TIMEOUT_MS);
+        child.stdout.on('data', (c) => outBuf.push(c));
+        child.stderr.on('data', (c) => errBuf.push(c));
+        child.on('error', (err) => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timer);
+            resolve({ ok: false, code: null, stdout: '', stderr: 'git process error: ' + err.message, timedOut: false });
+        });
+        child.on('close', (code) => {
+            if (resolved) return;
+            resolved = true;
+            clearTimeout(timer);
+            resolve({
+                ok: code === 0, code: code,
+                stdout: Buffer.concat(outBuf).toString('utf8'),
+                stderr: Buffer.concat(errBuf).toString('utf8'),
+                timedOut: false
+            });
+        });
+    });
+}
+
+// origin remote 一致性比较专用的归一化：去首尾空白、去结尾斜杠、去结尾 .git、统一转小写
+// （Windows 上 file:// 路径大小写不敏感，且 git clone 落进 .git/config 的写法可能跟传入的
+// 原始字符串不完全一致，直接 !== 比较会把同一个地址误判成"不一致"）。
+function normalizeGitUrlForCompare(url) {
+    if (typeof url !== 'string') return '';
+    let s = url.trim();
+    s = s.replace(/\/+$/, '');
+    s = s.replace(/\.git$/i, '');
+    return s.toLowerCase();
+}
+
+// 确保 cwd 里有一个叫 origin 的 remote、且指向（不带 token 的）gitUrl——pull/push 共用。
+// origin 不存在 → 照常 add。origin 已存在且指向别处 → 拒绝并如实报告，绝不静默 set-url
+// 替用户改指向（同一份 origin 被悄悄改指到别处、再 push，等于把用户的真实内容原样双手
+// 奉上——这跟"宁可拒绝也不猜测覆盖"是同一条纪律，见文件头安全设计注释）。
+async function ensureOriginRemote(projectDir, gitUrl, token) {
+    const listResult = await runGitCommand(['remote'], projectDir, token);
+    if (!listResult.ok) {
+        return { ok: false, error: listResult.stderr || listResult.stdout || 'git remote 查询失败' };
+    }
+    const remotes = listResult.stdout.split(/\r?\n/).map((s) => s.trim()).filter((s) => s.length > 0);
+    if (remotes.indexOf('origin') === -1) {
+        const addResult = await runGitCommand(['remote', 'add', 'origin', gitUrl], projectDir, token);
+        if (!addResult.ok) return { ok: false, error: addResult.stderr || addResult.stdout || 'git remote add 失败' };
+        return { ok: true };
+    }
+    const urlResult = await runGitCommand(['remote', 'get-url', 'origin'], projectDir, token);
+    const curUrl = urlResult.ok ? urlResult.stdout.trim() : null;
+    if (curUrl !== null && normalizeGitUrlForCompare(curUrl) !== normalizeGitUrlForCompare(gitUrl)) {
+        return {
+            ok: false,
+            action: 'origin-mismatch',
+            error: '该目录已有一个 origin remote，但指向的地址和本次请求要求的不一致，为避免误将内容推送/拉取到错误的仓库，不会自动修改。' +
+                '当前 origin 指向：' + redactToken(curUrl, token) +
+                '；本次请求要求指向：' + redactToken(gitUrl, token) +
+                '。如果确实要改，请自己在项目目录里手动执行 git remote set-url origin <新地址>。'
+        };
+    }
+    return { ok: true };
+}
+
+// POST /overleaf/pull —— 见文件头安全设计注释 + 交付说明里的分支逻辑表。
+async function doOverleafPull(projectDir, gitUrl, token) {
+    try {
+        const gitDir = path.join(projectDir, '.git');
+        let hasGitDir = false;
+        try { hasGitDir = fs.existsSync(gitDir); } catch (e) { hasGitDir = false; }
+
+        if (!hasGitDir) {
+            let dirExists = false;
+            try { dirExists = fs.existsSync(projectDir); } catch (e) {}
+            if (!dirExists) {
+                try { fs.mkdirSync(projectDir, { recursive: true }); } catch (e) {
+                    return { ok: false, action: 'mkdir-failed', error: '创建项目目录失败: ' + e.message };
+                }
+            } else {
+                let entries = [];
+                try { entries = fs.readdirSync(projectDir); } catch (e) {
+                    return { ok: false, action: 'readdir-failed', error: '读取项目目录失败: ' + e.message };
+                }
+                if (entries.length > 0) {
+                    // 目录已存在文件但不是 git 仓库——绝不清空/覆盖，直接拒绝，交给用户手动处理。
+                    return {
+                        ok: false,
+                        action: 'refused-nonempty-dir',
+                        error: '该目录已存在文件但不是 git 仓库，为避免覆盖现有内容，不会自动 clone。请指向一个空目录，或手动在该目录跑 git init/git remote add/git pull 之后再用本功能。'
+                    };
+                }
+            }
+            const cloneResult = await runGitCommand(['clone', gitUrl, '.'], projectDir, token);
+            if (!cloneResult.ok) {
+                return { ok: false, action: 'clone-failed', error: redactToken(cloneResult.stderr || cloneResult.stdout || 'git clone 失败', token) };
+            }
+            return { ok: true, action: 'cloned' };
+        }
+
+        // 已经是 git 仓库：dirty 检查必须先于任何网络操作。
+        const statusResult = await runGitCommand(['status', '--porcelain'], projectDir, token);
+        if (!statusResult.ok) {
+            return { ok: false, action: 'status-failed', error: redactToken(statusResult.stderr || statusResult.stdout || 'git status 失败', token) };
+        }
+        if (statusResult.stdout.trim().length > 0) {
+            return {
+                ok: true,
+                action: 'skipped-dirty',
+                error: '本地有未提交的改动，跳过本次同步（不会自动覆盖），建议先点“推送”或手动处理后再拉取。'
+            };
+        }
+
+        const remoteResult = await ensureOriginRemote(projectDir, gitUrl, token);
+        if (!remoteResult.ok) {
+            return { ok: false, action: remoteResult.action || 'remote-failed', error: redactToken(remoteResult.error, token) };
+        }
+
+        const fetchResult = await runGitCommand(['fetch', 'origin'], projectDir, token);
+        if (!fetchResult.ok) {
+            return { ok: false, action: 'fetch-failed', error: redactToken(fetchResult.stderr || fetchResult.stdout || 'git fetch 失败', token) };
+        }
+
+        const branchResult = await runGitCommand(['rev-parse', '--abbrev-ref', 'HEAD'], projectDir, token);
+        if (!branchResult.ok) {
+            return { ok: false, action: 'branch-failed', error: redactToken(branchResult.stderr || 'git rev-parse 获取当前分支名失败', token) };
+        }
+        const branch = branchResult.stdout.trim();
+
+        const oldHeadResult = await runGitCommand(['rev-parse', 'HEAD'], projectDir, token);
+        const oldHead = oldHeadResult.ok ? oldHeadResult.stdout.trim() : null;
+
+        const mergeResult = await runGitCommand(['merge', '--ff-only', 'origin/' + branch], projectDir, token);
+        if (!mergeResult.ok) {
+            // 非快进（本地和远程各自有新提交）或 origin/<branch> 压根不存在（比如远程默认分支
+            // 是 master，本地却在别的分支上）——两种情况都不尝试自动合并/rebase/瞎猜分支名重试，
+            // 统一归类为"分叉"，原样报告给用户自己判断。
+            return {
+                ok: true,
+                action: 'diverged',
+                error: '本地和 Overleaf 上的版本出现分叉，无法自动合并，请手动处理（打开终端 cd 到项目目录执行 git status / git log 检查，必要时手动 git merge 或 git reset）。如果 Overleaf 上的默认分支名和本地当前分支（' + branch + '）不一致，也会出现这个提示，请手动确认分支名。'
+            };
+        }
+
+        const newHeadResult = await runGitCommand(['rev-parse', 'HEAD'], projectDir, token);
+        const newHead = newHeadResult.ok ? newHeadResult.stdout.trim() : null;
+
+        if (oldHead && newHead && oldHead === newHead) {
+            return { ok: true, action: 'up-to-date' };
+        }
+
+        let changedFiles = [];
+        if (oldHead && newHead) {
+            const diffResult = await runGitCommand(['diff', '--name-only', oldHead, newHead], projectDir, token);
+            if (diffResult.ok) {
+                changedFiles = diffResult.stdout.split(/\r?\n/).filter((s) => s.length > 0);
+            }
+        }
+        return { ok: true, action: 'fast-forward', changedFiles: changedFiles };
+    } catch (e) {
+        return { ok: false, error: redactToken('内部错误: ' + (e && e.message), token) };
+    }
+}
+
+// POST /overleaf/push —— 见文件头安全设计注释。绝不 force push：非快进被拒绝时提交本身
+// 已经落在本地历史里（不回滚），只是没推上去，安全、不丢用户的本地工作。
+async function doOverleafPush(projectDir, gitUrl, token, message) {
+    try {
+        const gitDir = path.join(projectDir, '.git');
+        let hasGitDir = false;
+        try { hasGitDir = fs.existsSync(gitDir); } catch (e) { hasGitDir = false; }
+        if (!hasGitDir) {
+            return { ok: false, error: '这个目录还不是 git 仓库，请先拉取一次' };
+        }
+
+        const addResult = await runGitCommand(['add', '-A'], projectDir, token);
+        if (!addResult.ok) {
+            return { ok: false, error: redactToken(addResult.stderr || addResult.stdout || 'git add 失败', token) };
+        }
+
+        const stagedResult = await runGitCommand(['diff', '--cached', '--name-only'], projectDir, token);
+        if (!stagedResult.ok) {
+            return { ok: false, error: redactToken(stagedResult.stderr || stagedResult.stdout || 'git diff --cached 失败', token) };
+        }
+        if (stagedResult.stdout.trim().length === 0) {
+            return { ok: true, action: 'nothing-to-push' }; // 没有改动，不做空提交
+        }
+
+        const commitMessage = (message && String(message).trim()) || ('AI-Translator sync ' + new Date().toISOString());
+        const commitResult = await runGitCommand(['commit', '-m', commitMessage], projectDir, token);
+        if (!commitResult.ok) {
+            return { ok: false, error: redactToken(commitResult.stderr || commitResult.stdout || 'git commit 失败', token) };
+        }
+
+        const remoteResult = await ensureOriginRemote(projectDir, gitUrl, token);
+        if (!remoteResult.ok) {
+            return { ok: false, action: remoteResult.action || 'remote-failed', error: redactToken(remoteResult.error, token) };
+        }
+
+        const branchResult = await runGitCommand(['rev-parse', '--abbrev-ref', 'HEAD'], projectDir, token);
+        if (!branchResult.ok) {
+            return { ok: false, error: redactToken(branchResult.stderr || 'git rev-parse 获取当前分支名失败', token) };
+        }
+        const branch = branchResult.stdout.trim();
+
+        const pushResult = await runGitCommand(['push', 'origin', branch], projectDir, token);
+        if (!pushResult.ok) {
+            const combined = (pushResult.stderr || '') + '\n' + (pushResult.stdout || '');
+            if (/non-fast-forward|fetch first|rejected/i.test(combined)) {
+                return {
+                    ok: true,
+                    action: 'rejected-non-fastforward',
+                    error: '推送被拒绝：Overleaf 上有你本地还没有的新修改，请先点“拉取”同步之后再推送。'
+                };
+            }
+            return { ok: false, error: redactToken(combined, token) };
+        }
+
+        return { ok: true, action: 'pushed' };
+    } catch (e) {
+        return { ok: false, error: redactToken('内部错误: ' + (e && e.message), token) };
+    }
+}
+
+// 只用于 /overleaf/* 这两个能动用户真实 git 仓库的路由：拒绝来自任意网页的跨域驱动。
+// 浏览器发起跨域 fetch 时一定会带 Origin 头且不可伪造，所以白名单足以挡住恶意页面；
+// 没有 Origin 头的（curl / node 脚本 / 本地测试）放行，因为那本来就不是这条攻击链。
+function ovlOriginAllowed(req) {
+    const origin = req.headers.origin;
+    if (!origin) return true;              // 非浏览器发起
+    if (origin === 'null') return true;    // file:// 页面（本 App 的正常打开方式）
+    return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 路由
 // ---------------------------------------------------------------------------
 
@@ -781,7 +1080,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear. WebSocket on same host:port for disk-change push.');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push. WebSocket on same host:port for disk-change push.');
             return;
         }
 
@@ -988,6 +1287,54 @@ const server = http.createServer(async (req, res) => {
                 });
             } catch (e) {}
             sendJson(res, 200, { ok: true, clearedAll: true });
+            return;
+        }
+
+        // v2 Pass P24：Overleaf git 集成——见 doOverleafPull 头部注释的安全设计 + 分支逻辑。
+        if (req.method === 'POST' && pathname === '/overleaf/pull') {
+            if (!ovlOriginAllowed(req)) {
+                sendJson(res, 403, { ok: false, action: 'forbidden-origin',
+                    error: '拒绝来自外部网页的同步请求。这两个接口只接受 AI-Translator 页面本身的调用。' });
+                return;
+            }
+            const bodyText = await readBody(req);
+            let body;
+            try { body = JSON.parse(bodyText || '{}'); } catch (e) {
+                sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
+                return;
+            }
+            const projectDir = body.projectDir;
+            const gitUrl = body.gitUrl;
+            const token = body.token;
+            if (!projectDir || typeof projectDir !== 'string') { sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' }); return; }
+            if (!gitUrl || typeof gitUrl !== 'string') { sendJson(res, 400, { ok: false, error: 'gitUrl is required' }); return; }
+            if (!token || typeof token !== 'string') { sendJson(res, 400, { ok: false, error: 'token is required' }); return; }
+            const result = await doOverleafPull(projectDir, gitUrl, token);
+            sendJson(res, 200, result);
+            return;
+        }
+
+        // v2 Pass P24：Overleaf git 集成——见 doOverleafPush 头部注释，绝不 force push。
+        if (req.method === 'POST' && pathname === '/overleaf/push') {
+            if (!ovlOriginAllowed(req)) {
+                sendJson(res, 403, { ok: false, action: 'forbidden-origin',
+                    error: '拒绝来自外部网页的同步请求。这两个接口只接受 AI-Translator 页面本身的调用。' });
+                return;
+            }
+            const bodyText = await readBody(req);
+            let body;
+            try { body = JSON.parse(bodyText || '{}'); } catch (e) {
+                sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
+                return;
+            }
+            const projectDir = body.projectDir;
+            const gitUrl = body.gitUrl;
+            const token = body.token;
+            if (!projectDir || typeof projectDir !== 'string') { sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' }); return; }
+            if (!gitUrl || typeof gitUrl !== 'string') { sendJson(res, 400, { ok: false, error: 'gitUrl is required' }); return; }
+            if (!token || typeof token !== 'string') { sendJson(res, 400, { ok: false, error: 'token is required' }); return; }
+            const result = await doOverleafPush(projectDir, gitUrl, token, body.message);
+            sendJson(res, 200, result);
             return;
         }
 

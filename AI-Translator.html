@@ -2026,6 +2026,9 @@ body.ovl-translator-open #ovlTransWin { display: block; }
     background: #242E3D; border-bottom: 1px solid #1B222C; flex-shrink: 0;
 }
 .ovl-pdf-projectrow label { font-size: 11px; color: #9AA4B2; white-space: nowrap; flex-shrink: 0; }
+/* v2 Pass P24：Overleaf 同步那一行的标签——不是 <label for=...>（不对应单个 input），
+   视觉照抄上面那条已有的 .ovl-pdf-projectrow label 规则，不发明新样式体系。 */
+.ovl-overleaf-label { font-size: 11px; color: #9AA4B2; white-space: nowrap; flex-shrink: 0; margin-right: 2px; }
 .ovl-pdf-projectrow input[type="text"] {
     flex: 1 1 auto; min-width: 0; background: #1B222C; border: 1px solid #3a4457;
     color: #E7E9EE; font-size: 11px; font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
@@ -21878,6 +21881,15 @@ function ovlShellHtml() {
         // 见 ovlBrowseProjectFolder。
         +       '<button type="button" class="ovl-browse-btn" id="ovlBrowseFolderBtn" data-tip="用原生文件夹选择框设置项目路径（需要桥接服务在线）" data-tip-pos="bottom">浏览…</button>'
         +     '</div>'
+        // v2 Pass P24：Overleaf git 同步——手动拉取/推送两个按钮 + 一句话状态。地址/token/
+        // 自动拉取间隔在设置面板的「Overleaf 同步」分类里填，见 ovlSettingsOverleafHtml；
+        // 按钮的 disabled/data-tip 由 ovlOverleafUpdateButtonsUI() 动态维护。
+        +     '<div class="ovl-pdf-projectrow ovl-overleaf-syncrow">'
+        +       '<span class="ovl-overleaf-label">Overleaf 同步</span>'
+        +       '<button type="button" class="ovl-browse-btn" id="ovlOverleafPullBtn" disabled data-tip="先在设置里填 Overleaf token 和项目地址" data-tip-pos="bottom">拉取</button>'
+        +       '<button type="button" class="ovl-browse-btn" id="ovlOverleafPushBtn" disabled data-tip="先在设置里填 Overleaf token 和项目地址" data-tip-pos="bottom">推送</button>'
+        +       '<span class="ovl-pdf-status" id="ovlOverleafSyncStatus">未配置 Overleaf 同步</span>'
+        +     '</div>'
         +     '<div class="ovl-pdf-body" id="ovlPdfBody"><div class="ovl-pdf-placeholder">检测编译桥接服务中…</div></div>'
         +     '<div class="ovl-log-panel" id="ovlLogPanel">'
         +       '<div class="ovl-log-toolbar">'
@@ -25586,6 +25598,9 @@ async function ovlBridgeCheckHealth() {
     }
     ovlUpdatePdfToolbarUI();
     ovlRenderPdfBody();
+    // v2 Pass P24：桥上线/离线状态是 Overleaf 拉取/推送按钮能不能点的另一半判断条件
+    // （另一半是 ovlOverleafConfigured()），这里是"桥上线检测逻辑"本体，每次探测完都要跟着刷新。
+    if (typeof ovlOverleafUpdateButtonsUI === 'function') ovlOverleafUpdateButtonsUI();
 }
 
 async function ovlDoRecompile(opts) {
@@ -25737,6 +25752,227 @@ async function ovlBrowseProjectFolder() {
     } finally {
         if (btn) btn.disabled = false;
     }
+}
+
+// ---------------------------------------------------------------------------
+// v2 Pass P24：Overleaf git 同步——手动拉取/推送 + 自动定时拉取。安全设计、分支逻辑
+// （dirty/diverged/rejected-non-fastforward 一律停手不猜）见 tools/latex-bridge/server.js
+// 里 doOverleafPull/doOverleafPush 的头部注释。前端这边只负责：解析地址、判断"配置好了
+// 没"、维护按钮态、调这两个桥接口、把返回结果翻成中文提示——绝不在这里做任何合并/覆盖判断，
+// 那些判断全部在桥那一侧做完，前端只是如实转述结果。
+// ---------------------------------------------------------------------------
+
+// 从用户粘贴的地址里抠出 24 位十六进制 Overleaf ProjectID，兼容三种粘贴方式：
+// https://git.overleaf.com/<id>、https://www.overleaf.com/project/<id>、裸 <id>。
+// 抠不出 id 但地址本身像个 URL（http 开头）就原样返回当兜底；再不行返回 null——前端据此
+// 判断"地址没配好"（见 ovlOverleafConfigured）。
+function ovlOverleafResolveGitUrl(addr) {
+    if (!addr || typeof addr !== 'string') return null;
+    const trimmed = addr.trim();
+    if (!trimmed) return null;
+    const m = trimmed.match(/[0-9a-f]{24}/i);
+    if (m) return 'https://git.overleaf.com/' + m[0];
+    if (/^https?:\/\//i.test(trimmed)) return trimmed;
+    return null;
+}
+
+function ovlOverleafConfigured() {
+    return !!(OvlSettings.overleafToken && ovlOverleafResolveGitUrl(OvlSettings.overleafProjectAddr));
+}
+
+// 拉取/推送两个按钮的 disabled + data-tip（纯 CSS 悬浮提示，见 [data-tip] 规则）跟着
+// "配置好了没"/"桥在不在线"走——ovlApplySettings() 末尾（设置一改）、ovlBridgeCheckHealth()
+// 末尾（桥上线状态一变）各调一次，两处都变了立刻反映到按钮上，不用等下次手动点开设置面板。
+function ovlOverleafUpdateButtonsUI() {
+    const pullBtn = document.getElementById('ovlOverleafPullBtn');
+    const pushBtn = document.getElementById('ovlOverleafPushBtn');
+    if (!pullBtn && !pushBtn) return;
+    const configured = ovlOverleafConfigured();
+    const online = OvlState.bridgeOnline === true;
+    const disabled = !(configured && online);
+    let tip = '';
+    if (!configured) tip = '先在设置里填 Overleaf token 和项目地址';
+    else if (!online) tip = '桥接服务未启动，见 tools/latex-bridge/README.md';
+    if (pullBtn) { pullBtn.disabled = disabled; pullBtn.setAttribute('data-tip', tip || '从 Overleaf 拉取最新版本'); }
+    if (pushBtn) { pushBtn.disabled = disabled; pushBtn.setAttribute('data-tip', tip || '把本地改动推送到 Overleaf'); }
+}
+
+function ovlOverleafSetSyncStatus(text, isError) {
+    const el = document.getElementById('ovlOverleafSyncStatus');
+    if (!el) return;
+    el.textContent = text;
+    el.classList.toggle('ovl-status-err', !!isError);
+    el.classList.toggle('ovl-status-ok', !isError);
+}
+
+// opts.silent=true 用于自动定时拉取：成功且已是最新时不弹 toast（只更新状态文字），避免
+// 每隔几分钟弹一次"已是最新"打扰用户；真正拉到新东西/任何失败/diverged/skipped-dirty
+// 这几种"用户需要知道"的情况，不管 silent 与否都要弹 toast——不能因为 silent 就吞掉。
+async function ovlOverleafPull(opts) {
+    opts = opts || {};
+    const silent = !!opts.silent;
+    // 浏览器里当前打开的文件有没有未保存的编辑——跟桥那边检查的"磁盘上 git 状态干不干净"
+    // 是两回事：磁盘可能是干净的，但用户在浏览器里还有没点保存的改动，此时 pull 覆盖磁盘上
+    // 那个文件，用户之后 Ctrl+S 会用浏览器里那份旧内容把刚拉下来的新内容覆盖掉，等于静默
+    // 丢了 Overleaf 那边的更新，所以这一步必须在前端先挡一道，桥那边的 dirty 检查管不到它。
+    if (OvlState.dirty) {
+        ovlOverleafSetSyncStatus('当前文件有未保存的修改，请先保存后再拉取', true);
+        showToast('当前文件有未保存的修改，请先保存后再拉取', 'error');
+        return;
+    }
+    if (!ovlOverleafConfigured()) {
+        ovlOverleafSetSyncStatus('未配置 Overleaf 同步', true);
+        showToast('请先在设置里填 Overleaf token 和项目地址', 'error');
+        return;
+    }
+    if (OvlState.bridgeOnline !== true) {
+        ovlOverleafSetSyncStatus('桥接服务未在线，无法拉取', true);
+        showToast('桥接服务未在线，无法拉取', 'error');
+        return;
+    }
+    const pathInput = document.getElementById('ovlProjectPathInput');
+    const projectDir = pathInput ? pathInput.value.trim() : '';
+    if (!projectDir) {
+        ovlOverleafSetSyncStatus('请先设置项目绝对路径', true);
+        showToast('请先设置项目绝对路径', 'error');
+        return;
+    }
+    const gitUrl = ovlOverleafResolveGitUrl(OvlSettings.overleafProjectAddr);
+    const pullBtn = document.getElementById('ovlOverleafPullBtn');
+    const pushBtn = document.getElementById('ovlOverleafPushBtn');
+    if (pullBtn) pullBtn.disabled = true;
+    if (pushBtn) pushBtn.disabled = true; // 拉取推送不许并发碰同一个 git 工作目录
+    ovlOverleafSetSyncStatus('拉取中…', false);
+    try {
+        const resp = await fetch(ovlBridgeUrl('/overleaf/pull'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectDir: projectDir, gitUrl: gitUrl, token: OvlSettings.overleafToken })
+        });
+        const data = await resp.json();
+        if (!data || !data.ok) {
+            const msg = '拉取失败：' + ((data && data.error) || '未知错误');
+            ovlOverleafSetSyncStatus(msg, true);
+            showToast(msg, 'error');
+            return;
+        }
+        if (data.action === 'up-to-date') {
+            ovlOverleafSetSyncStatus('已是最新', false);
+            if (!silent) showToast('已是最新', 'success');
+        } else if (data.action === 'cloned') {
+            ovlOverleafSetSyncStatus('已从 Overleaf 克隆项目', false);
+            showToast('已从 Overleaf 克隆项目', 'success');
+        } else if (data.action === 'fast-forward') {
+            const n = Array.isArray(data.changedFiles) ? data.changedFiles.length : 0;
+            ovlOverleafSetSyncStatus('已拉取更新（' + n + ' 个文件变化）', false);
+            showToast('已从 Overleaf 拉取更新，' + n + ' 个文件变化', 'success');
+        } else if (data.action === 'skipped-dirty') {
+            ovlOverleafSetSyncStatus('本地有未提交改动，已跳过', true);
+            showToast(data.error || '本地有未提交改动，已跳过本次拉取', 'warning');
+        } else if (data.action === 'diverged') {
+            ovlOverleafSetSyncStatus('本地和 Overleaf 版本分叉，需手动处理', true);
+            showToast(data.error || '本地和 Overleaf 版本分叉，需要手动处理', 'error');
+        } else {
+            ovlOverleafSetSyncStatus('拉取完成（' + data.action + '）', false);
+            if (!silent) showToast('拉取完成', 'success');
+        }
+        if (data.action === 'fast-forward' || data.action === 'cloned') {
+            if (OvlState.dirHandle && !OvlState.usingWebkitFallback) {
+                try { await ovlRenderTree(OvlState.dirHandle); } catch (e) { console.warn('[ovl] overleaf pull: refresh file tree failed', e); }
+            }
+            // 当前打开文件的磁盘内容变化会由既有的 P17 WebSocket 磁盘监听机制自动感知并在
+            // OvlState.dirty===false 时自动重新加载（ovlBridgeHandleExternalChange）——这里
+            // 只补一次订阅刷新，确保 watch 是最新的（万一 pull 之前压根还没建立过订阅）。
+            if (typeof ovlBridgeUpdateWatch === 'function') { try { ovlBridgeUpdateWatch(); } catch (e) {} }
+        }
+    } catch (e) {
+        ovlOverleafSetSyncStatus('拉取失败：连不上桥接服务', true);
+        showToast('拉取失败：连不上桥接服务', 'error');
+    } finally {
+        ovlOverleafUpdateButtonsUI();
+    }
+}
+
+// 推送的是磁盘上已保存的内容，不涉及浏览器内存里的未保存编辑——想把当前编辑也推上去，
+// 本来就该先 Ctrl+S 保存，这是既有的保存机制，不是这个函数要解决的事，所以这里不检查
+// OvlState.dirty（跟 ovlOverleafPull 的前置检查不是同一回事）。
+async function ovlOverleafPush() {
+    if (!ovlOverleafConfigured()) {
+        ovlOverleafSetSyncStatus('未配置 Overleaf 同步', true);
+        showToast('请先在设置里填 Overleaf token 和项目地址', 'error');
+        return;
+    }
+    if (OvlState.bridgeOnline !== true) {
+        ovlOverleafSetSyncStatus('桥接服务未在线，无法推送', true);
+        showToast('桥接服务未在线，无法推送', 'error');
+        return;
+    }
+    const pathInput = document.getElementById('ovlProjectPathInput');
+    const projectDir = pathInput ? pathInput.value.trim() : '';
+    if (!projectDir) {
+        ovlOverleafSetSyncStatus('请先设置项目绝对路径', true);
+        showToast('请先设置项目绝对路径', 'error');
+        return;
+    }
+    const gitUrl = ovlOverleafResolveGitUrl(OvlSettings.overleafProjectAddr);
+    const pullBtn = document.getElementById('ovlOverleafPullBtn');
+    const pushBtn = document.getElementById('ovlOverleafPushBtn');
+    if (pullBtn) pullBtn.disabled = true;
+    if (pushBtn) pushBtn.disabled = true;
+    ovlOverleafSetSyncStatus('推送中…', false);
+    try {
+        const resp = await fetch(ovlBridgeUrl('/overleaf/push'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                projectDir: projectDir,
+                gitUrl: gitUrl,
+                token: OvlSettings.overleafToken,
+                message: 'AI-Translator sync ' + new Date().toLocaleString()
+            })
+        });
+        const data = await resp.json();
+        if (!data || !data.ok) {
+            const msg = '推送失败：' + ((data && data.error) || '未知错误');
+            ovlOverleafSetSyncStatus(msg, true);
+            showToast(msg, 'error');
+            return;
+        }
+        if (data.action === 'pushed') {
+            ovlOverleafSetSyncStatus('已推送到 Overleaf', false);
+            showToast('已推送到 Overleaf', 'success');
+        } else if (data.action === 'nothing-to-push') {
+            ovlOverleafSetSyncStatus('没有改动，无需推送', false);
+            showToast('没有改动，无需推送', 'info');
+        } else if (data.action === 'rejected-non-fastforward') {
+            ovlOverleafSetSyncStatus('推送被拒绝：请先点拉取', true);
+            showToast(data.error || '推送被拒绝：Overleaf 上有你本地还没有的新修改，请先点“拉取”同步之后再推送。', 'error');
+        } else {
+            ovlOverleafSetSyncStatus('推送完成（' + data.action + '）', false);
+            showToast('推送完成', 'success');
+        }
+    } catch (e) {
+        ovlOverleafSetSyncStatus('推送失败：连不上桥接服务', true);
+        showToast('推送失败：连不上桥接服务', 'error');
+    } finally {
+        ovlOverleafUpdateButtonsUI();
+    }
+}
+
+// 自动拉取定时器。overleafAutoPullMinutes 走的是设置面板的通用 data-setpath 处理器，改一次
+// 就会触发一次 ovlApplySettings()（见该函数末尾），这个 Setup 函数每次都先 clear 掉旧定时器
+// 再按最新的分钟数重设，所以这一个字段不需要在通用处理器之外再单独接线。
+let OvlOverleafAutoPullTimer = null;
+function ovlOverleafAutoPullTimerClear() {
+    if (OvlOverleafAutoPullTimer) { clearInterval(OvlOverleafAutoPullTimer); OvlOverleafAutoPullTimer = null; }
+}
+function ovlOverleafSetupAutoPullTimer() {
+    ovlOverleafAutoPullTimerClear();
+    const minutes = Number(OvlSettings.overleafAutoPullMinutes) || 0;
+    if (minutes <= 0) return;
+    OvlOverleafAutoPullTimer = setInterval(function () {
+        ovlOverleafPull({ silent: true }).catch(function (e) { console.error('[ovl] overleaf auto pull failed', e); });
+    }, minutes * 60 * 1000);
 }
 
 // ---- WebSocket：磁盘外部改动推送（协议见 tools/latex-bridge/server.js 头部注释）----
@@ -26270,6 +26506,15 @@ function ovlBindShell() {
         if (browseFolderBtn) browseFolderBtn.addEventListener('click', function () {
             ovlBrowseProjectFolder().catch(function (e) { console.error('[ovl] browse folder failed', e); });
         });
+        // v2 Pass P24：Overleaf 手动拉取/推送——见 ovlOverleafPull/ovlOverleafPush。
+        const overleafPullBtn = document.getElementById('ovlOverleafPullBtn');
+        if (overleafPullBtn) overleafPullBtn.addEventListener('click', function () {
+            ovlOverleafPull({ silent: false }).catch(function (e) { console.error('[ovl] overleaf pull failed', e); });
+        });
+        const overleafPushBtn = document.getElementById('ovlOverleafPushBtn');
+        if (overleafPushBtn) overleafPushBtn.addEventListener('click', function () {
+            ovlOverleafPush().catch(function (e) { console.error('[ovl] overleaf push failed', e); });
+        });
         const logTabs = document.getElementById('ovlLogTabs');
         if (logTabs) {
             logTabs.addEventListener('click', function (e) {
@@ -26365,7 +26610,11 @@ const OVL_SETTINGS_DEFAULTS = {
     spellLang: 'en-US',
     transSimpleMode: false,     // P2 消费：翻译器窗口简化模式（只留左右两个框）
     visualTranslate: 'auto',    // P4 消费：'auto' | 'button' | 'off'
-    visualTransModel: ''        // P4 消费：''=跟随翻译器当前选中的模型
+    visualTransModel: '',       // P4 消费：''=跟随翻译器当前选中的模型
+    // ---- v2 Pass P24：Overleaf git 同步 ----
+    overleafProjectAddr: '',    // 用户粘贴的 Overleaf 项目地址（git URL / web URL / 纯 ID 都行，见 ovlOverleafResolveGitUrl）
+    overleafToken: '',          // Overleaf 项目 Git Token（明文存 localStorage，跟这个 App 里其它凭证同一存储方式，不是这次新引入的安全水位）
+    overleafAutoPullMinutes: 0  // 自动拉取间隔（分钟），0 = 关闭自动拉取
 };
 const OVL_FONT_FAMILIES = {
     'ovl-mono-default': '"SFMono-Regular", Consolas, "Courier New", monospace',
@@ -26425,6 +26674,10 @@ function ovlApplySettings() {
         // P2：settings.transSimpleMode 的勾选框走的是通用 data-setpath 处理（改 OvlSettings
         // 之后统一调 ovlSaveSettings()+ovlApplySettings()），真正把它落到 DOM 上就靠这一行。
         ovlTransSyncSimpleUI();
+        // v2 Pass P24：设置一改（含 token/地址/自动拉取间隔）立刻反映到按钮态 + 重设定时器
+        // ——overleafAutoPullMinutes 走的也是通用 data-setpath 处理，不用单独接线。
+        if (typeof ovlOverleafUpdateButtonsUI === 'function') ovlOverleafUpdateButtonsUI();
+        if (typeof ovlOverleafSetupAutoPullTimer === 'function') ovlOverleafSetupAutoPullTimer();
     } catch (e) { console.error('[ovl] applySettings failed', e); }
 }
 
@@ -26603,75 +26856,75 @@ function ovlBindTip2() {
 
 function ovlSettingsEditorHtml() {
     const s = OvlSettings;
-    let html = '<div class="ovl-set-category-title">Editor</div>';
-    html += ovlSetRow('Auto-close brackets', '<input type="checkbox" data-setpath="settings.autoCloseBrackets"' + (s.autoCloseBrackets ? ' checked' : '') + '>',
+    let html = '<div class="ovl-set-category-title">编辑器</div>';
+    html += ovlSetRow('自动补全括号', '<input type="checkbox" data-setpath="settings.autoCloseBrackets"' + (s.autoCloseBrackets ? ' checked' : '') + '>',
         '打出 (、{、[、$ 时自动补上配对的右半边。补出来的内容可以用 Ctrl+Z 撤销。');
-    html += ovlSetRow('Non-blinking cursor', '<input type="checkbox" disabled data-setpath="settings.nonBlinkingCursor"' + (s.nonBlinkingCursor ? ' checked' : '') + '>',
+    html += ovlSetRow('光标不闪烁', '<input type="checkbox" disabled data-setpath="settings.nonBlinkingCursor"' + (s.nonBlinkingCursor ? ' checked' : '') + '>',
         '这一项目前不起作用：网页里的文本框没法控制光标闪不闪。开关的状态会记住，但光标行为不会变。');
-    html += ovlSetRow('Tab size', '<select data-setpath="settings.tabSize">' + [2, 4, 8].map(function (v) { return ovlOptTag(v, String(v), s.tabSize); }).join('') + '</select>',
+    html += ovlSetRow('Tab 宽度', '<select data-setpath="settings.tabSize">' + [2, 4, 8].map(function (v) { return ovlOptTag(v, String(v), s.tabSize); }).join('') + '</select>',
         '按一次 Tab 键在编辑器里显示多宽。只影响显示宽度，不改变文件内容。');
-    html += ovlSetRow('PDF Viewer', '<select disabled><option selected>Browser built-in (Chrome PDF Viewer)</option></select>',
+    html += ovlSetRow('PDF 阅读器', '<select disabled><option selected>内置 PDF 阅读器（pdf.js 渲染）</option></select>',
         '用的是 Chrome 自带的 PDF 阅读器，目前没有别的可选。');
-    html += ovlSetRow('Show quick actions on text selection', '<input type="checkbox" data-setpath="settings.quickActions"' + (s.quickActions ? ' checked' : '') + '>',
+    html += ovlSetRow('选中文字时显示快捷工具条', '<input type="checkbox" data-setpath="settings.quickActions"' + (s.quickActions ? ' checked' : '') + '>',
         '在编辑器里选中文字后，旁边会浮出一个小工具条（加粗、斜体、插入引文）。');
-    html += ovlSetRow('Breadcrumbs', '<input type="checkbox" data-setpath="settings.breadcrumbs"' + (s.breadcrumbs ? ' checked' : '') + '>',
+    html += ovlSetRow('面包屑导航', '<input type="checkbox" data-setpath="settings.breadcrumbs"' + (s.breadcrumbs ? ' checked' : '') + '>',
         '在编辑器上方显示光标当前所在的章节位置，方便知道自己在文档的哪一部分。');
-    html += ovlSetRow('Equation preview', '<input type="checkbox" data-setpath="settings.equationPreview"' + (s.equationPreview ? ' checked' : '') + '>',
+    html += ovlSetRow('公式预览', '<input type="checkbox" data-setpath="settings.equationPreview"' + (s.equationPreview ? ' checked' : '') + '>',
         '光标停在 $...$ 公式里时，浮出一个小窗口显示公式排版后的样子。只支持写在同一行里的公式。');
-    html += ovlSetRow('Soft wrap', '<span class="ovl-set-readonly-val">已开启（不可关闭）</span>',
+    html += ovlSetRow('自动折行', '<span class="ovl-set-readonly-val">已开启（不可关闭）</span>',
         '太长的行会自动折到下一行显示，不用左右拖滚动条。这一项固定开启，行号和各种跳转都已经按折行后的位置对齐。');
-    html += ovlSetRow('Show line numbers', '<input type="checkbox" data-setpath="settings.showLineNumbers"' + (s.showLineNumbers ? ' checked' : '') + '>',
+    html += ovlSetRow('显示行号', '<input type="checkbox" data-setpath="settings.showLineNumbers"' + (s.showLineNumbers ? ' checked' : '') + '>',
         '在编辑器左边显示行号。');
     return html;
 }
 function ovlSettingsSpellingHtml() {
     const s = OvlSettings;
-    let html = '<div class="ovl-set-category-title">Spelling</div>';
-    html += ovlSetRow('Spellcheck', '<input type="checkbox" data-setpath="settings.spellcheck"' + (s.spellcheck ? ' checked' : '') + '>',
+    let html = '<div class="ovl-set-category-title">拼写检查</div>';
+    html += ovlSetRow('拼写检查', '<input type="checkbox" data-setpath="settings.spellcheck"' + (s.spellcheck ? ' checked' : '') + '>',
         '打开 Chrome 自带的拼写检查，拼错的词下面画红波浪线。');
     const langs = [['en-US', 'English (American)'], ['en-GB', 'English (British)'], ['zh-CN', '中文（简体）'], ['fr-FR', 'Français'], ['de-DE', 'Deutsch']];
-    html += ovlSetRow('Spellcheck language', '<select data-setpath="settings.spellLang">' + langs.map(function (p) { return ovlOptTag(p[0], p[1], s.spellLang); }).join('') + '</select>',
+    html += ovlSetRow('拼写检查语言', '<select data-setpath="settings.spellLang">' + langs.map(function (p) { return ovlOptTag(p[0], p[1], s.spellLang); }).join('') + '</select>',
         '拼写检查用哪种语言的词典。注意它不认识 LaTeX 命令，会把每个 \\命令 都标成拼错。');
-    html += ovlSetRow('Custom dictionary', '<span class="ovl-set-readonly-val">不支持从网页管理</span>',
+    html += ovlSetRow('自定义词典', '<span class="ovl-set-readonly-val">不支持从网页管理</span>',
         '自定义词典只能在红波浪线上点右键、选「添加到词典」来加，网页里改不了它。');
     return html;
 }
 function ovlSettingsCompilerHtml() {
     const c = OvlCompileSettings;
-    let html = '<div class="ovl-set-category-title">Compiler</div>';
+    let html = '<div class="ovl-set-category-title">编译</div>';
     if (OvlState.bridgeOnline !== true) {
         html += '<div class="ovl-set-banner"><strong>桥接服务未在线。</strong>下面这些设置会照常存起来，但要等 tools/latex-bridge/server.js 在线之后，下一次 Recompile 才会真的用上。</div>';
     }
-    html += ovlSetRow('Main document', '<span class="ovl-set-readonly-val">' + escapeHtml(OvlState.mainDocFile || '(未设置，默认用当前打开的 .tex 或 main.tex)') + '</span>',
+    html += ovlSetRow('主文档', '<span class="ovl-set-readonly-val">' + escapeHtml(OvlState.mainDocFile || '(未设置，默认用当前打开的 .tex 或 main.tex)') + '</span>',
         '编译时从哪个 .tex 文件开始。要改的话，在左边文件树里右键某个 .tex 文件，选 Set as main document。');
-    html += ovlSetRow('Compiler', '<select data-setpath="compile.engine">'
+    html += ovlSetRow('编译引擎', '<select data-setpath="compile.engine">'
         + ovlOptTag('pdflatex', 'pdfLaTeX', c.engine) + ovlOptTag('xelatex', 'XeLaTeX', c.engine) + ovlOptTag('lualatex', 'LuaLaTeX', c.engine)
         + '</select>', '用哪个 LaTeX 引擎来排版。不确定就保持 pdfLaTeX；文档里用了中文字体或 fontspec 就选 XeLaTeX。');
-    html += ovlSetRow('TeX Live version', '<select disabled><option selected>2025（本机唯一安装的版本）</option></select>',
+    html += ovlSetRow('TeX Live 版本', '<select disabled><option selected>2025（本机唯一安装的版本）</option></select>',
         '这台电脑只装了 TeX Live 2025 一个版本，没有别的可切。');
-    html += ovlSetRow('Compile mode', '<select data-setpath="compile.mode">' + ovlOptTag('normal', 'Normal', c.mode) + ovlOptTag('draft', 'Fast [draft]', c.mode) + '</select>',
+    html += ovlSetRow('编译模式', '<select data-setpath="compile.mode">' + ovlOptTag('normal', '正常', c.mode) + ovlOptTag('draft', '快速（草稿）', c.mode) + '</select>',
         'Fast 模式跳过部分排版工作，出图快但页码和交叉引用可能还没算准；定稿前用 Normal。这里和 PDF 工具条上 Recompile 旁边的菜单是同一个设置。');
-    html += ovlSetRow('Stop on first error', '<input type="checkbox" data-setpath="compile.haltOnError"' + (c.haltOnError ? ' checked' : '') + '>',
+    html += ovlSetRow('遇到第一个错误就停止', '<input type="checkbox" data-setpath="compile.haltOnError"' + (c.haltOnError ? ' checked' : '') + '>',
         '遇到第一个错误就停下来，不再往下编译。想快速定位是哪一处写错了的时候好用。');
-    html += ovlSetRow('Autocompile', '<input type="checkbox" data-setpath="compile.autoCompile"' + (c.autoCompile ? ' checked' : '') + '>',
+    html += ovlSetRow('自动编译', '<input type="checkbox" data-setpath="compile.autoCompile"' + (c.autoCompile ? ' checked' : '') + '>',
         '停止输入约 2.5 秒后自动编译一次，不用每次手动点 Recompile。');
     return html;
 }
 function ovlSettingsAppearanceHtml() {
     const s = OvlSettings;
-    let html = '<div class="ovl-set-category-title">Appearance</div>';
-    html += ovlSetRow('Editor theme', '<select data-setpath="settings.editorTheme">' + ovlOptTag('light', '浅色', s.editorTheme) + ovlOptTag('dark', '深色', s.editorTheme) + '</select>',
+    let html = '<div class="ovl-set-category-title">外观</div>';
+    html += ovlSetRow('编辑器主题', '<select data-setpath="settings.editorTheme">' + ovlOptTag('light', '浅色', s.editorTheme) + ovlOptTag('dark', '深色', s.editorTheme) + '</select>',
         '编辑器用浅色还是深色底。只改文字和背景颜色，不做语法着色。');
-    html += ovlSetRow('Dark mode PDF preview', '<input type="checkbox" data-setpath="settings.darkModePdf"' + (s.darkModePdf ? ' checked' : '') + '>',
+    html += ovlSetRow('PDF 预览深色模式', '<input type="checkbox" data-setpath="settings.darkModePdf"' + (s.darkModePdf ? ' checked' : '') + '>',
         '把右边的 PDF 反色显示，夜里看不刺眼。和 PDF 工具条上的 ◐ 按钮是同一个开关。');
-    html += ovlSetRow('Editor font size', '<select data-setpath="settings.fontSize">' + [10, 11, 12, 13, 14, 16].map(function (v) { return ovlOptTag(v, v + 'px', s.fontSize); }).join('') + '</select>',
+    html += ovlSetRow('编辑器字号', '<select data-setpath="settings.fontSize">' + [10, 11, 12, 13, 14, 16].map(function (v) { return ovlOptTag(v, v + 'px', s.fontSize); }).join('') + '</select>',
         '编辑器正文的字号，行号会跟着一起变。');
-    html += ovlSetRow('Editor font family', '<select data-setpath="settings.fontFamily">'
+    html += ovlSetRow('编辑器字体', '<select data-setpath="settings.fontFamily">'
         + ovlOptTag('ovl-mono-default', '系统等宽（SFMono/Consolas）', s.fontFamily)
         + ovlOptTag('ovl-mono-menlo', 'Menlo/Monaco', s.fontFamily)
         + ovlOptTag('ovl-mono-cascadia', 'Cascadia Code', s.fontFamily)
         + '</select>', '编辑器用哪种等宽字体。三个选项都是系统里通常已经装了的字体，不会额外下载。');
-    html += ovlSetRow('Editor line height', '<select data-setpath="settings.lineHeight">' + ovlOptTag('compact', 'Compact', s.lineHeight) + ovlOptTag('normal', 'Normal', s.lineHeight) + ovlOptTag('wide', 'Wide', s.lineHeight) + '</select>',
+    html += ovlSetRow('编辑器行高', '<select data-setpath="settings.lineHeight">' + ovlOptTag('compact', '紧凑', s.lineHeight) + ovlOptTag('normal', '正常', s.lineHeight) + ovlOptTag('wide', '宽松', s.lineHeight) + '</select>',
         '编辑器里每行文字之间的疏密程度。');
     return html;
 }
@@ -26696,7 +26949,7 @@ function ovlSettingsAppearanceHtml() {
 // 按钮进去（见下面这一行），不是漏迁。
 function ovlSettingsTranslatorHtml() {
     const s = OvlSettings;
-    let html = '<div class="ovl-set-category-title">Translator</div>';
+    let html = '<div class="ovl-set-category-title">翻译器</div>';
     // v2 P5：翻译器窗口自己的设置齿轮已经删除（renderHeader 顶部注释），入口改到这里。
     html += ovlSetRow('API Key / 模型列表（旧版设置）', '<button type="button" class="ovl-modal-btn" onclick="ovlCloseSettings(); ovlOpenTranslator(); openSettings();">打开旧版设置面板</button>',
         '三家在线 API 的 Key、Claude 的 CORS 代理地址、本地 LM Studio 连接、在线/本地模型的可见性勾选、按翻译/对话分开的默认模型——这些还留在这个旧版面板里（点开后停在「API」页签）。句对行距、跨栏高亮、传输协议、提示词、历史条数这些已经在下面搬了过来，这里不会重复。');
@@ -26848,19 +27101,40 @@ function ovlSetHistoryLimitCustom(value) {
     ovlRenderSettingsCategory('translator');
 }
 
-const OVL_SETTINGS_RENDERERS = { editor: ovlSettingsEditorHtml, spelling: ovlSettingsSpellingHtml, compiler: ovlSettingsCompilerHtml, appearance: ovlSettingsAppearanceHtml, translator: ovlSettingsTranslatorHtml };
+// v2 Pass P24：设置面板新分类「Overleaf 同步」——地址/token/自动拉取间隔三个字段全走通用
+// data-setpath 处理（ovlBindSettingsModal 的 change 委托），改动立刻存盘 + ovlApplySettings()
+// 里刷新按钮态/重设定时器，不需要专用的 change 处理函数。banner 写法照抄 ovlSettingsCompilerHtml。
+function ovlSettingsOverleafHtml() {
+    const s = OvlSettings;
+    let html = '<div class="ovl-set-category-title">Overleaf 同步</div>';
+    if (OvlState.bridgeOnline !== true) {
+        html += '<div class="ovl-set-banner"><strong>桥接服务未在线。</strong>下面这些设置会照常存起来，但要等桥接服务在线后才能真正拉取/推送。</div>';
+    }
+    html += ovlSetRow('Overleaf 项目地址', '<input type="text" data-setpath="settings.overleafProjectAddr" style="width:220px" placeholder="git.overleaf.com/... 或项目 ID" value="' + escapeAttr(s.overleafProjectAddr) + '">',
+        '在 Overleaf 项目页面「Menu → Git」里能看到这个项目的 git 地址，粘贴完整地址、网页地址、或者纯项目 ID 都可以，会自动识别。');
+    html += ovlSetRow('Overleaf Git Token', '<input type="password" data-setpath="settings.overleafToken" style="width:220px" placeholder="olp_..." value="' + escapeAttr(s.overleafToken) + '">',
+        '同样在 Overleaf 项目的 Git 设置里生成/查看。这个 token 能直接读写你的 Overleaf 项目，明文存在浏览器本地存储里（跟这个 App 里其它 API Key 同一种存法），不要在公用/他人电脑上填写。');
+    html += ovlSetRow('自动拉取间隔', '<select data-setpath="settings.overleafAutoPullMinutes">'
+        + [[0, '关闭'], [5, '5 分钟'], [15, '15 分钟'], [30, '30 分钟'], [60, '60 分钟']].map(function (p) { return ovlOptTag(p[0], p[1], s.overleafAutoPullMinutes); }).join('')
+        + '</select>',
+        '每隔多久自动从 Overleaf 拉取一次最新版本。只在「本地没有未提交改动、当前打开的文件也没有未保存的编辑」时才会真的执行，遇到冲突会自动跳过并在下方状态栏提示，不会自动覆盖你的本地修改。');
+    return html;
+}
+
+const OVL_SETTINGS_RENDERERS = { editor: ovlSettingsEditorHtml, spelling: ovlSettingsSpellingHtml, compiler: ovlSettingsCompilerHtml, appearance: ovlSettingsAppearanceHtml, translator: ovlSettingsTranslatorHtml, overleaf: ovlSettingsOverleafHtml };
 
 function ovlSettingsModalHtml() {
     return ''
         + '<div class="ovl-settings-modal">'
-        +   '<div class="ovl-settings-header"><span>Settings</span><button type="button" class="ovl-settings-closebtn" id="ovlSettingsCloseBtn">&times;</button></div>'
+        +   '<div class="ovl-settings-header"><span>设置</span><button type="button" class="ovl-settings-closebtn" id="ovlSettingsCloseBtn">&times;</button></div>'
         +   '<div class="ovl-settings-body">'
         +     '<div class="ovl-settings-sidebar">'
-        +       '<div class="ovl-settings-navitem" data-cat="editor">Editor</div>'
-        +       '<div class="ovl-settings-navitem" data-cat="spelling">Spelling</div>'
-        +       '<div class="ovl-settings-navitem" data-cat="compiler">Compiler</div>'
-        +       '<div class="ovl-settings-navitem" data-cat="appearance">Appearance</div>'
-        +       '<div class="ovl-settings-navitem" data-cat="translator">Translator</div>'
+        +       '<div class="ovl-settings-navitem" data-cat="editor">编辑器</div>'
+        +       '<div class="ovl-settings-navitem" data-cat="spelling">拼写检查</div>'
+        +       '<div class="ovl-settings-navitem" data-cat="compiler">编译</div>'
+        +       '<div class="ovl-settings-navitem" data-cat="appearance">外观</div>'
+        +       '<div class="ovl-settings-navitem" data-cat="translator">翻译器</div>'
+        +       '<div class="ovl-settings-navitem" data-cat="overleaf">Overleaf 同步</div>'
         +     '</div>'
         +     '<div class="ovl-settings-content" id="ovlSettingsContent"></div>'
         +   '</div>'
@@ -26919,7 +27193,7 @@ function ovlBindSettingsModal() {
         const parts = path.split('.');
         const store = parts[0] === 'compile' ? OvlCompileSettings : OvlSettings;
         let val = el.type === 'checkbox' ? el.checked : el.value;
-        if (path === 'settings.fontSize' || path === 'settings.tabSize') val = Number(val);
+        if (path === 'settings.fontSize' || path === 'settings.tabSize' || path === 'settings.overleafAutoPullMinutes') val = Number(val);
         store[parts[1]] = val;
         if (parts[0] === 'compile') { ovlSaveCompileSettings(); ovlUpdatePdfToolbarUI(); }
         else { ovlSaveSettings(); ovlApplySettings(); }
