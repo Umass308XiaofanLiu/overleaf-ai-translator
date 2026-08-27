@@ -18496,11 +18496,11 @@ async function chatAgentExecTool(toolName, args, projectDir, signal) {
 // 具体分工：
 //   - chatAgentAbsPath           把 projectDir + 相对路径拼成给人看的完整路径（纯展示用）
 //   - chatAgentProbeCheckpoint   探测 projectDir 是不是 git 工作树、能不能生成回退检查点——
-//                                复用 /fs/mkdir 对已存在的根目录（"."）是幂等操作这个事实当
-//                                "安全探针"：不新增服务端端点（本轮不改 server.js），也不会
-//                                真的创建/修改任何文件，只是顺手在 refs/ovl-checkpoints/ 下
-//                                多一个从未被回退过的检查点 ref（纯 git 对象数据库里的簿记，
-//                                不影响分支/工作区）。同一个 projectDir 只探一次，缓存复用。
+//                                v2 Pass P44 起改调只读端点 /fs/capabilities（server.js 只跑
+//                                一次 `git rev-parse --is-inside-work-tree`，不 add/commit/
+//                                update-ref，零副作用、不产生任何 refs/ovl-checkpoints/ 垃圾
+//                                ref）。此前（P43）曾拿写类端点 /fs/mkdir 对根目录 "." 当探针，
+//                                已彻底移除。同一个 projectDir 只探一次，缓存复用。
 //   - chatAgentPreviewAffected   执行前用只读的 /fs/list 递归预览"这个路径展开后是哪些文件"，
 //                                供确认框里的"受影响路径清单"用（写操作真正返回的 affected
 //                                字段这时候还没有——那是执行之后才有的，所以必须自己先探一遍）。
@@ -18542,9 +18542,9 @@ async function chatAgentProbeCheckpoint(projectDir, signal) {
         return ChatAgentCheckpointProbeCache;
     }
     try {
-        const resp = await fetch(ovlBridgeUrl('/fs/mkdir'), {
+        const resp = await fetch(ovlBridgeUrl('/fs/capabilities'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ projectDir: projectDir, path: '.' }),
+            body: JSON.stringify({ projectDir: projectDir }),
             signal: signal || undefined
         });
         const data = await resp.json();

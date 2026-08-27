@@ -1548,6 +1548,22 @@ function checkpointFields(cp) {
     return { checkpoint: cp.checkpoint, checkpointAvailable: cp.available, checkpointWarning: cp.warning || null };
 }
 
+// v2 Pass P44：纯只读的能力查询——只回答"这个目录能不能提供回退保障"，不产生任何副作用。
+// 跟 fsGitCheckpoint() 的关键区别：只跑一次 `git rev-parse --is-inside-work-tree`，
+// 绝不 add / write-tree / commit-tree / update-ref，因此不会在 refs/ovl-checkpoints/ 下
+// 留下任何 ref，也不碰真实 .git/index 或工作区文件。字段命名沿用 checkpointFields()，
+// 前端不用改数据结构；checkpoint 字段恒为 null（没有生成任何检查点对象）。
+async function doFsCapabilities(projectDir) {
+    const treeCheck = await runGitCommand(['rev-parse', '--is-inside-work-tree'], projectDir, null, FS_GIT_TIMEOUT_MS);
+    if (!treeCheck.ok || treeCheck.stdout.trim() !== 'true') {
+        return Object.assign({ ok: true }, checkpointFields({
+            available: false, checkpoint: null,
+            warning: '该目录不是 git 仓库（或不在 git 工作树内），本次操作无法提供回退保障。'
+        }));
+    }
+    return Object.assign({ ok: true }, checkpointFields({ available: true, checkpoint: null }));
+}
+
 async function doFsList(projectDir, relPath) {
     const r = resolveInProject(projectDir, relPath || '.');
     if (!r.ok) return { ok: false, error: r.error };
@@ -2001,7 +2017,7 @@ const server = http.createServer(async (req, res) => {
         // 跟 /overleaf/* 同样能真的改写用户磁盘上的文件，复用同一条跨域白名单纪律。
         if (req.method === 'POST' && (pathname === '/fs/list' || pathname === '/fs/read' || pathname === '/fs/mkdir'
             || pathname === '/fs/write' || pathname === '/fs/move' || pathname === '/fs/copy' || pathname === '/fs/delete'
-            || pathname === '/fs/restore')) {
+            || pathname === '/fs/restore' || pathname === '/fs/capabilities')) {
             if (!ovlOriginAllowed(req)) {
                 sendJson(res, 403, { ok: false, error: '拒绝来自外部网页的文件操作请求。这些接口只接受 AI-Translator 页面本身的调用。' });
                 return;
@@ -2018,6 +2034,10 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
 
+            if (pathname === '/fs/capabilities') {
+                sendJson(res, 200, await doFsCapabilities(projectDir));
+                return;
+            }
             if (pathname === '/fs/list') {
                 sendJson(res, 200, await doFsList(projectDir, body.path));
                 return;
