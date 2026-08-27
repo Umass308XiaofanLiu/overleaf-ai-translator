@@ -27024,14 +27024,29 @@ function ovlDeriveProjectPathFromLocation(folderName) {
 // 选/续开文件夹之后调用：猜得出来就自动填上项目绝对路径（同一份 localStorage，
 // 下次刷新也还在，跟手填是同一条路径，不是另建一套）；猜不出来什么都不做，
 // 保留用户可能已经手填的内容。
+//
+// v2 Pass P55（Bug 1 前端根因修复）：ovlDeriveProjectPathFromLocation() 的猜测前提是
+// "项目文件夹跟 AI-Translator.html 同一级目录"——这条前提在用户把真实项目挪进本仓库内部的
+// projects/CG 子目录之后不再成立：挑中 projects/CG 时 handle.name 只是末段"CG"，猜出来的会
+// 是一条压根不存在的路径（.../AI-Translator/CG，缺了中间的 projects/ 这一层，往往还恰好等于
+// 项目搬家前真实待过的旧位置）。旧版这里无条件把猜测写回输入框 + localStorage，一旦这条假路径
+// 被拿去点"拉取"，桥那边（修复前）就会在这条不存在的路径上凭空 mkdir+clone——这正是用户报告的
+// "点击拉取会自动在原本的位置克隆一个项目文件夹出来"。
+// 修复：猜出来的路径先问一遍桥这个路径是不是真实存在，确认存在才覆盖输入框/localStorage；
+// 不存在、桥离线或探测失败（ovlProjectHistoryProbePathExists 返回 null）一律保守地不覆盖——
+// 宁可保留用户手填/上一次真实生效的路径，也不能让一条编造出来的路径悄悄生效。
 function ovlAutoFillProjectPath(handle) {
     try {
         const guess = ovlDeriveProjectPathFromLocation(handle && handle.name);
         if (!guess) return;
         const input = document.getElementById('ovlProjectPathInput');
         if (!input) return;
-        input.value = guess;
-        try { localStorage.setItem(ovlProjectPathLsKey(), guess); } catch (e) {}
+        if (typeof ovlProjectHistoryProbePathExists !== 'function') return;
+        Promise.resolve(ovlProjectHistoryProbePathExists(guess)).then(function (exists) {
+            if (exists !== true) return; // null（没法判断）/false（确认不存在）都不覆盖
+            input.value = guess;
+            try { localStorage.setItem(ovlProjectPathLsKey(), guess); } catch (e) {}
+        }).catch(function () {});
     } catch (e) { console.error('[ovl] autoFillProjectPath failed', e); }
 }
 
@@ -27489,12 +27504,12 @@ function ovlFsDbOpen() {
     });
 }
 
-function ovlSaveDirHandleToIdb(handle) {
+function ovlSaveDirHandleToIdb(handle, key) {
     return ovlFsDbOpen().then(function (db) {
         return new Promise(function (resolve, reject) {
             try {
                 const tx = db.transaction(OVL_FS_DB_STORE, 'readwrite');
-                tx.objectStore(OVL_FS_DB_STORE).put(handle, OVL_FS_DB_KEY);
+                tx.objectStore(OVL_FS_DB_STORE).put(handle, key || OVL_FS_DB_KEY);
                 tx.oncomplete = function () { resolve(); };
                 tx.onerror = function () { reject(tx.error); };
             } catch (e) { reject(e); }
@@ -27502,16 +27517,35 @@ function ovlSaveDirHandleToIdb(handle) {
     });
 }
 
-function ovlLoadDirHandleFromIdb() {
+function ovlLoadDirHandleFromIdb(key) {
     return ovlFsDbOpen().then(function (db) {
         return new Promise(function (resolve, reject) {
             try {
                 const tx = db.transaction(OVL_FS_DB_STORE, 'readonly');
-                const req = tx.objectStore(OVL_FS_DB_STORE).get(OVL_FS_DB_KEY);
+                const req = tx.objectStore(OVL_FS_DB_STORE).get(key || OVL_FS_DB_KEY);
                 req.onsuccess = function () { resolve(req.result || null); };
                 req.onerror = function () { reject(req.error); };
             } catch (e) { reject(e); }
         });
+    });
+}
+
+// v2 Pass P55：项目历史里每一条本地记录各自的 FSA 句柄——跟上面"lastProject"单独一条不是
+// 一回事（那个只记"最近一个"，历史列表里点开任意一条早就点开过的记录，明明浏览器早就发过
+// readwrite 权限，却因为没存这条记录自己的句柄，被迫每次都重新弹一次系统原生选择器，还只能
+// 靠用户自己在弹出的对话框里手动认对文件夹——这是 Bug 2 的真根因）。key 用规范化路径拼前缀，
+// 同一个 OVL_FS_DB_STORE，不用另开一张表。
+const OVL_FS_DB_HISTORY_KEY_PREFIX = 'historyHandle:';
+function ovlHistoryHandleIdbKey(normalizedPath) { return OVL_FS_DB_HISTORY_KEY_PREFIX + normalizedPath; }
+function ovlSaveHistoryDirHandle(normalizedPath, handle) {
+    if (!normalizedPath || !handle) return Promise.resolve();
+    return ovlSaveDirHandleToIdb(handle, ovlHistoryHandleIdbKey(normalizedPath))
+        .catch(function (e) { console.warn('[ovl] persist history dir handle failed', e); });
+}
+function ovlLoadHistoryDirHandle(normalizedPath) {
+    if (!normalizedPath) return Promise.resolve(null);
+    return ovlLoadDirHandleFromIdb(ovlHistoryHandleIdbKey(normalizedPath)).catch(function (e) {
+        console.warn('[ovl] load history dir handle failed', e); return null;
     });
 }
 
@@ -27712,6 +27746,14 @@ function ovlProjectHistoryRecordLocalOpenFromInput() {
         if (!p) return;
         const name = (OvlState.dirHandle && OvlState.dirHandle.name) || ovlProjectHistoryBasename(p);
         ovlProjectHistoryAdd({ name: name, path: p, kind: ovlIsRemoteBridge() ? 'remote' : 'local' });
+        // v2 Pass P55：本地模式下顺手把这次真实换上的 FSA 句柄按这条记录的规范化路径存起来，
+        // 下次从项目历史点开同一条记录才有可能免掉一次系统原生选择器（见 ovlLoadHistoryDirHandle
+        // 头部注释）。远程模式没有真句柄，跳过；usingWebkitFallback 降级模式的句柄也不是真
+        // FileSystemDirectoryHandle，同样跳过。
+        if (!ovlIsRemoteBridge() && !OvlState.usingWebkitFallback && OvlState.dirHandle) {
+            const normId = ovlNormalizeProjectPath(p);
+            ovlSaveHistoryDirHandle(normId, OvlState.dirHandle);
+        }
     } catch (e) { console.warn('[ovl] record local open history failed', e); }
 }
 
@@ -27759,10 +27801,22 @@ function ovlFormatHistoryTime(iso) {
 // "打开项目"入口，见前端现状勘察 §3(b)）。existence 探测跟 pickFolder 并行触发、不 await 它再
 // 调 pickFolder——这次点击本身才是 showDirectoryPicker() 要求的那个真实用户手势，等一轮 fetch
 // 回来手势窗口就过期了（跟 ovlOverleafCloneFinishNamed 收尾时是同一条约束）。
+// v2 Pass P55（Bug 2 修复）：旧版无条件走 ovlPickFolder() 重弹一次系统原生选择器，选完不管
+// 用户在对话框里实际选中的是不是同一个文件夹，都把输入框覆盖回 entry.path——于是出现"文本显示
+// 的是点的那条历史，实际加载的文件树却是系统对话框恰好停留/记住的另一个文件夹（往往就是上次
+// 打开的那个）"，正是用户报告的"选完直接跳转到另外一个我上次打开的项目"。
+// 修复思路：本地模式下先尝试用 ovlLoadHistoryDirHandle() 找这条记录自己存过的 FSA 句柄——找到
+// 且权限还在/能重新授予，直接用它渲染文件树，全程不弹任何系统对话框（远程模式路径字符串本身
+// 就是事实来源，走 ovlPickFolder→ovlRemotePickFolder 用 entry.path 预填，不受此问题影响）。
+// 真的没有缓存句柄（比如这条历史是在这次修复之前就有的旧记录）才退回原生选择器兜底，但这时
+// 弹窗前先给一条明确说明用途的提示，选完后校验 handle.name 是否真的对得上这条记录的文件夹名——
+// 对不上就如实告知“你选的不是这个项目”，绝不再悄悄把路径文本改回 entry.path 冒充成功。
 function ovlProjectHistoryOpenEntry(entry, onClosed) {
     try {
         if (typeof onClosed === 'function') onClosed();
         const pathInput = document.getElementById('ovlProjectPathInput');
+        const isRemoteEntry = ovlIsRemoteBridge() || entry.kind === 'remote';
+
         if (pathInput) {
             pathInput.value = entry.path;
             try { localStorage.setItem(ovlProjectPathLsKey(), entry.path); } catch (e) {}
@@ -27775,21 +27829,87 @@ function ovlProjectHistoryOpenEntry(entry, onClosed) {
             }
         }).catch(function () {});
 
+        if (isRemoteEntry) {
+            // 远程模式：pathInput.value 已经是 entry.path，ovlRemotePickFolder() 会用它当预填值，
+            // 点"选择此文件夹"不改路径就是打开 entry 本身——这条链路本来就不受 Bug 2 影响。
+            if (typeof ovlPickFolder === 'function') {
+                Promise.resolve(ovlPickFolder()).catch(function (e) { console.warn('[ovl] open from history (remote) failed', e); });
+            }
+            return;
+        }
+
+        const expectedBasename = ovlProjectHistoryBasename(entry.path);
+        const normId = ovlNormalizeProjectPath(entry.path);
         const beforeHandle = OvlState.dirHandle;
-        if (typeof ovlPickFolder === 'function') {
+
+        function finishWithHandle(handle) {
+            OvlState.usingWebkitFallback = false;
+            OvlState.dirHandle = handle;
+            if (pathInput) {
+                pathInput.value = entry.path;
+                try { localStorage.setItem(ovlProjectPathLsKey(), entry.path); } catch (e) {}
+            }
+            ovlUpdateTreeToolbtnsVisibility();
+            return Promise.resolve(ovlRenderTree(handle)).then(function () {
+                try { ovlProjectHistoryAdd({ name: entry.name, path: entry.path, kind: entry.kind, projectId: entry.projectId }); } catch (e) {}
+                try { ovlSaveHistoryDirHandle(normId, handle); } catch (e) {}
+            });
+        }
+
+        // 走原生选择器兜底：不假设用户一定会选对——选完比对 handle.name 跟这条历史记录的文件夹
+        // 名是否一致，一致才当成功处理；不一致就诚实报告实际选中的是哪个文件夹，不冒充打开了
+        // entry，也不会把用户实际选中的这个文件夹的句柄错记到 entry 的缓存位上。
+        function fallbackToPicker() {
+            try { showToast('请在弹出的系统文件夹选择框中选择「' + expectedBasename + '」文件夹，用于重新授权访问', 'info'); } catch (e) {}
+            if (typeof ovlPickFolder !== 'function') return;
             Promise.resolve(ovlPickFolder()).then(function () {
-                if (OvlState.dirHandle && OvlState.dirHandle !== beforeHandle) {
-                    // ovlPickFolder 内部 ovlAutoFillProjectPath 会用"HTML 文件同级目录"猜一个路径
-                    // 把输入框覆盖掉——对这条历史记录大概率是错的，这里用已知为真的 entry.path 盖
-                    // 回去（跟 ovlOverleafCloneFinishNamed 收尾时同样的写法）。
+                if (!OvlState.dirHandle || OvlState.dirHandle === beforeHandle) return; // 用户取消，什么都没变
+                const pickedName = OvlState.dirHandle.name || '';
+                if (pickedName === expectedBasename) {
+                    // 名字对得上：认为选对了，路径文本仍以 entry.path 为准（同一目录只是显示用
+                    // 绝对路径字符串本来就取不到，跟原有行为一致），并顺手缓存句柄。
                     if (pathInput) {
                         pathInput.value = entry.path;
                         try { localStorage.setItem(ovlProjectPathLsKey(), entry.path); } catch (e) {}
                     }
                     try { ovlProjectHistoryAdd({ name: entry.name, path: entry.path, kind: entry.kind, projectId: entry.projectId }); } catch (e) {}
+                    try { ovlSaveHistoryDirHandle(normId, OvlState.dirHandle); } catch (e) {}
+                } else {
+                    // 名字对不上：不能就此当真——ovlPickFolder() 内部已经把 OvlState.dirHandle/
+                    // 文件树都换成了用户实际选中的这个（错的）文件夹，必须整个滚回选之前的状态，
+                    // 不然会出现"路径文本仍显示 entry.path，文件树却是另一个项目"这种更隐蔽的
+                    // 不一致——那正是 Bug 2 的病根（旧版就是选完直接采信、只把路径文本改回
+                    // entry.path，从不校验文件树是不是真的换对了）。绝不冒充打开了 entry，
+                    // 也不会把用户实际选中的这个文件夹的句柄错记到 entry 的缓存位上或历史列表里。
+                    OvlState.dirHandle = beforeHandle || null;
+                    OvlState.usingWebkitFallback = false;
+                    try { ovlUpdateTreeToolbtnsVisibility(); } catch (e) {}
+                    if (beforeHandle) {
+                        try { ovlRenderTree(beforeHandle); } catch (e) {}
+                    } else {
+                        try { const body = document.getElementById('ovlTreeBody'); if (body) body.textContent = ''; } catch (e) {}
+                    }
+                    // pathInput 从进入本函数起就一直是 entry.path，这条失败路径没有动过它，如实保留。
+                    try {
+                        showToast('你选择的是「' + pickedName + '」文件夹，跟历史记录里的「' + expectedBasename + '」不一致，没有打开——请重新点击这条历史记录，在弹出的选择框里选对文件夹', 'error');
+                    } catch (e) {}
                 }
             }).catch(function (e) { console.warn('[ovl] open from history failed', e); });
         }
+
+        ovlLoadHistoryDirHandle(normId).then(function (handle) {
+            if (!handle) { fallbackToPicker(); return; }
+            return ovlQueryRW(handle).then(function (perm) {
+                if (perm === 'granted') return { handle: handle, perm: perm };
+                return ovlRequestRW(handle).then(function (p2) { return { handle: handle, perm: p2 }; });
+            }).then(function (res) {
+                if (res && res.perm === 'granted') {
+                    return finishWithHandle(res.handle);
+                }
+                // 权限被拒绝（比如用户手动撤销了浏览器授权）：缓存的句柄已经用不了，退回原生选择器。
+                fallbackToPicker();
+            });
+        }).catch(function (e) { console.warn('[ovl] load cached history handle failed', e); fallbackToPicker(); });
     } catch (e) {
         console.error('[ovl] project history open entry failed', e);
         try { showToast('打开失败', 'error'); } catch (e2) {}

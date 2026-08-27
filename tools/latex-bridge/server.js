@@ -1070,34 +1070,44 @@ async function doOverleafPull(projectDir, gitUrl, token, strategy) {
         try { hasGitDir = fs.existsSync(gitDir); } catch (e) { hasGitDir = false; }
 
         if (!hasGitDir) {
+            // v2 Pass P55（Bug 1 修复）：以前这里发现目标目录不存在/不是 git 仓库时，会自己
+            // mkdir 再 git clone——「拉取」和「克隆」被悄悄合并成了一个动作。后果是：只要前端
+            // 传进来的 projectDir 是一个过期路径（比如用户把项目挪到了别处，输入框/localStorage
+            // 里还留着旧路径没同步），点一下"拉取"就会在那个过期路径上凭空造出一个新项目目录，
+            // 这正是用户报告的"点击拉取会在原本的位置克隆一个项目文件夹出来"。
+            // 现在拉取绝不新建目录、绝不 clone——目录不存在就是不存在，明确报错交回给用户去
+            // 核对/重选项目路径；克隆只应该由专门的"克隆"按钮（doOverleafClone，见下文/前端
+            // ovlOverleafClone 相关代码）触发，那条路径本来就要求用户走一次"存放位置"弹窗确认，
+            // 不会有过期路径静默生效的问题。
             let dirExists = false;
             try { dirExists = fs.existsSync(projectDir); } catch (e) {}
             if (!dirExists) {
-                try { fs.mkdirSync(projectDir, { recursive: true }); } catch (e) {
-                    return { ok: false, action: 'mkdir-failed', error: '创建项目目录失败: ' + e.message };
-                }
-            } else {
-                let entries = [];
-                try { entries = fs.readdirSync(projectDir); } catch (e) {
-                    return { ok: false, action: 'readdir-failed', error: '读取项目目录失败: ' + e.message };
-                }
-                if (entries.length > 0) {
-                    // 目录已存在文件但不是 git 仓库——绝不清空/覆盖，直接拒绝，交给用户手动处理。
-                    return {
-                        ok: false,
-                        action: 'refused-nonempty-dir',
-                        error: '该目录已存在文件但不是 git 仓库，为避免覆盖现有内容，不会自动 clone。请指向一个空目录，或手动在该目录跑 git init/git remote add/git pull 之后再用本功能。'
-                    };
-                }
+                return {
+                    ok: false,
+                    action: 'dir-not-found',
+                    error: '目标路径不存在：' + projectDir + '。拉取不会自动创建目录或克隆新项目——如果项目已经被移动或删除，请重新打开正确的项目文件夹后再拉取；需要克隆全新项目请使用"克隆"功能。'
+                };
             }
-            const cloneResult = await runGitCommand(['clone', gitUrl, '.'], projectDir, token);
-            if (!cloneResult.ok) {
-                return { ok: false, action: 'clone-failed', error: redactToken(cloneResult.stderr || cloneResult.stdout || 'git clone 失败', token) };
+            let entries = [];
+            try { entries = fs.readdirSync(projectDir); } catch (e) {
+                return { ok: false, action: 'readdir-failed', error: '读取项目目录失败: ' + e.message };
             }
-            // 走到这一步之前已经确认目录是空的（entries.length === 0）或者是本函数刚新建的，
-            // clone 只会写入远程仓库里已有的文件，不可能凭空冒出未跟踪文件，不必再花一次
-            // git 进程去查，直接给 0。
-            return { ok: true, action: 'cloned', untrackedCount: 0 };
+            if (entries.length > 0) {
+                // 目录已存在文件但不是 git 仓库——绝不清空/覆盖，直接拒绝，交给用户手动处理。
+                return {
+                    ok: false,
+                    action: 'refused-nonempty-dir',
+                    error: '该目录已存在文件但不是 git 仓库，为避免覆盖现有内容，不会自动 clone。请指向一个空目录，或手动在该目录跑 git init/git remote add/git pull 之后再用本功能。'
+                };
+            }
+            // 目录存在但是空的：同样不隐式 clone——「拉取」不应该在任何情况下悄悄变成「克隆」，
+            // 克隆只应该由用户主动点"克隆"按钮触发（该按钮会弹"存放位置"确认弹窗，见 P53）。
+            // 空目录多半也是同一类过期/误传路径的产物，报错比凭空造一个项目更安全。
+            return {
+                ok: false,
+                action: 'refused-empty-dir-not-repo',
+                error: '目标目录存在但不是 git 仓库（是空目录）：' + projectDir + '。拉取不会自动 clone——如果想在这个目录克隆项目，请使用"克隆"功能；如果这是一个过期路径，请重新打开正确的项目文件夹。'
+            };
         }
 
         // 已经是 git 仓库：dirty 检查必须先于任何网络操作。只看已跟踪文件（-uno）。
