@@ -1687,7 +1687,10 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    "深色下更清楚"的覆盖值——加了也用不上、还可能反过来在白底上显得突兀。以后 Visual 面板
    真的有了深色皮肤，只需要在 :root（约 368 行）那两个变量上覆盖新的深色值。 */
 /* ==================== v2 Pass P37：黄色"标记高亮"叠加层 ====================
-   G3 基础设施——反向 SyncTeX 单击跳转（G2）、查找跳转（G4）共用同一套 ovlMarkLines()。
+   G3 基础设施——反向 SyncTeX 单击跳转（G2）用 ovlMarkLines()（行级，天生只能定位到行）；
+   查找跳转（G4）v2 Pass P52 起改用同一套叠加层 + class 但字符区间精度的 ovlMarkRange()
+   （命中的是精确子串，不该被画成整行/整块），两者共享的只是这一层展示基础设施（overlay
+   容器、.ovl-mark-box、淡出计时器），不共享"精度"这件事。
    跟上面 #ovlVisualSelOverlay/.ovl-sel-box 那套蓝色选区叠加层刻意保持两条平行、互不修改的
    实现：颜色变量（--ovl-mark-*）、class（.ovl-mark-box）、容器 id 全部另起一份。
    #ovlVisualMarkOverlay 挂在 #ovlVisualPane 内部（跟 #ovlVisualSelOverlay 同一个挂法，随
@@ -25824,7 +25827,11 @@ function ovlBindVisualSelOverlay() {
 // 的路子是搭一个镜像 div（跟 24425 行附近软换行那套镜像同思路）逐字符测量，但折行 + 滚动
 // 的组合下极易跟真实渲染错位一像素两像素，维护成本压不住，而用户的实际用途是"跳过去一眼
 // 找到那一句"，整行色带足够、且不会撒谎（Visual 模式仍然是精确逐行方框，能做到就不将就）。
-const OvlMarkState = { lineFrom: -1, lineTo: -1 };
+// v2 Pass P52：rangeChars 是可选的字符级精度覆盖——[startChar,endChar)，#ovlCodeArea 坐标系。
+// null=当前是纯行级标记（ovlMarkLines 的调用方，或字符级映射失败退化）；非 null=还应该尝试
+// 按字符精度重画（ovlRepaintMarkOverlay 每次滚动/切模式都会用它现算，不缓存 DOM Range——
+// pane.innerHTML 整篇重写后旧 Range 就是野指针，必须每次从 rangeChars 现算）。
+const OvlMarkState = { lineFrom: -1, lineTo: -1, rangeChars: null };
 
 // v2 Pass P45：用户反馈黄色高亮"1 分钟后自动消失"——约 60 秒后开始淡出（CSS transition，
 // 见 #ovlVisualMarkOverlay/#ovlCodeMarkOverlay 的 .ovl-mark-fadeout 规则，约 1664 行附近），
@@ -25882,6 +25889,7 @@ function ovlClearVisualMarkOverlay() {
 function ovlClearMarkOverlay() {
     OvlMarkState.lineFrom = -1;
     OvlMarkState.lineTo = -1;
+    OvlMarkState.rangeChars = null;
     ovlMarkClearFadeTimers();
     ovlMarkResetFadeVisual();
     ovlClearCodeMarkOverlay();
@@ -25952,17 +25960,19 @@ function ovlVisualMarkRangeForLines(pane, lineFrom, lineTo) {
     } catch (e) { return null; }
 }
 
-function ovlPaintVisualMarkOverlay() {
+// 通用绘制：给一个 Visual DOM Range，按视觉行合并矩形、转叠加层坐标、画黄框。行级
+// （ovlPaintVisualMarkOverlay）和 P52 新增的字符级（ovlPaintVisualMarkOverlayFromChars）
+// 共用这一份——两者唯一的差别只是"怎么算出这个 Range"，画法完全一致。
+// 返回 true=确实画出了至少一个框，false=range 算出的矩形是空的（调用方应该把它当失败处理，
+// 别把叠加层留在半吊子状态）。
+function ovlPaintMarkOverlayForVisualRange(range) {
     try {
         const pane = document.getElementById('ovlVisualPane');
         const overlay = document.getElementById('ovlVisualMarkOverlay');
-        if (!pane || !overlay) return;
-        if (OvlState.editorMode !== 'visual' || OvlMarkState.lineFrom < 0
-            || pane.style.display === 'none' || !pane.offsetParent) { overlay.innerHTML = ''; return; }
-        const range = ovlVisualMarkRangeForLines(pane, OvlMarkState.lineFrom, OvlMarkState.lineTo);
-        if (!range) { overlay.innerHTML = ''; return; }
+        if (!pane || !overlay || !range) return false;
+        if (OvlState.editorMode !== 'visual' || pane.style.display === 'none' || !pane.offsetParent) { overlay.innerHTML = ''; return false; }
         const rows = ovlSelectionRowRectsViewport(range);
-        if (!rows.length) { overlay.innerHTML = ''; return; }
+        if (!rows.length) { overlay.innerHTML = ''; return false; }
         const paneRect = pane.getBoundingClientRect();
         const offX = pane.scrollLeft - paneRect.left;
         const offY = pane.scrollTop - paneRect.top;
@@ -25973,7 +25983,148 @@ function ovlPaintVisualMarkOverlay() {
                 + 'px;width:' + (row.right - row.left) + 'px;height:' + (row.bottom - row.top) + 'px;"></div>';
         }
         overlay.innerHTML = html;
+        return true;
+    } catch (e) { console.error('[ovl] paintMarkOverlayForVisualRange failed', e); return false; }
+}
+
+function ovlPaintVisualMarkOverlay() {
+    try {
+        const pane = document.getElementById('ovlVisualPane');
+        const overlay = document.getElementById('ovlVisualMarkOverlay');
+        if (!pane || !overlay) return;
+        if (OvlState.editorMode !== 'visual' || OvlMarkState.lineFrom < 0
+            || pane.style.display === 'none' || !pane.offsetParent) { overlay.innerHTML = ''; return; }
+        const range = ovlVisualMarkRangeForLines(pane, OvlMarkState.lineFrom, OvlMarkState.lineTo);
+        if (!range) { overlay.innerHTML = ''; return; }
+        ovlPaintMarkOverlayForVisualRange(range);
     } catch (e) { console.error('[ovl] paintVisualMarkOverlay failed', e); }
+}
+
+// ==================== v2 Pass P52：字符区间精度（Visual 侧的映射）====================
+// 源码字符区间 -> Visual 渲染 DOM Range。Visual 渲染文字跟源码不是逐字节对应（KaTeX 吃掉
+// 公式源码、命令被消化成格式而不是文字），没法直接用字符偏移量在渲染 DOM 里定位，只能退而
+// 求其次：①先找出"完整包住这段源码字符区间的那一个 .ovl-visual-block"（跨块的命中不处理，
+// 直接判失败——语义上"跨块"往往意味着命中跨越了不同渲染单元，强行拼接价值也不大）；
+// ②用块自己的源码文本（ovlVisualBlockSrcText 同一套坐标）切出命中的源码子串；③在这个块的
+// 渲染 DOM 里，按"这是源码里从块开头数第几次出现的这个子串"这个次序去定位渲染文字里对应的
+// 那一次出现——不假设逐字节对应，只假设"同一个词在段落里出现的先后次序，源码跟渲染后一致"
+// （对纯文字场景成立；命令被消化掉导致次序对不上/次数对不上时，下面会找不到足够次数的出现，
+// 返回 null，调用方退回整行高亮，不猜测、不画错位置）。
+// 实测踩过的坑（真机验证，不是纸面推导）：KaTeX 每条公式会同时渲一份 .katex-mathml
+// （屏幕阅读器专用的隐藏副本，CSS 用"1x1 裁切"经典手法藏起来，但 getClientRects() 量出来的
+// 1px×1px 矩形是"宽高都 >0"，会被后面 ovlSelectionRowRectsViewport 的 width>0&&height>0
+// 过滤器当成"有效矩形"放过去——直接用会画出一个几乎看不见的错位小方框，比"不画"更糟）
+// 和一份 .katex-html（真正可见渲染），两份的文字内容是重复的。TreeWalker 不排除的话，同一个
+// 词在段落里第 N 次出现，源码里数的次序跟"mathml/html 混在一起"的渲染次序对不上。这里显式
+// 跳过 .katex-mathml 子树，只在真正可见的那份渲染里数次序、定位——用一个真实 $jammer$ 公式
+// 结合 ovlVisualFindTextRangeInBlock 实测验证过跳过前/跳过后的行为差异。
+function ovlVisualFindTextRangeInBlock(blockEl, matchedText, occurrenceIndex) {
+    try {
+        if (!matchedText) return null;
+        const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
+            acceptNode: function (n) {
+                return (n.parentElement && n.parentElement.closest('.katex-mathml'))
+                    ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+            }
+        });
+        const nodes = [];
+        let concat = '', node;
+        while ((node = walker.nextNode())) {
+            nodes.push({ node: node, start: concat.length });
+            concat += node.nodeValue;
+        }
+        if (!concat) return null;
+        let searchFrom = 0, found = -1;
+        for (let i = 0; i <= occurrenceIndex; i++) {
+            found = concat.indexOf(matchedText, searchFrom);
+            if (found === -1) return null; // 渲染文字里这个词出现的次数比源码里少——映射失败
+            searchFrom = found + 1;
+        }
+        const matchEnd = found + matchedText.length;
+        function locate(pos) {
+            for (let i = 0; i < nodes.length; i++) {
+                const n = nodes[i];
+                const nEnd = n.start + n.node.nodeValue.length;
+                if (pos <= nEnd) return { node: n.node, offset: pos - n.start };
+            }
+            const last = nodes[nodes.length - 1];
+            return { node: last.node, offset: last.node.nodeValue.length };
+        }
+        const s = locate(found), e = locate(matchEnd);
+        const range = document.createRange();
+        range.setStart(s.node, Math.max(0, Math.min(s.node.nodeValue.length, s.offset)));
+        range.setEnd(e.node, Math.max(0, Math.min(e.node.nodeValue.length, e.offset)));
+        return range;
+    } catch (e) { return null; }
+}
+
+// startChar/endChar：#ovlCodeArea 坐标系；lineFrom/lineTo 是它俩换算出的 0-based 行区间
+// （调用方已经算好，避免这里重复算一遍 split('\n')）。
+function ovlVisualRangeForChars(pane, lineFrom, lineTo, startChar, endChar) {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || !pane) return null;
+        const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+        let target = null;
+        for (let i = 0; i < blocks.length; i++) {
+            const a = parseInt(blocks[i].getAttribute('data-src-line'), 10);
+            const zAttr = blocks[i].getAttribute('data-src-line-end');
+            const z = zAttr !== null ? parseInt(zAttr, 10) : a;
+            // 必须整段落在一个块的行区间内（完全包含，不是重叠）——命中横跨两个块的场景
+            // 直接判失败，不强行拼接两个块各自的渲染 DOM。
+            if (a <= lineFrom && z >= lineTo) { target = blocks[i]; break; }
+        }
+        if (!target) return null;
+        const a = parseInt(target.getAttribute('data-src-line'), 10);
+        const z = parseInt(target.getAttribute('data-src-line-end'), 10);
+        const chars = ovlGutterLineRangeToChars(ta, a, z);
+        const blockText = ta.value.slice(chars.start, chars.end);
+        const localStart = startChar - chars.start;
+        const localEnd = endChar - chars.start;
+        if (localStart < 0 || localEnd > blockText.length || localStart >= localEnd) return null;
+        const matchedText = blockText.slice(localStart, localEnd);
+        if (!matchedText) return null;
+        // 数出命中在块源码里是第几次出现（0-based）——次序作为源码→渲染的消歧依据。
+        let occurrenceIndex = 0, from = 0, idx;
+        while ((idx = blockText.indexOf(matchedText, from)) !== -1 && idx < localStart) {
+            occurrenceIndex++; from = idx + 1;
+        }
+        return ovlVisualFindTextRangeInBlock(target, matchedText, occurrenceIndex);
+    } catch (e) { return null; }
+}
+
+// 按实际命中的 Range 居中（比 ovlMarkCenterVisual 那套"整块/整行"更精确——直接用命中自己的
+// 视口矩形算中点），range 退化成 0 矩形（理论上不该发生，蓝色选区同款矩形早就在生产验证过
+// 不会）时退回 ovlMarkCenterVisual 兜底，不让页面卷到奇怪的地方。
+function ovlMarkCenterVisualRange(range) {
+    try {
+        const pane = document.getElementById('ovlVisualPane');
+        if (!pane || !range) return;
+        const r = range.getBoundingClientRect();
+        if (!r || (r.width === 0 && r.height === 0)) { ovlMarkCenterVisual(OvlMarkState.lineFrom, OvlMarkState.lineTo); return; }
+        const paneRect = pane.getBoundingClientRect();
+        const midY = pane.scrollTop + (r.top - paneRect.top) + r.height / 2;
+        let target = midY - pane.clientHeight / 2;
+        const maxScroll = Math.max(0, pane.scrollHeight - pane.clientHeight);
+        target = Math.max(0, Math.min(maxScroll, target));
+        pane.scrollTop = target;
+        const gutter = document.getElementById('ovlGutter');
+        if (gutter) gutter.scrollTop = pane.scrollTop;
+    } catch (e) { console.error('[ovl] markCenterVisualRange failed', e); }
+}
+
+// ovlRepaintMarkOverlay（滚动/resize/切模式重画）用这个——每次都从 OvlMarkState.rangeChars
+// 现算映射，不缓存 Range 对象（pane.innerHTML 随时可能整篇重写，缓存的 Range 会变成野指针）。
+// 返回 true=画成功；false=这一帧映射失败（调用方应该退回行级画法，不是留空）。
+function ovlPaintVisualMarkOverlayFromChars() {
+    try {
+        const pane = document.getElementById('ovlVisualPane');
+        if (!pane || !OvlMarkState.rangeChars) return false;
+        const range = ovlVisualRangeForChars(pane, OvlMarkState.lineFrom, OvlMarkState.lineTo,
+            OvlMarkState.rangeChars[0], OvlMarkState.rangeChars[1]);
+        if (!range) return false;
+        return ovlPaintMarkOverlayForVisualRange(range);
+    } catch (e) { console.error('[ovl] paintVisualMarkOverlayFromChars failed', e); return false; }
 }
 
 // Code 模式：整行色带，宽度铺满 #ovlCodeMarkOverlay（整个编辑器主体，含 gutter），高度/位置
@@ -25998,6 +26149,125 @@ function ovlPaintCodeMarkOverlay() {
     } catch (e) { console.error('[ovl] paintCodeMarkOverlay failed', e); }
 }
 
+// ==================== v2 Pass P52：字符区间精度（Code 侧的镜像测量）====================
+// 实测依据（决定"能不能做精确框"的关键判断，不是凭感觉）：#ovlCodeArea 的 CSS 是
+// white-space:pre-wrap + overflow-wrap:anywhere + overflow:auto（1591 行附近）——anywhere
+// 保证文本永远靠折行吃掉宽度，textarea 自身永远不会出现横向滚动（scrollLeft 恒为 0，
+// 只有纵向 scrollTop 要处理），这就去掉了镜像测量最容易出错的那个变量。而这套镜像 CSS
+// （字体/字号/行高/padding/box-sizing/white-space/overflow-wrap 逐项对齐，宽度按
+// ta.clientWidth 现测现设）本来就是生产在用的基础设施（ovlRecomputeLineOffsets 算软换行
+// 行数，逐行跟"全量 DOM 测量"版本交叉验证过零差异，见 26141 行附近的调试记录）——这里只是
+// 把"量一整行占几个视觉行"换成"量一行内某个字符区间的精确矩形"，同一份镜像、同一个
+// Range.getClientRects() 技术，可靠性继承那份实测结论。
+// 范围限定在"单行内命中"：命中跨越两个逻辑行（正则匹配到了换行符）要跨两个独立的 line-div
+// 拼接 Range，复杂度陡增，且多行命中本身用整行色带呈现也合理——ovlMarkRange 里直接判
+// lineFrom!==lineTo 就不进这个函数，退回行级。
+// 用独立的 #ovlCodeRangeMirror（不是 ovlGetCodeMirror 那个 #ovlCodeMirror）——避免跟
+// ovlRecomputeLineOffsetsChunked 正在进行的分片测量抢同一个容器：那个函数分片累积着挂在
+// #ovlCodeMirror 里的候选行 div，中途被这里的 mirror.textContent='' 清空会让它半路的
+// rowEls 引用变成已从 DOM 摘除的悬空节点，getBoundingClientRect() 全变 0——两套镜像各自
+// 独立的 DOM 子树，互不干扰。
+function ovlGetCodeRangeMirror() {
+    let mirror = document.getElementById('ovlCodeRangeMirror');
+    if (!mirror) {
+        mirror = document.createElement('div');
+        mirror.id = 'ovlCodeRangeMirror';
+        mirror.className = 'ovl-code-mirror';
+        document.body.appendChild(mirror);
+    }
+    return mirror;
+}
+
+// 返回值：null=量不出来（调用方退回行级）；否则是一个 box 数组（命中跨软换行边界时
+// getClientRects() 天然吐多个矩形，每个矩形一个 box），每个 box = { row, left, width, height }——
+// row 是相对全文档的累计视觉行号（跟 ovlVisualRowForLineIndex 同一套坐标，用于减去
+// ta.scrollTop 转视口坐标），left/width/height 是这一行内的局部像素矩形（相对该行内容
+// 左边界，不含 ta/gutter 的 padding，画的时候再加）。
+function ovlCodeMirrorMeasureRange(ta, lineIdx, startChar, endChar) {
+    try {
+        if (!ta) return null;
+        const chars = ovlGutterLineRangeToChars(ta, lineIdx, lineIdx);
+        const lineText = ta.value.slice(chars.start, chars.end);
+        const localStart = startChar - chars.start;
+        const localEnd = endChar - chars.start;
+        if (localStart < 0 || localEnd > lineText.length || localStart >= localEnd) return null;
+        const mirror = ovlGetCodeRangeMirror();
+        mirror.style.width = ta.clientWidth + 'px';
+        mirror.textContent = '';
+        const lineDiv = document.createElement('div');
+        const textNode = document.createTextNode(lineText);
+        lineDiv.appendChild(textNode);
+        mirror.appendChild(lineDiv);
+        const range = document.createRange();
+        range.setStart(textNode, localStart);
+        range.setEnd(textNode, localEnd);
+        const rawRects = Array.from(range.getClientRects()).filter(function (r) { return r.width > 0 && r.height > 0; });
+        const lineDivRect = lineDiv.getBoundingClientRect();
+        mirror.textContent = ''; // 量完立刻清空，离屏镜像不常驻大量节点
+        if (!rawRects.length) return null;
+        const rowStartBase = ovlVisualRowForLineIndex(lineIdx);
+        return rawRects.map(function (r) {
+            const localRow = Math.round((r.top - lineDivRect.top) / OVL_LINE_H);
+            return { row: rowStartBase + localRow, left: r.left - lineDivRect.left, width: r.width, height: r.height };
+        });
+    } catch (e) { console.error('[ovl] codeMirrorMeasureRange failed', e); return null; }
+}
+
+// 画法跟 ovlPaintCodeMarkOverlay（整行色带）平行独立：#ovlCodeMarkOverlay 铺满
+// .ovl-editor-body（含 gutter，1707 行 CSS），gutter 是 flex:0 0 auto 固定宽度（48px，
+// 1561 行），这里现测它的真实渲染宽度而不是硬编码常量——防御万一以后改了 CSS 数值。
+function ovlPaintCodeMarkRangeOverlay(boxes) {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        const overlay = document.getElementById('ovlCodeMarkOverlay');
+        if (!ta || !overlay) return false;
+        if (!boxes || !boxes.length) { overlay.innerHTML = ''; return false; }
+        if (OvlState.editorMode !== 'code' || ta.style.display === 'none' || !ta.offsetParent) { overlay.innerHTML = ''; return false; }
+        const paddingTop = 8, paddingLeft = 12; // .ovl-code-area 的 padding: 8px 12px（1591 行附近）
+        const gutter = document.getElementById('ovlGutter');
+        const gutterW = gutter ? gutter.getBoundingClientRect().width : 48;
+        let html = '';
+        for (let i = 0; i < boxes.length; i++) {
+            const b = boxes[i];
+            const top = paddingTop + b.row * OVL_LINE_H - ta.scrollTop;
+            const left = gutterW + paddingLeft + b.left - ta.scrollLeft;
+            html += '<div class="ovl-mark-box" style="left:' + left + 'px;top:' + top
+                + 'px;width:' + b.width + 'px;height:' + (b.height || OVL_LINE_H) + 'px;"></div>';
+        }
+        overlay.innerHTML = html;
+        return true;
+    } catch (e) { console.error('[ovl] paintCodeMarkRangeOverlay failed', e); return false; }
+}
+
+// 按命中自己的矩形居中（而不是整行）——多个 box（命中跨软换行）时取最小/最大行的中点。
+function ovlMarkCenterCodeRange(boxes) {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        const gutter = document.getElementById('ovlGutter');
+        if (!ta || !boxes || !boxes.length) return;
+        let rowMin = boxes[0].row, rowMax = boxes[0].row;
+        for (let i = 1; i < boxes.length; i++) { rowMin = Math.min(rowMin, boxes[i].row); rowMax = Math.max(rowMax, boxes[i].row); }
+        const midPx = (rowMin + rowMax + 1) / 2 * OVL_LINE_H;
+        let target = midPx - ta.clientHeight / 2;
+        const maxScroll = Math.max(0, ta.scrollHeight - ta.clientHeight);
+        target = Math.max(0, Math.min(maxScroll, target));
+        ta.scrollTop = target;
+        if (gutter) gutter.scrollTop = ta.scrollTop;
+    } catch (e) { console.error('[ovl] markCenterCodeRange failed', e); }
+}
+
+// ovlRepaintMarkOverlay 用这个重画（滚动/resize/切模式）——每次重新量，不缓存矩形（滚动/
+// resize 都可能改变折行位置）。返回 false=这一帧量不出来，调用方退回行级画法。
+function ovlPaintCodeMarkOverlayFromChars() {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || !OvlMarkState.rangeChars || OvlMarkState.lineFrom !== OvlMarkState.lineTo) return false;
+        const boxes = ovlCodeMirrorMeasureRange(ta, OvlMarkState.lineFrom, OvlMarkState.rangeChars[0], OvlMarkState.rangeChars[1]);
+        if (!boxes) return false;
+        return ovlPaintCodeMarkRangeOverlay(boxes);
+    } catch (e) { console.error('[ovl] paintCodeMarkOverlayFromChars failed', e); return false; }
+}
+
 // 滚动/resize/分栏拖动/切模式都走这一个 rAF 合并入口（跟 ovlScheduleFloatRelayout 同一条
 // 纪律，30473 行附近），没有激活的标记时 ovlRepaintMarkOverlay 直接短路，零开销。
 let OvlMarkOverlayRaf = null;
@@ -26008,11 +26278,18 @@ function ovlScheduleMarkOverlay() {
         ovlRepaintMarkOverlay();
     });
 }
+// P52：有 rangeChars 时优先尝试字符级重画，这一帧失败（内容变了/映射不到）才退回行级——
+// 不清掉 rangeChars（下一帧内容可能又对得上了），只是这一帧降级显示，不留空白。
 function ovlRepaintMarkOverlay() {
     try {
         if (OvlMarkState.lineFrom < 0) return;
-        if (OvlState.editorMode === 'visual') { ovlClearCodeMarkOverlay(); ovlPaintVisualMarkOverlay(); }
-        else { ovlClearVisualMarkOverlay(); ovlPaintCodeMarkOverlay(); }
+        if (OvlState.editorMode === 'visual') {
+            ovlClearCodeMarkOverlay();
+            if (!(OvlMarkState.rangeChars && ovlPaintVisualMarkOverlayFromChars())) ovlPaintVisualMarkOverlay();
+        } else {
+            ovlClearVisualMarkOverlay();
+            if (!(OvlMarkState.rangeChars && ovlPaintCodeMarkOverlayFromChars())) ovlPaintCodeMarkOverlay();
+        }
     } catch (e) { console.error('[ovl] repaintMarkOverlay failed', e); }
 }
 
@@ -26087,6 +26364,56 @@ function ovlMarkLines(lineFrom, lineTo, opts) {
         // v2 Pass P45：每一次真正画出新标记都要重置约 60 秒的自动淡出计时器。
         ovlMarkScheduleFadeOut();
     } catch (e) { console.error('[ovl] markLines failed', e); }
+}
+
+// ==== v2 Pass P52：字符区间精度的对外入口 ====
+// startChar/endChar：#ovlCodeArea（ta.value）里的字符偏移，[startChar,endChar)，含左闭右开，
+// 跟 ovlGutterLineRangeToChars 反方向操作同一套坐标系。用户反馈原话："查找栏输入一个单词，
+// 高亮的应该是对应的单词"——P37 把行级的 ovlMarkLines 复用到了查找场景，命中一个词却整行/
+// 整块地画黄框。这个新入口专门给"有精确字符区间"的调用方（目前是 ovlFindSelectCurrent）用；
+// ovlMarkLines 本身一个字节不改——点 PDF 跳转、SyncTeX 正向定位这些反向 SyncTeX 天生只能
+// 定位到行的场景，继续用 ovlMarkLines，语义没变。
+// 映射失败（Visual 侧渲染文字跟源码对不上号；Code 侧命中跨行）时明确退回 ovlMarkLines 的
+// 行级画法——不猜测字符位置、不画错位置，也不会什么都不画。
+function ovlMarkRange(startChar, endChar, opts) {
+    try {
+        void opts;
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta) return;
+        const text = ta.value;
+        startChar = Math.max(0, Math.min(text.length, startChar | 0));
+        endChar = Math.max(startChar, Math.min(text.length, endChar | 0));
+        const lineFrom = text.slice(0, startChar).split('\n').length - 1;
+        const lineTo = text.slice(0, endChar).split('\n').length - 1;
+        OvlMarkState.lineFrom = lineFrom;
+        OvlMarkState.lineTo = lineTo;
+        OvlMarkState.rangeChars = [startChar, endChar];
+        let painted = false;
+        if (OvlState.editorMode === 'visual') {
+            const pane = document.getElementById('ovlVisualPane');
+            const range = pane ? ovlVisualRangeForChars(pane, lineFrom, lineTo, startChar, endChar) : null;
+            ovlClearCodeMarkOverlay();
+            if (range) {
+                ovlMarkCenterVisualRange(range);
+                painted = ovlPaintMarkOverlayForVisualRange(range);
+            }
+        } else {
+            const boxes = (lineFrom === lineTo) ? ovlCodeMirrorMeasureRange(ta, lineFrom, startChar, endChar) : null;
+            ovlClearVisualMarkOverlay();
+            if (boxes) {
+                ovlMarkCenterCodeRange(boxes);
+                painted = ovlPaintCodeMarkRangeOverlay(boxes);
+            }
+        }
+        if (!painted) {
+            // 明确退回行级：清掉 rangeChars（下一次 repaint/scroll 也该老老实实走行级，不要
+            // 每帧都再尝试一次注定失败的字符级映射），复用 ovlMarkLines 已经验证过的行级实现。
+            OvlMarkState.rangeChars = null;
+            if (OvlState.editorMode === 'visual') { ovlMarkCenterVisual(lineFrom, lineTo); ovlPaintVisualMarkOverlay(); }
+            else { ovlMarkCenterCode(lineFrom, lineTo); ovlPaintCodeMarkOverlay(); }
+        }
+        ovlMarkScheduleFadeOut();
+    } catch (e) { console.error('[ovl] markRange failed', e); }
 }
 
 // 生命周期第③条"该栏发起新选区就清空"：Code 侧用 mousedown→mouseup 位移判定是不是一次真的
@@ -28390,16 +28717,20 @@ function ovlFindSelectCurrent() {
         // 未聚焦的 textarea 上一样生效并显示灰底选中，Replace/ReplaceAll 需要 ta 焦点时
         // 会在各自的函数体里自己 focus。
         ta.setSelectionRange(r[0], r[1]);
-        // 把命中行滚进视口 + 黄色高亮：v2 Pass P37 起改用 ovlMarkLines（G3 基础设施）——自动
-        // 判断 Code/Visual、居中（不再是"贴顶+减半屏"这种只在 Code 模式下成立的旧算法，
-        // Visual 模式下 ta.scrollTop 根本不是 Visual 面板的滚动位置）、画黄色高亮。命中可能
-        // 跨行（正则匹配到换行符），lineTo 用匹配结束位置的行号，不只看起点那一行。
-        const lineFrom = ta.value.slice(0, r[0]).split('\n').length - 1;
-        const lineTo = ta.value.slice(0, r[1]).split('\n').length - 1;
-        if (typeof ovlMarkLines === 'function') {
+        // 把命中滚进视口 + 黄色高亮：v2 Pass P52 起改用 ovlMarkRange（字符区间精度）——查找
+        // 命中的是一个精确的字符区间，不该被 ovlMarkLines 那套行级 API 画成整行/整块（用户反馈
+        // 原话："查找栏输入一个单词，高亮的应该是对应的单词"）。ovlMarkRange 内部自动判断
+        // Code/Visual、映射失败时自己退回行级，这里不用重复算 lineFrom/lineTo 传行级参数。
+        if (typeof ovlMarkRange === 'function') {
+            ovlMarkRange(r[0], r[1], { source: 'find' });
+        } else if (typeof ovlMarkLines === 'function') {
+            // 兜底①：ovlMarkRange 万一没定义（不该发生），退回 P37 的行级实现。
+            const lineFrom = ta.value.slice(0, r[0]).split('\n').length - 1;
+            const lineTo = ta.value.slice(0, r[1]).split('\n').length - 1;
             ovlMarkLines(lineFrom, Math.max(lineFrom, lineTo), { source: 'find' });
         } else {
-            // 兜底：ovlMarkLines 万一没定义（不该发生），至少保留旧的"贴顶滚动"不至于完全找不到。
+            // 兜底②：两个都没定义（不该发生），至少保留最早的"贴顶滚动"不至于完全找不到。
+            const lineFrom = ta.value.slice(0, r[0]).split('\n').length - 1;
             ta.scrollTop = Math.max(0, ovlVisualRowForLineIndex(lineFrom) * OVL_LINE_H - ta.clientHeight / 2);
             const gutter = document.getElementById('ovlGutter');
             if (gutter) gutter.scrollTop = ta.scrollTop;
