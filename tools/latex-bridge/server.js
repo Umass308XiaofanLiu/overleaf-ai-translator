@@ -791,7 +791,10 @@ const GIT_ASKPASS_HELPER = path.join(__dirname, 'git-askpass-helper.bat');
 // 不抛异常：spawn 失败、超时、非零退出码统统汇总成 {ok, code, stdout, stderr, timedOut} 返回。
 // timeoutMs 可选：不传时保持原来的 OVERLEAF_GIT_TIMEOUT_MS（pull/push 现有行为完全不变），
 // clone 一个带图片的论文仓库可能远超 30 秒，调用方会显式传一个更长的值。
-function runGitCommand(args, cwd, token, timeoutMs) {
+// extraEnv 可选（v2 Pass P41 新增，全部既有调用点都不传，行为完全不变）：额外合并进子进程
+// 环境变量的 {KEY: value} 对象，用于 fsGitCheckpoint()/doFsRestore() 借 GIT_INDEX_FILE 等
+// 变量把 git 操作限制在一个临时索引/工作树上，绝不触碰真实的 .git/index。
+function runGitCommand(args, cwd, token, timeoutMs, extraEnv) {
     return new Promise((resolve) => {
         let child;
         try {
@@ -802,7 +805,7 @@ function runGitCommand(args, cwd, token, timeoutMs) {
                     GIT_ASKPASS: GIT_ASKPASS_HELPER,
                     OVL_GIT_TOKEN: token || '',
                     GIT_TERMINAL_PROMPT: '0' // askpass 出问题时不许卡在交互式输入等待上
-                })
+                }, extraEnv || {})
             });
         } catch (e) {
             resolve({ ok: false, code: null, stdout: '', stderr: 'spawn git failed: ' + e.message, timedOut: false });
@@ -1375,18 +1378,23 @@ async function doOverleafClone(projectId, token) {
 //   2. 任何落在 .git/ 内部的路径（按路径分段精确匹配 ".git"，不是子串匹配，避免
 //      "xxx.gitignore" 这种正常文件被误伤）一律拒绝读写删除。
 //   3. write/mkdir/move/copy/delete 五个改变文件系统的操作，动手前都先调用
-//      fsGitCheckpoint() 打一个检查点：projectDir 是 git 工作树就
-//      `git add -A -- .` + `git commit`（pathspec 限定在 projectDir 自己这棵子树，
-//      不会因为 projectDir 恰好是某个更大仓库的子目录就把仓库其它地方的在途改动一并
-//      扫进这次的检查点提交）把"这次操作之前"的完整现场落成一个提交，返回它的
-//      commit hash 给前端展示"可回退到 X"；不是 git 工作树就明确 available:false
-//      + 中文 warning，绝不装作有回退保障。
+//      fsGitCheckpoint() 打一个检查点（v2 Pass P41 起改为"旁路 ref 快照"，见该函数
+//      头部注释）：projectDir 是 git 工作树就把"这次操作之前"的完整现场落成一个不
+//      挂在任何分支上的提交对象、挂到 refs/ovl-checkpoints/<id> 这个旁路 ref 下，
+//      绝不移动当前分支 HEAD、绝不产生分支上的提交、绝不碰用户真实的索引/工作区，
+//      返回它的 commit hash 给前端展示"可回退到 X"；不是 git 工作树就明确
+//      available:false + 中文 warning，绝不装作有回退保障。
+//      （P40 的旧实现是直接 `git add -A -- .` + `git commit` 到当前分支——这在
+//      projectDir 是用户真实项目仓库时会污染分支历史、且 push 时随手带进 Overleaf，
+//      已在 P41 彻底删除，不留开关。）
 //   4. move/delete 的响应里带 affected：受影响的完整相对路径清单（目录会展开成
 //      它下面全部文件的清单，不只报目录名）。
 //   5. 所有失败路径统一走 sendJson({ok:false, error:'中文错误'})，不会把未捕获异常
 //      直接摔成 500 堆栈——顶层路由的 try/catch 只是最后一道保险，各 do* 函数自己也是
 //      "不抛异常、统统汇总成 {ok,...} 返回" 的既有风格（镜像 runGitCommand 的写法）。
 //   6. 长操作走已有的 runGitCommand() 超时机制（30s），不新起一套超时逻辑。
+//   7. /fs/restore（P41 新增）：把工作区恢复到某个检查点当时的快照，语义与已知差异
+//      见 doFsRestore() 头部注释。
 // ---------------------------------------------------------------------------
 
 const FS_READ_MAX_BYTES = 1024 * 1024; // 1MB：读文件硬上限，见任务要求。
@@ -1472,34 +1480,68 @@ function looksBinary(buf) {
     return false;
 }
 
-// 改变文件系统前打的自动 git 检查点。projectDir 不是 git 工作树 -> available:false +
-// 中文 warning，绝不装作能回退。是工作树但当前没有任何改动可提交 -> 检查点就是现有
-// HEAD（created:false）。有改动 -> `git add -A -- .`（pathspec 限定在这棵子树）+ commit，
-// 检查点是新提交的 hash（created:true）。
+const FS_CHECKPOINT_REF_PREFIX = 'refs/ovl-checkpoints/';
+
+// 生成一个不会跟并发调用撞名、也不跟真实 .git/index 撞路径的临时索引文件路径。
+function fsTempIndexPath() {
+    return path.join(os.tmpdir(), 'ai-translator-ckpt-' + process.pid + '-' + Date.now() + '-' +
+        crypto.randomBytes(6).toString('hex') + '.index');
+}
+
+// 改变文件系统前打的自动 git 检查点——v2 Pass P41：旁路 ref 快照，不是分支提交。
+//
+// projectDir 不是 git 工作树 -> available:false + 中文 warning，绝不装作能回退。
+//
+// 是工作树 -> 用 git plumbing 把"此刻工作区的完整状态"（含未跟踪文件，尊重 .gitignore）
+// 落成一个提交对象，挂到 refs/ovl-checkpoints/<id> 这个旁路 ref 下，具体步骤：
+//   1. 用一个刚生成、此前不存在的临时文件路径当 GIT_INDEX_FILE（绝不是仓库真实的
+//      .git/index），在这个临时索引上跑 `git add -A -- .`——工作区状态被记进临时索引，
+//      用户真实的暂存区（无论里面有没有未提交的改动）全程没被这条命令碰过。
+//   2. `git write-tree`（仍指着这个临时索引）把它写成一个 tree 对象。
+//   3. `git commit-tree <tree> [-p <当前HEAD>]` 造一个提交对象——不写 refs/heads/*，
+//      HEAD 不存在（全新仓库还没有第一个提交）时不带 -p。
+//   4. `git update-ref refs/ovl-checkpoints/<id> <commit>` 把提交对象挂到旁路 ref 上。
+//      refs/ovl-checkpoints/* 不在 refs/heads/* 下，git push 默认不会推它。
+// 全程没有一步移动过当前分支、没有一步写过真实 .git/index、没有一步改过工作区文件。
+// 临时索引文件用完即删（finally 块，即使中途失败也清）。
 async function fsGitCheckpoint(projectDir, label) {
     const treeCheck = await runGitCommand(['rev-parse', '--is-inside-work-tree'], projectDir, null, FS_GIT_TIMEOUT_MS);
     if (!treeCheck.ok || treeCheck.stdout.trim() !== 'true') {
         return { available: false, checkpoint: null, warning: '该目录不是 git 仓库（或不在 git 工作树内），本次操作无法提供回退保障。' };
     }
-    const addResult = await runGitCommand(['add', '-A', '--', '.'], projectDir, null, FS_GIT_TIMEOUT_MS);
-    if (!addResult.ok) {
-        return { available: true, checkpoint: null, warning: '生成回退检查点失败（git add）：' + (addResult.stderr || addResult.stdout || '未知错误') };
-    }
-    const diffResult = await runGitCommand(['diff', '--cached', '--quiet'], projectDir, null, FS_GIT_TIMEOUT_MS);
-    if (diffResult.code === 0) {
-        const headResult = await runGitCommand(['rev-parse', 'HEAD'], projectDir, null, FS_GIT_TIMEOUT_MS);
-        if (!headResult.ok) {
-            return { available: true, checkpoint: null, warning: '仓库尚无任何提交，且当前也没有改动可提交，无法生成回退检查点。' };
+    const tmpIndex = fsTempIndexPath();
+    try {
+        const addResult = await runGitCommand(['add', '-A', '--', '.'], projectDir, null, FS_GIT_TIMEOUT_MS,
+            { GIT_INDEX_FILE: tmpIndex });
+        if (!addResult.ok) {
+            return { available: true, checkpoint: null, warning: '生成回退检查点失败（git add，临时索引）：' + (addResult.stderr || addResult.stdout || '未知错误') };
         }
-        return { available: true, checkpoint: headResult.stdout.trim(), created: false };
+        const writeTreeResult = await runGitCommand(['write-tree'], projectDir, null, FS_GIT_TIMEOUT_MS,
+            { GIT_INDEX_FILE: tmpIndex });
+        if (!writeTreeResult.ok) {
+            return { available: true, checkpoint: null, warning: '生成回退检查点失败（git write-tree）：' + (writeTreeResult.stderr || writeTreeResult.stdout || '未知错误') };
+        }
+        const tree = writeTreeResult.stdout.trim();
+        const headResult = await runGitCommand(['rev-parse', 'HEAD'], projectDir, null, FS_GIT_TIMEOUT_MS);
+        const headHash = headResult.ok ? headResult.stdout.trim() : null;
+        const commitMsg = 'AI-Translator fs checkpoint: ' + label + ' ' + new Date().toISOString();
+        const commitArgs = headHash
+            ? ['commit-tree', tree, '-p', headHash, '-m', commitMsg]
+            : ['commit-tree', tree, '-m', commitMsg];
+        const commitResult = await runGitCommand(commitArgs, projectDir, null, FS_GIT_TIMEOUT_MS);
+        if (!commitResult.ok) {
+            return { available: true, checkpoint: null, warning: '生成回退检查点失败（git commit-tree）：' + (commitResult.stderr || commitResult.stdout || '未知错误') };
+        }
+        const commitHash = commitResult.stdout.trim();
+        const refName = FS_CHECKPOINT_REF_PREFIX + Date.now() + '-' + crypto.randomBytes(4).toString('hex');
+        const updateRefResult = await runGitCommand(['update-ref', refName, commitHash], projectDir, null, FS_GIT_TIMEOUT_MS);
+        if (!updateRefResult.ok) {
+            return { available: true, checkpoint: commitHash, warning: '检查点提交对象已生成，但挂旁路 ref 失败（git update-ref）：' + (updateRefResult.stderr || updateRefResult.stdout || '未知错误') };
+        }
+        return { available: true, checkpoint: commitHash, ref: refName };
+    } finally {
+        try { fs.unlinkSync(tmpIndex); } catch (e) {}
     }
-    const commitMsg = 'AI-Translator fs checkpoint: ' + label + ' ' + new Date().toISOString();
-    const commitResult = await runGitCommand(['commit', '-m', commitMsg], projectDir, null, FS_GIT_TIMEOUT_MS);
-    if (!commitResult.ok) {
-        return { available: true, checkpoint: null, warning: '生成回退检查点失败（git commit）：' + (commitResult.stderr || commitResult.stdout || '未知错误') };
-    }
-    const headResult2 = await runGitCommand(['rev-parse', 'HEAD'], projectDir, null, FS_GIT_TIMEOUT_MS);
-    return { available: true, checkpoint: headResult2.ok ? headResult2.stdout.trim() : null, created: true };
 }
 
 function checkpointFields(cp) {
@@ -1607,6 +1649,104 @@ async function doFsDelete(projectDir, relPath) {
     return Object.assign({ ok: true, path: relPath, affected: affected }, checkpointFields(cp));
 }
 
+// 递归删除 root 下面因为 doFsRestore 删文件而产生的空目录（跳过 .git，且从不删 root 自己）。
+// 纯尽力而为：git 本来就不追踪空目录，这一步只是让恢复后的目录树看起来更干净，
+// 不是恢复语义正确性的一部分，失败了也不影响 doFsRestore 的主流程。
+function pruneEmptyDirs(root) {
+    (function walk(dir) {
+        let names;
+        try { names = fs.readdirSync(dir); } catch (e) { return; }
+        names.forEach((name) => {
+            if (name === '.git') return;
+            const full = path.join(dir, name);
+            let st;
+            try { st = fs.statSync(full); } catch (e) { return; }
+            if (!st.isDirectory()) return;
+            walk(full);
+            try { if (fs.readdirSync(full).length === 0) fs.rmdirSync(full); } catch (e) {}
+        });
+    })(root);
+}
+
+// v2 Pass P41：/fs/restore —— 把工作区恢复到某个 fsGitCheckpoint() 返回过的检查点当时
+// 的快照。checkpoint 既可以是旁路 ref 的 commit hash，也可以是任何 git 能识别的
+// commit-ish（比如 refs/ovl-checkpoints/<id> 本身）。
+//
+// 语义：
+//   1. 恢复动作本身先对"恢复前的当前状态"调用 fsGitCheckpoint() 打一个检查点——回退
+//      这个动作自己也可以再回退，不会因为"回错了"就没有退路。这一步失败不影响后续
+//      判断 checkpoint 是否有效（先校验 checkpoint 存在，校验通过才做这一步）。
+//   2. 用 `git ls-tree -r` 拿到目标快照里的完整文件清单，跟当前工作区实际存在的文件
+//      清单（跳过 .git）做差集：当前有、目标没有的文件——也就是"检查点之后新建的
+//      文件"——会被真的删除（recursive prune 顺手清掉因此产生的空目录），这样才能
+//      真正回到快照当时的状态，而不是只覆盖同名文件、把新建文件留在原地。
+//   3. 再用一次性的临时索引（同 fsGitCheckpoint 的手法，GIT_INDEX_FILE 指向刚生成的
+//      临时文件）`git read-tree <目标tree>` + `git checkout-index -a -f` 把目标快照
+//      的内容写回工作区——已存在的同名文件被覆盖、目标里有但当前没有的文件被创建。
+//      全程仍然不碰真实的 .git/index，也不移动当前分支。
+// 已知差异（如实说明，不是"完全等价"）：
+//   - 文件权限位（比如可执行位）不保证复原——checkout-index 写普通文件不保留 tree 里的
+//     可执行位以外的位（Windows 文件系统本来也没有 Unix 权限位的概念，这条在本项目的
+//     实际运行环境下影响可以忽略，但如实记录）。
+//   - 恢复后残留的空目录清理是尽力而为（pruneEmptyDirs 内部吞掉异常），极端情况下
+//     （比如某个空目录被占用无法删除）可能留下一个 git 本来就不追踪的空目录，不影响
+//     任何文件内容的正确性。
+async function doFsRestore(projectDir, checkpointRef) {
+    if (typeof checkpointRef !== 'string' || !checkpointRef.trim()) {
+        return { ok: false, error: 'checkpoint 缺失' };
+    }
+    const treeCheck = await runGitCommand(['rev-parse', '--is-inside-work-tree'], projectDir, null, FS_GIT_TIMEOUT_MS);
+    if (!treeCheck.ok || treeCheck.stdout.trim() !== 'true') {
+        return { ok: false, error: '该目录不是 git 仓库（或不在 git 工作树内），无法恢复。' };
+    }
+    const targetTreeResult = await runGitCommand(['rev-parse', '--verify', checkpointRef + '^{tree}'], projectDir, null, FS_GIT_TIMEOUT_MS);
+    if (!targetTreeResult.ok) {
+        return { ok: false, error: '找不到该检查点，或它不是一个有效的提交: ' + (targetTreeResult.stderr || targetTreeResult.stdout || '未知错误') };
+    }
+    const targetTree = targetTreeResult.stdout.trim();
+
+    // 恢复前先给当前状态打一个检查点，保证这次恢复本身也可回退。
+    const preCp = await fsGitCheckpoint(projectDir, 'before restore to ' + checkpointRef);
+
+    const lsResult = await runGitCommand(['ls-tree', '-r', '--name-only', targetTree], projectDir, null, FS_GIT_TIMEOUT_MS);
+    if (!lsResult.ok) {
+        return Object.assign({ ok: false, error: '读取检查点内容失败（git ls-tree）：' + (lsResult.stderr || lsResult.stdout || '未知错误') }, checkpointFields(preCp));
+    }
+    const targetFiles = new Set(lsResult.stdout.split(/\r?\n/).map((s) => s.trim()).filter((s) => s.length > 0));
+
+    const currentFiles = collectAffectedRelPaths(projectDir, projectDir).map((p) => p.split(path.sep).join('/'));
+    const removedExtraFiles = [];
+    currentFiles.forEach((rel) => {
+        if (!targetFiles.has(rel)) {
+            try { fs.rmSync(path.join(projectDir, rel), { force: true }); removedExtraFiles.push(rel); } catch (e) {}
+        }
+    });
+    try { pruneEmptyDirs(projectDir); } catch (e) {}
+
+    const tmpIndex = fsTempIndexPath();
+    try {
+        const extraEnv = { GIT_INDEX_FILE: tmpIndex, GIT_WORK_TREE: projectDir };
+        const readTreeResult = await runGitCommand(['read-tree', targetTree], projectDir, null, FS_GIT_TIMEOUT_MS, extraEnv);
+        if (!readTreeResult.ok) {
+            return Object.assign({ ok: false, error: '恢复失败（git read-tree）：' + (readTreeResult.stderr || readTreeResult.stdout || '未知错误') }, checkpointFields(preCp));
+        }
+        const checkoutResult = await runGitCommand(['checkout-index', '-a', '-f'], projectDir, null, FS_GIT_TIMEOUT_MS, extraEnv);
+        if (!checkoutResult.ok) {
+            return Object.assign({ ok: false, error: '恢复失败（git checkout-index）：' + (checkoutResult.stderr || checkoutResult.stdout || '未知错误') }, checkpointFields(preCp));
+        }
+    } finally {
+        try { fs.unlinkSync(tmpIndex); } catch (e) {}
+    }
+
+    return Object.assign({
+        ok: true,
+        restoredTo: checkpointRef,
+        filesRestored: targetFiles.size,
+        removedExtraFiles: removedExtraFiles,
+        note: '已恢复到检查点当时的文件内容。已知差异：不保证复原文件权限位；恢复后残留空目录的清理是尽力而为。'
+    }, checkpointFields(preCp));
+}
+
 // 只用于 /overleaf/* 这三个能动用户真实 git 仓库的路由：拒绝来自任意网页的跨域驱动。
 // 浏览器发起跨域 fetch 时一定会带 Origin 头且不可伪造，所以白名单足以挡住恶意页面；
 // 没有 Origin 头的（curl / node 脚本 / 本地测试）放行，因为那本来就不是这条攻击链。
@@ -1647,7 +1787,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete. WebSocket on same host:port for disk-change push.');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete, POST /fs/restore. WebSocket on same host:port for disk-change push.');
             return;
         }
 
@@ -1860,7 +2000,8 @@ const server = http.createServer(async (req, res) => {
         // v2 Pass P40：/fs/* 受限文件操作端点——见 resolveInProject/fsGitCheckpoint 头部注释。
         // 跟 /overleaf/* 同样能真的改写用户磁盘上的文件，复用同一条跨域白名单纪律。
         if (req.method === 'POST' && (pathname === '/fs/list' || pathname === '/fs/read' || pathname === '/fs/mkdir'
-            || pathname === '/fs/write' || pathname === '/fs/move' || pathname === '/fs/copy' || pathname === '/fs/delete')) {
+            || pathname === '/fs/write' || pathname === '/fs/move' || pathname === '/fs/copy' || pathname === '/fs/delete'
+            || pathname === '/fs/restore')) {
             if (!ovlOriginAllowed(req)) {
                 sendJson(res, 403, { ok: false, error: '拒绝来自外部网页的文件操作请求。这些接口只接受 AI-Translator 页面本身的调用。' });
                 return;
@@ -1915,6 +2056,11 @@ const server = http.createServer(async (req, res) => {
             if (pathname === '/fs/delete') {
                 if (!body.path || typeof body.path !== 'string') { sendJson(res, 400, { ok: false, error: 'path is required' }); return; }
                 sendJson(res, 200, await doFsDelete(projectDir, body.path));
+                return;
+            }
+            if (pathname === '/fs/restore') {
+                if (!body.checkpoint || typeof body.checkpoint !== 'string') { sendJson(res, 400, { ok: false, error: 'checkpoint is required' }); return; }
+                sendJson(res, 200, await doFsRestore(projectDir, body.checkpoint));
                 return;
             }
         }
