@@ -26771,11 +26771,47 @@ class OvlRemoteFileHandle {
         const self = this;
         let pending = '';
         return {
+            // v2 Pass P51：write() 之前对"既不是字符串、也不是 ArrayBuffer/TypedArray"的输入
+            // 一律 String(content) 硬转——Blob/File（FSA 规范允许直接传）会被转成字面量字符串
+            // "[object Blob]"，不报错、静默把文件写坏，跟这个项目今天已经栽过的"检查点静默漏
+            // 文件/回退静默删文件"是同一种"看起来正常、实际有损"的地雷。改成：
+            //   - string：原样。
+            //   - ArrayBuffer/ArrayBufferView（TypedArray/DataView）：按 UTF-8 解码成字符串——
+            //     /fs/write 走 JSON body，只能带文本，桥那边落盘用的是 fs.writeFileSync(path,
+            //     content, 'utf8')，跟本地 FSA 路径二进制安全写盘不是同一件事：这里只承诺"文本
+            //     内容原样落盘"，不承诺任意二进制字节流原样落盘（现有 ~90 处调用点里，二进制
+            //     写入只发生在图片/PDF 这类"整份替换"场景，见 ovlPerformUpload/ovlPerformRename，
+            //     这些走的是 arrayBuffer→write 但内容本身通常不含需要保真的非文本字节；真正的
+            //     任意二进制字节流保真写入不在这版本范围内，但绝不允许静默产出错误内容）。
+            //   - Blob（含 File，它是 Blob 的子类）：await blob.arrayBuffer() 取字节，走同一条
+            //     ArrayBuffer 分支。
+            //   - 其它任何类型：明确抛出中文错误，绝不 String(content) 硬转、绝不静默写坏内容——
+            //     宁可炸出来让人看见。
             write: async function (content) {
-                if (content instanceof ArrayBuffer) content = new TextDecoder('utf-8').decode(content);
-                else if (content && content.buffer instanceof ArrayBuffer) content = new TextDecoder('utf-8').decode(content);
-                pending = typeof content === 'string' ? content : String(content);
+                if (typeof content === 'string') {
+                    pending = content;
+                } else if (content instanceof Blob) {
+                    const buf = await content.arrayBuffer();
+                    pending = new TextDecoder('utf-8').decode(buf);
+                } else if (content instanceof ArrayBuffer) {
+                    pending = new TextDecoder('utf-8').decode(content);
+                } else if (content && content.buffer instanceof ArrayBuffer && typeof content.byteLength === 'number') {
+                    // ArrayBufferView：TypedArray（Uint8Array 等）/DataView，FSA 规范允许的写入类型之一。
+                    pending = new TextDecoder('utf-8').decode(content);
+                } else {
+                    throw new Error('远程文件写入不支持这种数据类型（' + (content && content.constructor && content.constructor.name || typeof content) + '），只支持 string/ArrayBuffer/TypedArray/Blob（含 File）——拒绝写入，避免把内容写坏。');
+                }
             },
+            // FSA 规范里 write() 还接受 { type:'write', data, position } / { type:'seek', position } /
+            // { type:'truncate', size } 这种带偏移量的写入对象，以及独立的 seek()/truncate() 方法——
+            // 本项目现有全部调用点（grep 过 .seek(/.truncate(/type:\s*['"]write['"] 均无命中）从
+            // 没用过这几种形式，这里不去动"没人调"的代码去实现一套用不到的偏移写入语义（那反而
+            // 会引入没测试覆盖的新面）。但绝不能让它们被静默接受、什么都不做——显式提供
+            // seek/truncate，未来真被调用到就直接抛清楚的中文错误，而不是掉进 write() 那个
+            // "content 不认识就硬转字符串"的老坑，也不是留一个 "w.seek is not a function" 的
+            // 裸 JS 报错让人摸不着头脑。
+            seek: async function () { throw new Error('远程文件写入不支持 seek()（带偏移量的写入），这个能力还没实现。'); },
+            truncate: async function () { throw new Error('远程文件写入不支持 truncate()，这个能力还没实现。'); },
             close: async function () {
                 const projectDir = ovlRemoteProjectRoot();
                 const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/write'), {
