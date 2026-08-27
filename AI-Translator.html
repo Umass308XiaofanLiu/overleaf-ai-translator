@@ -758,9 +758,19 @@ body.is-resizing-settings-modal * {
 }
 #aiChatRoot .aichat-focus-h { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
 #aiChatRoot .aichat-focus-label { font-weight: 800; letter-spacing: 0.03em; flex: 0 0 auto; }
-/* v2 Pass P35：.aichat-focus-spacer / .aichat-focus-clear 整块删掉——「全部清除」按钮本体
-   挪到翻译窗口头部 #focusClearAllBtn 了（见 renderHeader / focusRenderChip 的注释），
-   这里的 head 行现在只剩 label，不再需要一个把 clear 推到最右边的 spacer。 */
+#aiChatRoot .aichat-focus-spacer { flex: 1 1 auto; }
+#aiChatRoot .aichat-focus-clear {
+    flex: 0 0 auto;
+    border: 1px solid #fcd34d;
+    background: #fef3c7;
+    color: #92400e;
+    border-radius: 6px;
+    font-size: 9px;
+    font-weight: 800;
+    padding: 1px 6px;
+    cursor: pointer;
+}
+#aiChatRoot .aichat-focus-clear:hover { background: #fde68a; color: #78350f; }
 #aiChatRoot .aichat-focus-item { display: flex; align-items: center; gap: 5px; padding: 1px 0; }
 #aiChatRoot .aichat-focus-kind {
     flex: 0 0 auto;
@@ -5818,33 +5828,8 @@ function focusSig() {
 // 【为什么非要有这个】十分钟前标的一处关注，会一直悄悄地跟着每一轮问话走。
 // 不把它摆在眼前，用户就会拿一个自己都忘了的重点去问一个不相干的问题，
 // 然后觉得模型「答得莫名其妙」。
-// v2 Pass P35：「全部清除」按钮本体已经从这个 chip 挪到翻译窗口头部（renderHeader 里
-// #focusClearAllBtn，紧跟在「重新生成所有翻译」右侧），这里只负责把它的 disabled/文案
-// 状态跟 FocusState 同步——写法照抄 translateBtn 那条注释里说的规矩："disabled 必须由
-// 这边直接改到 DOM 上"，不等重渲染。放在独立函数里是因为 focusRenderChip 下面还有一条
-// "chat footer 里的 slot 不存在就整段跳过" 的早退（chat 窗口还没建过），但头部按钮跟
-// chat 窗口是否已建无关，不能被那条早退连带跳过。
-function ovlTransSyncFocusClearBtn() {
-    try {
-        const btn = document.getElementById('focusClearAllBtn');
-        if (!btn) return;
-        const n = (typeof FocusState !== 'undefined' && FocusState && FocusState.entries) ? FocusState.entries.length : 0;
-        btn.disabled = (n === 0);
-        btn.classList.toggle('bg-slate-200', n === 0);
-        btn.classList.toggle('text-slate-400', n === 0);
-        btn.classList.toggle('cursor-not-allowed', n === 0);
-        btn.classList.toggle('bg-amber-500', n > 0);
-        btn.classList.toggle('text-white', n > 0);
-        btn.classList.toggle('hover:bg-amber-600', n > 0);
-        btn.classList.toggle('shadow-amber-200', n > 0);
-        btn.setAttribute('data-tip', n
-            ? ('取消全部关注（' + n + ' 处）。文档上下文不受影响 —— 下一轮照样带整篇译文。')
-            : '当前没有已标记的「额外关注」。');
-    } catch (e) { console.error('[focus] syncClearBtn failed', e); }
-}
 function focusRenderChip() {
     try {
-        ovlTransSyncFocusClearBtn();
         const slot = document.getElementById('aiChatFocusSlot');
         if (!slot) return;
         slot.textContent = '';
@@ -5887,9 +5872,18 @@ function focusRenderChip() {
             + '那一条会被自动取消并在这里告诉你 —— 整行条目和片段条目一视同仁。'
             + '暂时解不出来又还没到复核时机的（比如刚刷新、文档还没加载），会在括号里如实报「只发得出几处」。');
         label.setAttribute('data-tip-pos', 'top-start');
-        // v2 Pass P35：「全部清除」按钮挪到翻译窗口头部（#focusClearAllBtn），这里不再重复
-        // 一份——spacer 也一并去掉，label 独占这一行。
+        const spacer = document.createElement('span');
+        spacer.className = 'aichat-focus-spacer';
+        const clear = document.createElement('button');
+        clear.type = 'button';
+        clear.className = 'aichat-focus-clear';
+        clear.textContent = '全部清除';
+        clear.setAttribute('data-tip', '取消全部关注。文档上下文不受影响 —— 下一轮照样带整篇译文。');
+        clear.setAttribute('data-tip-pos', 'top-end');
+        clear.addEventListener('click', function () { focusClearAll(); });
         head.appendChild(label);
+        head.appendChild(spacer);
+        head.appendChild(clear);
         box.appendChild(head);
 
         for (let i = 0; i < entries.length; i++) {
@@ -15652,13 +15646,14 @@ function renderHeader() {
                 <button onclick="handleRegenerateAll()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="ovl-t-regen p-2.5 rounded-2xl transition-all shadow-xl active:scale-95 flex items-center justify-center ${AppState.translationPairs.length === 0 ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isRegeneratingAll ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isRegeneratingAll ? '正在逐句重译，点一下停下来。' : '用当前模型把每一句重新翻一遍（原文不动）。换了模型、或对整体译文不满意时用它；再点一次可中断。'}" data-tip-pos="bottom-end">
                     ${AppState.isRegeneratingAll ? `<span class="animate-pulse">${Icons.StopCircle}</span>` : Icons.RefreshCw}
                 </button>
-                <!-- v2 Pass P35：原来挂在 AI 对话窗footer 里的「全部清除」（清的是 FocusState 额外
-                     关注标记，不是译文本身，见 focusClearAll()）挪到这里、紧跟在「重新生成所有
-                     翻译」右侧。故意不带 .ovl-t-regen/.ovl-t-panelhead/.ovl-t-syncdetect 里任何一个
-                     class——那三个是简化模式专门挂 display:none 的钩子，简化模式下这颗按钮要保留。
-                     没有关注条目时禁用；实时状态由 ovlTransSyncFocusClearBtn()（focusAfterChange
-                     收口时调用，见约 5827 行）直接改 DOM，和 translateBtn 的 disabled 同一套做法。 -->
-                <button id="focusClearAllBtn" type="button" onclick="focusClearAll()" ${(typeof FocusState === 'undefined' || !FocusState.entries.length) ? 'disabled' : ''} class="ovl-t-focusclear p-2.5 rounded-2xl transition-all shadow-xl active:scale-95 flex items-center justify-center ${(typeof FocusState === 'undefined' || !FocusState.entries.length) ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-amber-500 text-white hover:bg-amber-600 shadow-amber-200'}" data-tip="取消全部关注。文档上下文不受影响 —— 下一轮照样带整篇译文。" data-tip-pos="bottom-end">
+                <!-- v2 Pass P36：真正的「一键清除全部内容」（清输入框 + 左右两栏，见 handleClear()）
+                     从源面板表头（.ovl-t-panelhead，简化模式下整块隐藏）搬到这里、紧跟在「重新生成
+                     所有翻译」右侧。故意不带 .ovl-t-regen/.ovl-t-panelhead/.ovl-t-tools/.ovl-t-syncdetect
+                     里任何一个 class——那几个是简化模式专门挂 display:none 的钩子，简化模式下这颗
+                     按钮要保留。配色沿用它原本的次要/危险语义（灰底、悬停变红），不跟 regen 一样抢眼。
+                     上一轮（P35）曾误把这个位置留给 focusClearAllBtn（取消关注，另一个按钮），已改正
+                     —— 那个按钮已还原回 AI 对话窗 footer 的 focusRenderChip() 里。 -->
+                <button type="button" onclick="handleClear()" class="p-2.5 rounded-2xl border border-slate-200 text-slate-400 hover:text-rose-500 hover:bg-rose-50 transition-all active:scale-95 flex items-center justify-center" data-tip="清空输入框和左右两栏的全部内容，重新开始。已保存过的历史快照不受影响。" data-tip-pos="bottom-end">
                     ${Icons.Trash2}
                 </button>
             </div>
@@ -15961,7 +15956,6 @@ function renderSourcePanel() {
                             </button>
                         </div>
                     ` : ''}
-                    <button onclick="handleClear()" class="text-slate-400 hover:text-rose-500 p-2 transition-colors" data-tip="清空输入框和左右两栏的全部内容，重新开始。已保存过的历史快照不受影响。" data-tip-pos="left">${Icons.Trash2}</button>
                 </div>
             </div>
             <div class="flex-grow flex flex-col overflow-hidden bg-slate-50/20">
