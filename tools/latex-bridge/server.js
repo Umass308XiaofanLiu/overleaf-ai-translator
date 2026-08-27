@@ -1512,19 +1512,45 @@ function fsTempIndexPath() {
         crypto.randomBytes(6).toString('hex') + '.index');
 }
 
+// 拿 <commit-ish>（可以是 HEAD，也可以是任何 tree-ish）下面的完整"已跟踪路径"清单
+// （相对仓库根，'/' 分隔）。commit-ish 不存在（比如全新仓库还没有第一个提交）时返回
+// 空数组而不是报错——调用方按"没有 HEAD 就没有基线可比对"处理。
+async function fsListTreeFiles(projectDir, commitish) {
+    const r = await runGitCommand(['ls-tree', '-r', '--name-only', commitish], projectDir, null, FS_GIT_TIMEOUT_MS);
+    if (!r.ok) return [];
+    return r.stdout.split(/\r?\n/).map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
 // 改变文件系统前打的自动 git 检查点——v2 Pass P41：旁路 ref 快照，不是分支提交。
+// v2 Pass P46（本次修复，事故编号见函数外的调用方注释）：修了两处：
+//   (a) 临时索引不再从空白开始，先 `git read-tree HEAD` 把 HEAD 的已跟踪文件集合读进去，
+//       再 `git add -A -- .`——这样这些文件在这个临时索引里"本来就是已跟踪的"，
+//       `.gitignore` / `.git/info/exclude` 的忽略规则不会把它们从快照里排除掉（忽略规则
+//       只对"未跟踪"路径生效，这是 git 本身的语义，不是本函数发明的）。
+//       事故复盘：旧实现临时索引从空白开始，对空索引而言仓库里每个文件都是"未跟踪"的，
+//       于是 `.git/info/exclude` 里的 `/report/`、`*.drawio` 之类规则会静默漏掉这些
+//       已跟踪文件，快照树因此比 HEAD 少 248 个文件，全程没有任何报错信号。
+//   (b) 生成快照树之后，跟 HEAD 做一次完整性自检（见 fsCheckpointIntegrityCheck）：
+//       HEAD 里已跟踪、且当前工作区仍然存在的文件，必须每一个都出现在快照树里；
+//       少了就不再静默返回一个"看起来正常、其实残缺"的检查点——直接判定
+//       available:false + 明确中文 warning，前端/调用方不能再假装这次操作有回退保障。
 //
 // projectDir 不是 git 工作树 -> available:false + 中文 warning，绝不装作能回退。
 //
 // 是工作树 -> 用 git plumbing 把"此刻工作区的完整状态"（含未跟踪文件，尊重 .gitignore）
 // 落成一个提交对象，挂到 refs/ovl-checkpoints/<id> 这个旁路 ref 下，具体步骤：
 //   1. 用一个刚生成、此前不存在的临时文件路径当 GIT_INDEX_FILE（绝不是仓库真实的
-//      .git/index），在这个临时索引上跑 `git add -A -- .`——工作区状态被记进临时索引，
-//      用户真实的暂存区（无论里面有没有未提交的改动）全程没被这条命令碰过。
-//   2. `git write-tree`（仍指着这个临时索引）把它写成一个 tree 对象。
-//   3. `git commit-tree <tree> [-p <当前HEAD>]` 造一个提交对象——不写 refs/heads/*，
-//      HEAD 不存在（全新仓库还没有第一个提交）时不带 -p。
-//   4. `git update-ref refs/ovl-checkpoints/<id> <commit>` 把提交对象挂到旁路 ref 上。
+//      .git/index）。HEAD 存在时先 `git read-tree HEAD` 把已跟踪文件集合读进这个临时
+//      索引（HEAD 不存在——全新仓库——就跳过，临时索引仍从空白开始，这种情况下仓库里
+//      本来也没有"已跟踪文件"需要保护）。
+//   2. 在这个临时索引上跑 `git add -A -- .`——工作区状态（新增/修改/删除）被记进临时
+//      索引，用户真实的暂存区（无论里面有没有未提交的改动）全程没被这条命令碰过。
+//   3. `git write-tree`（仍指着这个临时索引）把它写成一个 tree 对象。
+//   4. 完整性自检：HEAD 存在时，比对 HEAD 的已跟踪文件清单 与 这棵新 tree 的文件清单；
+//      HEAD 里"当前工作区仍然存在"的每个路径都必须在新 tree 里出现，少一个就判定失败。
+//   5. `git commit-tree <tree> [-p <当前HEAD>]` 造一个提交对象——不写 refs/heads/*，
+//      HEAD 不存在时不带 -p。
+//   6. `git update-ref refs/ovl-checkpoints/<id> <commit>` 把提交对象挂到旁路 ref 上。
 //      refs/ovl-checkpoints/* 不在 refs/heads/* 下，git push 默认不会推它。
 // 全程没有一步移动过当前分支、没有一步写过真实 .git/index、没有一步改过工作区文件。
 // 临时索引文件用完即删（finally 块，即使中途失败也清）。
@@ -1533,8 +1559,20 @@ async function fsGitCheckpoint(projectDir, label) {
     if (!treeCheck.ok || treeCheck.stdout.trim() !== 'true') {
         return { available: false, checkpoint: null, warning: '该目录不是 git 仓库（或不在 git 工作树内），本次操作无法提供回退保障。' };
     }
+    const headResult = await runGitCommand(['rev-parse', 'HEAD'], projectDir, null, FS_GIT_TIMEOUT_MS);
+    const headHash = headResult.ok ? headResult.stdout.trim() : null;
+
     const tmpIndex = fsTempIndexPath();
     try {
+        if (headHash) {
+            // 关键修复 (a)：先把 HEAD 的已跟踪文件集合读进临时索引，后面的 `git add -A`
+            // 才不会把它们当"未跟踪"处理，忽略规则也就不会误伤它们。
+            const readTreeResult = await runGitCommand(['read-tree', headHash], projectDir, null, FS_GIT_TIMEOUT_MS,
+                { GIT_INDEX_FILE: tmpIndex });
+            if (!readTreeResult.ok) {
+                return { available: true, checkpoint: null, warning: '生成回退检查点失败（git read-tree HEAD，临时索引）：' + (readTreeResult.stderr || readTreeResult.stdout || '未知错误') };
+            }
+        }
         const addResult = await runGitCommand(['add', '-A', '--', '.'], projectDir, null, FS_GIT_TIMEOUT_MS,
             { GIT_INDEX_FILE: tmpIndex });
         if (!addResult.ok) {
@@ -1546,8 +1584,22 @@ async function fsGitCheckpoint(projectDir, label) {
             return { available: true, checkpoint: null, warning: '生成回退检查点失败（git write-tree）：' + (writeTreeResult.stderr || writeTreeResult.stdout || '未知错误') };
         }
         const tree = writeTreeResult.stdout.trim();
-        const headResult = await runGitCommand(['rev-parse', 'HEAD'], projectDir, null, FS_GIT_TIMEOUT_MS);
-        const headHash = headResult.ok ? headResult.stdout.trim() : null;
+
+        // 关键修复 (b)：完整性自检——HEAD 里已跟踪、且当前工作区仍然存在的文件，
+        // 必须每一个都出现在快照树里。少了就不允许静默返回一个看起来正常的检查点。
+        if (headHash) {
+            const missing = await fsCheckpointMissingTrackedFiles(projectDir, headHash, tree);
+            if (missing.length > 0) {
+                return {
+                    available: false, checkpoint: null,
+                    warning: '生成回退检查点失败：完整性自检未通过——快照树缺少 ' + missing.length +
+                        ' 个 HEAD 中已跟踪且当前仍存在的文件（例如: ' + missing.slice(0, 5).join(', ') +
+                        (missing.length > 5 ? ' 等' : '') + '），可能是 .gitignore/.git/info/exclude 的忽略规则误伤了已跟踪文件。' +
+                        '本次操作无法提供可信的回退保障，已拒绝生成检查点。'
+                };
+            }
+        }
+
         const commitMsg = 'AI-Translator fs checkpoint: ' + label + ' ' + new Date().toISOString();
         const commitArgs = headHash
             ? ['commit-tree', tree, '-p', headHash, '-m', commitMsg]
@@ -1566,6 +1618,24 @@ async function fsGitCheckpoint(projectDir, label) {
     } finally {
         try { fs.unlinkSync(tmpIndex); } catch (e) {}
     }
+}
+
+// fsGitCheckpoint 完整性自检的核心比对：HEAD 已跟踪文件清单 中，"当前工作区仍然
+// 存在"的那些路径，有哪些没有出现在刚生成的快照树里。返回缺失路径清单（相对仓库根，
+// '/' 分隔），空数组代表完整性自检通过。
+// 之所以要先过滤"当前工作区仍然存在"：HEAD 里有、但用户在本次操作之前就已经手动删除
+// （或本次操作本身就是删除它）的文件，快照里没有它是正确行为，不算完整性问题。
+async function fsCheckpointMissingTrackedFiles(projectDir, headHash, snapshotTree) {
+    const headFiles = await fsListTreeFiles(projectDir, headHash);
+    if (headFiles.length === 0) return [];
+    const snapshotFiles = new Set(await fsListTreeFiles(projectDir, snapshotTree));
+    const missing = [];
+    headFiles.forEach((rel) => {
+        if (snapshotFiles.has(rel)) return;
+        const abs = path.join(projectDir, rel.split('/').join(path.sep));
+        if (fs.existsSync(abs)) missing.push(rel);
+    });
+    return missing;
 }
 
 function checkpointFields(cp) {
@@ -1708,22 +1778,36 @@ function pruneEmptyDirs(root) {
     })(root);
 }
 
+// 回退一次性删除文件数超过这个阈值就触发熔断，默认拒绝执行，要求调用方显式传 force:true。
+// 取值理由：这次事故里静默删除了 248 个文件——熔断阈值必须远低于这个量级才有意义；
+// 但正常使用中「删除一个中等大小的子目录再回退」之类的操作，一次牵涉几个到十几个文件很
+// 常见，阈值太低会导致熔断变成噪音、用户被迫每次都加 force，反而养成无脑加 force 的习惯。
+// 取 30 作为折中：小到能在 248 这个事故量级面前提供实质性拦截，大到不会误伤"删掉一个装了
+// 十来个素材文件的 figures 子目录"这种日常操作。
+const FS_RESTORE_DELETE_CIRCUIT_BREAKER = 30;
+
 // v2 Pass P41：/fs/restore —— 把工作区恢复到某个 fsGitCheckpoint() 返回过的检查点当时
 // 的快照。checkpoint 既可以是旁路 ref 的 commit hash，也可以是任何 git 能识别的
 // commit-ish（比如 refs/ovl-checkpoints/<id> 本身）。
 //
-// 语义：
-//   1. 恢复动作本身先对"恢复前的当前状态"调用 fsGitCheckpoint() 打一个检查点——回退
-//      这个动作自己也可以再回退，不会因为"回错了"就没有退路。这一步失败不影响后续
-//      判断 checkpoint 是否有效（先校验 checkpoint 存在，校验通过才做这一步）。
-//   2. 用 `git ls-tree -r` 拿到目标快照里的完整文件清单，跟当前工作区实际存在的文件
-//      清单（跳过 .git）做差集：当前有、目标没有的文件——也就是"检查点之后新建的
-//      文件"——会被真的删除（recursive prune 顺手清掉因此产生的空目录），这样才能
-//      真正回到快照当时的状态，而不是只覆盖同名文件、把新建文件留在原地。
-//   3. 再用一次性的临时索引（同 fsGitCheckpoint 的手法，GIT_INDEX_FILE 指向刚生成的
-//      临时文件）`git read-tree <目标tree>` + `git checkout-index -a -f` 把目标快照
-//      的内容写回工作区——已存在的同名文件被覆盖、目标里有但当前没有的文件被创建。
-//      全程仍然不碰真实的 .git/index，也不移动当前分支。
+// v2 Pass P46（本次修复）：原实现「工作区有、快照没有 ⇒ 删」这条规则本身就是这次数据
+// 丢失事故的第二个缺陷——一个残缺快照会被当成"这些文件都是快照之后新建的"，然后真的删掉。
+// 修复后的语义（opts = { dryRun, force }，均可省略，默认 false）：
+//   0. 先决安全闸门：拿到目标快照的文件清单后，如果当前 HEAD 存在，就把"当前 HEAD 里
+//      已跟踪、且工作区里仍然存在、但目标快照里没有"的文件单独挑出来（headOnlyMissing）。
+//      这批文件如果不为空，直接判定为"快照本身有问题"，整个恢复中止、不删除任何文件、
+//      明确中文报错列出这些路径——绝不当成"这些文件是快照之后新建的"去删。这是本次修复
+//      的核心：一个文件在 HEAD 里存在，就永远不能被本函数当成"待删除的新建文件"处理。
+//   1. dryRun:true 时，只计算并返回将要发生的变更清单（willDelete / willCreate /
+//      willOverwrite），不打检查点、不碰任何磁盘文件，供前端在真正执行前把确切影响面
+//      摆给用户确认。
+//   2. 熔断：willDelete 清单长度超过 FS_RESTORE_DELETE_CIRCUIT_BREAKER 时，非 dryRun
+//      调用且没有传 force:true 一律拒绝执行，返回 requiresForce:true + 完整清单（前端可以
+//      直接把这份清单当成确认对话框的内容，不用再发一次 dryRun 请求）。
+//   3. 实际执行：先对"恢复前的当前状态"调用 fsGitCheckpoint() 打一个检查点——回退这个
+//      动作自己也可以再回退。然后删除 willDelete 里的文件（recursive prune 顺手清掉因此
+//      产生的空目录），再用一次性临时索引 `git read-tree <目标tree>` + `git checkout-index
+//      -a -f` 把目标快照内容写回工作区。全程仍然不碰真实的 .git/index，也不移动当前分支。
 // 已知差异（如实说明，不是"完全等价"）：
 //   - 文件权限位（比如可执行位）不保证复原——checkout-index 写普通文件不保留 tree 里的
 //     可执行位以外的位（Windows 文件系统本来也没有 Unix 权限位的概念，这条在本项目的
@@ -1731,7 +1815,11 @@ function pruneEmptyDirs(root) {
 //   - 恢复后残留的空目录清理是尽力而为（pruneEmptyDirs 内部吞掉异常），极端情况下
 //     （比如某个空目录被占用无法删除）可能留下一个 git 本来就不追踪的空目录，不影响
 //     任何文件内容的正确性。
-async function doFsRestore(projectDir, checkpointRef) {
+async function doFsRestore(projectDir, checkpointRef, opts) {
+    opts = opts || {};
+    const dryRun = !!opts.dryRun;
+    const force = !!opts.force;
+
     if (typeof checkpointRef !== 'string' || !checkpointRef.trim()) {
         return { ok: false, error: 'checkpoint 缺失' };
     }
@@ -1745,21 +1833,69 @@ async function doFsRestore(projectDir, checkpointRef) {
     }
     const targetTree = targetTreeResult.stdout.trim();
 
+    const targetFiles = new Set(await fsListTreeFiles(projectDir, targetTree));
+    const currentFiles = collectAffectedRelPaths(projectDir, projectDir).map((p) => p.split(path.sep).join('/'));
+    const currentSet = new Set(currentFiles);
+
+    // 待删除候选：当前有、目标快照没有的文件。
+    const deleteCandidates = currentFiles.filter((rel) => !targetFiles.has(rel));
+
+    // 安全闸门：这批候选里，有哪些其实是 HEAD 里已跟踪的文件——如果有，说明快照残缺，
+    // 不是"这些文件是快照之后新建的"，整个恢复必须中止，一个文件都不许删。
+    const headResult = await runGitCommand(['rev-parse', 'HEAD'], projectDir, null, FS_GIT_TIMEOUT_MS);
+    const headHash = headResult.ok ? headResult.stdout.trim() : null;
+    let headOnlyMissing = [];
+    if (headHash) {
+        const headFiles = new Set(await fsListTreeFiles(projectDir, headHash));
+        headOnlyMissing = deleteCandidates.filter((rel) => headFiles.has(rel));
+    }
+    if (headOnlyMissing.length > 0) {
+        return {
+            ok: false,
+            error: '拒绝恢复：检查点快照缺少 ' + headOnlyMissing.length + ' 个当前 HEAD 中已跟踪、工作区里也确实存在的文件' +
+                '（例如: ' + headOnlyMissing.slice(0, 5).join(', ') + (headOnlyMissing.length > 5 ? ' 等' : '') + '）。' +
+                '这说明该检查点快照本身不完整/不可信，不是"这些文件是检查点之后新建的"——为避免误删已跟踪文件，' +
+                '本次恢复已整体中止，未删除任何文件。请改用其它检查点，或先确认该检查点是否可信。',
+            headOnlyMissing: headOnlyMissing
+        };
+    }
+
+    const willDelete = deleteCandidates; // 此时已确认里面不含任何 HEAD 已跟踪文件，可以安全删除。
+    const willCreate = Array.from(targetFiles).filter((rel) => !currentSet.has(rel));
+    const willOverwrite = Array.from(targetFiles).filter((rel) => currentSet.has(rel));
+
+    if (dryRun) {
+        return {
+            ok: true,
+            dryRun: true,
+            restoredTo: checkpointRef,
+            willDelete: willDelete,
+            willCreate: willCreate,
+            willOverwrite: willOverwrite,
+            requiresForce: willDelete.length > FS_RESTORE_DELETE_CIRCUIT_BREAKER,
+            circuitBreakerThreshold: FS_RESTORE_DELETE_CIRCUIT_BREAKER
+        };
+    }
+
+    if (willDelete.length > FS_RESTORE_DELETE_CIRCUIT_BREAKER && !force) {
+        return {
+            ok: false,
+            error: '拒绝执行：本次恢复将删除 ' + willDelete.length + ' 个文件，超过熔断阈值（' +
+                FS_RESTORE_DELETE_CIRCUIT_BREAKER + '）。如确认要继续，请显式传 force:true 重新调用。',
+            requiresForce: true,
+            willDelete: willDelete,
+            willCreate: willCreate,
+            willOverwrite: willOverwrite,
+            circuitBreakerThreshold: FS_RESTORE_DELETE_CIRCUIT_BREAKER
+        };
+    }
+
     // 恢复前先给当前状态打一个检查点，保证这次恢复本身也可回退。
     const preCp = await fsGitCheckpoint(projectDir, 'before restore to ' + checkpointRef);
 
-    const lsResult = await runGitCommand(['ls-tree', '-r', '--name-only', targetTree], projectDir, null, FS_GIT_TIMEOUT_MS);
-    if (!lsResult.ok) {
-        return Object.assign({ ok: false, error: '读取检查点内容失败（git ls-tree）：' + (lsResult.stderr || lsResult.stdout || '未知错误') }, checkpointFields(preCp));
-    }
-    const targetFiles = new Set(lsResult.stdout.split(/\r?\n/).map((s) => s.trim()).filter((s) => s.length > 0));
-
-    const currentFiles = collectAffectedRelPaths(projectDir, projectDir).map((p) => p.split(path.sep).join('/'));
     const removedExtraFiles = [];
-    currentFiles.forEach((rel) => {
-        if (!targetFiles.has(rel)) {
-            try { fs.rmSync(path.join(projectDir, rel), { force: true }); removedExtraFiles.push(rel); } catch (e) {}
-        }
+    willDelete.forEach((rel) => {
+        try { fs.rmSync(path.join(projectDir, rel.split('/').join(path.sep)), { force: true }); removedExtraFiles.push(rel); } catch (e) {}
     });
     try { pruneEmptyDirs(projectDir); } catch (e) {}
 
@@ -2113,7 +2249,7 @@ const server = http.createServer(async (req, res) => {
             }
             if (pathname === '/fs/restore') {
                 if (!body.checkpoint || typeof body.checkpoint !== 'string') { sendJson(res, 400, { ok: false, error: 'checkpoint is required' }); return; }
-                sendJson(res, 200, await doFsRestore(projectDir, body.checkpoint));
+                sendJson(res, 200, await doFsRestore(projectDir, body.checkpoint, { dryRun: !!body.dryRun, force: !!body.force }));
                 return;
             }
         }
