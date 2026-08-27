@@ -18489,7 +18489,7 @@ async function chatAgentExecTool(toolName, args, projectDir, signal) {
     }
     let resp, data;
     try {
-        resp = await fetch(ovlBridgeUrl(toolName === 'list_dir' ? '/fs/list' : '/fs/read'), {
+        resp = await ovlBridgeFetch(ovlBridgeUrl(toolName === 'list_dir' ? '/fs/list' : '/fs/read'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(toolName === 'list_dir'
@@ -18622,7 +18622,7 @@ async function chatAgentProbeCheckpoint(projectDir, signal) {
         return ChatAgentCheckpointProbeCache;
     }
     try {
-        const resp = await fetch(ovlBridgeUrl('/fs/capabilities'), {
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/fs/capabilities'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ projectDir: projectDir }),
             signal: signal || undefined
@@ -18649,7 +18649,7 @@ async function chatAgentPreviewAffected(projectDir, relPath, signal) {
         const segs = norm.split('/');
         const filename = segs.pop();
         const parentPath = segs.length ? segs.join('/') : '.';
-        const pr = await fetch(ovlBridgeUrl('/fs/list'), {
+        const pr = await ovlBridgeFetch(ovlBridgeUrl('/fs/list'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ projectDir: projectDir, path: parentPath }), signal: signal || undefined
         });
@@ -18663,7 +18663,7 @@ async function chatAgentPreviewAffected(projectDir, relPath, signal) {
         const queue = [norm];
         while (queue.length) {
             const dir = queue.shift();
-            const lr = await fetch(ovlBridgeUrl('/fs/list'), {
+            const lr = await ovlBridgeFetch(ovlBridgeUrl('/fs/list'), {
                 method: 'POST', headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ projectDir: projectDir, path: dir }), signal: signal || undefined
             });
@@ -18867,7 +18867,7 @@ async function chatAgentDoRollback(projectDir, checkpoint, opLabel) {
     });
     if (!confirmed) { chatAppendRow('system', '已取消回退。'); return; }
     try {
-        const resp = await fetch(ovlBridgeUrl('/fs/restore'), {
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/fs/restore'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ projectDir: projectDir, checkpoint: checkpoint })
         });
@@ -18943,7 +18943,7 @@ async function chatAgentExecWriteTool(toolName, args, projectDir, signal, pendin
         : { projectDir: projectDir, path: args.path };
     let resp, data;
     try {
-        resp = await fetch(ovlBridgeUrl(endpointMap[toolName]), {
+        resp = await ovlBridgeFetch(ovlBridgeUrl(endpointMap[toolName]), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify(body), signal: signal || undefined
         });
@@ -24808,7 +24808,10 @@ async function ovlResolveFigureThumb(projectDir, relPath) {
     const ext = ovlFigThumbExt(relPath);
     if (OVL_FIG_THUMB_RASTER_EXTS.indexOf(ext) !== -1) {
         try {
-            const resp = await fetch(assetUrl);
+            // v2 Pass P49：远程模式下 /project-asset 也要带令牌头——这里本来就是先 fetch 再转
+            // blob object URL 给 <img src> 用，天然就是"能加请求头"的读取方式，改成
+            // ovlBridgeFetch 就够了，不需要额外设计。
+            const resp = await ovlBridgeFetch(assetUrl);
             if (!resp.ok) return { ok: false }; // 404（文件不存在/穿越被拒）或桥端其他错误——原样退化
             const blob = await resp.blob();
             if (!blob || !blob.size) return { ok: false };
@@ -24824,7 +24827,10 @@ async function ovlResolveFigureThumb(projectDir, relPath) {
         if (typeof pdfjsLib === 'undefined') return { ok: false };
         let doc = null;
         try {
-            doc = await pdfjsLib.getDocument(assetUrl).promise;
+            // v2 Pass P49：pdf.js 的 getDocument 走的是自己的内部 XHR/fetch，不经过
+            // ovlBridgeFetch，没法用同一层注入令牌头。pdf.js 原生支持 httpHeaders 选项，
+            // 直接把令牌头传进去即可，不需要另外设计签名参数。
+            doc = await pdfjsLib.getDocument({ url: assetUrl, httpHeaders: ovlBridgeAuthHeaders() }).promise;
             const page = await doc.getPage(1);
             const unitViewport = page.getViewport({ scale: 1 });
             const longest = Math.max(unitViewport.width, unitViewport.height) || 1;
@@ -27031,7 +27037,7 @@ function ovlProjectHistoryProbePathExists(path) {
         const timer = ctl ? setTimeout(function () { ctl.abort(); }, 3000) : null;
         const opts = { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ projectDir: path, mainFile: '__ovl_history_probe_nonexistent__.tex' }) };
         if (ctl) opts.signal = ctl.signal;
-        return fetch(ovlBridgeUrl('/wordcount'), opts).then(function (resp) {
+        return ovlBridgeFetch(ovlBridgeUrl('/wordcount'), opts).then(function (resp) {
             if (timer) clearTimeout(timer);
             return resp.status === 400 ? false : true;
         }).catch(function () { if (timer) clearTimeout(timer); return null; });
@@ -28210,8 +28216,40 @@ function ovlBindEditorShortcuts() {
 // 多页 PDF，这是预期行为，不是桥坏了。桥没起时，网页其余一切功能照常可用，只有这一块降级成
 // 一句"怎么启动"的提示，不许静默失败、不许抛出未捕获异常。
 
-const OVL_BRIDGE_ORIGIN = 'http://127.0.0.1:8181';
-function ovlBridgeUrl(p) { return OVL_BRIDGE_ORIGIN + p; }
+// v2 Pass P49：桥地址不再是硬编码常量——默认仍是 127.0.0.1:8181（不改任何现有行为），
+// 但可以在设置里改成 Tailscale 地址（如 http://100.98.164.17:8181）跨机访问，见设置面板
+// 新增的「远程桥接」分类（ovlSettingsBridgeHtml）。OvlSettings 在本文件更后面才声明
+// （let OvlSettings = ...），但这几个函数只在真正发请求时才会被调用，届时早已初始化完毕。
+const OVL_BRIDGE_DEFAULT_ORIGIN = 'http://127.0.0.1:8181';
+function ovlBridgeOrigin() {
+    try {
+        const addr = (OvlSettings && OvlSettings.ovlBridgeAddr || '').trim();
+        return addr ? addr.replace(/\/+$/, '') : OVL_BRIDGE_DEFAULT_ORIGIN;
+    } catch (e) { return OVL_BRIDGE_DEFAULT_ORIGIN; }
+}
+function ovlBridgeUrl(p) { return ovlBridgeOrigin() + p; }
+// 远程模式下所有会读写文件/触发外部动作的桥请求都要带令牌头（见 tools/latex-bridge/
+// server.js 的 tokenAuthorized）——统一在这一层加，调用点不用逐个改。本地默认地址下
+// OvlSettings.ovlBridgeToken 多半是空字符串，加不加这个头对本地桥（不校验令牌）无影响。
+const OVL_BRIDGE_TOKEN_HEADER = 'X-Latex-Bridge-Token';
+function ovlBridgeAuthHeaders(existing) {
+    let token = '';
+    try { token = (OvlSettings && OvlSettings.ovlBridgeToken || '').trim(); } catch (e) {}
+    if (!token) return existing || {};
+    const h = Object.assign({}, existing || {});
+    h[OVL_BRIDGE_TOKEN_HEADER] = token;
+    return h;
+}
+// 统一的桥请求 fetch 封装——所有 fetch(ovlBridgeUrl(...)) 调用点改走这个，自动带上令牌头。
+// p 既可以是路径（'/compile' 之类，内部再拼 ovlBridgeUrl），也可以是已经拼好的完整 URL
+// （调用点大量是 fetch(ovlBridgeUrl(...)) 这种写法，直接把 ovlBridgeUrl(...) 的结果原样
+// 传进来最省事，不用逐个改成"只传路径"）；opts 跟原生 fetch 第二个参数同形状。
+function ovlBridgeFetch(p, opts) {
+    const o = Object.assign({}, opts || {});
+    o.headers = ovlBridgeAuthHeaders(o.headers);
+    const url = /^https?:\/\//i.test(p || '') ? p : ovlBridgeUrl(p);
+    return fetch(url, o);
+}
 
 function ovlSetPdfStatus(text, isError, isBusy) {
     const el = document.getElementById('ovlPdfStatus');
@@ -28329,7 +28367,7 @@ async function ovlOverleafProbeStrategySupport(projectDir) {
         return OvlState.bridgeCapabilities.indexOf('overleaf-pull-strategy') !== -1;
     }
     try {
-        const resp = await fetch(ovlBridgeUrl('/fs/capabilities'), {
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/fs/capabilities'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ projectDir: projectDir })
         });
@@ -28349,7 +28387,7 @@ async function ovlBridgeCheckHealth() {
     try {
         const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
         const timer = ctl ? setTimeout(function () { ctl.abort(); }, 1500) : null;
-        const resp = await fetch(ovlBridgeUrl('/health'), ctl ? { signal: ctl.signal } : {});
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/health'), ctl ? { signal: ctl.signal } : {});
         if (timer) clearTimeout(timer);
         const data = await resp.json();
         online = !!(data && data.ok);
@@ -28440,7 +28478,7 @@ async function ovlDoRecompile(opts) {
 
     let data = null;
     try {
-        const resp = await fetch(ovlBridgeUrl('/compile'), {
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/compile'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -28474,7 +28512,7 @@ async function ovlDoRecompile(opts) {
 
     if (data && data.ok && data.pdfExists) {
         try {
-            const pdfResp = await fetch(ovlBridgeUrl('/output/' + data.id + '/output.pdf'));
+            const pdfResp = await ovlBridgeFetch(ovlBridgeUrl('/output/' + data.id + '/output.pdf'));
             const buf = await pdfResp.arrayBuffer();
             OvlState.pdfObjectUrl = URL.createObjectURL(new Blob([buf], { type: 'application/pdf' }));
             // 页数优先信桥从 .log 里挖出来的 "Output written on ... (N pages, ...)"（真数字）；
@@ -28511,7 +28549,11 @@ function ovlDownloadCompiledPdf() {
     const data = OvlState.lastCompile;
     if (!data || !data.pdfExists) return;
     const a = document.createElement('a');
-    a.href = ovlBridgeUrl('/output/' + data.id + '/output.pdf');
+    // v2 Pass P49：<a href> 是纯浏览器导航，加不了令牌请求头，远程模式下直接打
+    // /output/:id/output.pdf 会被 401。但这份 PDF 其实已经在 doCompile() 里用带头的
+    // ovlBridgeFetch 拉过一次、转成 OvlState.pdfObjectUrl 这个 blob: URL 了（见上面
+    // 编译成功分支）——下载复用同一份 blob，不用再打一次没法带头的裸链接。
+    a.href = OvlState.pdfObjectUrl || ovlBridgeUrl('/output/' + data.id + '/output.pdf');
     a.download = 'output.pdf';
     a.target = '_blank';
     a.rel = 'noopener';
@@ -28530,7 +28572,7 @@ async function ovlBrowseProjectFolder() {
     const pathInput = document.getElementById('ovlProjectPathInput');
     if (btn) btn.disabled = true;
     try {
-        const resp = await fetch(ovlBridgeUrl('/pick-folder'), { method: 'POST' });
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/pick-folder'), { method: 'POST' });
         const data = await resp.json();
         if (!data || !data.ok) {
             ovlFlashSaveStatus('选择文件夹失败：' + ((data && data.error) || '桥接服务未启动，见 tools/latex-bridge/README.md'), true);
@@ -28743,7 +28785,7 @@ function ovlOverleafShowDiscardDoneDialog(data, projectDir) {
 
 async function ovlOverleafDiscardRollback(projectDir, checkpoint) {
     try {
-        const resp = await fetch(ovlBridgeUrl('/fs/restore'), {
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/fs/restore'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ projectDir: projectDir, checkpoint: checkpoint })
         });
@@ -28921,7 +28963,7 @@ async function ovlOverleafPullRun(projectDir, gitUrl, strategy, opts) {
     OvlState.ovlSyncBusy = true; // v2 Pass P33：供「编辑」的互斥判定读，见 OvlState.ovlSyncBusy 字段注释
     ovlOverleafSetSyncStatus('拉取中…', false);
     try {
-        const resp = await fetch(ovlBridgeUrl('/overleaf/pull'), {
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/overleaf/pull'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ projectDir: projectDir, gitUrl: gitUrl, token: OvlSettings.overleafToken, strategy: strategy })
@@ -29017,7 +29059,7 @@ async function ovlOverleafPush() {
     if (pushBtn) pushBtn.disabled = true;
     ovlOverleafSetSyncStatus('推送中…', false);
     try {
-        const resp = await fetch(ovlBridgeUrl('/overleaf/push'), {
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/overleaf/push'), {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -29901,7 +29943,7 @@ async function ovlOverleafDoClone(projectId, token) {
     try {
         let data;
         try {
-            const resp = await fetch(ovlBridgeUrl('/overleaf/clone'), {
+            const resp = await ovlBridgeFetch(ovlBridgeUrl('/overleaf/clone'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ projectId: projectId, token: token })
@@ -30016,7 +30058,7 @@ let OvlBridgeWsPath = null;      // 当前这条连接订阅的绝对路径（nu
 let OvlBridgeWsReconnectTimer = null;
 let OvlBridgeWsReconnectDelay = 1000; // 简单指数退避，封顶 15s——桥离线/重启不是错误，安静重试
 
-function ovlBridgeWsUrl() { return OVL_BRIDGE_ORIGIN.replace(/^http/, 'ws'); }
+function ovlBridgeWsUrl() { return ovlBridgeOrigin().replace(/^http/, 'ws'); }
 
 function ovlBridgeCloseWatch() {
     if (OvlBridgeWsReconnectTimer) { clearTimeout(OvlBridgeWsReconnectTimer); OvlBridgeWsReconnectTimer = null; }
@@ -30172,7 +30214,7 @@ async function ovlSyncTexForward() {
         // mainDocFile/main.tex 兜底。
         const mainFile = (OvlState.currentFile && OvlState.currentFile.name) || OvlState.mainDocFile || 'main.tex';
         ovlFlashSaveStatus('正在定位 PDF 页面…', false);
-        const resp = await fetch(ovlBridgeUrl('/synctex/forward'), {
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/synctex/forward'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ id: OvlState.lastCompile.id, projectDir: projectDir, mainFile: mainFile, line: line })
         });
@@ -30262,10 +30304,42 @@ function ovlRenderLogOtherFiles() {
     let html = '';
     data.files.forEach(function (f) {
         if (f === 'output.pdf') return;
-        const url = ovlBridgeUrl('/output/' + data.id + '/' + encodeURIComponent(f));
-        html += '<a class="ovl-log-otherfile-link" href="' + escapeAttr(url) + '" target="_blank" rel="noopener">' + escapeHtml(f) + '</a>';
+        // v2 Pass P49：这类链接原本是纯 <a href target=_blank> 导航，加不了令牌请求头，
+        // 远程模式下直接点开会被 401。改成 data-otherfile + 委托点击处理
+        // （ovlDownloadOtherFile），用带头的 ovlBridgeFetch 先拿到 blob 再触发下载/新开窗口。
+        html += '<a class="ovl-log-otherfile-link" href="#" data-otherfile="' + escapeAttr(f) + '">' + escapeHtml(f) + '</a>';
     });
     wrap.innerHTML = html || '<div class="ovl-log-empty">还没有可下载的文件。</div>';
+    wrap.onclick = function (ev) {
+        const link = ev.target && ev.target.closest ? ev.target.closest('[data-otherfile]') : null;
+        if (!link) return;
+        ev.preventDefault();
+        ovlDownloadOtherFile(link.getAttribute('data-otherfile'));
+    };
+}
+
+// v2 Pass P49：/output/:id/:file 这类"点了直接打开/下载"的只读产物，远程模式下没法靠
+// <a href> 裸链接带令牌头，这里用 ovlBridgeFetch 真的带头拉一次，转成 blob object URL
+// 再用一个临时 <a download> 触发保存——跟 ovlDownloadCompiledPdf() 同一个思路，只是这里
+// 没有现成缓存的 blob（PDF 才有），得现拉一次。
+async function ovlDownloadOtherFile(filename) {
+    const data = OvlState.lastCompile;
+    if (!data || !data.id || !filename) return;
+    try {
+        const resp = await ovlBridgeFetch('/output/' + data.id + '/' + encodeURIComponent(filename));
+        if (!resp.ok) { ovlFlashSaveStatus('下载失败（HTTP ' + resp.status + '）', true); return; }
+        const blob = await resp.blob();
+        const objUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = objUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(function () { try { URL.revokeObjectURL(objUrl); } catch (e) {} }, 30000);
+    } catch (e) {
+        ovlFlashSaveStatus('下载失败：连不上桥接服务', true);
+    }
 }
 
 // 跳到源码那一行 —— 只对当前编辑器里已经打开的那个文件生效（M3 阶段桥只标注被编译文件的
@@ -30297,7 +30371,7 @@ function ovlClearCachedFiles() {
         confirmLabel: '清理',
         danger: true,
         onConfirm: function () {
-            fetch(ovlBridgeUrl('/clear'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
+            ovlBridgeFetch(ovlBridgeUrl('/clear'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' })
                 .then(function () {
                     if (OvlState.pdfObjectUrl) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} OvlState.pdfObjectUrl = null; }
                     OvlState.lastCompile = null;
@@ -30727,7 +30801,14 @@ const OVL_SETTINGS_DEFAULTS = {
     // ---- v2 Pass P28：AI 辅助合并（stash-pop 冲突时的三栏对照弹窗，见 ovlAiMergeOpen）----
     // 浏览器直连这个端点（不经过桥），见任务背景：该端点对 Origin: null 放行 CORS。
     ovlAiMergeEndpoint: 'http://100.98.164.17:1235/v1',
-    ovlAiMergeModel: 'qwen/qwen3.8-27b'
+    ovlAiMergeModel: 'qwen/qwen3.8-27b',
+    // ---- v2 Pass P49：远程桥接（跨机访问 tools/latex-bridge/server.js）----
+    // ''=用默认地址 http://127.0.0.1:8181（见 ovlBridgeOrigin），跟这套设置项加入之前
+    // 逐字节一致；填了别的地址（如 http://100.98.164.17:8181）才会改用它。
+    ovlBridgeAddr: '',
+    // 只有桥绑在非 127.0.0.1 地址时才会被真正校验（见 server.js REMOTE_MODE），本地默认
+    // 用法不用填。明文存 localStorage，跟这个 App 里其它凭证同一种存法。
+    ovlBridgeToken: ''
 };
 const OVL_FONT_FAMILIES = {
     'ovl-mono-default': '"SFMono-Regular", Consolas, "Courier New", monospace',
@@ -30804,6 +30885,23 @@ function ovlApplySettings() {
         // ——overleafAutoPullMinutes 走的也是通用 data-setpath 处理，不用单独接线。
         if (typeof ovlOverleafUpdateButtonsUI === 'function') ovlOverleafUpdateButtonsUI();
         if (typeof ovlOverleafSetupAutoPullTimer === 'function') ovlOverleafSetupAutoPullTimer();
+        // v2 Pass P49：服务地址/令牌一改，旧的在线判定就不作数了——重新探活一次，别停留在
+        // 旧地址的旧状态上（旧地址探活成功的话会一直显示"在线"，其实是在看错的服务）。
+        // 只在地址真的变了才重探（不是每次改任何设置都打一次 /health），并顺带断开、
+        // 交给下一次 ovlBridgeUpdateWatch() 用新地址重连 WebSocket。
+        if (typeof ovlBridgeOrigin === 'function') {
+            const nowOrigin = ovlBridgeOrigin();
+            if (OvlState.ovlBridgeLastOrigin !== undefined && OvlState.ovlBridgeLastOrigin !== nowOrigin) {
+                OvlState.bridgeOnline = null;
+                if (typeof ovlBridgeCloseWatch === 'function') { try { ovlBridgeCloseWatch(); } catch (e) {} }
+                if (typeof ovlBridgeCheckHealth === 'function') ovlBridgeCheckHealth().then(function () {
+                    if (typeof ovlUpdatePdfToolbarUI === 'function') ovlUpdatePdfToolbarUI();
+                    if (typeof ovlRenderPdfBody === 'function') ovlRenderPdfBody();
+                    if (typeof ovlBridgeUpdateWatch === 'function') ovlBridgeUpdateWatch();
+                });
+            }
+            OvlState.ovlBridgeLastOrigin = nowOrigin;
+        }
     } catch (e) { console.error('[ovl] applySettings failed', e); }
 }
 
@@ -31265,7 +31363,57 @@ function ovlSettingsAiMergeHtml() {
     return html;
 }
 
-const OVL_SETTINGS_RENDERERS = { editor: ovlSettingsEditorHtml, spelling: ovlSettingsSpellingHtml, compiler: ovlSettingsCompilerHtml, appearance: ovlSettingsAppearanceHtml, translator: ovlSettingsTranslatorHtml, overleaf: ovlSettingsOverleafHtml, aimerge: ovlSettingsAiMergeHtml };
+// v2 Pass P49：设置面板新分类「远程桥接」——服务地址 + 访问令牌两个字段走通用 data-setpath
+// 处理（改了立刻存盘，ovlApplySettings() 里检测到地址变化会自动重新探活），另加一个
+// 「测试连接」按钮：读的是输入框当前值（不是 OvlSettings，用户可能还没失焦触发 change），
+// 真去打一次 /health，把成功/连不上/令牌无效三种结果用中文明确显示出来。
+function ovlSettingsBridgeHtml() {
+    const s = OvlSettings;
+    let html = '<div class="ovl-set-category-title">远程桥接</div>';
+    html += '<div class="ovl-set-banner">桥接服务（tools/latex-bridge/server.js）默认只监听本机 127.0.0.1。要跨机访问（比如桥跑在 jump 上，家里/学校的机器连过去），把桥用 LATEX_BRIDGE_HOST 绑到具体的 Tailscale IP（例如 100.98.164.17，不要绑 0.0.0.0），再在下面填桥打印出来的地址和访问令牌。留空 = 用默认地址 http://127.0.0.1:8181，跟以前完全一样。</div>';
+    html += ovlSetRow('服务地址', '<input type="text" id="ovlBridgeAddrInput" data-setpath="settings.ovlBridgeAddr" style="width:260px" placeholder="http://127.0.0.1:8181" value="' + escapeAttr(s.ovlBridgeAddr) + '">',
+        '形如 http://100.98.164.17:8181。留空则用本机默认地址，不会改变现有行为。');
+    html += ovlSetRow('访问令牌', '<input type="password" id="ovlBridgeTokenInput" data-setpath="settings.ovlBridgeToken" style="width:260px" placeholder="桥启动日志里打印的令牌" value="' + escapeAttr(s.ovlBridgeToken) + '">',
+        '桥绑在非 127.0.0.1 地址时会强制校验这个令牌，桥第一次以远程地址启动时自动生成并打印在终端日志里，抄过来即可；纯本地跑（默认地址）不需要填。');
+    html += ovlSetRow('连接测试', '<button type="button" class="ovl-modal-btn" onclick="ovlBridgeTestConnection()">测试连接</button>'
+        + '<span id="ovlBridgeTestResult" style="margin-left:8px;font-size:11px;"></span>',
+        '按当前输入框里的地址和令牌真的打一次 /health，不需要先保存。');
+    return html;
+}
+// 三种结果：成功（✓ 绿色）、连不上（✗ 红色，网络层失败/超时/地址错误）、令牌无效
+// （✗ 红色，HTTP 401/403，说明地址是对的、桥也在线，只是令牌不对）。
+async function ovlBridgeTestConnection() {
+    const resultEl = document.getElementById('ovlBridgeTestResult');
+    const addrInput = document.getElementById('ovlBridgeAddrInput');
+    const tokenInput = document.getElementById('ovlBridgeTokenInput');
+    const addr = ((addrInput && addrInput.value) || '').trim().replace(/\/+$/, '') || OVL_BRIDGE_DEFAULT_ORIGIN;
+    const token = ((tokenInput && tokenInput.value) || '').trim();
+    if (resultEl) { resultEl.textContent = '测试中…'; resultEl.style.color = '#9AA4B2'; }
+    try {
+        const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const timer = ctl ? setTimeout(function () { ctl.abort(); }, 3000) : null;
+        const headers = token ? (function () { const h = {}; h[OVL_BRIDGE_TOKEN_HEADER] = token; return h; })() : {};
+        const opts = { headers: headers };
+        if (ctl) opts.signal = ctl.signal;
+        const resp = await fetch(addr + '/health', opts);
+        if (timer) clearTimeout(timer);
+        if (resp.status === 401 || resp.status === 403) {
+            if (resultEl) { resultEl.textContent = '✗ 连上了服务，但访问令牌不对'; resultEl.style.color = '#f87171'; }
+            return;
+        }
+        let data = null;
+        try { data = await resp.json(); } catch (e) { data = null; }
+        if (resp.ok && data && data.ok) {
+            if (resultEl) { resultEl.textContent = '✓ 连接成功（桥 API v' + (data.bridgeApiVersion != null ? data.bridgeApiVersion : '?') + '）'; resultEl.style.color = '#4ade80'; }
+        } else {
+            if (resultEl) { resultEl.textContent = '✗ 连上了，但响应异常（HTTP ' + resp.status + '）'; resultEl.style.color = '#f87171'; }
+        }
+    } catch (e) {
+        if (resultEl) { resultEl.textContent = '✗ 连不上（地址错误 / 桥未启动 / 网络不通）'; resultEl.style.color = '#f87171'; }
+    }
+}
+
+const OVL_SETTINGS_RENDERERS = { editor: ovlSettingsEditorHtml, spelling: ovlSettingsSpellingHtml, compiler: ovlSettingsCompilerHtml, appearance: ovlSettingsAppearanceHtml, translator: ovlSettingsTranslatorHtml, overleaf: ovlSettingsOverleafHtml, aimerge: ovlSettingsAiMergeHtml, bridge: ovlSettingsBridgeHtml };
 
 function ovlSettingsModalHtml() {
     return ''
@@ -31280,6 +31428,7 @@ function ovlSettingsModalHtml() {
         +       '<div class="ovl-settings-navitem" data-cat="translator">翻译器</div>'
         +       '<div class="ovl-settings-navitem" data-cat="overleaf">Overleaf 同步</div>'
         +       '<div class="ovl-settings-navitem" data-cat="aimerge">AI 辅助合并</div>'
+        +       '<div class="ovl-settings-navitem" data-cat="bridge">远程桥接</div>'
         +     '</div>'
         +     '<div class="ovl-settings-content" id="ovlSettingsContent"></div>'
         +   '</div>'
@@ -31365,7 +31514,7 @@ function ovlToggleInvert() {
 }
 async function ovlStopCompilation() {
     try {
-        await fetch(ovlBridgeUrl('/stop'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        await ovlBridgeFetch(ovlBridgeUrl('/stop'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
         ovlFlashSaveStatus('已请求停止编译', false);
     } catch (e) {
         console.error('[ovl] stop compilation failed', e);
@@ -31821,7 +31970,7 @@ async function ovlPdfHandleDblClick(ev, container) {
         const synY = pageHeightPt - pdfPt[1];
         const pageNum = entry.num; // 报给 /synctex/edit 的页码必须是"这一页自己的页码"，不是 OvlState.pdfView.page
         ovlFlashSaveStatus('正在定位源码…', false);
-        const resp = await fetch(ovlBridgeUrl('/synctex/edit'), {
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/synctex/edit'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ id: OvlState.lastCompile.id, page: pageNum, x: synX, y: synY })
         });
@@ -32222,7 +32371,7 @@ async function ovlProjectWordCount() {
     ovlFlashSaveStatus('正在统计字数…', false);
     let data;
     try {
-        const resp = await fetch(ovlBridgeUrl('/wordcount'), {
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/wordcount'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ projectDir: projectDir, mainFile: mainFile })
         });

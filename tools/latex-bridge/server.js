@@ -50,19 +50,28 @@ try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化�
 // v2 Pass P45：/health 里带的能力/版本自报——见该端点注释。每次给桥新增一个"前端需要能
 // 判断有没有"的能力（新端点、既有端点的行为变化），就在 BRIDGE_CAPABILITIES 里加一个字符串，
 // 版本号也提一位。已经上线的能力不会被撤销，这个数组只做加法。
-const BRIDGE_API_VERSION = 45;
+const BRIDGE_API_VERSION = 49;
 const BRIDGE_CAPABILITIES = [
     'overleaf-clone',          // POST /overleaf/clone
     'overleaf-pull-strategy',  // POST /overleaf/pull 认识 body.strategy（abort/stash/discard）
     'fs-ops',                  // POST /fs/list /fs/read /fs/write /fs/mkdir /fs/move /fs/copy /fs/delete /fs/restore
     'fs-capabilities',         // POST /fs/capabilities（只读能力探测）
-    'overleaf-discard-checkpoint' // strategy=discard 丢弃前自动打旁路快照，响应带 checkpoint 字段
+    'overleaf-discard-checkpoint', // strategy=discard 丢弃前自动打旁路快照，响应带 checkpoint 字段
+    'remote-token-auth'        // v2 Pass P49：可绑非回环地址 + 令牌鉴权，见 tokenAuthorized()
 ];
 
-const HOST = '127.0.0.1';
+// v2 Pass P49：监听地址可配（LATEX_BRIDGE_HOST），默认仍是 127.0.0.1——不传就跟以前
+// 完全一样，不改变任何现有用户的行为。绝不要默认绑 0.0.0.0；要跨机访问请绑到具体的
+// Tailscale IP（如 100.98.164.17），绑 0.0.0.0 会把桥暴露给同一网络下的任何设备，
+// 启动时会打印醒目警告（见 server.listen 回调）。
+const HOST = process.env.LATEX_BRIDGE_HOST || '127.0.0.1';
 // LATEX_BRIDGE_PORT 仅供测试用（起在别的空闲端口上，绝不占用用户真实在跑的 8181）：
 // 不传时行为跟以前完全一样，还是硬编码 8181。
 const PORT = process.env.LATEX_BRIDGE_PORT ? parseInt(process.env.LATEX_BRIDGE_PORT, 10) : 8181;
+
+// 绑在 127.0.0.1/localhost/::1 之外的地址时才算"远程模式"——只有这时才强制校验访问令牌，
+// 纯本地跑（默认）保持零配置，行为跟没有这套令牌机制之前逐字节一致。
+const REMOTE_MODE = !/^(127\.0\.0\.1|localhost|::1)$/i.test(HOST);
 
 // TeX Live 路径（规划 §1.4 实测）。允许用 LATEX_BRIDGE_TEXBIN 环境变量覆盖，方便别的机器上跑。
 const TEXBIN = process.env.LATEX_BRIDGE_TEXBIN || 'E:\\texlive\\2025\\bin\\windows';
@@ -85,6 +94,59 @@ try { fs.mkdirSync(WORK_ROOT, { recursive: true }); } catch (e) {}
 
 const COMPILE_TIMEOUT_MS = 120000;
 
+// ---------------------------------------------------------------------------
+// v2 Pass P49：远程访问令牌。
+// 优先读环境变量 LATEX_BRIDGE_TOKEN；否则读本地令牌文件（同目录 .bridge-token，已加入
+// .gitignore，绝不会被提交）；文件不存在就自动生成一个高强度随机令牌写进去，并在
+// REMOTE_MODE 下的启动日志里打印出来，供用户抄进前端设置。
+// 令牌只在 REMOTE_MODE 下才会被强制校验（见下面 tokenAuthorized），本地默认用法完全
+// 不受影响——不读令牌文件、不生成、不校验都不会改变现有行为的这句话不成立：其实文件
+// 总会被生成/读取（哪怕本地模式），但只有 REMOTE_MODE 才会真正拿它去挡请求。
+// ---------------------------------------------------------------------------
+const TOKEN_HEADER = 'x-latex-bridge-token';
+const TOKEN_FILE = path.join(__dirname, '.bridge-token');
+
+function loadOrCreateToken() {
+    if (process.env.LATEX_BRIDGE_TOKEN) return process.env.LATEX_BRIDGE_TOKEN;
+    try {
+        const existing = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
+        if (existing) return existing;
+    } catch (e) { /* 文件不存在或读不了，走下面的生成分支 */ }
+    const generated = crypto.randomBytes(32).toString('hex');
+    try { fs.writeFileSync(TOKEN_FILE, generated, { mode: 0o600 }); } catch (e) {
+        console.warn('[latex-bridge] 无法写入令牌文件 ' + TOKEN_FILE + '：' + (e && e.message));
+    }
+    return generated;
+}
+
+const BRIDGE_TOKEN = loadOrCreateToken();
+
+// 定长时间比较，防时序侧信道——不要用 === 直接比字符串。
+function timingSafeEqualStr(a, b) {
+    const bufA = Buffer.from(String(a || ''), 'utf8');
+    const bufB = Buffer.from(String(b || ''), 'utf8');
+    if (bufA.length !== bufB.length) {
+        // 长度不等也跑一次等长比较（跟自己比），避免"提前返回"这件事本身泄露长度信息。
+        try { crypto.timingSafeEqual(bufA, bufA); } catch (e) {}
+        return false;
+    }
+    return crypto.timingSafeEqual(bufA, bufB);
+}
+
+// 令牌只走请求头，绝不出现在 URL 查询串、日志或错误消息里。
+function tokenAuthorized(req) {
+    if (!REMOTE_MODE) return true;
+    const provided = req.headers[TOKEN_HEADER];
+    if (!provided || typeof provided !== 'string') return false;
+    return timingSafeEqualStr(provided, BRIDGE_TOKEN);
+}
+
+// /health 是唯一豁免令牌校验的端点（前端要靠它探活，探活本身不该要求先有令牌）；
+// GET / 是人读的欢迎页，同样豁免。除此之外的一切路由（/fs/*、/overleaf/*、/compile、
+// /stop、/clear、/pick-folder、/synctex/*、/output/*、/project-asset、/wordcount……）
+// 全部经过下面路由分发前的统一校验，不再逐个端点手动加。
+const TOKEN_EXEMPT_PATHS = new Set(['/health', '/']);
+
 let currentChild = null;
 let currentChildId = null;
 
@@ -92,11 +154,23 @@ let currentChildId = null;
 // 小工具
 // ---------------------------------------------------------------------------
 
-function cors(res) {
-    res.setHeader('Access-Control-Allow-Origin', '*');
+// v2 Pass P49：远程机器上的页面仍是 file://（Origin: null），本地机器上是 http://127.0.0.1
+// 之类。不再无脑回显任意 Origin/用 "*"——只认 "null" 和 localhost 家族，其余一律不设
+// Access-Control-Allow-Origin（浏览器会因此拦下响应）。真正的防线是令牌
+// （见 tokenAuthorized），这里的 Origin 白名单只是浏览器侧的第二层，不是唯一防线。
+function corsAllowedOrigin(origin) {
+    if (!origin || origin === 'null') return 'null';
+    if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin)) return origin;
+    return null;
+}
+
+function cors(req, res) {
+    const allowed = corsAllowedOrigin(req.headers.origin);
+    if (allowed) res.setHeader('Access-Control-Allow-Origin', allowed);
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, DELETE, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, ' + TOKEN_HEADER);
     res.setHeader('Access-Control-Max-Age', '86400');
+    res.setHeader('Vary', 'Origin');
 }
 
 function sendJson(res, code, obj) {
@@ -1926,6 +2000,11 @@ async function doFsRestore(projectDir, checkpointRef, opts) {
 // 只用于 /overleaf/* 这三个能动用户真实 git 仓库的路由：拒绝来自任意网页的跨域驱动。
 // 浏览器发起跨域 fetch 时一定会带 Origin 头且不可伪造，所以白名单足以挡住恶意页面；
 // 没有 Origin 头的（curl / node 脚本 / 本地测试）放行，因为那本来就不是这条攻击链。
+// v2 Pass P49 补充定位：这道 Origin 检查在本地模式下仍然是真实防线（同源浏览器页面
+// 才带得出白名单里的 Origin）；但在 REMOTE_MODE 下它形同虚设——file:// 页面的 Origin
+// 恒为 "null" 本来就放行，任何能拿到令牌的调用方也天然能带上任意 Origin。REMOTE_MODE
+// 下真正的防线是上面路由分发前的 tokenAuthorized() 令牌闸门，这个函数不再是防线本身，
+// 只是本地模式下的历史防线，保留不动。
 function ovlOriginAllowed(req) {
     const origin = req.headers.origin;
     if (!origin) return true;              // 非浏览器发起
@@ -1938,7 +2017,7 @@ function ovlOriginAllowed(req) {
 // ---------------------------------------------------------------------------
 
 const server = http.createServer(async (req, res) => {
-    cors(res);
+    cors(req, res);
 
     if (req.method === 'OPTIONS') {
         res.writeHead(204);
@@ -1949,15 +2028,21 @@ const server = http.createServer(async (req, res) => {
     const u = new URL(req.url, 'http://' + HOST + ':' + PORT);
     const pathname = decodeURIComponent(u.pathname);
 
+    // v2 Pass P49：统一令牌校验闸门——REMOTE_MODE 下除 /health、GET / 之外的一切路由
+    // 都要求正确的访问令牌，放在路由分发之前一次性挡住，不用逐个端点手动加。
+    // 本地默认模式（REMOTE_MODE=false）tokenAuthorized 恒真，这段代码不改变任何现有行为。
+    if (!TOKEN_EXEMPT_PATHS.has(pathname) && !tokenAuthorized(req)) {
+        sendJson(res, 401, { ok: false, error: '缺少或错误的访问令牌，请在设置里填写桥启动日志打印的访问令牌' });
+        return;
+    }
+
     try {
         if (req.method === 'GET' && pathname === '/health') {
-            sendJson(res, 200, {
+            const healthBody = {
                 ok: true,
                 pid: process.pid,
                 node: process.version,
-                latexmkPath: LATEXMK,
                 latexmkExists: fs.existsSync(LATEXMK),
-                workRoot: WORK_ROOT,
                 // v2 Pass P45：能力/版本自报——前端判断"这个桥支不支持某个新功能"必须靠这里，
                 // 不能靠解析下面 GET / 那段人读的文字列表（刚出过 P44 加了 /fs/capabilities
                 // 却漏更新那段文字的事故，字符串列表跟真实路由不同步这类问题不会自愈）。
@@ -1967,7 +2052,14 @@ const server = http.createServer(async (req, res) => {
                 // 是旧桥，不可能反过来）。
                 bridgeApiVersion: BRIDGE_API_VERSION,
                 bridgeCapabilities: BRIDGE_CAPABILITIES
-            });
+            };
+            // v2 Pass P49：/health 在 REMOTE_MODE 下豁免令牌校验（前端要靠它探活），所以绝不能
+            // 顺带泄露本机敏感路径——latexmkPath/workRoot 只在本地模式下返回。
+            if (!REMOTE_MODE) {
+                healthBody.latexmkPath = LATEXMK;
+                healthBody.workRoot = WORK_ROOT;
+            }
+            sendJson(res, 200, healthBody);
             return;
         }
 
@@ -2416,6 +2508,16 @@ server.listen(PORT, HOST, () => {
     console.log('[latex-bridge] listening on http://' + HOST + ':' + PORT);
     console.log('[latex-bridge] latexmk: ' + LATEXMK + (fs.existsSync(LATEXMK) ? ' (found)' : ' (MISSING!)'));
     console.log('[latex-bridge] work root: ' + WORK_ROOT);
+    if (HOST === '0.0.0.0') {
+        console.warn('[latex-bridge] ⚠️ 警告：正在监听 0.0.0.0（所有网卡），这会把桥暴露给同一网络下的任何');
+        console.warn('[latex-bridge]    设备，强烈建议改绑到具体的 Tailscale IP（例如 100.x.x.x），而不是 0.0.0.0。');
+    }
+    if (REMOTE_MODE) {
+        console.log('[latex-bridge] 远程模式已启用：除 /health 外的所有端点都要求访问令牌（请求头 ' + TOKEN_HEADER + '）。');
+        console.log('[latex-bridge] 访问令牌（请抄进前端设置的"访问令牌"一栏，注意保密，不要发给别人）：');
+        console.log('[latex-bridge]   ' + BRIDGE_TOKEN);
+        console.log('[latex-bridge] 前端设置里的"服务地址"填：http://' + HOST + ':' + PORT);
+    }
 });
 
 process.on('SIGINT', () => { try { killTree(currentChild && currentChild.pid); } catch (e) {} process.exit(0); });
