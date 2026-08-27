@@ -24146,26 +24146,150 @@ function ovlVisualTransCachePut(text, config, tgt) {
     } catch (e) {}
 }
 
-// ---- 单块翻译：掩码 -> 调模型 -> 校验 -> 还原 ----
-// 契约：纯公式/纯注释块（掩码后没有可翻的字）原样返回，不占请求；校验不过直接 throw，
-// 调用方（ovlVisualLangRunQueue）负责把这一块标记失败、不写入缓存、不阻塞其它块。
+// ==================== v2 Pass P39：Visual 中文模式补齐代码/逐字环境的哨兵保护 ====================
+// 【缺口】P38 的哨兵掩码复用的是 XPORT_MATH_ENVS/XPORT_OPAQUE_RE，这两张表是给"整篇翻译"
+// 那条成熟路径服务的，覆盖的是数学环境和引用类命令——verbatim/lstlisting/algorithm 这类
+// "整段都是代码/伪代码、一个字都不该被翻译"的逐字环境完全不在保护范围内，块内部只有
+// $…$/引用命令会被掩码，代码本体会被当成正文直接送去给模型"翻译"，实测这类环境在真实
+// 论文里存在（算法伪代码块），一旦被中文模式懒翻译命中就是结构性损坏。
+//
+// 【为什么不改 XPORT_MATH_ENVS/XPORT_OPAQUE_RE】那两张表被整篇翻译路径（xportPack 等）
+// 共用，且是全局正则/常量，本轮只需要动 Visual 逐块翻译这一条路，改全局表等于给不需要
+// 改的功能引入回归面。做法是在调用 xportMask 之前先加一层本模块私有的"代码/逐字环境"
+// 掩码，产出的哨兵格式与 xportMask 自己认的 [[数字]]、以及 @@数字@@（跨栏高亮协议）都
+// 刻意不同——用全角字符〔〔OVLCODE数字〕〕，避免两层哨兵互相误判、还原顺序打架。
+//
+// 【两层如何叠加】ovlVisualCodeMask 先把代码/逐字环境整段抽走，原地留下我方哨兵；
+// 剩下的文本（含哨兵字面量）再交给 xportMask 走一遍公式/引用掩码——哨兵本身不含
+// $ \ % [[ 这些 xportMask 会识别的字符，会被当成普通文本原样透传，不会被二次处理。
+// 模型返回后先用 xportUnmask 还原公式/引用层，再用 ovlVisualCodeCheck 校验我方哨兵
+// 是否完整（不多不少、不重不漏），通过才用 ovlVisualCodeUnmask 还原代码原文；校验不
+// 通过就整块回退显示原文并 console.warn，绝不把带哨兵残渣的文本显示给用户。
+const OVL_VISUAL_CODE_ENV_NAMES = ['verbatim', 'Verbatim', 'lstlisting', 'minted', 'alltt',
+    'algorithm', 'algorithmic', 'algorithmicx', 'algorithm2e'];
+function ovlVisualCodeToken(k) { return '〔〔OVLCODE' + k + '〕〕'; }
+const OVL_VISUAL_CODE_TOKEN_RE = /〔〔OVLCODE(\d+)〕〕/g;
+
+// 从 \begin{...} 的反斜杠位置起，找它配对的 \end{...} 之后一位的下标；用通用的
+// \begin/\end 深度计数（不比对环境名），这样 algorithm 里嵌 algorithmic 这类"目标环境
+// 套目标环境"也能整体收成一块，不会在内层就被错误截断。找不到配对返回 -1。
+function ovlVisualCodeEnvEnd(text, beginIdx) {
+    const openBraceEnd = text.indexOf('}', beginIdx);
+    if (openBraceEnd === -1) return -1;
+    let depth = 1;
+    const tagRe = /\\(begin|end)\{[^}]*\}/g;
+    tagRe.lastIndex = openBraceEnd + 1;
+    let m;
+    while ((m = tagRe.exec(text))) {
+        if (m[1] === 'begin') depth++;
+        else { depth--; if (depth === 0) return tagRe.lastIndex; }
+    }
+    return -1;
+}
+// 把一段原文里的代码/逐字环境整体抽走，换成本模块私有哨兵。返回
+// { text: 抽走后的文本, map: [被抽走的原文片段…]（下标从 0，哨兵里的数字从 1 开始）}。
+function ovlVisualCodeMask(text) {
+    const src = String(text == null ? '' : text);
+    const n = src.length;
+    const map = [];
+    let out = '';
+    let i = 0;
+    while (i < n) {
+        if (src[i] === '\\') {
+            // \verb / \verb*，任意非字母非空白字符做定界符，定界符之间原样不转义
+            const vm = /^\\verb\*?([^a-zA-Z\s])/.exec(src.slice(i, i + 8));
+            if (vm) {
+                const delim = vm[1];
+                const openEnd = i + vm[0].length;
+                const closeIdx = src.indexOf(delim, openEnd);
+                if (closeIdx !== -1) {
+                    map.push(src.slice(i, closeIdx + 1));
+                    out += ovlVisualCodeToken(map.length);
+                    i = closeIdx + 1;
+                    continue;
+                }
+            }
+            const bm = /^\\begin\{([^}]*)\}/.exec(src.slice(i, i + 60));
+            if (bm && OVL_VISUAL_CODE_ENV_NAMES.indexOf(bm[1].replace(/\*$/, '')) !== -1) {
+                const closeEnd = ovlVisualCodeEnvEnd(src, i);
+                if (closeEnd !== -1) {
+                    map.push(src.slice(i, closeEnd));
+                    out += ovlVisualCodeToken(map.length);
+                    i = closeEnd;
+                    continue;
+                }
+            }
+        }
+        out += src[i]; i++;
+    }
+    return { text: out, map: map };
+}
+// 校验：body 里我方哨兵是不是恰好把 map 里每一项都用了且只用了一次（顺序无关）；
+// map 为空时还要求 body 里一个我方哨兵都不能凭空出现（模型不该自己编出这种记号）。
+function ovlVisualCodeCheck(body, map) {
+    const t = String(body == null ? '' : body);
+    if (!map.length) return !OVL_VISUAL_CODE_TOKEN_RE.test(t);
+    const seen = new Array(map.length).fill(0);
+    const re = new RegExp(OVL_VISUAL_CODE_TOKEN_RE.source, 'g');
+    let m, total = 0;
+    while ((m = re.exec(t))) {
+        total++;
+        const k = parseInt(m[1], 10);
+        if (!(k >= 1 && k <= map.length)) return false;
+        seen[k - 1]++;
+    }
+    if (total !== map.length) return false;
+    for (let i = 0; i < map.length; i++) if (seen[i] !== 1) return false;
+    return true;
+}
+function ovlVisualCodeUnmask(body, map) {
+    return String(body == null ? '' : body).replace(new RegExp(OVL_VISUAL_CODE_TOKEN_RE.source, 'g'), function (whole, d) {
+        const k = parseInt(d, 10);
+        return (k >= 1 && k <= map.length) ? map[k - 1] : whole;
+    });
+}
+// 合并两层哨兵后判断"这一块还有没有可翻的自然语言"——xportMask 自己的 [[数字]] 和本层
+// 的〔〔OVLCODE数字〕〕都先剥掉，剩下全是空白就说明整块要么是纯公式/引用、要么是纯代码/
+// 逐字环境（或两者叠加），跳过模型调用，原样显示原文，省一次请求也绝不会翻坏代码。
+function ovlVisualNothingToTranslate(maskedText) {
+    return String(maskedText == null ? '' : maskedText)
+        .replace(/\[\[\s*\d+\s*\]\]/g, '')
+        .replace(OVL_VISUAL_CODE_TOKEN_RE, '')
+        .trim() === '';
+}
+
+// ---- 单块翻译：代码层掩码 -> 公式/引用层掩码 -> 调模型 -> 两层各自校验 -> 两层各自还原 ----
+// 契约：纯公式/纯代码块（两层掩码后没有可翻的字）原样返回，不占请求；xportBlockOk 校验
+// 不过直接 throw（沿用 P38 既有行为，调用方 ovlVisualLangRunQueue 会标记这一块失败、
+// 不写入缓存、不阻塞其它块）；本层新增的哨兵校验不过则不 throw——直接回退返回原文
+// 并 console.warn，因为这类失败的正确表现是"当作没翻译过"而不是"标记失败等重试"，
+// 绝不能把带哨兵残渣的文本显示给用户。
 async function ovlVisualTranslateBlockText(text, config, signal) {
     const src = String(text == null ? '' : text);
     if (!src.trim()) return src;
-    const masked = xportMask(src);
-    if (xportNothingToTranslate(masked.text)) return src;
+    const codeMasked = ovlVisualCodeMask(src);
+    const masked = xportMask(codeMasked.text);
+    if (ovlVisualNothingToTranslate(masked.text)) return src;
     const prompt = '你是学术论文翻译助手，把下面的 LaTeX 片段翻译成简体中文学术书面语。硬性规则：\n'
         + '1) 文本中所有形如 [[数字]] 的占位符必须原样保留在译文里、不得翻译、不得增删、不得改动方括号或数字——'
         + '它们代表被抽走的公式/引用/命令，请把每一个都当成一个不可拆分的单词对待，直接嵌进对应的译文位置。\n'
-        + '2) 只输出翻译结果本身，不要添加任何解释、前后缀、引号或 Markdown 代码块标记。\n'
-        + '3) 保持原文的意思和语气，译成通顺准确的简体中文学术书面语。\n\n'
+        + '2) 文本中所有形如 〔〔OVLCODE数字〕〕 的占位符同样必须原样保留在译文里、不得翻译、不得增删、'
+        + '不得改动括号或数字——它们代表被抽走的代码/伪代码/逐字环境，请把每一个都当成一个不可拆分的'
+        + '单词对待，直接嵌进对应的译文位置。\n'
+        + '3) 只输出翻译结果本身，不要添加任何解释、前后缀、引号或 Markdown 代码块标记。\n'
+        + '4) 保持原文的意思和语气，译成通顺准确的简体中文学术书面语。\n\n'
         + '原文：\n' + masked.text;
     const raw = await callModelPlainText(prompt, config, signal);
     const body = (typeof raw === 'string') ? raw.trim() : '';
     if (!xportBlockOk(body, masked.map)) {
         throw new Error('翻译结果未通过完整性校验（占位符或公式被改动）');
     }
-    return xportUnmask(body, masked.map);
+    const afterXport = xportUnmask(body, masked.map);
+    if (!ovlVisualCodeCheck(afterXport, codeMasked.map)) {
+        console.warn('[ovl] visual 中文模式：代码/逐字环境哨兵残留或数量不匹配，回退显示原文', src.slice(0, 120));
+        return src;
+    }
+    return ovlVisualCodeUnmask(afterXport, codeMasked.map);
 }
 
 const OVL_VISUAL_MATH_ATOMIC_ENV_RE = /^(equation|align|gather|multline|eqnarray|alignat|flalign|IEEEeqnarray|cases|dcases|rcases|matrix|pmatrix|bmatrix|vmatrix|Vmatrix|smallmatrix|array|split|subarray|CD)\*?$/;
