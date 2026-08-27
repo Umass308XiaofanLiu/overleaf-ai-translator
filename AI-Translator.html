@@ -5867,7 +5867,9 @@ function focusWireBlock() {
             + '⚠ 这是**关注**，不是修改授权：没有被明确要求改动之前，一个字都不要改，也不要因为'
             + '它们被标出来就输出 ==EDIT== 块。\n'
             + (hasTexItems ? '其中标着「LaTeX 源码」的几处来自用户正在编辑的 .tex 文件，**不在**上面的 ==DOC== 编号体系里；'
-                + '你看不到那个文件的其余内容，不要假装看过，也不要为它们输出 ==EDIT== 块。\n' : '')
+                + '这几行只是起点——如果下面【文件读取工具】小节里的工具可用，需要看这个文件的其余部分、'
+                + '它 \\ref/\\cite 指向的定义、或者 supp.tex 等别的文件，主动去读；没读过的部分依然'
+                + '不要假装看过，也不要为它们输出 ==EDIT== 块。\n' : '')
             + items.join('\n')
             + '\n==FOCUSEND==';
     } catch (e) {
@@ -17399,7 +17401,9 @@ function chatAppendPendingRow() {
         row.appendChild(bubble);
         log.appendChild(row);
         chatScrollToBottom();
-        return { row: row, timeEl: time, tokEl: tok };
+        // labelEl 单独暴露出去：P42 的工具调用循环用它把 "thinking…" 临时换成
+        // "正在读取 xxx…"，工具执行完再换回来——纯文本替换，不新建/不摧毁这一行。
+        return { row: row, timeEl: time, tokEl: tok, labelEl: label };
     } catch (e) {
         console.error('[chat] appendPendingRow failed', e);
         return null;
@@ -17798,6 +17802,9 @@ function chatSystemPrompt(hasTarget, hasDoc, hasFocus, docLang) {
           + '那是**请你多留意的地方**，不是让你改的地方：没有被明确要求改动之前，'
           + '不要因为某处被标出来就去改写它，更不要为此输出 ==EDIT== 块。\n'
         : '';
+    // v2 Pass P42：只读的文件工具小节。永远都在（不受 hasDoc/hasTarget/hasFocus 影响）——
+    // 哪怕这一轮什么都没附加，模型也应该知道自己能不能主动去读项目文件夹里的东西。
+    const toolsBlock = chatAgentToolsSystemBlock();
     const base = ''
         + '你是学术论文翻译工具里的助手。用户正在处理一篇需要翻译的论文，你**只看得到左栏「原文」**'
         + '（用户正在写、正在改的那份待翻译内容）；右栏的「译文」是翻译结果，你看不到它，'
@@ -17815,7 +17822,9 @@ function chatSystemPrompt(hasTarget, hasDoc, hasFocus, docLang) {
             : '')
         + focusRule
         + (focusRule ? '\n' : '')
-        + '回复格式（严格遵守，**不要输出 JSON**）：\n'
+        + toolsBlock
+        + (toolsBlock ? '\n' : '')
+        + '回复格式（严格遵守，**不要输出 JSON**——==TOOL== 块内部的那段参数除外，见上面工具小节）：\n'
         + '==CHAT==\n'
         + '<给用户看的话，可以用 Markdown>\n\n'
         + '规则：\n'
@@ -18224,6 +18233,296 @@ function chatSetBusy(on) {
 // 也就是说旧的那份从落地起就是死代码，只会在排查「状态条为什么不刷新」时把人引到错的函数上
 // （而提取式测试的 extractFn 取的正是文件里**第一个**同名函数）。已删除。
 
+// ============================================================================
+// v2 Pass P42：AI 聊天窗 agent 化（只读）——文本协议的工具调用循环
+// ============================================================================
+// 模型层（chatCallModel）是纯文本接口——一坨 messages 进，一段文本出，不支持结构化
+// tool-calling，也**绝不允许**为了加这个功能去改 callClaudeAPI/callOpenAIAPI 那几个函数。
+// 所以工具调用走跟 ==EDIT==/==DOC==/==FOCUS== 同一套「== 分帧」文本协议：模型这一轮如果
+// 想先看文件，整条回复只能是一个
+//   ==TOOL name=list_dir|read_file==
+//   {JSON 参数}
+//   ==TOOLEND==
+// 这样的块；不含这个块就当作最终回复，原样交给下面已有的 chatParseEnvelope/chatRenderAssistant，
+// 两套协议在同一段文本里互不干扰（工具块用的是 TOOL/TOOLEND，不是 CHAT/EDIT/END/DOC/FOCUS）。
+//
+// 只读：目前只有 list_dir / read_file 两个工具，都是对 tools/latex-bridge/server.js 已有的
+// /fs/list、/fs/read 端点的只读调用——那两个端点本身也能写（/fs/write 等），但这一轮的系统
+// 提示只教模型这两个只读用法，前端也没有暴露任何 write/move/delete 的调用路径（下一轮再做，
+// 这一轮连"预留但禁用"的代码路径都不留）。
+//
+// 三条硬上限，全部是结构性存在（for 循环有界 + 累计字节计数），不是靠模型自觉：
+//   1. CHAT_AGENT_MAX_ITERS 轮模型调用——绝不会死循环。
+//   2. CHAT_AGENT_TOTAL_READ_BUDGET 字节的**累计**读取预算，超了就不再执行新的工具调用。
+//   3. 单次 read_file 没给 startLine/endLine 时，注入模型的正文本身也有行数/字节上限，
+//      超了就截断并提示模型可以用行区间续读。
+// 格式纠错只给一次机会（usedRetry），再错就把那段原始文本原样交给 chatParseEnvelope
+// 当白话处理——那边对没有 ==CHAT== 标记的文本本来就会整段当白话，不会因为这里多包一层而崩。
+const CHAT_AGENT_MAX_ITERS = 8;
+const CHAT_AGENT_TOTAL_READ_BUDGET = 300 * 1024;      // 这一整轮（可能好几次工具调用）的累计读取预算
+const CHAT_AGENT_SINGLE_READ_MAX_LINES = 2000;        // 没给行区间时，单次 read_file 最多注入这么多行
+const CHAT_AGENT_SINGLE_READ_MAX_BYTES = 200 * 1024;  // 同上，字节上限（两条谁先触发都截）
+const CHAT_AGENT_TOOLS = ['list_dir', 'read_file'];
+
+// 项目绝对路径：跟 Overleaf 面板"项目绝对路径"输入框共用同一个 DOM 元素（ovlDoRecompile 等
+// 处已有的取法），不新起第二套配置。
+function chatAgentProjectDir() {
+    try {
+        const el = document.getElementById('ovlProjectPathInput');
+        return el ? String(el.value || '').trim() : '';
+    } catch (e) { return ''; }
+}
+
+// 桥在线状态直接读 OvlState.bridgeOnline（ovlBridgeCheckHealth 每 5 秒轮询维护的那个布尔值），
+// 绝不为了判断这一条额外发一次探测请求。
+function chatAgentBridgeReady() {
+    try { return OvlState.bridgeOnline === true && !!chatAgentProjectDir(); } catch (e) { return false; }
+}
+
+// 工具小节的系统提示。桥不可用时明确说"没有工具"，绝不让模型以为自己能读文件、结果每次
+// 调用都拿到一堆连接失败——那是「优雅降级」，不是「假装有能力再报错」。
+function chatAgentToolsSystemBlock() {
+    if (!chatAgentBridgeReady()) {
+        return '\n【文件读取工具】这一轮不可用（还没有连上编译桥接服务，或者没有填写项目绝对路径）。'
+            + '不要输出 ==TOOL== 块，只能根据上面已经给到你的内容回答，也不要假装自己读过任何'
+            + '没有出现在这段对话里的文件。\n';
+    }
+    return '\n【文件读取工具】用户关注的那句话（如果有的话）只是一个起点——需要的话，你可以主动'
+        + '读取用户项目文件夹里的其它文件：它的上下文、它 \\ref/\\cite 指向的定义、supp.tex 等'
+        + '文件里的相关数据，读完再综合回答，而不是只盯着关注的那一句话猜。可用工具：\n'
+        + '  · list_dir —— 列出一个目录。参数：{"path": "相对项目根目录的路径，用 \\".\\" 表示根目录"}\n'
+        + '  · read_file —— 读取一个文件。参数：{"path": "相对路径"}，可选 "startLine"/"endLine"'
+        + '（1-based、含端点，只读一段，别一次整篇灌进来）\n'
+        + '调用格式——**这一轮的整条回复只能是下面这一个块，前后不要有任何别的文字，也不要同时输出 ==CHAT==**：\n'
+        + '==TOOL name=list_dir==\n{"path":"."}\n==TOOLEND==\n'
+        + '或者：\n'
+        + '==TOOL name=read_file==\n{"path":"main.tex","startLine":100,"endLine":160}\n==TOOLEND==\n'
+        + '规则：\n'
+        + '1. 一轮最多发起一次工具调用；结果会在下一轮发给你，那时候可以再调用、也可以直接回答。\n'
+        + '2. 读大文件优先用 startLine/endLine 只读需要的那一段。\n'
+        + '3. 工具调用的总轮数和总读取量都有上限，到了上限你会被明确告知，那时必须直接基于已经'
+        + '读到的内容回答，不要再输出 ==TOOL==。\n'
+        + '4. 只有确实需要先看到文件内容才能回答、或者用户明确要求你去看某个文件时才调用工具；'
+        + '能直接回答的问题不要绕远路先读文件。\n'
+        + '5. 不需要工具的时候，正常按 ==CHAT== 格式回答，不要输出空的或试探性的工具块。\n';
+}
+
+// 解析模型这一轮的回复是不是一个工具调用。跟 chatParseEnvelope 同一套"取第一个终止符"纪律，
+// 这里不重复展开。isToolCall=false 时，调用方原样把 raw 交给 chatParseEnvelope 走已有的
+// ==CHAT==/==EDIT== 解析——两套协议互不干扰。
+function chatAgentParseToolCall(raw) {
+    const text = String(raw == null ? '' : raw);
+    const out = { isToolCall: false, malformed: false, reason: '', tool: '', args: null };
+    const tm = /^[ \t]*==TOOL\b([^\n]*?)==[ \t]*$/m.exec(text);
+    if (!tm) return out;
+    out.isToolCall = true;
+    const bodyStart = tm.index + tm[0].length;
+    const endRe = /^[ \t]*==TOOLEND==[ \t]*$/gm;
+    endRe.lastIndex = bodyStart;
+    const em = endRe.exec(text);
+    if (!em) { out.malformed = true; out.reason = '==TOOL== 块没有闭合（缺 ==TOOLEND==，可能是被截断了）'; return out; }
+    const attrs = String(tm[1] || '');
+    const nameM = /\bname\s*=\s*"?([a-zA-Z_]+)"?/i.exec(attrs);
+    const name = nameM ? nameM[1] : '';
+    if (CHAT_AGENT_TOOLS.indexOf(name) === -1) {
+        out.malformed = true; out.reason = '不认识的工具名「' + name + '」（只支持 list_dir / read_file）'; return out;
+    }
+    let body = text.slice(bodyStart, em.index).replace(/^\r?\n/, '').replace(/\r?\n[ \t]*$/, '').trim();
+    let args;
+    try { args = body ? JSON.parse(body) : {}; }
+    catch (e) { out.malformed = true; out.reason = '工具参数不是合法 JSON：' + e.message; return out; }
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+        out.malformed = true; out.reason = '工具参数必须是一个 JSON 对象'; return out;
+    }
+    if (name === 'read_file' && (typeof args.path !== 'string' || !args.path)) {
+        out.malformed = true; out.reason = 'read_file 缺少必填的 path 参数'; return out;
+    }
+    out.tool = name;
+    out.args = args;
+    return out;
+}
+
+// 对话窗里那条可折叠的"工具调用"行——用户必须能看清 agent 到底看了什么，见任务硬性要求。
+// 复用 aichat-think/aichat-think-body 这两个既有折叠样式（chatAppendThinking 同一套），
+// 不新增 CSS。
+function chatAppendToolRow(summaryText, detailText) {
+    try {
+        const log = document.getElementById('aiChatLog');
+        if (!log) return null;
+        const row = document.createElement('div');
+        row.className = 'aichat-row aichat-row-system';
+        const bubble = document.createElement('div');
+        bubble.className = 'aichat-bubble';
+        const det = document.createElement('details');
+        det.className = 'aichat-think';
+        const sum = document.createElement('summary');
+        sum.textContent = summaryText;
+        const body = document.createElement('div');
+        body.className = 'aichat-think-body';
+        body.textContent = detailText;
+        det.appendChild(sum);
+        det.appendChild(body);
+        bubble.appendChild(det);
+        row.appendChild(bubble);
+        log.appendChild(row);
+        chatScrollToBottom();
+        return row;
+    } catch (e) { console.error('[chat] appendToolRow failed', e); return null; }
+}
+
+// 实际执行一次工具调用，返回 { ok, uiSummary, uiDetail, textForModel, bytes }。
+// bytes 是按字符数估的近似值（跟文件里别处 chatEstTokens 同一口径），只用来跟
+// CHAT_AGENT_TOTAL_READ_BUDGET 比大小，不追求逐字节精确。
+async function chatAgentExecTool(toolName, args, projectDir, signal) {
+    const label = (toolName === 'list_dir') ? '列出目录' : '读取文件';
+    if (!projectDir) {
+        const msg = '没有配置项目绝对路径，无法执行文件操作。';
+        return { ok: false, uiSummary: label + '失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    let resp, data;
+    try {
+        resp = await fetch(ovlBridgeUrl(toolName === 'list_dir' ? '/fs/list' : '/fs/read'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(toolName === 'list_dir'
+                ? { projectDir: projectDir, path: (typeof args.path === 'string' && args.path) ? args.path : '.' }
+                : { projectDir: projectDir, path: args.path }),
+            signal: signal || undefined
+        });
+        const text = await resp.text();
+        try { data = JSON.parse(text); } catch (e) { data = null; }
+    } catch (e) {
+        if (e && e.name === 'AbortError') throw e;   // 中断不是"工具失败"，原样往上抛，走 chatSend 既有的中止路径
+        const msg = '连不上桥接服务（' + ((e && e.message) || e) + '）';
+        return { ok: false, uiSummary: label + '失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    if (!data || !resp.ok || data.ok !== true) {
+        const err = (data && data.error) || ('HTTP ' + (resp ? resp.status : '?'));
+        return { ok: false, uiSummary: label + '失败', uiDetail: err, textForModel: '失败：' + err, bytes: 0 };
+    }
+    if (toolName === 'list_dir') {
+        const entries = Array.isArray(data.entries) ? data.entries : [];
+        const lines = entries.map(function (e) {
+            return (e.isDir ? '[目录] ' : '[文件] ') + e.name + (e.isDir ? '' : '（' + e.size + ' 字节）');
+        });
+        const text = '目录「' + data.path + '」共 ' + entries.length + ' 项：\n' + (lines.length ? lines.join('\n') : '（空目录）');
+        return { ok: true, uiSummary: '列出目录：' + data.path + '（' + entries.length + ' 项）', uiDetail: text, textForModel: text, bytes: text.length };
+    }
+    // read_file
+    if (data.binary) {
+        const msg = '文件「' + data.path + '」是二进制文件，无法按文本读取。';
+        return { ok: true, uiSummary: '读取文件：' + data.path + '（二进制，已跳过）', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const allLines = String(data.content == null ? '' : data.content).split(/\r\n|\r|\n/);
+    const total = allLines.length;
+    const reqStart = Number(args.startLine);
+    const reqEnd = Number(args.endLine);
+    const hasRange = isFinite(reqStart) && reqStart >= 1;
+    let lo = hasRange ? Math.max(1, Math.floor(reqStart)) : 1;
+    lo = Math.min(lo, Math.max(1, total));
+    let hi = hasRange
+        ? (isFinite(reqEnd) && reqEnd >= lo ? Math.floor(reqEnd) : total)
+        : total;
+    hi = Math.max(lo, Math.min(hi, total));
+    let truncatedByLines = false;
+    if (!hasRange && (hi - lo + 1) > CHAT_AGENT_SINGLE_READ_MAX_LINES) {
+        hi = lo + CHAT_AGENT_SINGLE_READ_MAX_LINES - 1;
+        truncatedByLines = true;
+    }
+    let body = allLines.slice(lo - 1, hi).map(function (l, i) { return (lo + i) + '\t' + l; }).join('\n');
+    let truncatedByBytes = false;
+    if (body.length > CHAT_AGENT_SINGLE_READ_MAX_BYTES) {
+        body = body.slice(0, CHAT_AGENT_SINGLE_READ_MAX_BYTES);
+        truncatedByBytes = true;
+    }
+    let text = '文件「' + data.path + '」第 ' + lo + '–' + hi + ' 行（全文共 ' + total + ' 行）：\n' + body;
+    if (truncatedByLines) {
+        text += '\n\n（⚠ 已截断到 ' + CHAT_AGENT_SINGLE_READ_MAX_LINES + ' 行上限；这个文件还有更多内容，'
+            + '需要的话请用 startLine/endLine 指定行区间继续读。）';
+    }
+    if (truncatedByBytes) {
+        text += '\n\n（⚠ 已按单次读取的字节上限截断；需要的话请用 startLine/endLine 分段继续读。）';
+    }
+    return {
+        ok: true,
+        uiSummary: '读取文件：' + data.path + ' 第 ' + lo + '–' + hi + ' 行' + ((truncatedByLines || truncatedByBytes) ? '（已截断）' : ''),
+        uiDetail: text,
+        textForModel: text,
+        bytes: text.length
+    };
+}
+
+// 文本协议的多轮工具调用主循环。wire 是这一轮已经装好的消息数组（chatAssembleTurn 的产物，
+// 最后一条是用户这一轮的完整载荷），本函数在它后面追加"assistant 工具调用 → user 工具结果"
+// 这样的往返，直到模型给出不含 ==TOOL== 的最终回复，或撞上下面任一硬上限。
+// 返回值跟原来直接 `await chatCallModel(...)` 完全一样（一段 raw 文本；meta 通过引用原地
+// 填好），调用方 chatSend 后续那一段"陈旧响应丢弃 / meta.aborted / chatRenderAssistant"
+// 逻辑一个字都不用改。
+//
+// 【已知取舍】循环内部一律不传流式 sink（本地模型的逐字流式展示因此在这条路径上关闭）——
+// 在拿到完整响应之前没法预先知道这一轮是工具调用还是最终答案，索性统一走非流式：简单，
+// 也不会把 ==TOOL== 协议文本泄漏进用户看到的气泡。最终答案因此改成"一次性到达"而不是逐字
+// 流入，跟 openai/claude/gemini 三家原本的行为一致（只有 local 流式这一条路径受影响）。
+async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
+    const projectDir = chatAgentProjectDir();
+    let bytesUsed = 0;
+    let usedRetry = false;
+    let raw = '';
+
+    const setLabel = function (text) {
+        try { if (pending && pending.labelEl) pending.labelEl.textContent = text; } catch (e) {}
+    };
+
+    for (let iter = 1; iter <= CHAT_AGENT_MAX_ITERS; iter++) {
+        raw = await chatCallModel(wire, sys, signal, meta, null);
+        const parsed = chatAgentParseToolCall(raw);
+
+        if (!parsed.isToolCall) return raw;   // 正常最终回复，交给外层已有的信封解析
+
+        if (parsed.malformed) {
+            if (!usedRetry && iter < CHAT_AGENT_MAX_ITERS) {
+                usedRetry = true;
+                wire.push({ role: 'assistant', content: raw });
+                wire.push({ role: 'user', content: '你上一条回复的工具调用格式不对：' + parsed.reason
+                    + '\n请重新回复：要么是一个合法的 ==TOOL name=list_dir|read_file== / JSON 参数 / ==TOOLEND== 三段式块，'
+                    + '要么直接按 ==CHAT== 格式回答，不要输出别的内容。' });
+                setLabel('格式有误，正在请模型重新给出…');
+                continue;
+            }
+            // 纠错机会已经用掉、或者已经没有轮次可用——把这段原始文本原样交出去，当白话处理，
+            // 不为了"再猜一次"无限重试。
+            return raw;
+        }
+
+        if (iter === CHAT_AGENT_MAX_ITERS) break;   // 最后一轮还在要工具：不执行，进入下面的封顶处理
+
+        if (bytesUsed >= CHAT_AGENT_TOTAL_READ_BUDGET) {
+            wire.push({ role: 'assistant', content: raw });
+            wire.push({ role: 'user', content: '[工具结果]\n已经达到这一轮的累计读取上限（约 '
+                + Math.round(CHAT_AGENT_TOTAL_READ_BUDGET / 1024) + 'KB），不会再执行新的工具调用了。'
+                + '请直接基于目前已经读到的内容回答。' });
+            setLabel('已到读取上限…');
+            continue;
+        }
+
+        setLabel('正在' + (parsed.tool === 'read_file' ? '读取' : '查看') + '「' + (parsed.args.path || '.') + '」…');
+        const result = await chatAgentExecTool(parsed.tool, parsed.args, projectDir, signal);
+        chatAppendToolRow(
+            (parsed.tool === 'read_file' ? '🔧 read_file' : '🔧 list_dir') + '（' + (parsed.args.path || '.') + '）· ' + result.uiSummary,
+            result.uiDetail.length > 4000 ? result.uiDetail.slice(0, 4000) + '\n…（此处仅显示前 4000 字，模型收到的是完整版本）' : result.uiDetail
+        );
+        bytesUsed += result.bytes;
+        wire.push({ role: 'assistant', content: raw });
+        wire.push({ role: 'user', content: '[工具结果 · ' + parsed.tool + ']\n' + result.textForModel });
+        setLabel('thinking…');
+    }
+
+    // 撞上了轮数上限：如实告诉用户，不再继续、不装作给出了完整答案。
+    chatAppendRow('system', '已达到工具调用轮数上限（' + CHAT_AGENT_MAX_ITERS + ' 轮），以下是目前已经掌握的信息。');
+    return '==CHAT==\n已经达到这一轮工具调用的轮数上限（' + CHAT_AGENT_MAX_ITERS + ' 轮），我先基于目前已经读到的内容回答；'
+        + '如果还需要继续深入，请再发一次消息，我会接着往下查。';
+}
+
 function chatPushUser(text) {
     ChatState.messages.push({ role: 'user', content: String(text == null ? '' : text) });
     chatAppendRow('user', text);
@@ -18335,7 +18634,10 @@ async function chatSend() {
             text: function (s) { killPending(); sink0.text(s); },
             destroy: sink0.destroy
         };
-        const raw = await chatCallModel(wire, sys, controller ? controller.signal : null, meta, live);
+        // v2 Pass P42：单次 chatCallModel 换成可能多轮的工具调用循环——对没有触发任何
+        // ==TOOL== 调用的普通对话，这一行为跟原来逐字节一致（循环第一轮不是工具调用就直接
+        // 返回，等价于原来那一次 await chatCallModel(...)）。
+        const raw = await chatAgentRunLoop(wire, sys, controller ? controller.signal : null, meta, pending);
 
         // 陈旧响应：用户在这期间又发了一条。丢弃，绝不往窗口里写。
         if (mySeq !== ChatState.seq) return;
