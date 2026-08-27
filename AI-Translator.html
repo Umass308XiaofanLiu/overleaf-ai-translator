@@ -22847,6 +22847,8 @@ const OvlState = {
     // null=还没探测到这个字段（桥离线，或连着的是这个字段加入之前的旧桥）；数组=新桥
     // 真实自报的能力清单。桥离线时强制置回 null，不留陈旧的"上次在线时探到的能力"。
     bridgeCapabilities: null,
+    // v2 Pass P53：本地模式 /health 自报的"克隆存放位置"默认父目录；远程模式恒为 null。
+    defaultOverleafCloneRoot: null,
     // ---- v2 Pass P17：桥 WebSocket 磁盘改动推送的自触发回声过滤，见 ovlBridgeHandleExternalChange ----
     lastSelfWriteMtimeMs: null, // 自己上一次真的写盘成功后，FSA File.lastModified 读回来的值
     lastSelfWritePath: null,    // 上面那次写盘对应的绝对路径（ovlBridgeAbsPathFor 算出来的）
@@ -29113,6 +29115,9 @@ async function ovlBridgeCheckHealth() {
         // ovlOverleafProbeStrategySupport() 都要能区分它俩，分别决定"保守拦截"还是
         // "照常尝试、靠 ovlBridgeIsNoSuchRouteError 兜底"。
         bridgeCapabilities = (data && Array.isArray(data.bridgeCapabilities)) ? data.bridgeCapabilities : null;
+        // v2 Pass P53：本地模式下 /health 会带上"克隆存放位置"弹窗要用的默认父目录（远程
+        // 模式下这个字段不存在——桥那边故意不在 REMOTE_MODE 下透出本机路径，见桥端注释）。
+        OvlState.defaultOverleafCloneRoot = (data && typeof data.defaultOverleafCloneRoot === 'string') ? data.defaultOverleafCloneRoot : null;
     } catch (e) {
         online = false;
         bridgeCapabilities = null;
@@ -30618,6 +30623,175 @@ function ovlOverleafCloneSetBusy(busy) {
     }
 }
 
+// v2 Pass P53：克隆前置"存放位置"弹窗——问完 token/项目 ID 之后、真正发起 /overleaf/clone
+// 之前，先让用户确认/改"存放位置（父目录）"+"文件夹名"，取代过去固定写死到
+// %LOCALAPPDATA%\AI-Translator\overleaf\<projectId> 的行为。返回 Promise，resolve
+// {parentDir, folderName}（用户确认）或 null（用户取消——调用方什么都不做，不发起克隆）。
+//
+// 本地模式：位置输入框旁边一个"浏览…"按钮直接调 POST /pick-folder（原生 Windows 文件夹
+// 选择框，弹在桥所在这台机器——本地模式下桥就在这台机器，没有 P50 那个"弹在别人看不到的
+// 远程桌面上"的问题）。
+// 远程模式：绝不调 /pick-folder（会弹在桥所在的远程机器桌面上，用户在家/在学校根本看不见，
+// P50 已经踩过这个坑并处理过，见 ovlRemotePickFolder 头部注释）——只给纯路径输入框 + 一个
+// "校验"按钮，调新增的 POST /overleaf/check-target 问桥"这个父目录存不存在/能不能写"。这个
+// 接口故意不是 P50 那个基于 /fs/list 的逐级目录浏览器（那个的 resolveInProject() 语义要求
+// 路径落在某个已知 projectDir 内部，克隆目标定义上就在任何项目之外，硬套上去就得放宽
+// resolveInProject 的越界防护——不值得；见桥端 doOverleafCheckTarget 头部注释）。
+//
+// 点"克隆"提交前，无论本地/远程都会再校验一次（防止用户手改了输入框却没点"浏览/校验"）：
+// 已存在且非空的目标在这里就会被挡下并用中文提示，不用等到 clone 请求真的失败。
+function ovlOverleafPickCloneLocation(projectId, token) {
+    return new Promise(function (resolve) {
+        const overlay = document.getElementById('ovlModalOverlay');
+        if (!overlay) { resolve(null); return; }
+        overlay.innerHTML = '';
+        overlay.hidden = false;
+
+        const remote = ovlIsRemoteBridge();
+
+        const box = document.createElement('div');
+        box.className = 'ovl-modal ovl-modal-wide';
+
+        const h = document.createElement('div'); h.className = 'ovl-modal-title'; h.textContent = '选择克隆存放位置';
+        box.appendChild(h);
+
+        const msg = document.createElement('div'); msg.className = 'ovl-modal-message';
+        msg.textContent = remote
+            ? '桥接服务跑在远程机器上，下面填的是那台远程机器上的路径（不是你眼前这台电脑）。可以先点"校验"确认这个位置能不能用，点"克隆"前也会自动再校验一次。'
+            : '选一个用来存放这个项目的文件夹（父目录），以及子文件夹的名字。';
+        box.appendChild(msg);
+
+        const parentLabel = document.createElement('div'); parentLabel.className = 'ovl-modal-label'; parentLabel.textContent = '存放位置（父目录）';
+        box.appendChild(parentLabel);
+
+        const parentRow = document.createElement('div');
+        parentRow.style.display = 'flex'; parentRow.style.gap = '8px'; parentRow.style.alignItems = 'flex-start';
+        const parentInput = document.createElement('input');
+        parentInput.type = 'text'; parentInput.className = 'ovl-modal-input'; parentInput.style.flex = '1';
+        parentInput.id = 'ovlCloneLocParentInput';
+        parentInput.placeholder = remote ? '例如 /home/xiaofanl/overleaf' : 'C:\\Users\\...\\overleaf';
+        let defaultParent = '';
+        try {
+            defaultParent = remote
+                ? (localStorage.getItem('ovl.overleafCloneParentDirRemote') || '')
+                : (localStorage.getItem('ovl.overleafCloneParentDir') || OvlState.defaultOverleafCloneRoot || '');
+        } catch (e) { defaultParent = remote ? '' : (OvlState.defaultOverleafCloneRoot || ''); }
+        parentInput.value = defaultParent;
+        parentRow.appendChild(parentInput);
+
+        let browseBtn = null;
+        if (!remote) {
+            browseBtn = document.createElement('button');
+            browseBtn.type = 'button'; browseBtn.className = 'ovl-modal-btn'; browseBtn.textContent = '浏览…';
+            browseBtn.id = 'ovlCloneLocBrowseBtn';
+            parentRow.appendChild(browseBtn);
+        }
+        box.appendChild(parentRow);
+
+        const folderLabel = document.createElement('div'); folderLabel.className = 'ovl-modal-label'; folderLabel.textContent = '文件夹名';
+        box.appendChild(folderLabel);
+        const folderInput = document.createElement('input');
+        folderInput.type = 'text'; folderInput.className = 'ovl-modal-input';
+        folderInput.id = 'ovlCloneLocFolderInput';
+        // 还没克隆下来、拿不到 .tex 里的标题，先退回项目 ID；克隆成功后 ovlOverleafCloneFinish
+        // 仍然会用桥端 extractSuggestedProjectName() 抠出来的人类可读标题去问一次"历史显示名"。
+        folderInput.value = projectId; folderInput.placeholder = projectId;
+        box.appendChild(folderInput);
+
+        const statusEl = document.createElement('div'); statusEl.className = 'ovl-modal-error';
+        statusEl.id = 'ovlCloneLocStatus';
+        box.appendChild(statusEl);
+
+        const btnRow = document.createElement('div'); btnRow.className = 'ovl-modal-btns';
+        let validateBtn = null;
+        if (remote) {
+            validateBtn = document.createElement('button');
+            validateBtn.type = 'button'; validateBtn.className = 'ovl-modal-btn'; validateBtn.textContent = '校验';
+            validateBtn.id = 'ovlCloneLocValidateBtn';
+            btnRow.appendChild(validateBtn);
+        }
+        const cancelBtn = document.createElement('button'); cancelBtn.type = 'button'; cancelBtn.className = 'ovl-modal-btn'; cancelBtn.textContent = '取消';
+        cancelBtn.id = 'ovlCloneLocCancelBtn';
+        const okBtn = document.createElement('button'); okBtn.type = 'button'; okBtn.className = 'ovl-modal-btn ovl-modal-btn-primary'; okBtn.textContent = '克隆';
+        okBtn.id = 'ovlCloneLocOkBtn';
+        btnRow.appendChild(cancelBtn); btnRow.appendChild(okBtn);
+        box.appendChild(btnRow);
+        overlay.appendChild(box);
+
+        let settled = false;
+        function close() { overlay.hidden = true; overlay.innerHTML = ''; document.removeEventListener('keydown', onKey); }
+        function finish(result) { if (settled) return; settled = true; close(); resolve(result); }
+        function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); finish(null); } }
+        document.addEventListener('keydown', onKey);
+        overlay.addEventListener('click', function (e) { if (e.target === overlay) finish(null); });
+        cancelBtn.addEventListener('click', function () { finish(null); });
+
+        function setStatus(text, isError) {
+            statusEl.textContent = text || '';
+            statusEl.style.color = isError ? '#f87171' : '#4ade80';
+        }
+
+        // 返回 null 表示"校验不过，别往下走"；{parentDir, folderName, targetDir} 表示通过。
+        async function runCheck() {
+            const parentDir = parentInput.value.trim();
+            const folderName = folderInput.value.trim() || projectId;
+            if (!parentDir) { setStatus('存放位置不能为空', true); return null; }
+            setStatus('校验中…', false);
+            let data;
+            try {
+                const resp = await ovlBridgeFetch(ovlBridgeUrl('/overleaf/check-target'), {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ parentDir: parentDir, folderName: folderName })
+                });
+                data = await resp.json();
+            } catch (e) {
+                setStatus('连不上桥接服务，无法校验', true);
+                return null;
+            }
+            if (!data || !data.ok) { setStatus('校验失败：' + ((data && data.error) || '未知错误'), true); return null; }
+            if (data.parentStatus === 'not-absolute') { setStatus('存放位置必须是绝对路径', true); return null; }
+            if (data.parentStatus === 'missing') { setStatus('存放位置不存在', true); return null; }
+            if (data.parentStatus === 'not-directory') { setStatus('存放位置不是一个目录', true); return null; }
+            if (data.parentStatus === 'not-writable') { setStatus('存放位置没有写入权限', true); return null; }
+            if (data.targetStatus === 'occupied') { setStatus('目标文件夹「' + folderName + '」已存在且非空，换一个名字或位置', true); return null; }
+            setStatus('位置有效：' + (data.targetDir || (parentDir + ' / ' + folderName)), false);
+            return { parentDir: parentDir, folderName: folderName };
+        }
+
+        if (browseBtn) {
+            browseBtn.addEventListener('click', async function () {
+                browseBtn.disabled = true;
+                try {
+                    const resp = await ovlBridgeFetch(ovlBridgeUrl('/pick-folder'), { method: 'POST' });
+                    const data = await resp.json();
+                    if (data && data.ok && !data.cancelled && data.path) {
+                        parentInput.value = data.path;
+                        setStatus('', false);
+                    } else if (data && !data.ok) {
+                        setStatus('选择文件夹失败：' + (data.error || '未知错误'), true);
+                    }
+                } catch (e) {
+                    setStatus('连不上桥接服务', true);
+                } finally { browseBtn.disabled = false; }
+            });
+        }
+        if (validateBtn) validateBtn.addEventListener('click', function () { runCheck(); });
+
+        okBtn.addEventListener('click', async function () {
+            okBtn.disabled = true;
+            let result;
+            try { result = await runCheck(); } finally { okBtn.disabled = false; }
+            if (!result) return; // 校验没过，状态区已经给出中文原因，留在弹窗里让用户改
+            try {
+                localStorage.setItem(remote ? 'ovl.overleafCloneParentDirRemote' : 'ovl.overleafCloneParentDir', result.parentDir);
+            } catch (e) {}
+            finish(result);
+        });
+
+        setTimeout(function () { parentInput.focus(); }, 0);
+    });
+}
+
 // 点击入口：桥离线直接提示；没 token 先问 token（问到就存成默认值）；再问项目 ID/链接；
 // 两步都是 ovlPromptDialog 的 onConfirm 回调链，取消/校验不过就停在原地，不往下走
 // （不需要 onCancel——"什么都不做"正是 onConfirm 不被调用时的默认行为）。
@@ -30636,7 +30810,12 @@ function ovlOverleafClone() {
             onConfirm: function (v) {
                 const projectId = ovlOverleafExtractProjectId(v);
                 if (!projectId) { showToast('项目 ID 格式不对，应为 24 位十六进制字符', 'error'); return; }
-                ovlOverleafDoClone(projectId, token);
+                // v2 Pass P53：在真正发起 /overleaf/clone 之前先弹"存放位置"弹窗——用户没
+                // 确认位置之前不发生任何克隆动作；取消（resolve(null)）就什么都不做。
+                ovlOverleafPickCloneLocation(projectId, token).then(function (loc) {
+                    if (!loc) return;
+                    ovlOverleafDoClone(projectId, token, loc.parentDir, loc.folderName);
+                });
             }
         });
     }
@@ -30657,16 +30836,20 @@ function ovlOverleafClone() {
     });
 }
 
-// 实际发起 clone 请求。projectId/token 由 ovlOverleafClone() 问完了传进来。
-async function ovlOverleafDoClone(projectId, token) {
+// 实际发起 clone 请求。projectId/token 由 ovlOverleafClone() 问完了传进来；parentDir/
+// folderName 是 v2 Pass P53 新增的、由 ovlOverleafPickCloneLocation() 问完了传进来的显式
+// 目标位置（都不传时桥退回旧默认路径，向后兼容）。
+async function ovlOverleafDoClone(projectId, token, parentDir, folderName) {
     ovlOverleafCloneSetBusy(true);
     try {
         let data;
         try {
+            const body = { projectId: projectId, token: token };
+            if (parentDir && folderName) { body.parentDir = parentDir; body.folderName = folderName; }
             const resp = await ovlBridgeFetch(ovlBridgeUrl('/overleaf/clone'), {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ projectId: projectId, token: token })
+                body: JSON.stringify(body)
             });
             data = await resp.json();
         } catch (e) {
@@ -30695,7 +30878,7 @@ async function ovlOverleafDoClone(projectId, token) {
         ovlOverleafSetSyncStatus('克隆完成', false);
         // 收尾（问历史名称、登记历史、打开项目）失败不该冒充"克隆失败"——克隆本身在这里
         // 已经确认成功了，收尾步骤全部包在它自己的 try/catch 里，不往外抛。
-        ovlOverleafCloneFinish(projectId, data);
+        ovlOverleafCloneFinish(projectId, data, folderName);
     } finally {
         ovlOverleafCloneSetBusy(false);
     }
@@ -30703,8 +30886,11 @@ async function ovlOverleafDoClone(projectId, token) {
 
 // 克隆成功（cloned / already-cloned）之后：问项目历史显示名——取消或留空都退回默认值
 // （项目已经克隆到磁盘了，不能因为没起名字就不入历史，靠 ovlPromptDialog 的 onCancel 兜底）。
-function ovlOverleafCloneFinish(projectId, data) {
-    const defaultName = (data && data.suggestedName) || projectId;
+// v2 Pass P53：defaultName 优先用桥从 .tex 抠出来的 suggestedName，其次用户在存放位置
+// 弹窗里自己起的文件夹名（folderName），最后才退回 projectId——folderName 通常比裸的
+// 项目 ID 更可读。
+function ovlOverleafCloneFinish(projectId, data, folderName) {
+    const defaultName = (data && data.suggestedName) || folderName || projectId;
     function proceed(name) {
         ovlOverleafCloneFinishNamed(projectId, data, name).catch(function (e) {
             console.error('[ovl] overleaf clone finish failed', e);

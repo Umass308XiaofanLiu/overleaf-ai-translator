@@ -50,7 +50,7 @@ try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化�
 // v2 Pass P45：/health 里带的能力/版本自报——见该端点注释。每次给桥新增一个"前端需要能
 // 判断有没有"的能力（新端点、既有端点的行为变化），就在 BRIDGE_CAPABILITIES 里加一个字符串，
 // 版本号也提一位。已经上线的能力不会被撤销，这个数组只做加法。
-const BRIDGE_API_VERSION = 50;
+const BRIDGE_API_VERSION = 51;
 const BRIDGE_CAPABILITIES = [
     'overleaf-clone',          // POST /overleaf/clone
     'overleaf-pull-strategy',  // POST /overleaf/pull 认识 body.strategy（abort/stash/discard）
@@ -59,7 +59,9 @@ const BRIDGE_CAPABILITIES = [
     'overleaf-discard-checkpoint', // strategy=discard 丢弃前自动打旁路快照，响应带 checkpoint 字段
     'remote-token-auth',       // v2 Pass P49：可绑非回环地址 + 令牌鉴权，见 tokenAuthorized()
     'fs-write-conflict-check', // v2 Pass P50：POST /fs/write 认识 body.expectedMtimeMs，冲突时返回 conflict:true
-    'ws-ticket-auth'           // v2 Pass P50：POST /ws-ticket 换一次性短时票据，REMOTE_MODE 下 WebSocket 握手强制校验
+    'ws-ticket-auth',          // v2 Pass P50：POST /ws-ticket 换一次性短时票据，REMOTE_MODE 下 WebSocket 握手强制校验
+    'overleaf-clone-target'    // v2 Pass P53：POST /overleaf/clone 认识 body.parentDir/body.folderName；
+                                // 新增 POST /overleaf/check-target 校验存放位置
 ];
 
 // v2 Pass P49：监听地址可配（LATEX_BRIDGE_HOST），默认仍是 127.0.0.1——不传就跟以前
@@ -1433,12 +1435,33 @@ function extractSuggestedProjectName(targetDir) {
 // OVL_TEST_CLONE_ROOT / OVL_TEST_GIT_BASE 两个环境变量仅供 e2e 测试使用：分别让测试把 clone
 // 目标根目录、Overleaf git 服务地址重定向到临时目录 / file:// 假仓库，避免测试写进真实的
 // %LOCALAPPDATA%\AI-Translator。能设环境变量的人本来就能直接改代码，这不构成新的攻击面。
-async function doOverleafClone(projectId, token) {
-    const cloneRoot = process.env.OVL_TEST_CLONE_ROOT
+//
+// v2 Pass P53：parentDir/folderName 是新增的可选显式目标位置——用户在前端弹窗里选的"存放
+// 位置"+"文件夹名"。两者都不传（或传空）时完全退回上面这条旧默认路径，向后兼容旧调用方/
+// 既有测试。传了就必须是绝对路径（不接受相对路径，避免意外相对于服务端 cwd 解析）。
+function defaultOverleafCloneRoot() {
+    return process.env.OVL_TEST_CLONE_ROOT
         || (process.platform === 'win32' && process.env.LOCALAPPDATA
               ? path.join(process.env.LOCALAPPDATA, 'AI-Translator', 'overleaf')
               : path.join(os.homedir(), '.ai-translator', 'overleaf'));
-    const targetDir = path.join(cloneRoot, projectId);
+}
+
+function computeOverleafCloneTargetDir(projectId, parentDir, folderName) {
+    const cloneRoot = defaultOverleafCloneRoot();
+    if (parentDir && folderName) {
+        if (!path.isAbsolute(parentDir)) {
+            return { ok: false, error: '存放位置必须是绝对路径: ' + parentDir };
+        }
+        return { ok: true, targetDir: path.join(path.resolve(parentDir), folderName) };
+    }
+    return { ok: true, targetDir: path.join(cloneRoot, projectId) };
+}
+
+async function doOverleafClone(projectId, token, parentDir, folderName) {
+    const targetResult = computeOverleafCloneTargetDir(projectId, parentDir, folderName);
+    if (!targetResult.ok) return { ok: false, error: targetResult.error };
+    const targetDir = targetResult.targetDir;
+    const cloneRoot = path.dirname(targetDir);
     const gitBase = process.env.OVL_TEST_GIT_BASE || 'https://git.overleaf.com';
     const gitUrl = gitBase.replace(/\/+$/, '') + '/' + projectId;
 
@@ -1499,6 +1522,62 @@ async function doOverleafClone(projectId, token) {
     } catch (e) {
         return { ok: false, error: redactToken('内部错误: ' + (e && e.message), token) };
     }
+}
+
+// v2 Pass P53：克隆前置的"存放位置"弹窗要在真正 clone 之前就能告诉用户"这个位置行不行"，
+// 尤其是远程模式（桥跑在别的机器上，用户没法用本机原生文件夹选择框、只能手填路径，手填就
+// 更容易填错）。这个接口故意做得比 /fs/list 窄得多：只回答"父目录存不存在/能不能写"、
+// "目标子目录存不存在/是否非空"，绝不返回目录里有什么文件——克隆目标按定义在任何已知项目
+// 之外，不能套用 resolveInProject() 那套"必须落在某个 projectDir 内部"的越界防护语义，
+// 但也不该为了这一个校验需求就去放宽 /fs/* 那几个通用文件操作端点的防护范围。父目录必须
+// 是绝对路径，本身不做任何写操作（accessSync/statSync/readdirSync 全部只读探测）。
+async function doOverleafCheckTarget(parentDir, folderName) {
+    if (!parentDir || typeof parentDir !== 'string') {
+        return { ok: false, error: '存放位置不能为空' };
+    }
+    if (!path.isAbsolute(parentDir)) {
+        return { ok: true, parentStatus: 'not-absolute', targetStatus: null, targetDir: null };
+    }
+    let parentStatus;
+    try {
+        const st = fs.statSync(parentDir);
+        if (!st.isDirectory()) {
+            parentStatus = 'not-directory';
+        } else {
+            try {
+                fs.accessSync(parentDir, fs.constants.W_OK);
+                parentStatus = 'ok';
+            } catch (e) {
+                parentStatus = 'not-writable';
+            }
+        }
+    } catch (e) {
+        parentStatus = 'missing';
+    }
+
+    if (parentStatus !== 'ok') {
+        return { ok: true, parentStatus: parentStatus, targetStatus: null, targetDir: null };
+    }
+
+    const name = (typeof folderName === 'string' && folderName.trim()) ? folderName.trim() : null;
+    if (!name) {
+        return { ok: true, parentStatus: parentStatus, targetStatus: null, targetDir: null };
+    }
+    const targetDir = path.join(path.resolve(parentDir), name);
+    let targetStatus;
+    try {
+        const tst = fs.statSync(targetDir);
+        if (!tst.isDirectory()) {
+            targetStatus = 'occupied'; // 存在但是个文件——同样是"占着"，保护性地按占用处理
+        } else {
+            let entries;
+            try { entries = fs.readdirSync(targetDir); } catch (e) { entries = null; }
+            targetStatus = (entries === null || entries.length > 0) ? 'occupied' : 'available';
+        }
+    } catch (e) {
+        targetStatus = 'available'; // 不存在——clone 时会自动创建
+    }
+    return { ok: true, parentStatus: parentStatus, targetStatus: targetStatus, targetDir: targetDir };
 }
 
 // ---------------------------------------------------------------------------
@@ -2112,13 +2191,17 @@ const server = http.createServer(async (req, res) => {
             if (!REMOTE_MODE) {
                 healthBody.latexmkPath = LATEXMK;
                 healthBody.workRoot = WORK_ROOT;
+                // v2 Pass P53：本地模式下把"克隆存放位置"弹窗的默认父目录告诉前端——跟
+                // doOverleafClone 不传 parentDir/folderName 时用的默认根目录是同一个值，
+                // 只是这里提前算出来给用户看、允许他改，不代表任何写操作。
+                healthBody.defaultOverleafCloneRoot = defaultOverleafCloneRoot();
             }
             sendJson(res, 200, healthBody);
             return;
         }
 
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete, POST /fs/restore, POST /fs/capabilities, POST /ws-ticket. WebSocket on same host:port for disk-change push.');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /overleaf/check-target, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete, POST /fs/restore, POST /fs/capabilities, POST /ws-ticket. WebSocket on same host:port for disk-change push.');
             return;
         }
 
@@ -2453,8 +2536,9 @@ const server = http.createServer(async (req, res) => {
         }
 
         // v2 Pass P24（追加）：Overleaf git 集成——首次把一个 Overleaf 项目整体 clone 下来。
-        // 见 doOverleafClone 头部注释：故意不接受调用方传目标路径，目标目录完全由服务端按
-        // projectId 自己算，防止任意页面借这个接口让桥往任意路径写文件。
+        // v2 Pass P53：新增可选的 parentDir/folderName——用户在前端"存放位置"弹窗里选的目标
+        // 位置，不传时（旧调用方/既有测试）完全退回原来"服务端按 projectId 自己算"的默认值，
+        // 见 doOverleafClone/computeOverleafCloneTargetDir 头部注释。
         if (req.method === 'POST' && pathname === '/overleaf/clone') {
             if (!ovlOriginAllowed(req)) {
                 sendJson(res, 403, { ok: false, action: 'forbidden-origin',
@@ -2474,7 +2558,29 @@ const server = http.createServer(async (req, res) => {
                 return;
             }
             if (!token || typeof token !== 'string') { sendJson(res, 400, { ok: false, error: '缺少 Overleaf token' }); return; }
-            const result = await doOverleafClone(projectId, token);
+            const parentDir = (typeof body.parentDir === 'string' && body.parentDir) ? body.parentDir : null;
+            const folderName = (typeof body.folderName === 'string' && body.folderName) ? body.folderName : null;
+            const result = await doOverleafClone(projectId, token, parentDir, folderName);
+            sendJson(res, 200, result);
+            return;
+        }
+
+        // v2 Pass P53：克隆前置的"存放位置"弹窗用来校验父目录存不存在/能不能写、目标子目录
+        // 是否已被占用——见 doOverleafCheckTarget 头部注释（故意比 /fs/list 窄得多，只读探测，
+        // 绝不列举目录内容）。
+        if (req.method === 'POST' && pathname === '/overleaf/check-target') {
+            if (!ovlOriginAllowed(req)) {
+                sendJson(res, 403, { ok: false, action: 'forbidden-origin',
+                    error: '拒绝来自外部网页的同步请求。这两个接口只接受 AI-Translator 页面本身的调用。' });
+                return;
+            }
+            const bodyText = await readBody(req);
+            let body;
+            try { body = JSON.parse(bodyText || '{}'); } catch (e) {
+                sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
+                return;
+            }
+            const result = await doOverleafCheckTarget(body.parentDir, body.folderName);
             sendJson(res, 200, result);
             return;
         }
