@@ -30552,7 +30552,7 @@ function ovlCopyLatexSource() {
 // insertText 整段替换掉——跟 ovlEditorApplyReplace 同一条撤销栈纪律，且天然触发 #ovlCodeArea
 // 现成的 input 监听器（约 28360 行）：脏标记/gutter/大纲/自动落盘/focus 复核，一个字节不用
 // 在这里重新挂一遍。
-let OvlInlineSrcEdit = null; // null=未在编辑；打开时是 { wrap, ta, blocks, parent, lineFrom, lineTo, firstParaStart, closing }
+let OvlInlineSrcEdit = null; // null=未在编辑；打开时是 { wrap, ta, blocks, parent, lineFrom, lineTo, firstParaStart, origText, closing }
 
 function ovlInlineSrcAutoGrow(ta) {
     try { ta.style.height = 'auto'; ta.style.height = Math.max(ta.scrollHeight, 1) + 'px'; } catch (e) {}
@@ -30646,6 +30646,25 @@ function ovlInlineSrcSave() {
     const st = OvlInlineSrcEdit;
     if (!st || st.closing) return;
     st.closing = true;
+
+    // 用户反馈：进入就地编辑但一个字没改，退出时也会重新编译 PDF。根因是下面那句
+    // execCommand('insertText') 无条件执行——哪怕写回逐字节相同的内容，#ovlCodeArea 的
+    // input 监听器（约 32270 行 ovlScheduleAutoCompile）照样会被触发，顺带还污染撤销栈、
+    // 置脏标记、触发自动落盘。零改动就走跟「取消」同一条零副作用退出路径：原块恢复显示、
+    // 拆掉编辑器，源码一个字节不碰。闸门自己出错不阻断（宁可多编译一次也不能丢编辑）。
+    let noop = false;
+    try { noop = (st.ta.value === st.origText); } catch (e) { console.error('[ovl] inlineSrcSave noop check failed', e); noop = false; }
+    if (noop) {
+        try {
+            st.blocks.forEach(function (b) { b.style.display = ''; });
+            ovlInlineSrcTeardown();
+            return;
+        } catch (e) {
+            console.error('[ovl] inlineSrcSave noop teardown failed', e);
+            // 收尾失败就退回正常保存路径兜底，不 return。
+        }
+    }
+
     let spliced = false;
     try {
         const ta = document.getElementById('ovlCodeArea');
@@ -30783,7 +30802,7 @@ function ovlInlineSrcEditOpen(source) {
         OvlInlineSrcEdit = {
             wrap: wrap, ta: ta, blocks: touched, parent: parent,
             lineFrom: lineFrom, lineTo: lineTo, firstParaStart: firstParaStart,
-            closing: false
+            origText: text, closing: false
         };
 
         ta.addEventListener('input', ovlInlineSrcOnInput);
