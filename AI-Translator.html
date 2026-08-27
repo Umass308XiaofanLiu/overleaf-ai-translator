@@ -758,19 +758,9 @@ body.is-resizing-settings-modal * {
 }
 #aiChatRoot .aichat-focus-h { display: flex; align-items: center; gap: 6px; margin-bottom: 2px; }
 #aiChatRoot .aichat-focus-label { font-weight: 800; letter-spacing: 0.03em; flex: 0 0 auto; }
-#aiChatRoot .aichat-focus-spacer { flex: 1 1 auto; }
-#aiChatRoot .aichat-focus-clear {
-    flex: 0 0 auto;
-    border: 1px solid #fcd34d;
-    background: #fef3c7;
-    color: #92400e;
-    border-radius: 6px;
-    font-size: 9px;
-    font-weight: 800;
-    padding: 1px 6px;
-    cursor: pointer;
-}
-#aiChatRoot .aichat-focus-clear:hover { background: #fde68a; color: #78350f; }
+/* v2 Pass P35：.aichat-focus-spacer / .aichat-focus-clear 整块删掉——「全部清除」按钮本体
+   挪到翻译窗口头部 #focusClearAllBtn 了（见 renderHeader / focusRenderChip 的注释），
+   这里的 head 行现在只剩 label，不再需要一个把 clear 推到最右边的 spacer。 */
 #aiChatRoot .aichat-focus-item { display: flex; align-items: center; gap: 5px; padding: 1px 0; }
 #aiChatRoot .aichat-focus-kind {
     flex: 0 0 auto;
@@ -5828,8 +5818,33 @@ function focusSig() {
 // 【为什么非要有这个】十分钟前标的一处关注，会一直悄悄地跟着每一轮问话走。
 // 不把它摆在眼前，用户就会拿一个自己都忘了的重点去问一个不相干的问题，
 // 然后觉得模型「答得莫名其妙」。
+// v2 Pass P35：「全部清除」按钮本体已经从这个 chip 挪到翻译窗口头部（renderHeader 里
+// #focusClearAllBtn，紧跟在「重新生成所有翻译」右侧），这里只负责把它的 disabled/文案
+// 状态跟 FocusState 同步——写法照抄 translateBtn 那条注释里说的规矩："disabled 必须由
+// 这边直接改到 DOM 上"，不等重渲染。放在独立函数里是因为 focusRenderChip 下面还有一条
+// "chat footer 里的 slot 不存在就整段跳过" 的早退（chat 窗口还没建过），但头部按钮跟
+// chat 窗口是否已建无关，不能被那条早退连带跳过。
+function ovlTransSyncFocusClearBtn() {
+    try {
+        const btn = document.getElementById('focusClearAllBtn');
+        if (!btn) return;
+        const n = (typeof FocusState !== 'undefined' && FocusState && FocusState.entries) ? FocusState.entries.length : 0;
+        btn.disabled = (n === 0);
+        btn.classList.toggle('bg-slate-200', n === 0);
+        btn.classList.toggle('text-slate-400', n === 0);
+        btn.classList.toggle('cursor-not-allowed', n === 0);
+        btn.classList.toggle('bg-amber-500', n > 0);
+        btn.classList.toggle('text-white', n > 0);
+        btn.classList.toggle('hover:bg-amber-600', n > 0);
+        btn.classList.toggle('shadow-amber-200', n > 0);
+        btn.setAttribute('data-tip', n
+            ? ('取消全部关注（' + n + ' 处）。文档上下文不受影响 —— 下一轮照样带整篇译文。')
+            : '当前没有已标记的「额外关注」。');
+    } catch (e) { console.error('[focus] syncClearBtn failed', e); }
+}
 function focusRenderChip() {
     try {
+        ovlTransSyncFocusClearBtn();
         const slot = document.getElementById('aiChatFocusSlot');
         if (!slot) return;
         slot.textContent = '';
@@ -5872,18 +5887,9 @@ function focusRenderChip() {
             + '那一条会被自动取消并在这里告诉你 —— 整行条目和片段条目一视同仁。'
             + '暂时解不出来又还没到复核时机的（比如刚刷新、文档还没加载），会在括号里如实报「只发得出几处」。');
         label.setAttribute('data-tip-pos', 'top-start');
-        const spacer = document.createElement('span');
-        spacer.className = 'aichat-focus-spacer';
-        const clear = document.createElement('button');
-        clear.type = 'button';
-        clear.className = 'aichat-focus-clear';
-        clear.textContent = '全部清除';
-        clear.setAttribute('data-tip', '取消全部关注。文档上下文不受影响 —— 下一轮照样带整篇译文。');
-        clear.setAttribute('data-tip-pos', 'top-end');
-        clear.addEventListener('click', function () { focusClearAll(); });
+        // v2 Pass P35：「全部清除」按钮挪到翻译窗口头部（#focusClearAllBtn），这里不再重复
+        // 一份——spacer 也一并去掉，label 独占这一行。
         head.appendChild(label);
-        head.appendChild(spacer);
-        head.appendChild(clear);
         box.appendChild(head);
 
         for (let i = 0; i < entries.length; i++) {
@@ -15624,11 +15630,19 @@ function renderHeader() {
             </div>
 
             <div class="flex items-center gap-3 ovl-t-actions">
-                <!-- v2 P5：#chatToggleBtn（Chat 开关）整个删除——聊天窗现在从 v2 主界面左侧栏
-                     的 #ovlChatBtn 打开（同一个 chatToggle()，同一个 #aiChatRoot，行为完全
-                     不变），翻译器窗口自己不再重复一个入口。chatSyncToggleButton()/chatClose()
-                     里对 #chatToggleBtn 的引用都已带 null 检查或已改指向 #ovlChatBtn，不会
-                     因为这个节点消失而报错。 -->
+                <!-- v2 Pass P35：v2 P5 那轮把 #chatToggleBtn 整个删掉、只留 v2 主界面左侧栏的
+                     #ovlChatBtn 一个入口——实测发现翻译窗口开着的时候（尤其弹出/最大化后）
+                     侧栏可能被挡住或够不着，用户还是想在翻译窗口本身找到打开 AI 对话的入口，
+                     于是这里加回来。**不新写一套打开逻辑**：onclick 直接复用 chatToggle()，
+                     跟 #ovlChatBtn（见 ovlBindShell）是同一个函数、同一个 #aiChatRoot 单例。
+                     id 特地用回 chatToggleBtn——chatSyncToggleButton()（约 21416 行）本来就在
+                     null-safe 地找这个 id 来同步 aria-pressed / is-chat-open 高亮，P5 只是把
+                     按钮删了、没删同步逻辑，这里重新挂上等于白捡一份现成的开关态同步，不用
+                     再写一遍。故意放在 .ovl-t-actions 而不是 .ovl-t-tools——后者简化模式下
+                     除 .ovl-t-langbar 外整组隐藏，AI 对话入口不该跟着消失。 -->
+                <button type="button" id="chatToggleBtn" onclick="chatToggle()" aria-pressed="${ChatState.open ? 'true' : 'false'}" class="${ChatState.open ? 'is-chat-open ' : ''}p-2.5 rounded-2xl border border-slate-200 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-all active:scale-95 flex items-center justify-center" data-tip="打开／关闭 AI 对话窗。" data-tip-pos="bottom-start">
+                    ${Icons.MessageSquare}
+                </button>
                 <!-- id 是给 syncTranslateButtonState() 用的：handleInputChange 刻意不重渲染
                      （避免焦点丢失），所以这颗按钮的 disabled 必须由那边直接改到 DOM 上，
                      否则它会一直停在「输入框还是空的」那一刻算出来的值上。 -->
@@ -15637,6 +15651,15 @@ function renderHeader() {
                 </button>
                 <button onclick="handleRegenerateAll()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="ovl-t-regen p-2.5 rounded-2xl transition-all shadow-xl active:scale-95 flex items-center justify-center ${AppState.translationPairs.length === 0 ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isRegeneratingAll ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isRegeneratingAll ? '正在逐句重译，点一下停下来。' : '用当前模型把每一句重新翻一遍（原文不动）。换了模型、或对整体译文不满意时用它；再点一次可中断。'}" data-tip-pos="bottom-end">
                     ${AppState.isRegeneratingAll ? `<span class="animate-pulse">${Icons.StopCircle}</span>` : Icons.RefreshCw}
+                </button>
+                <!-- v2 Pass P35：原来挂在 AI 对话窗footer 里的「全部清除」（清的是 FocusState 额外
+                     关注标记，不是译文本身，见 focusClearAll()）挪到这里、紧跟在「重新生成所有
+                     翻译」右侧。故意不带 .ovl-t-regen/.ovl-t-panelhead/.ovl-t-syncdetect 里任何一个
+                     class——那三个是简化模式专门挂 display:none 的钩子，简化模式下这颗按钮要保留。
+                     没有关注条目时禁用；实时状态由 ovlTransSyncFocusClearBtn()（focusAfterChange
+                     收口时调用，见约 5827 行）直接改 DOM，和 translateBtn 的 disabled 同一套做法。 -->
+                <button id="focusClearAllBtn" type="button" onclick="focusClearAll()" ${(typeof FocusState === 'undefined' || !FocusState.entries.length) ? 'disabled' : ''} class="ovl-t-focusclear p-2.5 rounded-2xl transition-all shadow-xl active:scale-95 flex items-center justify-center ${(typeof FocusState === 'undefined' || !FocusState.entries.length) ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : 'bg-amber-500 text-white hover:bg-amber-600 shadow-amber-200'}" data-tip="取消全部关注。文档上下文不受影响 —— 下一轮照样带整篇译文。" data-tip-pos="bottom-end">
+                    ${Icons.Trash2}
                 </button>
             </div>
         </header>
@@ -21926,7 +21949,7 @@ const OvlState = {
     logFilter: 'all',        // 'all' | 'error' | 'warning' | 'info'
     // ---- v2 Pass D：M4 翻页/缩放；v2 Pass P16 起渲染器从 iframe+PDF Open Parameters 换成
     // pdf.js 画到 <canvas>（见 ovlPdfApplyView），字段含义不变，只是不再靠 URL hash 遥控。 ----
-    pdfView: { page: 1, totalPages: 1, zoomMode: 'value', zoomPct: 100 }, // zoomMode: 'value'|'fitwidth'|'fitheight'；page 现在是"当前最可见的那一页"（连续滚动，见 ovlPdfHandleScroll），不是"唯一渲染的那一页"
+    pdfView: { page: 1, totalPages: 1, zoomMode: 'fitwidth', zoomPct: 100 }, // zoomMode: 'value'|'fitwidth'|'fitheight'；page 现在是"当前最可见的那一页"（连续滚动，见 ovlPdfHandleScroll），不是"唯一渲染的那一页"；这里只是模块加载时的静态占位，真正生效的默认值在编译完成 handler 里走 ovlPdfResolveDefaultZoomMode()（v2 Pass P35）
     // ---- v2 Pass P16：pdf.js 文档缓存，服务 M4 渲染 + M11 反向 SyncTeX 的坐标换算 ----
     pdfDoc: null,            // 当前 pdfjsLib PDFDocumentProxy（跟 pdfObjectUrl 对应，见 pdfDocUrl）
     pdfDocUrl: null,         // pdfDoc 是从哪个 pdfObjectUrl 加载的——用来判断新一轮编译后是否要重新 getDocument()
@@ -26599,7 +26622,10 @@ async function ovlDoRecompile(opts) {
     OvlState.bridgeOnline = true;
     OvlState.lastCompile = data;
     // M4：每次新编译，翻页/缩放状态重置——旧 PDF 的页码对新 PDF 没有意义。
-    OvlState.pdfView = { page: 1, totalPages: 1, zoomMode: 'value', zoomPct: 100 };
+    // v2 Pass P35：缩放模式的默认值走 ovlPdfResolveDefaultZoomMode()——用户没存过偏好时是
+    // 'fitwidth'，存过（OvlSettings.pdfDefaultZoomMode，见 ovlPdfSetZoomMode 等写入点）就用
+    // 存的那个，不强制覆盖成 fit-width。
+    OvlState.pdfView = { page: 1, totalPages: 1, zoomMode: ovlPdfResolveDefaultZoomMode(), zoomPct: 100 };
 
     if (data && data.ok && data.pdfExists) {
         try {
@@ -28673,6 +28699,11 @@ const OVL_SETTINGS_DEFAULTS = {
     visualTransModel: '',       // P4 消费：''=跟随翻译器当前选中的模型
     ovlVisualLineBreaks: true,  // Visual 断行 Pass 消费：true=按源码行切细渲染，false=退回整段渲染
     ovlVisualOutlineSelection: true, // Pass Sel-Outline 消费：true=方框描边选区，false=退回浏览器原生高亮
+    // ---- v2 Pass P35：PDF 默认缩放模式 ----
+    // ''=用户从没手动改过缩放（走 ovlPdfResolveDefaultZoomMode() 的兜底 'fitwidth'）；
+    // 'value'|'fitwidth'|'fitheight' = 用户手动改过（见 ovlPdfSetZoomMode/ovlPdfSetZoomValue/
+    // ovlPdfZoomStep），一旦有存档就每次新编译都照这个来，不再被 fit-width default 覆盖。
+    pdfDefaultZoomMode: '',
     // ---- v2 Pass P24：Overleaf git 同步 ----
     overleafProjectAddr: '',    // 用户粘贴的 Overleaf 项目地址（git URL / web URL / 纯 ID 都行，见 ovlOverleafResolveGitUrl）
     overleafToken: '',          // Overleaf 项目 Git Token（明文存 localStorage，跟这个 App 里其它凭证同一存储方式，不是这次新引入的安全水位）
@@ -29413,23 +29444,39 @@ function ovlPdfHandleScroll() {
         }
     });
 }
+// v2 Pass P35：没存过偏好（''）时新编译默认 fit-width；存过就一直用存的那个，见调用点
+// OvlState.pdfView 重置那行（编译完成 handler）。
+function ovlPdfResolveDefaultZoomMode() {
+    const saved = (typeof OvlSettings !== 'undefined' && OvlSettings) ? OvlSettings.pdfDefaultZoomMode : '';
+    return (saved === 'value' || saved === 'fitwidth' || saved === 'fitheight') ? saved : 'fitwidth';
+}
+// 用户手动改缩放（工具条按钮/输入框/快捷键）才算"存过偏好"，写回 OvlSettings 持久化；
+// ovlPdfPresentation() 的临时 fitheight 不算——那是演示模式，不该污染用户平时的默认值。
+function ovlPdfSaveZoomPreference(mode) {
+    if (typeof OvlSettings === 'undefined' || !OvlSettings) return;
+    OvlSettings.pdfDefaultZoomMode = mode;
+    ovlSaveSettings();
+}
 function ovlPdfZoomStep(delta) {
     if (!OvlState.pdfObjectUrl) return;
     const v = OvlState.pdfView;
     const base = v.zoomMode === 'value' ? v.zoomPct : 100;
     v.zoomMode = 'value';
     v.zoomPct = Math.max(50, Math.min(400, base + delta));
+    ovlPdfSaveZoomPreference('value');
     ovlPdfApplyView();
 }
 function ovlPdfSetZoomValue(pct) {
     if (!OvlState.pdfObjectUrl) return;
     OvlState.pdfView.zoomMode = 'value';
     OvlState.pdfView.zoomPct = Math.max(50, Math.min(400, pct || 100));
+    ovlPdfSaveZoomPreference('value');
     ovlPdfApplyView();
 }
 function ovlPdfSetZoomMode(mode) {
     if (!OvlState.pdfObjectUrl) return;
     OvlState.pdfView.zoomMode = mode;
+    ovlPdfSaveZoomPreference(mode);
     ovlPdfApplyView();
 }
 function ovlPdfPresentation() {
@@ -29820,10 +29867,20 @@ function ovlBindPdfCanvasEvents() {
     // 重排一次，否则页面还是按旧容器尺寸缩放的，会跟容器错位——value 模式不受容器尺寸影响，
     // 不用跟着重排（省掉多余的 page.render()）。
     if (typeof ResizeObserver !== 'undefined') {
+        // v2 Pass P35：拖分栏/窗口 resize 时 ResizeObserver 一次拖拽会连续回调几十次——
+        // 每次都直接 ovlPdfRelayout() 会对着已渲染的每一页重跑一次 pdf.js render()，
+        // 拖起来会顿。这里用 rAF 把同一帧内的多次回调合并成一次，帧与帧之间用一个
+        // "已经排了一帧" 标记去抖，松手前最多每帧重排一次。
+        let roRafPending = false;
         const ro = new ResizeObserver(function () {
-            if (OvlState.pdfView.zoomMode === 'fitwidth' || OvlState.pdfView.zoomMode === 'fitheight') {
-                ovlPdfRelayout();
-            }
+            if (roRafPending) return;
+            roRafPending = true;
+            requestAnimationFrame(function () {
+                roRafPending = false;
+                if (OvlState.pdfView.zoomMode === 'fitwidth' || OvlState.pdfView.zoomMode === 'fitheight') {
+                    ovlPdfRelayout();
+                }
+            });
         });
         ro.observe(wrap);
     }
