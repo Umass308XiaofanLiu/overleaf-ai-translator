@@ -373,8 +373,11 @@ body.is-resizing-settings-modal * {
     --ovl-sel-fill: rgba(59, 130, 246, 0.18);
     --ovl-sel-outline: rgba(59, 130, 246, 0.55);
     /* v2 Pass P37：黄色"标记高亮"专用变量，独立于上面两个蓝色选区变量——反向 SyncTeX 跳转
-       /查找跳转命中都用这一套，跟用户正在用的蓝色选区互不干扰、互不覆盖。 */
-    --ovl-mark-fill: rgba(234, 179, 8, 0.28);
+       /查找跳转命中都用这一套，跟用户正在用的蓝色选区互不干扰、互不覆盖。
+       v2 Pass P45：用户反馈黄色太抢眼——填充透明度从 0.28 大幅下调到 0.10（描边保留
+       0.85 不变，还是能一眼看清框在哪，只是不再像一大块实心黄底糊在字上）。绝不动
+       --ovl-sel-fill/--ovl-sel-outline（蓝色选区框，硬性约束）。 */
+    --ovl-mark-fill: rgba(234, 179, 8, 0.10);
     --ovl-mark-outline: rgba(202, 138, 4, 0.85);
 }
 [data-align-content] > * + * { margin-top: var(--pair-gap); }
@@ -869,6 +872,20 @@ body.is-resizing-settings-modal * {
 #aiChatRoot .aichat-kv.is-ok > span:last-child { color: #047857; }
 #aiChatRoot .aichat-kv.is-bad > span:last-child { color: #be123c; }
 #aiChatRoot .aichat-panel-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+/* v2 Pass P45（F4）：AI 能不能读写项目文件的克制状态行——单行、小字号，不要求用户手动关掉，
+   跟标题栏下面直接贴一条即可，颜色区分"可用/不可用"两种状态。 */
+#aiChatRoot .aichat-caphint {
+    font-size: 10.5px;
+    line-height: 1.5;
+    padding: 4px 10px;
+    border-bottom: 1px solid #e2e8f0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 0 0 auto;
+}
+#aiChatRoot .aichat-caphint.is-ready { color: #047857; background: #ecfdf5; }
+#aiChatRoot .aichat-caphint.is-blocked { color: #92400e; background: #fffbeb; }
 #aiChatRoot .aichat-arcitem {
     display: flex;
     align-items: center;
@@ -1658,7 +1675,7 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    编辑器主体（含 gutter，"整个可视宽度"），画的是整行色带，位置靠 JS 用 ta.scrollTop 现算，
    scroll 时重算（Code 模式下 textarea 自己滚，不是父容器滚，没法靠"挂在滚动内容内部"
    免费获得跟随滚动的效果）。 */
-#ovlVisualMarkOverlay { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 6; }
+#ovlVisualMarkOverlay { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 6; opacity: 1; transition: opacity 0.6s ease; }
 .ovl-mark-box {
     position: absolute;
     border: 1px solid var(--ovl-mark-outline, rgba(202, 138, 4, 0.85));
@@ -1673,7 +1690,13 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
     pointer-events: none;
     overflow: hidden;
     z-index: 1;
+    opacity: 1;
+    transition: opacity 0.6s ease;
 }
+/* v2 Pass P45：约 60 秒后自动淡出（见 ovlMarkScheduleFadeOut）——只切 opacity，不切
+   display/visibility，靠上面两条 transition 平滑过渡，不是突然消失。淡出动画播完之后
+   ovlClearMarkOverlay() 才真的清空 DOM，见该函数调用点。 */
+#ovlVisualMarkOverlay.ovl-mark-fadeout, #ovlCodeMarkOverlay.ovl-mark-fadeout { opacity: 0; }
 .ovl-visual-raw { white-space: pre-wrap; word-break: break-word; font: 12px/1.5 "SFMono-Regular", Consolas, monospace; color: #374151; }
 .ovl-visual-bar {
     background: #eef1f5; color: #475569; font-size: 12px; padding: 6px 10px;
@@ -3737,7 +3760,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
 const APP_VERSION = '02.02.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-08-26';   // APP_BUILD_DATE_STAMP
+const APP_BUILD_DATE = '2026-08-27';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -17305,6 +17328,9 @@ function chatShellHtml() {
         +       '<button type="button" class="aichat-iconbtn" id="aiChatCloseBtn" data-tip="关掉对话窗（按 Esc 也一样）。位置和大小会记住，下次打开还在原处。" data-tip-pos="bottom-end">' + Icons.XSmall + '</button>'
         +     '</span>'
         +   '</div>'
+        // v2 Pass P45（F4）：AI 能不能直接读写项目文件，克制的一行状态提示——不是每次都要
+        // 手动关掉的大横幅，纯展示、不带交互，见 chatUpdateCapabilityHint。
+        +   '<div class="aichat-caphint" id="aiChatCapHint" hidden></div>'
         +   '<div class="aichat-log" id="aiChatLog"></div>'
         +   '<div class="aichat-footer">'
         +     '<div id="aiChatFocusSlot"></div>'
@@ -18283,15 +18309,42 @@ function chatAgentProjectDir() {
 
 // 桥在线状态直接读 OvlState.bridgeOnline（ovlBridgeCheckHealth 每 5 秒轮询维护的那个布尔值），
 // 绝不为了判断这一条额外发一次探测请求。
+// v2 Pass P45：把"这一轮工具能不能用"的判定和"为什么不能用"的具体原因收敛到这一个函数——
+// 系统提示（chatAgentToolsSystemBlock）和聊天窗可用性提示（F4，chatUpdateCapabilityHint）
+// 必须用同一份判定，不能出现"提示说能用，模型那边却被系统提示挡住"或反过来的错位。
+//
+// v2 Pass P45 回归修复：第一版在这里写的是"/health 的 bridgeCapabilities 数组不存在就判
+// stale-bridge"，结果把一个功能完好、只是没重启到 P45（因此没有这个自报字段）的桥直接
+// 判死刑、连试都不试——这比"旧桥打转"这个原 bug 还糟（原 bug 至少还会尝试）。字段缺失
+// 只代表"这个桥比自报机制本身还老"，不代表它真的缺某个具体能力。所以改成：
+//   - 字段存在（数组）：这是桥自己明确说的，直接信，可以做快路径拦截。
+//   - 字段缺失：不拦截，正常放行（reason 标为 'capabilities-unknown'，仍然 ready:true）——
+//     真缺能力的话，实际调用会 404 命中 ovlBridgeIsNoSuchRouteError()，那才是唯一可信的
+//     "真的不支持"信号（chatAgentExecTool/chatAgentExecWriteTool 已经在拦这个），不需要在
+//     这里靠猜。
+function chatAgentReadiness() {
+    if (OvlState.bridgeOnline !== true) return { ready: false, reason: 'no-bridge' };
+    if (!chatAgentProjectDir()) return { ready: false, reason: 'no-projectdir' };
+    if (Array.isArray(OvlState.bridgeCapabilities) && OvlState.bridgeCapabilities.indexOf('fs-ops') === -1) {
+        return { ready: false, reason: 'stale-bridge' };
+    }
+    if (!Array.isArray(OvlState.bridgeCapabilities)) return { ready: true, reason: 'capabilities-unknown' };
+    return { ready: true, reason: '' };
+}
 function chatAgentBridgeReady() {
-    try { return OvlState.bridgeOnline === true && !!chatAgentProjectDir(); } catch (e) { return false; }
+    try { return chatAgentReadiness().ready; } catch (e) { return false; }
 }
 
 // 工具小节的系统提示。桥不可用时明确说"没有工具"，绝不让模型以为自己能读文件、结果每次
 // 调用都拿到一堆连接失败——那是「优雅降级」，不是「假装有能力再报错」。
 function chatAgentToolsSystemBlock() {
-    if (!chatAgentBridgeReady()) {
-        return '\n【文件读取工具】这一轮不可用（还没有连上编译桥接服务，或者没有填写项目绝对路径）。'
+    const readiness = chatAgentReadiness();
+    if (!readiness.ready) {
+        let why = '还没有连上编译桥接服务，或者没有填写项目绝对路径';
+        if (readiness.reason === 'no-bridge') why = '还没有连上编译桥接服务';
+        else if (readiness.reason === 'no-projectdir') why = '还没有填写项目绝对路径';
+        else if (readiness.reason === 'stale-bridge') why = '连着的桥接服务版本过旧（不支持文件操作接口），需要用户重启本地桥接服务';
+        return '\n【文件读取工具】这一轮不可用（' + why + '）。'
             + '不要输出 ==TOOL== 块，只能根据上面已经给到你的内容回答，也不要假装自己读过或改过任何'
             + '没有出现在这段对话里的文件。\n';
     }
@@ -18430,6 +18483,13 @@ async function chatAgentExecTool(toolName, args, projectDir, signal) {
         if (e && e.name === 'AbortError') throw e;   // 中断不是"工具失败"，原样往上抛，走 chatSend 既有的中止路径
         const msg = '连不上桥接服务（' + ((e && e.message) || e) + '）';
         return { ok: false, uiSummary: label + '失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    // v2 Pass P45：桥版本过旧、压根没有这个端点时，桥吐的是 { ok:false, error:'no such
+    // route: POST /fs/read' }（server.js 404 出口唯一的措辞）——这种情况必须在这里就拦下来
+    // 给用户一句明确的"桥版本过旧"，不能把这种错误原样喂给模型：模型看不出"no such route"
+    // 意味着桥太旧，只会瞎猜成"路径不对"之类然后继续误导用户重试。
+    if (ovlBridgeIsNoSuchRouteError(data)) {
+        return { ok: false, uiSummary: label + '失败：桥版本过旧', uiDetail: OVL_BRIDGE_STALE_MSG, textForModel: OVL_BRIDGE_STALE_MSG, bytes: 0 };
     }
     if (!data || !resp.ok || data.ok !== true) {
         const err = (data && data.error) || ('HTTP ' + (resp ? resp.status : '?'));
@@ -18603,6 +18663,41 @@ async function chatAgentPreviewAffected(projectDir, relPath, signal) {
         if (e && e.name === 'AbortError') throw e;
         return { ok: false, error: String((e && e.message) || e) };
     }
+}
+
+// v2 Pass P45（F4）：AI agent 的文件读写能力"能不能用一眼看清"——原来完全没有按钮、没有
+// 提示，用户反馈"没看到运行的按钮，在哪里可以操作？"。事实是 chatAgentRunLoop 已经无条件
+// 接在聊天发送路径上，直接聊天就会用到（不需要点任何按钮），但这件事本身不可见就等于没
+// 交付。这里只做只读展示，判定条件跟真正决定"要不要往系统提示里塞工具说明"的
+// chatAgentReadiness() 是同一个函数——不能出现"这里说能用，模型那边其实被挡住了"的错位。
+function chatUpdateCapabilityHint() {
+    try {
+        const el = document.getElementById('aiChatCapHint');
+        if (!el) return;
+        const st = chatAgentReadiness();
+        el.hidden = false;
+        el.classList.toggle('is-ready', st.ready);
+        el.classList.toggle('is-blocked', !st.ready);
+        let text;
+        if (st.ready && st.reason === 'capabilities-unknown') {
+            // 桥没自报能力字段（比自报机制本身还老），但不代表它真的不支持文件操作——
+            // 不能把一个功能完好的桥标成不可用，这里用中性表述，真缺能力会在第一次真调用
+            // 时被 ovlBridgeIsNoSuchRouteError() 拦下并明确提示，不是靠这里瞎猜。
+            text = '✓ AI 大概率已连接项目文件（桥未自报版本，实际支持情况以首次读写结果为准）：直接用自然语言让它读/改文件即可。';
+        } else if (st.ready) {
+            text = '✓ AI 已连接项目文件——直接用自然语言让它读/改文件即可，不需要点任何按钮（写操作每次都会先弹窗确认）。';
+        } else if (st.reason === 'no-bridge') {
+            text = '○ AI 暂不能读写项目文件：未连接本地桥接服务（先启动 tools/latex-bridge/ 下的桥）。';
+        } else if (st.reason === 'no-projectdir') {
+            text = '○ AI 暂不能读写项目文件：还没有打开/选择项目文件夹。';
+        } else if (st.reason === 'stale-bridge') {
+            text = '○ AI 暂不能读写项目文件：本地桥接服务版本过旧，请重启后重试。';
+        } else {
+            text = '○ AI 暂不能读写项目文件。';
+        }
+        el.textContent = text;
+        el.title = text;
+    } catch (e) { console.error('[chat] updateCapabilityHint failed', e); }
 }
 
 const CHAT_AGENT_TOOL_LABELS = { write_file: '写入文件', mkdir: '新建目录', move: '移动/重命名', copy: '复制', delete: '删除' };
@@ -18839,6 +18934,11 @@ async function chatAgentExecWriteTool(toolName, args, projectDir, signal, pendin
         const msg = '连不上桥接服务（' + ((e && e.message) || e) + '）';
         return { ok: false, uiSummary: '操作失败', uiDetail: msg, textForModel: msg, bytes: 0 };
     }
+    // v2 Pass P45：跟只读工具（chatAgentExecTool）同一条拦截——桥太旧不认识这个 /fs/* 端点时
+    // 直接给明确提示，不把 "no such route" 原样丢给模型瞎猜。
+    if (ovlBridgeIsNoSuchRouteError(data)) {
+        return { ok: false, uiSummary: '操作失败：桥版本过旧', uiDetail: OVL_BRIDGE_STALE_MSG, textForModel: OVL_BRIDGE_STALE_MSG, bytes: 0 };
+    }
     if (!data || !resp.ok || data.ok !== true) {
         const err = (data && data.error) || ('HTTP ' + (resp ? resp.status : '?'));
         return { ok: false, uiSummary: '操作失败', uiDetail: err, textForModel: '失败：' + err, bytes: 0 };
@@ -18974,6 +19074,7 @@ async function chatSend() {
     let pendingRow = null;
     let tick = null;
     let live = null;
+    if (typeof chatUpdateCapabilityHint === 'function') { try { chatUpdateCapabilityHint(); } catch (e) {} }
     try {
         const ta = document.getElementById('aiChatInput');
         const draft = ta ? String(ta.value || '') : '';
@@ -22189,6 +22290,7 @@ function ensureChatRoot() {
         chatApplyGeom();
         chatSyncMinUI();          // 把最小化按钮的图标/提示和未读徽标刷成初始状态
         chatRenderParamBar();
+        if (typeof chatUpdateCapabilityHint === 'function') { try { chatUpdateCapabilityHint(); } catch (e) {} }
 
         chatAppendRow('system', '对话窗已就绪。拖标题栏移动；四条边和四个角都能拖着改大小（和 Windows 的窗口一样，'
             + '拖左边或上边时对面那条边钉住不动），手动调过的尺寸之后一直作数。'
@@ -22718,6 +22820,10 @@ const OvlState = {
     uploadTargetHandle: null, // “上传”点的是哪个目录（header 按钮=项目根，右键菜单=被点中的目录/同级）
     // ---- M3：编译桥接服务 + PDF/日志面板 ----
     bridgeOnline: null,      // null=还没探测过；true/false=探测结果
+    // v2 Pass P45：/health 的 bridgeCapabilities 数组（见 ovlBridgeCheckHealth）——
+    // null=还没探测到这个字段（桥离线，或连着的是这个字段加入之前的旧桥）；数组=新桥
+    // 真实自报的能力清单。桥离线时强制置回 null，不留陈旧的"上次在线时探到的能力"。
+    bridgeCapabilities: null,
     // ---- v2 Pass P17：桥 WebSocket 磁盘改动推送的自触发回声过滤，见 ovlBridgeHandleExternalChange ----
     lastSelfWriteMtimeMs: null, // 自己上一次真的写盘成功后，FSA File.lastModified 读回来的值
     lastSelfWritePath: null,    // 上面那次写盘对应的绝对路径（ovlBridgeAbsPathFor 算出来的）
@@ -25586,6 +25692,36 @@ function ovlGroupSelRectsIntoRows(rects) {
         }
         if (!merged) rows.push({ top: r.top, bottom: r.bottom, left: r.left, right: r.right });
     }
+    // v2 Pass P45：上面这个单趟贪心合并不是传递闭包——两个先后各自成组的行，可能都只跟
+    // "中间"某个矩形重叠过半，彼此却因为处理顺序从没被直接比较过，最终分成两组、几何上
+    // 却互相重叠。这正是黄色标记在 KaTeX 公式上出现"同一视觉行好几个重叠方框"的真根因
+    // （KaTeX 一条公式渲成多层嵌套 inline span，上标套上标时竖直位置犬牙交错，最容易触发
+    // 这个 transitivity 缺口）——不是没清空叠加层，也不是单击/双击重复画（那两条已经用
+    // 250ms 去重 + overlay.innerHTML 整体替换挡住了）。这里再做一轮"合并到不动点"：只要
+    // 还存在两个行组彼此重叠超过较矮那个一半的高度就继续合并，直到没有为止。这个函数是
+    // 蓝色选区叠加层（ovlRecomputeVisualSelOverlay）跟黄色标记叠加层共用的同一份实现，
+    // 两边都受益，不需要分别打补丁。
+    let changed = true;
+    while (changed) {
+        changed = false;
+        outer:
+        for (let a = 0; a < rows.length; a++) {
+            for (let b = a + 1; b < rows.length; b++) {
+                const ra = rows[a], rb = rows[b];
+                const ov = Math.min(ra.bottom, rb.bottom) - Math.max(ra.top, rb.top);
+                const mh = Math.min(ra.bottom - ra.top, rb.bottom - rb.top);
+                if (mh > 0 && ov > mh / 2) {
+                    ra.top = Math.min(ra.top, rb.top);
+                    ra.bottom = Math.max(ra.bottom, rb.bottom);
+                    ra.left = Math.min(ra.left, rb.left);
+                    ra.right = Math.max(ra.right, rb.right);
+                    rows.splice(b, 1);
+                    changed = true;
+                    break outer;
+                }
+            }
+        }
+    }
     return rows;
 }
 
@@ -25658,6 +25794,48 @@ function ovlBindVisualSelOverlay() {
 // 找到那一句"，整行色带足够、且不会撒谎（Visual 模式仍然是精确逐行方框，能做到就不将就）。
 const OvlMarkState = { lineFrom: -1, lineTo: -1 };
 
+// v2 Pass P45：用户反馈黄色高亮"1 分钟后自动消失"——约 60 秒后开始淡出（CSS transition，
+// 见 #ovlVisualMarkOverlay/#ovlCodeMarkOverlay 的 .ovl-mark-fadeout 规则，约 1664 行附近），
+// 淡出动画播完再真的清空 DOM，复用既有的 ovlClearMarkOverlay，不另起一套清空逻辑。
+// window.__ovlMarkFadeMsOverride 是测试专用的可控时钟入口，不影响生产默认值 60000ms
+// （硬性要求："不要为了好测就把生产默认值改掉"）。
+const OVL_MARK_FADE_MS = 60000;
+const OVL_MARK_FADE_TRANSITION_MS = 650; // 跟 CSS transition: opacity 0.6s 对齐，留一点余量
+let OvlMarkFadeTimer = null;
+let OvlMarkFadeOutTimer = null;
+function ovlMarkFadeDurationMs() {
+    const override = (typeof window !== 'undefined') ? window.__ovlMarkFadeMsOverride : null;
+    return (typeof override === 'number' && override >= 0) ? override : OVL_MARK_FADE_MS;
+}
+function ovlMarkClearFadeTimers() {
+    if (OvlMarkFadeTimer) { clearTimeout(OvlMarkFadeTimer); OvlMarkFadeTimer = null; }
+    if (OvlMarkFadeOutTimer) { clearTimeout(OvlMarkFadeOutTimer); OvlMarkFadeOutTimer = null; }
+}
+function ovlMarkResetFadeVisual() {
+    const vo = document.getElementById('ovlVisualMarkOverlay');
+    const co = document.getElementById('ovlCodeMarkOverlay');
+    if (vo) vo.classList.remove('ovl-mark-fadeout');
+    if (co) co.classList.remove('ovl-mark-fadeout');
+}
+// 每次新的 ovlMarkLines 调用都要重置这个计时器（硬性要求）；用户滚动/交互不重置——这个
+// 函数只从 ovlMarkLines 里调用一次，滚动触发的 ovlRepaintMarkOverlay 完全不碰它，纯计时。
+function ovlMarkScheduleFadeOut() {
+    ovlMarkClearFadeTimers();
+    ovlMarkResetFadeVisual();
+    const ms = ovlMarkFadeDurationMs();
+    OvlMarkFadeTimer = setTimeout(function () {
+        OvlMarkFadeTimer = null;
+        const vo = document.getElementById('ovlVisualMarkOverlay');
+        const co = document.getElementById('ovlCodeMarkOverlay');
+        if (vo) vo.classList.add('ovl-mark-fadeout');
+        if (co) co.classList.add('ovl-mark-fadeout');
+        OvlMarkFadeOutTimer = setTimeout(function () {
+            OvlMarkFadeOutTimer = null;
+            ovlClearMarkOverlay();
+        }, OVL_MARK_FADE_TRANSITION_MS);
+    }, ms);
+}
+
 function ovlClearCodeMarkOverlay() {
     const overlay = document.getElementById('ovlCodeMarkOverlay');
     if (overlay) overlay.innerHTML = '';
@@ -25667,10 +25845,13 @@ function ovlClearVisualMarkOverlay() {
     if (overlay) overlay.innerHTML = '';
 }
 // 生命周期第②③条（Esc / 该栏发起新选区）的统一清空入口——连同 OvlMarkState 一起清零，
-// 这样切模式/重排的 repaint 不会用陈旧的行区间又画回来。
+// 这样切模式/重排的 repaint 不会用陈旧的行区间又画回来。也是 60 秒自动淡出计时器走完之后
+// 真正清空 DOM 的落点（ovlMarkScheduleFadeOut），所有"清空"殊途同归到这一个函数。
 function ovlClearMarkOverlay() {
     OvlMarkState.lineFrom = -1;
     OvlMarkState.lineTo = -1;
+    ovlMarkClearFadeTimers();
+    ovlMarkResetFadeVisual();
     ovlClearCodeMarkOverlay();
     ovlClearVisualMarkOverlay();
 }
@@ -25871,6 +26052,8 @@ function ovlMarkLines(lineFrom, lineTo, opts) {
             ovlClearVisualMarkOverlay();
             ovlPaintCodeMarkOverlay();
         }
+        // v2 Pass P45：每一次真正画出新标记都要重置约 60 秒的自动淡出计时器。
+        ovlMarkScheduleFadeOut();
     } catch (e) { console.error('[ovl] markLines failed', e); }
 }
 
@@ -28062,9 +28245,57 @@ function ovlRenderPdfBody() {
     body.appendChild(d);
 }
 
+// v2 Pass P45：桥认不认识某个能力，优先看 /health 的 bridgeCapabilities 数组——桥自己
+// 明确说了就直接信，这是快路径。数组不存在（旧桥没有这个 P45 起才有的自报字段）**不代表
+// 它真的缺这个能力**，只代表它比自报机制本身还老，调用方必须自己决定这时候是"保守拦截"
+// 还是"照常尝试、靠 ovlBridgeIsNoSuchRouteError 兜底"，不能在这个函数里替调用方乱猜——
+// 第一版在这里直接把"字段缺失"等同于"不支持"，结果把一个功能完好只是没重启到 P45 的桥
+// 也判死刑、连试都不试，比原来的打转 bug 还糟，已改正（见 ovlOverleafProbeStrategySupport /
+// chatAgentReadiness 各自的取舍）。
+function ovlBridgeHasCapability(name) {
+    return Array.isArray(OvlState.bridgeCapabilities) && OvlState.bridgeCapabilities.indexOf(name) !== -1;
+}
+// 兜底防线（F5 硬性要求）：即使 /health 的能力自报因为某个端点漏登记而失真，具体某个
+// /fs/* 或 /overleaf/* 请求真打过去 404 时，桥自己吐的错误串固定是
+// "no such route: <METHOD> <path>"（server.js 里唯一一处 404 出口）——认出这个真实错误串，
+// 在把它交给模型瞎猜之前就先拦下来，直接告诉用户"桥版本过旧，请重启"。这是全篇唯一
+// "真的可信"的判据来源：真打了一次请求、桥自己说不认识这个路由，不是靠猜。
+function ovlBridgeIsNoSuchRouteError(data) {
+    return !!(data && data.ok === false && typeof data.error === 'string' && /^no such route:/i.test(data.error));
+}
+const OVL_BRIDGE_STALE_MSG = '本地桥接服务版本过旧（不认识这个接口），不是路径或文件本身的问题，请重启 tools/latex-bridge/ 下的桥接服务后再试一次。';
+
+// v2 Pass P45：拉取遇到 skipped-dirty 时，"要不要弹三选一框"要靠这个函数判断桥认不认识
+// strategy 参数——绝不能只看 /health 缺不缺 bridgeCapabilities 字段就直接判老（字段缺失
+// ≠ 不支持，见 ovlBridgeHasCapability 头部注释）。
+//   - 字段存在：直接读 overleaf-pull-strategy 这一项，桥自己说了算，不用额外发请求。
+//   - 字段缺失：改探测 /fs/capabilities 这个真实端点存不存在——它是 P44 才上线的，比
+//     P27 上线的 strategy 支持晚，能响应这个端点（不管业务上 ok 还是不 ok，只看路由存不
+//     存在）就足以证明这个桥新到一定支持 strategy；探测本身失败（网络错误/超时）保守地
+//     当"支持"处理，不能因为一次探测抖动就把一个可能完全正常的桥判死刑，交给真正的拉取
+//     请求自己去暴露问题。
+async function ovlOverleafProbeStrategySupport(projectDir) {
+    if (Array.isArray(OvlState.bridgeCapabilities)) {
+        return OvlState.bridgeCapabilities.indexOf('overleaf-pull-strategy') !== -1;
+    }
+    try {
+        const resp = await fetch(ovlBridgeUrl('/fs/capabilities'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectDir: projectDir })
+        });
+        let data = null;
+        try { data = await resp.json(); } catch (e) { data = null; }
+        if (ovlBridgeIsNoSuchRouteError(data)) return false;
+        return true; // 端点存在（不管这一次业务上成不成功），版本足够新
+    } catch (e) {
+        return true;
+    }
+}
+
 async function ovlBridgeCheckHealth() {
     let online = false;
     let latexmkExists = false;
+    let bridgeCapabilities = null;
     try {
         const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
         const timer = ctl ? setTimeout(function () { ctl.abort(); }, 1500) : null;
@@ -28073,11 +28304,20 @@ async function ovlBridgeCheckHealth() {
         const data = await resp.json();
         online = !!(data && data.ok);
         latexmkExists = !!(data && data.latexmkExists);
+        // 字段缺失（旧桥没有 P45 起才有的自报字段，不代表旧桥没有对应能力）时保持 null，
+        // 不要塞一个空数组——空数组会被 ovlBridgeHasCapability 判成"探测过、就是没有能力"，
+        // 跟"压根没探测到这个字段"是两种不同的不确定性，chatAgentReadiness()/
+        // ovlOverleafProbeStrategySupport() 都要能区分它俩，分别决定"保守拦截"还是
+        // "照常尝试、靠 ovlBridgeIsNoSuchRouteError 兜底"。
+        bridgeCapabilities = (data && Array.isArray(data.bridgeCapabilities)) ? data.bridgeCapabilities : null;
     } catch (e) {
         online = false;
+        bridgeCapabilities = null;
     }
     const wasOnline = OvlState.bridgeOnline;
     OvlState.bridgeOnline = online;
+    OvlState.bridgeCapabilities = online ? bridgeCapabilities : null;
+    if (typeof chatUpdateCapabilityHint === 'function') { try { chatUpdateCapabilityHint(); } catch (e) {} }
     // 桥在线状态没有翻转的这一轮（绝大多数 5 秒轮询）不重渲 PDF body——ovlRenderPdfBody()
     // 末尾会无条件调 ovlPdfApplyView() 重画当前页 canvas，每轮都跑就是"PDF 每隔几秒闪一下"
     // 的根因。只在状态真的变化（或首次探测）时才需要重渲，跟下面状态文案用同一个判断。
@@ -28339,23 +28579,20 @@ function ovlBuildDirtyFileRow(f) {
     return row;
 }
 
-// 「丢弃本地改动并拉取」的二次确认——ovlConfirmDialog 本身会清空重建 #ovlModalOverlay，
-// 不需要先手动关掉外层的三选一弹窗。
-function ovlOverleafConfirmDiscardAndPull(dirtyFiles, projectDir, gitUrl) {
-    const names = (dirtyFiles || []).map(function (f) { return (f.status || '').trim() + '  ' + f.path; }).join('\n');
-    ovlConfirmDialog({
-        title: '确认丢弃本地改动',
-        message: '以下文件的本地改动会被丢弃，且无法恢复：\n\n' + (names || '（无）') +
-            '\n\n未跟踪文件不受影响，不会被删除。',
-        confirmLabel: '丢弃并拉取',
-        danger: true,
-        onConfirm: function () { ovlOverleafPullRun(projectDir, gitUrl, 'discard', {}); }
-    });
-}
-
+// v2 Pass P45：这个三选一弹窗本身已经把要丢弃的文件清单摆出来了，点"丢弃"之后原来还要
+// 再弹一次 ovlOverleafConfirmDiscardAndPull 二次确认——用户反馈这是"两级确认，像在原地
+// 打转"。现在合并成一步：点"丢弃"直接执行，不再有第二层确认框。
+//
+// 弹窗本身同步渲染、立刻可见（不等任何网络请求）——回退保障状态（chatAgentProbeCheckpoint
+// 探测 /fs/capabilities，同一份缓存，不会因为这里多探一次就多打检查点）异步查到之后再
+// 原地把 cpNote 那一行文字填进去。这样设计有两个理由：①真实用户体验上，弹窗不该因为等
+// 一次网络往返而有肉眼可见的出现延迟；②"执行前的弹窗里出现无回退保障提示"这条硬性要求
+// 靠的是"探测结果回来之前 discardBtn 保持 disabled"来保证——不会出现探测还没回来、用户
+// 却已经点了丢弃的时间窗口。
 function ovlOverleafShowDirtyDialog(dirtyFiles, projectDir, gitUrl) {
     const overlay = document.getElementById('ovlModalOverlay');
     if (!overlay) return;
+
     overlay.innerHTML = '';
     overlay.hidden = false;
 
@@ -28373,6 +28610,15 @@ function ovlOverleafShowDirtyDialog(dirtyFiles, projectDir, gitUrl) {
     (dirtyFiles || []).forEach(function (f) { listWrap.appendChild(ovlBuildDirtyFileRow(f)); });
     box.appendChild(listWrap);
 
+    // 丢弃前的回退保障状态——执行前就要看到，不是丢弃完了才告诉用户（硬性要求）。探测结果
+    // 回来之前显示"正在确认…"、丢弃按钮先禁用，避免用户在这个空窗期点了丢弃。
+    const cpNote = document.createElement('div');
+    cpNote.className = 'ovl-modal-message';
+    cpNote.style.marginTop = '2px';
+    cpNote.textContent = '正在确认丢弃是否有回退保障…';
+    cpNote.style.color = '#94a3b8';
+    box.appendChild(cpNote);
+
     const btnRow = document.createElement('div'); btnRow.className = 'ovl-modal-btns';
     const stashBtn = document.createElement('button');
     stashBtn.type = 'button'; stashBtn.className = 'ovl-modal-btn ovl-modal-btn-primary';
@@ -28382,6 +28628,9 @@ function ovlOverleafShowDirtyDialog(dirtyFiles, projectDir, gitUrl) {
     const discardBtn = document.createElement('button');
     discardBtn.type = 'button'; discardBtn.className = 'ovl-modal-btn ovl-modal-btn-danger';
     discardBtn.textContent = '丢弃本地改动并拉取';
+    discardBtn.disabled = true; // 探测结果回来之前先禁用，见上面 cpNote 的注释
+    discardBtn.setAttribute('data-tip', '正在确认回退保障状态…');
+    discardBtn.setAttribute('data-tip-pos', 'top');
     const cancelBtn = document.createElement('button');
     cancelBtn.type = 'button'; cancelBtn.className = 'ovl-modal-btn'; cancelBtn.textContent = '取消';
     btnRow.appendChild(stashBtn); btnRow.appendChild(discardBtn); btnRow.appendChild(cancelBtn);
@@ -28395,7 +28644,69 @@ function ovlOverleafShowDirtyDialog(dirtyFiles, projectDir, gitUrl) {
     document.addEventListener('keydown', onKey);
 
     stashBtn.addEventListener('click', function () { close(); ovlOverleafPullRun(projectDir, gitUrl, 'stash', {}); });
-    discardBtn.addEventListener('click', function () { close(); ovlOverleafConfirmDiscardAndPull(dirtyFiles, projectDir, gitUrl); });
+    // 丢弃按钮直接执行——不再弹第二个确认框（P45 合并的那一步）。
+    discardBtn.addEventListener('click', function () { close(); ovlOverleafPullRun(projectDir, gitUrl, 'discard', {}); });
+
+    chatAgentProbeCheckpoint(projectDir).then(function (cp) {
+        // 这段异步结果回来的时候，用户可能已经关掉了这个弹窗（点了取消/暂存/Esc，或者
+        // 又触发了别的弹窗）——overlay.contains(box) 判断"当前挂着的还是不是这一份 DOM"，
+        // 不是就什么都不做，绝不把结果写到一个已经不存在于页面上的节点。
+        if (!overlay.contains(box)) return;
+        if (cp && cp.available === false) {
+            cpNote.textContent = '❌ 本次丢弃无回退保障：' + (cp.warning || '目标目录不是 git 仓库，丢弃后无法恢复。');
+            cpNote.style.color = '#f87171';
+            discardBtn.setAttribute('data-tip', '会丢弃上面列出的这些文件的本地改动，且本次无回退保障，操作后不可恢复');
+        } else if (cp && cp.available === true) {
+            cpNote.textContent = '✓ 点"丢弃"前会自动生成一个旁路回退快照，丢错了可以恢复。';
+            cpNote.style.color = '#86efac';
+            discardBtn.setAttribute('data-tip', '会丢弃上面列出的这些文件的本地改动；执行前会自动生成一个可回退的快照');
+        } else {
+            cpNote.textContent = '⚠ 无法确认回退保障状态，请谨慎操作。';
+            cpNote.style.color = '#fbbf24';
+        }
+        discardBtn.disabled = false;
+    }).catch(function () {
+        if (!overlay.contains(box)) return;
+        cpNote.textContent = '⚠ 无法确认回退保障状态，请谨慎操作。';
+        cpNote.style.color = '#fbbf24';
+        discardBtn.disabled = false;
+    });
+}
+
+// 丢弃成功后：如果生成了可回退检查点，把标识摆出来 + 提供一个真能点的"一键回退"入口，
+// 不只是显示个哈希让用户自己去敲命令行。跟 /fs/restore 走同一个端点（chatAgentDoRollback
+// 那套写工具回退是同一条路，这里是拉取丢弃场景的入口，逻辑相通但触发点不同，各自独立
+// 一份，互不依赖对方的 DOM/状态）。这里的"一键回退"按钮本身就是用户看清检查点信息后
+// 主动点的，不再叠加第二层确认——正是 F1 要去掉的"二次确认打转"，回退这条路径也一样遵守。
+function ovlOverleafShowDiscardDoneDialog(data, projectDir) {
+    ovlConfirmDialog({
+        title: '已丢弃本地改动并拉取',
+        message: '丢弃前已自动生成回退快照，标识：\n' + data.checkpoint
+            + '\n\n如果发现丢错了，点"一键回退"可以把工作区恢复到丢弃之前的状态'
+            + '（之后再拉取到的新内容也会被这次回退覆盖掉；回退动作本身还会再打一个快照，'
+            + '所以回退之后仍然可以再回退回来）。不点也没关系，这个快照会一直留在'
+            + 'refs/ovl-checkpoints/ 下面，以后想恢复随时都能用。',
+        confirmLabel: '一键回退',
+        onConfirm: function () { ovlOverleafDiscardRollback(projectDir, data.checkpoint); }
+    });
+}
+
+async function ovlOverleafDiscardRollback(projectDir, checkpoint) {
+    try {
+        const resp = await fetch(ovlBridgeUrl('/fs/restore'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectDir: projectDir, checkpoint: checkpoint })
+        });
+        const data = await resp.json();
+        if (!data || data.ok !== true) {
+            showToast('回退失败：' + ((data && data.error) || '未知错误'), 'error');
+            return;
+        }
+        showToast('已回退到丢弃之前的状态（恢复 ' + data.filesRestored + ' 个文件）', 'success');
+        if (OvlState.dirHandle && !OvlState.usingWebkitFallback) { try { ovlRenderTree(OvlState.dirHandle); } catch (e) {} }
+    } catch (e) {
+        showToast('回退失败：连不上桥接服务', 'error');
+    }
 }
 
 // stash pop 冲突：拉取本身已经成功，只是把暂存的改动恢复回来时撞车了——仓库现在处于冲突
@@ -28483,9 +28794,48 @@ function ovlOverleafHandlePullResult(data, ctx) {
         const n = Array.isArray(data.changedFiles) ? data.changedFiles.length : 0;
         ovlOverleafSetSyncStatus('已丢弃本地改动并拉取（' + n + ' 个文件变化）' + suffix, false);
         showToast('已丢弃本地改动并从 Overleaf 拉取更新' + suffix, 'success');
+        // v2 Pass P45：丢弃前 server.js 已经自动打了一个旁路回退检查点（doOverleafPull 的
+        // strategy==='discard' 分支）——把标识摆出来，并给一个能真的点的"一键回退"入口，
+        // 不是只显示个哈希让用户自己去敲命令行。checkpointAvailable===false 时（比如目标
+        // 目录不是 git 仓库这种边缘情况）不弹这个对话框，跟 toast/状态栏一样保持安静。
+        if (data.checkpointAvailable && data.checkpoint) {
+            ovlOverleafShowDiscardDoneDialog(data, ctx.projectDir);
+        }
     } else if (data.action === 'skipped-dirty') {
-        ovlOverleafSetSyncStatus('本地有未提交改动，已跳过', true);
-        ovlOverleafShowDirtyDialog(data.dirtyFiles, ctx.projectDir, ctx.gitUrl);
+        // v2 Pass P45：真实事故复盘——用户点"丢弃"/"暂存"后界面像是原地打转，根因是当时连着
+        // 的桥是没重启过的旧进程，根本不认识 strategy 参数：不管前端传 stash/discard，旧桥
+        // 永远按老逻辑走、永远回 skipped-dirty，于是弹窗一遍遍重新弹出、点哪个按钮都像没反应。
+        //
+        // 回归修复：第一版这里靠"/health 缺不缺 bridgeCapabilities 字段"整体判断桥新旧，结果
+        // 把一个功能完好、只是没重启到 P45（因此没有这个自报字段）的桥也当废桥直接拒绝服务，
+        // 比原来的打转 bug 更糟——原 bug 好歹还会尝试。现在改成两层判断，字段缺失时不拦截：
+        //   1. ctx.strategy 是 'stash'/'discard'（用户已经选过一次、这是"重试"）却又收到
+        //      skipped-dirty——这是最直接的证据：桥没认识 strategy、把它当空气，不管发生
+        //      多少次都不会有不同结果，此时不该再弹一次三选一框（那才是真正的"打转"）。
+        //   2. 只有第 1 步之后才去问"这到底是不是旧桥"：ovlOverleafProbeStrategySupport 优先
+        //      信 /health 的自报字段（存在就直接读，快路径）；字段缺失时改探测一个真实端点
+        //      （/fs/capabilities，P44 上线，早于 P45 的自报字段——支持它的桥必然也支持
+        //      P27 的 strategy）存不存在，"no such route" 才是唯一可信的"真的太旧"信号。
+        //
+        // 首次拉取（strategy==='abort'）收到 skipped-dirty 是完全正常、符合预期的结果（就是
+        // 真的有本地改动），不管桥新旧都要弹这个三选一框——没有办法、也不需要在这一步区分
+        // 新旧桥。
+        if (ctx.strategy === 'abort') {
+            ovlOverleafSetSyncStatus('本地有未提交改动，已跳过', true);
+            ovlOverleafShowDirtyDialog(data.dirtyFiles, ctx.projectDir, ctx.gitUrl);
+        } else {
+            ovlOverleafProbeStrategySupport(ctx.projectDir).then(function (supported) {
+                if (!supported) {
+                    ovlOverleafSetSyncStatus('桥接服务版本过旧，无法安全处理本地改动', true);
+                    showToast('本地桥接服务版本过旧（不认识拉取时的暂存/丢弃策略参数），继续点"暂存"或"丢弃"也不会有效果——请重启 tools/latex-bridge/ 下的桥接服务后再拉取。', 'error');
+                } else {
+                    // 桥明明支持 strategy 却还是回了 skipped-dirty——大概率是拉取窗口之间
+                    // 工作区状态又变脏了这种正常情况，原样弹三选一框，不是 bug。
+                    ovlOverleafSetSyncStatus('本地有未提交改动，已跳过', true);
+                    ovlOverleafShowDirtyDialog(data.dirtyFiles, ctx.projectDir, ctx.gitUrl);
+                }
+            });
+        }
     } else if (data.action === 'stash-pop-conflict') {
         ovlOverleafSetSyncStatus('暂存恢复时发生冲突，需手动处理', true);
         ovlOverleafShowStashConflictDialog(data);
@@ -28533,7 +28883,7 @@ async function ovlOverleafPullRun(projectDir, gitUrl, strategy, opts) {
             showToast(msg, 'error');
             return;
         }
-        ovlOverleafHandlePullResult(data, { silent: silent, projectDir: projectDir, gitUrl: gitUrl });
+        ovlOverleafHandlePullResult(data, { silent: silent, projectDir: projectDir, gitUrl: gitUrl, strategy: strategy });
     } catch (e) {
         ovlOverleafSetSyncStatus('拉取失败：连不上桥接服务', true);
         showToast('拉取失败：连不上桥接服务', 'error');

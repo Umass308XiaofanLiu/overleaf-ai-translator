@@ -47,6 +47,18 @@ const { spawn, execSync } = require('child_process');
 let WebSocket = null;
 try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化处的兜底说明 */ }
 
+// v2 Pass P45：/health 里带的能力/版本自报——见该端点注释。每次给桥新增一个"前端需要能
+// 判断有没有"的能力（新端点、既有端点的行为变化），就在 BRIDGE_CAPABILITIES 里加一个字符串，
+// 版本号也提一位。已经上线的能力不会被撤销，这个数组只做加法。
+const BRIDGE_API_VERSION = 45;
+const BRIDGE_CAPABILITIES = [
+    'overleaf-clone',          // POST /overleaf/clone
+    'overleaf-pull-strategy',  // POST /overleaf/pull 认识 body.strategy（abort/stash/discard）
+    'fs-ops',                  // POST /fs/list /fs/read /fs/write /fs/mkdir /fs/move /fs/copy /fs/delete /fs/restore
+    'fs-capabilities',         // POST /fs/capabilities（只读能力探测）
+    'overleaf-discard-checkpoint' // strategy=discard 丢弃前自动打旁路快照，响应带 checkpoint 字段
+];
+
 const HOST = '127.0.0.1';
 // LATEX_BRIDGE_PORT 仅供测试用（起在别的空闲端口上，绝不占用用户真实在跑的 8181）：
 // 不传时行为跟以前完全一样，还是硬编码 8181。
@@ -1005,11 +1017,20 @@ async function doOverleafPull(projectDir, gitUrl, token, strategy) {
         }
 
         let discardedFiles = [];
+        let discardCp = { available: null, checkpoint: null, warning: null };
         if (isDirty && strategy === 'discard') {
+            // v2 Pass P45：真正丢弃之前先打一个旁路快照（不动分支/索引/工作区，见
+            // fsGitCheckpoint 头部注释）——用户反馈"丢弃"点起来太吓人，给一条回退保障。
+            // 打快照失败不阻断丢弃本身（那是既有的"丢弃"功能，不能因为新增的保障机制本身
+            // 出故障就连累主流程），只是响应里 checkpointAvailable 会如实为 false。
+            discardCp = await fsGitCheckpoint(projectDir, 'overleaf pull discard');
             // 只丢弃已跟踪文件的改动——绝不用 git clean，一个未跟踪文件都不许删。
             const discardResult = await runGitCommand(['checkout', '--', '.'], projectDir, token);
             if (!discardResult.ok) {
-                return { ok: false, action: 'discard-failed', error: redactToken(discardResult.stderr || discardResult.stdout || 'git checkout -- . 失败', token) };
+                return Object.assign(
+                    { ok: false, action: 'discard-failed', error: redactToken(discardResult.stderr || discardResult.stdout || 'git checkout -- . 失败', token) },
+                    checkpointFields(discardCp)
+                );
             }
             discardedFiles = dirtyFiles;
         }
@@ -1072,7 +1093,10 @@ async function doOverleafPull(projectDir, gitUrl, token, strategy) {
 
         if (strategy === 'discard' && isDirty) {
             const untrackedCount = await countUntrackedFiles(projectDir, token);
-            return { ok: true, action: 'pulled-with-discard', discardedFiles: discardedFiles, changedFiles: changedFiles, untrackedCount: untrackedCount };
+            return Object.assign(
+                { ok: true, action: 'pulled-with-discard', discardedFiles: discardedFiles, changedFiles: changedFiles, untrackedCount: untrackedCount },
+                checkpointFields(discardCp)
+            );
         }
 
         if (stashPushed) {
@@ -1797,13 +1821,22 @@ const server = http.createServer(async (req, res) => {
                 node: process.version,
                 latexmkPath: LATEXMK,
                 latexmkExists: fs.existsSync(LATEXMK),
-                workRoot: WORK_ROOT
+                workRoot: WORK_ROOT,
+                // v2 Pass P45：能力/版本自报——前端判断"这个桥支不支持某个新功能"必须靠这里，
+                // 不能靠解析下面 GET / 那段人读的文字列表（刚出过 P44 加了 /fs/capabilities
+                // 却漏更新那段文字的事故，字符串列表跟真实路由不同步这类问题不会自愈）。
+                // 老版本桥（这个字段加入之前编译、没重启过）压根不会返回这两个字段——前端那边
+                // 的判定必须把"字段缺失"当成"旧桥、什么都不支持"处理，不能因为缺字段就报错
+                // 或者误判成新桥（这个推断方向是单向且安全的：新桥必然带字段，缺字段只可能
+                // 是旧桥，不可能反过来）。
+                bridgeApiVersion: BRIDGE_API_VERSION,
+                bridgeCapabilities: BRIDGE_CAPABILITIES
             });
             return;
         }
 
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete, POST /fs/restore. WebSocket on same host:port for disk-change push.');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete, POST /fs/restore, POST /fs/capabilities. WebSocket on same host:port for disk-change push.');
             return;
         }
 
