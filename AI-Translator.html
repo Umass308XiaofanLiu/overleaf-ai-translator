@@ -372,6 +372,10 @@ body.is-resizing-settings-modal * {
     --pair-gap: 8px;
     --ovl-sel-fill: rgba(59, 130, 246, 0.18);
     --ovl-sel-outline: rgba(59, 130, 246, 0.55);
+    /* v2 Pass P37：黄色"标记高亮"专用变量，独立于上面两个蓝色选区变量——反向 SyncTeX 跳转
+       /查找跳转命中都用这一套，跟用户正在用的蓝色选区互不干扰、互不覆盖。 */
+    --ovl-mark-fill: rgba(234, 179, 8, 0.28);
+    --ovl-mark-outline: rgba(202, 138, 4, 0.85);
 }
 [data-align-content] > * + * { margin-top: var(--pair-gap); }
 /* 每行都带 Tailwind 的 transition-all（0.15s），它会把 margin-top 一起做补间动画。
@@ -1483,7 +1487,13 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 }
 .ovl-mode-toggle label.ovl-mode-active { background: #098842; color: #ffffff; }
 
-.ovl-editor-body { flex: 1 1 auto; min-height: 0; display: flex; overflow: hidden; }
+.ovl-editor-body {
+    flex: 1 1 auto; min-height: 0; display: flex; overflow: hidden;
+    /* v2 Pass P37：#ovlCodeMarkOverlay 是这个元素的绝对定位子节点，靠这个当 containing
+       block——本来就没设 top/left/right/bottom，加 relative 不改变它在外层 flex 布局里的
+       占位，不影响既有布局（跟 1573 行 .ovl-visual-pane 补 position:relative 的理由一样）。 */
+    position: relative;
+}
 .ovl-gutter {
     flex: 0 0 auto;
     width: 48px;
@@ -1614,6 +1624,31 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    见 ovlApplySettings 里的注释；.ovl-visual-pane 背景写死 #ffffff），所以这里不加一条
    "深色下更清楚"的覆盖值——加了也用不上、还可能反过来在白底上显得突兀。以后 Visual 面板
    真的有了深色皮肤，只需要在 :root（约 368 行）那两个变量上覆盖新的深色值。 */
+/* ==================== v2 Pass P37：黄色"标记高亮"叠加层 ====================
+   G3 基础设施——反向 SyncTeX 单击跳转（G2）、查找跳转（G4）共用同一套 ovlMarkLines()。
+   跟上面 #ovlVisualSelOverlay/.ovl-sel-box 那套蓝色选区叠加层刻意保持两条平行、互不修改的
+   实现：颜色变量（--ovl-mark-*）、class（.ovl-mark-box）、容器 id 全部另起一份。
+   #ovlVisualMarkOverlay 挂在 #ovlVisualPane 内部（跟 #ovlVisualSelOverlay 同一个挂法，随
+   pane 滚动天然跟着走）；#ovlCodeMarkOverlay 挂在 .ovl-editor-body 内部、inset:0 铺满整个
+   编辑器主体（含 gutter，"整个可视宽度"），画的是整行色带，位置靠 JS 用 ta.scrollTop 现算，
+   scroll 时重算（Code 模式下 textarea 自己滚，不是父容器滚，没法靠"挂在滚动内容内部"
+   免费获得跟随滚动的效果）。 */
+#ovlVisualMarkOverlay { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 6; }
+.ovl-mark-box {
+    position: absolute;
+    border: 1px solid var(--ovl-mark-outline, rgba(202, 138, 4, 0.85));
+    background: var(--ovl-mark-fill, rgba(234, 179, 8, 0.28));
+    border-radius: 2px;
+    pointer-events: none;
+    box-sizing: border-box;
+}
+#ovlCodeMarkOverlay {
+    position: absolute;
+    top: 0; left: 0; right: 0; bottom: 0;
+    pointer-events: none;
+    overflow: hidden;
+    z-index: 1;
+}
 .ovl-visual-raw { white-space: pre-wrap; word-break: break-word; font: 12px/1.5 "SFMono-Regular", Consolas, monospace; color: #374151; }
 .ovl-visual-bar {
     background: #eef1f5; color: #475569; font-size: 12px; padding: 6px 10px;
@@ -22096,6 +22131,9 @@ function ovlShellHtml() {
         +     '<div class="ovl-editor-body">'
         +       '<div class="ovl-gutter" id="ovlGutter"></div>'
         +       '<textarea class="ovl-code-area" id="ovlCodeArea" spellcheck="false" disabled placeholder="从左侧文件树打开一个 .tex 文件"></textarea>'
+        // v2 Pass P37：Code 模式黄色标记高亮的整行色带画在这个叠加层里（见 CSS #ovlCodeMarkOverlay
+        // 附近的大注释）。静态挂一次，跟 #ovlCodeArea 是同一批建一次的骨架，不用每次渲染重挂。
+        +       '<div id="ovlCodeMarkOverlay"></div>'
         // M5：只读富文本预览，内容由 ovlVisualRender() 填充（LatexFilter 结构转换 + 既有
         // renderFormattedText 走 marked/KaTeX），不是"Visual 模式将在 M5 实现"占位符了。
         +       '<div class="ovl-visual-pane" id="ovlVisualPane" style="display:none;"><div class="ovl-visual-empty">打开一个 .tex 文件后这里会显示只读预览。</div></div>'
@@ -23455,6 +23493,12 @@ function ovlSetEditorMode(mode) {
             // P13：跟上面同一个"display 刚翻转、布局还没落地"的理由，卷动也得等这次重排
             // 结束——ovlCodeScrollToLine 内部会按需重算 lineOffsets，太早调会拿到旧尺寸。
             if (syncLine >= 0) setTimeout(function () { ovlCodeScrollToLine(syncLine); }, 60);
+            // v2 Pass P37：切回 Code 模式，黄色标记高亮（如果有）要在这边重画——跟上面 P13
+            // 那次 scrollTop 同一个"display 刚翻转、布局还没落地"的理由，等 60ms 那次重排/
+            // 卷动落地之后再补一次，不然会画在旧的 scrollTop 上。ovlRenderVisualGutter() 那边
+            // （切进 Visual 的分支，ovlVisualRender() 内部会调用）已经自带这一步，Code 这边
+            // 没有对应的统一收口点，这里单独补一次。
+            if (typeof ovlScheduleMarkOverlay === 'function') setTimeout(ovlScheduleMarkOverlay, 70);
         }
     } catch (e) {
         console.error('[ovl] setEditorMode failed', e);
@@ -24271,6 +24315,12 @@ function ovlVisualSelOverlayReset(pane) {
     const overlay = document.createElement('div');
     overlay.id = 'ovlVisualSelOverlay';
     pane.appendChild(overlay);
+    // v2 Pass P37：#ovlVisualMarkOverlay（黄色标记高亮，跟上面的蓝色选区叠加层挂法一样、
+    // 一起随 pane.innerHTML 重写而重挂）也在这里顺手补一份空节点——这个函数本来就是
+    // "pane 整篇重写之后重新挂空叠加层"这一件事的统一入口，不额外开第二个调用点。真正的
+    // 内容由 ovlRenderVisualGutter() 结尾调用 ovlScheduleMarkOverlay() 补画（那时候
+    // OvlVisualBlockRects 才是刚渲染完这一份的最新数据）。
+    if (typeof ovlVisualMarkOverlayReset === 'function') ovlVisualMarkOverlayReset(pane);
 }
 
 function ovlClearVisualSelOverlay() {
@@ -24374,6 +24424,285 @@ function ovlBindVisualSelOverlay() {
     document.addEventListener('selectionchange', ovlScheduleVisualSelOverlay);
     window.addEventListener('resize', ovlScheduleVisualSelOverlay);
     window.addEventListener('blur', ovlClearVisualSelOverlay);
+}
+
+// ==================== v2 Pass P37：黄色"标记高亮"基础设施（ovlMarkLines）====================
+// 反向 SyncTeX 单击跳转（ovlPdfHandleDblClick 旁边新增的单击分支）、查找跳转
+// （ovlFindSelectCurrent）共用这一套：给一个 [lineFrom, lineTo]（0-based 逻辑行，含端点），
+// 自动判断当前是 Code 还是 Visual 模式、卷到"目标尽量落在容器垂直中部"、画黄色高亮，直到
+// 下一次调用 / Esc / 该栏发起新选区为止。跟蓝色选区叠加层（ovlRecomputeVisualSelOverlay 等，
+// 上面那一段）刻意用两套完全独立的状态、DOM 节点、CSS 变量——那套是"用户正在选的文字"，
+// 这套是"跳转命中的落点"，语义不同，谁也不覆盖谁。
+//
+// Code 模式为什么不做逐字符精确高亮：textarea 里没有可寻址的字符级 DOM 节点可以画框——唯一
+// 的路子是搭一个镜像 div（跟 24425 行附近软换行那套镜像同思路）逐字符测量，但折行 + 滚动
+// 的组合下极易跟真实渲染错位一像素两像素，维护成本压不住，而用户的实际用途是"跳过去一眼
+// 找到那一句"，整行色带足够、且不会撒谎（Visual 模式仍然是精确逐行方框，能做到就不将就）。
+const OvlMarkState = { lineFrom: -1, lineTo: -1 };
+
+function ovlClearCodeMarkOverlay() {
+    const overlay = document.getElementById('ovlCodeMarkOverlay');
+    if (overlay) overlay.innerHTML = '';
+}
+function ovlClearVisualMarkOverlay() {
+    const overlay = document.getElementById('ovlVisualMarkOverlay');
+    if (overlay) overlay.innerHTML = '';
+}
+// 生命周期第②③条（Esc / 该栏发起新选区）的统一清空入口——连同 OvlMarkState 一起清零，
+// 这样切模式/重排的 repaint 不会用陈旧的行区间又画回来。
+function ovlClearMarkOverlay() {
+    OvlMarkState.lineFrom = -1;
+    OvlMarkState.lineTo = -1;
+    ovlClearCodeMarkOverlay();
+    ovlClearVisualMarkOverlay();
+}
+
+// pane.innerHTML 整篇重写时（跟 ovlVisualSelOverlayReset 同一批时机）重新挂一个空节点，
+// 真正的内容由 ovlRenderVisualGutter() 结尾调用 ovlScheduleMarkOverlay() 补画。
+function ovlVisualMarkOverlayReset(pane) {
+    if (!pane) return;
+    const overlay = document.createElement('div');
+    overlay.id = 'ovlVisualMarkOverlay';
+    pane.appendChild(overlay);
+}
+
+// 找 el 子树里第一个/最后一个非空文本节点——ovlVisualMarkRangeForLines 拿它俩当 Range 端点。
+// 实测踩过的坑：Range 端点如果落在"元素之间"（setStartBefore(blockDiv)/setEndAfter(blockDiv)，
+// 或者对一个只有单个块级子节点 <p> 的 <div> 调 selectNodeContents），getClientRects() 除了
+// 每一条真正的文字行框之外，还会多吐出一个"整个块级盒子"的大矩形（宽度=整块宽、高度=块总
+// 高度），这个大矩形跟每一行文字的行框垂直重叠都超过一半，会被 ovlGroupSelRectsIntoRows
+// 误判成"跟每一行都是同一行"，全部合并成一个框——三行文字量出来 rectsN=4（1 个虚的整块框
+// + 3 个真的行框），最终只画出 1 个黄框，跟视觉上明明有 3 行不符。把端点钉死在真实文本
+// 节点内部（真实用户拖选文字产生的 Range 天生就是这样，蓝色选区没这个问题的原因也在这里），
+// 这个多出来的整块虚框就不会再出现。
+function ovlVisualMarkTextBoundary(el, fromEnd) {
+    try {
+        const walker = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+        let node = null, last = null;
+        while ((node = walker.nextNode())) {
+            if (!fromEnd) return node; // 第一个文本节点就是要的
+            last = node;
+        }
+        return last; // fromEnd：一路走到底，最后一个非空的
+    } catch (e) { return null; }
+}
+
+// Visual 模式：找出 [lineFrom,lineTo] 触及的 .ovl-visual-block，搭一个跨越首尾块的 Range，
+// 直接喂给 ovlSelectionRowRectsViewport()（蓝色选区那套"按视觉行合并矩形"的同一个函数，
+// 24376 行附近）——精确逐行框，公式碎块问题跟蓝色选区共享同一份免疫力，不用重新发明。
+function ovlVisualMarkRangeForLines(pane, lineFrom, lineTo) {
+    const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+    if (!blocks.length) return null;
+    let startEl = null, endEl = null;
+    for (let i = 0; i < blocks.length; i++) {
+        const a = parseInt(blocks[i].getAttribute('data-src-line'), 10);
+        const zAttr = blocks[i].getAttribute('data-src-line-end');
+        const z = zAttr !== null ? parseInt(zAttr, 10) : a;
+        if (a <= lineTo && z >= lineFrom) {
+            if (!startEl) startEl = blocks[i];
+            endEl = blocks[i];
+        }
+    }
+    if (!startEl) return null;
+    try {
+        const range = document.createRange();
+        const startText = ovlVisualMarkTextBoundary(startEl, false);
+        const endText = ovlVisualMarkTextBoundary(endEl, true);
+        if (startText && endText) {
+            range.setStart(startText, 0);
+            range.setEnd(endText, endText.length);
+        } else {
+            // 兜底：块里没有文本节点（纯图片/公式渲染成 canvas 之类），退回整块边界——
+            // 这种情况下"一个块=一个大框"本来就是合理呈现，不是 bug。
+            range.setStartBefore(startEl);
+            range.setEndAfter(endEl);
+        }
+        return range;
+    } catch (e) { return null; }
+}
+
+function ovlPaintVisualMarkOverlay() {
+    try {
+        const pane = document.getElementById('ovlVisualPane');
+        const overlay = document.getElementById('ovlVisualMarkOverlay');
+        if (!pane || !overlay) return;
+        if (OvlState.editorMode !== 'visual' || OvlMarkState.lineFrom < 0
+            || pane.style.display === 'none' || !pane.offsetParent) { overlay.innerHTML = ''; return; }
+        const range = ovlVisualMarkRangeForLines(pane, OvlMarkState.lineFrom, OvlMarkState.lineTo);
+        if (!range) { overlay.innerHTML = ''; return; }
+        const rows = ovlSelectionRowRectsViewport(range);
+        if (!rows.length) { overlay.innerHTML = ''; return; }
+        const paneRect = pane.getBoundingClientRect();
+        const offX = pane.scrollLeft - paneRect.left;
+        const offY = pane.scrollTop - paneRect.top;
+        let html = '';
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            html += '<div class="ovl-mark-box" style="left:' + (row.left + offX) + 'px;top:' + (row.top + offY)
+                + 'px;width:' + (row.right - row.left) + 'px;height:' + (row.bottom - row.top) + 'px;"></div>';
+        }
+        overlay.innerHTML = html;
+    } catch (e) { console.error('[ovl] paintVisualMarkOverlay failed', e); }
+}
+
+// Code 模式：整行色带，宽度铺满 #ovlCodeMarkOverlay（整个编辑器主体，含 gutter），高度/位置
+// 用 ovlVisualRowForLineIndex + OVL_LINE_H 现算（跟 ovlCodeScrollToLine/ovlFindSelectCurrent
+// 同一套"软换行感知的视觉行号"，24576 行附近），再减去 ta.scrollTop 转成当前视口坐标。
+function ovlPaintCodeMarkOverlay() {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        const overlay = document.getElementById('ovlCodeMarkOverlay');
+        if (!ta || !overlay) return;
+        if (OvlState.editorMode !== 'code' || OvlMarkState.lineFrom < 0
+            || ta.style.display === 'none' || !ta.offsetParent) { overlay.innerHTML = ''; return; }
+        const paddingTop = 8; // .ovl-code-area 的 padding: 8px 12px（约 1524 行），量出来的常数
+        const rowStart = ovlVisualRowForLineIndex(OvlMarkState.lineFrom);
+        const rowsLast = (OvlState.lineOffsets && OvlState.lineOffsets[OvlMarkState.lineTo])
+            ? OvlState.lineOffsets[OvlMarkState.lineTo].rows : 1;
+        const rowEnd = ovlVisualRowForLineIndex(OvlMarkState.lineTo) + rowsLast; // exclusive
+        const top = paddingTop + rowStart * OVL_LINE_H - ta.scrollTop;
+        const height = Math.max(OVL_LINE_H, (rowEnd - rowStart) * OVL_LINE_H);
+        overlay.innerHTML = '<div class="ovl-mark-box" style="left:0;right:0;width:100%;top:'
+            + top + 'px;height:' + height + 'px;"></div>';
+    } catch (e) { console.error('[ovl] paintCodeMarkOverlay failed', e); }
+}
+
+// 滚动/resize/分栏拖动/切模式都走这一个 rAF 合并入口（跟 ovlScheduleFloatRelayout 同一条
+// 纪律，30473 行附近），没有激活的标记时 ovlRepaintMarkOverlay 直接短路，零开销。
+let OvlMarkOverlayRaf = null;
+function ovlScheduleMarkOverlay() {
+    if (OvlMarkOverlayRaf !== null) return;
+    OvlMarkOverlayRaf = requestAnimationFrame(function () {
+        OvlMarkOverlayRaf = null;
+        ovlRepaintMarkOverlay();
+    });
+}
+function ovlRepaintMarkOverlay() {
+    try {
+        if (OvlMarkState.lineFrom < 0) return;
+        if (OvlState.editorMode === 'visual') { ovlClearCodeMarkOverlay(); ovlPaintVisualMarkOverlay(); }
+        else { ovlClearVisualMarkOverlay(); ovlPaintCodeMarkOverlay(); }
+    } catch (e) { console.error('[ovl] repaintMarkOverlay failed', e); }
+}
+
+// 把 Code 编辑器卷到 [lineFrom,lineTo] 的垂直中点（跟 ovlCodeScrollToLine 不同——那个是
+// "对齐顶部"，这里要的是"居中方便找"，语义不同不复用同一个函数，只复用它俩共同依赖的
+// ovlVisualRowForLineIndex/OVL_LINE_H）。
+function ovlMarkCenterCode(lineFrom, lineTo) {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        const gutter = document.getElementById('ovlGutter');
+        if (!ta) return;
+        const rowStart = ovlVisualRowForLineIndex(lineFrom);
+        const rowsLast = (OvlState.lineOffsets && OvlState.lineOffsets[lineTo]) ? OvlState.lineOffsets[lineTo].rows : 1;
+        const rowEnd = ovlVisualRowForLineIndex(lineTo) + rowsLast;
+        const midPx = (rowStart + rowEnd) / 2 * OVL_LINE_H;
+        let target = midPx - ta.clientHeight / 2;
+        const maxScroll = Math.max(0, ta.scrollHeight - ta.clientHeight);
+        target = Math.max(0, Math.min(maxScroll, target));
+        ta.scrollTop = target;
+        if (gutter) gutter.scrollTop = ta.scrollTop;
+    } catch (e) { console.error('[ovl] markCenterCode failed', e); }
+}
+
+// Visual 版本：复用 ovlRenderVisualGutter 刚算出来的 gutter 格子 top/height（跟
+// ovlVisualScrollToLine 31270 行附近同一份数据源，那个函数是"对齐顶部"，这里改成居中）。
+function ovlMarkCenterVisual(lineFrom, lineTo) {
+    try {
+        const pane = document.getElementById('ovlVisualPane');
+        const gutter = document.getElementById('ovlGutter');
+        if (!pane || !gutter || !OvlVisualBlockRects.length) return;
+        let idxFrom = 0, idxTo = 0;
+        for (let i = 0; i < OvlVisualBlockRects.length; i++) { if (OvlVisualBlockRects[i].line <= lineFrom) idxFrom = i; else break; }
+        for (let i = 0; i < OvlVisualBlockRects.length; i++) { if (OvlVisualBlockRects[i].line <= lineTo) idxTo = i; else break; }
+        const cellFrom = gutter.children[idxFrom];
+        const cellTo = gutter.children[idxTo] || cellFrom;
+        if (!cellFrom) return;
+        const topFrom = parseFloat(cellFrom.style.top) || 0;
+        const topTo = (parseFloat(cellTo.style.top) || 0) + (parseFloat(cellTo.style.height) || 0);
+        const mid = (topFrom + topTo) / 2;
+        let target = mid - pane.clientHeight / 2;
+        const maxScroll = Math.max(0, pane.scrollHeight - pane.clientHeight);
+        target = Math.max(0, Math.min(maxScroll, target));
+        pane.scrollTop = target;
+        gutter.scrollTop = pane.scrollTop;
+    } catch (e) { console.error('[ovl] markCenterVisual failed', e); }
+}
+
+// ==== 对外唯一入口 ====
+// lineFrom/lineTo：0-based 逻辑行，含端点。opts 目前只是占位（预留 text/source 之类的调用方
+// 元信息，当前实现用不到，签名先留着不用调用方等第二轮改造）。自动作用于当前激活的那一栏，
+// 调用方（G2 反向 SyncTeX、G4 查找跳转）不用关心现在是 Code 还是 Visual。
+function ovlMarkLines(lineFrom, lineTo, opts) {
+    try {
+        void opts;
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta) return;
+        const text = ta.value;
+        const n = text.length ? text.split('\n').length : 1;
+        lineFrom = Math.max(0, Math.min(n - 1, lineFrom | 0));
+        lineTo = Math.max(lineFrom, Math.min(n - 1, lineTo | 0));
+        OvlMarkState.lineFrom = lineFrom;
+        OvlMarkState.lineTo = lineTo;
+        if (OvlState.editorMode === 'visual') {
+            ovlMarkCenterVisual(lineFrom, lineTo);
+            ovlClearCodeMarkOverlay();
+            ovlPaintVisualMarkOverlay();
+        } else {
+            ovlMarkCenterCode(lineFrom, lineTo);
+            ovlClearVisualMarkOverlay();
+            ovlPaintCodeMarkOverlay();
+        }
+    } catch (e) { console.error('[ovl] markLines failed', e); }
+}
+
+// 生命周期第③条"该栏发起新选区就清空"：Code 侧用 mousedown→mouseup 位移判定是不是一次真的
+// 拖拽选字（跟下面 G2 单击防误触同一把尺子），键盘扩选用 shift+方向/Home/End 判定；Visual
+// 侧监听 mousedown 之后的下一次 mouseup，读原生 Selection 是否落在 pane 内且非空。都只在
+// "确实选出了非空内容"时才清，单纯点一下光标不算发起新选区，不会误清刚跳过去的标记。
+function ovlBindMarkOverlayClearOnSelect() {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (ta) {
+            let downX = null, downY = null;
+            ta.addEventListener('mousedown', function (e) { downX = e.clientX; downY = e.clientY; });
+            ta.addEventListener('mouseup', function (e) {
+                const moved = downX !== null && (Math.abs(e.clientX - downX) > 4 || Math.abs(e.clientY - downY) > 4);
+                downX = null; downY = null;
+                if (moved && ta.selectionStart !== ta.selectionEnd) ovlClearMarkOverlay();
+            });
+            ta.addEventListener('keydown', function (e) {
+                if (!e.shiftKey) return;
+                const k = e.key;
+                if (k !== 'ArrowLeft' && k !== 'ArrowRight' && k !== 'ArrowUp' && k !== 'ArrowDown'
+                    && k !== 'Home' && k !== 'End' && k !== 'PageUp' && k !== 'PageDown') return;
+                setTimeout(function () { if (ta.selectionStart !== ta.selectionEnd) ovlClearMarkOverlay(); }, 0);
+            });
+        }
+        const pane = document.getElementById('ovlVisualPane');
+        if (pane) {
+            let vGesture = false;
+            pane.addEventListener('mousedown', function () { vGesture = true; });
+            document.addEventListener('mouseup', function () {
+                if (!vGesture) return;
+                vGesture = false;
+                try {
+                    const sel = ovlWinOf(pane).getSelection();
+                    if (sel && !sel.isCollapsed && sel.rangeCount && pane.contains(sel.getRangeAt(0).commonAncestorContainer)) {
+                        ovlClearMarkOverlay();
+                    }
+                } catch (e2) {}
+            });
+        }
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape' && OvlMarkState.lineFrom >= 0) ovlClearMarkOverlay();
+        });
+        // 窗口 resize（含拖分栏触发的 ResizeObserver 已经走 ovlScheduleLineOffsetRecompute /
+        // ovlRenderVisualGutter 两条各自的路径补了 repaint，这里再挂一次 window resize 兜底
+        // Visual 面板宽度变化导致的折行变化——viewport 矩形一变，Visual 那套精确逐行框必须
+        // 重新量，不能只靠 rAF 合并旧坐标）。
+        window.addEventListener('resize', function () { if (typeof ovlScheduleMarkOverlay === 'function') ovlScheduleMarkOverlay(); });
+    } catch (e) { console.error('[ovl] bindMarkOverlayClearOnSelect failed', e); }
 }
 
 // ==================== v2 Polish 2：软换行 + 行偏移表（Bug 2）====================
@@ -24626,7 +24955,14 @@ function ovlScheduleLineOffsetRecompute(delay) {
         // 防抖到时间之后走分片版本（ovlRecomputeLineOffsetsChunked），不是上面那个同步全量版——
         // 这里是真正会跟用户"继续打字/继续拖"撞车的时机，必须不阻塞；见分片版本头部注释里
         // 记录的实测数据（1129ms 卡顿）。
-        ovlRecomputeLineOffsetsChunked(function (ok) { if (ok) ovlRenderGutter(true); });
+        ovlRecomputeLineOffsetsChunked(function (ok) {
+            if (ok) ovlRenderGutter(true);
+            // v2 Pass P37：拖分栏/敲字导致重新换行会让 Code 模式的黄色标记高亮画在旧行号
+            // 对应的旧像素位置上——行偏移表一重算完就补一次repaint，不管 ok 与否都试一次
+            // （即使行数没变化、表没重算，宽度变化也可能只影响 rows，ovlScheduleMarkOverlay
+            // 内部本来就是"没有激活的标记就是空操作"，多调一次零成本）。
+            if (typeof ovlScheduleMarkOverlay === 'function') ovlScheduleMarkOverlay();
+        });
     }, delay);
 }
 
@@ -26240,13 +26576,20 @@ function ovlFindSelectCurrent() {
         // 未聚焦的 textarea 上一样生效并显示灰底选中，Replace/ReplaceAll 需要 ta 焦点时
         // 会在各自的函数体里自己 focus。
         ta.setSelectionRange(r[0], r[1]);
-        // 把命中行滚进视口：v2 Polish 2（Bug 2）软换行下改用视觉行号 × 固定行高
-        // （ovlVisualRowForLineIndex，见该函数注释），不再是 line × 18 的旧假设。
-        const before = ta.value.slice(0, r[0]);
-        const line = before.split('\n').length - 1;
-        ta.scrollTop = Math.max(0, ovlVisualRowForLineIndex(line) * OVL_LINE_H - ta.clientHeight / 2);
-        const gutter = document.getElementById('ovlGutter');
-        if (gutter) gutter.scrollTop = ta.scrollTop;
+        // 把命中行滚进视口 + 黄色高亮：v2 Pass P37 起改用 ovlMarkLines（G3 基础设施）——自动
+        // 判断 Code/Visual、居中（不再是"贴顶+减半屏"这种只在 Code 模式下成立的旧算法，
+        // Visual 模式下 ta.scrollTop 根本不是 Visual 面板的滚动位置）、画黄色高亮。命中可能
+        // 跨行（正则匹配到换行符），lineTo 用匹配结束位置的行号，不只看起点那一行。
+        const lineFrom = ta.value.slice(0, r[0]).split('\n').length - 1;
+        const lineTo = ta.value.slice(0, r[1]).split('\n').length - 1;
+        if (typeof ovlMarkLines === 'function') {
+            ovlMarkLines(lineFrom, Math.max(lineFrom, lineTo), { source: 'find' });
+        } else {
+            // 兜底：ovlMarkLines 万一没定义（不该发生），至少保留旧的"贴顶滚动"不至于完全找不到。
+            ta.scrollTop = Math.max(0, ovlVisualRowForLineIndex(lineFrom) * OVL_LINE_H - ta.clientHeight / 2);
+            const gutter = document.getElementById('ovlGutter');
+            if (gutter) gutter.scrollTop = ta.scrollTop;
+        }
     } catch (e) { console.error('[ovl] findSelectCurrent failed', e); }
 }
 
@@ -28407,6 +28750,10 @@ function ovlBindShell() {
             });
             ta.addEventListener('scroll', function () {
                 if (gutter) gutter.scrollTop = ta.scrollTop;
+                // v2 Pass P37：Code 模式黄色标记高亮靠 ta.scrollTop 现算位置，textarea 自己
+                // 滚（不是父容器滚），必须单独跟这个既有 scroll 监听器搭车，不然标记会停在
+                // 原地不跟着卷。
+                if (typeof ovlScheduleMarkOverlay === 'function') ovlScheduleMarkOverlay();
             });
         }
 
@@ -29817,23 +30164,13 @@ async function ovlPdfHandleDblClick(ev, container) {
         }
         if (OvlState.viewMode === 'pdf') ovlSetViewMode('split'); // 编辑器面板得先可见，跳过去才看得见
         const lineIdx = Math.max(0, data.line - 1);
-        if (OvlState.editorMode === 'visual') {
-            ovlVisualScrollToLine(lineIdx);
-        } else {
-            ovlCodeScrollToLine(lineIdx);
-            // 顺手选中整行（跟 ovlLogJumpToLine 同一个习惯），双击后一眼能看出具体是哪一行，
-            // 不用只看到"卷到了大概那个位置"。
-            const ta = document.getElementById('ovlCodeArea');
-            if (ta && !ta.disabled) {
-                const lines = ta.value.split('\n');
-                const idx = Math.max(0, Math.min(lines.length - 1, lineIdx));
-                let start = 0;
-                for (let i = 0; i < idx; i++) start += lines[i].length + 1;
-                const end = start + (lines[idx] ? lines[idx].length : 0);
-                ta.focus();
-                ta.setSelectionRange(start, end);
-            }
-        }
+        // v2 Pass P37：反向 SyncTeX 跳转原来只对齐顶部、也没有任何高亮，用户反馈"点了看不出
+        // 跳到哪句话"——统一改用 ovlMarkLines（G3 基础设施）：自动判断 Code/Visual、居中、
+        // 黄色高亮，直到下一次跳转/Esc/发起新选区为止。不再手动 setSelectionRange 选中整行——
+        // 高亮框本身已经比灰底选区更显眼，且不会跟用户接下来自己拖选文字打架。
+        if (typeof ovlMarkLines === 'function') ovlMarkLines(lineIdx, lineIdx, { source: 'pdf-synctex' });
+        else if (OvlState.editorMode === 'visual') ovlVisualScrollToLine(lineIdx);
+        else ovlCodeScrollToLine(lineIdx);
         ovlFlashSaveStatus('已跳到源码第 ' + data.line + ' 行', false);
     } catch (e) {
         console.error('[ovl] pdf reverse syncTex failed', e);
@@ -29848,7 +30185,41 @@ async function ovlPdfHandleDblClick(ev, container) {
 function ovlBindPdfCanvasEvents() {
     const wrap = document.getElementById('ovlPdfCanvasWrap');
     if (!wrap) return;
+    // v2 Pass P37：单击也能触发反向 SyncTeX（用户反馈原来只有双击、单击点了没反应）。跟
+    // dblclick 复用同一个 ovlPdfHandleDblClick——它本身只认"这一次点击落在哪个坐标"，不关心
+    // 触发它的是单击还是双击。两个坑：
+    // 1) 防误触——用户在 PDF 上拖拽选文字，松手那一刻浏览器一样会派发 click。必须同时满足
+    //    "mousedown→mouseup 位移 < 5px" 且 "当前没有非空文本选区" 才当成跳转点击，否则每次
+    //    选完文字都会顺带跳一次源码，体验事故。
+    // 2) 去重——真实的双击序列是 mousedown/up/click ×2 再加一次 dblclick，四个事件挤在
+    //    很短时间内；不做去重的话双击会一次触发 3 次跳转（两次 click + 一次 dblclick）。
+    //    标准套路：click 命中时不立刻跳，排一个 250ms 的定时器；dblclick 触发时先把这个
+    //    定时器取消掉，改由 dblclick 自己直接跳一次——净效果单击 250ms 后跳一次，双击只跳
+    //    一次，都不多不少。
+    let pdfMouseDownPos = null;
+    let pdfClickTimer = null;
+    wrap.addEventListener('mousedown', function (ev) {
+        pdfMouseDownPos = { x: ev.clientX, y: ev.clientY };
+    });
+    wrap.addEventListener('click', function (ev) {
+        const container = ev.target.closest('.ovl-pdf-page');
+        const down = pdfMouseDownPos;
+        pdfMouseDownPos = null;
+        if (!container) return;
+        const moved = !down || Math.abs(ev.clientX - down.x) > 5 || Math.abs(ev.clientY - down.y) > 5;
+        if (moved) return; // 拖拽选字松手产生的 click，不是跳转点击
+        try {
+            const sel = ovlWinOf(container).getSelection();
+            if (sel && !sel.isCollapsed && String(sel).length > 0) return; // 有非空文本选区，同样当拖选处理
+        } catch (e) {}
+        if (pdfClickTimer) clearTimeout(pdfClickTimer);
+        pdfClickTimer = setTimeout(function () {
+            pdfClickTimer = null;
+            ovlPdfHandleDblClick(ev, container).catch(function (e) { console.error('[ovl] pdf click handler failed', e); });
+        }, 250);
+    });
     wrap.addEventListener('dblclick', function (ev) {
+        if (pdfClickTimer) { clearTimeout(pdfClickTimer); pdfClickTimer = null; }
         const container = ev.target.closest('.ovl-pdf-page');
         if (!container) return;
         ovlPdfHandleDblClick(ev, container).catch(function (e) { console.error('[ovl] pdf dblclick handler failed', e); });
@@ -31238,6 +31609,11 @@ function ovlRenderVisualGutter() {
         gutter.scrollTop = pane.scrollTop;
         ovlPaintGutterMarks();
         ovlScheduleVisualGutterAfterFonts(0);
+        // v2 Pass P37：OvlVisualBlockRects 刚刷新完，是重画黄色标记高亮的正确时机——覆盖
+        // "切模式进 Visual / 换文件 / 折叠导言区" 等所有会重跑 ovlRenderVisualGutter 的路径，
+        // 不用在每个调用点各自记得补一次。ovlScheduleMarkOverlay 内部会判断当前是不是
+        // Visual 模式、有没有激活的标记，没有就是空操作。
+        if (typeof ovlScheduleMarkOverlay === 'function') ovlScheduleMarkOverlay();
     } catch (e) { console.error('[ovl] renderVisualGutter failed', e); }
 }
 
@@ -32297,6 +32673,7 @@ function ovlBindPassD() {
         ovlBindVisualPane();
         ovlBindVisualTranslate(); // P4：需求 6，Visual 模式选中即译
         ovlBindVisualSelOverlay(); // Pass Sel-Outline：Visual 选区描边叠加层
+        ovlBindMarkOverlayClearOnSelect(); // v2 Pass P37：黄色标记高亮——Esc/新选区清空
 
         const syncTexBtn = document.getElementById('ovlSyncTexBtn');
         if (syncTexBtn) syncTexBtn.addEventListener('click', function () {
