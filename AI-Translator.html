@@ -1487,6 +1487,28 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 }
 .ovl-mode-toggle label.ovl-mode-active { background: #098842; color: #ffffff; }
 
+/* v2 Pass P38：Visual 语言切换（Original/Chinese）下拉触发按钮 + 懒翻译进度提示。
+   按钮外观照抄工具条其它 icon 按钮的尺寸手感，菜单本体复用 .ovl-layout-menu（见该规则）。 */
+.ovl-visual-lang-btn {
+    flex: 0 0 auto;
+    margin-left: 4px;
+    width: 20px; height: 22px;
+    border: none; border-radius: 4px;
+    background: transparent; color: #C7CCD6;
+    font-size: 10px; line-height: 1; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+}
+.ovl-visual-lang-btn:hover:not(:disabled) { background: #495365; }
+.ovl-visual-lang-btn:disabled { opacity: .35; cursor: not-allowed; }
+.ovl-visual-lang-btn.ovl-visual-lang-active { color: #4ade80; }
+.ovl-visual-lang-progress {
+    flex: 0 0 auto;
+    margin-left: 6px;
+    font-size: 11px;
+    color: #9AA4B2;
+    white-space: nowrap;
+}
+
 .ovl-editor-body {
     flex: 1 1 auto; min-height: 0; display: flex; overflow: hidden;
     /* v2 Pass P37：#ovlCodeMarkOverlay 是这个元素的绝对定位子节点，靠这个当 containing
@@ -22100,6 +22122,13 @@ function ovlShellHtml() {
         +           '<label data-mode="code" class="ovl-mode-active">Code</label>'
         +           '<label data-mode="visual">Visual</label>'
         +         '</div>'
+        // v2 Pass P38：Visual 显示语言切换（Original/Chinese）——紧贴在 Code/Visual 切换胶囊右侧
+        // 的一颗倒三角小按钮，点开下拉选 Original/Chinese。只在 Visual 模式下有意义，Code 模式
+        // 下置灰（ovlSetEditorMode 里同步 disabled，见约 23461 行附近）。进度提示紧跟在按钮右侧，
+        // 没有翻译在跑时用 hidden 隐藏，不占位置。
+        +         '<button type="button" class="ovl-visual-lang-btn" id="ovlVisualLangBtn" disabled'
+        +           ' data-tip="Visual 显示语言：Original / Chinese" data-tip-pos="bottom">&#9662;</button>'
+        +         '<span class="ovl-visual-lang-progress" id="ovlVisualLangProgress" hidden></span>'
         // M10 SyncTeX 正向（源码 -> PDF）：真跑 tools/latex-bridge 的 synctex.exe view 子命令
         // （§2.6.10）。没有编译产物时禁用。v2 Pass P16 起反向（PDF -> 源码）也做出来了——
         // 换了 pdf.js 渲染器之后双击 PDF 画布上的文字就能跳回源码那一行，见 ovlPdfHandleDblClick，
@@ -22217,6 +22246,14 @@ function ovlPortalHtml() {
         +   '<div class="ovl-layout-menu-item" data-view="split">Split view</div>'
         +   '<div class="ovl-layout-menu-item" data-view="editor">Editor only</div>'
         +   '<div class="ovl-layout-menu-item" data-view="pdf">PDF only</div>'
+        + '</div>'
+        // v2 Pass P38：Visual 语言下拉——外壳复用既有 .ovl-layout-menu/.ovl-layout-menu-item，
+        // 跟布局菜单同一套开合/外部点击关闭/Escape 关闭机制（ovlToggleVisualLangMenu 等，见
+        // ovlBindVisualLangMenu），不新起一套浮层机制。
+        + '<div class="ovl-layout-menu ovl-visual-lang-menu" id="ovlVisualLangMenu" hidden>'
+        +   '<div class="ovl-layout-menu-title">Visual 显示语言</div>'
+        +   '<div class="ovl-layout-menu-item ovl-active" data-lang="original">Original</div>'
+        +   '<div class="ovl-layout-menu-item" data-lang="zh">Chinese</div>'
         + '</div>'
         // 项目菜单（§2.6.1 项目标题 ▾）：内容固定，ovlBindProjectMenu 绑定。
         // 项目历史已挪到文件树头部「打开项目文件夹…」下面的独立按钮（#ovlProjectHistoryBtn），
@@ -23465,6 +23502,15 @@ function ovlSetEditorMode(mode) {
                 labels[i].classList.toggle('ovl-mode-active', labels[i].getAttribute('data-mode') === mode);
             }
         }
+        // v2 Pass P38：语言下拉按钮只在 Visual 模式下有意义，Code 模式置灰；离开 Visual 模式时
+        // 顺手取消掉还在飞的后台翻译请求（省额度——不在 Visual 模式看着，就没必要继续替它翻），
+        // pending 标记留在 DOM 上，下次切回 Visual 模式触发的 ovlVisualRender() 会重新渲染出
+        // 新的 pending 块，ovlVisualLangSyncAfterRender() 自动把调度器重新踢起来。
+        const langBtn = document.getElementById('ovlVisualLangBtn');
+        if (langBtn) langBtn.disabled = (mode !== 'visual');
+        if (mode !== 'visual' && fromMode === 'visual' && OvlVisualLangState.lang === 'zh') {
+            ovlVisualLangCancelInFlight();
+        }
         if (mode === 'visual') {
             if (ta) ta.style.display = 'none';
             // v2 Pass P11：gutter 不再隐藏——用户明确要 Visual 模式也有行号，而且要跟 Code
@@ -24010,6 +24056,118 @@ function ovlVisualLoadFigureThumbnails(root) {
 // raw 标记"（ovlSplitVisualBlocks 上面这段大注释开头就是这句话），落单的 \begin/\end
 // 一样是"原样保留"，不会报错也不会变得比现在更难看，反而换来了段落级别的行号和"关注"
 // 粒度。因此把"挡空行"的判断从"深度计数器 > 0"收窄成"数学专用环境的深度计数器 > 0"。
+// ==================== v2 Pass P38：Visual 语言切换（Original/Chinese）====================
+// 用户原话："在 visual 的按钮的右侧部分新增一个倒三角的小按钮……可以选择 original 或者
+// Chinese……当我点击 chinese 的时候，visual 模式下显示的全部的内容都会被翻译为中文然后在
+// visual 模式下显示……原本的 latex 格式的公式和变量不要被搞成乱码。"
+//
+// 【复用了什么，为什么没有直接调 translateViaSentinel】哨兵掩码/校验三件套——xportMask
+// （8183 行）/xportUnmask（8225 行）/xportBlockOk（8331 行）/xportNothingToTranslate
+// （8358 行）——原样复用，这正是全文翻译窗口用来"保住公式/引用不被翻烂"的那一套机制，
+// 数学环境表 XPORT_MATH_ENVS、不透明命令表 XPORT_OPAQUE_RE 已经覆盖 $...$/$$...$$/
+// \(...\)/\[...\]/equation 等数学环境/\ref/\cite/\label/\includegraphics/\url/\input/
+// \include，转义字符 \%\$\& 由 xportMask 逐字符扫描时原样跳过（8212-8218 行），不会被
+// 误当分隔符。translateViaSentinel 本身**没有**复用——它是"整篇文档、按 xportPack 分批、
+// 只对 provider==='local'/'gemini' 生效（xportActive 8347 行的白名单）"的编排层，这里要的
+// 形状是"单块、任意 provider 都要能翻、逐块可独立取消/重试"，硬套那层编排等于要在里面挖洞
+// 绕过 provider 白名单——掩码/校验这三个函数本身跟 provider 无关，原样拿来当底层原语用，
+// 编排逻辑（调度/缓存/取消/进度）在这里单独写一份，不是"平行发明一套保护机制"。
+//
+// 【成本控制】懒翻译（视口优先，其余低并发后台补齐）+ localStorage 缓存（键=源码哈希+
+// 语言+model，命中零请求）+ 可取消（AbortController）+ 中文进度提示，四点都是用户点名的
+// 硬要求（API 额度紧张）。
+
+// ---- 状态 ----
+// lang: 'original' | 'zh'；seq: 每次切换/取消都 ++，worker 循环拿旧 seq 的响应一律丢弃；
+// controller: 当前这一批后台翻译共用的 AbortSignal 来源；running: 调度器是不是已经在跑，
+// 避免同一时刻起两组并发 worker。
+const OvlVisualLangState = { lang: 'original', seq: 0, controller: null, running: false, total: 0, done: 0 };
+
+// ---- 缓存：源码块哈希 + 语言 + provider/model -> 译文 ----
+// 32 位 FNV-1a 起手 + 一个简单的第二哈希叠加，纯粹是为了在字符串很短时也不至于经常撞
+// （撞了的后果只是缓存误命中一次，下面还有 xportBlockOk 但缓存命中不再校验，所以尽量把
+// 碰撞率压低）；不追求密码学强度，这不是安全边界。
+function ovlVisualHashSrc(text) {
+    const s = String(text == null ? '' : text);
+    let h1 = 0x811c9dc5, h2 = 0x9dc5811c;
+    for (let i = 0; i < s.length; i++) {
+        const c = s.charCodeAt(i);
+        h1 ^= c; h1 = (h1 * 0x01000193) >>> 0;
+        h2 = (h2 + c) >>> 0; h2 ^= (h2 << 5); h2 = (h2 ^ (h2 >>> 7)) >>> 0;
+    }
+    return h1.toString(16) + '-' + h2.toString(16) + '-' + s.length.toString(16);
+}
+
+const OVL_VISUAL_TRANS_CACHE_KEY = 'ovlVisualTransCache_v1';
+const OVL_VISUAL_TRANS_CACHE_MAX = 500; // 上限 + 按最近使用时间淘汰，防止 localStorage 被撑爆
+
+function ovlVisualTransCacheLoad() {
+    try {
+        const raw = localStorage.getItem(OVL_VISUAL_TRANS_CACHE_KEY);
+        const parsed = raw ? JSON.parse(raw) : null;
+        return (parsed && typeof parsed === 'object') ? parsed : {};
+    } catch (e) { return {}; }
+}
+function ovlVisualTransCacheSave(map) {
+    try { localStorage.setItem(OVL_VISUAL_TRANS_CACHE_KEY, JSON.stringify(map)); }
+    catch (e) { /* 配额满/不可用就放弃这次写缓存，不影响翻译本身能不能用 */ }
+}
+function ovlVisualTransCacheKey(text, config) {
+    const provider = (config && config.provider) ? String(config.provider) : '';
+    const model = (config && config.model) ? String(config.model) : '';
+    return ovlVisualHashSrc(text) + '|zh|' + provider + '|' + model;
+}
+// 命中返回译文字符串，未命中返回 null。命中会顺手把 ts 刷新成"最近使用"，配合淘汰策略。
+function ovlVisualTransCacheGet(text, config) {
+    try {
+        const map = ovlVisualTransCacheLoad();
+        const key = ovlVisualTransCacheKey(text, config);
+        const hit = map[key];
+        if (hit && typeof hit.tgt === 'string') {
+            hit.ts = Date.now();
+            ovlVisualTransCacheSave(map);
+            return hit.tgt;
+        }
+    } catch (e) {}
+    return null;
+}
+function ovlVisualTransCachePut(text, config, tgt) {
+    try {
+        const map = ovlVisualTransCacheLoad();
+        const key = ovlVisualTransCacheKey(text, config);
+        map[key] = { tgt: tgt, ts: Date.now() };
+        const keys = Object.keys(map);
+        if (keys.length > OVL_VISUAL_TRANS_CACHE_MAX) {
+            keys.sort(function (a, b) { return (map[a].ts || 0) - (map[b].ts || 0); });
+            const drop = keys.length - OVL_VISUAL_TRANS_CACHE_MAX;
+            for (let i = 0; i < drop; i++) delete map[keys[i]];
+        }
+        ovlVisualTransCacheSave(map);
+    } catch (e) {}
+}
+
+// ---- 单块翻译：掩码 -> 调模型 -> 校验 -> 还原 ----
+// 契约：纯公式/纯注释块（掩码后没有可翻的字）原样返回，不占请求；校验不过直接 throw，
+// 调用方（ovlVisualLangRunQueue）负责把这一块标记失败、不写入缓存、不阻塞其它块。
+async function ovlVisualTranslateBlockText(text, config, signal) {
+    const src = String(text == null ? '' : text);
+    if (!src.trim()) return src;
+    const masked = xportMask(src);
+    if (xportNothingToTranslate(masked.text)) return src;
+    const prompt = '你是学术论文翻译助手，把下面的 LaTeX 片段翻译成简体中文学术书面语。硬性规则：\n'
+        + '1) 文本中所有形如 [[数字]] 的占位符必须原样保留在译文里、不得翻译、不得增删、不得改动方括号或数字——'
+        + '它们代表被抽走的公式/引用/命令，请把每一个都当成一个不可拆分的单词对待，直接嵌进对应的译文位置。\n'
+        + '2) 只输出翻译结果本身，不要添加任何解释、前后缀、引号或 Markdown 代码块标记。\n'
+        + '3) 保持原文的意思和语气，译成通顺准确的简体中文学术书面语。\n\n'
+        + '原文：\n' + masked.text;
+    const raw = await callModelPlainText(prompt, config, signal);
+    const body = (typeof raw === 'string') ? raw.trim() : '';
+    if (!xportBlockOk(body, masked.map)) {
+        throw new Error('翻译结果未通过完整性校验（占位符或公式被改动）');
+    }
+    return xportUnmask(body, masked.map);
+}
+
 const OVL_VISUAL_MATH_ATOMIC_ENV_RE = /^(equation|align|gather|multline|eqnarray|alignat|flalign|IEEEeqnarray|cases|dcases|rcases|matrix|pmatrix|bmatrix|vmatrix|Vmatrix|smallmatrix|array|split|subarray|CD)\*?$/;
 // v2 Overleaf 预览 Pass：table/algorithm/figure 三个 float 环境要跟数学环境一样"整段自成
 // 一块"——任务原话："a table/algorithm/figure should stay as one coherent block ... Reuse/
@@ -24190,6 +24348,19 @@ function ovlSplitVisualLines(blockText, blockStartLine) {
 //     那一整段；正文块打开断行开关后，区间收窄到 ovlSplitVisualLines 切出来的那个子块。
 //   data-para-start：1=段落起点（这个块自己或者它是某段的第一个子块），0=续行（同一段落
 //     接着上一个子块）。CSS 靠这个决定块间要不要留段间距，见 .ovl-visual-block 那组规则。
+// v2 Pass P38：一个块该渲染原文还是译文——lang!=='zh' 时逐字节沿用旧行为（原样渲染原文，
+// 保证"切回 Original 瞬时、不调模型"）；lang==='zh' 时先查缓存，命中直接渲译文，未命中就
+// 先渲原文占位（不留空白）并标 pending=true，交给 ovlVisualLangRunQueue() 后台补上。
+function ovlVisualRenderBlockContent(text) {
+    if (OvlVisualLangState.lang !== 'zh') return { html: ovlVisualRenderChunk(text), pending: false };
+    try {
+        const cfg = (typeof getApiConfig === 'function') ? getApiConfig() : null;
+        const cached = cfg ? ovlVisualTransCacheGet(text, cfg) : null;
+        if (cached != null) return { html: ovlVisualRenderChunk(cached), pending: false };
+    } catch (e) {}
+    return { html: ovlVisualRenderChunk(text), pending: true };
+}
+
 function ovlVisualRenderBodyWithLines(body, baseLine) {
     const blocks = ovlSplitVisualBlocks(body, baseLine);
     if (!blocks.length) return ovlVisualRenderChunk(body);
@@ -24203,14 +24374,18 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
         if (!subs || !subs.length) {
             // 原子块，或断行开关关掉/切不出子块（比如块只有一行）：整块渲染一个
             // .ovl-visual-block，永远是"段落起点"——跟旧行为（切分前）逐像素一致。
+            // data-src-line/data-src-line-end/data-para-start 三个属性逐字节不变——P37 的
+            // 黄色标记高亮、单击 PDF 跳转、查找跳转全靠它们，中文模式下也必须继续可用。
+            const rc = ovlVisualRenderBlockContent(b.text);
             html += '<div class="ovl-visual-block" data-src-line="' + b.line + '" data-src-line-end="' + blockLineEnd
-                + '" data-para-start="1">' + ovlVisualRenderChunk(b.text) + '</div>';
+                + '" data-para-start="1"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '') + '>' + rc.html + '</div>';
             continue;
         }
         for (let j = 0; j < subs.length; j++) {
             const sb = subs[j];
+            const rc = ovlVisualRenderBlockContent(sb.text);
             html += '<div class="ovl-visual-block" data-src-line="' + sb.line + '" data-src-line-end="' + sb.lineEnd
-                + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '">' + ovlVisualRenderChunk(sb.text) + '</div>';
+                + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '') + '>' + rc.html + '</div>';
         }
     }
     return html;
@@ -24287,12 +24462,198 @@ function ovlVisualRender() {
         // 不需要等 rAF/setTimeout。放在 innerHTML 赋值之后的最后一步，任何调用 ovlVisualRender
         // 的地方（切模式/换文件/折叠导言区）都自动带上正确的 gutter，不用每个调用点各自记得再调一次。
         if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
+        // v2 Pass P38：整篇重渲染之后，统计这次渲染里还有几块没翻译（data-ovl-trans-pending），
+        // 刷新进度提示，并在中文模式下把懒翻译调度器踢起来。
+        if (typeof ovlVisualLangSyncAfterRender === 'function') ovlVisualLangSyncAfterRender();
     } catch (e) {
         console.error('[ovl] visualRender failed', e);
         const pane = document.getElementById('ovlVisualPane');
         if (pane) { pane.innerHTML = '<div class="ovl-visual-empty">Visual 预览渲染失败，请切回 Code 模式查看源码。</div>'; ovlVisualSelOverlayReset(pane); }
         if (typeof ovlRenderVisualGutter === 'function') { try { ovlRenderVisualGutter(); } catch (e2) {} }
     }
+}
+
+// ==================== v2 Pass P38（续）：Visual 语言切换——调度器 + 下拉菜单绑定 ====================
+
+// 进度提示：没有中文翻译在跑（lang!=='zh'，或者已经全部翻完）就隐藏，不占位置。
+function ovlVisualLangProgressUpdate() {
+    const el = document.getElementById('ovlVisualLangProgress');
+    if (!el) return;
+    if (OvlVisualLangState.lang !== 'zh' || OvlVisualLangState.total <= 0 || OvlVisualLangState.done >= OvlVisualLangState.total) {
+        el.setAttribute('hidden', '');
+        el.textContent = '';
+        return;
+    }
+    el.textContent = '已翻 ' + OvlVisualLangState.done + '/' + OvlVisualLangState.total + ' 块';
+    el.removeAttribute('hidden');
+}
+
+// 取消当前这一批后台翻译：++seq 让所有 worker 的下一次循环检查判自己过期退出，同时真的
+// abort 掉正在飞的请求（用户点了切回 Original / 离开 Visual 模式时，飞在半路的模型请求
+// 也不该继续算钱）。不清 lang/total/done——那些由调用方（ovlVisualLangSetMode）决定要不要清。
+function ovlVisualLangCancelInFlight() {
+    OvlVisualLangState.seq++;
+    if (OvlVisualLangState.controller) {
+        try { OvlVisualLangState.controller.abort(); } catch (e) {}
+        OvlVisualLangState.controller = null;
+    }
+    OvlVisualLangState.running = false;
+}
+
+// 从块的 data-src-line/data-src-line-end 换算回 #ovlCodeArea 当前的真实源码——不缓存文本
+// 本身，每次都现从 textarea 切片，天然跟"源码块内容变了就重翻"这条要求对齐（哈希是按现取
+// 的文本算的，编辑过的块下次取到的就是新文本，缓存自动 miss）。
+function ovlVisualBlockSrcText(blockEl) {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta) return null;
+        const lo = parseInt(blockEl.getAttribute('data-src-line'), 10);
+        const hi = parseInt(blockEl.getAttribute('data-src-line-end'), 10);
+        if (!isFinite(lo) || !isFinite(hi)) return null;
+        const chars = ovlGutterLineRangeToChars(ta, lo, hi);
+        return ta.value.slice(chars.start, chars.end);
+    } catch (e) { return null; }
+}
+
+// 懒翻译取块顺序：视口内（含前后各一屏）优先，其余按文档顺序殿后——用户原话"先翻当前视口
+// 内（及前后各一屏）的块，其余在后台以低并发逐步补齐"。
+function ovlVisualLangCollectPending(pane) {
+    const all = Array.from(pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-pending="1"]'));
+    if (!all.length) return all;
+    let top = 0, bottom = 0;
+    try {
+        const r = pane.getBoundingClientRect();
+        top = r.top - pane.clientHeight;
+        bottom = r.bottom + pane.clientHeight;
+    } catch (e) { return all; }
+    const inView = [], outView = [];
+    all.forEach(function (el) {
+        let r;
+        try { r = el.getBoundingClientRect(); } catch (e) { outView.push(el); return; }
+        if (r.bottom >= top && r.top <= bottom) inView.push(el); else outView.push(el);
+    });
+    return inView.concat(outView);
+}
+
+// 后台调度器：最多 OVL_VISUAL_LANG_CONCURRENCY 个请求同时在飞（"低并发"），每个 worker
+// 是一个自驱动循环——每轮都重新从 DOM 里现取"还没翻译"的块列表（不是一次性排好队），
+// 这样中途新增的待翻块（比如就地编辑改了某一块之后又被标成 pending）会被自动捡起来，
+// 不需要单独一条"重新入队"的代码路径。JS 单线程：从"取队列头"到"摘掉它的 pending 标记"
+// 之间没有 await，不会有两个 worker 抢同一块的竞态。
+const OVL_VISUAL_LANG_CONCURRENCY = 3;
+async function ovlVisualLangRunQueue() {
+    if (OvlVisualLangState.running || OvlVisualLangState.lang !== 'zh') return;
+    const pane0 = document.getElementById('ovlVisualPane');
+    if (!pane0) return;
+    OvlVisualLangState.running = true;
+    const mySeq = OvlVisualLangState.seq;
+    const controller = new AbortController();
+    OvlVisualLangState.controller = controller;
+    let cfg;
+    try { cfg = getApiConfig(); } catch (e) { cfg = null; }
+
+    async function worker() {
+        for (;;) {
+            if (mySeq !== OvlVisualLangState.seq || controller.signal.aborted) return;
+            const pane = document.getElementById('ovlVisualPane');
+            if (!pane) return;
+            const queue = ovlVisualLangCollectPending(pane);
+            if (!queue.length) return;
+            const el = queue[0];
+            el.removeAttribute('data-ovl-trans-pending');
+            const text = ovlVisualBlockSrcText(el);
+            if (text == null || !text.trim()) continue;
+            try {
+                const tgt = await ovlVisualTranslateBlockText(text, cfg, controller.signal);
+                if (mySeq !== OvlVisualLangState.seq) return; // 陈旧响应（已切走/已取消），丢弃不落地
+                try { ovlVisualTransCachePut(text, cfg, tgt); } catch (e) {}
+                if (document.body.contains(el)) el.innerHTML = ovlVisualRenderChunk(tgt);
+                OvlVisualLangState.done++;
+            } catch (err) {
+                if (err && err.name === 'AbortError') return;
+                console.error('[ovl] visual block translate failed', err);
+                OvlVisualLangState.done++;
+                if (document.body.contains(el)) el.setAttribute('data-ovl-trans-failed', '1');
+            }
+            ovlVisualLangProgressUpdate();
+        }
+    }
+    const workers = [];
+    for (let i = 0; i < OVL_VISUAL_LANG_CONCURRENCY; i++) workers.push(worker());
+    try { await Promise.all(workers); } finally {
+        OvlVisualLangState.running = false;
+        if (OvlVisualLangState.controller === controller) OvlVisualLangState.controller = null;
+    }
+}
+
+// 整篇重渲染 / 就地编辑局部重渲染之后都要调一次：重新数一遍这次渲染里还剩几块没翻译，
+// 刷新进度条，中文模式下且有待翻块时把调度器踢起来（ovlVisualLangRunQueue 内部有
+// running 守卫，不会因为多处调用而并发起两组 worker）。
+function ovlVisualLangSyncAfterRender() {
+    if (OvlVisualLangState.lang !== 'zh') { ovlVisualLangProgressUpdate(); return; }
+    const pane = document.getElementById('ovlVisualPane');
+    if (!pane) return;
+    const total = pane.querySelectorAll('.ovl-visual-block').length;
+    const pending = pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-pending="1"]').length;
+    OvlVisualLangState.total = total;
+    OvlVisualLangState.done = total - pending;
+    ovlVisualLangProgressUpdate();
+    if (pending > 0) ovlVisualLangRunQueue();
+}
+
+// ---- 下拉菜单：开合/勾选态，外壳复用 .ovl-layout-menu（跟 ovlToggleLayoutMenu 同一套手法）----
+function ovlCloseVisualLangMenu() {
+    const menu = document.getElementById('ovlVisualLangMenu');
+    if (menu) menu.setAttribute('hidden', '');
+}
+function ovlToggleVisualLangMenu() {
+    if (OvlState.editorMode !== 'visual') return; // 只在 Visual 模式下有意义，Code 模式按钮本身也是 disabled
+    const menu = document.getElementById('ovlVisualLangMenu');
+    const btn = document.getElementById('ovlVisualLangBtn');
+    if (!menu || !btn) return;
+    const willOpen = menu.hasAttribute('hidden');
+    if (!willOpen) { ovlCloseVisualLangMenu(); return; }
+    const r = btn.getBoundingClientRect();
+    menu.style.top = (r.bottom + 4) + 'px';
+    menu.style.left = r.left + 'px';
+    menu.removeAttribute('hidden');
+}
+function ovlVisualLangUpdateMenuUI() {
+    const menu = document.getElementById('ovlVisualLangMenu');
+    if (menu) {
+        const items = menu.querySelectorAll('.ovl-layout-menu-item[data-lang]');
+        for (let i = 0; i < items.length; i++) {
+            items[i].classList.toggle('ovl-active', items[i].getAttribute('data-lang') === OvlVisualLangState.lang);
+        }
+    }
+    const btn = document.getElementById('ovlVisualLangBtn');
+    if (btn) btn.classList.toggle('ovl-visual-lang-active', OvlVisualLangState.lang === 'zh');
+}
+
+// 唯一入口：切换 Visual 显示语言。切回 Original 是纯同步的重渲染（ovlVisualRenderBlockContent
+// 在 lang!=='zh' 时从不查缓存也不调模型），瞬时生效；切到 Chinese 会先用缓存把能命中的块
+// 立刻渲出来，未命中的留占位 + 触发后台懒翻译。
+function ovlVisualLangSetMode(lang) {
+    if (lang !== 'original' && lang !== 'zh') return;
+    ovlCloseVisualLangMenu();
+    if (OvlVisualLangState.lang === lang) return;
+    ovlVisualLangCancelInFlight();
+    OvlVisualLangState.lang = lang;
+    OvlVisualLangState.total = 0;
+    OvlVisualLangState.done = 0;
+    ovlVisualLangUpdateMenuUI();
+    if (typeof ovlVisualRender === 'function') ovlVisualRender();
+}
+
+function ovlBindVisualLangMenu() {
+    const btn = document.getElementById('ovlVisualLangBtn');
+    if (btn) btn.addEventListener('click', function (e) { e.stopPropagation(); ovlToggleVisualLangMenu(); });
+    const menu = document.getElementById('ovlVisualLangMenu');
+    if (menu) menu.addEventListener('click', function (e) {
+        const item = e.target.closest('.ovl-layout-menu-item[data-lang]');
+        if (!item) return;
+        ovlVisualLangSetMode(item.getAttribute('data-lang'));
+    });
 }
 
 // 折叠横条点击：委托绑定在 #ovlVisualPane 上（面板整个是动态内容，不用逐条重新 addEventListener）。
@@ -28706,12 +29067,18 @@ function ovlBindShell() {
         document.addEventListener('click', function (e) {
             const menu = document.getElementById('ovlLayoutMenu');
             const btn = document.getElementById('ovlLayoutBtn');
-            if (!menu || menu.hasAttribute('hidden')) return;
-            if (menu.contains(e.target) || (btn && btn.contains(e.target))) return;
-            ovlCloseLayoutMenu();
+            if (menu && !menu.hasAttribute('hidden') && !menu.contains(e.target) && !(btn && btn.contains(e.target))) {
+                ovlCloseLayoutMenu();
+            }
+            // v2 Pass P38：Visual 语言下拉同一套外部点击关闭手法，独立判定、不影响上面那个菜单。
+            const langMenu = document.getElementById('ovlVisualLangMenu');
+            const langBtn = document.getElementById('ovlVisualLangBtn');
+            if (langMenu && !langMenu.hasAttribute('hidden') && !langMenu.contains(e.target) && !(langBtn && langBtn.contains(e.target))) {
+                ovlCloseVisualLangMenu();
+            }
         });
         document.addEventListener('keydown', function (e) {
-            if (e.key === 'Escape') ovlCloseLayoutMenu();
+            if (e.key === 'Escape') { ovlCloseLayoutMenu(); ovlCloseVisualLangMenu(); }
         });
 
         const modeToggle = document.getElementById('ovlModeToggle');
@@ -28722,6 +29089,7 @@ function ovlBindShell() {
                 ovlSetEditorMode(label.getAttribute('data-mode'));
             });
         }
+        if (typeof ovlBindVisualLangMenu === 'function') ovlBindVisualLangMenu();
 
         const ta = document.getElementById('ovlCodeArea');
         const gutter = document.getElementById('ovlGutter');
@@ -31051,6 +31419,10 @@ function ovlInlineSrcRerenderLocal(st, newText) {
         const pane = document.getElementById('ovlVisualPane');
         if (pane && typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(pane);
         if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
+        // v2 Pass P38：就地编辑保存后，被改过的这一块源码哈希变了——ovlVisualRenderBodyWithLines
+        // 重新渲染出来的新块如果落在中文模式下会自动带 data-ovl-trans-pending（缓存按内容哈希，
+        // 编辑过的文本天然 miss），这里补一次同步把调度器踢起来翻这一块；没改过的块不受影响。
+        if (typeof ovlVisualLangSyncAfterRender === 'function') ovlVisualLangSyncAfterRender();
     } catch (e) {
         console.error('[ovl] inlineSrcRerenderLocal failed, falling back to full re-render', e);
         try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e2) {}
@@ -31279,6 +31651,18 @@ function ovlShowQuickActionsAt(x, y, source) {
             ? ('选中超过 ' + OVL_TRANS_MAX_CHARS + ' 字，翻译不可用；选少几行再试')
             : '翻译成中文');
     }
+    // v2 Pass P38：Visual 中文预览模式下，渲染文字跟源码不再逐字对应，ovlLocateVisualPick 的
+    // "唯一命中"判定会几乎必然落空——「替/简/语」三颗按钮在这个模式下置灰 + 换一句中文提示，
+    // 不是留着让它们悄悄报错/改错位置（ovlLocateVisualPick 本身不动，这里只是 UI 层的锁）。
+    const zhLocked = (OvlQaState.source === 'visual' && OvlVisualLangState.lang === 'zh');
+    const ZH_LOCK_TIP = '中文预览模式下译文与源码不再逐字对应，无法自动定位替换位置。请切回 Original 或到 Code 模式操作。';
+    ['word.replace', 'word.simplify', 'word.grammar'].forEach(function (qid) {
+        const b = qa.querySelector('[data-qa="' + qid + '"]');
+        if (!b) return;
+        b.classList.toggle('ovl-qa-off', zhLocked);
+        if (zhLocked) b.setAttribute('data-tip', ZH_LOCK_TIP);
+        else b.setAttribute('data-tip', qid === 'word.replace' ? '替换' : (qid === 'word.simplify' ? '简化' : '语法修正'));
+    });
     // v2 Pass P8（§1.6 第 8 条 + §3.9）：定点刷新「关注」复选框的勾选态。不能指望
     // focusSyncCheckboxes 的唯一调用点（syncSelectionHighlightLayers 内部）一定会跑到——
     // 那个函数开头有两条提前 return，在 v2 外壳里经常一次都不经过；这里每次弹出工具条都
@@ -31334,10 +31718,18 @@ function ovlBindQuickActions() {
     }
     if (qa) qa.addEventListener('click', function (e) {
         const btn = e.target.closest('[data-qa]');
-        // v2 Pass P7（§2.8）：置灰守卫纳入既有的 disabled 检查，不另起一套。
-        if (!btn || btn.disabled || btn.classList.contains('ovl-qa-off')) return;
+        if (!btn) return;
         const id = btn.getAttribute('data-qa');
         const src = OvlQaState.source || 'code';
+        // v2 Pass P38：Visual 中文预览模式下点「替/简/语」不能悄悄没反应——显式 toast 说明原因，
+        // 再 return（ovlLocateVisualPick 本身不碰，只是不让调用方走到它跟前）。
+        if (src === 'visual' && OvlVisualLangState.lang === 'zh'
+            && (id === 'word.replace' || id === 'word.simplify' || id === 'word.grammar')) {
+            try { showToast('中文预览模式下译文与源码不再逐字对应，无法自动定位替换。请切回 Original 或到 Code 模式操作。', 'warning'); } catch (e2) {}
+            return;
+        }
+        // v2 Pass P7（§2.8）：置灰守卫纳入既有的 disabled 检查，不另起一套。
+        if (btn.disabled || btn.classList.contains('ovl-qa-off')) return;
         if (id === 'word.replace' || id === 'word.simplify' || id === 'word.grammar') {
             ovlEditorSynonymOpen(id.slice(5), src);
         } else if (id === 'word.translate') {
