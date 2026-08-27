@@ -48,7 +48,9 @@ let WebSocket = null;
 try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化处的兜底说明 */ }
 
 const HOST = '127.0.0.1';
-const PORT = 8181;
+// LATEX_BRIDGE_PORT 仅供测试用（起在别的空闲端口上，绝不占用用户真实在跑的 8181）：
+// 不传时行为跟以前完全一样，还是硬编码 8181。
+const PORT = process.env.LATEX_BRIDGE_PORT ? parseInt(process.env.LATEX_BRIDGE_PORT, 10) : 8181;
 
 // TeX Live 路径（规划 §1.4 实测）。允许用 LATEX_BRIDGE_TEXBIN 环境变量覆盖，方便别的机器上跑。
 const TEXBIN = process.env.LATEX_BRIDGE_TEXBIN || 'E:\\texlive\\2025\\bin\\windows';
@@ -1361,6 +1363,250 @@ async function doOverleafClone(projectId, token) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// v2 Pass P40：/fs/* —— 受限文件操作端点，服务"AI 聊天窗当 agent 操纵项目文件树"这个
+// 需求（协助移动/复制/修改/删除任意文件，并借项目自己的 git 提供误操作回退）。
+//
+// 安全护栏（跟 /overleaf/* 那段头部注释同一个纪律：宁可拒绝也不猜测覆盖）：
+//   1. 路径必须严格限制在调用方传入的 projectDir 内。resolveInProject() 先按字符串
+//      resolve+前缀比对拦一轮，再对"路径链上第一个真实存在的祖先目录"做一次 realpath
+//      展开、拿展开后的真实路径再比一次前缀——防的是 base 内部藏了个指向 base 之外的
+//      符号链接/junction（纯字符串前缀比对看不出这种绕法，见任务里点名的攻击向量）。
+//   2. 任何落在 .git/ 内部的路径（按路径分段精确匹配 ".git"，不是子串匹配，避免
+//      "xxx.gitignore" 这种正常文件被误伤）一律拒绝读写删除。
+//   3. write/mkdir/move/copy/delete 五个改变文件系统的操作，动手前都先调用
+//      fsGitCheckpoint() 打一个检查点：projectDir 是 git 工作树就
+//      `git add -A -- .` + `git commit`（pathspec 限定在 projectDir 自己这棵子树，
+//      不会因为 projectDir 恰好是某个更大仓库的子目录就把仓库其它地方的在途改动一并
+//      扫进这次的检查点提交）把"这次操作之前"的完整现场落成一个提交，返回它的
+//      commit hash 给前端展示"可回退到 X"；不是 git 工作树就明确 available:false
+//      + 中文 warning，绝不装作有回退保障。
+//   4. move/delete 的响应里带 affected：受影响的完整相对路径清单（目录会展开成
+//      它下面全部文件的清单，不只报目录名）。
+//   5. 所有失败路径统一走 sendJson({ok:false, error:'中文错误'})，不会把未捕获异常
+//      直接摔成 500 堆栈——顶层路由的 try/catch 只是最后一道保险，各 do* 函数自己也是
+//      "不抛异常、统统汇总成 {ok,...} 返回" 的既有风格（镜像 runGitCommand 的写法）。
+//   6. 长操作走已有的 runGitCommand() 超时机制（30s），不新起一套超时逻辑。
+// ---------------------------------------------------------------------------
+
+const FS_READ_MAX_BYTES = 1024 * 1024; // 1MB：读文件硬上限，见任务要求。
+const FS_GIT_TIMEOUT_MS = 30000;
+
+function fsRealpath(p) {
+    try { return fs.realpathSync.native ? fs.realpathSync.native(p) : fs.realpathSync(p); }
+    catch (e) { return null; }
+}
+
+// 把 relPath 解析到 projectDir 内部的绝对路径，做双重防越界校验（字符串前缀 + realpath
+// 展开后再比一次前缀），并拒绝任何落在 .git/ 内部的路径。校验不过一律返回 {ok:false}，
+// 绝不静默放行——调用方按 r.ok 分流，成功时 r.resolved 是可以直接拿去用的绝对路径。
+function resolveInProject(projectDir, relPath) {
+    if (typeof projectDir !== 'string' || !projectDir) return { ok: false, error: 'projectDir 缺失' };
+    if (typeof relPath !== 'string' || !relPath) return { ok: false, error: 'path 缺失' };
+    let base;
+    try { base = path.resolve(projectDir); } catch (e) { return { ok: false, error: 'projectDir 无效' }; }
+    if (!fs.existsSync(base) || !fs.statSync(base).isDirectory()) {
+        return { ok: false, error: 'projectDir 不存在或不是目录: ' + projectDir };
+    }
+    const realBase = fsRealpath(base);
+    if (!realBase) return { ok: false, error: 'projectDir 无法解析真实路径' };
+
+    let resolved;
+    try { resolved = path.resolve(base, relPath); } catch (e) { return { ok: false, error: 'path 无效' }; }
+    const baseWithSep = base.endsWith(path.sep) ? base : base + path.sep;
+    if (resolved !== base && resolved.indexOf(baseWithSep) !== 0) {
+        return { ok: false, error: 'path 跑出项目目录范围，拒绝' };
+    }
+
+    const relForCheck = path.relative(base, resolved);
+    const segments = relForCheck.split(path.sep).filter((s) => s.length > 0);
+    if (segments.indexOf('.git') !== -1) {
+        return { ok: false, error: '拒绝访问 .git 内部路径' };
+    }
+
+    // realpath 二次校验：找路径链上第一个真实存在的祖先（目标本身可能还不存在，比如
+    // write/mkdir 的目标），展开它的真实路径，再跟 realBase 比一次前缀——防 base 内部
+    // 有符号链接/junction 指向 base 之外（纯字符串比对看不出这种绕法）。
+    let probe = resolved;
+    while (!fs.existsSync(probe)) {
+        const parent = path.dirname(probe);
+        if (parent === probe) { probe = null; break; }
+        probe = parent;
+    }
+    if (probe) {
+        const realProbe = fsRealpath(probe);
+        if (!realProbe) return { ok: false, error: '路径解析失败' };
+        const realBaseWithSep = realBase.endsWith(path.sep) ? realBase : realBase + path.sep;
+        if (realProbe !== realBase && realProbe.indexOf(realBaseWithSep) !== 0) {
+            return { ok: false, error: 'path 通过符号链接/junction 跑出项目目录范围，拒绝' };
+        }
+    }
+
+    return { ok: true, resolved: resolved, base: base };
+}
+
+// 收集"实际受影响的完整路径清单"（相对 base）：单个文件就是它自己，目录就展开成它
+// 下面全部文件（跳过 .git），供 move/delete 的响应用，方便前端在执行前后展示确切影响面。
+function collectAffectedRelPaths(base, absPath) {
+    let st;
+    try { st = fs.statSync(absPath); } catch (e) { return []; }
+    if (!st.isDirectory()) return [path.relative(base, absPath)];
+    const out = [];
+    (function walk(dir) {
+        let names;
+        try { names = fs.readdirSync(dir); } catch (e) { return; }
+        names.forEach((name) => {
+            if (name === '.git') return;
+            const full = path.join(dir, name);
+            let s;
+            try { s = fs.statSync(full); } catch (e) { return; }
+            if (s.isDirectory()) walk(full); else out.push(path.relative(base, full));
+        });
+    })(absPath);
+    return out;
+}
+
+function looksBinary(buf) {
+    const len = Math.min(buf.length, 8000);
+    for (let i = 0; i < len; i++) { if (buf[i] === 0) return true; }
+    return false;
+}
+
+// 改变文件系统前打的自动 git 检查点。projectDir 不是 git 工作树 -> available:false +
+// 中文 warning，绝不装作能回退。是工作树但当前没有任何改动可提交 -> 检查点就是现有
+// HEAD（created:false）。有改动 -> `git add -A -- .`（pathspec 限定在这棵子树）+ commit，
+// 检查点是新提交的 hash（created:true）。
+async function fsGitCheckpoint(projectDir, label) {
+    const treeCheck = await runGitCommand(['rev-parse', '--is-inside-work-tree'], projectDir, null, FS_GIT_TIMEOUT_MS);
+    if (!treeCheck.ok || treeCheck.stdout.trim() !== 'true') {
+        return { available: false, checkpoint: null, warning: '该目录不是 git 仓库（或不在 git 工作树内），本次操作无法提供回退保障。' };
+    }
+    const addResult = await runGitCommand(['add', '-A', '--', '.'], projectDir, null, FS_GIT_TIMEOUT_MS);
+    if (!addResult.ok) {
+        return { available: true, checkpoint: null, warning: '生成回退检查点失败（git add）：' + (addResult.stderr || addResult.stdout || '未知错误') };
+    }
+    const diffResult = await runGitCommand(['diff', '--cached', '--quiet'], projectDir, null, FS_GIT_TIMEOUT_MS);
+    if (diffResult.code === 0) {
+        const headResult = await runGitCommand(['rev-parse', 'HEAD'], projectDir, null, FS_GIT_TIMEOUT_MS);
+        if (!headResult.ok) {
+            return { available: true, checkpoint: null, warning: '仓库尚无任何提交，且当前也没有改动可提交，无法生成回退检查点。' };
+        }
+        return { available: true, checkpoint: headResult.stdout.trim(), created: false };
+    }
+    const commitMsg = 'AI-Translator fs checkpoint: ' + label + ' ' + new Date().toISOString();
+    const commitResult = await runGitCommand(['commit', '-m', commitMsg], projectDir, null, FS_GIT_TIMEOUT_MS);
+    if (!commitResult.ok) {
+        return { available: true, checkpoint: null, warning: '生成回退检查点失败（git commit）：' + (commitResult.stderr || commitResult.stdout || '未知错误') };
+    }
+    const headResult2 = await runGitCommand(['rev-parse', 'HEAD'], projectDir, null, FS_GIT_TIMEOUT_MS);
+    return { available: true, checkpoint: headResult2.ok ? headResult2.stdout.trim() : null, created: true };
+}
+
+function checkpointFields(cp) {
+    return { checkpoint: cp.checkpoint, checkpointAvailable: cp.available, checkpointWarning: cp.warning || null };
+}
+
+async function doFsList(projectDir, relPath) {
+    const r = resolveInProject(projectDir, relPath || '.');
+    if (!r.ok) return { ok: false, error: r.error };
+    let st;
+    try { st = fs.statSync(r.resolved); } catch (e) { return { ok: false, error: '路径不存在: ' + relPath }; }
+    if (!st.isDirectory()) return { ok: false, error: '不是目录: ' + relPath };
+    let names;
+    try { names = fs.readdirSync(r.resolved); } catch (e) { return { ok: false, error: '读取目录失败: ' + e.message }; }
+    const entries = [];
+    names.forEach((name) => {
+        if (name === '.git') return; // .git 内部一律不列出
+        const full = path.join(r.resolved, name);
+        let s;
+        try { s = fs.statSync(full); } catch (e) { return; }
+        entries.push({ name: name, isDir: s.isDirectory(), size: s.isDirectory() ? null : s.size, mtimeMs: s.mtimeMs });
+    });
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    return { ok: true, path: relPath, entries: entries };
+}
+
+async function doFsRead(projectDir, relPath) {
+    const r = resolveInProject(projectDir, relPath);
+    if (!r.ok) return { ok: false, error: r.error };
+    let st;
+    try { st = fs.statSync(r.resolved); } catch (e) { return { ok: false, error: '文件不存在: ' + relPath }; }
+    if (!st.isFile()) return { ok: false, error: '不是文件: ' + relPath };
+    if (st.size > FS_READ_MAX_BYTES) {
+        return { ok: false, error: '文件过大（' + st.size + ' 字节 > ' + FS_READ_MAX_BYTES + ' 字节上限），拒绝读取', size: st.size, tooLarge: true };
+    }
+    let buf;
+    try { buf = fs.readFileSync(r.resolved); } catch (e) { return { ok: false, error: '读取失败: ' + e.message }; }
+    if (looksBinary(buf)) {
+        return { ok: true, path: relPath, size: st.size, binary: true, content: null, mtimeMs: st.mtimeMs };
+    }
+    return { ok: true, path: relPath, size: st.size, binary: false, content: buf.toString('utf8'), mtimeMs: st.mtimeMs };
+}
+
+async function doFsWrite(projectDir, relPath, content) {
+    const r = resolveInProject(projectDir, relPath);
+    if (!r.ok) return { ok: false, error: r.error };
+    if (typeof content !== 'string') return { ok: false, error: 'content 必须是字符串' };
+    const cp = await fsGitCheckpoint(projectDir, 'write ' + relPath);
+    try { fs.mkdirSync(path.dirname(r.resolved), { recursive: true }); }
+    catch (e) { return Object.assign({ ok: false, error: '创建父目录失败: ' + e.message }, checkpointFields(cp)); }
+    try { fs.writeFileSync(r.resolved, content, 'utf8'); }
+    catch (e) { return Object.assign({ ok: false, error: '写入失败: ' + e.message }, checkpointFields(cp)); }
+    return Object.assign({ ok: true, path: relPath, bytesWritten: Buffer.byteLength(content, 'utf8') }, checkpointFields(cp));
+}
+
+async function doFsMkdir(projectDir, relPath) {
+    const r = resolveInProject(projectDir, relPath);
+    if (!r.ok) return { ok: false, error: r.error };
+    const cp = await fsGitCheckpoint(projectDir, 'mkdir ' + relPath);
+    try { fs.mkdirSync(r.resolved, { recursive: true }); }
+    catch (e) { return Object.assign({ ok: false, error: '建目录失败: ' + e.message }, checkpointFields(cp)); }
+    return Object.assign({ ok: true, path: relPath }, checkpointFields(cp));
+}
+
+async function doFsMove(projectDir, fromRel, toRel) {
+    const rf = resolveInProject(projectDir, fromRel);
+    if (!rf.ok) return { ok: false, error: '来源路径: ' + rf.error };
+    const rt = resolveInProject(projectDir, toRel);
+    if (!rt.ok) return { ok: false, error: '目标路径: ' + rt.error };
+    if (!fs.existsSync(rf.resolved)) return { ok: false, error: '来源不存在: ' + fromRel };
+    if (fs.existsSync(rt.resolved)) return { ok: false, error: '目标已存在，拒绝覆盖: ' + toRel };
+    const affected = collectAffectedRelPaths(rf.base, rf.resolved);
+    const cp = await fsGitCheckpoint(projectDir, 'move ' + fromRel + ' -> ' + toRel);
+    try { fs.mkdirSync(path.dirname(rt.resolved), { recursive: true }); } catch (e) { /* 后面 rename 会自己报错 */ }
+    try { fs.renameSync(rf.resolved, rt.resolved); }
+    catch (e) { return Object.assign({ ok: false, error: '移动失败: ' + e.message }, checkpointFields(cp)); }
+    return Object.assign({ ok: true, from: fromRel, to: toRel, affected: affected }, checkpointFields(cp));
+}
+
+async function doFsCopy(projectDir, fromRel, toRel) {
+    const rf = resolveInProject(projectDir, fromRel);
+    if (!rf.ok) return { ok: false, error: '来源路径: ' + rf.error };
+    const rt = resolveInProject(projectDir, toRel);
+    if (!rt.ok) return { ok: false, error: '目标路径: ' + rt.error };
+    if (!fs.existsSync(rf.resolved)) return { ok: false, error: '来源不存在: ' + fromRel };
+    if (fs.existsSync(rt.resolved)) return { ok: false, error: '目标已存在，拒绝覆盖: ' + toRel };
+    const cp = await fsGitCheckpoint(projectDir, 'copy ' + fromRel + ' -> ' + toRel);
+    try { fs.mkdirSync(path.dirname(rt.resolved), { recursive: true }); }
+    catch (e) { return Object.assign({ ok: false, error: '创建目标父目录失败: ' + e.message }, checkpointFields(cp)); }
+    try { fs.cpSync(rf.resolved, rt.resolved, { recursive: true, errorOnExist: true }); }
+    catch (e) { return Object.assign({ ok: false, error: '复制失败: ' + e.message }, checkpointFields(cp)); }
+    const affected = collectAffectedRelPaths(rt.base, rt.resolved);
+    return Object.assign({ ok: true, from: fromRel, to: toRel, affected: affected }, checkpointFields(cp));
+}
+
+async function doFsDelete(projectDir, relPath) {
+    const r = resolveInProject(projectDir, relPath);
+    if (!r.ok) return { ok: false, error: r.error };
+    if (!fs.existsSync(r.resolved)) return { ok: false, error: '路径不存在: ' + relPath };
+    if (r.resolved === r.base) return { ok: false, error: '拒绝删除项目根目录本身' };
+    const affected = collectAffectedRelPaths(r.base, r.resolved);
+    const cp = await fsGitCheckpoint(projectDir, 'delete ' + relPath);
+    try { fs.rmSync(r.resolved, { recursive: true, force: false }); }
+    catch (e) { return Object.assign({ ok: false, error: '删除失败: ' + e.message }, checkpointFields(cp)); }
+    return Object.assign({ ok: true, path: relPath, affected: affected }, checkpointFields(cp));
+}
+
 // 只用于 /overleaf/* 这三个能动用户真实 git 仓库的路由：拒绝来自任意网页的跨域驱动。
 // 浏览器发起跨域 fetch 时一定会带 Origin 头且不可伪造，所以白名单足以挡住恶意页面；
 // 没有 Origin 头的（curl / node 脚本 / 本地测试）放行，因为那本来就不是这条攻击链。
@@ -1401,7 +1647,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone. WebSocket on same host:port for disk-change push.');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete. WebSocket on same host:port for disk-change push.');
             return;
         }
 
@@ -1609,6 +1855,68 @@ const server = http.createServer(async (req, res) => {
             } catch (e) {}
             sendJson(res, 200, { ok: true, clearedAll: true });
             return;
+        }
+
+        // v2 Pass P40：/fs/* 受限文件操作端点——见 resolveInProject/fsGitCheckpoint 头部注释。
+        // 跟 /overleaf/* 同样能真的改写用户磁盘上的文件，复用同一条跨域白名单纪律。
+        if (req.method === 'POST' && (pathname === '/fs/list' || pathname === '/fs/read' || pathname === '/fs/mkdir'
+            || pathname === '/fs/write' || pathname === '/fs/move' || pathname === '/fs/copy' || pathname === '/fs/delete')) {
+            if (!ovlOriginAllowed(req)) {
+                sendJson(res, 403, { ok: false, error: '拒绝来自外部网页的文件操作请求。这些接口只接受 AI-Translator 页面本身的调用。' });
+                return;
+            }
+            const bodyText = await readBody(req);
+            let body;
+            try { body = JSON.parse(bodyText || '{}'); } catch (e) {
+                sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
+                return;
+            }
+            const projectDir = body.projectDir;
+            if (!projectDir || typeof projectDir !== 'string') {
+                sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' });
+                return;
+            }
+
+            if (pathname === '/fs/list') {
+                sendJson(res, 200, await doFsList(projectDir, body.path));
+                return;
+            }
+            if (pathname === '/fs/read') {
+                if (!body.path || typeof body.path !== 'string') { sendJson(res, 400, { ok: false, error: 'path is required' }); return; }
+                sendJson(res, 200, await doFsRead(projectDir, body.path));
+                return;
+            }
+            if (pathname === '/fs/mkdir') {
+                if (!body.path || typeof body.path !== 'string') { sendJson(res, 400, { ok: false, error: 'path is required' }); return; }
+                sendJson(res, 200, await doFsMkdir(projectDir, body.path));
+                return;
+            }
+            if (pathname === '/fs/write') {
+                if (!body.path || typeof body.path !== 'string') { sendJson(res, 400, { ok: false, error: 'path is required' }); return; }
+                sendJson(res, 200, await doFsWrite(projectDir, body.path, body.content));
+                return;
+            }
+            if (pathname === '/fs/move') {
+                if (!body.from || !body.to || typeof body.from !== 'string' || typeof body.to !== 'string') {
+                    sendJson(res, 400, { ok: false, error: 'from 和 to 都是必填字符串' });
+                    return;
+                }
+                sendJson(res, 200, await doFsMove(projectDir, body.from, body.to));
+                return;
+            }
+            if (pathname === '/fs/copy') {
+                if (!body.from || !body.to || typeof body.from !== 'string' || typeof body.to !== 'string') {
+                    sendJson(res, 400, { ok: false, error: 'from 和 to 都是必填字符串' });
+                    return;
+                }
+                sendJson(res, 200, await doFsCopy(projectDir, body.from, body.to));
+                return;
+            }
+            if (pathname === '/fs/delete') {
+                if (!body.path || typeof body.path !== 'string') { sendJson(res, 400, { ok: false, error: 'path is required' }); return; }
+                sendJson(res, 200, await doFsDelete(projectDir, body.path));
+                return;
+            }
         }
 
         // v2 Pass P24：Overleaf git 集成——见 doOverleafPull 头部注释的安全设计 + 分支逻辑。
