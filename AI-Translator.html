@@ -966,6 +966,9 @@ body.is-resizing-settings-modal * {
     overflow-y: auto;
 }
 
+/* v2 Pass P43：写操作结果行下面的「一键回退」按钮——复用 .aichat-btn，只加个上边距。 */
+#aiChatRoot .aichat-tool-rollback-wrap { margin-top: 6px; }
+
 /* 助手气泡下面那排小动作（目前只有「复制答案」）。刻意低对比：它是辅助，不是主角。 */
 #aiChatRoot .aichat-msgacts { display: flex; gap: 6px; margin-top: 6px; }
 #aiChatRoot .aichat-msgacts .aichat-minibtn { font-size: 9px; padding: 1px 7px; }
@@ -18262,7 +18265,12 @@ const CHAT_AGENT_MAX_ITERS = 8;
 const CHAT_AGENT_TOTAL_READ_BUDGET = 300 * 1024;      // 这一整轮（可能好几次工具调用）的累计读取预算
 const CHAT_AGENT_SINGLE_READ_MAX_LINES = 2000;        // 没给行区间时，单次 read_file 最多注入这么多行
 const CHAT_AGENT_SINGLE_READ_MAX_BYTES = 200 * 1024;  // 同上，字节上限（两条谁先触发都截）
-const CHAT_AGENT_TOOLS = ['list_dir', 'read_file'];
+// v2 Pass P43：只读两个工具之外，补上 write_file/mkdir/move/copy/delete 五个写工具——全部映射到
+// 桥已有的 /fs/write /fs/mkdir /fs/move /fs/copy /fs/delete。跟只读工具走同一套 ==TOOL==/==TOOLEND==
+// 文本协议、同一个 chatAgentRunLoop 主循环，唯一的区别是执行前必须弹 ovlConfirmDialog 拿到用户
+// 逐次确认（见 chatAgentExecWriteTool），绝不提供"这次会话全部允许"之类的批量豁免。
+const CHAT_AGENT_WRITE_TOOLS = ['write_file', 'mkdir', 'move', 'copy', 'delete'];
+const CHAT_AGENT_TOOLS = ['list_dir', 'read_file'].concat(CHAT_AGENT_WRITE_TOOLS);
 
 // 项目绝对路径：跟 Overleaf 面板"项目绝对路径"输入框共用同一个 DOM 元素（ovlDoRecompile 等
 // 处已有的取法），不新起第二套配置。
@@ -18284,27 +18292,39 @@ function chatAgentBridgeReady() {
 function chatAgentToolsSystemBlock() {
     if (!chatAgentBridgeReady()) {
         return '\n【文件读取工具】这一轮不可用（还没有连上编译桥接服务，或者没有填写项目绝对路径）。'
-            + '不要输出 ==TOOL== 块，只能根据上面已经给到你的内容回答，也不要假装自己读过任何'
+            + '不要输出 ==TOOL== 块，只能根据上面已经给到你的内容回答，也不要假装自己读过或改过任何'
             + '没有出现在这段对话里的文件。\n';
     }
     return '\n【文件读取工具】用户关注的那句话（如果有的话）只是一个起点——需要的话，你可以主动'
-        + '读取用户项目文件夹里的其它文件：它的上下文、它 \\ref/\\cite 指向的定义、supp.tex 等'
+        + '读取甚至修改用户项目文件夹里的文件：它的上下文、它 \\ref/\\cite 指向的定义、supp.tex 等'
         + '文件里的相关数据，读完再综合回答，而不是只盯着关注的那一句话猜。可用工具：\n'
+        + '只读：\n'
         + '  · list_dir —— 列出一个目录。参数：{"path": "相对项目根目录的路径，用 \\".\\" 表示根目录"}\n'
         + '  · read_file —— 读取一个文件。参数：{"path": "相对路径"}，可选 "startLine"/"endLine"'
         + '（1-based、含端点，只读一段，别一次整篇灌进来）\n'
+        + '会改动文件系统（每一次都会先弹窗让用户确认，用户拒绝的话你会在工具结果里看到"用户拒绝了该操作"，'
+        + '那时不要原样重试，要么换个方案要么向用户说明、停下来）：\n'
+        + '  · write_file —— 写入一个文件（不存在就新建，存在就整体覆盖）。参数：{"path":"相对路径","content":"完整的新内容（字符串）"}\n'
+        + '  · mkdir —— 新建一个目录（含中间目录）。参数：{"path":"相对路径"}\n'
+        + '  · move —— 移动/重命名一个文件或目录。参数：{"from":"相对路径","to":"相对路径"}（目标已存在会失败，不会覆盖）\n'
+        + '  · copy —— 复制一个文件或目录。参数：{"from":"相对路径","to":"相对路径"}（目标已存在会失败，不会覆盖）\n'
+        + '  · delete —— 删除一个文件或目录（目录会递归删除）。参数：{"path":"相对路径"}\n'
         + '调用格式——**这一轮的整条回复只能是下面这一个块，前后不要有任何别的文字，也不要同时输出 ==CHAT==**：\n'
         + '==TOOL name=list_dir==\n{"path":"."}\n==TOOLEND==\n'
         + '或者：\n'
         + '==TOOL name=read_file==\n{"path":"main.tex","startLine":100,"endLine":160}\n==TOOLEND==\n'
+        + '或者（写工具同一套格式，工具名换成 write_file/mkdir/move/copy/delete）：\n'
+        + '==TOOL name=write_file==\n{"path":"notes/todo.tex","content":"..."}\n==TOOLEND==\n'
         + '规则：\n'
         + '1. 一轮最多发起一次工具调用；结果会在下一轮发给你，那时候可以再调用、也可以直接回答。\n'
         + '2. 读大文件优先用 startLine/endLine 只读需要的那一段。\n'
         + '3. 工具调用的总轮数和总读取量都有上限，到了上限你会被明确告知，那时必须直接基于已经'
         + '读到的内容回答，不要再输出 ==TOOL==。\n'
-        + '4. 只有确实需要先看到文件内容才能回答、或者用户明确要求你去看某个文件时才调用工具；'
-        + '能直接回答的问题不要绕远路先读文件。\n'
-        + '5. 不需要工具的时候，正常按 ==CHAT== 格式回答，不要输出空的或试探性的工具块。\n';
+        + '4. 只有确实需要先看到文件内容才能回答、或者用户明确要求你去看/改某个文件时才调用工具；'
+        + '能直接回答的问题不要绕远路先读文件，更不要没被要求就主动改文件。\n'
+        + '5. 不需要工具的时候，正常按 ==CHAT== 格式回答，不要输出空的或试探性的工具块。\n'
+        + '6. 写工具执行前用户会看到一个确认弹窗（列出确切路径、受影响的文件清单），你不需要、也没有'
+        + '办法替用户点这个确认——每次调用写工具都会真的弹一次，不存在"用户已经同意过了所以这次不用问"。\n';
 }
 
 // 解析模型这一轮的回复是不是一个工具调用。跟 chatParseEnvelope 同一套"取第一个终止符"纪律，
@@ -18325,7 +18345,7 @@ function chatAgentParseToolCall(raw) {
     const nameM = /\bname\s*=\s*"?([a-zA-Z_]+)"?/i.exec(attrs);
     const name = nameM ? nameM[1] : '';
     if (CHAT_AGENT_TOOLS.indexOf(name) === -1) {
-        out.malformed = true; out.reason = '不认识的工具名「' + name + '」（只支持 list_dir / read_file）'; return out;
+        out.malformed = true; out.reason = '不认识的工具名「' + name + '」（只支持 ' + CHAT_AGENT_TOOLS.join(' / ') + '）'; return out;
     }
     let body = text.slice(bodyStart, em.index).replace(/^\r?\n/, '').replace(/\r?\n[ \t]*$/, '').trim();
     let args;
@@ -18336,6 +18356,21 @@ function chatAgentParseToolCall(raw) {
     }
     if (name === 'read_file' && (typeof args.path !== 'string' || !args.path)) {
         out.malformed = true; out.reason = 'read_file 缺少必填的 path 参数'; return out;
+    }
+    // v2 Pass P43：五个写工具各自的必填参数校验，跟上面 read_file 那条同一个模式。
+    if (name === 'write_file') {
+        if (typeof args.path !== 'string' || !args.path) { out.malformed = true; out.reason = 'write_file 缺少必填的 path 参数'; return out; }
+        if (typeof args.content !== 'string') { out.malformed = true; out.reason = 'write_file 缺少必填的 content 参数（必须是字符串，哪怕是空字符串也要显式给 ""）'; return out; }
+    }
+    if (name === 'mkdir' && (typeof args.path !== 'string' || !args.path)) {
+        out.malformed = true; out.reason = 'mkdir 缺少必填的 path 参数'; return out;
+    }
+    if ((name === 'move' || name === 'copy')
+        && (typeof args.from !== 'string' || !args.from || typeof args.to !== 'string' || !args.to)) {
+        out.malformed = true; out.reason = name + ' 缺少必填的 from/to 参数（都必须是非空字符串）'; return out;
+    }
+    if (name === 'delete' && (typeof args.path !== 'string' || !args.path)) {
+        out.malformed = true; out.reason = 'delete 缺少必填的 path 参数'; return out;
     }
     out.tool = name;
     out.args = args;
@@ -18452,6 +18487,392 @@ async function chatAgentExecTool(toolName, args, projectDir, signal) {
     };
 }
 
+// ============================================================================
+// v2 Pass P43：AI 聊天窗 agent 化——补上写能力（write_file/mkdir/move/copy/delete）
+// ============================================================================
+// 只读工具（上面 chatAgentExecTool）读完就直接执行、事后展示；写工具不一样——**每一次**
+// 都必须先让用户在 ovlConfirmDialog 里看清楚"要动哪个文件、影响面有多大、有没有回退保障"
+// 再点确认，绝不提供"这次会话全部允许 / 不再询问"之类的批量豁免（硬性要求原话）。
+// 具体分工：
+//   - chatAgentAbsPath           把 projectDir + 相对路径拼成给人看的完整路径（纯展示用）
+//   - chatAgentProbeCheckpoint   探测 projectDir 是不是 git 工作树、能不能生成回退检查点——
+//                                复用 /fs/mkdir 对已存在的根目录（"."）是幂等操作这个事实当
+//                                "安全探针"：不新增服务端端点（本轮不改 server.js），也不会
+//                                真的创建/修改任何文件，只是顺手在 refs/ovl-checkpoints/ 下
+//                                多一个从未被回退过的检查点 ref（纯 git 对象数据库里的簿记，
+//                                不影响分支/工作区）。同一个 projectDir 只探一次，缓存复用。
+//   - chatAgentPreviewAffected   执行前用只读的 /fs/list 递归预览"这个路径展开后是哪些文件"，
+//                                供确认框里的"受影响路径清单"用（写操作真正返回的 affected
+//                                字段这时候还没有——那是执行之后才有的，所以必须自己先探一遍）。
+//   - chatAgentBuildConfirmMessage 把上面探到的信息拼成确认框的标题/正文。
+//   - chatAgentConfirm            把回调式的 ovlConfirmDialog 包成 Promise，方便 await。
+//   - chatAgentExecWriteTool      主入口：探测 → 弹确认框 → 用户拒绝就原样返回"用户拒绝了该
+//                                操作"当工具结果（不中断整个会话）→ 确认就真的调用 /fs/* →
+//                                成功后：展示回退检查点 + 一键回退按钮、刷新文件树、检查是不是
+//                                改到了当前编辑器打开的文件（有未保存改动就只提示不覆盖）。
+
+// projectDir/relPath 拼成的绝对路径只用来给人看（确认框、聊天记录里的文本），不参与任何
+// 真正的文件系统调用——那些调用永远只发 relPath，越界校验统统留在桥那边（resolveInProject）。
+function chatAgentAbsPath(projectDir, relPath) {
+    if (!projectDir || !relPath) return String(relPath == null ? '' : relPath);
+    const sep = (String(projectDir).indexOf('\\') === -1 && String(projectDir).indexOf('/') !== -1) ? '/' : '\\';
+    const normRel = String(relPath).replace(/[\\/]+/g, sep).replace(/^[\\/]+/, '');
+    return String(projectDir).replace(/[\\/]+$/, '') + sep + normRel;
+}
+
+// 跟 ovlBridgeAbsPathFor(name) 同一个用途，但接的是通用相对路径，给 chatAgentNoteEditorConflict
+// 用来判断"agent 刚动的这个路径是不是当前编辑器打开的那个文件"。
+function chatAgentSameAsCurrentFile(projectDir, relPath) {
+    try {
+        const cf = OvlState.currentFile;
+        if (!cf || !cf.name || typeof ovlBridgeAbsPathFor !== 'function') return false;
+        const absTouched = chatAgentAbsPath(projectDir, relPath);
+        const absCurrent = ovlBridgeAbsPathFor(cf.name);
+        if (!absTouched || !absCurrent) return false;
+        return String(absTouched).toLowerCase() === String(absCurrent).toLowerCase();
+    } catch (e) { return false; }
+}
+
+// 检查点可用性探测缓存：同一个 projectDir 在一次页面会话里通常不会时而是 git 仓库、时而不是，
+// 缓存下来避免每次写确认都多打一个检查点 ref。projectDir 变了（比如用户中途换了项目文件夹）
+// 就重新探。
+let ChatAgentCheckpointProbeCache = { projectDir: null, available: null, warning: null };
+async function chatAgentProbeCheckpoint(projectDir, signal) {
+    if (ChatAgentCheckpointProbeCache.projectDir === projectDir && ChatAgentCheckpointProbeCache.available !== null) {
+        return ChatAgentCheckpointProbeCache;
+    }
+    try {
+        const resp = await fetch(ovlBridgeUrl('/fs/mkdir'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectDir: projectDir, path: '.' }),
+            signal: signal || undefined
+        });
+        const data = await resp.json();
+        if (data && data.ok === true) {
+            ChatAgentCheckpointProbeCache = { projectDir: projectDir, available: !!data.checkpointAvailable, warning: data.checkpointWarning || null };
+        } else {
+            ChatAgentCheckpointProbeCache = { projectDir: projectDir, available: false, warning: '无法确认回退保障状态：' + ((data && data.error) || '未知错误') };
+        }
+    } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
+        ChatAgentCheckpointProbeCache = { projectDir: projectDir, available: false, warning: '无法确认回退保障状态（探测请求失败：' + ((e && e.message) || e) + '）' };
+    }
+    return ChatAgentCheckpointProbeCache;
+}
+
+// 递归预览一个相对路径展开后的完整文件清单（只读，靠反复调用已有的 /fs/list）。
+// cap 之内精确列出，超过就截断（truncated:true），供确认框展示"受影响路径"用。
+const CHAT_AGENT_AFFECTED_PREVIEW_CAP = 200;
+async function chatAgentPreviewAffected(projectDir, relPath, signal) {
+    try {
+        const norm = String(relPath).replace(/\\/g, '/').replace(/\/+$/, '');
+        const segs = norm.split('/');
+        const filename = segs.pop();
+        const parentPath = segs.length ? segs.join('/') : '.';
+        const pr = await fetch(ovlBridgeUrl('/fs/list'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectDir: projectDir, path: parentPath }), signal: signal || undefined
+        });
+        const pd = await pr.json();
+        if (!pd || pd.ok !== true) return { ok: false, error: (pd && pd.error) || '查询失败' };
+        const entry = (pd.entries || []).find(function (e) { return e.name === filename; });
+        if (!entry) return { ok: true, exists: false, isDir: false, paths: [], truncated: false };
+        if (!entry.isDir) return { ok: true, exists: true, isDir: false, paths: [norm], truncated: false, existingSize: entry.size };
+        const paths = [];
+        let truncated = false;
+        const queue = [norm];
+        while (queue.length) {
+            const dir = queue.shift();
+            const lr = await fetch(ovlBridgeUrl('/fs/list'), {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ projectDir: projectDir, path: dir }), signal: signal || undefined
+            });
+            const ld = await lr.json();
+            if (!ld || ld.ok !== true) continue;
+            for (let i = 0; i < (ld.entries || []).length; i++) {
+                const e2 = ld.entries[i];
+                const childRel = dir === '.' ? e2.name : dir + '/' + e2.name;
+                if (e2.isDir) { queue.push(childRel); continue; }
+                if (paths.length >= CHAT_AGENT_AFFECTED_PREVIEW_CAP) { truncated = true; continue; }
+                paths.push(childRel);
+            }
+        }
+        if (paths.length >= CHAT_AGENT_AFFECTED_PREVIEW_CAP) truncated = true;
+        return { ok: true, exists: true, isDir: true, paths: paths, truncated: truncated };
+    } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
+        return { ok: false, error: String((e && e.message) || e) };
+    }
+}
+
+const CHAT_AGENT_TOOL_LABELS = { write_file: '写入文件', mkdir: '新建目录', move: '移动/重命名', copy: '复制', delete: '删除' };
+
+// 拼确认框的标题 + 正文（纯文本，ovl-modal-message 是 white-space:pre-line，换行会正常显示）。
+function chatAgentBuildConfirmMessage(toolName, args, projectDir, extra) {
+    const abs = function (rel) { return chatAgentAbsPath(projectDir, rel); };
+    const label = CHAT_AGENT_TOOL_LABELS[toolName] || toolName;
+    let title = label + '？';
+    const lines = [];
+    if (toolName === 'write_file') {
+        title = (extra.exists ? '覆盖已有文件？' : '新建文件？');
+        lines.push('操作：写入文件' + (extra.exists ? '（将覆盖现有内容）' : '（新建）'));
+        lines.push('目标路径：' + args.path);
+        lines.push('完整路径：' + abs(args.path));
+        if (extra.exists) lines.push('⚠ 目标文件已存在（现有 ' + (extra.existingSize == null ? '?' : extra.existingSize) + ' 字节），确认后原内容会被整体覆盖，不会合并。');
+        lines.push('新内容长度：约 ' + (args.content ? args.content.length : 0) + ' 字符。');
+    } else if (toolName === 'mkdir') {
+        title = '新建目录？';
+        lines.push('操作：新建目录（含中间目录）');
+        lines.push('目标路径：' + args.path);
+        lines.push('完整路径：' + abs(args.path));
+    } else if (toolName === 'move' || toolName === 'copy') {
+        title = (toolName === 'move' ? '移动/重命名？' : '复制？');
+        lines.push('操作：' + label);
+        lines.push('源路径：' + args.from + '（' + abs(args.from) + '）');
+        lines.push('目标路径：' + args.to + '（' + abs(args.to) + '）');
+        if (extra.isDir) {
+            lines.push('⚠ 源路径是一个目录——这是递归影响，展开后共 ' + extra.paths.length + (extra.truncated ? '+' : '') + ' 个文件：');
+            lines.push(extra.paths.slice(0, CHAT_AGENT_AFFECTED_PREVIEW_CAP).map(function (p) { return '  · ' + p; }).join('\n'));
+            if (extra.truncated) lines.push('  …（超过 ' + CHAT_AGENT_AFFECTED_PREVIEW_CAP + ' 项，已省略剩余部分）');
+        }
+    } else if (toolName === 'delete') {
+        title = '删除？';
+        lines.push('操作：删除');
+        lines.push('目标路径：' + args.path + '（' + abs(args.path) + '）');
+        if (extra.isDir) {
+            lines.push('⚠ 这是一个目录，将递归删除它下面的全部内容。受影响的文件（共 ' + extra.paths.length + (extra.truncated ? '+' : '') + ' 项）：');
+            lines.push(extra.paths.slice(0, CHAT_AGENT_AFFECTED_PREVIEW_CAP).map(function (p) { return '  · ' + p; }).join('\n'));
+            if (extra.truncated) lines.push('  …（超过 ' + CHAT_AGENT_AFFECTED_PREVIEW_CAP + ' 项，已省略剩余部分）');
+        }
+    }
+    if (extra.checkpointAvailable === false) {
+        lines.push('');
+        lines.push('❌ 本次操作无回退保障：' + (extra.checkpointWarning || '目标目录不是 git 仓库，无法生成快照，执行后不能一键撤销。'));
+    } else if (extra.checkpointAvailable === true) {
+        lines.push('');
+        lines.push('✓ 执行前会自动生成一个旁路回退检查点，之后可以一键撤销这次操作。');
+    }
+    return { title: title, message: lines.join('\n') };
+}
+
+// 把回调式的 ovlConfirmDialog 包一层 Promise，方便 await——onConfirm/onCancel 二选一必触发
+// 一次，跟 ovlConfirmDialog 自己"settled 只触发一次"的纪律一致。
+function chatAgentConfirm(opts) {
+    return new Promise(function (resolve) {
+        if (typeof ovlConfirmDialog !== 'function') { resolve(false); return; }
+        ovlConfirmDialog(Object.assign({}, opts, {
+            onConfirm: function () { resolve(true); },
+            onCancel: function () { resolve(false); }
+        }));
+    });
+}
+
+// 写操作成功后：如果动到的路径就是当前编辑器里打开的文件，明确告诉用户，绝不吞掉这个信息。
+//   - 有未保存改动（OvlState.dirty）：编辑器内容不会被覆盖（已有的 ovlBridgeHandleExternalChange
+//     本来就会因为 dirty 跳过重新加载），但必须显式提示——不然用户根本不知道磁盘已经和屏幕上
+//     的内容不一致了。
+//   - delete：不管是否 dirty 都要提示——文件已经不在磁盘上了，这跟"外部改了内容"是两回事。
+//   - 其余情况（没有未保存改动、也不是删除）：已有的 WebSocket 磁盘变化推送会自动把新内容
+//     同步进编辑器（ovlBridgeHandleExternalChange），这里不重复处理，避免两套逻辑打架。
+function chatAgentNoteEditorConflict(actionLabel, projectDir, relPath, isDelete) {
+    try {
+        if (!chatAgentSameAsCurrentFile(projectDir, relPath)) return;
+        const cf = OvlState.currentFile;
+        const name = (cf && cf.name) || relPath;
+        if (isDelete) {
+            chatAppendRow('system', '⚠ AI agent 刚删除了当前编辑器打开的文件「' + name + '」。'
+                + '编辑器里的内容还留着（没有被强制清空），但磁盘上这个文件已经不存在了——'
+                + '保存会重新把它创建出来，也可以手动关闭这个标签。');
+        } else if (OvlState.dirty) {
+            chatAppendRow('system', '⚠ AI agent 刚' + actionLabel + '了当前编辑器打开的文件「' + name + '」，'
+                + '但你在编辑器里还有未保存的改动——编辑器内容没有被覆盖，磁盘上已经是 agent 写入的新内容。'
+                + '请自行决定：保存（会覆盖 agent 刚写的内容）还是丢弃本地改动、重新打开这个文件看 agent 写了什么。');
+        }
+        // 未 dirty 且非删除：交给既有的 WebSocket 外部改动推送自动同步（会弹「已从磁盘同步外部改动」）。
+    } catch (e) { console.error('[chat-agent] noteEditorConflict failed', e); }
+}
+
+// 写操作成功后的展示行：跟只读工具的 chatAppendToolRow 平级，但多一个「一键回退」按钮。
+function chatAppendWriteResultRow(toolName, args, data, projectDir) {
+    try {
+        const log = document.getElementById('aiChatLog');
+        if (!log) return null;
+        const label = CHAT_AGENT_TOOL_LABELS[toolName] || toolName;
+        const primary = (toolName === 'move' || toolName === 'copy') ? (args.from + ' → ' + args.to) : args.path;
+        const row = document.createElement('div');
+        row.className = 'aichat-row aichat-row-system';
+        const bubble = document.createElement('div');
+        bubble.className = 'aichat-bubble';
+        const det = document.createElement('details');
+        det.className = 'aichat-think';
+        const sum = document.createElement('summary');
+        sum.textContent = '✅ ' + label + '（' + primary + '）已完成';
+        const body = document.createElement('div');
+        body.className = 'aichat-think-body';
+        let detailText = '路径：' + primary + '\n完整路径：' + chatAgentAbsPath(projectDir, (toolName === 'move' || toolName === 'copy') ? args.to : args.path) + '\n';
+        detailText += data.checkpointAvailable
+            ? ('回退检查点：' + data.checkpoint)
+            : ('⚠ 无回退保障：' + (data.checkpointWarning || '目标目录不是 git 仓库'));
+        body.textContent = detailText;
+        det.appendChild(sum);
+        det.appendChild(body);
+        bubble.appendChild(det);
+        if (data.checkpointAvailable && data.checkpoint) {
+            const wrap = document.createElement('div');
+            wrap.className = 'aichat-tool-rollback-wrap';
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'aichat-btn';
+            btn.textContent = '⟲ 一键回退到这一步之前';
+            btn.addEventListener('click', function () {
+                chatAgentDoRollback(projectDir, data.checkpoint, label + '（' + primary + '）');
+            });
+            wrap.appendChild(btn);
+            bubble.appendChild(wrap);
+        }
+        row.appendChild(bubble);
+        log.appendChild(row);
+        chatScrollToBottom();
+        return row;
+    } catch (e) { console.error('[chat] appendWriteResultRow failed', e); return null; }
+}
+
+// 一键回退：本身也要 ovlConfirmDialog 确认（硬性要求原话），明确告知"会把工作区恢复到该快照，
+// 之后新建的文件会被删除"。回退调用 /fs/restore——那个端点自己会先给"回退前"的状态再打一个
+// 检查点，所以回退之后仍然可以再回退回来，这里的提示文案如实说明这一点。
+async function chatAgentDoRollback(projectDir, checkpoint, opLabel) {
+    const confirmed = await chatAgentConfirm({
+        title: '回退到这一步之前？',
+        message: '即将把工作区恢复到执行「' + opLabel + '」之前的状态（检查点 ' + checkpoint + '）。\n'
+            + '⚠ 回退会整体覆盖当前工作区：这一步之后新建的文件会被删除，被改动/删除的文件会恢复成'
+            + '快照当时的样子。\n'
+            + '这个回退动作本身也会先给"回退前"的状态打一个检查点，所以回退之后仍然可以再回退回来。',
+        danger: true,
+        confirmLabel: '确认回退'
+    });
+    if (!confirmed) { chatAppendRow('system', '已取消回退。'); return; }
+    try {
+        const resp = await fetch(ovlBridgeUrl('/fs/restore'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectDir: projectDir, checkpoint: checkpoint })
+        });
+        const data = await resp.json();
+        if (!data || data.ok !== true) {
+            chatAppendRow('error', '回退失败：' + ((data && data.error) || '未知错误'));
+            return;
+        }
+        chatAppendRow('system', '✅ 已回退到「' + opLabel + '」之前的状态（恢复 ' + data.filesRestored + ' 个文件；'
+            + ((data.removedExtraFiles && data.removedExtraFiles.length) ? ('删除了 ' + data.removedExtraFiles.length + ' 个之后新建的文件；') : '')
+            + '本次回退前状态的检查点：' + (data.checkpoint || '（不可用）') + '）。');
+        try {
+            if (OvlState.dirHandle && !OvlState.usingWebkitFallback && typeof ovlRenderTree === 'function') ovlRenderTree(OvlState.dirHandle);
+        } catch (e) {}
+    } catch (e) {
+        chatAppendRow('error', '回退失败：连不上桥接服务（' + ((e && e.message) || e) + '）');
+    }
+}
+
+// 写工具的执行主入口：探测检查点可用性 → 探测受影响路径/是否会覆盖 → 弹确认框 → 用户拒绝就
+// 原样把"用户拒绝了该操作"当工具结果返回（ok:false，但 chatAgentRunLoop 仍然会把它当成一次
+// 正常的工具往返继续对话，不会中断整个会话）→ 确认就真的调用对应的 /fs/* 端点。
+async function chatAgentExecWriteTool(toolName, args, projectDir, signal, pending) {
+    const setLabel = function (t) { try { if (pending && pending.labelEl) pending.labelEl.textContent = t; } catch (e) {} };
+    if (!projectDir) {
+        const msg = '没有配置项目绝对路径，无法执行文件操作。';
+        return { ok: false, uiSummary: '操作失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const primaryRelPath = (toolName === 'move' || toolName === 'copy') ? args.to : args.path;
+
+    setLabel('正在核对「' + (CHAT_AGENT_TOOL_LABELS[toolName] || toolName) + '」的影响面…');
+    let cpProbe;
+    try { cpProbe = await chatAgentProbeCheckpoint(projectDir, signal); }
+    catch (e) { if (e && e.name === 'AbortError') throw e; cpProbe = { available: false, warning: '探测回退保障状态失败' }; }
+    const extra = { checkpointAvailable: cpProbe.available, checkpointWarning: cpProbe.warning };
+
+    try {
+        if (toolName === 'write_file') {
+            const preview = await chatAgentPreviewAffected(projectDir, args.path, signal);
+            extra.exists = !!(preview && preview.exists && !preview.isDir);
+            extra.existingSize = preview && preview.existingSize;
+        } else if (toolName === 'move' || toolName === 'copy' || toolName === 'delete') {
+            const sourceRel = toolName === 'delete' ? args.path : args.from;
+            const preview = await chatAgentPreviewAffected(projectDir, sourceRel, signal);
+            extra.isDir = !!(preview && preview.isDir);
+            extra.paths = (preview && preview.paths) || [];
+            extra.truncated = !!(preview && preview.truncated);
+        }
+    } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
+        // 预览失败不阻断确认——确认框仍然用已经拿到的信息展示，只是少一份"受影响清单"。
+    }
+
+    const built = chatAgentBuildConfirmMessage(toolName, args, projectDir, extra);
+    setLabel('等待你确认「' + built.title + '」…');
+    const confirmed = await chatAgentConfirm({
+        title: built.title,
+        message: built.message,
+        danger: (toolName === 'delete'),
+        confirmLabel: '确认执行'
+    });
+    if (!confirmed) {
+        const msg = '用户拒绝了该操作。';
+        chatAppendToolRow('🔧 ' + toolName + '（' + (primaryRelPath || '') + '）· 已被用户取消', built.message);
+        return { ok: false, refused: true, uiSummary: '用户取消', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+
+    setLabel('正在执行「' + built.title + '」…');
+    const endpointMap = { write_file: '/fs/write', mkdir: '/fs/mkdir', move: '/fs/move', copy: '/fs/copy', delete: '/fs/delete' };
+    const body = (toolName === 'write_file') ? { projectDir: projectDir, path: args.path, content: args.content }
+        : (toolName === 'mkdir') ? { projectDir: projectDir, path: args.path }
+        : (toolName === 'move' || toolName === 'copy') ? { projectDir: projectDir, from: args.from, to: args.to }
+        : { projectDir: projectDir, path: args.path };
+    let resp, data;
+    try {
+        resp = await fetch(ovlBridgeUrl(endpointMap[toolName]), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body), signal: signal || undefined
+        });
+        const text = await resp.text();
+        try { data = JSON.parse(text); } catch (e) { data = null; }
+    } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
+        const msg = '连不上桥接服务（' + ((e && e.message) || e) + '）';
+        return { ok: false, uiSummary: '操作失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    if (!data || !resp.ok || data.ok !== true) {
+        const err = (data && data.error) || ('HTTP ' + (resp ? resp.status : '?'));
+        return { ok: false, uiSummary: '操作失败', uiDetail: err, textForModel: '失败：' + err, bytes: 0 };
+    }
+
+    chatAppendWriteResultRow(toolName, args, data, projectDir);
+
+    try {
+        if (OvlState.dirHandle && !OvlState.usingWebkitFallback && typeof ovlRenderTree === 'function') {
+            ovlRenderTree(OvlState.dirHandle);
+        }
+    } catch (e) { console.warn('[chat-agent] file tree refresh failed', e); }
+
+    try {
+        if (toolName === 'write_file') {
+            chatAgentNoteEditorConflict('写入', projectDir, args.path, false);
+        } else if (toolName === 'copy') {
+            chatAgentNoteEditorConflict('复制（目标路径）', projectDir, args.to, false);
+        } else if (toolName === 'move') {
+            chatAgentNoteEditorConflict('移动（源路径）', projectDir, args.from, true); // 源路径原地消失，语义等同"删除"
+            chatAgentNoteEditorConflict('移动（目标路径）', projectDir, args.to, false);
+        } else if (toolName === 'delete') {
+            const affected = (data.affected && data.affected.length) ? data.affected : [args.path];
+            affected.forEach(function (p) { chatAgentNoteEditorConflict('删除', projectDir, p, true); });
+        }
+    } catch (e) { console.error('[chat-agent] editor conflict check failed', e); }
+
+    const textForModel = '操作成功：' + built.title + '（' + (primaryRelPath || '') + '）。'
+        + (data.checkpointAvailable
+            ? ('已生成回退检查点 ' + (data.checkpoint || '') + '，用户界面上有一键回退按钮。')
+            : ('⚠ 未生成回退检查点：' + (data.checkpointWarning || '目标目录不是 git 仓库') + '。'));
+    return { ok: true, uiSummary: built.title + ' 成功', uiDetail: textForModel, textForModel: textForModel, bytes: (args.content ? args.content.length : 0) };
+}
+
 // 文本协议的多轮工具调用主循环。wire 是这一轮已经装好的消息数组（chatAssembleTurn 的产物，
 // 最后一条是用户这一轮的完整载荷），本函数在它后面追加"assistant 工具调用 → user 工具结果"
 // 这样的往返，直到模型给出不含 ==TOOL== 的最终回复，或撞上下面任一硬上限。
@@ -18505,12 +18926,22 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
             continue;
         }
 
-        setLabel('正在' + (parsed.tool === 'read_file' ? '读取' : '查看') + '「' + (parsed.args.path || '.') + '」…');
-        const result = await chatAgentExecTool(parsed.tool, parsed.args, projectDir, signal);
-        chatAppendToolRow(
-            (parsed.tool === 'read_file' ? '🔧 read_file' : '🔧 list_dir') + '（' + (parsed.args.path || '.') + '）· ' + result.uiSummary,
-            result.uiDetail.length > 4000 ? result.uiDetail.slice(0, 4000) + '\n…（此处仅显示前 4000 字，模型收到的是完整版本）' : result.uiDetail
-        );
+        // v2 Pass P43：写工具（write_file/mkdir/move/copy/delete）走 chatAgentExecWriteTool——
+        // 那个函数内部自己弹确认框、自己在拿到结果后画展示行（带一键回退），这里不再重复调
+        // chatAppendToolRow，避免同一次操作在聊天记录里出现两条重复的行。
+        const isWriteTool = CHAT_AGENT_WRITE_TOOLS.indexOf(parsed.tool) !== -1;
+        setLabel(isWriteTool
+            ? ('准备执行「' + (CHAT_AGENT_TOOL_LABELS[parsed.tool] || parsed.tool) + '」…')
+            : ('正在' + (parsed.tool === 'read_file' ? '读取' : '查看') + '「' + (parsed.args.path || '.') + '」…'));
+        const result = isWriteTool
+            ? await chatAgentExecWriteTool(parsed.tool, parsed.args, projectDir, signal, pending)
+            : await chatAgentExecTool(parsed.tool, parsed.args, projectDir, signal);
+        if (!isWriteTool) {
+            chatAppendToolRow(
+                (parsed.tool === 'read_file' ? '🔧 read_file' : '🔧 list_dir') + '（' + (parsed.args.path || '.') + '）· ' + result.uiSummary,
+                result.uiDetail.length > 4000 ? result.uiDetail.slice(0, 4000) + '\n…（此处仅显示前 4000 字，模型收到的是完整版本）' : result.uiDetail
+            );
+        }
         bytesUsed += result.bytes;
         wire.push({ role: 'assistant', content: raw });
         wire.push({ role: 'user', content: '[工具结果 · ' + parsed.tool + ']\n' + result.textForModel });
