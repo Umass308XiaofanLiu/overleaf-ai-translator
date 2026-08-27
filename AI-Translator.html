@@ -26702,11 +26702,162 @@ function ovlAutoFillProjectPath(handle) {
         const input = document.getElementById('ovlProjectPathInput');
         if (!input) return;
         input.value = guess;
-        try { localStorage.setItem('ovl.bridgeProjectPath', guess); } catch (e) {}
+        try { localStorage.setItem(ovlProjectPathLsKey(), guess); } catch (e) {}
     } catch (e) { console.error('[ovl] autoFillProjectPath failed', e); }
 }
 
+// ==================== v2 Pass P50：远程桥接下的文件系统访问 ====================
+// 问题：左侧文件树/打开文件/保存文件这一整套（本文件里约 90 处）读写的是浏览器 File System
+// Access API（FileSystemDirectoryHandle/FileSystemFileHandle），天生只能碰本机磁盘；桥跑在
+// jump 上时，浏览器所在的机器（家里/学校）和桥所在的机器根本是两个不同的文件系统。
+// 解法：不去重写那 90 处——它们全部只按"这个对象有没有 entries()/getFileHandle()/getFile()/
+// createWritable() 这些方法"来用，从不检查是不是真的浏览器原生对象（鸭子类型）。这里实现两个
+// 跟原生句柄同形状的 shim 类，全部转发成 /fs/list /fs/read /fs/write /fs/mkdir /fs/delete +
+// /project-asset（二进制读取，复用既有的 Visual 模式缩略图接口）请求；本地模式完全不会创建
+// 这些对象，原有 ~90 处调用点一处都不用改，行为逐字节不变。
+
+// "项目绝对路径"输入框的当前值——远程模式下这就是 /fs/* 请求的 projectDir，跟本地模式下
+// 传给桥做 /compile 的那个概念是同一个输入框、同一份持久化（ovlProjectPathLsKey()）。
+function ovlRemoteProjectRoot() {
+    try {
+        const input = document.getElementById('ovlProjectPathInput');
+        return input ? input.value.trim() : '';
+    } catch (e) { return ''; }
+}
+
+async function ovlRemoteFsJson(url, body) {
+    const resp = await ovlBridgeFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    let data = null;
+    try { data = await resp.json(); } catch (e) { data = null; }
+    return data;
+}
+
+class OvlRemoteFileHandle {
+    constructor(relPath, name) {
+        this.kind = 'file';
+        this.name = name;
+        this.__ovlRemote = true;
+        this.__relPath = relPath;
+        this.__lastKnownMtimeMs = null; // 上次真正读到/写成功时的磁盘 mtime，Ctrl+S 前的冲突检测靠它
+    }
+    // 远程模式下"权限"这件事完全不存在（真正的门禁是桥那一侧的访问令牌，不是浏览器沙箱授权），
+    // 恒真即可——跟原生 FileSystemHandle 同一个 Promise<'granted'|'denied'> 形状，ovlEnsureRW()
+    // 这类调用点不用区分本地/远程。
+    queryPermission() { return Promise.resolve('granted'); }
+    requestPermission() { return Promise.resolve('granted'); }
+    async isSameEntry(other) {
+        return !!(other && other.__ovlRemote && other.kind === 'file' && other.__relPath === this.__relPath);
+    }
+    async getFile() {
+        const projectDir = ovlRemoteProjectRoot();
+        const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/read'), { projectDir: projectDir, path: this.__relPath });
+        if (!data || data.ok !== true) throw new Error((data && data.error) || '读取远程文件失败');
+        this.__lastKnownMtimeMs = (typeof data.mtimeMs === 'number') ? data.mtimeMs : this.__lastKnownMtimeMs;
+        let bytes;
+        if (data.binary) {
+            // /fs/read 对二进制文件不下发字节（避免把 base64 膨胀塞进 JSON），改走既有的
+            // GET /project-asset——P18 起就是 Visual 模式缩略图的真实资源来源，同一个鉴权/CORS
+            // 通路（ovlBridgeFetch 自动带令牌头），这里原样复用，不新增桥接口。
+            const assetUrl = ovlBridgeUrl('/project-asset?projectDir=' + encodeURIComponent(projectDir) + '&path=' + encodeURIComponent(this.__relPath));
+            const assetResp = await ovlBridgeFetch(assetUrl);
+            if (!assetResp.ok) throw new Error('读取远程二进制文件失败：HTTP ' + assetResp.status);
+            bytes = await assetResp.arrayBuffer();
+        } else {
+            bytes = data.content;
+        }
+        return new File([bytes], this.name, { lastModified: (typeof data.mtimeMs === 'number') ? data.mtimeMs : Date.now() });
+    }
+    async createWritable() {
+        const self = this;
+        let pending = '';
+        return {
+            write: async function (content) {
+                if (content instanceof ArrayBuffer) content = new TextDecoder('utf-8').decode(content);
+                else if (content && content.buffer instanceof ArrayBuffer) content = new TextDecoder('utf-8').decode(content);
+                pending = typeof content === 'string' ? content : String(content);
+            },
+            close: async function () {
+                const projectDir = ovlRemoteProjectRoot();
+                const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/write'), {
+                    projectDir: projectDir, path: self.__relPath, content: pending,
+                    expectedMtimeMs: (typeof self.__lastKnownMtimeMs === 'number') ? self.__lastKnownMtimeMs : undefined
+                });
+                if (!data || data.ok !== true) {
+                    // v2 Pass P50 保存冲突检测：磁盘内容在上次读取之后被别人（或另一个标签页）
+                    // 改过——绝不静默覆盖，直接抛出去，走 ovlSaveCurrentFile 现成的 catch 分支
+                    // 弹"保存失败：……"，用户能看见、能决定重新加载还是别的处理方式。
+                    throw new Error((data && data.error) || '保存远程文件失败');
+                }
+                self.__lastKnownMtimeMs = (typeof data.mtimeMs === 'number') ? data.mtimeMs : self.__lastKnownMtimeMs;
+            }
+        };
+    }
+}
+
+class OvlRemoteDirHandle {
+    constructor(relPath, name) {
+        this.kind = 'directory';
+        this.name = name;
+        this.__ovlRemote = true;
+        this.__relPath = relPath; // '.' = 项目根目录本身，其余是相对 projectDir、'/' 分隔
+    }
+    queryPermission() { return Promise.resolve('granted'); }
+    requestPermission() { return Promise.resolve('granted'); }
+    async isSameEntry(other) {
+        return !!(other && other.__ovlRemote && other.kind === 'directory' && other.__relPath === this.__relPath);
+    }
+    __childRel(name) { return this.__relPath === '.' ? name : this.__relPath + '/' + name; }
+    async __listRaw() {
+        const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: ovlRemoteProjectRoot(), path: this.__relPath });
+        if (!data || data.ok !== true) throw new Error((data && data.error) || '列出远程目录失败');
+        return Array.isArray(data.entries) ? data.entries : [];
+    }
+    async __childExists(name, wantDir) {
+        let entries;
+        try { entries = await this.__listRaw(); } catch (e) { return false; }
+        return entries.some(function (e) { return e.name === name && !!e.isDir === !!wantDir; });
+    }
+    async *entries() {
+        const raw = await this.__listRaw();
+        for (const e of raw) {
+            const childRel = this.__childRel(e.name);
+            yield [e.name, e.isDir ? new OvlRemoteDirHandle(childRel, e.name) : new OvlRemoteFileHandle(childRel, e.name)];
+        }
+    }
+    async getFileHandle(name, opts) {
+        const create = !!(opts && opts.create);
+        const childRel = this.__childRel(name);
+        const exists = await this.__childExists(name, false);
+        if (!exists) {
+            if (!create) { const err = new Error('文件不存在: ' + name); err.name = 'NotFoundError'; throw err; }
+            // 原生 FSA 的 getFileHandle(name,{create:true}) 会立刻在磁盘上建一个空文件（不等
+            // createWritable().write()）——这里保持同一份语义，"新建文件"这类调用点（
+            // ovlPerformNewFile）拿到 handle 后不一定会紧接着写内容。
+            const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/write'), { projectDir: ovlRemoteProjectRoot(), path: childRel, content: '' });
+            if (!data || data.ok !== true) throw new Error((data && data.error) || '创建远程文件失败');
+        }
+        return new OvlRemoteFileHandle(childRel, name);
+    }
+    async getDirectoryHandle(name, opts) {
+        const create = !!(opts && opts.create);
+        const childRel = this.__childRel(name);
+        const exists = await this.__childExists(name, true);
+        if (!exists) {
+            if (!create) { const err = new Error('目录不存在: ' + name); err.name = 'NotFoundError'; throw err; }
+            const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/mkdir'), { projectDir: ovlRemoteProjectRoot(), path: childRel });
+            if (!data || data.ok !== true) throw new Error((data && data.error) || '创建远程目录失败');
+        }
+        return new OvlRemoteDirHandle(childRel, name);
+    }
+    async removeEntry(name, opts) {
+        const childRel = this.__childRel(name);
+        const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/delete'), { projectDir: ovlRemoteProjectRoot(), path: childRel });
+        if (!data || data.ok !== true) throw new Error((data && data.error) || '删除远程文件/目录失败');
+    }
+}
+
 async function ovlPickFolder() {
+    if (ovlIsRemoteBridge()) { await ovlRemotePickFolder(); return; }
     try {
         if (window.showDirectoryPicker) {
             let handle;
@@ -26739,6 +26890,181 @@ async function ovlPickFolder() {
         console.error('[ovl] pick folder failed', e);
         ovlShowTreeError('打开文件夹失败：' + (e && e.message ? e.message : String(e)));
     }
+}
+
+// 纯字符串算"上一级路径"，不发请求——服务端 /fs/list 本来就不允许把 projectDir 之外的
+// 路径当 projectDir 用（resolveInProject 的路径穿越防护），"上一级"只是把浏览器这边正在填
+// 的候选路径换成更短的一段，再用它整个重新当 projectDir 去 /fs/list('.')，不是真的"逃出"
+// 服务端限定的目录范围。
+function ovlRemoteParentPath(p) {
+    try {
+        let s = String(p || '').trim().replace(/[\\/]+$/, '');
+        if (!s) return '';
+        const sep = (s.indexOf('\\') !== -1 && s.indexOf('/') === -1) ? '\\' : '/';
+        const idx = s.lastIndexOf(sep);
+        if (idx < 0) return '';
+        if (idx === 0) return sep; // 根目录（POSIX "/"）
+        if (/^[A-Za-z]:$/.test(s.slice(0, idx))) return s.slice(0, idx) + sep; // Windows 盘符根，如 "E:\"
+        return s.slice(0, idx);
+    } catch (e) { return ''; }
+}
+
+// v2 Pass P50：远程模式下替代 showDirectoryPicker() 的入口——它会在桥所在的那台机器（比如
+// jump）上弹一个本机看不见的原生对话框，用户在家/在学校根本看不到那个窗口，点了等于没反应。
+// 这里换成"路径输入框 + 基于 POST /fs/list 的目录浏览"，全程走已经鉴权的 /fs/list，不新增
+// 桥接口。"打开项目文件夹…"按钮（ovlPickFolder 分流进来）和路径输入框旁边的"浏览"按钮
+// （ovlBrowseProjectFolder 分流进来）共用同一个弹窗——两者在远程模式下要做的事完全一样：
+// 选一个远程绝对路径，然后把文件树/项目路径都换成它。
+let OvlRemoteFolderDialogOnKey = null;
+function ovlRemoteFolderDialogClose() {
+    const overlay = document.getElementById('ovlModalOverlay');
+    if (overlay) { overlay.hidden = true; overlay.innerHTML = ''; }
+    if (OvlRemoteFolderDialogOnKey) { document.removeEventListener('keydown', OvlRemoteFolderDialogOnKey); OvlRemoteFolderDialogOnKey = null; }
+}
+
+function ovlRemotePickFolder() {
+    return new Promise(function (resolve) {
+        const overlay = document.getElementById('ovlModalOverlay');
+        if (!overlay) { resolve(); return; }
+        if (OvlRemoteFolderDialogOnKey) { document.removeEventListener('keydown', OvlRemoteFolderDialogOnKey); OvlRemoteFolderDialogOnKey = null; }
+        overlay.innerHTML = '';
+        overlay.hidden = false;
+
+        const box = document.createElement('div');
+        box.className = 'ovl-modal ovl-modal-wide';
+
+        const h = document.createElement('div');
+        h.className = 'ovl-modal-title';
+        h.id = 'ovlRemotePickTitle';
+        h.textContent = '选择远程项目文件夹';
+        box.appendChild(h);
+
+        const msg = document.createElement('div');
+        msg.className = 'ovl-modal-message';
+        msg.textContent = '桥接服务跑在远程机器上，这里选的是那台远程机器上的目录（不是你眼前这台电脑）。'
+            + '直接填绝对路径，或点下面的目录名逐级浏览。';
+        box.appendChild(msg);
+
+        const label = document.createElement('div');
+        label.className = 'ovl-modal-label';
+        label.textContent = '远程绝对路径';
+        box.appendChild(label);
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.id = 'ovlRemotePickInput';
+        input.className = 'ovl-modal-input';
+        let initial = ovlRemoteProjectRoot();
+        if (!initial) { try { initial = localStorage.getItem(ovlProjectPathLsKey()) || ''; } catch (e) { initial = ''; } }
+        input.value = initial;
+        input.placeholder = '例如 /home/xiaofanl/projects/AI-Translator';
+        box.appendChild(input);
+
+        const errEl = document.createElement('div');
+        errEl.className = 'ovl-modal-error';
+        errEl.id = 'ovlRemotePickError';
+        box.appendChild(errEl);
+
+        const listWrap = document.createElement('div');
+        listWrap.className = 'ovl-history-list';
+        listWrap.id = 'ovlRemotePickList';
+        listWrap.style.maxHeight = '260px';
+        listWrap.style.overflowY = 'auto';
+        box.appendChild(listWrap);
+
+        function renderError(text) { errEl.textContent = text || ''; }
+
+        function listCurrent() {
+            const p = input.value.trim();
+            renderError('');
+            listWrap.textContent = '';
+            if (!p) return;
+            const loading = document.createElement('div');
+            loading.className = 'ovl-tree-loading';
+            loading.textContent = '正在列出…';
+            listWrap.appendChild(loading);
+            ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: p, path: '.' }).then(function (data) {
+                listWrap.textContent = '';
+                if (!data || data.ok !== true) {
+                    renderError((data && data.error) || '列出目录失败——检查路径是否存在、桥是否在线、令牌是否正确');
+                    return;
+                }
+                const dirs = (Array.isArray(data.entries) ? data.entries : []).filter(function (e) { return e.isDir; });
+                const parent = ovlRemoteParentPath(p);
+                if (parent && parent !== p) {
+                    const upRow = document.createElement('div');
+                    upRow.className = 'ovl-history-row';
+                    upRow.style.cursor = 'pointer';
+                    upRow.textContent = '.. 上一级';
+                    upRow.addEventListener('click', function () { input.value = parent; listCurrent(); });
+                    listWrap.appendChild(upRow);
+                }
+                if (!dirs.length) {
+                    const empty = document.createElement('div');
+                    empty.className = 'ovl-history-empty';
+                    empty.textContent = '（没有子目录）';
+                    listWrap.appendChild(empty);
+                }
+                dirs.forEach(function (e) {
+                    const row = document.createElement('div');
+                    row.className = 'ovl-history-row';
+                    row.style.cursor = 'pointer';
+                    row.textContent = '📁 ' + e.name;
+                    row.addEventListener('click', function () {
+                        const sep = (p.indexOf('\\') !== -1 && p.indexOf('/') === -1) ? '\\' : '/';
+                        input.value = p.replace(/[\\/]+$/, '') + sep + e.name;
+                        listCurrent();
+                    });
+                    listWrap.appendChild(row);
+                });
+            }).catch(function (e) {
+                listWrap.textContent = '';
+                renderError('列出目录失败：' + (e && e.message ? e.message : String(e)));
+            });
+        }
+
+        const btnRow = document.createElement('div');
+        btnRow.className = 'ovl-modal-btns';
+        const listBtn = document.createElement('button');
+        listBtn.type = 'button'; listBtn.id = 'ovlRemotePickListBtn'; listBtn.className = 'ovl-modal-btn'; listBtn.textContent = '列出/刷新';
+        listBtn.addEventListener('click', listCurrent);
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button'; cancelBtn.id = 'ovlRemotePickCancelBtn'; cancelBtn.className = 'ovl-modal-btn'; cancelBtn.textContent = '取消';
+        const okBtn = document.createElement('button');
+        okBtn.type = 'button'; okBtn.id = 'ovlRemotePickOkBtn'; okBtn.className = 'ovl-modal-btn ovl-modal-btn-primary'; okBtn.textContent = '选择此文件夹';
+        btnRow.appendChild(listBtn); btnRow.appendChild(cancelBtn); btnRow.appendChild(okBtn);
+        box.appendChild(btnRow);
+        overlay.appendChild(box);
+
+        function close() { ovlRemoteFolderDialogClose(); resolve(); }
+        function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); close(); } }
+        cancelBtn.addEventListener('click', close);
+        overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
+        document.addEventListener('keydown', onKey);
+        OvlRemoteFolderDialogOnKey = onKey;
+
+        okBtn.addEventListener('click', function () {
+            const p = input.value.trim();
+            if (!p) { renderError('请先填写远程绝对路径'); return; }
+            okBtn.disabled = true;
+            ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: p, path: '.' }).then(function (data) {
+                okBtn.disabled = false;
+                if (!data || data.ok !== true) { renderError((data && data.error) || '这个路径打不开——检查是否存在/是否是目录'); return; }
+                const pathInput = document.getElementById('ovlProjectPathInput');
+                if (pathInput) pathInput.value = p;
+                try { localStorage.setItem(ovlProjectPathLsKey(), p); } catch (e2) {}
+                OvlState.usingWebkitFallback = false;
+                OvlState.dirHandle = new OvlRemoteDirHandle('.', ovlProjectHistoryBasename(p) || p);
+                ovlUpdateTreeToolbtnsVisibility();
+                Promise.resolve(ovlRenderTree(OvlState.dirHandle)).then(function () {
+                    try { ovlBridgeUpdateWatch(); } catch (e3) {}
+                }).catch(function () {});
+                close();
+            }).catch(function (e2) { okBtn.disabled = false; renderError('连接失败：' + (e2 && e2.message ? e2.message : String(e2))); });
+        });
+
+        if (input.value) listCurrent();
+    });
 }
 
 // ==================== M2：写回磁盘 + 脏标记 + 重开上次项目 ====================
@@ -26827,6 +27153,10 @@ function ovlLoadDirHandleFromIdb() {
 // 启动时（非阻塞）看一眼上次的项目还在不在，在的话给一个可点的"继续"提示，而不是自动接管——
 // 静默接管会在用户其实想开别的文件夹时产生一次多余的权限弹窗。
 function ovlOfferReopenLastProject() {
+    // v2 Pass P50：这份 IndexedDB 记的是原生 FileSystemDirectoryHandle，只可能来自本地磁盘——
+    // 远程模式下（当前桥地址不是 127.0.0.1）绝不能拿它去当"继续上次的项目"，那会把本机上一次
+    // 打开的本地文件夹句柄错当成远程项目呈现，两边路径体系完全不通用。
+    if (ovlIsRemoteBridge()) return;
     ovlLoadDirHandleFromIdb().then(function (handle) {
         if (!handle) return;
         return ovlQueryRW(handle).then(function (perm) { ovlShowReopenBanner(handle, perm); });
@@ -26898,7 +27228,15 @@ function ovlUpdateTreeToolbtnsVisibility() {
 // 选择器里选没选中同一个文件夹——这是架构接缝决定的，不是这里少做了什么。
 
 const OVL_PROJECT_HISTORY_LS_KEY = 'ovlProjectHistory'; // 已 grep -a 确认不撞 v1/v2 现有任何 localStorage key
+const OVL_PROJECT_HISTORY_LS_KEY_REMOTE = 'ovlProjectHistoryRemote';
 const OVL_PROJECT_HISTORY_MAX = 30;
+// v2 Pass P50：本地磁盘路径（FSA 打开的那台机器）和远程桥路径（桥所在的 jump 之类机器）根本
+// 不是同一个文件系统——两边存进同一份历史/"上次的项目"会互相污染（比如本地 E:\foo 和远程
+// /home/foo 混在一条列表里，或者更糟，远程模式下把本地那次的路径当远程路径去连）。用当前
+// 是否远程模式选不同的 localStorage key 隔开，本地模式的 key 字符串完全不变（跟这套隔离机制
+// 加入之前逐字节一致），只有远程模式会落到一个新 key 上。
+function ovlProjectHistoryLsKey() { return ovlIsRemoteBridge() ? OVL_PROJECT_HISTORY_LS_KEY_REMOTE : OVL_PROJECT_HISTORY_LS_KEY; }
+function ovlProjectPathLsKey() { return ovlIsRemoteBridge() ? 'ovl.bridgeProjectPathRemote' : 'ovl.bridgeProjectPath'; }
 // 本次页面会话里探测出"路径已不存在"的条目（存规范化后的 path），只用来在历史弹窗里画「失效」
 // 徽标——不落盘，下次刷新页面/重新探测会重新判定，避免一条过期的"失效"记录赖着不走。
 const OvlProjectHistoryInvalidPaths = new Set();
@@ -26928,7 +27266,7 @@ function ovlProjectHistoryBasename(p) {
 // 绝不能把异常抛到 boot 链路上（规格 §6 健壮性底线，本文件其它地方也是这个纪律）。
 function ovlProjectHistoryLoad() {
     try {
-        const raw = localStorage.getItem(OVL_PROJECT_HISTORY_LS_KEY);
+        const raw = localStorage.getItem(ovlProjectHistoryLsKey());
         if (!raw) return [];
         const list = JSON.parse(raw);
         if (!Array.isArray(list)) return [];
@@ -26937,7 +27275,7 @@ function ovlProjectHistoryLoad() {
 }
 
 function ovlProjectHistorySave(list) {
-    try { localStorage.setItem(OVL_PROJECT_HISTORY_LS_KEY, JSON.stringify(list)); }
+    try { localStorage.setItem(ovlProjectHistoryLsKey(), JSON.stringify(list)); }
     catch (e) { console.warn('[ovl] projectHistory save failed', e); }
 }
 
@@ -26962,7 +27300,7 @@ function ovlProjectHistoryAdd(opts) {
                 id: id,
                 name: (opts.name && String(opts.name).trim()) || ovlProjectHistoryBasename(path),
                 path: path,
-                kind: opts.kind === 'overleaf' ? 'overleaf' : 'local',
+                kind: opts.kind === 'overleaf' ? 'overleaf' : (opts.kind === 'remote' ? 'remote' : 'local'),
                 projectId: opts.projectId || null,
                 lastOpened: now
             });
@@ -27008,7 +27346,7 @@ function ovlProjectHistoryRecordLocalOpenFromInput() {
         const p = pathInput ? pathInput.value.trim() : '';
         if (!p) return;
         const name = (OvlState.dirHandle && OvlState.dirHandle.name) || ovlProjectHistoryBasename(p);
-        ovlProjectHistoryAdd({ name: name, path: p, kind: 'local' });
+        ovlProjectHistoryAdd({ name: name, path: p, kind: ovlIsRemoteBridge() ? 'remote' : 'local' });
     } catch (e) { console.warn('[ovl] record local open history failed', e); }
 }
 
@@ -27062,7 +27400,7 @@ function ovlProjectHistoryOpenEntry(entry, onClosed) {
         const pathInput = document.getElementById('ovlProjectPathInput');
         if (pathInput) {
             pathInput.value = entry.path;
-            try { localStorage.setItem('ovl.bridgeProjectPath', entry.path); } catch (e) {}
+            try { localStorage.setItem(ovlProjectPathLsKey(), entry.path); } catch (e) {}
         }
 
         ovlProjectHistoryProbePathExists(entry.path).then(function (exists) {
@@ -27081,7 +27419,7 @@ function ovlProjectHistoryOpenEntry(entry, onClosed) {
                     // 回去（跟 ovlOverleafCloneFinishNamed 收尾时同样的写法）。
                     if (pathInput) {
                         pathInput.value = entry.path;
-                        try { localStorage.setItem('ovl.bridgeProjectPath', entry.path); } catch (e) {}
+                        try { localStorage.setItem(ovlProjectPathLsKey(), entry.path); } catch (e) {}
                     }
                     try { ovlProjectHistoryAdd({ name: entry.name, path: entry.path, kind: entry.kind, projectId: entry.projectId }); } catch (e) {}
                 }
@@ -27289,7 +27627,7 @@ function ovlProjectHistoryMaybeAutoRestore() {
             const pathInput = document.getElementById('ovlProjectPathInput');
             if (pathInput) {
                 pathInput.value = last.path;
-                try { localStorage.setItem('ovl.bridgeProjectPath', last.path); } catch (e) {}
+                try { localStorage.setItem(ovlProjectPathLsKey(), last.path); } catch (e) {}
             }
         }).catch(function () {});
     } catch (e) { console.warn('[ovl] project history auto restore failed', e); }
@@ -28228,6 +28566,16 @@ function ovlBridgeOrigin() {
     } catch (e) { return OVL_BRIDGE_DEFAULT_ORIGIN; }
 }
 function ovlBridgeUrl(p) { return ovlBridgeOrigin() + p; }
+// v2 Pass P50：判定"远程模式"的唯一权威逻辑——跟桥自己 server.js 里的 REMOTE_MODE
+// （!/^(127\.0\.0\.1|localhost|::1)$/i.test(HOST)）保持同一条规则，前端这边只有这一处判断，
+// 文件树/打开/保存/WS 票据……所有分流点都调这个函数，不再各自重新判断一遍。
+function ovlIsRemoteBridge() {
+    try {
+        const origin = ovlBridgeOrigin();
+        const u = new URL(origin);
+        return !/^(127\.0\.0\.1|localhost|::1)$/i.test(u.hostname);
+    } catch (e) { return false; }
+}
 // 远程模式下所有会读写文件/触发外部动作的桥请求都要带令牌头（见 tools/latex-bridge/
 // server.js 的 tokenAuthorized）——统一在这一层加，调用点不用逐个改。本地默认地址下
 // OvlSettings.ovlBridgeToken 多半是空字符串，加不加这个头对本地桥（不校验令牌）无影响。
@@ -28458,7 +28806,7 @@ async function ovlDoRecompile(opts) {
         }
     }
 
-    try { localStorage.setItem('ovl.bridgeProjectPath', projectDir); } catch (e) {}
+    try { localStorage.setItem(ovlProjectPathLsKey(), projectDir); } catch (e) {}
     const mainFile = OvlState.mainDocFile || (OvlState.currentFile && OvlState.currentFile.name) || 'main.tex';
 
     // v2 Pass P14：桥接服务是直接读磁盘上的文件去编译的，请求体里压根没带编辑器内容
@@ -28568,6 +28916,11 @@ function ovlDownloadCompiledPdf() {
 // 弹原生 Windows 文件夹选择框，选完直接回填输入框 + 存 localStorage，跟原来手填走
 // 完全同一份持久化（key 不变），输入框本身继续保留当兜底（桥不在线/非 Windows 时还能手填）。
 async function ovlBrowseProjectFolder() {
+    // v2 Pass P50：这个按钮以前直接调桥的 POST /pick-folder，弹的是桥所在机器上的原生对话框——
+    // 远程模式下那台机器是 jump，用户在家/在学校根本看不到那个窗口，点了跟没反应一样（今天
+    // 刚因为这个排查过一次故障）。远程模式下换成同一套基于 /fs/list 的目录浏览弹窗，跟"打开
+    // 项目文件夹…"按钮共用 ovlRemotePickFolder()，选完直接把文件树也换掉，不用再点第二次。
+    if (ovlIsRemoteBridge()) { await ovlRemotePickFolder(); return; }
     const btn = document.getElementById('ovlBrowseFolderBtn');
     const pathInput = document.getElementById('ovlProjectPathInput');
     if (btn) btn.disabled = true;
@@ -28581,7 +28934,7 @@ async function ovlBrowseProjectFolder() {
         if (data.cancelled) return; // 用户自己关掉了对话框，什么都不用做，不算错误
         if (pathInput && data.path) {
             pathInput.value = data.path;
-            try { localStorage.setItem('ovl.bridgeProjectPath', data.path); } catch (e) {}
+            try { localStorage.setItem(ovlProjectPathLsKey(), data.path); } catch (e) {}
             ovlFlashSaveStatus('项目路径已设置为：' + data.path, false);
             ovlBridgeUpdateWatch(); // 路径刚补上，之前"缺路径所以没订阅"的情况这下可能解除了
         }
@@ -30017,7 +30370,7 @@ async function ovlOverleafCloneFinishNamed(projectId, data, name) {
     const pathInput = document.getElementById('ovlProjectPathInput');
     if (pathInput) {
         pathInput.value = data.dir;
-        try { localStorage.setItem('ovl.bridgeProjectPath', data.dir); } catch (e) {}
+        try { localStorage.setItem(ovlProjectPathLsKey(), data.dir); } catch (e) {}
         if (typeof ovlBridgeUpdateWatch === 'function') { try { ovlBridgeUpdateWatch(); } catch (e) {} }
     }
 
@@ -30033,7 +30386,7 @@ async function ovlOverleafCloneFinishNamed(projectId, data, name) {
         try { await ovlPickFolder(); } catch (e) { console.warn('[ovl] auto open cloned project failed', e); }
         if (pathInput && pathInput.value !== data.dir) {
             pathInput.value = data.dir;
-            try { localStorage.setItem('ovl.bridgeProjectPath', data.dir); } catch (e2) {}
+            try { localStorage.setItem(ovlProjectPathLsKey(), data.dir); } catch (e2) {}
         }
     }
 }
@@ -30072,9 +30425,37 @@ function ovlBridgeCloseWatch() {
     OvlBridgeWsPath = null;
 }
 
+// v2 Pass P50：换一次性 WS 票据——补 P49 遗留的已知缺口：磁盘变更推送这条 WebSocket 连接
+// 浏览器原生 API 加不了自定义请求头，没法像别的请求那样带令牌，REMOTE_MODE 下之前完全没鉴权
+// （tailnet 上任何人连上去都能实时看到项目文件在变、路径是什么）。这里先用长期令牌换一张
+// 60 秒短时、一次性的票据（票据本身走 HTTP POST /fs-ticket 请求体外层的令牌头鉴权，即
+// ovlBridgeFetch 自动加的那个），再把票据（不是长期令牌）拼进 WS 连接 URL——长期令牌永远
+// 只走请求头，绝不出现在任何 URL 里。只在远程模式换票，本地模式（桥不校验令牌）直接跳过，
+// 行为跟这套机制加入之前逐字节一致。
+function ovlBridgeFetchWsTicket() {
+    return ovlBridgeFetch(ovlBridgeUrl('/ws-ticket'), { method: 'POST' })
+        .then(function (resp) { return resp.json(); })
+        .then(function (data) { return (data && data.ok && data.ticket) ? data.ticket : null; })
+        .catch(function () { return null; });
+}
+
 function ovlBridgeConnectWs(absPath) {
+    if (ovlIsRemoteBridge()) {
+        ovlBridgeFetchWsTicket().then(function (ticket) {
+            if (OvlBridgeWsPath !== absPath) return; // 换票这段时间订阅目标已经变了，不连旧的
+            if (!ticket) return; // 换票失败（令牌不对/桥离线）——安静放弃，不影响核心编辑
+            ovlBridgeOpenWs(absPath, ticket);
+        });
+        return;
+    }
+    ovlBridgeOpenWs(absPath, null);
+}
+
+function ovlBridgeOpenWs(absPath, ticket) {
+    let wsUrl = ovlBridgeWsUrl();
+    if (ticket) wsUrl += (wsUrl.indexOf('?') === -1 ? '?' : '&') + 'ticket=' + encodeURIComponent(ticket);
     let ws;
-    try { ws = new WebSocket(ovlBridgeWsUrl()); } catch (e) { return; } // 浏览器层面建不出来——安静放弃，不影响核心编辑
+    try { ws = new WebSocket(wsUrl); } catch (e) { return; } // 浏览器层面建不出来——安静放弃，不影响核心编辑
     OvlBridgeWs = ws;
     ws.onopen = function () {
         OvlBridgeWsReconnectDelay = 1000; // 连上了，退避计时器归零
@@ -30658,9 +31039,9 @@ function ovlBindShell() {
             // 只写不读的老 bug：填过的路径存进了 localStorage，但从没人在启动时读回来，
             // 所以每次刷新页面这里都是空的，点编译就撞上"请先在上面填写项目绝对路径"——
             // 明明填过，只是没有被记住。ovlBindShell() 全程只在启动时调一次，这里补上读取。
-            try { projectPathInput.value = localStorage.getItem('ovl.bridgeProjectPath') || ''; } catch (e) {}
+            try { projectPathInput.value = localStorage.getItem(ovlProjectPathLsKey()) || ''; } catch (e) {}
             projectPathInput.addEventListener('change', function () {
-                try { localStorage.setItem('ovl.bridgeProjectPath', projectPathInput.value.trim()); } catch (e) {}
+                try { localStorage.setItem(ovlProjectPathLsKey(), projectPathInput.value.trim()); } catch (e) {}
                 // v2 Pass P17：路径手改了，之前"缺路径没订阅"可能解除，或者要订阅换成新路径下的同名文件。
                 if (typeof ovlBridgeUpdateWatch === 'function') { try { ovlBridgeUpdateWatch(); } catch (e) {} }
             });
@@ -32336,6 +32717,10 @@ async function ovlProjectDownloadZip() {
 async function ovlProjectMakeCopy() {
     if (!OvlState.dirHandle) { ovlFlashSaveStatus('请先打开项目文件夹', true); return; }
     if (OvlState.usingWebkitFallback) { ovlFlashSaveStatus('降级只读模式（webkitdirectory）下无法复制项目', true); return; }
+    // v2 Pass P50：目标文件夹靠 showDirectoryPicker() 选，这是浏览器本机原生对话框，只能选本机
+    // 目录——远程模式下源项目在桥所在的远程机器上，"选一个本机目录当远程项目的复制目标"这件事
+    // 本身不成立，明确禁用并说明原因，不让用户点了没反应。
+    if (ovlIsRemoteBridge()) { ovlFlashSaveStatus('远程模式下暂不支持「Make a copy」（目标文件夹选择器只能选本机目录，选不了远程机器上的路径）。请改用 Overleaf 同步，或直接在远程机器上手动复制。', true); return; }
     if (!window.showDirectoryPicker) { ovlFlashSaveStatus('这个浏览器不支持选择目标文件夹', true); return; }
     let destParent;
     try {
@@ -34606,7 +34991,7 @@ function ovlBoot() {
     // M3：项目绝对路径记忆值回填 + 探测桥接服务是否在线。探测失败不算 boot 失败——
     // 桥本来就是可选的，见 §3.1 第 3 条"桥离线不许让任何既有功能失效"。
     try {
-        const savedPath = localStorage.getItem('ovl.bridgeProjectPath');
+        const savedPath = localStorage.getItem(ovlProjectPathLsKey());
         const pathInput = document.getElementById('ovlProjectPathInput');
         if (savedPath && pathInput) pathInput.value = savedPath;
     } catch (e) {}

@@ -50,14 +50,16 @@ try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化�
 // v2 Pass P45：/health 里带的能力/版本自报——见该端点注释。每次给桥新增一个"前端需要能
 // 判断有没有"的能力（新端点、既有端点的行为变化），就在 BRIDGE_CAPABILITIES 里加一个字符串，
 // 版本号也提一位。已经上线的能力不会被撤销，这个数组只做加法。
-const BRIDGE_API_VERSION = 49;
+const BRIDGE_API_VERSION = 50;
 const BRIDGE_CAPABILITIES = [
     'overleaf-clone',          // POST /overleaf/clone
     'overleaf-pull-strategy',  // POST /overleaf/pull 认识 body.strategy（abort/stash/discard）
     'fs-ops',                  // POST /fs/list /fs/read /fs/write /fs/mkdir /fs/move /fs/copy /fs/delete /fs/restore
     'fs-capabilities',         // POST /fs/capabilities（只读能力探测）
     'overleaf-discard-checkpoint', // strategy=discard 丢弃前自动打旁路快照，响应带 checkpoint 字段
-    'remote-token-auth'        // v2 Pass P49：可绑非回环地址 + 令牌鉴权，见 tokenAuthorized()
+    'remote-token-auth',       // v2 Pass P49：可绑非回环地址 + 令牌鉴权，见 tokenAuthorized()
+    'fs-write-conflict-check', // v2 Pass P50：POST /fs/write 认识 body.expectedMtimeMs，冲突时返回 conflict:true
+    'ws-ticket-auth'           // v2 Pass P50：POST /ws-ticket 换一次性短时票据，REMOTE_MODE 下 WebSocket 握手强制校验
 ];
 
 // v2 Pass P49：监听地址可配（LATEX_BRIDGE_HOST），默认仍是 127.0.0.1——不传就跟以前
@@ -139,6 +141,41 @@ function tokenAuthorized(req) {
     const provided = req.headers[TOKEN_HEADER];
     if (!provided || typeof provided !== 'string') return false;
     return timingSafeEqualStr(provided, BRIDGE_TOKEN);
+}
+
+// ---------------------------------------------------------------------------
+// v2 Pass P50：WebSocket 一次性短时票据存储。REMOTE_MODE 下磁盘变更推送这条 WS 连接原本完全
+// 没鉴权（浏览器 WebSocket API 加不了自定义请求头，长期令牌没法像 HTTP 请求那样走请求头带过
+// 去）——票据只解决"连接建立时怎么证明你是持有令牌的人"，不是长期令牌的替代品：一次性（用过
+// 即从 Map 里删掉）、60 秒短时效、只在 REMOTE_MODE 下强制校验，本地模式（REMOTE_MODE=false）
+// WS 连接不受影响，跟没有这套机制之前逐字节一致。
+// ---------------------------------------------------------------------------
+// LATEX_BRIDGE_WS_TICKET_TTL_MS 仅供测试用（缩短过期时间验证"过期票据被拒"，不用真等 60 秒）：
+// 不传时行为跟没有这个覆盖变量之前完全一样，还是硬编码 60000ms。
+const WS_TICKET_TTL_MS = process.env.LATEX_BRIDGE_WS_TICKET_TTL_MS ? parseInt(process.env.LATEX_BRIDGE_WS_TICKET_TTL_MS, 10) : 60000;
+const wsTickets = new Map(); // ticket -> expiresAt(ms)
+
+function pruneExpiredWsTickets() {
+    const now = Date.now();
+    for (const [t, exp] of wsTickets) { if (exp <= now) wsTickets.delete(t); }
+}
+
+function createWsTicket() {
+    pruneExpiredWsTickets();
+    const ticket = crypto.randomBytes(24).toString('hex');
+    wsTickets.set(ticket, Date.now() + WS_TICKET_TTL_MS);
+    return ticket;
+}
+
+// 一次性：不管校验成不成功，只要 Map 里存在这个 key 就先删掉——防止同一张票被并发/重放使用
+// 第二次（"检查完再删"之间有窗口期，这里改成"先取出再检查"，取的动作本身就是消费）。
+function consumeWsTicket(ticket) {
+    if (!ticket || typeof ticket !== 'string') return false;
+    const exp = wsTickets.get(ticket);
+    wsTickets.delete(ticket);
+    if (!exp) return false;
+    if (exp <= Date.now()) return false;
+    return true;
 }
 
 // /health 是唯一豁免令牌校验的端点（前端要靠它探活，探活本身不该要求先有令牌）；
@@ -1769,16 +1806,33 @@ async function doFsRead(projectDir, relPath) {
     return { ok: true, path: relPath, size: st.size, binary: false, content: buf.toString('utf8'), mtimeMs: st.mtimeMs };
 }
 
-async function doFsWrite(projectDir, relPath, content) {
+// v2 Pass P50：expectedMtimeMs 是可选的乐观并发冲突检测——远程模式下浏览器读到的文件内容
+// 跟真正落盘之间可能隔了任意长时间（用户切走标签页、断网重连……），这段时间里别人（或用户
+// 自己另一个标签页）可能已经改过磁盘上的同一个文件；不检测直接写会把对方的修改静默覆盖掉。
+// 只在调用方明确传了这个数字时才检查（新建文件等场景不传，语义上"不关心冲突"）；文件此刻
+// 不存在时不算冲突（新建场景），只有"文件存在且 mtime 跟调用方读到时不一致"才判冲突。
+async function doFsWrite(projectDir, relPath, content, expectedMtimeMs) {
     const r = resolveInProject(projectDir, relPath);
     if (!r.ok) return { ok: false, error: r.error };
     if (typeof content !== 'string') return { ok: false, error: 'content 必须是字符串' };
+    if (typeof expectedMtimeMs === 'number' && isFinite(expectedMtimeMs)) {
+        let curStat = null;
+        try { curStat = fs.statSync(r.resolved); } catch (e) { curStat = null; }
+        if (curStat && curStat.mtimeMs !== expectedMtimeMs) {
+            return {
+                ok: false, conflict: true, currentMtimeMs: curStat.mtimeMs,
+                error: '文件已被外部修改（磁盘上的 mtime 跟你上次读取时不一致），为避免覆盖对方的修改，本次保存已取消。'
+            };
+        }
+    }
     const cp = await fsGitCheckpoint(projectDir, 'write ' + relPath);
     try { fs.mkdirSync(path.dirname(r.resolved), { recursive: true }); }
     catch (e) { return Object.assign({ ok: false, error: '创建父目录失败: ' + e.message }, checkpointFields(cp)); }
     try { fs.writeFileSync(r.resolved, content, 'utf8'); }
     catch (e) { return Object.assign({ ok: false, error: '写入失败: ' + e.message }, checkpointFields(cp)); }
-    return Object.assign({ ok: true, path: relPath, bytesWritten: Buffer.byteLength(content, 'utf8') }, checkpointFields(cp));
+    let newMtimeMs = null;
+    try { newMtimeMs = fs.statSync(r.resolved).mtimeMs; } catch (e) {}
+    return Object.assign({ ok: true, path: relPath, bytesWritten: Buffer.byteLength(content, 'utf8'), mtimeMs: newMtimeMs }, checkpointFields(cp));
 }
 
 async function doFsMkdir(projectDir, relPath) {
@@ -2064,7 +2118,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete, POST /fs/restore, POST /fs/capabilities. WebSocket on same host:port for disk-change push.');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete, POST /fs/restore, POST /fs/capabilities, POST /ws-ticket. WebSocket on same host:port for disk-change push.');
             return;
         }
 
@@ -2315,7 +2369,7 @@ const server = http.createServer(async (req, res) => {
             }
             if (pathname === '/fs/write') {
                 if (!body.path || typeof body.path !== 'string') { sendJson(res, 400, { ok: false, error: 'path is required' }); return; }
-                sendJson(res, 200, await doFsWrite(projectDir, body.path, body.content));
+                sendJson(res, 200, await doFsWrite(projectDir, body.path, body.content, body.expectedMtimeMs));
                 return;
             }
             if (pathname === '/fs/move') {
@@ -2425,6 +2479,16 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
+        // v2 Pass P50：WebSocket 一次性短时票据——磁盘变更推送这条 WS 连接，浏览器原生 WebSocket
+        // API 加不了自定义请求头，没法带令牌，REMOTE_MODE 下之前是完全没鉴权的（tailnet 上任何人
+        // 连上去都能实时看到项目里哪些文件在变、路径是什么）。这个端点本身走上面统一的令牌闸门
+        // （不在 TOKEN_EXEMPT_PATHS 里），换票据必须先有效令牌；票据本身只在 WS 连接 URL 里出现，
+        // 一次性、60 秒过期，绝不是长期令牌的替代品——长期令牌永远只走请求头，不出现在任何 URL。
+        if (req.method === 'POST' && pathname === '/ws-ticket') {
+            sendJson(res, 200, { ok: true, ticket: createWsTicket(), expiresInMs: WS_TICKET_TTL_MS });
+            return;
+        }
+
         sendJson(res, 404, { ok: false, error: 'no such route: ' + req.method + ' ' + pathname });
     } catch (err) {
         sendJson(res, 500, { ok: false, error: 'internal error: ' + (err && err.message) });
@@ -2486,7 +2550,22 @@ function attachWatcher(ws, filePath) {
 
 if (WebSocket && WebSocket.Server) {
     const wss = new WebSocket.Server({ server: server });
-    wss.on('connection', function (ws) {
+    wss.on('connection', function (ws, req) {
+        // v2 Pass P50：REMOTE_MODE 下握手时校验一次性票据（见上面 wsTickets 那段注释）——票据从
+        // 连接 URL 的查询串里取，绝不是长期令牌本身。本地模式（REMOTE_MODE=false）完全不检查，
+        // 跟这套机制加入之前行为逐字节一致。校验不过直接关闭连接，不建立 watch，不回任何消息
+        // （避免把"票据是否存在/是否过期"这类细节回显给未认证的连接方）。
+        if (REMOTE_MODE) {
+            let ticket = '';
+            try {
+                const wsUrl = new URL(req.url, 'http://' + HOST + ':' + PORT);
+                ticket = wsUrl.searchParams.get('ticket') || '';
+            } catch (e) { ticket = ''; }
+            if (!consumeWsTicket(ticket)) {
+                try { ws.close(4401, 'invalid or expired ticket'); } catch (e) {}
+                return;
+            }
+        }
         ws.on('message', function (raw) {
             let msg;
             try { msg = JSON.parse(raw.toString('utf8')); } catch (e) { return; } // 畸形消息直接丢弃，不断连接
