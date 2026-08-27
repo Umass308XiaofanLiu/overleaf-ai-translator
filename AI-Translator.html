@@ -27858,7 +27858,14 @@ function ovlIndentSelection(delta) {
 const OvlCmds = {
     'edit.undo':      { label: '撤销',   key: 'Ctrl+Z',       run: ovlCmdUndo, enabled: () => OvlState.editorMode === 'code' },
     'edit.redo':      { label: '重做',   key: 'Ctrl+Shift+Z', run: ovlCmdRedo, enabled: () => OvlState.editorMode === 'code' },
-    'edit.find':      { label: '查找/替换', key: 'Ctrl+F',    run: () => ovlFindOpen(), enabled: () => OvlState.editorMode === 'code' },
+    // v2 Pass P46：曾经写成 enabled: () => OvlState.editorMode === 'code'，跟 edit.undo/redo/
+    // selectAll 那几个"必须往可见 textarea 里插字"的命令抄了同一个条件，但查找/替换其实不需要
+    // textarea 可见——ovlFindRecompute/ovlFindSelectCurrent 全程只用 ta.value + setSelectionRange，
+    // P37 早就把 ovlMarkLines 改成自动识别 Code/Visual 两种高亮方式了。按钮和 Ctrl+F 两个入口
+    // 都单一走 ovlRunCmd('edit.find') 这一个 enabled() 门，Visual 模式下这个门一直判 false，
+    // 于是两个入口"同时点了没反应"（无异常、无提示，ovlRunCmd 静默 return）。真正需要的只是
+    // "有文件在编辑"，不是"当前是 Code 视图"。
+    'edit.find':      { label: '查找/替换', key: 'Ctrl+F',    run: () => ovlFindOpen(), enabled: () => { const ta = document.getElementById('ovlCodeArea'); return !!(ta && !ta.disabled); } },
     // M8b Edit「Select all」：走原生 ta.select()，不是自己维护的选区状态。
     'edit.selectAll': { label: '全选',   key: 'Ctrl+A', run: () => { const ta = ovlFocusTa(); if (ta) ta.select(); }, enabled: () => OvlState.editorMode === 'code' },
     'fmt.bold':       { label: '加粗',   key: 'Ctrl+B', run: () => ovlWrapSelection('\\textbf{', '}'), enabled: ovlEditableEnabled },
@@ -28044,11 +28051,23 @@ function ovlReplaceCurrent() {
         if (!ta || ta.disabled || !replaceInput) return;
         if (OvlFindState.idx < 0 || !OvlFindState.matches[OvlFindState.idx]) { ovlFindNext(); return; }
         const r = OvlFindState.matches[OvlFindState.idx];
+        // v2 Pass P46：Visual 模式下 #ovlCodeArea 是 display:none，focus() 在隐藏元素上是
+        // no-op，紧跟着的 execCommand('insertText') 因为没有真正的焦点元素同样悄悄什么都不做——
+        // 查找能跳转/高亮（只用 setSelectionRange，不需要可见）,但替换会静默失效。跟
+        // ovlEditorApplyReplace（约 33547 行）同一个套路：写之前临时摘掉 display:none，写完立刻
+        // 盖回去，全程同步执行不过渲染帧，用户看不到闪烁。
+        const wasHidden = ta.style.display === 'none';
+        if (wasHidden) ta.style.display = '';
         ta.focus();
         ta.setSelectionRange(r[0], r[1]);
         document.execCommand('insertText', false, replaceInput.value);
+        if (wasHidden) ta.style.display = 'none';
         ovlRenderGutter(false);
         ovlFindRecompute(true);
+        // Visual 面板是从 ta.value 整体重渲的只读预览，替换只改了底层 textarea，这里补一次
+        // 重渲染，不然用户在 Visual 模式下点"替换"看不到任何变化（跟 P46 的报错现象是同一类：
+        // 数据其实改了，但可见的地方没跟着动）。
+        if (OvlState.editorMode === 'visual' && typeof ovlVisualRender === 'function') ovlVisualRender();
     } catch (e) { console.error('[ovl] replaceCurrent failed', e); }
 }
 
@@ -28076,11 +28095,16 @@ function ovlReplaceAll() {
         const newMid = mid.replace(re, repl);
         const newText = before + newMid + after;
         if (newText === text) { ovlFindRecompute(false); return; }
+        // v2 Pass P46：同 ovlReplaceCurrent 的理由，Visual 模式下 ta 是 display:none 不可聚焦。
+        const wasHidden = ta.style.display === 'none';
+        if (wasHidden) ta.style.display = '';
         ta.focus();
         ta.setSelectionRange(0, ta.value.length);
         document.execCommand('insertText', false, newText);
+        if (wasHidden) ta.style.display = 'none';
         ovlRenderGutter(true);
         ovlFindRecompute(false);
+        if (OvlState.editorMode === 'visual' && typeof ovlVisualRender === 'function') ovlVisualRender();
     } catch (e) { console.error('[ovl] replaceAll failed', e); }
 }
 
