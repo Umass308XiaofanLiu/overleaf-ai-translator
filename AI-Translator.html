@@ -1507,18 +1507,38 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 }
 .ovl-mode-toggle label.ovl-mode-active { background: #098842; color: #ffffff; }
 
-/* v2 Pass P38：Visual 语言切换（Original/Chinese）下拉触发按钮 + 懒翻译进度提示。
-   按钮外观照抄工具条其它 icon 按钮的尺寸手感，菜单本体复用 .ovl-layout-menu（见该规则）。 */
-.ovl-visual-lang-btn {
-    flex: 0 0 auto;
-    margin-left: 4px;
-    width: 20px; height: 22px;
-    border: none; border-radius: 4px;
-    background: transparent; color: #C7CCD6;
-    font-size: 10px; line-height: 1; cursor: pointer;
-    display: inline-flex; align-items: center; justify-content: center;
+/* v2 Pass P48：三角挪进 Visual 按钮内部——右侧约 1/4 宽度划成独立的点击区，不再是 Visual
+   胶囊右边的一颗独立按钮。DOM 上 .ovl-visual-lang-btn 仍是 <label data-mode="visual"> 的
+   **兄弟节点**（都挂在 .ovl-mode-visual-wrap 下面），刻意不嵌进 <label> 内部——<label> 是
+   labelable-element 的默认转发目标之一，一旦把 <button> 嵌进 <label>，点 label 左侧 3/4 的
+   纯文字区域时浏览器会连带对嵌套的 button 触发一次合成 click（经典"点文字激活内部控件"
+   行为），会把"切模式"和"开菜单"两个动作意外绑在一起。改成同级 + 绝对定位叠在视觉右侧，
+   两个真实点击目标互不重叠、天然分区，不用在 JS 里额外判断"点的是不是三角"。
+   宽度用 .ovl-mode-visual-wrap 的固定 22px（label 本身文字+左右 padding 撑出的整体宽度
+   实测约 84px 上下，22px 落在这个宽度的 1/4 左右）。 */
+.ovl-mode-visual-wrap {
+    position: relative;
+    display: inline-flex;
 }
-.ovl-visual-lang-btn:hover:not(:disabled) { background: #495365; }
+.ovl-mode-toggle label[data-mode="visual"] {
+    /* 右侧给三角腾出空间，文字不会被三角盖住。 */
+    padding-right: 24px;
+}
+.ovl-visual-lang-btn {
+    position: absolute;
+    top: 1px; right: 1px; bottom: 1px;
+    width: 22px;
+    border: none;
+    /* 一条淡分隔线暗示这是按钮内部的一个分区，而不是完全独立的按钮。 */
+    border-left: 1px solid rgba(255, 255, 255, .3);
+    border-radius: 0 9999px 9999px 0;
+    background: transparent; color: #F1F3F7;
+    /* 比原来的 10px 明显放大——用户明确要求"做大一些明显一些"。 */
+    font-size: 16px; font-weight: 700; line-height: 1; cursor: pointer;
+    display: inline-flex; align-items: center; justify-content: center;
+    padding: 0; margin: 0;
+}
+.ovl-visual-lang-btn:hover:not(:disabled) { background: rgba(255, 255, 255, .2); }
 .ovl-visual-lang-btn:disabled { opacity: .35; cursor: not-allowed; }
 .ovl-visual-lang-btn.ovl-visual-lang-active { color: #4ade80; }
 .ovl-visual-lang-progress {
@@ -22959,14 +22979,20 @@ function ovlShellHtml() {
         +       '<div class="ovl-toolbar-pinned">'
         +         '<div class="ovl-mode-toggle" id="ovlModeToggle">'
         +           '<label data-mode="code" class="ovl-mode-active">Code</label>'
-        +           '<label data-mode="visual">Visual</label>'
+        // v2 Pass P48：语言下拉三角挪进 Visual 按钮内部（右侧约 1/4 区域），不再是胶囊右边的
+        // 独立按钮——.ovl-visual-lang-btn 跟 <label data-mode="visual"> 是 .ovl-mode-visual-wrap
+        // 下的同级节点，靠绝对定位叠在视觉右侧，见约 1512 行 CSS 大注释：故意不嵌进 <label>
+        // 内部，避开 label 对内部 labelable 元素的默认点击转发。
+        +           '<span class="ovl-mode-visual-wrap">'
+        +             '<label data-mode="visual">Visual</label>'
+        // v2 Pass P38：Visual 显示语言切换（Original/Chinese）——点开下拉选 Original/Chinese。
+        // 只在 Visual 模式下有意义，Code 模式下置灰（ovlSetEditorMode 里同步 disabled，见约
+        // 23461 行附近），这条既有语义 P48 未改。
+        +             '<button type="button" class="ovl-visual-lang-btn" id="ovlVisualLangBtn" disabled'
+        +               ' data-tip="Visual 显示语言：Original / Chinese" data-tip-pos="bottom">&#9662;</button>'
+        +           '</span>'
         +         '</div>'
-        // v2 Pass P38：Visual 显示语言切换（Original/Chinese）——紧贴在 Code/Visual 切换胶囊右侧
-        // 的一颗倒三角小按钮，点开下拉选 Original/Chinese。只在 Visual 模式下有意义，Code 模式
-        // 下置灰（ovlSetEditorMode 里同步 disabled，见约 23461 行附近）。进度提示紧跟在按钮右侧，
-        // 没有翻译在跑时用 hidden 隐藏，不占位置。
-        +         '<button type="button" class="ovl-visual-lang-btn" id="ovlVisualLangBtn" disabled'
-        +           ' data-tip="Visual 显示语言：Original / Chinese" data-tip-pos="bottom">&#9662;</button>'
+        // 进度提示紧跟在整个 Code/Visual 胶囊右侧，没有翻译在跑时用 hidden 隐藏，不占位置。
         +         '<span class="ovl-visual-lang-progress" id="ovlVisualLangProgress" hidden></span>'
         // M10 SyncTeX 正向（源码 -> PDF）：真跑 tools/latex-bridge 的 synctex.exe view 子命令
         // （§2.6.10）。没有编译产物时禁用。v2 Pass P16 起反向（PDF -> 源码）也做出来了——
@@ -30080,6 +30106,43 @@ async function ovlBridgeHandleExternalChange(msg) {
     ovlFlashSaveStatus('已从磁盘同步外部改动', false);
 }
 
+// v2 Pass P48：正向 SyncTeX"总是跳到固定页"的根因——#ovlCodeArea 在 Visual 模式下是
+// display:none（见 ovlSetEditorMode），用户在 Visual 面板里点/选的东西根本不会去更新这个
+// 隐藏 textarea 的 selectionStart，它会停在很早以前的某个旧值，不管 Visual 里选哪个块都是
+// 同一个数——2026-08-27 用真实 CDP 点击两个不同块实测复现：两次点击发给桥的 line 逐字节
+// 相同（恒为同一个值），跟用户反馈"总是定位到固定页"完全吻合。
+// 这里按当前编辑器模式分别取"用户真正在关注哪一行"：
+//   Visual：选区/光标落在哪个 .ovl-visual-block，就用它的 data-src-line——P29 起每块都带
+//           精确的源码行区间，是现成、可靠的，不用像 ovlLocateVisualPick 那样反查文字。
+//           data-src-line 是 0-based（跟 ovlMarkLines 的 0-based 约定同一套，见 bodyStartLine
+//           那行 (src.slice(0,bodyStart).match(/\n/g)||[]).length 的算法），+1 换算成
+//           textarea/桥这边的 1-based 行号。
+//   Code：沿用 textarea 光标所在行——这条原逻辑本来就是对的，不用换。
+// 两种都取不到（比如 Visual 面板压根没选中任何东西）就返回 null，调用方要显式告诉用户，
+// 不能悄悄退化成第 1 行。
+function ovlSyncTexCurrentLine() {
+    if (OvlState.editorMode === 'visual') {
+        try {
+            const pane = document.getElementById('ovlVisualPane');
+            if (!pane) return null;
+            const sel = ovlWinOf(pane).getSelection();
+            if (!sel || sel.rangeCount === 0) return null;
+            let node = sel.anchorNode;
+            if (!node) return null;
+            if (node.nodeType !== 1) node = node.parentElement;
+            if (!node || !pane.contains(node)) return null;
+            const block = node.closest ? node.closest('.ovl-visual-block[data-src-line]') : null;
+            if (!block) return null;
+            const line0 = parseInt(block.getAttribute('data-src-line'), 10);
+            return isFinite(line0) ? (line0 + 1) : null;
+        } catch (e) { return null; }
+    }
+    const ta = document.getElementById('ovlCodeArea');
+    if (!ta || ta.disabled) return null;
+    const before = ta.value.slice(0, ta.selectionStart);
+    return before.split('\n').length;
+}
+
 // ---- M10 SyncTeX 正向（源码 -> PDF），§2.6.10 ----
 // 真跑桥的 /synctex/forward（桥内部调 TeX Live 自带的 synctex.exe view，本机 2026-08-24 实测
 // 走通，见 tools/latex-bridge/server.js 的 doSyncTexForward）。只做到页级跳转——v2 Pass D 那时
@@ -30098,9 +30161,16 @@ async function ovlSyncTexForward() {
         const pathInput = document.getElementById('ovlProjectPathInput');
         const projectDir = pathInput ? pathInput.value.trim() : '';
         if (!ta || ta.disabled || !projectDir) { ovlFlashSaveStatus('请先打开一个 .tex 文件并填好项目绝对路径', true); return; }
-        const before = ta.value.slice(0, ta.selectionStart);
-        const line = before.split('\n').length;
-        const mainFile = OvlState.mainDocFile || (OvlState.currentFile && OvlState.currentFile.name) || 'main.tex';
+        const line = ovlSyncTexCurrentLine();
+        if (line == null) { ovlFlashSaveStatus('请先在左栏点一下你要定位的位置', true); return; }
+        // v2 Pass P48：这里要传的是"这一行实际所在的那个文件"，不是项目的主文档——synctex 的
+        // `-i line:col:name` 只按 name 在已编译的 synctex 数据库里查 line 对应哪一页，用户如果
+        // 正在编辑一个被 \input 进主文档的子文件，行号是相对这个子文件数的，配上主文档文件名
+        // 会文件名/行号对不上（要么查到风马牛不相及的位置，要么直接报"No tag"）。mainDocFile
+        // 只在"要不要真的调 pdflatex 编译"这类场景下才该优先（doDoRecompile/word count 那两处
+        // 保持原样不动），正向定位这里改成"当前正打开/编辑的文件优先"，没有才退回
+        // mainDocFile/main.tex 兜底。
+        const mainFile = (OvlState.currentFile && OvlState.currentFile.name) || OvlState.mainDocFile || 'main.tex';
         ovlFlashSaveStatus('正在定位 PDF 页面…', false);
         const resp = await fetch(ovlBridgeUrl('/synctex/forward'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -30110,6 +30180,10 @@ async function ovlSyncTexForward() {
         if (!data || !data.ok) { ovlFlashSaveStatus('SyncTeX 定位失败：' + (data && data.error ? data.error : '未知错误'), true); return; }
         if (OvlState.viewMode === 'editor') ovlSetViewMode('split');
         ovlPdfSetPage(data.page);
+        // v2 Pass P48：翻页之外顺手用 P37 的 ovlMarkLines 把左栏对应的源码行黄色高亮一次，
+        // 跟反向 SyncTeX（双击 PDF 跳回源码那一行会高亮）的体验对称。ovlMarkLines 要 0-based
+        // 行号，line 是上面 ovlSyncTexCurrentLine() 换算出来的 1-based，这里减回去。
+        if (typeof ovlMarkLines === 'function') ovlMarkLines(line - 1, line - 1, { source: 'synctex-forward' });
         ovlFlashSaveStatus('已跳到 PDF 第 ' + data.page + ' 页（SyncTeX 正向只做到页级，见按钮的 tooltip）', false);
     } catch (e) {
         console.error('[ovl] syncTexForward failed', e);
