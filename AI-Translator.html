@@ -2127,6 +2127,11 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-findtoggle:hover { background: #e2e8f0; }
 .ovl-findtoggle.ovl-active { background: #c7d2fe; color: #3730a3; border-color: #a5b4fc; }
 .ovl-findcount { font-size: 11px; color: #64748b; min-width: 46px; text-align: center; white-space: nowrap; }
+/* v2 Pass P68：查找降级提示（中文预览下回落到源码搜索、且只能定位到整段时显式提示，
+   不许再默默画一个大黄框）——hidden 属性控制显隐，空文本时 JS 也会补一次 hidden。 */
+.ovl-findhint-row { padding-top: 2px; }
+.ovl-findhint { font-size: 11px; color: #b45309; }
+.ovl-findhint[hidden] { display: none; }
 .ovl-findbtn {
     height: 24px;
     padding: 0 8px;
@@ -23127,6 +23132,11 @@ function ovlShellHtml() {
         +         '<button type="button" class="ovl-findbtn" id="ovlReplaceBtn">Replace</button>'
         +         '<button type="button" class="ovl-findbtn" id="ovlReplaceAllBtn">Replace All</button>'
         +       '</div>'
+        // v2 Pass P68：Visual 中文模式下"回落到源码搜索、但只能定位到整段"这种静默降级必须
+        // 显式告诉用户（原来的整块兜底是无声的黄色大框，用户根本发现不了自己搜的词其实没被
+        // 精确定位到——这个 bug 拖到今天才被用户实测发现，就是因为它太安静了）。默认隐藏，
+        // 只在 ovlFindSelectCurrent 判定确实降级时才填字 + 显示，见该函数。
+        +       '<div class="ovl-findbar-row ovl-findhint-row"><span class="ovl-findhint" id="ovlFindHint" hidden></span></div>'
         +     '</div>'
         +     '<div class="ovl-editor-body">'
         +       '<div class="ovl-gutter" id="ovlGutter"></div>'
@@ -26464,7 +26474,11 @@ function ovlBindVisualSelOverlay() {
 // null=当前是纯行级标记（ovlMarkLines 的调用方，或字符级映射失败退化）；非 null=还应该尝试
 // 按字符精度重画（ovlRepaintMarkOverlay 每次滚动/切模式都会用它现算，不缓存 DOM Range——
 // pane.innerHTML 整篇重写后旧 Range 就是野指针，必须每次从 rangeChars 现算）。
-const OvlMarkState = { lineFrom: -1, lineTo: -1, rangeChars: null };
+// zhVisualRec：P68 新增——Visual 中文模式下查找命中的是"块 + 命中文字 + 块内第几次出现"
+// 而不是源码字符偏移（中文渲染文字在英文源码里没有对应位置），null=当前不是这种命中；
+// 非 null=重画（ovlRepaintMarkOverlay）时优先按这个三元组重新在渲染 DOM 里定位，画法/兜底
+// 跟 rangeChars 那套字符级重画平行独立，互不冲突（同一时刻只有一个非 null）。
+const OvlMarkState = { lineFrom: -1, lineTo: -1, rangeChars: null, zhVisualRec: null };
 
 // v2 Pass P45：用户反馈黄色高亮"1 分钟后自动消失"——约 60 秒后开始淡出（CSS transition，
 // 见 #ovlVisualMarkOverlay/#ovlCodeMarkOverlay 的 .ovl-mark-fadeout 规则，约 1664 行附近），
@@ -26523,6 +26537,7 @@ function ovlClearMarkOverlay() {
     OvlMarkState.lineFrom = -1;
     OvlMarkState.lineTo = -1;
     OvlMarkState.rangeChars = null;
+    OvlMarkState.zhVisualRec = null;
     ovlMarkClearFadeTimers();
     ovlMarkResetFadeVisual();
     ovlClearCodeMarkOverlay();
@@ -26651,21 +26666,30 @@ function ovlPaintVisualMarkOverlay() {
 // 词在段落里第 N 次出现，源码里数的次序跟"mathml/html 混在一起"的渲染次序对不上。这里显式
 // 跳过 .katex-mathml 子树，只在真正可见的那份渲染里数次序、定位——用一个真实 $jammer$ 公式
 // 结合 ovlVisualFindTextRangeInBlock 实测验证过跳过前/跳过后的行为差异。
+// P68：跳过 .katex-mathml 的 TreeWalker 遍历抽成公共helper——原来只有 ovlVisualFindTextRangeInBlock
+// 一个调用点，P68 新增的中文可见文字查找（ovlFindCollectZhMatches）需要同一份"用户看得见的
+// 文字"，不重新写一遍这套坑（katex-mathml 隐藏副本会污染文字拼接，上面那段注释详细解释）。
+function ovlVisualCollectBlockVisibleText(blockEl) {
+    const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
+        acceptNode: function (n) {
+            return (n.parentElement && n.parentElement.closest('.katex-mathml'))
+                ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
+        }
+    });
+    const nodes = [];
+    let concat = '', node;
+    while ((node = walker.nextNode())) {
+        nodes.push({ node: node, start: concat.length });
+        concat += node.nodeValue;
+    }
+    return { nodes: nodes, text: concat };
+}
+
 function ovlVisualFindTextRangeInBlock(blockEl, matchedText, occurrenceIndex) {
     try {
         if (!matchedText) return null;
-        const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
-            acceptNode: function (n) {
-                return (n.parentElement && n.parentElement.closest('.katex-mathml'))
-                    ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
-            }
-        });
-        const nodes = [];
-        let concat = '', node;
-        while ((node = walker.nextNode())) {
-            nodes.push({ node: node, start: concat.length });
-            concat += node.nodeValue;
-        }
+        const collected = ovlVisualCollectBlockVisibleText(blockEl);
+        const nodes = collected.nodes, concat = collected.text;
         if (!concat) return null;
         let searchFrom = 0, found = -1;
         for (let i = 0; i <= occurrenceIndex; i++) {
@@ -26689,6 +26713,77 @@ function ovlVisualFindTextRangeInBlock(blockEl, matchedText, occurrenceIndex) {
         range.setEnd(e.node, Math.max(0, Math.min(e.node.nodeValue.length, e.offset)));
         return range;
     } catch (e) { return null; }
+}
+
+// ==================== v2 Pass P68 修复 2：occurrenceIndex 的计数基准对齐渲染文字 ====================
+// 根因（诊断见 .claude/tmp/p68_diagnosis.md）：下面 occurrenceIndex 原来直接在"整段源码
+// blockText"里数第几次出现，但真正定位（ovlVisualFindTextRangeInBlock）是在"渲染后可见
+// 文字"里数第几次出现——命中词若同时出现在 \label{}/\ref{} 系列的参数里，或者 % 注释里
+// （P61 起注释确定性不渲染），源码计数会比渲染计数偏大，两边对不上号，轻则退回整块（不算错，
+// 但没利用上字符级精度），重则**定位到错误的一次真实出现**（用户会以为跳错地方，比"整块
+// 高亮"更糟）。
+// 选定的统一基准：跳过源码里"确定不会渲染成可见文字"的区间（注释 + \label/\ref 系列命令的
+// 参数花括号）之后再数出现次数——不需要真的跑一遍 LatexFilter/KaTeX 渲染管线（太重，且渲染
+// 结果的字符边界跟源码字符边界本来就不对齐，没法反过来精确映射），只需要排除这几类"源码里
+// 有、渲染绝不出现"的已知构造，跟 ovlStripLatexCommentsForRender 同一条"确定性剥离而非
+// 启发式猜测"的纪律。命中本身（matchedText 自己）如果恰好落在这些区间里，说明这个具体命中
+// 根本没有对应的可见文字——ovlVisualFindTextRangeInBlock 会老实找不到、返回 null，调用方
+// 照旧退回整块，这里不用特殊处理。
+// 【实测依据，不是纸面推测】用真实 CDP 走一遍 ovlOpenFile → visual 渲染，逐个探过：
+// \label{x}/\ref{x}/\eqref{x}/\autoref{x} 四个确定性整段消失（键名不出现在 textContent
+// 里，MACRO_TABLE 的 del1 表收了 label，\ref/\eqref/\autoref 由另一条 stripCommand 路径
+// 处理，约 6891-6913 行）；而 \cite{x}/\citep{x}/\pageref{x} 这三个**不在** MACRO_TABLE 里，
+// 没有任何已知宏识别它们，会被原样保留成字面文本（"\cite{x}" 连反斜杠花括号一起显示出来）——
+// 这跟"\cite 系列渲染成 [1] 引用标记"的直觉推测正好相反，只信实测、不假设。所以这里只排除
+// 确定性消失的 label/ref/eqref/autoref 四个，cite 系列一个字节都不动——它们的参数原样是
+// "可见文字"，本来就该被正常计数/定位，排除了反而会把它们的真实出现漏数。
+const OVL_VISUAL_NONRENDERED_ARG_CMD_RE = /\\(label|ref|eqref|autoref)\s*\{/g;
+function ovlVisualNonRenderedSpans(blockText) {
+    const spans = [];
+    // 注释：跟 ovlStripLatexCommentsForRender 同一套转义/逐字宏/逐字环境判定规则，这里只记录
+    // 跨度不做替换（那个函数是为 table/algorithm/figure 三条渲染路径设计的，返回剥离后的
+    // 文本；这里要的是跨度本身，重扫一遍比试图从剥离结果反推跨度更直接、成本也低）。
+    let i = 0;
+    const n = blockText.length;
+    while (i < n) {
+        if (blockText[i] === '\\') {
+            const rm = OVL_COMMENT_RAW_MACRO_RE.exec(blockText.slice(i, i + 24));
+            if (rm) {
+                const openIdx = i + rm[0].length - 1;
+                const closeIdx = ovlFindMatchingBrace(blockText, openIdx);
+                if (closeIdx !== -1) { i = closeIdx + 1; continue; }
+            }
+            const bm = /^\\begin\{(verbatim|Verbatim|lstlisting|minted|alltt)\}/.exec(blockText.slice(i, i + 24));
+            if (bm) {
+                const endTag = '\\end{' + bm[1] + '}';
+                const endIdx = blockText.indexOf(endTag, i + bm[0].length);
+                if (endIdx !== -1) { i = endIdx + endTag.length; continue; }
+            }
+        }
+        if (blockText[i] === '%' && !ovlLatexEscapedAt(blockText, i)) {
+            const nl = blockText.indexOf('\n', i);
+            const stop = (nl === -1) ? n : nl + 1;
+            spans.push([i, stop]);
+            i = stop;
+            continue;
+        }
+        i++;
+    }
+    // \label{}/\ref{}/\eqref{}/\autoref{}：连命令名带花括号参数整段标成不渲染（实测确认这四个
+    // 确定性整段消失，见上面大注释；\cite 系列不在此列，故意不处理）。
+    OVL_VISUAL_NONRENDERED_ARG_CMD_RE.lastIndex = 0;
+    let m;
+    while ((m = OVL_VISUAL_NONRENDERED_ARG_CMD_RE.exec(blockText)) !== null) {
+        const openIdx = m.index + m[0].length - 1;
+        const closeIdx = ovlFindMatchingBrace(blockText, openIdx);
+        if (closeIdx !== -1) spans.push([m.index, closeIdx + 1]);
+    }
+    spans.sort(function (a, b) { return a[0] - b[0]; });
+    return spans;
+}
+function ovlVisualPosInNonRenderedSpan(spans, pos) {
+    for (let i = 0; i < spans.length; i++) { if (pos >= spans[i][0] && pos < spans[i][1]) return true; }
+    return false;
 }
 
 // startChar/endChar：#ovlCodeArea 坐标系；lineFrom/lineTo 是它俩换算出的 0-based 行区间
@@ -26717,13 +26812,58 @@ function ovlVisualRangeForChars(pane, lineFrom, lineTo, startChar, endChar) {
         if (localStart < 0 || localEnd > blockText.length || localStart >= localEnd) return null;
         const matchedText = blockText.slice(localStart, localEnd);
         if (!matchedText) return null;
-        // 数出命中在块源码里是第几次出现（0-based）——次序作为源码→渲染的消歧依据。
+        // 数出命中在块源码里是第几次出现（0-based）——次序作为源码→渲染的消歧依据。P68 修复 2：
+        // 跳过不会渲染成可见文字的区间（注释 + \label/\ref/\eqref/\autoref 参数，实测确认
+        // \cite 系列不在此列——见 ovlVisualNonRenderedSpans 头顶的大注释），让这里的计数基准
+        // 跟 ovlVisualFindTextRangeInBlock 在渲染 DOM 里数次序的基准对齐。
+        const nonRendered = ovlVisualNonRenderedSpans(blockText);
         let occurrenceIndex = 0, from = 0, idx;
         while ((idx = blockText.indexOf(matchedText, from)) !== -1 && idx < localStart) {
-            occurrenceIndex++; from = idx + 1;
+            if (!ovlVisualPosInNonRenderedSpan(nonRendered, idx)) occurrenceIndex++;
+            from = idx + 1;
         }
         return ovlVisualFindTextRangeInBlock(target, matchedText, occurrenceIndex);
     } catch (e) { return null; }
+}
+
+// ==================== v2 Pass P68 修复 1：Visual 中文模式——查找直接搜可见渲染文字 ====================
+// 根因（诊断见 .claude/tmp/p68_diagnosis.md）：翻译只替换块的 innerHTML，#ovlCodeArea（ta.value）
+// 永远是英文源码；原来查找永远只扫 ta.value，中文模式下用户搜中文词恒是 0/0，搜英文词拿到的
+// 命中区间又是英文源码坐标，交给 ovlVisualRangeForChars 在中文渲染 DOM 里 indexOf 恒为 -1，
+// 100% 掉进整块兜底——用户反馈原话"搜一个词，高亮出来的是一整句话"就是这条必然路径。
+// 这里改成中文模式下优先直接在渲染出的中文文字上逐块查找："第几块 + 命中文字 + 块内第几次
+// 出现"三元组（不是全局字符偏移——中文渲染文字在英文源码里根本没有对应字节位置，跟
+// ovlVisualRangeForChars 反过来"从源码字符区间找块"是两个方向），定位复用
+// ovlVisualFindTextRangeInBlock 同一套"按次序在渲染 DOM 里找第 N 次出现"逻辑，画法复用
+// ovlPaintMarkOverlayForVisualRange，不另起一套矩形计算。
+// 返回 [{line, lineEnd, text, occurrenceIndex}, ...]，按块的文档顺序、块内命中先后排列。
+function ovlFindCollectZhMatches(re) {
+    const out = [];
+    try {
+        const pane = document.getElementById('ovlVisualPane');
+        if (!pane) return out;
+        const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+        for (let bi = 0; bi < blocks.length; bi++) {
+            const block = blocks[bi];
+            const text = ovlVisualCollectBlockVisibleText(block).text;
+            if (!text) continue;
+            const line = parseInt(block.getAttribute('data-src-line'), 10);
+            const lineEndAttr = block.getAttribute('data-src-line-end');
+            const lineEnd = lineEndAttr !== null ? parseInt(lineEndAttr, 10) : line;
+            re.lastIndex = 0;
+            let m, guard = 0;
+            const occurrenceCounts = Object.create(null);
+            while ((m = re.exec(text)) !== null) {
+                const matchedText = m[0];
+                if (!matchedText) { re.lastIndex++; if (++guard > 20000) break; continue; }
+                const occurrenceIndex = occurrenceCounts[matchedText] || 0;
+                occurrenceCounts[matchedText] = occurrenceIndex + 1;
+                out.push({ line: line, lineEnd: lineEnd, text: matchedText, occurrenceIndex: occurrenceIndex });
+                if (++guard > 20000) break;
+            }
+        }
+    } catch (e) { console.error('[ovl] findCollectZhMatches failed', e); }
+    return out;
 }
 
 // 按实际命中的 Range 居中（比 ovlMarkCenterVisual 那套"整块/整行"更精确——直接用命中自己的
@@ -26758,6 +26898,51 @@ function ovlPaintVisualMarkOverlayFromChars() {
         if (!range) return false;
         return ovlPaintMarkOverlayForVisualRange(range);
     } catch (e) { console.error('[ovl] paintVisualMarkOverlayFromChars failed', e); return false; }
+}
+
+// P68：OvlMarkState.zhVisualRec 版本的重画——跟上面 ovlPaintVisualMarkOverlayFromChars 平行
+// （那个是"源码字符区间"重画，这个是"渲染文字里第几块第几次出现"重画），每次都从块的
+// data-src-line/data-src-line-end 重新 querySelector 现取块（pane.innerHTML 可能整篇重写，
+// 缓存 DOM 引用会变野指针），不做居中（居中只在 ovlMarkRangeZhVisual 首次命中时做一次，
+// 跟 ovlPaintVisualMarkOverlayFromChars 同一条纪律：repaint 只管画，不管卷动）。
+function ovlPaintZhVisualMarkOverlayFromRec() {
+    try {
+        const pane = document.getElementById('ovlVisualPane');
+        const rec = OvlMarkState.zhVisualRec;
+        if (!pane || !rec) return false;
+        const block = pane.querySelector('.ovl-visual-block[data-src-line="' + rec.line + '"][data-src-line-end="' + rec.lineEnd + '"]');
+        if (!block) return false;
+        const range = ovlVisualFindTextRangeInBlock(block, rec.text, rec.occurrenceIndex);
+        if (!range) return false;
+        return ovlPaintMarkOverlayForVisualRange(range);
+    } catch (e) { console.error('[ovl] paintZhVisualMarkOverlayFromRec failed', e); return false; }
+}
+
+// ==== v2 Pass P68 修复 1：Visual 中文模式查找命中的对外入口 ====
+// rec = { line, lineEnd, text, occurrenceIndex }，来自 ovlFindCollectZhMatches。跟
+// ovlMarkRange（源码字符区间）平行独立：这条路径压根没有 #ovlCodeArea 坐标系里的区间可用，
+// 所以不复用 ovlMarkRange，单开一个入口，但画法/居中/兜底/60 秒淡出计时器全部复用既有实现，
+// 不重新发明。返回 true=画出了精确的字符级框；false=块里找不到这次出现，已老实退回整块
+// 高亮（调用方——ovlFindSelectCurrent——据此决定要不要在查找栏显示"只能定位到段落"提示）。
+function ovlMarkRangeZhVisual(rec) {
+    try {
+        const pane = document.getElementById('ovlVisualPane');
+        OvlMarkState.lineFrom = rec.line;
+        OvlMarkState.lineTo = rec.lineEnd;
+        OvlMarkState.rangeChars = null;
+        OvlMarkState.zhVisualRec = rec;
+        ovlClearCodeMarkOverlay();
+        const block = pane ? pane.querySelector('.ovl-visual-block[data-src-line="' + rec.line + '"][data-src-line-end="' + rec.lineEnd + '"]') : null;
+        const range = block ? ovlVisualFindTextRangeInBlock(block, rec.text, rec.occurrenceIndex) : null;
+        let painted = false;
+        if (range) {
+            ovlMarkCenterVisualRange(range);
+            painted = ovlPaintMarkOverlayForVisualRange(range);
+        }
+        if (!painted) { ovlMarkCenterVisual(rec.line, rec.lineEnd); ovlPaintVisualMarkOverlay(); }
+        ovlMarkScheduleFadeOut();
+        return painted;
+    } catch (e) { console.error('[ovl] markRangeZhVisual failed', e); return false; }
 }
 
 // Code 模式：整行色带，宽度铺满 #ovlCodeMarkOverlay（整个编辑器主体，含 gutter），高度/位置
@@ -26913,12 +27098,19 @@ function ovlScheduleMarkOverlay() {
 }
 // P52：有 rangeChars 时优先尝试字符级重画，这一帧失败（内容变了/映射不到）才退回行级——
 // 不清掉 rangeChars（下一帧内容可能又对得上了），只是这一帧降级显示，不留空白。
+// P68：zhVisualRec（Visual 中文模式查找命中）优先级比 rangeChars 更高——两者不会同时非
+// null（ovlMarkRangeZhVisual 和 ovlMarkRange 各自的入口互斥地清掉对方），这里判断顺序纯粹
+// 是防御性的"谁非 null 就用谁"。
 function ovlRepaintMarkOverlay() {
     try {
         if (OvlMarkState.lineFrom < 0) return;
         if (OvlState.editorMode === 'visual') {
             ovlClearCodeMarkOverlay();
-            if (!(OvlMarkState.rangeChars && ovlPaintVisualMarkOverlayFromChars())) ovlPaintVisualMarkOverlay();
+            if (OvlMarkState.zhVisualRec) {
+                if (!ovlPaintZhVisualMarkOverlayFromRec()) ovlPaintVisualMarkOverlay();
+            } else if (!(OvlMarkState.rangeChars && ovlPaintVisualMarkOverlayFromChars())) {
+                ovlPaintVisualMarkOverlay();
+            }
         } else {
             ovlClearVisualMarkOverlay();
             if (!(OvlMarkState.rangeChars && ovlPaintCodeMarkOverlayFromChars())) ovlPaintCodeMarkOverlay();
@@ -26985,6 +27177,8 @@ function ovlMarkLines(lineFrom, lineTo, opts) {
         lineTo = Math.max(lineFrom, Math.min(n - 1, lineTo | 0));
         OvlMarkState.lineFrom = lineFrom;
         OvlMarkState.lineTo = lineTo;
+        OvlMarkState.rangeChars = null;
+        OvlMarkState.zhVisualRec = null; // P68：行级标记跟字符级/中文可见文字级标记互斥
         if (OvlState.editorMode === 'visual') {
             ovlMarkCenterVisual(lineFrom, lineTo);
             ovlClearCodeMarkOverlay();
@@ -27021,6 +27215,7 @@ function ovlMarkRange(startChar, endChar, opts) {
         OvlMarkState.lineFrom = lineFrom;
         OvlMarkState.lineTo = lineTo;
         OvlMarkState.rangeChars = [startChar, endChar];
+        OvlMarkState.zhVisualRec = null; // P68：源码字符区间标记跟中文可见文字级标记互斥
         let painted = false;
         if (OvlState.editorMode === 'visual') {
             const pane = document.getElementById('ovlVisualPane');
@@ -27046,7 +27241,10 @@ function ovlMarkRange(startChar, endChar, opts) {
             else { ovlMarkCenterCode(lineFrom, lineTo); ovlPaintCodeMarkOverlay(); }
         }
         ovlMarkScheduleFadeOut();
-    } catch (e) { console.error('[ovl] markRange failed', e); }
+        // P68：返回是否画出了精确字符级框（不是整块/整行兜底）——ovlFindSelectCurrent 用这个
+        // 判断要不要在查找栏显示"只能定位到段落"的降级提示，不许静默画一个大黄框了事。
+        return painted;
+    } catch (e) { console.error('[ovl] markRange failed', e); return false; }
 }
 
 // 生命周期第③条"该栏发起新选区就清空"：Code 侧用 mousedown→mouseup 位移判定是不是一次真的
@@ -29785,9 +29983,28 @@ const OvlFindState = {
     regex: false,
     wholeWord: false,
     inSelection: false,
-    matches: [],   // [[start,end], ...]
+    matches: [],   // 源码字符区间命中：[[start,end], ...]（#ovlCodeArea 坐标系，Replace/ReplaceAll
+                    // 永远只操作这一套——中文渲染文字在源码里根本不存在对应字节位置，不可替换）
+    // v2 Pass P68：Visual 中文模式下，查询词在渲染出的中文文字里有命中时，导航/计数/高亮全部
+    // 改用这一套（不是 matches），跟"整块" bug 的根因一致——命中的字符区间没法用源码坐标表达。
+    zhMatches: [], // [{line, lineEnd, text, occurrenceIndex}, ...]，见 ovlFindCollectZhMatches
+    usingZh: false, // true=当前导航/计数/高亮的是 zhMatches，false=matches（含中文模式回落源码搜索）
     idx: -1
 };
+
+// P68：matches 和 zhMatches 互斥使用，两处都要判断"当前是哪一套"的地方（计数、Next/Prev）
+// 收口到这一个函数，不重复写三遍同样的三元判断。
+function ovlFindMatchCount() {
+    return OvlFindState.usingZh ? OvlFindState.zhMatches.length : OvlFindState.matches.length;
+}
+// 查找栏的降级提示（回落到源码搜索、但只画出了整块/整段时才会非空）——集中在这一个函数里
+// 写/清，不许任何一条路径悄悄跳过它（P68 的核心诉求：不许静默降级）。
+function ovlFindSetHint(text) {
+    const el = document.getElementById('ovlFindHint');
+    if (!el) return;
+    if (text) { el.textContent = text; el.removeAttribute('hidden'); }
+    else { el.textContent = ''; el.setAttribute('hidden', ''); }
+}
 
 function ovlFindBuildRegex(query) {
     if (!query) return null;
@@ -29808,9 +30025,10 @@ function ovlFindUpdateCount(hadQuery) {
     const countEl = document.getElementById('ovlFindCount');
     if (!countEl) return;
     if (!hadQuery) { countEl.textContent = ''; return; }
-    countEl.textContent = OvlFindState.matches.length
-        ? (OvlFindState.idx + 1) + '/' + OvlFindState.matches.length
-        : '0/0';
+    // P68：计数必须跟实际在导航/高亮的那一套一致（usingZh 时数 zhMatches，不能一个数中文
+    // 命中、一个数英文命中——用户反馈原话就点名了这种"数字对不上眼前高亮"的体验）。
+    const total = ovlFindMatchCount();
+    countEl.textContent = total ? (OvlFindState.idx + 1) + '/' + total : '0/0';
 }
 
 // preserveIdx=false：从当前光标位置起找最近一个命中当"当前项"（典型于新查询/切换开关）。
@@ -29823,28 +30041,55 @@ function ovlFindRecompute(preserveIdx) {
         const query = input.value;
         input.classList.remove('ovl-find-bad');
         OvlFindState.matches = [];
+        OvlFindState.zhMatches = [];
+        OvlFindState.usingZh = false;
+        ovlFindSetHint('');
         if (!query) { OvlFindState.idx = -1; ovlFindUpdateCount(false); return; }
         const re = ovlFindBuildRegex(query);
         if (!re) { input.classList.add('ovl-find-bad'); OvlFindState.idx = -1; ovlFindUpdateCount(false); return; }
 
-        let scanText = ta.value;
-        let scanOffset = 0;
-        if (OvlFindState.inSelection && ta.selectionStart !== ta.selectionEnd) {
-            scanOffset = ta.selectionStart;
-            scanText = ta.value.slice(ta.selectionStart, ta.selectionEnd);
+        // v2 Pass P68：Visual 中文模式下，先在用户看得见的中文渲染文字上找——诊断结论是
+        // "搜一个词，高亮出来的是一整句"100% 复现于这个模式，根因是原来永远只扫英文源码
+        // （ta.value），中文命中恒为 0。这里优先尝试中文渲染文字，有命中就用它导航/计数/
+        // 高亮；0 命中才回落到下面的源码搜索（保住"搜 \cite 键、搜英文术语"这类既有用法）。
+        const zhActive = OvlState.editorMode === 'visual' && typeof OvlVisualLangState !== 'undefined' && OvlVisualLangState.lang === 'zh';
+        if (zhActive) {
+            OvlFindState.zhMatches = ovlFindCollectZhMatches(re);
+            re.lastIndex = 0; // 上面的扫描消耗了这个 'g' 正则的 lastIndex，下面复用前重置
         }
-        let m, guard = 0;
-        while ((m = re.exec(scanText)) !== null) {
-            OvlFindState.matches.push([m.index + scanOffset, m.index + scanOffset + m[0].length]);
-            if (m[0].length === 0) re.lastIndex++;      // 零宽匹配（如 \b\b）防死循环
-            if (++guard > 20000) break;                  // 防炸：极端病态正则不许把标签页锁死
+        if (zhActive && OvlFindState.zhMatches.length) {
+            OvlFindState.usingZh = true;
+            // matches 留空：Replace/ReplaceAll 继续只对源码工作，中文命中在源码里本来就没有
+            // 对应字节区间，诚实地不提供可替换目标（跟既有的"源码里搜不到就不能替换"是同一
+            // 条道理，不是这次新引入的限制）。
+        } else {
+            let scanText = ta.value;
+            let scanOffset = 0;
+            if (OvlFindState.inSelection && ta.selectionStart !== ta.selectionEnd) {
+                scanOffset = ta.selectionStart;
+                scanText = ta.value.slice(ta.selectionStart, ta.selectionEnd);
+            }
+            let m, guard = 0;
+            while ((m = re.exec(scanText)) !== null) {
+                OvlFindState.matches.push([m.index + scanOffset, m.index + scanOffset + m[0].length]);
+                if (m[0].length === 0) re.lastIndex++;      // 零宽匹配（如 \b\b）防死循环
+                if (++guard > 20000) break;                  // 防炸：极端病态正则不许把标签页锁死
+            }
         }
+
+        const total = ovlFindMatchCount();
         if (!preserveIdx) {
-            const cur = ta.selectionEnd;
-            const idx = OvlFindState.matches.findIndex((r) => r[0] >= cur);
-            OvlFindState.idx = idx === -1 ? (OvlFindState.matches.length ? 0 : -1) : idx;
-        } else if (OvlFindState.idx >= OvlFindState.matches.length) {
-            OvlFindState.idx = OvlFindState.matches.length ? 0 : -1;
+            if (OvlFindState.usingZh) {
+                // 中文渲染文字命中没有"光标附近"这个概念（跟 #ovlCodeArea 不是同一坐标系），
+                // 从文档顺序里的第一个开始，比强行找一个不存在的"最近"更诚实。
+                OvlFindState.idx = total ? 0 : -1;
+            } else {
+                const cur = ta.selectionEnd;
+                const idx = OvlFindState.matches.findIndex((r) => r[0] >= cur);
+                OvlFindState.idx = idx === -1 ? (OvlFindState.matches.length ? 0 : -1) : idx;
+            }
+        } else if (OvlFindState.idx >= total) {
+            OvlFindState.idx = total ? 0 : -1;
         }
         ovlFindUpdateCount(true);
         if (OvlFindState.idx >= 0) ovlFindSelectCurrent();
@@ -29856,8 +30101,19 @@ function ovlFindRecompute(preserveIdx) {
 function ovlFindSelectCurrent() {
     try {
         const ta = document.getElementById('ovlCodeArea');
+        if (!ta) return;
+        // v2 Pass P68：中文渲染文字命中——没有源码字符区间可用（不 setSelectionRange，也不能
+        // 走 ovlMarkRange），单开 ovlMarkRangeZhVisual 入口；找不到对应可见文字的具体那一次
+        // 出现时会老实退回整块，这里据此把降级提示亮出来（不许再默默画一个大黄框）。
+        if (OvlFindState.usingZh) {
+            const rec = OvlFindState.zhMatches[OvlFindState.idx];
+            if (!rec) return;
+            const painted = ovlMarkRangeZhVisual(rec);
+            ovlFindSetHint(painted ? '' : '中文预览下该词只能定位到段落');
+            return;
+        }
         const r = OvlFindState.matches[OvlFindState.idx];
-        if (!ta || !r) return;
+        if (!r) return;
         // 【不 focus ta】查找面板打开期间焦点应该一直留在 #ovlFindInput 里，这样用户能连续
         // 敲字 / 按 Enter 循环下一个，而不会每次重算命中就把焦点抢走、把接下来敲的字打进
         // 编辑器正文（实测复现：输入 "alpha" 第一个字符触发 recompute 抢走焦点，剩下
@@ -29870,7 +30126,11 @@ function ovlFindSelectCurrent() {
         // 原话："查找栏输入一个单词，高亮的应该是对应的单词"）。ovlMarkRange 内部自动判断
         // Code/Visual、映射失败时自己退回行级，这里不用重复算 lineFrom/lineTo 传行级参数。
         if (typeof ovlMarkRange === 'function') {
-            ovlMarkRange(r[0], r[1], { source: 'find' });
+            const painted = ovlMarkRange(r[0], r[1], { source: 'find' });
+            // P68：Visual 中文模式下，源码搜索命中（比如搜 \cite 键这类回落场景）如果最终
+            // 只画出了整块（Visual 侧渲染文字跟源码对不上号），同样要显式提示——不区分
+            // "本来就在中文模式回落"还是"Code/英文模式的既有整块兜底"，都不许静默。
+            ovlFindSetHint((OvlState.editorMode === 'visual' && !painted) ? '中文预览下该词只能定位到段落' : '');
         } else if (typeof ovlMarkLines === 'function') {
             // 兜底①：ovlMarkRange 万一没定义（不该发生），退回 P37 的行级实现。
             const lineFrom = ta.value.slice(0, r[0]).split('\n').length - 1;
@@ -29887,14 +30147,16 @@ function ovlFindSelectCurrent() {
 }
 
 function ovlFindNext() {
-    if (!OvlFindState.matches.length) { ovlFindRecompute(false); return; }
-    OvlFindState.idx = (OvlFindState.idx + 1) % OvlFindState.matches.length;
+    const total = ovlFindMatchCount();
+    if (!total) { ovlFindRecompute(false); return; }
+    OvlFindState.idx = (OvlFindState.idx + 1) % total;
     ovlFindUpdateCount(true);
     ovlFindSelectCurrent();
 }
 function ovlFindPrev() {
-    if (!OvlFindState.matches.length) { ovlFindRecompute(false); return; }
-    OvlFindState.idx = (OvlFindState.idx - 1 + OvlFindState.matches.length) % OvlFindState.matches.length;
+    const total = ovlFindMatchCount();
+    if (!total) { ovlFindRecompute(false); return; }
+    OvlFindState.idx = (OvlFindState.idx - 1 + total) % total;
     ovlFindUpdateCount(true);
     ovlFindSelectCurrent();
 }
@@ -29922,7 +30184,10 @@ function ovlFindClose() {
         const panel = document.getElementById('ovlEditorPanel');
         if (panel) panel.removeAttribute('data-find');
         OvlFindState.matches = [];
+        OvlFindState.zhMatches = [];
+        OvlFindState.usingZh = false;
         OvlFindState.idx = -1;
+        ovlFindSetHint('');
         const ta = document.getElementById('ovlCodeArea');
         if (ta && !ta.disabled) { try { ta.focus(); } catch (e) {} }
     } catch (e) { console.error('[ovl] findClose failed', e); }
