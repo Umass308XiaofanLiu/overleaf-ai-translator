@@ -24504,7 +24504,15 @@ function ovlVisualRenderChunk(tex) {
         }
     }
     const protectedInput = ovlProtectTextColorForFilter(tex);
-    const filtered = LatexFilter.filterLatexForTranslation(protectedInput.text, { comments: 'auto', structure: true });
+    // P61：Visual 模式的输入必然来自已打开的 .tex 文件本体（不是聊天框里可能不是 tex 源码
+    // 的自由文本），LatexFilter 的 'auto' 模式是为"不确定是不是真 tex 源码"的场景设计的
+    // （靠 detectTexMode 在一个小窗口里数强信号，分数不够就不剥注释）——Visual 逐块渲染
+    // 恰好每块都很小，经常凑不够分数，导致 % 注释大概率原样漏出来显示给用户（P59 已实测
+    // 复现：一段纯散文里的 "%evil comment" 整行原样出现在渲染结果里）。这里不是不确定是不是
+    // tex，是已经确定就是 tex，改成 'always' 跳过这层猜测，直接剥注释——不改 LatexFilter
+    // 内部 'auto' 启发式本身（那是给聊天框粘贴文本这类真的需要猜测的场景用的，改了影响面
+    // 太大），只改这一个调用点传的参数。
+    const filtered = LatexFilter.filterLatexForTranslation(protectedInput.text, { comments: 'always', structure: true });
     const restored = ovlRestoreTextColorAfterFilter(filtered.text, protectedInput.tokens);
     return renderFormattedText(restored);
 }
@@ -24544,7 +24552,104 @@ function ovlStripFloatLayoutNoise(str) {
         .replace(/\\looseness\s*=\s*-?\d+/g, '');
 }
 
+// ==================== v2 Pass P61：注释确定性剥离 + 表格花括号配平解析 ====================
+// 【注释】table/algorithm/figure 三条渲染路径完全绕开 LatexFilter（结构性标记不是翻译用
+// 散文，走 LatexFilter 只会拆出乱码），从来没有任何一步剥过 % 注释——P59 诊断实测：一个
+// 表格单元格里的 "% this row note" 原样混进 <td> 显示给用户。这里补一个确定性（不靠密度
+// 启发式）的行注释剥离函数，三个渲染函数入口各调用一次。
+//
+// 三个必须处理对的坑（跟 XPORT 层 8177-8179 行、ovlLatexActiveText 是同一套转义/逐字规则，
+// 复用 ovlLatexEscapedAt 保持判定口径一致，不重新发明一套）：
+//   1. \% 是转义字面百分号，不是注释——用 ovlLatexEscapedAt 数 % 前面连续反斜杠的奇偶性。
+//   2. verbatim/Verbatim/lstlisting/minted/alltt 环境内部的 % 是字面字符，整段原样搬运、
+//      不进入逐字符扫描。
+//   3. \url{...}/\href{...}{...}/\nolinkurl{...}/\path{...} 参数里的 % 是真实字符（比如
+//      "%20" 这种 URL 百分号编码），跟 LatexFilter 的 RAW_MACROS 同一处理口径，整段原样透传。
+//   4. 真正的注释：从未转义的 % 剥到该物理行末尾为止，且连同这一行自己的换行符一起吃掉——
+//      这是 TeX 的真实语义（% 到行尾包括换行本身都被吞掉），不能只删 % 到 \n 前一个字符，
+//      否则下一行会被错误地当成新的一行拼接（该断的地方不断，不该断的地方却断了）。
+const OVL_COMMENT_VERBATIM_ENVS = ['verbatim', 'Verbatim', 'lstlisting', 'minted', 'alltt'];
+const OVL_COMMENT_RAW_MACRO_RE = /^\\(url|href|nolinkurl|path)\s*\{/;
+function ovlStripLatexCommentsForRender(text) {
+    const src = String(text == null ? '' : text);
+    const n = src.length;
+    let out = '';
+    let i = 0;
+    while (i < n) {
+        if (src[i] === '\\') {
+            // 逐字宏参数（\url{...} 等）：花括号配平摘出整段原样搬运，内部的 % 不扫描。
+            const rm = OVL_COMMENT_RAW_MACRO_RE.exec(src.slice(i, i + 24));
+            if (rm) {
+                const openIdx = i + rm[0].length - 1;
+                const closeIdx = ovlFindMatchingBrace(src, openIdx);
+                if (closeIdx !== -1) {
+                    out += src.slice(i, closeIdx + 1);
+                    i = closeIdx + 1;
+                    continue;
+                }
+            }
+            // 逐字环境：整段原样搬运，内部的 % 不扫描。
+            const bm = /^\\begin\{(verbatim|Verbatim|lstlisting|minted|alltt)\}/.exec(src.slice(i, i + 24));
+            if (bm && OVL_COMMENT_VERBATIM_ENVS.indexOf(bm[1]) !== -1) {
+                const endTag = '\\end{' + bm[1] + '}';
+                const endIdx = src.indexOf(endTag, i + bm[0].length);
+                if (endIdx !== -1) {
+                    const stop = endIdx + endTag.length;
+                    out += src.slice(i, stop);
+                    i = stop;
+                    continue;
+                }
+            }
+        }
+        if (src[i] === '%' && !ovlLatexEscapedAt(src, i)) {
+            const nl = src.indexOf('\n', i);
+            i = (nl === -1) ? n : nl + 1;   // 连同这一行自己的换行符一起吃掉
+            continue;
+        }
+        out += src[i]; i++;
+    }
+    return out;
+}
+
 // ---- 1) 表格 ----
+// 通用环境边界：从 text[beginIdx] 处的 \begin{...} 开始，用"任意 \begin/\end 深度计数"
+// （不比对环境名）找到与它配对的 \end{...}——只要文档本身花括号/环境配平，从外层
+// \begin 数到深度归零的那个 \end 就必然是它自己的配对，中间不管嵌套什么环境都不会数错，
+// 这是深度计数法相对"贪婪正则匹配到最后一个 \end{tabular}"的核心优势（P59 诊断实测：
+// 贪婪正则在真实用户文件里遇到单元格内嵌套 \begin{tabular}...\end{tabular} 时会整段错位）。
+// 返回 { tagStart, envEnd }：tagStart 是配对 \end{...} 标签自己的起始下标，envEnd 是
+// 该标签结束后的下标；找不到配对返回 null。
+function ovlFindEnvClose(text, beginIdx) {
+    const tagRe = /\\(begin|end)\{[^{}]*\}/g;
+    tagRe.lastIndex = beginIdx;
+    const first = tagRe.exec(text);
+    if (!first || first.index !== beginIdx || first[1] !== 'begin') return null; // 调用方保证越界即 null
+    let depth = 1, m;
+    while ((m = tagRe.exec(text))) {
+        if (m[1] === 'begin') { depth++; }
+        else { depth--; if (depth === 0) return { tagStart: m.index, envEnd: tagRe.lastIndex }; }
+    }
+    return null;
+}
+// 在 text 里找 \begin{tabular} 起点，配平列格式 {...}（花括号配平扫描，允许列格式内部
+// 含花括号——@{}、p{3.8cm}、>{\centering\arraybackslash} 这些 booktabs/array 惯用写法都是
+// 常态，[^{}]* 这种"不许嵌套"的正则片段本质上做不对，见 P59 诊断实测）。返回
+// { beginIdx, bodyStart, bodyEnd, envEnd } 或 null（没找到 tabular）。只支持纯 `tabular`
+// 环境（不支持 tabular*/longtable/tabularx，这几个还需要额外的宽度参数解析，明确不支持，
+// 见任务报告）。
+function ovlFindTabularSpan(text) {
+    const beginM = /\\begin\{tabular\}/.exec(text);
+    if (!beginM) return null;
+    const afterBegin = beginM.index + beginM[0].length;
+    const specM = /^\s*(?:\[[^\]]*\])?\{/.exec(text.slice(afterBegin));
+    if (!specM) return null; // 没有列格式，不是合法 tabular，交给上层退化
+    const openIdx = afterBegin + specM[0].length - 1;
+    const closeIdx = ovlFindMatchingBrace(text, openIdx);
+    if (closeIdx === -1) return null;
+    const closeInfo = ovlFindEnvClose(text, beginM.index);
+    if (!closeInfo) return null;
+    return { beginIdx: beginM.index, bodyStart: closeIdx + 1, bodyEnd: closeInfo.tagStart, envEnd: closeInfo.envEnd };
+}
 // \\ 行分隔（容忍 \\[2mm] 这种可选间距参数）+ & 列分隔，都要做花括号深度感知——真实论文里
 // 单元格内容常有 \textbf{...}/\textcolor{...}{...} 这类带花括号的宏，深度不为 0 时的 & / \\
 // 不能被当分隔符，即使这份 fixture 里没有这种情况也要做对（任务原话要求）。
@@ -24552,6 +24657,7 @@ function ovlSplitTableRows(body) {
     const s = body
         .replace(/\\hline\b/g, '')
         .replace(/\\cline\s*\{[^{}]*\}/g, '')
+        .replace(/\\cmidrule\s*(?:\([^()]*\))?\s*\{[^{}]*\}/g, '')
         .replace(/\\toprule\b|\\midrule\b|\\bottomrule\b/g, '');
     const rows = [];
     let depth = 0, cur = '';
@@ -24584,7 +24690,93 @@ function ovlSplitTableCells(row) {
     cells.push(cur);
     return cells.map(c => c.trim());
 }
+// 单元格内嵌套 \begin{tabular}...\end{tabular}（诊断报告方案 (b)：不递归渲出真正的嵌套
+// <table>——那是更大的工作量，且这次修复的首要目标是"整个外层表格完全不显示"这个更严重的
+// 问题——而是把嵌套 tabular 的内容打平成一段文本：按行 <br> 分隔、按列 " / " 分隔，保留
+// "看得出内容"的效果，不假装做出了跟 Overleaf 一样的真嵌套渲染。）
+function ovlFlattenNestedTabular(nestedTex) {
+    const span = ovlFindTabularSpan(nestedTex);
+    if (!span) return ovlUnwrapSingleParagraph(ovlVisualRenderChunk(nestedTex));
+    const body = nestedTex.slice(span.bodyStart, span.bodyEnd);
+    const rows = ovlSplitTableRows(body);
+    return rows.map(function (row) {
+        const cells = ovlSplitTableCells(row).map(function (c) {
+            return ovlUnwrapSingleParagraph(ovlVisualRenderChunk(c));
+        }).filter(function (c) { return c.trim(); });
+        return cells.join(' / ');
+    }).filter(function (r) { return r; }).join('<br>');
+}
+// 把外层表格 body 里所有"整体自成一段"的嵌套 tabular 换成不透明占位符（先摘走再切行列，
+// 避免子表自己的 & / \\ 污染外层 ovlSplitTableRows/Cells 的深度计数——这两个函数只认花括号
+// 深度，不认识"\begin{tabular}...\end{tabular}是一整个不可再分的子环境"这件事）。
+const OVL_NESTED_TABULAR_TOKEN_RE = /〔〔OVLTBL(\d+)〕〕/;
+function ovlProtectNestedTabular(bodyText) {
+    const tokens = [];
+    let out = '', i = 0;
+    const n = bodyText.length;
+    while (i < n) {
+        if (bodyText.startsWith('\\begin{tabular}', i)) {
+            const closeInfo = ovlFindEnvClose(bodyText, i);
+            if (closeInfo) {
+                tokens.push(bodyText.slice(i, closeInfo.envEnd));
+                out += '〔〔OVLTBL' + tokens.length + '〕〕';
+                i = closeInfo.envEnd;
+                continue;
+            }
+        }
+        out += bodyText[i]; i++;
+    }
+    return { text: out, tokens: tokens };
+}
+// \multicolumn{n}{align}{content} -> colspan="n" 的单元格，content 走正常渲染；align 参数
+// 只用来定位边界，不解释对齐语义（预览不追求跟 pdflatex 像素对齐）。只处理"整个单元格恰好
+// 就是一个 \multicolumn{...}{...}{...}"这种最常见写法，前后混排其它文本时不识别、原样走
+// 普通单元格渲染兜底（不假装支持没做对的场景）。
+function ovlParseMulticolumnCell(cell) {
+    const m = /^\s*\\multicolumn\s*\{(\d+)\}\s*\{[^{}]*\}\s*\{/.exec(cell);
+    if (!m) return null;
+    const openIdx = m.index + m[0].length - 1;
+    const closeIdx = ovlFindMatchingBrace(cell, openIdx);
+    if (closeIdx === -1) return null;
+    if (cell.slice(closeIdx + 1).trim()) return null;
+    return { span: parseInt(m[1], 10), content: cell.slice(openIdx + 1, closeIdx) };
+}
+// \multirow{n}{width}{content} —— 明确不支持真正的跨行合并（需要跨行的列位置记账，跟
+// \multicolumn 混用时尤其复杂，这次不做）：只剥掉宏壳子，把 content 当普通单元格内容显示，
+// 不生成 rowspan 属性、不删除后续行里对应的空位——效果是"看得到这段文字，但不会真的跨行
+// 合并"，比"整格显示裸 LaTeX 源码"好，但不是完整实现，见任务报告明确列出。
+function ovlStripMultirowWrapper(cell) {
+    const m = /^\s*\\multirow\s*\{[^{}]*\}\s*\{[^{}]*\}\s*\{/.exec(cell);
+    if (!m) return cell;
+    const openIdx = m.index + m[0].length - 1;
+    const closeIdx = ovlFindMatchingBrace(cell, openIdx);
+    if (closeIdx === -1) return cell;
+    return cell.slice(0, m.index) + cell.slice(openIdx + 1, closeIdx) + cell.slice(closeIdx + 1);
+}
+// 单元格渲染：先还原嵌套 tabular 占位符（如果有），再走 multicolumn/multirow 处理，最后
+// 递归喂回 ovlVisualRenderChunk 渲染剩余正文。
+function ovlRenderTableCell(rawCell, nestedTokens) {
+    const cell = ovlStripMultirowWrapper(rawCell);
+    const tokM = OVL_NESTED_TABULAR_TOKEN_RE.exec(cell);
+    if (tokM) {
+        const k = parseInt(tokM[1], 10);
+        const nestedHtml = (k >= 1 && k <= nestedTokens.length) ? ovlFlattenNestedTabular(nestedTokens[k - 1]) : '';
+        const before = cell.slice(0, tokM.index).trim();
+        const after = cell.slice(tokM.index + tokM[0].length).trim();
+        let html = '';
+        if (before) html += ovlUnwrapSingleParagraph(ovlVisualRenderChunk(before));
+        html += nestedHtml;
+        if (after) html += ovlUnwrapSingleParagraph(ovlVisualRenderChunk(after));
+        return { html: html, colspan: 0 };
+    }
+    const mc = ovlParseMulticolumnCell(cell);
+    if (mc) {
+        return { html: mc.content.trim() ? ovlUnwrapSingleParagraph(ovlVisualRenderChunk(mc.content)) : '', colspan: mc.span };
+    }
+    return { html: cell.trim() ? ovlUnwrapSingleParagraph(ovlVisualRenderChunk(cell)) : '', colspan: 0 };
+}
 function ovlRenderVisualTable(tex) {
+    tex = ovlStripLatexCommentsForRender(tex);
     const outerM = /\\begin\{table\*?\}(?:\[[^\]]*\])?([\s\S]*)\\end\{table\*?\}/.exec(tex);
     let inner = outerM ? outerM[1] : tex;
     const capExtract = ovlExtractBraceCommand(inner, 'caption');
@@ -24596,21 +24788,24 @@ function ovlRenderVisualTable(tex) {
     if (capExtract.found) capExtract.arg = ovlStripFloatLayoutNoise(capExtract.arg);
     inner = ovlExtractBraceCommand(inner, 'label').rest;
     inner = ovlStripFloatLayoutNoise(inner);
-    const tabularM = /\\begin\{tabular\}\s*(?:\[[^\]]*\])?\{[^{}]*\}([\s\S]*)\\end\{tabular\}/.exec(inner);
+    const tabularSpan = ovlFindTabularSpan(inner);
     let html = '<div class="ovl-visual-table-wrap">';
     if (capExtract.found && capExtract.arg.trim()) {
         html += '<div class="ovl-visual-caption ovl-visual-caption-above">' + ovlUnwrapSingleParagraph(ovlVisualRenderChunk(capExtract.arg)) + '</div>';
     }
-    if (tabularM) {
-        const rows = ovlSplitTableRows(tabularM[1]);
+    if (tabularSpan) {
+        const rawBody = inner.slice(tabularSpan.bodyStart, tabularSpan.bodyEnd);
+        const protectedBody = ovlProtectNestedTabular(rawBody);
+        const rows = ovlSplitTableRows(protectedBody.text);
         if (rows.length) {
             html += '<table class="ovl-visual-table"><tbody>';
             rows.forEach((row, ri) => {
                 const cells = ovlSplitTableCells(row);
                 html += '<tr' + (ri === 0 ? ' class="ovl-visual-table-head"' : '') + '>';
                 cells.forEach(cell => {
-                    const cellHtml = cell.trim() ? ovlUnwrapSingleParagraph(ovlVisualRenderChunk(cell)) : '';
-                    html += (ri === 0 ? '<th>' : '<td>') + cellHtml + (ri === 0 ? '</th>' : '</td>');
+                    const rendered = ovlRenderTableCell(cell, protectedBody.tokens);
+                    const colspanAttr = rendered.colspan > 1 ? ' colspan="' + rendered.colspan + '"' : '';
+                    html += (ri === 0 ? '<th' : '<td') + colspanAttr + '>' + rendered.html + (ri === 0 ? '</th>' : '</td>');
                 });
                 html += '</tr>';
             });
@@ -24698,6 +24893,7 @@ function ovlRenderAlgorithmicLines(lines, numbered) {
     return html;
 }
 function ovlRenderVisualAlgorithm(tex) {
+    tex = ovlStripLatexCommentsForRender(tex);
     const outerM = /\\begin\{algorithm\*?\}(?:\[[^\]]*\])?([\s\S]*)\\end\{algorithm\*?\}/.exec(tex);
     let inner = outerM ? outerM[1] : tex;
     const capExtract = ovlExtractBraceCommand(inner, 'caption');
@@ -24753,6 +24949,7 @@ function ovlRenderFigurePlaceholder(relPath) {
         + '</div>';
 }
 function ovlRenderVisualFigure(tex) {
+    tex = ovlStripLatexCommentsForRender(tex);
     const outerM = /\\begin\{figure\*?\}(?:\[[^\]]*\])?([\s\S]*)\\end\{figure\*?\}/.exec(tex);
     let inner = outerM ? outerM[1] : tex;
     const capExtract = ovlExtractBraceCommand(inner, 'caption');
