@@ -1305,6 +1305,7 @@ body.ovl-shell-active #ovlShell { display: flex; }
     padding: 0 12px;
     border-bottom: 1px solid #2F3A4C;
     z-index: 1010;
+    position: relative; /* v2 Pass P67：给绝对定位居中的项目名标题当参照系，不挤压左右两组按钮 */
 }
 .ovl-topbar-left { display: flex; align-items: center; gap: 14px; min-width: 0; }
 .ovl-topbar-brand {
@@ -1331,6 +1332,58 @@ body.ovl-shell-active #ovlShell { display: flex; }
     user-select: none; pointer-events: none;
 }
 .ovl-layout-menu-item { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+/* ==================== v2 Pass P67：顶栏正中间的项目名（Overleaf 风格）====================
+   绝对定位居中，脱离 .ovl-topbar 的 flex 排布——标题多长都不会把左右两组按钮挤歪。
+   外层 .ovl-topbar-title 本身不接鼠标事件（pointer-events:none），只有里面的文字/输入框
+   各自开回 pointer-events:auto，避免这块透明区域挡住下面别的点击（其实这里没有别的东西，
+   纯粹保险）。*/
+.ovl-topbar-title {
+    position: absolute;
+    left: 50%;
+    top: 50%;
+    transform: translate(-50%, -50%);
+    max-width: min(46vw, 520px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    pointer-events: none;
+    z-index: 1;
+}
+.ovl-topbar-title-text {
+    font-size: 13px;
+    font-weight: 500;
+    color: #E7E9EE;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+    cursor: default;
+    pointer-events: auto;
+    padding: 3px 8px;
+    border-radius: 4px;
+    user-select: none;
+}
+.ovl-topbar-title-text:hover { background: #2F3A4C; }
+.ovl-topbar-title-text.ovl-topbar-title-empty {
+    color: #6B7482;
+    cursor: default;
+}
+.ovl-topbar-title-text.ovl-topbar-title-empty:hover { background: transparent; }
+.ovl-topbar-title-input {
+    display: none;
+    font-size: 13px;
+    font-weight: 500;
+    color: #F4F5F6;
+    background: #12161C;
+    border: 1px solid #3D4A5F;
+    border-radius: 4px;
+    padding: 2px 7px;
+    width: 240px;
+    max-width: 100%;
+    pointer-events: auto;
+    outline: none;
+}
+.ovl-topbar-title-input:focus { border-color: #5B8DEF; }
 .ovl-topbar-right { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .ovl-layout-btn {
     background: #2F3A4C;
@@ -22935,6 +22988,13 @@ function ovlShellHtml() {
         +     '</nav>'
         +     '<span class="ovl-version-watermark" title="Academic AI Translator">v' + escapeHtml(APP_VERSION) + '</span>'
         +   '</div>'
+        // v2 Pass P67：顶栏正中间显示当前项目名（Overleaf 风格），双击进入内联改名——见
+        // ovlTopbarTitleRefresh/ovlTopbarTitleEnterEdit 一组函数。绝对定位（见上面 CSS），
+        // 摆在 DOM 里哪个位置都不影响左右两组按钮的布局。
+        +   '<div class="ovl-topbar-title" id="ovlTopbarTitle">'
+        +     '<span class="ovl-topbar-title-text ovl-topbar-title-empty" id="ovlTopbarTitleText" title="">未打开项目</span>'
+        +     '<input type="text" class="ovl-topbar-title-input" id="ovlTopbarTitleInput" maxlength="255" spellcheck="false" autocomplete="off">'
+        +   '</div>'
         +   '<div class="ovl-topbar-right">'
         // v2 Pass P25：拉取/推送从 PDF 面板搬到顶栏「项目」按钮左侧（用户明确要求）。地址/
         // token/自动拉取间隔仍在设置面板的「Overleaf 同步」分类里填，见 ovlSettingsOverleafHtml；
@@ -28323,7 +28383,210 @@ function ovlSetProjectPath(path, opts) {
         if (typeof ovlOverleafSyncAddrForProject === 'function') {
             try { ovlOverleafSyncAddrForProject(path, { hintId: opts.projectId || null }); } catch (e) {}
         }
+        // v2 Pass P67：顶栏标题挂在这个唯一收口上，不用再回去补七个改路径的入口。
+        if (typeof ovlTopbarTitleRefresh === 'function') { try { ovlTopbarTitleRefresh(); } catch (e) {} }
     } catch (e) { console.error('[ovl] setProjectPath failed', e); }
+}
+
+// ==================== v2 Pass P67：顶栏项目名 + 双击重命名（Overleaf 风格）====================
+// 语义：双击改名＝真的重命名磁盘上的文件夹（不是只改显示名）。桥端新端点见
+// tools/latex-bridge/server.js 的 doOverleafRenameProject/POST /overleaf/rename-project。
+// 改名成功后必须迁移三样跟"项目路径字符串"绑定的本地状态——见 ovlOverleafRenameMigrateState：
+//   1) P62 翻译缓存桶（ovlVisualTransCache_v2::<规范化路径>）
+//   2) P66 路径→Overleaf 项目 ID 映射表（ovlOverleafAddrMapGet/Set）
+//   3) 项目历史记录（就地把旧路径条目改成新路径，不新增一条、不留死记录）
+// 三样任一迁移失败都要 showToast 明确告知，不静默吞掉（见该函数尾部）。
+
+// 名字合法性前端校验（跟桥端 ovlValidateRenameName 是同一套规则，各自独立实现——前端这层
+// 只是为了不发明显会被拒绝的请求，真正兜底的校验在桥端，前端校验不算数）。
+const OVL_RESERVED_DEVICE_NAME_RE = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+const OVL_FORBIDDEN_NAME_CHARS_RE = /[<>:"/\\|?*]/;
+function ovlValidateProjectRenameName(name) {
+    if (typeof name !== 'string') return '新名称不能为空';
+    const trimmed = name.trim();
+    if (!trimmed) return '新名称不能为空';
+    if (trimmed.length > 255) return '新名称过长（最多 255 个字符）';
+    if (OVL_FORBIDDEN_NAME_CHARS_RE.test(trimmed)) return '新名称不能包含 < > : " / \\ | ? * 这些字符';
+    if (trimmed.indexOf('..') !== -1) return '新名称不能包含连续两个英文句点 ".."';
+    if (/[ .]$/.test(trimmed)) return '新名称不能以空格或英文句点结尾';
+    if (OVL_RESERVED_DEVICE_NAME_RE.test(trimmed)) return '新名称不能是 Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）';
+    return null; // 合法
+}
+
+// 读 #ovlProjectPathInput 现算显示名——未打开项目时显示灰色占位并禁用双击（ovlTopbarTitleEnterEdit
+// 自己会因为拿不到路径直接 return）。ovlSetProjectPath 是所有改路径入口的统一收口，这里挂一次
+// 就覆盖了全部入口，不用逐个补。
+function ovlTopbarTitleRefresh() {
+    try {
+        const textEl = document.getElementById('ovlTopbarTitleText');
+        if (!textEl) return;
+        const pathInput = document.getElementById('ovlProjectPathInput');
+        const p = pathInput ? String(pathInput.value || '').trim() : '';
+        if (!p) {
+            textEl.textContent = '未打开项目';
+            textEl.title = '';
+            textEl.classList.add('ovl-topbar-title-empty');
+        } else {
+            textEl.textContent = ovlProjectHistoryBasename(p);
+            textEl.title = p; // 完整绝对路径，过长省略号截断的文字靠 title 补全
+            textEl.classList.remove('ovl-topbar-title-empty');
+        }
+    } catch (e) {}
+}
+
+let OvlTopbarTitleEditing = false;
+let OvlTopbarTitleSkipNextBlurCommit = false; // Esc 取消时置位，吞掉紧跟着来的一次 blur 提交
+
+function ovlTopbarTitleEnterEdit() {
+    try {
+        const pathInput = document.getElementById('ovlProjectPathInput');
+        const p = pathInput ? String(pathInput.value || '').trim() : '';
+        if (!p) return; // 未打开项目，禁用双击进入编辑
+        const textEl = document.getElementById('ovlTopbarTitleText');
+        const inputEl = document.getElementById('ovlTopbarTitleInput');
+        if (!textEl || !inputEl) return;
+        OvlTopbarTitleEditing = true;
+        inputEl.value = ovlProjectHistoryBasename(p);
+        textEl.style.display = 'none';
+        inputEl.style.display = 'inline-block';
+        inputEl.focus();
+        inputEl.select();
+    } catch (e) { console.error('[ovl] topbar title enter edit failed', e); }
+}
+
+function ovlTopbarTitleExitEdit() {
+    try {
+        const textEl = document.getElementById('ovlTopbarTitleText');
+        const inputEl = document.getElementById('ovlTopbarTitleInput');
+        OvlTopbarTitleEditing = false;
+        if (inputEl) inputEl.style.display = 'none';
+        if (textEl) textEl.style.display = '';
+    } catch (e) {}
+}
+
+function ovlTopbarTitleCancelEdit() {
+    OvlTopbarTitleSkipNextBlurCommit = true;
+    ovlTopbarTitleExitEdit();
+}
+
+// 回车/失焦都走这里；Enter 提交后 exitEdit() 隐藏输入框也会触发一次 blur，靠开头的
+// OvlTopbarTitleEditing 判断挡掉第二次提交（不是靠额外的节流标志）。
+function ovlTopbarTitleCommitEdit() {
+    if (!OvlTopbarTitleEditing) return;
+    const inputEl = document.getElementById('ovlTopbarTitleInput');
+    const pathInput = document.getElementById('ovlProjectPathInput');
+    const oldPath = pathInput ? String(pathInput.value || '').trim() : '';
+    const rawNew = inputEl ? inputEl.value : '';
+    const trimmedNew = rawNew.trim();
+    ovlTopbarTitleExitEdit();
+    if (!oldPath) return;
+    const currentName = ovlProjectHistoryBasename(oldPath);
+    // P34 同款空操作闸（跟 ovlInlineSrcSave 一致）：名字没变，直接静默退出，不发任何请求。
+    if (trimmedNew === currentName) return;
+    const invalidReason = ovlValidateProjectRenameName(trimmedNew);
+    if (invalidReason) {
+        try { showToast(invalidReason, 'error'); } catch (e) {}
+        return;
+    }
+    ovlOverleafRenameProject(oldPath, trimmedNew).catch(function (e) {
+        console.error('[ovl] rename project failed', e);
+    });
+}
+
+// 改名成功后迁移三样跟"项目路径字符串"绑定的本地状态，返回迁移失败的中文名称列表（空数组＝全部成功）。
+// 三步互不依赖、各自 try/catch，一步失败不影响另外两步继续尝试。
+function ovlOverleafRenameMigrateState(oldPath, newPath) {
+    const failures = [];
+
+    // 1) P62 翻译缓存桶：键是 ovlVisualTransCache_v2::<规范化项目绝对路径>，不迁移＝该项目
+    //    缓存作废、整篇重翻一次。连同 index（记录桶最近使用时间，供淘汰用）里的 key 一起搬。
+    try {
+        const oldId = ovlNormalizeProjectPath(oldPath);
+        const newId = ovlNormalizeProjectPath(newPath);
+        if (!oldId || !newId) throw new Error('normalize failed');
+        if (oldId !== newId) {
+            const oldBucketKey = ovlVisualTransCacheBucketKey(oldId);
+            const newBucketKey = ovlVisualTransCacheBucketKey(newId);
+            const raw = localStorage.getItem(oldBucketKey);
+            if (raw !== null) {
+                localStorage.setItem(newBucketKey, raw);
+                localStorage.removeItem(oldBucketKey);
+            }
+            const idx = ovlVisualTransCacheIndexLoad();
+            if (Object.prototype.hasOwnProperty.call(idx, oldId)) {
+                idx[newId] = idx[oldId];
+                delete idx[oldId];
+                ovlVisualTransCacheIndexSave(idx);
+            }
+        }
+    } catch (e) { failures.push('翻译缓存'); console.error('[ovl] rename migrate transCache failed', e); }
+
+    // 2) P66 路径→Overleaf 项目 ID 映射表：不迁移＝下次拉取又报"origin 指向不一致"。
+    try {
+        const addr = ovlOverleafAddrMapGet(oldPath);
+        if (addr) {
+            ovlOverleafAddrMapSet(newPath, addr);
+            const map = ovlOverleafAddrMapLoad();
+            const oldKey = ovlNormalizeProjectPath(oldPath);
+            if (oldKey && Object.prototype.hasOwnProperty.call(map, oldKey)) {
+                delete map[oldKey];
+                ovlOverleafAddrMapSave(map);
+            }
+        }
+    } catch (e) { failures.push('Overleaf 项目 ID 映射'); console.error('[ovl] rename migrate addrMap failed', e); }
+
+    // 3) 项目历史记录：旧路径的条目就地改成新路径（path + id 都要改），不能新旧两条并存，
+    //    也不能变成一条指向已不存在目录的死记录。
+    try {
+        const oldId = ovlNormalizeProjectPath(oldPath);
+        const newId = ovlNormalizeProjectPath(newPath);
+        if (!oldId || !newId) throw new Error('normalize failed');
+        const list = ovlProjectHistoryLoad();
+        const idx = list.findIndex(function (it) { return it.id === oldId; });
+        if (idx !== -1) {
+            list[idx].path = newPath;
+            list[idx].id = newId;
+            // 防御：万一巧合已存在一条指向新路径的记录，去重只留改名后的这条，不留两条。
+            const dupIdx = list.findIndex(function (it, i) { return i !== idx && it.id === newId; });
+            if (dupIdx !== -1) list.splice(dupIdx, 1);
+            ovlProjectHistorySave(list);
+        }
+    } catch (e) { failures.push('项目历史记录'); console.error('[ovl] rename migrate history failed', e); }
+
+    return failures;
+}
+
+// 打桥端 POST /overleaf/rename-project——真的把磁盘上的文件夹改名，成功后依次：迁移三样状态、
+// 用 ovlSetProjectPath 收口把 #ovlProjectPathInput/watch/Overleaf ID 反向同步/顶栏标题全部
+// 切到新路径，最后按迁移结果给一条 toast（全部成功＝改名成功提示；有失败＝明确列出哪几项，
+// 不静默吞掉）。
+async function ovlOverleafRenameProject(oldPath, newName) {
+    try {
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/overleaf/rename-project'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectDir: oldPath, newName: newName })
+        });
+        let data = null;
+        try { data = await resp.json(); } catch (e) { data = null; }
+        if (ovlBridgeIsNoSuchRouteError(data)) {
+            showToast(OVL_BRIDGE_STALE_MSG, 'error');
+            return;
+        }
+        if (!data || data.ok !== true || !data.newPath) {
+            showToast((data && data.error) ? data.error : '重命名失败', 'error');
+            return;
+        }
+        const newPath = data.newPath;
+        const failures = ovlOverleafRenameMigrateState(oldPath, newPath);
+        ovlSetProjectPath(newPath, {});
+        if (failures.length) {
+            showToast('文件夹已改名，但' + failures.join('、') + '迁移失败，请检查', 'warning');
+        } else {
+            showToast('已重命名为「' + ovlProjectHistoryBasename(newPath) + '」', 'success');
+        }
+    } catch (e) {
+        try { showToast('重命名请求失败：' + (e && e.message ? e.message : String(e)), 'error'); } catch (e2) {}
+    }
 }
 
 function ovlProjectHistoryBasename(p) {
@@ -31911,6 +32174,9 @@ async function ovlOverleafCloneFinishNamed(projectId, data, name) {
         pathInput.value = data.dir;
         try { localStorage.setItem(ovlProjectPathLsKey(), data.dir); } catch (e) {}
         if (typeof ovlBridgeUpdateWatch === 'function') { try { ovlBridgeUpdateWatch(); } catch (e) {} }
+        // v2 Pass P67：这条入口不走 ovlSetProjectPath（跟 P66 时一样的理由：watch 需要在
+        // ovlPickFolder 之后按原有时序另调），顶栏标题在这里单独补一句。
+        if (typeof ovlTopbarTitleRefresh === 'function') { try { ovlTopbarTitleRefresh(); } catch (e) {} }
     }
 
     // FSA 的目录句柄只能来自浏览器原生选择器的用户手势，没有"给一个绝对路径就打开文件树"
@@ -31927,6 +32193,7 @@ async function ovlOverleafCloneFinishNamed(projectId, data, name) {
             pathInput.value = data.dir;
             try { localStorage.setItem(ovlProjectPathLsKey(), data.dir); } catch (e2) {}
         }
+        if (typeof ovlTopbarTitleRefresh === 'function') { try { ovlTopbarTitleRefresh(); } catch (e3) {} }
     }
 }
 
@@ -32591,9 +32858,29 @@ function ovlBindShell() {
                 // ovlSetProjectPath（它会回写 .value，跟用户正在编辑的输入框打架），
                 // 这里只追加反向同步这一步。
                 if (typeof ovlOverleafSyncAddrForProject === 'function') { try { ovlOverleafSyncAddrForProject(newPath); } catch (e) {} }
+                // v2 Pass P67：手改路径同样不走 ovlSetProjectPath，顶栏标题也要在这里单独补一句。
+                if (typeof ovlTopbarTitleRefresh === 'function') { try { ovlTopbarTitleRefresh(); } catch (e) {} }
             });
             projectPathInput.addEventListener('keydown', function (e) {
                 if (e.key === 'Enter') { e.preventDefault(); ovlDoRecompile().catch(function (e2) { console.error('[ovl] recompile failed', e2); }); }
+            });
+        }
+        // v2 Pass P67：顶栏项目名——启动时先按刚恢复好的路径刷一次（覆盖上面 projectPathInput.value
+        // 的启动恢复这条不走 ovlSetProjectPath 的路径），再绑双击进入编辑 / 回车提交 / Esc 取消 / 失焦提交。
+        if (typeof ovlTopbarTitleRefresh === 'function') { try { ovlTopbarTitleRefresh(); } catch (e) {} }
+        const topbarTitleText = document.getElementById('ovlTopbarTitleText');
+        const topbarTitleInput = document.getElementById('ovlTopbarTitleInput');
+        if (topbarTitleText) {
+            topbarTitleText.addEventListener('dblclick', function () { ovlTopbarTitleEnterEdit(); });
+        }
+        if (topbarTitleInput) {
+            topbarTitleInput.addEventListener('keydown', function (e) {
+                if (e.key === 'Enter') { e.preventDefault(); ovlTopbarTitleCommitEdit(); }
+                else if (e.key === 'Escape') { e.preventDefault(); ovlTopbarTitleCancelEdit(); }
+            });
+            topbarTitleInput.addEventListener('blur', function () {
+                if (OvlTopbarTitleSkipNextBlurCommit) { OvlTopbarTitleSkipNextBlurCommit = false; return; }
+                ovlTopbarTitleCommitEdit();
             });
         }
         // v2 Pass P17：原生文件夹选择框——用户明确表示两次不想手填/粘贴路径，输入框继续
@@ -36963,6 +37250,7 @@ function ovlBoot() {
         const savedPath = localStorage.getItem(ovlProjectPathLsKey());
         const pathInput = document.getElementById('ovlProjectPathInput');
         if (savedPath && pathInput) pathInput.value = savedPath;
+        if (typeof ovlTopbarTitleRefresh === 'function') { try { ovlTopbarTitleRefresh(); } catch (e2) {} }
     } catch (e) {}
     ovlBridgeCheckHealth().catch(function (e) { console.warn('[ovl] bridge health check failed', e); });
     setInterval(function () {

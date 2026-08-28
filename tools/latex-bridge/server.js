@@ -50,7 +50,7 @@ try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化�
 // v2 Pass P45：/health 里带的能力/版本自报——见该端点注释。每次给桥新增一个"前端需要能
 // 判断有没有"的能力（新端点、既有端点的行为变化），就在 BRIDGE_CAPABILITIES 里加一个字符串，
 // 版本号也提一位。已经上线的能力不会被撤销，这个数组只做加法。
-const BRIDGE_API_VERSION = 52;
+const BRIDGE_API_VERSION = 53;
 const BRIDGE_CAPABILITIES = [
     'overleaf-clone',          // POST /overleaf/clone
     'overleaf-pull-strategy',  // POST /overleaf/pull 认识 body.strategy（abort/stash/discard）
@@ -62,8 +62,10 @@ const BRIDGE_CAPABILITIES = [
     'ws-ticket-auth',          // v2 Pass P50：POST /ws-ticket 换一次性短时票据，REMOTE_MODE 下 WebSocket 握手强制校验
     'overleaf-clone-target',   // v2 Pass P53：POST /overleaf/clone 认识 body.parentDir/body.folderName；
                                 // 新增 POST /overleaf/check-target 校验存放位置
-    'overleaf-origin-read'     // v2 Pass P66：只读 POST /overleaf/origin，回读某目录 .git/config 里的
+    'overleaf-origin-read',    // v2 Pass P66：只读 POST /overleaf/origin，回读某目录 .git/config 里的
                                 // origin，供前端反查"这个目录到底是哪个 Overleaf 项目"，不写任何东西
+    'overleaf-project-rename'  // v2 Pass P67：POST /overleaf/rename-project，真的重命名磁盘上的项目
+                                // 文件夹（只能改成同级兄弟目录），供顶栏项目名双击改名用
 ];
 
 // v2 Pass P49：监听地址可配（LATEX_BRIDGE_HOST），默认仍是 127.0.0.1——不传就跟以前
@@ -1062,6 +1064,71 @@ async function doOverleafOrigin(projectDir) {
         return { ok: true, hasOrigin: true, originUrl: stripped };
     } catch (e) {
         return { ok: true, hasOrigin: false, originUrl: null };
+    }
+}
+
+// v2 Pass P67：顶栏项目名双击改名——用户明确选定的语义是"真的重命名磁盘上的项目文件夹"，
+// 不是只改一个显示名。前端已经做过一轮校验，但这里必须独立再校验一遍（前端校验不算数，
+// 见下方 ovlValidateRenameName），并且只允许改成同级兄弟目录（新路径 = path.join(该目录的
+// 父目录, newName)），不接受任意目标路径——防止这个端点被当成一个"移动到任意地方"的后门。
+const OVL_RESERVED_DEVICE_NAME_RE = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])$/i;
+const OVL_FORBIDDEN_NAME_CHARS_RE = /[<>:"/\\|?*]/;
+function ovlValidateRenameName(newName) {
+    if (typeof newName !== 'string') return '新名称不能为空';
+    const trimmed = newName.trim();
+    if (!trimmed) return '新名称不能为空';
+    if (trimmed.length > 255) return '新名称过长（最多 255 个字符）';
+    if (OVL_FORBIDDEN_NAME_CHARS_RE.test(trimmed)) return '新名称不能包含 < > : " / \\ | ? * 这些字符';
+    if (trimmed.indexOf('..') !== -1) return '新名称不能包含连续两个英文句点 ".."';
+    if (/[ .]$/.test(trimmed)) return '新名称不能以空格或英文句点结尾';
+    if (OVL_RESERVED_DEVICE_NAME_RE.test(trimmed)) return '新名称不能是 Windows 保留设备名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）';
+    // 纯 basename 校验：含任何路径分隔符或 ".." 一律拒绝——path.basename 在遇到分隔符时会
+    // 把它们之前的部分都截掉，跟原始字符串不相等就说明带了路径结构，不是单纯的文件夹名。
+    if (path.basename(trimmed) !== trimmed) return '新名称不能包含路径分隔符';
+    return null; // 合法
+}
+
+async function doOverleafRenameProject(projectDir, newName) {
+    try {
+        if (!projectDir || typeof projectDir !== 'string') return { ok: false, error: 'projectDir is required (绝对路径)' };
+        const invalidReason = ovlValidateRenameName(newName);
+        if (invalidReason) return { ok: false, error: invalidReason };
+        const trimmedName = newName.trim();
+
+        // 正在编译时改名会把 latexmk 的 cwd 从脚下拽走，必须拒绝（跟 clone/pull 时的
+        // "先杀掉正在跑的旧编译"是完全不同的场景——那是我们自己主动结束旧进程，这里是
+        // 用户的编译还在正常进行，不能替他打断）。
+        if (currentChild) {
+            return { ok: false, error: '当前有编译正在进行，改名可能打断编译进程的工作目录，请等编译结束后再改名' };
+        }
+
+        let srcStat;
+        try { srcStat = fs.statSync(projectDir); } catch (e) { return { ok: false, error: '源目录不存在' }; }
+        if (!srcStat.isDirectory()) return { ok: false, error: '源路径不是一个目录' };
+
+        const parentDir = path.dirname(projectDir);
+        if (!parentDir || parentDir === projectDir) {
+            return { ok: false, error: '该目录没有父目录（已经是磁盘根目录），无法重命名' };
+        }
+
+        const newPath = path.join(parentDir, trimmedName);
+        if (newPath !== projectDir) {
+            let destExists = false;
+            try { fs.statSync(newPath); destExists = true; } catch (e) { destExists = false; }
+            if (destExists) return { ok: false, error: '目标名称已存在，请换一个名字' };
+        }
+
+        try {
+            await fs.promises.rename(projectDir, newPath);
+        } catch (e) {
+            if (e && (e.code === 'EBUSY' || e.code === 'EPERM' || e.code === 'EACCES')) {
+                return { ok: false, error: '目录正被占用（可能有文件被其他程序打开，或 OneDrive 正在同步），请稍后再试' };
+            }
+            return { ok: false, error: '重命名失败：' + (e && e.message ? e.message : String(e)) };
+        }
+        return { ok: true, newPath: newPath };
+    } catch (e) {
+        return { ok: false, error: '重命名失败：' + (e && e.message ? e.message : String(e)) };
     }
 }
 
@@ -2557,6 +2624,37 @@ const server = http.createServer(async (req, res) => {
             const projectDir = body.projectDir;
             if (!projectDir || typeof projectDir !== 'string') { sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' }); return; }
             const result = await doOverleafOrigin(projectDir);
+            sendJson(res, 200, result);
+            return;
+        }
+
+        // v2 Pass P67：顶栏项目名双击改名——真的把磁盘上的项目文件夹重命名。跟 /overleaf/origin
+        // 一样走 ovlOriginAllowed 前置检查、不在 TOKEN_EXEMPT_PATHS 里（远程模式下必须过令牌闸门——
+        // 这是一个会真实修改磁盘的写操作，跟只读的 /overleaf/origin 不是一回事）。
+        if (req.method === 'POST' && pathname === '/overleaf/rename-project') {
+            if (!ovlOriginAllowed(req)) {
+                sendJson(res, 403, { ok: false, action: 'forbidden-origin',
+                    error: '拒绝来自外部网页的同步请求。这个接口只接受 AI-Translator 页面本身的调用。' });
+                return;
+            }
+            const bodyText = await readBody(req);
+            let body;
+            try { body = JSON.parse(bodyText || '{}'); } catch (e) {
+                sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
+                return;
+            }
+            const projectDir = body.projectDir;
+            const newName = body.newName;
+            if (!projectDir || typeof projectDir !== 'string') { sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' }); return; }
+            if (!newName || typeof newName !== 'string') { sendJson(res, 400, { ok: false, error: 'newName is required' }); return; }
+            // newName 必须是纯 basename——含任何路径分隔符或 ".." 都是在试图把这个端点当成
+            // "移动到任意目录"的后门，请求体本身不合法，400 而不是业务性的 ok:false。
+            const trimmedForPathCheck = newName.trim();
+            if (path.basename(trimmedForPathCheck) !== trimmedForPathCheck || trimmedForPathCheck.indexOf('..') !== -1) {
+                sendJson(res, 400, { ok: false, error: 'newName 必须是纯文件夹名，不能包含路径分隔符或 ".."' });
+                return;
+            }
+            const result = await doOverleafRenameProject(projectDir, newName);
             sendJson(res, 200, result);
             return;
         }
