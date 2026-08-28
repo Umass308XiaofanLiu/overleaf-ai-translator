@@ -25246,51 +25246,229 @@ function ovlVisualHashSrc(text) {
     return h1.toString(16) + '-' + h2.toString(16) + '-' + s.length.toString(16);
 }
 
-const OVL_VISUAL_TRANS_CACHE_KEY = 'ovlVisualTransCache_v1';
-const OVL_VISUAL_TRANS_CACHE_MAX = 500; // 上限 + 按最近使用时间淘汰，防止 localStorage 被撑爆
+// ---- v2 Pass P62：按项目分区的缓存（修「切换项目后重新翻译」）----
+// 【根因】v1 是全局共用一个 500 条硬顶的 LRU，不区分项目——一篇几千行的论文自己产生的块数
+// 就能逼近/超过 500，同项目内部先翻的块会被后翻的块挤出去；再跨项目切换，各项目的块还要
+// 互相抢这 500 个坑位。key 本身（内容哈希+lang+provider+model）设计是对的——不含项目路径，
+// 天然"只要块源文一个字节没变就命中缓存"= 用户要的"diff 增量翻译"语义已经具备，不需要另外
+// 实现真正的文本 diff 算法。真正要修的是"存储分区"和"容量"两件事：
+//   1. 每个项目一个独立 localStorage key（前缀 + 项目绝对路径规范化后的 id），互不淘汰。
+//   2. 单项目预算改成按字节（这里用 JS 字符串 .length 近似，UTF-16 下和实际存储量成正比，
+//      比"数条目数"更贴近真实撑爆 localStorage 配额的那个量），不再是数条目的 500 硬顶。
+// 【容量预算依据】P59 诊断读取用户真实论文行数（4132 行正文），推断可翻译块数量级在几百到
+// 一千多；本 Pass 用合成夹具实测（见 test_p62_trans_cache.js）：1500 个短块（每条译文约
+// 80-200 字符）整体 JSON 序列化后约 400KB，换算下来即便一篇论文膨胀到 5000 个块也就 1.3MB
+// 量级。据此把单项目预算设到 2,000,000 字符（约 2MB，留了 5-10 倍余量），单项目内部实质上
+// 不会再触发按字节淘汰；真正兜底的是配额耗尽路径（见 ovlVisualTransCacheSave）。
+// 项目总数/总预算上限防的是"开过很多个项目、每个都攒了 2MB，总量顶爆 localStorage 整体配额"
+// 这种慢性积累——用 MAX_PROJECTS 数量 + TOTAL_BUDGET 字节数双重兜底，超了就把最久未碰的
+// 项目整桶淘汰（不影响当前项目，也不会把当前项目内部数据打散着削）。
+const OVL_VISUAL_TRANS_CACHE_KEY = 'ovlVisualTransCache_v1'; // 旧版全局共享缓存——只读兜底，不再写入/增长（见下方 legacy 说明）
+const OVL_VISUAL_TRANS_CACHE_V2_PREFIX = 'ovlVisualTransCache_v2::';
+const OVL_VISUAL_TRANS_CACHE_INDEX_KEY = 'ovlVisualTransCache_v2_index';
+const OVL_VISUAL_TRANS_CACHE_PROJECT_BUDGET_CHARS = 2000000;   // 单项目预算 ~2MB 字符
+const OVL_VISUAL_TRANS_CACHE_TOTAL_BUDGET_CHARS = 4000000;     // 所有项目合计预算 ~4MB 字符，留安全边际给 localStorage 里其它 key（配额普遍 5-10MB）
+const OVL_VISUAL_TRANS_CACHE_MAX_PROJECTS = 8;                 // 最多同时保留 8 个项目的缓存桶
 
-function ovlVisualTransCacheLoad() {
+// 当前项目的稳定标识：复用 P56 已有的 ovlNormalizeProjectPath（大小写/分隔符规范化后的绝对
+// 路径），跟项目历史、图片缩略图解析用的是同一个"项目根路径"来源（#ovlProjectPathInput），
+// 不依赖 DOM 序号/时间戳这类会变的量。拿不到路径（比如 FSA 句柄场景没有可用绝对路径）时退化
+// 到一个固定的 '__unknown__' 桶——多个"没有路径"的项目会共享这一个桶，不比旧行为更差。
+function ovlVisualTransCacheProjectId() {
+    try {
+        const el = document.getElementById('ovlProjectPathInput');
+        const raw = el ? String(el.value || '').trim() : '';
+        const norm = raw && typeof ovlNormalizeProjectPath === 'function' ? ovlNormalizeProjectPath(raw) : raw;
+        return norm || '__unknown__';
+    } catch (e) { return '__unknown__'; }
+}
+function ovlVisualTransCacheBucketKey(projectId) { return OVL_VISUAL_TRANS_CACHE_V2_PREFIX + projectId; }
+
+function ovlVisualTransCacheIndexLoad() {
+    try {
+        const raw = localStorage.getItem(OVL_VISUAL_TRANS_CACHE_INDEX_KEY);
+        const parsed = raw ? JSON.parse(raw) : null;
+        return (parsed && typeof parsed === 'object') ? parsed : {};
+    } catch (e) { return {}; }
+}
+function ovlVisualTransCacheIndexSave(idx) {
+    try { localStorage.setItem(OVL_VISUAL_TRANS_CACHE_INDEX_KEY, JSON.stringify(idx)); } catch (e) {}
+}
+function ovlVisualTransCacheIndexTouch(projectId) {
+    try {
+        const idx = ovlVisualTransCacheIndexLoad();
+        idx[projectId] = Date.now();
+        ovlVisualTransCacheIndexSave(idx);
+    } catch (e) {}
+}
+// 从索引里挑出"最久未碰"的项目 id（排除 exceptId，一般是当前项目——不淘汰自己）。
+function ovlVisualTransCacheOldestProject(exceptId) {
+    try {
+        const idx = ovlVisualTransCacheIndexLoad();
+        const ids = Object.keys(idx).filter(function (id) { return id !== exceptId; });
+        if (!ids.length) return null;
+        ids.sort(function (a, b) { return (idx[a] || 0) - (idx[b] || 0); });
+        return ids[0];
+    } catch (e) { return null; }
+}
+function ovlVisualTransCacheDropProject(projectId) {
+    try {
+        localStorage.removeItem(ovlVisualTransCacheBucketKey(projectId));
+        const idx = ovlVisualTransCacheIndexLoad();
+        delete idx[projectId];
+        ovlVisualTransCacheIndexSave(idx);
+    } catch (e) {}
+}
+
+function ovlVisualTransCacheBucketLoad(projectId) {
+    try {
+        const raw = localStorage.getItem(ovlVisualTransCacheBucketKey(projectId));
+        const parsed = raw ? JSON.parse(raw) : null;
+        return (parsed && typeof parsed === 'object') ? parsed : {};
+    } catch (e) { return {}; }
+}
+// 把单项目桶按 ts 淘汰到 <= budgetChars（估算：整桶 JSON 序列化后的字符数）。
+function ovlVisualTransCacheEvictToBudget(map, budgetChars) {
+    try {
+        let keys = Object.keys(map);
+        if (!keys.length) return map;
+        keys.sort(function (a, b) { return (map[a].ts || 0) - (map[b].ts || 0); });
+        let i = 0;
+        while (i < keys.length && JSON.stringify(map).length > budgetChars) {
+            delete map[keys[i]];
+            i++;
+        }
+    } catch (e) {}
+    return map;
+}
+// 配额耗尽（QuotaExceededError）时的优雅降级：先淘汰别的项目整桶腾地方（不动当前项目数据），
+// 还不够再砍当前项目桶自己最老的一半，两轮都不行就放弃并提示用户——绝不静默假装存成功。
+function ovlVisualTransCacheSaveBucket(projectId, map) {
+    const bucketKey = ovlVisualTransCacheBucketKey(projectId);
+    let payload;
+    try { payload = JSON.stringify(map); } catch (e) { return false; }
+    try {
+        localStorage.setItem(bucketKey, payload);
+        return true;
+    } catch (e) {
+        if (!(e && (e.name === 'QuotaExceededError' || e.code === 22 || e.code === 1014))) return false;
+        // 第一轮：淘汰其它项目的整桶，最多尝试 MAX_PROJECTS 次（防止索引脏数据导致死循环）。
+        for (let round = 0; round < OVL_VISUAL_TRANS_CACHE_MAX_PROJECTS; round++) {
+            const victim = ovlVisualTransCacheOldestProject(projectId);
+            if (!victim) break;
+            ovlVisualTransCacheDropProject(victim);
+            try { localStorage.setItem(bucketKey, payload); return true; } catch (e2) { /* 继续淘汰下一个 */ }
+        }
+        // 第二轮：别的项目全淘汰完还是不够，砍自己桶最老的一半再试。
+        try {
+            const keys = Object.keys(map);
+            if (keys.length > 1) {
+                keys.sort(function (a, b) { return (map[a].ts || 0) - (map[b].ts || 0); });
+                const drop = Math.ceil(keys.length / 2);
+                for (let i = 0; i < drop; i++) delete map[keys[i]];
+                payload = JSON.stringify(map);
+                localStorage.setItem(bucketKey, payload);
+                return true;
+            }
+        } catch (e3) {}
+        // 两轮都放弃：明确告诉用户，不静默失败。
+        try {
+            if (typeof showToast === 'function') showToast('翻译缓存空间已满，本次译文未能保存，下次可能需要重新翻译', 'warning');
+        } catch (e4) {}
+        return false;
+    }
+}
+// 全局维护：项目桶数量/总字节数超预算时，淘汰最久未碰的项目（不动当前项目）。
+function ovlVisualTransCacheMaintain(currentProjectId) {
+    try {
+        const idx = ovlVisualTransCacheIndexLoad();
+        let ids = Object.keys(idx);
+        let guard = 0;
+        while (guard < OVL_VISUAL_TRANS_CACHE_MAX_PROJECTS + 4) {
+            guard++;
+            ids = Object.keys(ovlVisualTransCacheIndexLoad());
+            if (ids.length <= OVL_VISUAL_TRANS_CACHE_MAX_PROJECTS) break;
+            const victim = ovlVisualTransCacheOldestProject(currentProjectId);
+            if (!victim) break;
+            ovlVisualTransCacheDropProject(victim);
+        }
+        // 总字节数估算：逐桶读 length 累加（桶数不多，<=MAX_PROJECTS+1，成本可控）。
+        let total = 0;
+        const idx2 = ovlVisualTransCacheIndexLoad();
+        const ids2 = Object.keys(idx2);
+        const sizes = {};
+        for (let i = 0; i < ids2.length; i++) {
+            const raw = localStorage.getItem(ovlVisualTransCacheBucketKey(ids2[i])) || '';
+            sizes[ids2[i]] = raw.length;
+            total += raw.length;
+        }
+        let guard2 = 0;
+        while (total > OVL_VISUAL_TRANS_CACHE_TOTAL_BUDGET_CHARS && guard2 < OVL_VISUAL_TRANS_CACHE_MAX_PROJECTS) {
+            guard2++;
+            const victim = ovlVisualTransCacheOldestProject(currentProjectId);
+            if (!victim) break;
+            total -= (sizes[victim] || 0);
+            ovlVisualTransCacheDropProject(victim);
+        }
+    } catch (e) {}
+}
+
+// ---- 旧版（v1，全局共享、条目数硬顶 500）只读兜底 ----
+// 不再写入/增长这个 key，只在新版（分项目）桶未命中时读一次当兜底，命中就"提升"进当前项目的
+// 新桶（写一份，不删旧的）。这样升级后已经缓存过的句子——不论当初是在哪个项目翻的——仍然能
+// 命中，不需要用户经历一次强制全量重翻；旧 key 因为不再增长，占用量不会变大，也不参与上面的
+// 预算/淘汰计算。
+function ovlVisualTransCacheLegacyLoad() {
     try {
         const raw = localStorage.getItem(OVL_VISUAL_TRANS_CACHE_KEY);
         const parsed = raw ? JSON.parse(raw) : null;
         return (parsed && typeof parsed === 'object') ? parsed : {};
     } catch (e) { return {}; }
 }
-function ovlVisualTransCacheSave(map) {
-    try { localStorage.setItem(OVL_VISUAL_TRANS_CACHE_KEY, JSON.stringify(map)); }
-    catch (e) { /* 配额满/不可用就放弃这次写缓存，不影响翻译本身能不能用 */ }
-}
+
 function ovlVisualTransCacheKey(text, config) {
     const provider = (config && config.provider) ? String(config.provider) : '';
     const model = (config && config.model) ? String(config.model) : '';
     return ovlVisualHashSrc(text) + '|zh|' + provider + '|' + model;
 }
 // 命中返回译文字符串，未命中返回 null。命中会顺手把 ts 刷新成"最近使用"，配合淘汰策略。
+// 只有 ts 距上次刷新超过 60s 才真的重写 localStorage（避免同一屏内反复渲染同一块时，每次
+// 命中都要整桶 JSON.stringify 一次，纯粹为了刷新时间戳这么小的收益不值这个成本）。
 function ovlVisualTransCacheGet(text, config) {
     try {
-        const map = ovlVisualTransCacheLoad();
+        const projectId = ovlVisualTransCacheProjectId();
         const key = ovlVisualTransCacheKey(text, config);
+        const map = ovlVisualTransCacheBucketLoad(projectId);
         const hit = map[key];
         if (hit && typeof hit.tgt === 'string') {
-            hit.ts = Date.now();
-            ovlVisualTransCacheSave(map);
+            const now = Date.now();
+            if (!hit.ts || now - hit.ts > 60000) {
+                hit.ts = now;
+                if (ovlVisualTransCacheSaveBucket(projectId, map)) ovlVisualTransCacheIndexTouch(projectId);
+            }
             return hit.tgt;
+        }
+        // 新桶未命中——查一次旧版全局缓存兜底，命中就提升进新桶（不删旧的、旧的不再增长）。
+        const legacy = ovlVisualTransCacheLegacyLoad();
+        const legacyHit = legacy[key];
+        if (legacyHit && typeof legacyHit.tgt === 'string') {
+            ovlVisualTransCachePut(text, config, legacyHit.tgt);
+            return legacyHit.tgt;
         }
     } catch (e) {}
     return null;
 }
 function ovlVisualTransCachePut(text, config, tgt) {
     try {
-        const map = ovlVisualTransCacheLoad();
+        const projectId = ovlVisualTransCacheProjectId();
         const key = ovlVisualTransCacheKey(text, config);
+        const map = ovlVisualTransCacheBucketLoad(projectId);
         map[key] = { tgt: tgt, ts: Date.now() };
-        const keys = Object.keys(map);
-        if (keys.length > OVL_VISUAL_TRANS_CACHE_MAX) {
-            keys.sort(function (a, b) { return (map[a].ts || 0) - (map[b].ts || 0); });
-            const drop = keys.length - OVL_VISUAL_TRANS_CACHE_MAX;
-            for (let i = 0; i < drop; i++) delete map[keys[i]];
+        ovlVisualTransCacheEvictToBudget(map, OVL_VISUAL_TRANS_CACHE_PROJECT_BUDGET_CHARS);
+        if (ovlVisualTransCacheSaveBucket(projectId, map)) {
+            ovlVisualTransCacheIndexTouch(projectId);
+            ovlVisualTransCacheMaintain(projectId);
         }
-        ovlVisualTransCacheSave(map);
     } catch (e) {}
 }
 
