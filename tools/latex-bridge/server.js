@@ -416,8 +416,12 @@ function copyBibResourcesToOutdir(mainAbs, projectDir, outdir) {
         if (n) names.push(n.endsWith('.bib') ? n : n + '.bib');
     }
     names.forEach((name) => {
-        const src = path.join(projectDir, name);
-        if (!fs.existsSync(src)) return; // 找不到就跳过，交给 bibtex 自己按原样报错，不装作成功
+        // v2 Pass P60：.bib 常跟主 .tex 放同一目录（子目录报告场景），优先在主文件目录找，
+        // 找不到再退回项目根（老项目 .bib 放根目录的既有行为零回归）。
+        const srcNextToMain = path.join(path.dirname(mainAbs), name);
+        const srcAtRoot = path.join(projectDir, name);
+        const src = fs.existsSync(srcNextToMain) ? srcNextToMain : srcAtRoot;
+        if (!fs.existsSync(src)) return; // 两处都找不到就跳过，交给 bibtex 自己按原样报错，不装作成功
         const dest = path.join(outdir, name);
         try {
             fs.mkdirSync(path.dirname(dest), { recursive: true });
@@ -458,6 +462,14 @@ function doCompile(projectDir, mainFile, opts) {
             return;
         }
         if (mode !== 'draft') copyBibResourcesToOutdir(mainAbs, projectDir, outdir);
+
+        // v2 Pass P60：编译 cwd 必须是主文件所在目录，不能恒为 projectDir——.tex 内部的
+        // \includegraphics{figures/fig.png} 这类相对路径是相对"进程 cwd"解析的（latexmk/
+        // pdflatex/xelatex/lualatex 都一样，Overleaf/TeXstudio 也是这个语义），不是相对
+        // .tex 文件自己所在目录。主文件在子目录（如 report/VR_08_07_2026/）、图片路径又
+        // 相对该子目录写时，cwd=projectDir 会让 kpathsea 找不到图。主文件本来就在项目根时
+        // path.dirname(mainAbs) === path.resolve(projectDir)，行为不变，零回归。
+        const compileCwd = path.dirname(mainAbs);
 
         // 同一时间只允许一个编译在跑；新请求来了先杀掉旧的（§3.1 契约）。
         if (currentChild) {
@@ -500,7 +512,7 @@ function doCompile(projectDir, mainFile, opts) {
         let stderrBuf = [];
         let child;
         try {
-            child = spawn(compilerBin, args, { cwd: projectDir, windowsHide: true });
+            child = spawn(compilerBin, args, { cwd: compileCwd, windowsHide: true });
         } catch (e) {
             resolve({ ok: false, error: 'spawn ' + (mode === 'draft' ? engine : 'latexmk') + ' failed: ' + e.message });
             return;
@@ -605,6 +617,9 @@ function doWordCount(projectDir, mainFile) {
             // 实测（本机 texcount）：-sum=all 不是这个版本认识的开关（不报错但也不产出
             // "Sum count:" 那一行）——用 -inc 就够了，"合计"改成前端拿 words+headers+captions
             // 自己加，加数还是 texcount 给的真实数字，不是编的。
+            // TODO(v2 Pass P60 §5.4)：这里的 cwd 恒为 projectDir，理论上跟 doCompile() 同一个
+            // 根因（texcount -inc 递归 \input 时才会用到相对路径解析）。本 Pass 未复现、未在
+            // 用户报告里出现，刻意不动，避免扩大改动的爆炸半径——见 .claude/tmp/p60_plan.md §1.3。
             child = spawn(TEXCOUNT, ['-inc', mainAbs], { cwd: projectDir, windowsHide: true });
         } catch (e) {
             resolve({ ok: false, error: 'spawn texcount failed: ' + e.message });

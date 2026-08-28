@@ -24808,7 +24808,65 @@ function ovlFigThumbExt(relPath) {
     return m ? m[1].toLowerCase() : '';
 }
 
-async function ovlResolveFigureThumb(projectDir, relPath) {
+// v2 Pass P60：子目录里的 .tex 引用图片时（\includegraphics{figures/fig.png} 相对*当前
+// 打开文件所在目录*写的），P18 原本只会拼"项目根 + 原始相对路径"去请求 /project-asset，
+// 子目录场景下必 404。这里在"加载时"（不是渲染时）算出当前文件的目录 baseDir，生成
+// "相对当前文件目录"和"相对项目根"两组候选，串行试，第一个成功的用。
+// 明确不覆盖：\graphicspath{{...}} 声明的额外搜索路径——正确实现需要先读主文档导言区
+// （Visual 面板渲染的可能是被 \input 的子文件，它自己没有导言区），跟本 Pass"只补目录
+// 上下文"的收敛范围不匹配。未命中的后果是退回 P15 起就有的占位框（图标+文件名），不是
+// 新增故障、也不会显示错的图。见 .claude/tmp/p60_plan.md §2.4。
+function ovlDirnameRel(relPath) {
+    if (!relPath) return '';
+    const norm = String(relPath).replace(/\\/g, '/');
+    const idx = norm.lastIndexOf('/');
+    return idx === -1 ? '' : norm.slice(0, idx);
+}
+function ovlJoinRelPath(dir, rel) {
+    let r = String(rel || '').replace(/\\/g, '/');
+    if (/^([A-Za-z]:|\/)/.test(r)) return r; // 绝对路径原样返回，不拼前缀
+    if (!dir) return r;
+    const combined = dir + '/' + r;
+    const parts = combined.split('/');
+    const out = [];
+    for (const seg of parts) {
+        if (seg === '' || seg === '.') continue;
+        if (seg === '..') {
+            if (out.length && out[out.length - 1] !== '..') out.pop();
+            else out.push(seg); // 栈空——保留 '..'，让桥端的路径穿越防护去拒绝
+        } else {
+            out.push(seg);
+        }
+    }
+    return out.join('/');
+}
+// 生成本次要尝试的候选资源路径：先"相对当前文件目录"（新行为），再"相对项目根"（P18 旧
+// 行为，兜底）；baseDir 为空或 raw 已经是绝对路径时两条会重合，去重后老项目零行为变化。
+// 省略扩展名（graphicx 官方推荐写法 \includegraphics{fig}，真实论文里很常见）时依次尝试
+// pdf/png/jpg/jpeg 四种扩展名，跟 pdflatex 默认搜索顺序一致；已知但前端渲不了的扩展名
+// （.eps/.tikz 等）原样透传、不产出候选，维持占位框。
+function ovlFigureCandidatePaths(baseDir, raw) {
+    const norm = String(raw || '').replace(/\\/g, '/').replace(/^\.\//, '');
+    if (!norm) return [];
+    const bases = [];
+    const b1 = ovlJoinRelPath(baseDir, norm);
+    if (bases.indexOf(b1) === -1) bases.push(b1);
+    if (bases.indexOf(norm) === -1) bases.push(norm);
+    const out = [];
+    const KNOWN_EXTS = OVL_FIG_THUMB_RASTER_EXTS.concat(['pdf']);
+    for (const base of bases) {
+        const ext = ovlFigThumbExt(base);
+        if (KNOWN_EXTS.indexOf(ext) !== -1) {
+            out.push(base);
+        } else if (!ext) {
+            ['pdf', 'png', 'jpg', 'jpeg'].forEach(function (e) { out.push(base + '.' + e); });
+        }
+        // 已知但渲不了的扩展名（.eps/.tikz 等）——不产出候选，维持占位框
+    }
+    return out.slice(0, 8); // 候选总数上限 8（2 基 × 4 扩展），超出截断
+}
+
+async function ovlResolveOneFigureCandidate(projectDir, relPath) {
     const assetUrl = ovlBridgeUrl('/project-asset?projectDir=' + encodeURIComponent(projectDir) + '&path=' + encodeURIComponent(relPath));
     const ext = ovlFigThumbExt(relPath);
     if (OVL_FIG_THUMB_RASTER_EXTS.indexOf(ext) !== -1) {
@@ -24857,11 +24915,20 @@ async function ovlResolveFigureThumb(projectDir, relPath) {
     return { ok: false }; // 不认识的扩展名（.eps/.tikz 之类），P15 原始占位框就是给这种情况兜底的
 }
 
-function ovlGetFigureThumb(projectDir, relPath) {
-    const key = projectDir + ' ' + relPath;
+async function ovlResolveFigureThumb(projectDir, baseDir, relPath) {
+    const candidates = ovlFigureCandidatePaths(baseDir, relPath);
+    for (const candidate of candidates) {
+        const result = await ovlResolveOneFigureCandidate(projectDir, candidate);
+        if (result && result.ok) return result;
+    }
+    return { ok: false };
+}
+
+function ovlGetFigureThumb(projectDir, baseDir, relPath) {
+    const key = projectDir + ' ' + baseDir + '|' + relPath;
     const cached = OvlFigThumbCache.get(key);
     if (cached) return cached; // Promise 或终态对象，直接复用，不重新发起
-    const p = ovlResolveFigureThumb(projectDir, relPath).then(function (result) {
+    const p = ovlResolveFigureThumb(projectDir, baseDir, relPath).then(function (result) {
         OvlFigThumbCache.set(key, result); // 用终态对象替换 Promise：以后同 key 的调用同步命中缓存
         return result;
     });
@@ -24895,10 +24962,18 @@ function ovlVisualLoadFigureThumbnails(root) {
     const pathInput = document.getElementById('ovlProjectPathInput');
     const projectDir = pathInput ? pathInput.value.trim() : '';
     if (!projectDir) return; // 没配置项目路径——保持 P15 原样的图标+文件名占位框，这本身就是预期降级
+    // v2 Pass P60：baseDir 取自当前正在渲染的文件（Visual 面板渲染的一定是当前打开的这一个
+    // 文件，两个调用点——ovlVisualRender() 末尾 / ovlInlineSrcRerenderLocal()——都是如此，
+    // 不存在一个 pane 里混着多个来源文件的情况，所以读 OvlState.currentFile 是正确且充分的。
+    // OvlOpenFileFromBlob() 建的 currentFile 没有 relPath 字段（webkitdirectory 只读降级模式）
+    // ——用 name 兜底，兜底不到就是空字符串，等价于回到 P18 旧行为（老项目零回归）。
+    const cf = (typeof OvlState !== 'undefined') && OvlState && OvlState.currentFile;
+    const curRel = (cf && (cf.relPath || cf.name)) || (typeof OvlState !== 'undefined' && OvlState.mainDocFile) || '';
+    const baseDir = ovlDirnameRel(curRel);
     boxes.forEach(function (box) {
         const relPath = box.getAttribute('data-fig-src');
         if (!relPath) return;
-        const outcome = ovlGetFigureThumb(projectDir, relPath);
+        const outcome = ovlGetFigureThumb(projectDir, baseDir, relPath);
         if (outcome && typeof outcome.then === 'function') {
             outcome.then(function (result) { if (box.isConnected) ovlApplyFigureThumb(box, result); });
         } else {
