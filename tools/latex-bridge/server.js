@@ -50,7 +50,7 @@ try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化�
 // v2 Pass P45：/health 里带的能力/版本自报——见该端点注释。每次给桥新增一个"前端需要能
 // 判断有没有"的能力（新端点、既有端点的行为变化），就在 BRIDGE_CAPABILITIES 里加一个字符串，
 // 版本号也提一位。已经上线的能力不会被撤销，这个数组只做加法。
-const BRIDGE_API_VERSION = 51;
+const BRIDGE_API_VERSION = 52;
 const BRIDGE_CAPABILITIES = [
     'overleaf-clone',          // POST /overleaf/clone
     'overleaf-pull-strategy',  // POST /overleaf/pull 认识 body.strategy（abort/stash/discard）
@@ -60,8 +60,10 @@ const BRIDGE_CAPABILITIES = [
     'remote-token-auth',       // v2 Pass P49：可绑非回环地址 + 令牌鉴权，见 tokenAuthorized()
     'fs-write-conflict-check', // v2 Pass P50：POST /fs/write 认识 body.expectedMtimeMs，冲突时返回 conflict:true
     'ws-ticket-auth',          // v2 Pass P50：POST /ws-ticket 换一次性短时票据，REMOTE_MODE 下 WebSocket 握手强制校验
-    'overleaf-clone-target'    // v2 Pass P53：POST /overleaf/clone 认识 body.parentDir/body.folderName；
+    'overleaf-clone-target',   // v2 Pass P53：POST /overleaf/clone 认识 body.parentDir/body.folderName；
                                 // 新增 POST /overleaf/check-target 校验存放位置
+    'overleaf-origin-read'     // v2 Pass P66：只读 POST /overleaf/origin，回读某目录 .git/config 里的
+                                // origin，供前端反查"这个目录到底是哪个 Overleaf 项目"，不写任何东西
 ];
 
 // v2 Pass P49：监听地址可配（LATEX_BRIDGE_HOST），默认仍是 127.0.0.1——不传就跟以前
@@ -1032,6 +1034,35 @@ async function ensureOriginRemote(projectDir, gitUrl, token) {
         };
     }
     return { ok: true };
+}
+
+// v2 Pass P66：只读反查某目录当前 origin 指向哪——前端拿不到 .git/config（/fs/read 明确
+// 拒绝 .git/ 内部路径，见 safeFsPath），需要一个语义受限的只读端点顶上，给前端一个权威判据：
+// "这个本地目录到底是哪个 Overleaf 项目"，用来在切换项目目录时反向同步 UI 上显示的项目 ID，
+// 从根上避免 P66 那种「目录是 A、发出去的 gitUrl 却还是上一个项目 B」的错配。
+// 只执行 `git remote get-url origin`，不 add/set-url/fetch，不写任何东西；不是 git 仓库/没有
+// origin 都不当错误处理，如实回报 hasOrigin:false，让前端自己决定怎么降级。
+// 返回前必须剥掉 userinfo（跟 ensureOriginRemote 报错文案用的是同一条正则）——手动
+// `git clone https://user:token@git.overleaf.com/<id>` 出来的目录，origin 里会带凭据；
+// 这条 URL 一律不写日志。
+async function doOverleafOrigin(projectDir) {
+    try {
+        const gitDir = path.join(projectDir, '.git');
+        let hasGitDir = false;
+        try { hasGitDir = fs.existsSync(gitDir); } catch (e) { hasGitDir = false; }
+        if (!hasGitDir) return { ok: true, hasOrigin: false, originUrl: null };
+        const urlResult = await runGitCommand(['remote', 'get-url', 'origin'], projectDir, null);
+        if (!urlResult.ok) return { ok: true, hasOrigin: false, originUrl: null };
+        const raw = (urlResult.stdout || '').trim();
+        if (!raw) return { ok: true, hasOrigin: false, originUrl: null };
+        // 剥 userinfo：本端点不持有 token（调用方没传，也不需要传——get-url 是纯本地读操作），
+        // 所以这里没有 redactToken() 可用的 token 值；userinfo 剥离已经覆盖了"URL 里带凭据"
+        // 这唯一的泄露面。
+        const stripped = raw.replace(/^([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^@/]*@/, '$1');
+        return { ok: true, hasOrigin: true, originUrl: stripped };
+    } catch (e) {
+        return { ok: true, hasOrigin: false, originUrl: null };
+    }
 }
 
 // 解析 `git status --porcelain`（v1 格式）的一行为 {status, path}——status 是原始两字符
@@ -2506,6 +2537,28 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 200, await doFsRestore(projectDir, body.checkpoint, { dryRun: !!body.dryRun, force: !!body.force }));
                 return;
             }
+        }
+
+        // v2 Pass P66：只读反查目录的 origin，供前端反向同步 UI 上的 Overleaf 项目 ID。
+        // 跟 /overleaf/pull、/overleaf/push 共用同一套「拒绝外部网页调用」的 CORS 前置检查，
+        // 但本身不写任何东西、不需要 token。
+        if (req.method === 'POST' && pathname === '/overleaf/origin') {
+            if (!ovlOriginAllowed(req)) {
+                sendJson(res, 403, { ok: false, action: 'forbidden-origin',
+                    error: '拒绝来自外部网页的同步请求。这个接口只接受 AI-Translator 页面本身的调用。' });
+                return;
+            }
+            const bodyText = await readBody(req);
+            let body;
+            try { body = JSON.parse(bodyText || '{}'); } catch (e) {
+                sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
+                return;
+            }
+            const projectDir = body.projectDir;
+            if (!projectDir || typeof projectDir !== 'string') { sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' }); return; }
+            const result = await doOverleafOrigin(projectDir);
+            sendJson(res, 200, result);
+            return;
         }
 
         // v2 Pass P24：Overleaf git 集成——见 doOverleafPull 头部注释的安全设计 + 分支逻辑。

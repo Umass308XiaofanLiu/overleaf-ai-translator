@@ -27626,8 +27626,9 @@ function ovlAutoFillProjectPath(handle) {
         if (typeof ovlProjectHistoryProbePathExists !== 'function') return;
         Promise.resolve(ovlProjectHistoryProbePathExists(guess)).then(function (exists) {
             if (exists !== true) return; // null（没法判断）/false（确认不存在）都不覆盖
-            input.value = guess;
-            try { localStorage.setItem(ovlProjectPathLsKey(), guess); } catch (e) {}
+            // v2 Pass P66：改走统一收口函数，顺带反向同步 Overleaf 项目 ID——这个函数本身
+            // 曾经是 P66 诊断 §2.2 点名的"改了路径但不同步 ID"入口之一。
+            ovlSetProjectPath(guess);
         }).catch(function () {});
     } catch (e) { console.error('[ovl] autoFillProjectPath failed', e); }
 }
@@ -28017,9 +28018,9 @@ function ovlRemotePickFolder() {
             ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: p, path: '.' }).then(function (data) {
                 okBtn.disabled = false;
                 if (!data || data.ok !== true) { renderError((data && data.error) || '这个路径打不开——检查是否存在/是否是目录'); return; }
-                const pathInput = document.getElementById('ovlProjectPathInput');
-                if (pathInput) pathInput.value = p;
-                try { localStorage.setItem(ovlProjectPathLsKey(), p); } catch (e2) {}
+                // v2 Pass P66：改走统一收口函数，顺带反向同步 Overleaf 项目 ID。watch 沿用
+                // 原有时序，在下面 renderTree 之后另调，这里跳过。
+                ovlSetProjectPath(p, { skipWatch: true });
                 OvlState.usingWebkitFallback = false;
                 OvlState.dirHandle = new OvlRemoteDirHandle('.', ovlProjectHistoryBasename(p) || p);
                 ovlUpdateTreeToolbtnsVisibility();
@@ -28254,6 +28255,77 @@ function ovlNormalizeProjectPath(p) {
     } catch (e) { return ''; }
 }
 
+// v2 Pass P66：按项目路径持久化 Overleaf 项目 ID/地址的小映射表——权威源是桥的
+// git remote get-url origin（见 ovlOverleafFetchOriginAddr），但桥离线/旧桥/目录还不是
+// git 仓库时，这份本地缓存能兜底把"这个目录对应哪个 Overleaf 项目"的判断带过去，好过
+// 直接沿用 OvlSettings.overleafProjectAddr 那个跟目录完全不联动的全局旧值（P66 根因）。
+// 本地/远程分两个 key，理由跟 ovlProjectPathLsKey() 完全一致：两种模式下的绝对路径来自
+// 不同机器的文件系统，同一个字符串可能指两个不同目录。
+// 每条 value 只有 24 字节量级（ID 或短 URL），不需要 P62 翻译缓存那套 index+LRU 分桶，
+// 单个 JSON 映射表 + 插入序淘汰最老的即可。不存 token——ID/URL 本身不是密钥，跟现有
+// OvlSettings.overleafProjectAddr 存在 ovl.settings 里是同一暴露面，不新增风险。
+const OVL_OVERLEAF_ADDR_MAP_MAX = 50;
+function ovlOverleafAddrMapLsKey() { return ovlIsRemoteBridge() ? 'ovl.overleafAddrByPathRemote' : 'ovl.overleafAddrByPath'; }
+function ovlOverleafAddrMapLoad() {
+    try {
+        const raw = localStorage.getItem(ovlOverleafAddrMapLsKey());
+        if (!raw) return {};
+        const obj = JSON.parse(raw);
+        return (obj && typeof obj === 'object' && !Array.isArray(obj)) ? obj : {};
+    } catch (e) { return {}; }
+}
+function ovlOverleafAddrMapSave(map) {
+    try { localStorage.setItem(ovlOverleafAddrMapLsKey(), JSON.stringify(map)); } catch (e) {}
+}
+function ovlOverleafAddrMapGet(dir) {
+    try {
+        const key = ovlNormalizeProjectPath(dir);
+        if (!key) return null;
+        const map = ovlOverleafAddrMapLoad();
+        return (typeof map[key] === 'string' && map[key]) ? map[key] : null;
+    } catch (e) { return null; }
+}
+function ovlOverleafAddrMapSet(dir, addr) {
+    try {
+        const key = ovlNormalizeProjectPath(dir);
+        if (!key || !addr || typeof addr !== 'string') return;
+        const map = ovlOverleafAddrMapLoad();
+        delete map[key]; // 重新插到末尾，保持"最近用过的最后被淘汰"的近似 LRU 顺序（插入序即可，够用）
+        map[key] = addr;
+        const keys = Object.keys(map);
+        if (keys.length > OVL_OVERLEAF_ADDR_MAP_MAX) {
+            keys.slice(0, keys.length - OVL_OVERLEAF_ADDR_MAP_MAX).forEach(function (k) { delete map[k]; });
+        }
+        ovlOverleafAddrMapSave(map);
+    } catch (e) {}
+}
+
+// v2 Pass P66：所有"改变当前项目路径"的入口统一收口在这里——之前这 3~4 步散在 8 个调用点
+// 各自手写（写 input.value + 写 localStorage + 有时调 ovlBridgeUpdateWatch），新增"顺带同步
+// Overleaf 项目 ID"这一步时漏掉了大半个，就是 P66 的根因（切换已克隆项目后「拉取」仍用上
+// 一个项目的 Overleaf ID）。新增改路径的入口一律走这里，不要再手写这几行。
+// opts.projectId：调用方如果已经知道这个目录对应哪个 Overleaf 项目 ID（比如刚从项目历史/
+// 刚克隆完），作为零延迟同步提示传进去，随后仍会被异步的桥 origin 结果校正（见
+// ovlOverleafSyncAddrForProject）。
+// opts.skipWatch：跳过 ovlBridgeUpdateWatch()，给调用点自己在别处按原有时序调用留口子
+// （例如远程模式目录选择弹窗，watch 在 renderTree 之后另调；项目历史打开时 watch 在
+// openViaBridge 的 renderTree 之后另调）。
+// 同步 Overleaf ID 这一步是 fire-and-forget，绝不 await——不能让切目录卡在一次网络请求上。
+function ovlSetProjectPath(path, opts) {
+    opts = opts || {};
+    try {
+        const input = document.getElementById('ovlProjectPathInput');
+        if (input) input.value = path;
+        try { localStorage.setItem(ovlProjectPathLsKey(), path); } catch (e) {}
+        if (!opts.skipWatch && typeof ovlBridgeUpdateWatch === 'function') {
+            try { ovlBridgeUpdateWatch(); } catch (e) {}
+        }
+        if (typeof ovlOverleafSyncAddrForProject === 'function') {
+            try { ovlOverleafSyncAddrForProject(path, { hintId: opts.projectId || null }); } catch (e) {}
+        }
+    } catch (e) { console.error('[ovl] setProjectPath failed', e); }
+}
+
 function ovlProjectHistoryBasename(p) {
     try {
         const norm = String(p || '').replace(/\\/g, '/').replace(/\/+$/, '');
@@ -28295,6 +28367,15 @@ function ovlProjectHistoryAdd(opts) {
         const idx = list.findIndex(function (it) { return it.id === id; });
         if (idx !== -1) {
             list[idx].lastOpened = now;
+            // v2 Pass P66：projectId 缺失/过期这条附带缺陷——一个先被当普通本地目录打开过
+            // （kind:'local', projectId:null）、后来才发现是 Overleaf 克隆目录的项目，projectId
+            // 以前永远停在 null。这里补上：调用方带了非空 projectId 且跟已有条目不同才回填，
+            // 不覆盖掉一个已经正确、只是这次调用没传 id 的条目（opts.projectId 为空就什么都不改）。
+            // name 仍然绝不用传入值覆盖（28282 那条纪律不变）。
+            if (opts.projectId && list[idx].projectId !== opts.projectId) {
+                list[idx].projectId = opts.projectId;
+                list[idx].kind = opts.kind === 'overleaf' ? 'overleaf' : (opts.kind === 'remote' ? 'remote' : list[idx].kind);
+            }
         } else {
             list.push({
                 id: id,
@@ -28422,8 +28503,11 @@ function ovlProjectHistoryOpenEntry(entry, onClosed) {
         const isRemoteEntry = ovlIsRemoteBridge() || entry.kind === 'remote';
 
         if (pathInput) {
-            pathInput.value = entry.path;
-            try { localStorage.setItem(ovlProjectPathLsKey(), entry.path); } catch (e) {}
+            // v2 Pass P66：改走统一收口函数——顺带把 entry.projectId 当零延迟同步提示传进去，
+            // 反向同步 Overleaf 项目 ID，避免"目录切成 A 了，Overleaf ID 还是上一个项目 B"
+            // （P66 根因）。watch 沿用原有时序：本地桥路径在 openViaBridge 的 renderTree 之后
+            // 另调，这里跳过，不提前触发。
+            ovlSetProjectPath(entry.path, { projectId: entry.projectId, skipWatch: true });
         }
 
         ovlProjectHistoryProbePathExists(entry.path).then(function (exists) {
@@ -28481,8 +28565,8 @@ function ovlProjectHistoryOpenEntry(entry, onClosed) {
                     // 名字对得上：认为选对了，路径文本仍以 entry.path 为准（同一目录只是显示用
                     // 绝对路径字符串本来就取不到，跟原有行为一致）。
                     if (pathInput) {
-                        pathInput.value = entry.path;
-                        try { localStorage.setItem(ovlProjectPathLsKey(), entry.path); } catch (e) {}
+                        // v2 Pass P66：同上，改走统一收口函数并带上 projectId 提示。
+                        ovlSetProjectPath(entry.path, { projectId: entry.projectId, skipWatch: true });
                     }
                     try { ovlProjectHistoryAdd({ name: entry.name, path: entry.path, kind: entry.kind, projectId: entry.projectId }); } catch (e) {}
                 } else {
@@ -28715,8 +28799,10 @@ function ovlProjectHistoryMaybeAutoRestore() {
             if (exists !== true) return; // null=没法判断，静默跳过，不误判成"不存在"
             const pathInput = document.getElementById('ovlProjectPathInput');
             if (pathInput) {
-                pathInput.value = last.path;
-                try { localStorage.setItem(ovlProjectPathLsKey(), last.path); } catch (e) {}
+                // v2 Pass P66：应用启动自动恢复上次项目——这条路径最毒（P66 诊断 §1.4(b)）：
+                // 用户上次用的是 B，今天开应用自动恢复成 A，设置里躺着的却还是上次会话保存下来的
+                // B。改走统一收口函数，带上 last.projectId 提示反向同步。
+                ovlSetProjectPath(last.path, { projectId: last.projectId, skipWatch: true });
             }
         }).catch(function () {});
     } catch (e) { console.warn('[ovl] project history auto restore failed', e); }
@@ -30095,7 +30181,6 @@ async function ovlBrowseProjectFolder() {
     // 项目文件夹…"按钮共用 ovlRemotePickFolder()，选完直接把文件树也换掉，不用再点第二次。
     if (ovlIsRemoteBridge()) { await ovlRemotePickFolder(); return; }
     const btn = document.getElementById('ovlBrowseFolderBtn');
-    const pathInput = document.getElementById('ovlProjectPathInput');
     if (btn) btn.disabled = true;
     try {
         const resp = await ovlBridgeFetch(ovlBridgeUrl('/pick-folder'), { method: 'POST' });
@@ -30105,11 +30190,11 @@ async function ovlBrowseProjectFolder() {
             return;
         }
         if (data.cancelled) return; // 用户自己关掉了对话框，什么都不用做，不算错误
-        if (pathInput && data.path) {
-            pathInput.value = data.path;
-            try { localStorage.setItem(ovlProjectPathLsKey(), data.path); } catch (e) {}
+        if (data.path) {
+            // v2 Pass P66：改走统一收口函数（内部已含 ovlBridgeUpdateWatch + 反向同步
+            // Overleaf 项目 ID），不再单独手写这几行。
+            ovlSetProjectPath(data.path);
             ovlFlashSaveStatus('项目路径已设置为：' + data.path, false);
-            ovlBridgeUpdateWatch(); // 路径刚补上，之前"缺路径所以没订阅"的情况这下可能解除了
         }
     } catch (e) {
         ovlFlashSaveStatus('连不上桥接服务 —— 见 tools/latex-bridge/README.md', true);
@@ -30166,6 +30251,98 @@ function ovlOverleafUpdateButtonsUI() {
         cloneBtn.disabled = !online;
         cloneBtn.setAttribute('data-tip', online ? '从 Overleaf 克隆项目到本地' : '桥接服务未启动，见 tools/latex-bridge/README.md');
     }
+}
+
+// ==================== v2 Pass P66：项目路径 <-> Overleaf 项目 ID 反向同步 ====================
+// 根因见 .claude/tmp/p66_diagnosis.md：切换已克隆项目的目录之后，OvlSettings.overleafProjectAddr
+// 这个全局单例值没有任何一条改路径的路径会跟着更新，「拉取」点下去发出的仍是切换前那个项目的
+// gitUrl，桥的 ensureOriginRemote 如实报 origin-mismatch（这道守卫本身是对的，一字不能动）。
+// 下面这组函数把"这个目录到底是哪个 Overleaf 项目"的判断权威交还给该目录自己的 git origin
+// （跟桥的守卫读的是同一份数据，判据天然一致），异步反查 + 本地缓存兜底 + 发请求那一刻现算
+// 三条互补，具体取舍见 plan.md §3.0/§3.1。
+
+// 把解析结果一次性同步到 OvlSettings.overleafProjectAddr + 存盘 + 设置面板输入框（若已打开）+
+// 按钮态。addr 为空/非字符串直接 return，绝不清空用户已经填好的地址——降级绝不比现状差。
+function ovlOverleafApplyAddr(addr) {
+    if (!addr || typeof addr !== 'string') return;
+    try {
+        if (OvlSettings.overleafProjectAddr === addr) return; // 没变化，不用重复保存/刷新
+        OvlSettings.overleafProjectAddr = addr;
+        ovlSaveSettings();
+        try {
+            const panelInput = document.querySelector('[data-setpath="settings.overleafProjectAddr"]');
+            if (panelInput) panelInput.value = addr;
+        } catch (e) {}
+        if (typeof ovlOverleafUpdateButtonsUI === 'function') { try { ovlOverleafUpdateButtonsUI(); } catch (e) {} }
+    } catch (e) { console.error('[ovl] overleafApplyAddr failed', e); }
+}
+
+// 打桥新增的只读 POST /overleaf/origin，读该目录 git remote get-url origin 并抠出项目 ID。
+// 旧桥没有这个端点/桥离线/目录不是 git 仓库/没有 origin，一律返回 null——调用方据此保守跳过，
+// 不弹任何错误 toast（同 ovlOverleafProbeStrategySupport 的能力探测纪律）。
+async function ovlOverleafFetchOriginAddr(projectDir) {
+    try {
+        if (!projectDir || typeof projectDir !== 'string') return null;
+        if (OvlState.bridgeOnline !== true) return null;
+        // 能力自报字段存在且明确不含这一项：确信是旧桥，不用发请求。字段缺失（比自报机制本身
+        // 还老的桥）必须实探，靠 ovlBridgeIsNoSuchRouteError 识别 404，不能在这里替调用方乱猜。
+        if (Array.isArray(OvlState.bridgeCapabilities) && OvlState.bridgeCapabilities.indexOf('overleaf-origin-read') === -1) return null;
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/overleaf/origin'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectDir: projectDir })
+        });
+        let data = null;
+        try { data = await resp.json(); } catch (e) { data = null; }
+        if (ovlBridgeIsNoSuchRouteError(data)) return null; // 旧桥：静默降级
+        if (!data || data.ok !== true || !data.hasOrigin || !data.originUrl) return null;
+        const id = ovlOverleafExtractProjectId(data.originUrl);
+        if (id) return 'https://git.overleaf.com/' + id;
+        if (/^https?:\/\//i.test(data.originUrl)) return data.originUrl; // 兜底：抠不出 24 位 ID 但本身是个 URL
+        return null;
+    } catch (e) { return null; }
+}
+
+// 切项目时的反向同步编排：先用调用方传的 hintId（零延迟、无请求，例如项目历史条目自带的
+// projectId）或本地映射表命中的值立刻刷一次 UI，随后 await 桥的权威 origin 结果做最终校正 +
+// 回写映射表。generation 守卫：用户快速连点两条历史时，先发后到的响应不许覆盖后发的结果。
+let OvlOverleafAddrSyncSeq = 0;
+function ovlOverleafSyncAddrForProject(projectDir, opts) {
+    opts = opts || {};
+    const mySeq = ++OvlOverleafAddrSyncSeq;
+    try {
+        const quick = (opts.hintId && typeof opts.hintId === 'string') ? opts.hintId : ovlOverleafAddrMapGet(projectDir);
+        if (quick) ovlOverleafApplyAddr(quick);
+    } catch (e) {}
+    Promise.resolve(ovlOverleafFetchOriginAddr(projectDir)).then(function (addr) {
+        if (mySeq !== OvlOverleafAddrSyncSeq) return; // 过期响应，用户已经切到别的项目了，丢弃
+        if (!addr) return; // 桥离线/旧桥/无 origin：保守跳过，绝不清空已有配置
+        ovlOverleafApplyAddr(addr);
+        try { ovlOverleafAddrMapSet(projectDir, addr); } catch (e) {}
+    }).catch(function () {});
+}
+
+// v2 Pass P66：发请求那一刻用的**唯一**入口——按当前 projectDir 现算 gitUrl，不再直接读全局
+// 旧值 OvlSettings.overleafProjectAddr。三级优先级：
+//   1. 桥的 git remote get-url origin（权威，异步）——命中就顺手回写第 2/3 级，UI 显示的和
+//      实际发出的始终一致。
+//   2. 按路径持久化的本地映射表（同步，桥离线/旧桥时的缓存兜底）。
+//   3. OvlSettings.overleafProjectAddr（全局旧值，最后的兜底，保持不回归）。
+// 只做"切项目时回填 UI"挡不住竞态：回填是一次异步 fetch，用户在它 resolve 之前点拉取仍会
+// 发出旧值（间歇性、最难查的一类 bug）——这里必须自己现算一遍，不能依赖回填的时序。
+async function ovlOverleafResolveGitUrlForDir(projectDir) {
+    try {
+        const originAddr = await ovlOverleafFetchOriginAddr(projectDir);
+        if (originAddr) {
+            try { ovlOverleafAddrMapSet(projectDir, originAddr); } catch (e) {}
+            ovlOverleafApplyAddr(originAddr);
+            return ovlOverleafResolveGitUrl(originAddr);
+        }
+    } catch (e) {}
+    try {
+        const cached = ovlOverleafAddrMapGet(projectDir);
+        if (cached) return ovlOverleafResolveGitUrl(cached);
+    } catch (e) {}
+    return ovlOverleafResolveGitUrl(OvlSettings.overleafProjectAddr);
 }
 
 function ovlOverleafSetSyncStatus(text, isError) {
@@ -30553,7 +30730,10 @@ async function ovlOverleafPull(opts) {
         showToast('请先设置项目绝对路径', 'error');
         return;
     }
-    const gitUrl = ovlOverleafResolveGitUrl(OvlSettings.overleafProjectAddr);
+    // v2 Pass P66：按当前 projectDir 现算 gitUrl，不再直接读全局旧值——见
+    // ovlOverleafResolveGitUrlForDir 头部注释，这是唯一能挡住"切目录后回填还没 resolve
+    // 用户就点了拉取"这条竞态的地方。
+    const gitUrl = await ovlOverleafResolveGitUrlForDir(projectDir);
     await ovlOverleafPullRun(projectDir, gitUrl, 'abort', { silent: silent });
 }
 
@@ -30578,7 +30758,9 @@ async function ovlOverleafPush() {
         showToast('请先设置项目绝对路径', 'error');
         return;
     }
-    const gitUrl = ovlOverleafResolveGitUrl(OvlSettings.overleafProjectAddr);
+    // v2 Pass P66：同 ovlOverleafPull，按当前 projectDir 现算 gitUrl。推送尤其不能省这一步——
+    // 推错仓库是不可逆的数据事故。
+    const gitUrl = await ovlOverleafResolveGitUrlForDir(projectDir);
     const pullBtn = document.getElementById('ovlOverleafPullBtn');
     const pushBtn = document.getElementById('ovlOverleafPushBtn');
     if (pullBtn) pullBtn.disabled = true;
@@ -31715,6 +31897,9 @@ async function ovlOverleafCloneFinishNamed(projectId, data, name) {
     OvlSettings.overleafProjectAddr = projectId;
     ovlSaveSettings();
     ovlOverleafUpdateButtonsUI();
+    // v2 Pass P66：把这次克隆的目录 -> 项目 ID 映射也记进本地缓存表，供之后切回这个目录时
+    // （桥离线/旧桥场景下）反向同步兜底命中，见 ovlOverleafAddrMapSet 头部注释。
+    try { if (typeof ovlOverleafAddrMapSet === 'function') ovlOverleafAddrMapSet(data.dir, projectId); } catch (e) {}
 
     if (typeof window.ovlProjectHistoryAdd === 'function') {
         try { window.ovlProjectHistoryAdd({ name: name, path: data.dir, kind: 'overleaf', projectId: projectId }); }
@@ -32398,9 +32583,14 @@ function ovlBindShell() {
             // 明明填过，只是没有被记住。ovlBindShell() 全程只在启动时调一次，这里补上读取。
             try { projectPathInput.value = localStorage.getItem(ovlProjectPathLsKey()) || ''; } catch (e) {}
             projectPathInput.addEventListener('change', function () {
-                try { localStorage.setItem(ovlProjectPathLsKey(), projectPathInput.value.trim()); } catch (e) {}
+                const newPath = projectPathInput.value.trim();
+                try { localStorage.setItem(ovlProjectPathLsKey(), newPath); } catch (e) {}
                 // v2 Pass P17：路径手改了，之前"缺路径没订阅"可能解除，或者要订阅换成新路径下的同名文件。
                 if (typeof ovlBridgeUpdateWatch === 'function') { try { ovlBridgeUpdateWatch(); } catch (e) {} }
+                // v2 Pass P66：用户手改路径同样要重新解析 Overleaf 项目 ID——不能调
+                // ovlSetProjectPath（它会回写 .value，跟用户正在编辑的输入框打架），
+                // 这里只追加反向同步这一步。
+                if (typeof ovlOverleafSyncAddrForProject === 'function') { try { ovlOverleafSyncAddrForProject(newPath); } catch (e) {} }
             });
             projectPathInput.addEventListener('keydown', function (e) {
                 if (e.key === 'Enter') { e.preventDefault(); ovlDoRecompile().catch(function (e2) { console.error('[ovl] recompile failed', e2); }); }
