@@ -24514,12 +24514,13 @@ function ovlUnwrapSingleParagraph(html) {
 // LatexFilter（\hline/\STATE/\includegraphics 这些结构性标记不是"翻译用的散文"，用
 // LatexFilter 处理只会拆出乱码或被 DELETE 规则整段吃掉，比如 includegraphics 就在
 // MACRO_TABLE 的 DELETE 名单里）。
-const OVL_VISUAL_FLOAT_DISPATCH_RE = /^\s*\\begin\{(table|algorithm|figure)\*?\}/;
+// P64：longtable 单独列一项（不接 \*? ，这个环境没有星号变体），复用 table 的渲染路径。
+const OVL_VISUAL_FLOAT_DISPATCH_RE = /^\s*\\begin\{(table|algorithm|figure)\*?\}|^\s*\\begin\{(longtable)\}/;
 function ovlVisualRenderChunk(tex) {
     const floatMatch = OVL_VISUAL_FLOAT_DISPATCH_RE.exec(tex);
     if (floatMatch) {
         try {
-            if (floatMatch[1] === 'table') return ovlRenderVisualTable(tex);
+            if (floatMatch[1] === 'table' || floatMatch[2] === 'longtable') return ovlRenderVisualTable(tex);
             if (floatMatch[1] === 'algorithm') return ovlRenderVisualAlgorithm(tex);
             if (floatMatch[1] === 'figure') return ovlRenderVisualFigure(tex);
         } catch (e) {
@@ -24654,30 +24655,68 @@ function ovlFindEnvClose(text, beginIdx) {
     }
     return null;
 }
-// 在 text 里找 \begin{tabular} 起点，配平列格式 {...}（花括号配平扫描，允许列格式内部
-// 含花括号——@{}、p{3.8cm}、>{\centering\arraybackslash} 这些 booktabs/array 惯用写法都是
-// 常态，[^{}]* 这种"不许嵌套"的正则片段本质上做不对，见 P59 诊断实测）。返回
-// { beginIdx, bodyStart, bodyEnd, envEnd } 或 null（没找到 tabular）。只支持纯 `tabular`
-// 环境（不支持 tabular*/longtable/tabularx，这几个还需要额外的宽度参数解析，明确不支持，
-// 见任务报告）。
+// P64：环境名 -> 列格式 {spec} 是 \begin{env} 后第几个花括号参数（可选 [pos] 不算在内）。
+// - tabular / longtable：\begin{env}[pos]{spec} —— spec 是第 1 个花括号。
+// - tabularx：\begin{tabularx}{width}{spec} —— width 是第 1 个（如 \columnwidth/\textwidth），
+//   spec 是第 2 个。这是本 Pass 的根因所在：上一版按"第 1 个花括号"取，tabularx 拿到的是
+//   width 参数，认不出列格式，整块判定为"没找到 tabular"退化成裸源码。
+const OVL_TABULAR_ENV_RE = /\\begin\{(tabular|tabularx|longtable)\}/;
+const OVL_TABULAR_ENV_START_RE = /^\\begin\{(tabular|tabularx|longtable)\}/;
+const OVL_TABULAR_ENV_WIDTH_ARG = { tabularx: 1 }; // 环境名 -> 列格式前要先跳过几个花括号参数
+
+// 在 text 里找 \begin{tabular|tabularx|longtable} 起点，按环境名决定列格式 {spec} 是第几个
+// 参数，再配平列格式本身的花括号（允许内部含花括号——@{}、p{3.8cm}、X（tabularx 专属列
+// 类型）、|（竖线分隔符）、>{\centering\arraybackslash} 这些 booktabs/array/tabularx 惯用
+// 写法都是常态，[^{}]* 这种"不许嵌套"的正则片段本质上做不对，见 P59 诊断实测）。返回
+// { beginIdx, bodyStart, bodyEnd, envEnd, envName } 或 null（没找到这三种环境之一）。
 function ovlFindTabularSpan(text) {
-    const beginM = /\\begin\{tabular\}/.exec(text);
+    const beginM = OVL_TABULAR_ENV_RE.exec(text);
     if (!beginM) return null;
-    const afterBegin = beginM.index + beginM[0].length;
-    const specM = /^\s*(?:\[[^\]]*\])?\{/.exec(text.slice(afterBegin));
-    if (!specM) return null; // 没有列格式，不是合法 tabular，交给上层退化
-    const openIdx = afterBegin + specM[0].length - 1;
+    const envName = beginM[1];
+    let pos = beginM.index + beginM[0].length;
+    // tabularx 的宽度参数在列格式之前，且没有可选 [pos] 混在中间——先原样跳过去。
+    const skipArgs = OVL_TABULAR_ENV_WIDTH_ARG[envName] || 0;
+    for (let k = 0; k < skipArgs; k++) {
+        const widthM = /^\s*\{/.exec(text.slice(pos));
+        if (!widthM) return null;
+        const openIdx = pos + widthM[0].length - 1;
+        const closeIdx = ovlFindMatchingBrace(text, openIdx);
+        if (closeIdx === -1) return null;
+        pos = closeIdx + 1;
+    }
+    const specM = /^\s*(?:\[[^\]]*\])?\{/.exec(text.slice(pos));
+    if (!specM) return null; // 没有列格式，不是合法环境，交给上层退化
+    const openIdx = pos + specM[0].length - 1;
     const closeIdx = ovlFindMatchingBrace(text, openIdx);
     if (closeIdx === -1) return null;
     const closeInfo = ovlFindEnvClose(text, beginM.index);
     if (!closeInfo) return null;
-    return { beginIdx: beginM.index, bodyStart: closeIdx + 1, bodyEnd: closeInfo.tagStart, envEnd: closeInfo.envEnd };
+    return { beginIdx: beginM.index, bodyStart: closeIdx + 1, bodyEnd: closeInfo.tagStart, envEnd: closeInfo.envEnd, envName: envName };
 }
 // \\ 行分隔（容忍 \\[2mm] 这种可选间距参数）+ & 列分隔，都要做花括号深度感知——真实论文里
 // 单元格内容常有 \textbf{...}/\textcolor{...}{...} 这类带花括号的宏，深度不为 0 时的 & / \\
 // 不能被当分隔符，即使这份 fixture 里没有这种情况也要做对（任务原话要求）。
+// P64：longtable 专有的分页控制宏——\endhead/\endfirsthead/\endfoot/\endlastfoot 各自标记
+// "此前的行属于续页表头/首页表头/续页表尾/末页表尾"，本预览不做分页语义，跟 \hline 一样
+// 当排版噪声直接吃掉（不当行分隔符、不当内容）；重复出现的 \caption{...} \\（longtable
+// 每页表头前常再放一次 caption）整段摘掉，避免在表格正文里重复出现一遍标题文字。
+function ovlStripLongtableRowNoise(body) {
+    let out = body;
+    while (true) {
+        const m = /\\caption\*?\s*(?:\[[^\]]*\])?\s*\{/.exec(out);
+        if (!m) break;
+        const openIdx = m.index + m[0].length - 1;
+        const closeIdx = ovlFindMatchingBrace(out, openIdx);
+        if (closeIdx === -1) break;
+        let end = closeIdx + 1;
+        const trailM = /^\s*\\\\/.exec(out.slice(end));
+        if (trailM) end += trailM[0].length;
+        out = out.slice(0, m.index) + out.slice(end);
+    }
+    return out.replace(/\\endfirsthead\b|\\endhead\b|\\endlastfoot\b|\\endfoot\b/g, '');
+}
 function ovlSplitTableRows(body) {
-    const s = body
+    const s = ovlStripLongtableRowNoise(body)
         .replace(/\\hline\b/g, '')
         .replace(/\\cline\s*\{[^{}]*\}/g, '')
         .replace(/\\cmidrule\s*(?:\([^()]*\))?\s*\{[^{}]*\}/g, '')
@@ -24738,7 +24777,7 @@ function ovlProtectNestedTabular(bodyText) {
     let out = '', i = 0;
     const n = bodyText.length;
     while (i < n) {
-        if (bodyText.startsWith('\\begin{tabular}', i)) {
+        if (OVL_TABULAR_ENV_START_RE.test(bodyText.slice(i, i + 20))) {
             const closeInfo = ovlFindEnvClose(bodyText, i);
             if (closeInfo) {
                 tokens.push(bodyText.slice(i, closeInfo.envEnd));
@@ -25686,7 +25725,10 @@ const OVL_VISUAL_MATH_ATOMIC_ENV_RE = /^(equation|align|gather|multline|eqnarray
 // 再来一遍，不需要引入新概念。只登记外层 float 壳的环境名——内部套的 tabular/algorithmic/
 // minipage 不需要单独跟踪，因为合法文档里它们必然在外层 table/algorithm/figure 闭合之前
 // 就已经闭合，只要外层不被提前切开，内部这几层天然完整。
-const OVL_VISUAL_FLOAT_ATOMIC_ENV_RE = /^(table|algorithm|figure)\*?$/;
+// P64：longtable 是"自成一体"的浮动表格（不套在 \begin{table} 里——它自己管跨页续页，
+// 套进 table 反而不合法），必须跟 table/algorithm/figure 一样单独记一档深度，否则
+// ovlSplitVisualBlocks 会把它当普通正文按源码行切散，& / \\ 全部打碎。
+const OVL_VISUAL_FLOAT_ATOMIC_ENV_RE = /^(table|algorithm|figure|longtable)\*?$/;
 function ovlSplitVisualBlocks(body, baseLine) {
     const lines = body.split('\n');
     const blocks = [];
