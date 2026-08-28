@@ -957,6 +957,26 @@ body.is-resizing-settings-modal * {
 #aiChatRoot .aichat-btn-primary:hover { background: #4338ca; color: #ffffff; }
 #aiChatRoot .aichat-btn[disabled] { opacity: 0.45; cursor: default; }
 #aiChatRoot .aichat-card-done { font-size: 11px; font-weight: 700; color: #047857; }
+#aiChatRoot .aichat-card-done-cancel { color: #94a3b8; }
+/* v2 Pass P69：AI 触发的写工具确认 / 回退确认，改成跟提案卡片同款的聊天内联卡片
+   （不再用居中模态 #ovlModalOverlay）。挂起时高亮边框，danger 操作（删除/回退）
+   视觉上明显区别。 */
+#aiChatRoot .aichat-card.aichat-card-pending { border-color: #f59e0b; box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.25); }
+#aiChatRoot .aichat-card.aichat-card-danger { border-color: #fecaca; }
+#aiChatRoot .aichat-card.aichat-card-danger .aichat-card-head { background: #fef2f2; color: #b91c1c; }
+#aiChatRoot .aichat-card-confirm-msg { font-size: 11.5px; line-height: 1.6; white-space: pre-line; color: #334155; }
+#aiChatRoot .aichat-btn-danger { background: #dc2626; border-color: #dc2626; color: #ffffff; }
+#aiChatRoot .aichat-btn-danger:hover { background: #b91c1c; color: #ffffff; }
+/* 挂起确认期间输入框上方的一条细提示——不阻塞输入，只是让用户知道还有事没了结。 */
+#aiChatRoot .aichat-pendinghint {
+    font-size: 10.5px;
+    line-height: 1.5;
+    padding: 4px 10px;
+    color: #92400e;
+    background: #fffbeb;
+    border-top: 1px solid #fde68a;
+    flex: 0 0 auto;
+}
 
 /* ---- 「思考」折叠区：reasoning_content 只能待在这里，绝不能当答案显示 ---- */
 #aiChatRoot .aichat-think { margin-top: 6px; }
@@ -17248,6 +17268,12 @@ const ChatState = {
     seq: 0,                         // 单调递增。回来的响应 seq 对不上就是陈旧响应，直接丢弃。
     abort: null,                    // 当前在飞那一轮的 AbortController
     busy: false,
+    // v2 Pass P69：AI 触发的确认（写工具 / 回退）改成聊天内联卡片后，挂起的确认登记在这里——
+    // 是"谁能让 chatAgentConfirm 的 Promise resolve"的唯一权威列表。每项 { cancel(reason), row }。
+    // 拆除聊天流（chatResetConversation）前必须先把这里全部结算掉，否则 resolve 闭包被
+    // DOM 清空一起抹掉，chatAgentRunLoop 永久卡住、SEND 永远卡死在 STOP。见 chatAgentConfirm /
+    // chatAgentSettlePendingConfirms。
+    pendingConfirms: [],
 
     // —— C3：附加选段 → 提案 → 应用 ——
     // target 在**点「附到对话」的那一刻**整个抄下来，之后绝不再读实时选区
@@ -17455,6 +17481,8 @@ function chatShellHtml() {
         +   '<div class="aichat-caphint" id="aiChatCapHint" hidden></div>'
         +   '<div class="aichat-log" id="aiChatLog"></div>'
         +   '<div class="aichat-footer">'
+        // v2 Pass P69：挂起确认卡的细提示——不阻塞输入，只提醒还有事没了结（见 chatUpdatePendingConfirmHint）。
+        +     '<div class="aichat-pendinghint" id="aiChatPendingHint" hidden></div>'
         +     '<div id="aiChatFocusSlot"></div>'
         +     '<div id="aiChatTargetSlot"></div>'
         +     '<div id="aiChatBatchSlot"></div>'
@@ -17857,6 +17885,18 @@ function chatBindShell(rootEl) {
     document.addEventListener('keydown', function (e) {
         try {
             if (!e || e.key !== 'Escape' || !ChatState.open) return;
+            // P69 决策 6：有挂起的确认卡时，Escape 取消最新一张卡（原地标注 + resolve(false)），
+            // 且必须 preventDefault + stopPropagation——不能让这次按键又被下面那段解释成
+            // "关闭聊天窗"（ovlConfirmDialog 原来在主 document 上也挂 Escape=取消，
+            // 和这里的"Escape=关聊天窗"冲突过，见 P69 调研 §5 第 7 条）。没有挂起卡片时
+            // 维持原状（关闭聊天窗）。
+            if (ChatState.pendingConfirms && ChatState.pendingConfirms.length) {
+                e.preventDefault();
+                e.stopPropagation();
+                const entry = ChatState.pendingConfirms[ChatState.pendingConfirms.length - 1];
+                try { entry.cancel('按 Esc 取消'); } catch (err2) {}
+                return;
+            }
             const active = document.activeElement;
             const insideChat = !!(active && active.closest && active.closest('#aiChatRoot'));
             const nothingFocused = (!active || active === document.body);
@@ -18872,16 +18912,126 @@ function chatAgentBuildConfirmMessage(toolName, args, projectDir, extra) {
     return { title: title, message: lines.join('\n') };
 }
 
-// 把回调式的 ovlConfirmDialog 包一层 Promise，方便 await——onConfirm/onCancel 二选一必触发
-// 一次，跟 ovlConfirmDialog 自己"settled 只触发一次"的纪律一致。
-function chatAgentConfirm(opts) {
+// v2 Pass P69：AI 触发的确认（写工具确认 / 回退确认，唯二两处调用点）从居中模态
+// #ovlModalOverlay 改成聊天流里的内联卡片——用户原话"希望 ai 的操作弹出的窗口都在聊天的
+// 对话框中以对话浮动小窗口的形式出现，就像 claude code 的客户端那样"。
+// 用户自己点按钮触发的另外 17 处 ovlConfirmDialog/ovlPromptDialog 调用点一律不动，那个
+// 函数体本身也绝不能改——18 个调用点共用。这里改成完全独立的内联实现，复用的是
+// chatRenderProposalCard 那套 .aichat-card 样式（CSS 见约 901–978 行），不是复用函数本身。
+//
+// 设计决策（.claude/tmp/p69_survey.md §6，主会话已定，逐条落地）：
+//   2/3. 串行 + 拆除先结算：ChatState.pendingConfirms 是唯一权威登记表，chatSend 开新一轮
+//        （chatAgentSettlePendingConfirms）和 chatResetConversation 清空聊天流之前都会结算它。
+//   4. 接入 abort signal：传入的 signal 一旦 abort，卡片自动 resolve(false) 并原地标注
+//      （调用方 chatAgentExecWriteTool 本来就把当前轮的 controller.signal 往下传）。
+//   6. Escape 由 chatBindShell 里的全局 keydown 处理器接管，取消最新一张挂起卡，
+//      preventDefault+stopPropagation，不会连带关闭聊天窗。
+//   8. 文案一字不减：opts.message 原样整段展示（pre-line），danger 操作视觉上明显区别。
+function chatAgentConfirm(opts, signal) {
+    opts = opts || {};
     return new Promise(function (resolve) {
-        if (typeof ovlConfirmDialog !== 'function') { resolve(false); return; }
-        ovlConfirmDialog(Object.assign({}, opts, {
-            onConfirm: function () { resolve(true); },
-            onCancel: function () { resolve(false); }
-        }));
+        if (signal && signal.aborted) { resolve(false); return; }
+        const log = document.getElementById('aiChatLog');
+        let settled = false;
+        const entry = {};
+
+        const row = document.createElement('div');
+        row.className = 'aichat-row aichat-row-assistant';
+        const card = document.createElement('div');
+        card.className = 'aichat-card aichat-card-confirm aichat-card-pending' + (opts.danger ? ' aichat-card-danger' : '');
+
+        const head = document.createElement('div');
+        head.className = 'aichat-card-head';
+        head.textContent = (opts.danger ? '⚠ ' : '') + (opts.title || '需要确认');
+        card.appendChild(head);
+
+        const body = document.createElement('div');
+        body.className = 'aichat-card-body';
+        // 文案一字不减：chatAgentBuildConfirmMessage 拼好的全部内容（绝对路径、字节数、
+        // 递归影响清单、回退保障那一行）原样整段放进来，pre-line 保留换行。
+        const msg = document.createElement('div');
+        msg.className = 'aichat-card-confirm-msg';
+        msg.textContent = opts.message || '';
+        body.appendChild(msg);
+
+        const actions = document.createElement('div');
+        actions.className = 'aichat-card-actions';
+        const okBtn = document.createElement('button');
+        okBtn.type = 'button';
+        okBtn.className = 'aichat-btn ' + (opts.danger ? 'aichat-btn-danger' : 'aichat-btn-primary');
+        okBtn.textContent = opts.confirmLabel || '确认';
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.className = 'aichat-btn';
+        cancelBtn.textContent = opts.cancelLabel || '取消';
+        actions.appendChild(okBtn);
+        actions.appendChild(cancelBtn);
+        body.appendChild(actions);
+        card.appendChild(body);
+        row.appendChild(card);
+        if (log) log.appendChild(row);
+        chatScrollToBottom();
+
+        function unregister() {
+            try {
+                const idx = ChatState.pendingConfirms.indexOf(entry);
+                if (idx !== -1) ChatState.pendingConfirms.splice(idx, 1);
+            } catch (e) {}
+            try { if (signal) signal.removeEventListener('abort', onAbort); } catch (e) {}
+            try { chatUpdatePendingConfirmHint(); } catch (e) {}
+        }
+        function finish(ok, doneLabel) {
+            if (settled) return;
+            settled = true;
+            unregister();
+            try {
+                actions.textContent = '';
+                const done = document.createElement('span');
+                done.className = 'aichat-card-done' + (ok ? '' : ' aichat-card-done-cancel');
+                done.textContent = doneLabel;
+                actions.appendChild(done);
+                card.classList.remove('aichat-card-pending');
+            } catch (e) {}
+            resolve(ok);
+        }
+        okBtn.addEventListener('click', function () { finish(true, '✓ 已确认执行'); });
+        cancelBtn.addEventListener('click', function () { finish(false, '已取消'); });
+
+        function onAbort() { finish(false, '已取消（请求已中止）'); }
+        if (signal) signal.addEventListener('abort', onAbort);
+
+        entry.cancel = function (reason) { finish(false, '已取消（' + reason + '）'); };
+        entry.row = row;
+        if (!ChatState.pendingConfirms) ChatState.pendingConfirms = [];
+        ChatState.pendingConfirms.push(entry);
+        chatUpdatePendingConfirmHint();
     });
+}
+
+// 输入框上方那条细提示——只提醒，不阻塞输入（决策 7：用户挂起期间仍能继续滚动/打字）。
+function chatUpdatePendingConfirmHint() {
+    try {
+        const el = document.getElementById('aiChatPendingHint');
+        if (!el) return;
+        const n = (ChatState.pendingConfirms || []).length;
+        el.hidden = n === 0;
+        if (n > 0) el.textContent = '⏳ 有 ' + n + ' 项待确认——请在上面的卡片里点「确认执行」或「取消」';
+    } catch (e) {}
+}
+
+// 结算全部挂起确认：resolve(false) + 原地标注，绝不静默丢弃。
+// 两个调用点：chatSend 开新一轮时（决策 2，保持"同一时刻只有一张挂起卡"的串行语义）、
+// chatResetConversation 清空 #aiChatLog 之前（决策 3，根治"resolve 闭包被清空一起抹掉、
+// chatAgentRunLoop 永久卡住"这个 P0 级 bug）。
+function chatAgentSettlePendingConfirms(reason) {
+    try {
+        if (!ChatState.pendingConfirms || !ChatState.pendingConfirms.length) return;
+        const list = ChatState.pendingConfirms.slice();
+        ChatState.pendingConfirms.length = 0;
+        list.forEach(function (entry) {
+            try { entry.cancel(reason || '对话已重置'); } catch (e) {}
+        });
+    } catch (e) {}
 }
 
 // 写操作成功后：如果动到的路径就是当前编辑器里打开的文件，明确告诉用户，绝不吞掉这个信息。
@@ -18958,6 +19108,10 @@ function chatAppendWriteResultRow(toolName, args, data, projectDir) {
 // 之后新建的文件会被删除"。回退调用 /fs/restore——那个端点自己会先给"回退前"的状态再打一个
 // 检查点，所以回退之后仍然可以再回退回来，这里的提示文案如实说明这一点。
 async function chatAgentDoRollback(projectDir, checkpoint, opLabel) {
+    // P69 顺手修复：这次改造前 /fs/restore 这次请求完全没有带 signal——即使 ChatState.abort
+    // 之后被中止（比如用户开了新一轮对话），这个回退请求也会不受影响地跑到底。现在跟
+    // 确认卡共用同一个 signal：ChatState.abort 当时是谁的 controller 就用谁的。
+    const rollbackSignal = ChatState.abort ? ChatState.abort.signal : null;
     const confirmed = await chatAgentConfirm({
         title: '回退到这一步之前？',
         message: '即将把工作区恢复到执行「' + opLabel + '」之前的状态（检查点 ' + checkpoint + '）。\n'
@@ -18966,12 +19120,13 @@ async function chatAgentDoRollback(projectDir, checkpoint, opLabel) {
             + '这个回退动作本身也会先给"回退前"的状态打一个检查点，所以回退之后仍然可以再回退回来。',
         danger: true,
         confirmLabel: '确认回退'
-    });
+    }, rollbackSignal);
     if (!confirmed) { chatAppendRow('system', '已取消回退。'); return; }
     try {
         const resp = await ovlBridgeFetch(ovlBridgeUrl('/fs/restore'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ projectDir: projectDir, checkpoint: checkpoint })
+            body: JSON.stringify({ projectDir: projectDir, checkpoint: checkpoint }),
+            signal: rollbackSignal || undefined
         });
         const data = await resp.json();
         if (!data || data.ok !== true) {
@@ -19030,7 +19185,7 @@ async function chatAgentExecWriteTool(toolName, args, projectDir, signal, pendin
         message: built.message,
         danger: (toolName === 'delete'),
         confirmLabel: '确认执行'
-    });
+    }, signal);
     if (!confirmed) {
         const msg = '用户拒绝了该操作。';
         chatAppendToolRow('🔧 ' + toolName + '（' + (primaryRelPath || '') + '）· 已被用户取消', built.message);
@@ -19211,6 +19366,11 @@ async function chatSend() {
         // 光有 abort 不够：两条消息挨得很近时，旧请求可能已经拿到响应正在解析。
         // 所以还要 seq 守卫（照抄 scheduleCrossHighlight）：mySeq 对不上的响应一律丢弃。
         chatStop();
+        // P69 决策 2：保持串行语义——新一轮开始时自动取消上一张仍挂起的确认卡（原地改写
+        // 成"已取消"并 resolve(false)），不让两张卡并存。写工具确认那张多半已经被上面
+        // chatStop() 的 abort signal 顺带结算掉了，这里兜底结算任何不挂 signal 的（比如
+        // 回退确认卡）。
+        chatAgentSettlePendingConfirms('开始了新一轮');
         mySeq = ++ChatState.seq;
 
         // 换文档了就先把上一份文档的对话归档、从空白开始（行号对不上，继续沿用只会误导）。
@@ -21955,6 +22115,12 @@ function chatCompactRun() {
 //    用户开一段新对话，是因为话题变了，不是因为他不再关心自己标出来的那几处。
 //    （同理，文档上下文也不受影响 —— 它每轮现算，压根不在 messages 里。）
 function chatResetConversation() {
+    // P69 决策 3：清空 #aiChatLog 之前必须先结算全部挂起的确认卡——否则连着 resolve 闭包
+    // 一起被 DOM 清空抹掉，chatAgentRunLoop 永久卡在 await chatAgentConfirm(...)，
+    // ChatState.busy 永远回不到 false，SEND 按钮永久卡死在 STOP。三个调用点（chatSend 里
+    // 换文档时的 chatSyncSession、chatOpen、restoreGlobalHistory 尾部）都经过这里，
+    // 集中在这一处结算，不需要每个调用点各自记得处理。
+    chatAgentSettlePendingConfirms('对话已清空');
     ChatState.messages = [];
     ChatState.proposals = [];
     ChatState.target = null;
