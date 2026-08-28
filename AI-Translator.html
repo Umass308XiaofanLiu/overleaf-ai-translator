@@ -26787,7 +26787,12 @@ function ovlShowTreeError(msg) {
 
 // 递归建目录树的 DOM（懒加载子目录：点开才递归读下一层）。
 // 跳过点开头的条目（.git 等）—— 纯性能/可用性考虑，不是安全加固。
-async function ovlBuildTreeDom(dirHandle) {
+// v2 Pass P56（Bug B）：新增 relPrefix 参数——项目根目录本身传空字符串，递归进子目录时
+// 用 '/' 拼接累加，得到"相对项目根的完整路径"（含所有子目录层级），挂在 __ovlEntry.relPath
+// 上。此前这里只记 name（当前这一层的 basename），子目录里的文件/"设为主文档"/打开文件都
+// 因此丢了自己所在的子目录信息——是 main file not found 的真根因。
+async function ovlBuildTreeDom(dirHandle, relPrefix) {
+    relPrefix = relPrefix || '';
     const ul = document.createElement('ul');
     ul.className = 'ovl-tree-ul';
     const entries = [];
@@ -26805,14 +26810,17 @@ async function ovlBuildTreeDom(dirHandle) {
     for (let i = 0; i < entries.length; i++) {
         const name = entries[i][0], h = entries[i][1];
         const isDir = h.kind === 'directory';
+        const relPath = relPrefix ? (relPrefix + '/' + name) : name;
         const li = document.createElement('li');
         li.className = 'ovl-tree-node';
         // M9：右键菜单需要知道点中的到底是谁 —— 挂在节点自己身上的普通 JS 属性（不是 HTML
         // 属性），只有事件真落在这棵子树上的监听器摸得到，不进 DOM 序列化、不影响 innerHTML。
-        li.__ovlEntry = { handle: h, parentHandle: dirHandle, name: name, isDir: isDir };
+        // relPath：相对项目根、'/' 分隔、含所有子目录层级——"设为主文档"/编译/word count/
+        // SyncTeX 正向都要用这个，不能再只用 name（见上方 P56 注释）。
+        li.__ovlEntry = { handle: h, parentHandle: dirHandle, name: name, relPath: relPath, isDir: isDir };
         const row = document.createElement('div');
         row.className = 'ovl-tree-row ' + (isDir ? 'ovl-tree-row-dir' : 'ovl-tree-row-file')
-            + (!isDir && name === OvlState.mainDocFile ? ' ovl-tree-row-mainfile' : '');
+            + (!isDir && relPath === OvlState.mainDocFile ? ' ovl-tree-row-mainfile' : '');
         row.textContent = (isDir ? '▸ ' : '') + name;
         li.appendChild(row);
         if (isDir) {
@@ -26824,7 +26832,7 @@ async function ovlBuildTreeDom(dirHandle) {
                 li.classList.toggle('ovl-tree-open', opening);
                 row.textContent = (opening ? '▾ ' : '▸ ') + name;
                 if (opening && childUl.childElementCount === 0) {
-                    ovlBuildTreeDom(h).then(function (built) {
+                    ovlBuildTreeDom(h, relPath).then(function (built) {
                         while (built.firstChild) childUl.appendChild(built.firstChild);
                     }).catch(function (e) {
                         console.error('[ovl] list dir failed', e);
@@ -26836,7 +26844,7 @@ async function ovlBuildTreeDom(dirHandle) {
                 }
             });
         } else {
-            row.addEventListener('click', function () { ovlOpenFile(h, name, dirHandle); });
+            row.addEventListener('click', function () { ovlOpenFile(h, name, dirHandle, relPath); });
         }
         ul.appendChild(li);
     }
@@ -26861,11 +26869,14 @@ async function ovlRenderTree(dirHandle) {
     }
 }
 
-async function ovlOpenFile(fileHandle, name, parentHandle) {
+async function ovlOpenFile(fileHandle, name, parentHandle, relPath) {
     try {
         const file = await fileHandle.getFile();
         const text = await file.text();
-        OvlState.currentFile = { name: name, handle: fileHandle, parentHandle: parentHandle || OvlState.dirHandle || null };
+        // v2 Pass P56（Bug B）：relPath = 相对项目根、含所有子目录层级的完整路径；调用点没传
+        // （旧调用形状/理论上摸不到树节点信息的场景）就退回 name——跟改之前完全一样的旧行为，
+        // 不会比修之前更差，只是恢复不了"记不住子目录"这个已知缺陷。
+        OvlState.currentFile = { name: name, relPath: relPath || name, handle: fileHandle, parentHandle: parentHandle || OvlState.dirHandle || null };
         OvlState.dirty = false;
         const ta = document.getElementById('ovlCodeArea');
         if (ta) { ta.disabled = false; ta.value = text; }
@@ -27258,8 +27269,13 @@ async function ovlPickFolder() {
             await ovlRenderTree(handle);
             ovlUpdateTreeToolbtnsVisibility();
             // 记住这个文件夹句柄，下次开页面能提示"继续上次的项目"（§M2）。写失败（IDB 不可用/
-            // 隐私模式）不影响这次的文件树——只是下次没有"继续上次"这个提示，静默降级即可。
-            ovlSaveDirHandleToIdb(handle).catch(function (e) { console.warn('[ovl] persist dir handle failed', e); });
+            // 隐私模式/file:// 协议下 indexedDB.open() 从不 settle，见 ovlFsDbAvailable 头部注释）
+            // 不影响这次的文件树——只是下次没有"继续上次"这个提示，静默降级即可；先探测可用性，
+            // 不可用就直接不写，不让这次打开背一个注定要等 4 秒超时的挂起 Promise。
+            ovlFsDbAvailable().then(function (available) {
+                if (!available) return;
+                return ovlSaveDirHandleToIdb(handle);
+            }).catch(function (e) { console.warn('[ovl] persist dir handle failed', e); });
         } else {
             OvlState.usingWebkitFallback = true;
             ovlUpdateTreeToolbtnsVisibility();
@@ -27530,24 +27546,31 @@ function ovlLoadDirHandleFromIdb(key) {
     });
 }
 
-// v2 Pass P55：项目历史里每一条本地记录各自的 FSA 句柄——跟上面"lastProject"单独一条不是
-// 一回事（那个只记"最近一个"，历史列表里点开任意一条早就点开过的记录，明明浏览器早就发过
-// readwrite 权限，却因为没存这条记录自己的句柄，被迫每次都重新弹一次系统原生选择器，还只能
-// 靠用户自己在弹出的对话框里手动认对文件夹——这是 Bug 2 的真根因）。key 用规范化路径拼前缀，
-// 同一个 OVL_FS_DB_STORE，不用另开一张表。
-const OVL_FS_DB_HISTORY_KEY_PREFIX = 'historyHandle:';
-function ovlHistoryHandleIdbKey(normalizedPath) { return OVL_FS_DB_HISTORY_KEY_PREFIX + normalizedPath; }
-function ovlSaveHistoryDirHandle(normalizedPath, handle) {
-    if (!normalizedPath || !handle) return Promise.resolve();
-    return ovlSaveDirHandleToIdb(handle, ovlHistoryHandleIdbKey(normalizedPath))
-        .catch(function (e) { console.warn('[ovl] persist history dir handle failed', e); });
+// v2 Pass P56：可用性探测，带超时，只探测一次并缓存结果（Promise 本身就是缓存）——
+// 真实 Chrome 下用 file:// 协议直接打开这个页面时，indexedDB.open() 的 onsuccess/onerror/
+// onblocked 三个回调一个都不触发（本项目 2026-08 实测确认，5 秒内零回调），上面
+// OVL_FS_DB_OPEN_TIMEOUT 的兜底 setTimeout 是唯一会 settle 的路径，每次都要真等满
+// OVL_FS_DB_OPEN_TIMEOUT（4 秒）才知道"这次不可用"。不缓存这个结论的话，每一个想用这份
+// IndexedDB 缓存的调用点（继续上次的项目/记住这次打开的文件夹句柄）都要各自付一次那 4 秒
+// 等待，表现就是"看起来有缓存机制，其实每次都在空等之后悄悄放弃"——这正是这一版要打掉的
+// 那种空壳写法。所有想用 IndexedDB 目录句柄缓存的调用点都必须先 await 这个探测，探测说
+// 不可用就直接跳过整段 IndexedDB 逻辑，走各自的桥优先/原生选择器兜底，不再进 ovlFsDbOpen()。
+let ovlFsDbAvailablePromise = null;
+function ovlFsDbAvailable() {
+    if (!ovlFsDbAvailablePromise) {
+        ovlFsDbAvailablePromise = ovlFsDbOpen().then(function () { return true; }).catch(function () { return false; });
+    }
+    return ovlFsDbAvailablePromise;
 }
-function ovlLoadHistoryDirHandle(normalizedPath) {
-    if (!normalizedPath) return Promise.resolve(null);
-    return ovlLoadDirHandleFromIdb(ovlHistoryHandleIdbKey(normalizedPath)).catch(function (e) {
-        console.warn('[ovl] load history dir handle failed', e); return null;
-    });
-}
+
+// v2 Pass P55 曾在这里加过"项目历史里每一条本地记录各自的 FSA 句柄"缓存
+// （ovlSaveHistoryDirHandle/ovlLoadHistoryDirHandle，key 用规范化路径拼前缀），指望历史记录
+// 打开时免掉系统原生选择器。v2 Pass P56 整段删掉：真 Chrome 下 file:// 打开本页面时
+// indexedDB.open() 从不 settle（见上面 ovlFsDbAvailable 头部注释），这条缓存写得进去也读不出
+// 来，是"看起来修好了、实际在真实用法下从没生效过"的空壳——P55 自己的 e2e 测试是在 http://
+// 下跑的，没测到这个协议差异，才误以为通过了。新方案见 ovlProjectHistoryOpenEntry：桥在线时
+// 直接用桥的 /fs/*（OvlRemoteDirHandle）按历史记录里的绝对路径打开，不依赖任何浏览器端缓存的
+// FSA 句柄；桥离线才退回原生选择器，那种情况下每次看到系统对话框是预期行为。
 
 // 启动时（非阻塞）看一眼上次的项目还在不在，在的话给一个可点的"继续"提示，而不是自动接管——
 // 静默接管会在用户其实想开别的文件夹时产生一次多余的权限弹窗。
@@ -27556,9 +27579,16 @@ function ovlOfferReopenLastProject() {
     // 远程模式下（当前桥地址不是 127.0.0.1）绝不能拿它去当"继续上次的项目"，那会把本机上一次
     // 打开的本地文件夹句柄错当成远程项目呈现，两边路径体系完全不通用。
     if (ovlIsRemoteBridge()) return;
-    ovlLoadDirHandleFromIdb().then(function (handle) {
-        if (!handle) return;
-        return ovlQueryRW(handle).then(function (perm) { ovlShowReopenBanner(handle, perm); });
+    // v2 Pass P56：file:// 下这份 IndexedDB 缓存从来没写进去过（见 ovlFsDbAvailable 头部注释）——
+    // 先探测可用性，不可用就直接跳过，不进 ovlLoadDirHandleFromIdb() 白等 4 秒超时。这个功能
+    // 天生是"有就提示、没有就不提示"的非关键增强，不可用时保持沉默是正确行为，不是缺陷；
+    // 缺陷是之前那 4 秒的空等，不是"不弹这个横幅"本身。
+    ovlFsDbAvailable().then(function (available) {
+        if (!available) return;
+        return ovlLoadDirHandleFromIdb().then(function (handle) {
+            if (!handle) return;
+            return ovlQueryRW(handle).then(function (perm) { ovlShowReopenBanner(handle, perm); });
+        });
     }).catch(function (e) { console.warn('[ovl] reopen last project unavailable', e); });
 }
 
@@ -27746,14 +27776,13 @@ function ovlProjectHistoryRecordLocalOpenFromInput() {
         if (!p) return;
         const name = (OvlState.dirHandle && OvlState.dirHandle.name) || ovlProjectHistoryBasename(p);
         ovlProjectHistoryAdd({ name: name, path: p, kind: ovlIsRemoteBridge() ? 'remote' : 'local' });
-        // v2 Pass P55：本地模式下顺手把这次真实换上的 FSA 句柄按这条记录的规范化路径存起来，
-        // 下次从项目历史点开同一条记录才有可能免掉一次系统原生选择器（见 ovlLoadHistoryDirHandle
-        // 头部注释）。远程模式没有真句柄，跳过；usingWebkitFallback 降级模式的句柄也不是真
-        // FileSystemDirectoryHandle，同样跳过。
-        if (!ovlIsRemoteBridge() && !OvlState.usingWebkitFallback && OvlState.dirHandle) {
-            const normId = ovlNormalizeProjectPath(p);
-            ovlSaveHistoryDirHandle(normId, OvlState.dirHandle);
-        }
+        // v2 Pass P55 曾在这里顺手缓存这次真实换上的 FSA 句柄，指望下次从项目历史点开同一条
+        // 记录时免掉系统原生选择器。v2 Pass P56 撤掉了这段：真 Chrome 下用 file:// 直接打开
+        // 本页面时 indexedDB.open() 从不 settle（见 ovlFsDbAvailable 头部注释），这份缓存写
+        // 得进去也读不出来（4 秒超时后悄悄放弃），是 Bug 2 修复在真实用法下完全空转的根因。
+        // 新方案见 ovlProjectHistoryOpenEntry：桥在线时直接用桥的 /fs/* 按历史记录里的绝对
+        // 路径打开，压根不需要缓存 FSA 句柄；桥离线才退回原生选择器，那条路径下每次都会看到
+        // 系统对话框是预期行为（有明确提示，不是缺陷），缓存句柄也帮不上忙。
     } catch (e) { console.warn('[ovl] record local open history failed', e); }
 }
 
@@ -27797,20 +27826,24 @@ function ovlFormatHistoryTime(iso) {
     } catch (e) { return ''; }
 }
 
-// "打开"这一条历史记录：关弹窗 → 写路径进输入框 → 调打开项目函数（ovlPickFolder，唯一存在的
-// "打开项目"入口，见前端现状勘察 §3(b)）。existence 探测跟 pickFolder 并行触发、不 await 它再
-// 调 pickFolder——这次点击本身才是 showDirectoryPicker() 要求的那个真实用户手势，等一轮 fetch
-// 回来手势窗口就过期了（跟 ovlOverleafCloneFinishNamed 收尾时是同一条约束）。
-// v2 Pass P55（Bug 2 修复）：旧版无条件走 ovlPickFolder() 重弹一次系统原生选择器，选完不管
-// 用户在对话框里实际选中的是不是同一个文件夹，都把输入框覆盖回 entry.path——于是出现"文本显示
-// 的是点的那条历史，实际加载的文件树却是系统对话框恰好停留/记住的另一个文件夹（往往就是上次
-// 打开的那个）"，正是用户报告的"选完直接跳转到另外一个我上次打开的项目"。
-// 修复思路：本地模式下先尝试用 ovlLoadHistoryDirHandle() 找这条记录自己存过的 FSA 句柄——找到
-// 且权限还在/能重新授予，直接用它渲染文件树，全程不弹任何系统对话框（远程模式路径字符串本身
-// 就是事实来源，走 ovlPickFolder→ovlRemotePickFolder 用 entry.path 预填，不受此问题影响）。
-// 真的没有缓存句柄（比如这条历史是在这次修复之前就有的旧记录）才退回原生选择器兜底，但这时
-// 弹窗前先给一条明确说明用途的提示，选完后校验 handle.name 是否真的对得上这条记录的文件夹名——
-// 对不上就如实告知“你选的不是这个项目”，绝不再悄悄把路径文本改回 entry.path 冒充成功。
+// "打开"这一条历史记录：关弹窗 → 写路径进输入框 → 打开这条记录代表的项目。
+// v2 Pass P55（Bug 2 修复，第一版）：旧版无条件走 ovlPickFolder() 重弹一次系统原生选择器，选完
+// 不管用户在对话框里实际选中的是不是同一个文件夹，都把输入框覆盖回 entry.path——于是出现"文本
+// 显示的是点的那条历史，实际加载的文件树却是系统对话框恰好停留/记住的另一个文件夹（往往就是
+// 上次打开的那个）"。P55 当时的修复方案是缓存这条记录自己的 FSA 句柄（ovlLoadHistoryDirHandle），
+// 命中就直接用、不弹原生选择器。
+// v2 Pass P56（Bug A 真根因）：那份 FSA 句柄缓存存在 IndexedDB 里，而用户实际用法是按 README
+// 用 file:// 直接打开本文件——真 Chrome 在 file:// 协议下 indexedDB.open() 的 onsuccess/onerror/
+// onblocked 三个回调一个都不触发（2026-08 本项目实测确认，5 秒内零回调），句柄从来没写进去、
+// 也读不出来，每次都在 4 秒超时之后静默退回原生选择器——P55 的 e2e 测试是在 http:// 下跑的，
+// 没测到这个协议差异，才误以为"通过了"，实际在用户的真实用法下 P55 的 Bug 2 修复完全空转。
+// 新方案：不再依赖任何浏览器端缓存的 FSA 句柄。桥（tools/latex-bridge/server.js）跟浏览器在
+// 同一台机器上、天然知道任意绝对路径，本地历史记录本来就存的是绝对路径——桥在线时直接用桥的
+// /fs/*（复用 P50 已经写好的 OvlRemoteDirHandle 鸭子类型 shim）按这条记录的路径打开，全程零
+// 系统对话框，不需要"选没选对文件夹"这道校验（压根没有选择这一步）。只有桥离线时才退回原生
+// 选择器兜底——这时保留 P55 的"选完比对 handle.name，不对就整个回滚、如实报错"那套纪律，绝不
+// 冒充成功。existence 探测跟主流程并行触发、不 await 它——桥离线走原生选择器时这次点击本身才是
+// showDirectoryPicker() 要求的那个真实用户手势，等一轮 fetch 回来手势窗口就过期了。
 function ovlProjectHistoryOpenEntry(entry, onClosed) {
     try {
         if (typeof onClosed === 'function') onClosed();
@@ -27831,7 +27864,7 @@ function ovlProjectHistoryOpenEntry(entry, onClosed) {
 
         if (isRemoteEntry) {
             // 远程模式：pathInput.value 已经是 entry.path，ovlRemotePickFolder() 会用它当预填值，
-            // 点"选择此文件夹"不改路径就是打开 entry 本身——这条链路本来就不受 Bug 2 影响。
+            // 点"选择此文件夹"不改路径就是打开 entry 本身——这条链路本来就不受 Bug A/Bug 2 影响。
             if (typeof ovlPickFolder === 'function') {
                 Promise.resolve(ovlPickFolder()).catch(function (e) { console.warn('[ovl] open from history (remote) failed', e); });
             }
@@ -27839,48 +27872,53 @@ function ovlProjectHistoryOpenEntry(entry, onClosed) {
         }
 
         const expectedBasename = ovlProjectHistoryBasename(entry.path);
-        const normId = ovlNormalizeProjectPath(entry.path);
         const beforeHandle = OvlState.dirHandle;
+        // Windows 盘符（"E:\..."/"E:/..."）或 POSIX 绝对路径（"/..."）才够格直接喂给桥的
+        // projectDir——历史记录本来就只存绝对路径（见 ovlProjectHistoryRecordLocalOpenFromInput
+        // 头部注释），这里只是防御性兜底，不是真的预期会命中 false。
+        const looksAbsolute = /^(?:[A-Za-z]:[\\/]|[\\/])/.test(entry.path || '');
 
-        function finishWithHandle(handle) {
+        // 桥优先：零弹窗。桥在这台机器上，凭绝对路径就能直接 /fs/list，不需要浏览器授权。
+        function openViaBridge() {
+            // 顺序照抄 ovlRemotePickFolder()：先换 OvlState.dirHandle/usingWebkitFallback 再渲染
+            // 树，跟既有的远程打开路径保持同一套状态更新顺序，不额外制造一种新的时序。
+            const handle = new OvlRemoteDirHandle('.', expectedBasename || entry.path);
             OvlState.usingWebkitFallback = false;
             OvlState.dirHandle = handle;
-            if (pathInput) {
-                pathInput.value = entry.path;
-                try { localStorage.setItem(ovlProjectPathLsKey(), entry.path); } catch (e) {}
-            }
             ovlUpdateTreeToolbtnsVisibility();
             return Promise.resolve(ovlRenderTree(handle)).then(function () {
                 try { ovlProjectHistoryAdd({ name: entry.name, path: entry.path, kind: entry.kind, projectId: entry.projectId }); } catch (e) {}
-                try { ovlSaveHistoryDirHandle(normId, handle); } catch (e) {}
+                try { ovlBridgeUpdateWatch(); } catch (e) {}
             });
         }
 
-        // 走原生选择器兜底：不假设用户一定会选对——选完比对 handle.name 跟这条历史记录的文件夹
-        // 名是否一致，一致才当成功处理；不一致就诚实报告实际选中的是哪个文件夹，不冒充打开了
-        // entry，也不会把用户实际选中的这个文件夹的句柄错记到 entry 的缓存位上。
-        function fallbackToPicker() {
-            try { showToast('请在弹出的系统文件夹选择框中选择「' + expectedBasename + '」文件夹，用于重新授权访问', 'info'); } catch (e) {}
+        // 走原生选择器兜底（桥离线时）：不假设用户一定会选对——选完比对 handle.name 跟这条历史
+        // 记录的文件夹名是否一致，一致才当成功处理；不一致就诚实报告实际选中的是哪个文件夹，
+        // 不冒充打开了 entry。
+        function fallbackToPicker(reason) {
+            try {
+                showToast(
+                    (reason ? reason + '，' : '') + '请在弹出的系统文件夹选择框中选择「' + expectedBasename + '」文件夹，用于重新授权访问',
+                    'info'
+                );
+            } catch (e) {}
             if (typeof ovlPickFolder !== 'function') return;
             Promise.resolve(ovlPickFolder()).then(function () {
                 if (!OvlState.dirHandle || OvlState.dirHandle === beforeHandle) return; // 用户取消，什么都没变
                 const pickedName = OvlState.dirHandle.name || '';
                 if (pickedName === expectedBasename) {
                     // 名字对得上：认为选对了，路径文本仍以 entry.path 为准（同一目录只是显示用
-                    // 绝对路径字符串本来就取不到，跟原有行为一致），并顺手缓存句柄。
+                    // 绝对路径字符串本来就取不到，跟原有行为一致）。
                     if (pathInput) {
                         pathInput.value = entry.path;
                         try { localStorage.setItem(ovlProjectPathLsKey(), entry.path); } catch (e) {}
                     }
                     try { ovlProjectHistoryAdd({ name: entry.name, path: entry.path, kind: entry.kind, projectId: entry.projectId }); } catch (e) {}
-                    try { ovlSaveHistoryDirHandle(normId, OvlState.dirHandle); } catch (e) {}
                 } else {
                     // 名字对不上：不能就此当真——ovlPickFolder() 内部已经把 OvlState.dirHandle/
                     // 文件树都换成了用户实际选中的这个（错的）文件夹，必须整个滚回选之前的状态，
                     // 不然会出现"路径文本仍显示 entry.path，文件树却是另一个项目"这种更隐蔽的
-                    // 不一致——那正是 Bug 2 的病根（旧版就是选完直接采信、只把路径文本改回
-                    // entry.path，从不校验文件树是不是真的换对了）。绝不冒充打开了 entry，
-                    // 也不会把用户实际选中的这个文件夹的句柄错记到 entry 的缓存位上或历史列表里。
+                    // 不一致。绝不冒充打开了 entry。
                     OvlState.dirHandle = beforeHandle || null;
                     OvlState.usingWebkitFallback = false;
                     try { ovlUpdateTreeToolbtnsVisibility(); } catch (e) {}
@@ -27897,19 +27935,14 @@ function ovlProjectHistoryOpenEntry(entry, onClosed) {
             }).catch(function (e) { console.warn('[ovl] open from history failed', e); });
         }
 
-        ovlLoadHistoryDirHandle(normId).then(function (handle) {
-            if (!handle) { fallbackToPicker(); return; }
-            return ovlQueryRW(handle).then(function (perm) {
-                if (perm === 'granted') return { handle: handle, perm: perm };
-                return ovlRequestRW(handle).then(function (p2) { return { handle: handle, perm: p2 }; });
-            }).then(function (res) {
-                if (res && res.perm === 'granted') {
-                    return finishWithHandle(res.handle);
-                }
-                // 权限被拒绝（比如用户手动撤销了浏览器授权）：缓存的句柄已经用不了，退回原生选择器。
-                fallbackToPicker();
+        if (OvlState.bridgeOnline === true && looksAbsolute) {
+            openViaBridge().catch(function (e) {
+                console.error('[ovl] open from history via bridge failed', e);
+                try { showToast('打开失败：' + (e && e.message ? e.message : String(e)), 'error'); } catch (e2) {}
             });
-        }).catch(function (e) { console.warn('[ovl] load cached history handle failed', e); fallbackToPicker(); });
+            return;
+        }
+        fallbackToPicker('本地桥接服务未启动，需要重新授权访问文件夹');
     } catch (e) {
         console.error('[ovl] project history open entry failed', e);
         try { showToast('打开失败', 'error'); } catch (e2) {}
@@ -28210,7 +28243,12 @@ async function ovlCopyDirRecursive(srcDirHandle, destParentHandle, destName) {
 }
 
 // 改名：读→写新名→removeEntry(旧名)，且**必须**写新的成功之后才删旧的 —— 中途失败要保留旧文件。
-async function ovlPerformRename(parentHandle, oldName, isDir, newName) {
+// v2 Pass P56（Bug B）：新增 oldRelPath（相对项目根、含子目录的完整路径，调用点从树节点的
+// entry.relPath 传入，可能为空——旧调用形状/根目录节点退化成 oldName 本身）。mainDocFile 现在
+// 存的是完整相对路径，必须按 oldRelPath 比对/改写，不能再按裸 oldName 比对——否则子目录里的
+// 主文档改名后 mainDocFile 指针对不上，既不会更新也不会报错，静默指向一个不存在的旧名字。
+async function ovlPerformRename(parentHandle, oldName, isDir, newName, oldRelPath) {
+    oldRelPath = oldRelPath || oldName;
     const rwOk = await ovlEnsureRW(parentHandle);
     if (!rwOk) throw new Error('没有写入权限');
     newName = String(newName || '').trim();
@@ -28218,6 +28256,9 @@ async function ovlPerformRename(parentHandle, oldName, isDir, newName) {
     if (newName === oldName) return;
     const clash = await ovlEntryExists(parentHandle, newName, isDir);
     if (clash) throw new Error('目标名称已存在：' + newName);
+    // 改名只在同一个父目录内发生，子目录前缀不变——把 oldRelPath 最后一段换成 newName。
+    const relPrefixMatch = /^(.*\/)?[^/]*$/.exec(oldRelPath);
+    const newRelPath = (relPrefixMatch && relPrefixMatch[1] ? relPrefixMatch[1] : '') + newName;
     if (isDir) {
         const srcDir = await parentHandle.getDirectoryHandle(oldName);
         await ovlCopyDirRecursive(srcDir, parentHandle, newName);
@@ -28232,30 +28273,43 @@ async function ovlPerformRename(parentHandle, oldName, isDir, newName) {
         await w.close();
         await parentHandle.removeEntry(oldName); // 写新的成功之后才删旧的
         // 如果正在编辑的就是这份文件，把 currentFile 指向新 handle/新名字 —— 否则接下来的
-        // Ctrl+S 会往一个已经不存在的旧文件柄上写，静默失败。
-        if (OvlState.currentFile && OvlState.currentFile.name === oldName && OvlState.currentFile.parentHandle) {
+        // Ctrl+S 会往一个已经不存在的旧文件柄上写，静默失败。按 relPath 比对（不是裸 name），
+        // 避免不同子目录下同名文件互相认错。
+        if (OvlState.currentFile && (OvlState.currentFile.relPath || OvlState.currentFile.name) === oldRelPath && OvlState.currentFile.parentHandle) {
             try {
                 const same = await OvlState.currentFile.parentHandle.isSameEntry(parentHandle);
                 if (same) {
                     OvlState.currentFile.name = newName;
+                    OvlState.currentFile.relPath = newRelPath;
                     OvlState.currentFile.handle = newHandle;
                     ovlUpdateTabUI();
                 }
             } catch (e) {}
         }
     }
-    if (OvlState.mainDocFile === oldName) {
-        OvlState.mainDocFile = newName;
-        try { localStorage.setItem('ovl.mainDocFile', newName); } catch (e) {}
+    if (isDir) {
+        // 文件夹改名：mainDocFile 若落在这个文件夹里面（前缀匹配），路径前缀跟着换。
+        const dirOldPrefix = oldRelPath + '/';
+        const dirNewPrefix = newRelPath + '/';
+        if (OvlState.mainDocFile === oldRelPath || (typeof OvlState.mainDocFile === 'string' && OvlState.mainDocFile.indexOf(dirOldPrefix) === 0)) {
+            OvlState.mainDocFile = OvlState.mainDocFile === oldRelPath ? newRelPath : (dirNewPrefix + OvlState.mainDocFile.slice(dirOldPrefix.length));
+            try { localStorage.setItem('ovl.mainDocFile', OvlState.mainDocFile); } catch (e) {}
+        }
+    } else if (OvlState.mainDocFile === oldRelPath) {
+        OvlState.mainDocFile = newRelPath;
+        try { localStorage.setItem('ovl.mainDocFile', newRelPath); } catch (e) {}
     }
 }
 
 // 删除：真的删用户的真文件，不进回收站。调用方（ovlHandleCtxAction）负责二次确认。
-async function ovlPerformDelete(parentHandle, name, isDir) {
+// v2 Pass P56（Bug B）：新增 relPath（同上，可能为空退化成 name），mainDocFile/currentFile
+// 比对同样必须按完整相对路径，不能再按裸 name。
+async function ovlPerformDelete(parentHandle, name, isDir, relPath) {
+    relPath = relPath || name;
     const rwOk = await ovlEnsureRW(parentHandle);
     if (!rwOk) throw new Error('没有写入权限');
     await parentHandle.removeEntry(name, { recursive: true });
-    if (!isDir && OvlState.currentFile && OvlState.currentFile.name === name && OvlState.currentFile.parentHandle) {
+    if (!isDir && OvlState.currentFile && (OvlState.currentFile.relPath || OvlState.currentFile.name) === relPath && OvlState.currentFile.parentHandle) {
         try {
             const same = await OvlState.currentFile.parentHandle.isSameEntry(parentHandle);
             if (same) {
@@ -28269,7 +28323,8 @@ async function ovlPerformDelete(parentHandle, name, isDir) {
             }
         } catch (e) {}
     }
-    if (OvlState.mainDocFile === name) {
+    const dirPrefix = relPath + '/';
+    if (OvlState.mainDocFile === relPath || (isDir && typeof OvlState.mainDocFile === 'string' && OvlState.mainDocFile.indexOf(dirPrefix) === 0)) {
         OvlState.mainDocFile = null;
         try { localStorage.removeItem('ovl.mainDocFile'); } catch (e) {}
     }
@@ -28451,7 +28506,7 @@ function ovlOpenCtxMenu(x, y, entry) {
         if (!entry.isDir) {
             // "Set as main document" 只对非主 .tex 文件出现（§2.6.5 实测原文）。
             const isTex = /\.tex$/i.test(entry.name);
-            if (!isTex || entry.name === OvlState.mainDocFile) ids = ids.filter(function (id) { return id !== 'setmain'; });
+            if (!isTex || (entry.relPath || entry.name) === OvlState.mainDocFile) ids = ids.filter(function (id) { return id !== 'setmain'; });
         }
     }
     if (OvlState.usingWebkitFallback) {
@@ -28488,7 +28543,7 @@ function ovlHandleCtxAction(id, entry) {
                 value: entry.name,
                 validate: function (v) { return (v && v.trim()) ? null : '名字不能为空'; },
                 onConfirm: function (v) {
-                    ovlPerformRename(entry.parentHandle, entry.name, entry.isDir, v)
+                    ovlPerformRename(entry.parentHandle, entry.name, entry.isDir, v, entry.relPath)
                         .then(function () { return ovlRenderTree(OvlState.dirHandle); })
                         .then(function () { ovlFlashSaveStatus('已重命名', false); })
                         .catch(function (e) { ovlFlashSaveStatus('重命名失败：' + (e && e.message ? e.message : String(e)), true); });
@@ -28499,10 +28554,12 @@ function ovlHandleCtxAction(id, entry) {
             ovlDownloadEntry(entry.handle, entry.name);
             break;
         case 'setmain':
-            OvlState.mainDocFile = entry.name;
-            try { localStorage.setItem('ovl.mainDocFile', entry.name); } catch (e) {}
+            // v2 Pass P56（Bug B）：存完整相对路径（含子目录），不再只存 basename——否则子目录
+            // 里的文件被设为主文档后，编译时拼出来的路径会丢掉子目录（main file not found）。
+            OvlState.mainDocFile = entry.relPath || entry.name;
+            try { localStorage.setItem('ovl.mainDocFile', OvlState.mainDocFile); } catch (e) {}
             ovlRenderTree(OvlState.dirHandle);
-            ovlFlashSaveStatus('已设为主文档：' + entry.name, false);
+            ovlFlashSaveStatus('已设为主文档：' + OvlState.mainDocFile, false);
             break;
         case 'delete':
             ovlConfirmDialog({
@@ -28512,7 +28569,7 @@ function ovlHandleCtxAction(id, entry) {
                 requireTyped: entry.isDir ? entry.name : null,
                 confirmLabel: '删除',
                 onConfirm: function () {
-                    ovlPerformDelete(entry.parentHandle, entry.name, entry.isDir)
+                    ovlPerformDelete(entry.parentHandle, entry.name, entry.isDir, entry.relPath)
                         .then(function () { return ovlRenderTree(OvlState.dirHandle); })
                         .then(function () { ovlFlashSaveStatus('已删除', false); })
                         .catch(function (e) { ovlFlashSaveStatus('删除失败：' + (e && e.message ? e.message : String(e)), true); });
@@ -29299,7 +29356,11 @@ async function ovlDoRecompile(opts) {
     }
 
     try { localStorage.setItem(ovlProjectPathLsKey(), projectDir); } catch (e) {}
-    const mainFile = OvlState.mainDocFile || (OvlState.currentFile && OvlState.currentFile.name) || 'main.tex';
+    // v2 Pass P56（Bug B）：currentFile 兜底用 relPath（含子目录），不是 name（basename）——
+    // 否则子目录里打开的文件被拿来兜底编译时会丢子目录，桥拼出 projectDir+文件名 报
+    // main file not found。mainDocFile 优先级不变（P48 既有判断：doCompile 必须用真正的
+    // 主文档），只是它自己现在存的也是完整相对路径了（见 setmain 分支）。
+    const mainFile = OvlState.mainDocFile || (OvlState.currentFile && OvlState.currentFile.relPath) || 'main.tex';
 
     // v2 Pass P14：桥接服务是直接读磁盘上的文件去编译的，请求体里压根没带编辑器内容
     // （见下面 fetch body，只有 projectDir/mainFile）——编辑框里的改动如果还没落盘，编译出来
@@ -30671,7 +30732,7 @@ async function ovlAiMergeApplyFile(fileIdx) {
             } else wasDirtyOtherFile = true;
         }
 
-        await ovlOpenFile(file.handle, file.name, file.parentHandle);
+        await ovlOpenFile(file.handle, file.name, file.parentHandle, file.path);
         const ta = document.getElementById('ovlCodeArea');
         if (!ta) throw new Error('编辑器未就绪');
         ta.value = mergedText;
@@ -31266,7 +31327,10 @@ async function ovlSyncTexForward() {
         // 只在"要不要真的调 pdflatex 编译"这类场景下才该优先（doDoRecompile/word count 那两处
         // 保持原样不动），正向定位这里改成"当前正打开/编辑的文件优先"，没有才退回
         // mainDocFile/main.tex 兜底。
-        const mainFile = (OvlState.currentFile && OvlState.currentFile.name) || OvlState.mainDocFile || 'main.tex';
+        // v2 Pass P56（Bug B）：用当前文件的 relPath（含子目录），不是 name（basename）——
+        // synctex 的 `-i line:col:name` 按 name 在数据库里查，子目录里的文件传 basename 会
+        // 查到不相关的位置或直接 "No tag"。"当前编辑的文件优先"这条 P48 判断本身不变。
+        const mainFile = (OvlState.currentFile && OvlState.currentFile.relPath) || OvlState.mainDocFile || 'main.tex';
         ovlFlashSaveStatus('正在定位 PDF 页面…', false);
         const resp = await ovlBridgeFetch(ovlBridgeUrl('/synctex/forward'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -33425,7 +33489,8 @@ async function ovlProjectWordCount() {
     const projectDir = pathInput ? pathInput.value.trim() : '';
     if (!projectDir) { ovlFlashSaveStatus('请先在 PDF 面板里填写项目绝对路径', true); return; }
     if (OvlState.bridgeOnline !== true) { ovlFlashSaveStatus('桥接服务未在线，无法跑 texcount', true); return; }
-    const mainFile = OvlState.mainDocFile || (OvlState.currentFile && OvlState.currentFile.name) || 'main.tex';
+    // v2 Pass P56（Bug B）：同 doCompile，兜底用 relPath 不是 name（basename）。
+    const mainFile = OvlState.mainDocFile || (OvlState.currentFile && OvlState.currentFile.relPath) || 'main.tex';
     ovlFlashSaveStatus('正在统计字数…', false);
     let data;
     try {
