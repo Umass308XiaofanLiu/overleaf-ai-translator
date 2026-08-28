@@ -1237,11 +1237,23 @@ body.ovl-popout-child #root {
 .ovl-vistrans-body { font-size: 13px; line-height: 1.65; }
 .ovl-vistrans-loading { font-size: 12px; color: #94a3b8; }
 .ovl-vistrans-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 8px; padding-top: 6px; border-top: 1px solid #e5e7eb; }
-.ovl-vistrans-copy, .ovl-vistrans-close {
+.ovl-vistrans-copy, .ovl-vistrans-close, .ovl-vistrans-edit {
     font-size: 11px; border: none; background: #f1f5f9; color: #475569; border-radius: 5px;
     padding: 3px 8px; cursor: pointer;
 }
-.ovl-vistrans-copy:hover, .ovl-vistrans-close:hover { background: #e2e8f0; }
+.ovl-vistrans-copy:hover, .ovl-vistrans-close:hover, .ovl-vistrans-edit:hover { background: #e2e8f0; }
+/* v2 Pass P63（H5）：浮框内「编辑」把 .ovl-vistrans-body 换成这个 textarea + 两颗小按钮。 */
+.ovl-vistrans-edit-ta {
+    width: 100%; box-sizing: border-box; min-height: 60px; font-size: 13px; line-height: 1.6;
+    border: 1px solid #cbd5e1; border-radius: 5px; padding: 6px 8px; resize: vertical;
+    font-family: inherit; color: #1f2937;
+}
+.ovl-vistrans-edit-actions { display: flex; justify-content: flex-end; gap: 6px; margin-top: 6px; }
+.ovl-vistrans-edit-save, .ovl-vistrans-edit-cancel {
+    font-size: 11px; border: none; border-radius: 5px; padding: 3px 8px; cursor: pointer;
+}
+.ovl-vistrans-edit-save { background: #2563eb; color: #fff; }
+.ovl-vistrans-edit-cancel { background: #f1f5f9; color: #475569; }
 
 /* v2 Pass P33：「编辑」改成就地源码编辑器——P32 那版浮框（.ovl-editsrc，靠 ovlPlaceFloating
    贴着选区飘）已整套删除，不再是"选中 -> 弹一个框"，而是"选中的 .ovl-visual-block 本身
@@ -2182,6 +2194,13 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-modal-title { font-size: 14px; font-weight: 700; margin-bottom: 10px; }
 .ovl-modal-label { font-size: 12px; color: #9AA4B2; margin-bottom: 6px; }
 .ovl-modal-message { font-size: 12px; color: #E7E9EE; line-height: 1.6; margin-bottom: 10px; white-space: pre-line; }
+/* v2 Pass P63：回译预览对照——原文/新文两栏，可横向滚动，长块不撑爆弹窗宽度。 */
+.ovl-backtrans-diff { display: flex; gap: 10px; max-width: 640px; max-height: 320px; overflow: auto; }
+.ovl-backtrans-col { flex: 1 1 0; min-width: 0; }
+.ovl-backtrans-label { font-size: 11px; color: #9AA4B2; margin-bottom: 4px; font-weight: 700; }
+.ovl-backtrans-text { font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; background: #1B2029; border: 1px solid #333B49; border-radius: 4px; padding: 6px 8px; }
+.ovl-diff-del { color: #F87171; text-decoration: line-through; }
+.ovl-diff-ins { color: #4ADE80; text-decoration: underline; }
 .ovl-modal-input {
     width: 100%;
     box-sizing: border-box;
@@ -3783,7 +3802,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
 const APP_VERSION = '02.02.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-08-27';   // APP_BUILD_DATE_STAMP
+const APP_BUILD_DATE = '2026-08-28';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -23194,6 +23213,10 @@ function ovlPortalHtml() {
         + '<div class="ovl-vistrans" id="ovlVisTransBox" hidden>'
         +   '<div class="ovl-vistrans-body" id="ovlVisTransBody"></div>'
         +   '<div class="ovl-vistrans-actions">'
+        // v2 Pass P63（H5）：「编辑」把 #ovlVisTransBody 换成可编辑 <textarea>，编辑完点
+        // 「回译并保存」——见 ovlVisTransEditStart/ovlVisTransEditSave（原文选中即译弹框
+        // 只是展示译文的地方，改成"编辑译文能反向改回原文"不建第二套浮框机器）。
+        +     '<button type="button" class="ovl-vistrans-edit" id="ovlVisTransEditBtn">编辑</button>'
         +     '<button type="button" class="ovl-vistrans-copy" id="ovlVisTransCopyBtn">复制译文</button>'
         +     '<button type="button" class="ovl-vistrans-close" id="ovlVisTransCloseBtn">&times;</button>'
         +   '</div>'
@@ -25614,6 +25637,40 @@ async function ovlVisualTranslateBlockText(text, config, signal) {
     if (!ovlVisualCodeCheck(afterXport, codeMasked.map)) {
         console.warn('[ovl] visual 中文模式：代码/逐字环境哨兵残留或数量不匹配，回退显示原文', src.slice(0, 120));
         return src;
+    }
+    return ovlVisualCodeUnmask(afterXport, codeMasked.map);
+}
+
+// ==================== v2 Pass P63（H5/H6）：中文 -> 英文回译 ====================
+// 跟 ovlVisualTranslateBlockText 反方向、同一套双层哨兵：先 ovlVisualCodeMask 保护代码/
+// 逐字环境，再 xportMask 保护公式/引用/命令；模型返回后先校验 xport 层（xportBlockOk），
+// 通过才 xportUnmask，再校验代码层（ovlVisualCodeCheck），通过才 ovlVisualCodeUnmask。
+// 任何一层校验不过直接 throw——调用方必须 catch 并且绝不能把结果写进 .tex 源码，这是
+// P63 规格§「回译必须走代码遮罩」的硬性要求：宁可拒绝写入，也不能把带哨兵残渣或被
+// 模型吃掉命令的英文写回用户论文。
+async function ovlBacktranslateZhToEn(zhText, config, signal) {
+    const src = String(zhText == null ? '' : zhText);
+    if (!src.trim()) return src;
+    const codeMasked = ovlVisualCodeMask(src);
+    const masked = xportMask(codeMasked.text);
+    if (ovlVisualNothingToTranslate(masked.text)) return src;
+    const prompt = '你是学术论文翻译助手，把下面这段简体中文学术书面语回译成英文学术论文正文用语。硬性规则：\n'
+        + '1) 文本中所有形如 [[数字]] 的占位符必须原样保留在译文里、不得翻译、不得增删、不得改动方括号或数字——'
+        + '它们代表被抽走的公式/引用/命令，请把每一个都当成一个不可拆分的单词对待，直接嵌进对应的译文位置。\n'
+        + '2) 文本中所有形如 〔〔OVLCODE数字〕〕 的占位符同样必须原样保留在译文里、不得翻译、不得增删、'
+        + '不得改动括号或数字——它们代表被抽走的代码/伪代码/逐字环境，请把每一个都当成一个不可拆分的'
+        + '单词对待，直接嵌进对应的译文位置。\n'
+        + '3) 只输出回译结果本身，不要添加任何解释、前后缀、引号或 Markdown 代码块标记。\n'
+        + '4) 忠实还原原意，译成准确通顺的英文学术书面语。\n\n'
+        + '中文原文：\n' + masked.text;
+    const raw = await callModelPlainText(prompt, config, signal);
+    const body = (typeof raw === 'string') ? raw.trim() : '';
+    if (!xportBlockOk(body, masked.map)) {
+        throw new Error('回译结果未通过完整性校验（占位符或公式被改动）');
+    }
+    const afterXport = xportUnmask(body, masked.map);
+    if (!ovlVisualCodeCheck(afterXport, codeMasked.map)) {
+        throw new Error('回译结果未通过完整性校验（代码/命令占位符被改动）');
     }
     return ovlVisualCodeUnmask(afterXport, codeMasked.map);
 }
@@ -28890,7 +28947,10 @@ function ovlConfirmDialog(opts) {
     box.className = 'ovl-modal';
     const h = document.createElement('div'); h.className = 'ovl-modal-title'; h.textContent = opts.title || '';
     box.appendChild(h);
-    const msg = document.createElement('div'); msg.className = 'ovl-modal-message'; msg.textContent = opts.message || '';
+    const msg = document.createElement('div'); msg.className = 'ovl-modal-message';
+    // v2 Pass P63：opts.html（可选）——回译预览需要展示"原文/新文"两栏对照，纯文本
+    // textContent 装不下结构化排版。不传就是旧行为，逐字节不变。
+    if (opts.html) msg.innerHTML = opts.html; else msg.textContent = opts.message || '';
     box.appendChild(msg);
     let input = null;
     if (opts.requireTyped) {
@@ -28928,6 +28988,52 @@ function ovlConfirmDialog(opts) {
     overlay.addEventListener('click', function (e) { if (e.target === overlay) { close(); fireCancelOnce(); } });
     document.addEventListener('keydown', onKey);
     if (input) setTimeout(function () { input.focus(); }, 0);
+}
+
+// v2 Pass P63：回译预览用的极简单词级 diff（LCS，非语义、非行级）——够用来在确认框里
+// 标出"哪些词变了"，不追求精确语义 diff。输入任何一侧超过 800 个词元就放弃 diff（O(n*m)
+// DP 太贵），退回纯并排展示，见 ovlDiffPreviewHtml 的兜底分支。
+function ovlSimpleWordDiff(oldText, newText) {
+    const a = String(oldText == null ? '' : oldText).split(/(\s+)/);
+    const b = String(newText == null ? '' : newText).split(/(\s+)/);
+    if (a.length > 800 || b.length > 800) return null;
+    const n = a.length, m = b.length;
+    const dp = new Array(n + 1);
+    for (let i = 0; i <= n; i++) dp[i] = new Array(m + 1).fill(0);
+    for (let i = n - 1; i >= 0; i--) {
+        for (let j = m - 1; j >= 0; j--) {
+            dp[i][j] = (a[i] === b[j]) ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+        }
+    }
+    let i = 0, j = 0;
+    const outOld = [], outNew = [];
+    while (i < n && j < m) {
+        if (a[i] === b[j]) { outOld.push({ t: a[i], k: 'eq' }); outNew.push({ t: b[j], k: 'eq' }); i++; j++; }
+        else if (dp[i + 1][j] >= dp[i][j + 1]) { outOld.push({ t: a[i], k: 'del' }); i++; }
+        else { outNew.push({ t: b[j], k: 'ins' }); j++; }
+    }
+    while (i < n) { outOld.push({ t: a[i], k: 'del' }); i++; }
+    while (j < m) { outNew.push({ t: b[j], k: 'ins' }); j++; }
+    return { oldParts: outOld, newParts: outNew };
+}
+// 回译确认框的正文 HTML：原文/新文两栏对照，diff 可用时标出增删词。两栏都必须展示——
+// P63 规格硬性要求，绝不能只给新文让用户凭空信任模型没改坏东西。
+function ovlDiffPreviewHtml(oldText, newText) {
+    const oldS = String(oldText == null ? '' : oldText);
+    const newS = String(newText == null ? '' : newText);
+    const diff = ovlSimpleWordDiff(oldS, newS);
+    const renderParts = function (parts, cls) {
+        return parts.map(function (p) {
+            if (p.k === 'eq') return escapeHtml(p.t);
+            return '<span class="' + cls + '">' + escapeHtml(p.t) + '</span>';
+        }).join('');
+    };
+    const oldHtml = diff ? renderParts(diff.oldParts, 'ovl-diff-del') : escapeHtml(oldS);
+    const newHtml = diff ? renderParts(diff.newParts, 'ovl-diff-ins') : escapeHtml(newS);
+    return '<div class="ovl-backtrans-diff">'
+        + '<div class="ovl-backtrans-col"><div class="ovl-backtrans-label">原文</div><div class="ovl-backtrans-text">' + oldHtml + '</div></div>'
+        + '<div class="ovl-backtrans-col"><div class="ovl-backtrans-label">回译后</div><div class="ovl-backtrans-text">' + newHtml + '</div></div>'
+        + '</div>';
 }
 
 // ---- 右键菜单：文件 = 改名/下载/[设为主文档]/删除/新建文件/新建文件夹/上传；
@@ -34466,6 +34572,10 @@ function ovlInlineSrcRerenderLocal(st, newText) {
 function ovlInlineSrcSave() {
     const st = OvlInlineSrcEdit;
     if (!st || st.closing) return;
+    // v2 Pass P63（H6）：mode==='zh'（Visual 中文预览模式下的就地编辑）不是同步 splice，
+    // 要先回译再校验再预览确认，整条路是异步的，分流到独立函数，不把 async/await 硬塞进
+    // 这个本来同步、有大量调用方假设它"跑完即生效"的函数里。
+    if (st.mode === 'zh') { ovlInlineZhSaveAsync(st); return; }
     st.closing = true;
 
     // 用户反馈：进入就地编辑但一个字没改，退出时也会重新编译 PDF。根因是下面那句
@@ -34518,6 +34628,121 @@ function ovlInlineSrcSave() {
         }
     } catch (e) {
         console.error('[ovl] inlineSrcSave failed', e);
+        try { showToast(spliced ? '保存后重渲染出错，已用整篇重渲染兜底。' : ('保存失败：' + (e && e.message ? e.message : String(e))), 'error'); } catch (e2) {}
+        if (!spliced) {
+            try { st.blocks.forEach(function (b) { b.style.display = ''; }); } catch (e3) {}
+            try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e4) {}
+        } else {
+            try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e3) {}
+            try { if (typeof ovlVisualRender === 'function') ovlVisualRender(); } catch (e5) {}
+        }
+    } finally {
+        OvlInlineSrcEdit = null;
+    }
+}
+
+// v2 Pass P63（H6）：mode==='zh' 的收尾——原块恢复显示、拆掉编辑器，跟 ovlInlineSrcCancel
+// 同一条零副作用退出路径，source/缓存一个字节都不碰。任何失败路径（回译失败/哨兵校验
+// 失败/用户取消预览）最终都走这里，保证"没有半写状态"。
+function ovlInlineZhAbort(st) {
+    try {
+        st.blocks.forEach(function (b) { b.style.display = ''; });
+        ovlInlineSrcTeardown();
+    } catch (e) {
+        console.error('[ovl] inlineZhAbort teardown failed', e);
+        OvlInlineSrcEdit = null;
+    }
+}
+
+// v2 Pass P63（H6）：Visual 中文预览模式就地编辑的保存路径。流程：
+//   1) 空操作闸（跟 ovlInlineSrcSave 同款判断）——一个字没改，原样退回，不回译不重渲不落盘。
+//   2) ovlBacktranslateZhToEn 回译成英文（双层哨兵掩码+校验，不过直接 throw）——失败就
+//      toast 中文提示 + 原样退回，源码零改动。
+//   3) ovlConfirmDialog 展示"原英文 / 回译后英文"对照，用户取消同样原样退回、源码零改动。
+//   4) 确认后按 [lineFrom,lineTo] 行区间 splice 英文源码（不做任何文本匹配）；splice 成功
+//      立刻把"用户编辑后的中文"以"新英文源码的哈希"为 key 写进持久缓存
+//      （ovlVisualTransCachePut）——这一步是 P63 规格点名的坑：不做的话下次渲染缓存 miss
+//      会重新调模型翻译，把用户手改的中文悄悄冲掉。
+async function ovlInlineZhSaveAsync(st) {
+    let noop = false;
+    try { noop = (st.ta.value === st.origText); } catch (e) { console.error('[ovl] inlineZhSave noop check failed', e); noop = false; }
+    if (noop) {
+        st.closing = true;
+        ovlInlineZhAbort(st);
+        return;
+    }
+
+    st.closing = true;
+    const newZhText = st.ta.value;
+    try { st.ta.readOnly = true; } catch (e) {}
+
+    let newEnText = null;
+    try {
+        newEnText = await ovlBacktranslateZhToEn(newZhText, st.cfg || getApiConfig(), null);
+    } catch (e) {
+        console.error('[ovl] inlineZhSave backtranslate failed', e);
+        try { showToast('回译失败：' + (e && e.message ? e.message : String(e)) + '，英文原文未改动。', 'error'); } catch (e2) {}
+        ovlInlineZhAbort(st);
+        return;
+    }
+
+    // 预览确认：展示"原英文 / 回译后英文"对照，用户点确定才真的覆盖——本项目目前唯一会
+    // 用模型生成结果覆盖用户亲手写的英文的功能，绝不能悄悄发生。
+    let confirmed = false;
+    await new Promise(function (resolve) {
+        try {
+            const html = ovlDiffPreviewHtml(st.origEnText, newEnText);
+            ovlConfirmDialog({
+                title: '确认用回译结果覆盖英文原文？',
+                html: html,
+                confirmLabel: '确认覆盖',
+                onConfirm: function () { confirmed = true; resolve(); },
+                onCancel: function () { confirmed = false; resolve(); }
+            });
+        } catch (e) {
+            console.error('[ovl] inlineZhSave confirm dialog failed', e);
+            confirmed = false;
+            resolve();
+        }
+    });
+
+    if (!confirmed) {
+        try { showToast('已取消，英文原文未改动。', 'info'); } catch (e) {}
+        ovlInlineZhAbort(st);
+        return;
+    }
+
+    let spliced = false;
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || ta.disabled) throw new Error('编辑器未就绪');
+        const chars = ovlGutterLineRangeToChars(ta, st.lineFrom, st.lineTo);
+        const oldLineCount = st.lineTo - st.lineFrom + 1;
+        const newLineCount = newEnText.split('\n').length;
+
+        const wasHidden = ta.style.display === 'none';
+        if (wasHidden) ta.style.display = '';
+        ta.focus();
+        ta.setSelectionRange(chars.start, chars.end);
+        document.execCommand('insertText', false, newEnText);
+        if (wasHidden) ta.style.display = 'none';
+        spliced = true;
+        if (typeof focusNoteTexChanged === 'function') { try { focusNoteTexChanged(); } catch (e) {} }
+
+        // 缓存一致性：splice 成功后立刻写，用跟渲染路径完全相同的 key 算法
+        // （ovlVisualTransCacheKey = hash(新英文源码) + '|zh|' + provider + '|' + model），
+        // 这样下一次渲染直接命中，显示的就是用户手改的中文，不会再调模型。
+        try { ovlVisualTransCachePut(newEnText, st.cfg || getApiConfig(), newZhText); } catch (e) { console.error('[ovl] inlineZhSave cache put failed', e); }
+
+        if (newLineCount === oldLineCount) {
+            ovlInlineSrcRerenderLocal(st, newEnText);
+        } else {
+            try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e) {}
+            if (typeof ovlVisualRender === 'function') ovlVisualRender();
+        }
+        try { showToast('已回译并写回英文原文。', 'success'); } catch (e) {}
+    } catch (e) {
+        console.error('[ovl] inlineZhSave splice failed', e);
         try { showToast(spliced ? '保存后重渲染出错，已用整篇重渲染兜底。' : ('保存失败：' + (e && e.message ? e.message : String(e))), 'error'); } catch (e2) {}
         if (!spliced) {
             try { st.blocks.forEach(function (b) { b.style.display = ''; }); } catch (e3) {}
@@ -34647,6 +34872,114 @@ function ovlInlineSrcEditOpen(source) {
     }
 }
 
+// v2 Pass P63（H6）：Visual 中文预览模式下的就地编辑入口——选中算法（触及块 -> 合并
+// data-src-line 行区间）逐字节照抄上面 ovlInlineSrcEditOpen 的 Visual 分支，只是编辑对象
+// 换成这些块当前显示的中文译文（ovlVisualTransCacheGet 命中的那份，跟屏幕上渲染出来的
+// 字节完全一致，不是重新现翻一遍）。保存时不直接 splice 中文——ovlInlineSrcSave 里
+// mode==='zh' 那一支会先回译成英文、双层哨兵校验、预览确认，全部通过才落盘，任何一步
+// 失败都原样退回、源码零改动，跟 ovlInlineSrcCancel/ovlInlineSrcTeardown 共用同一套收尾。
+function ovlInlineZhEditOpen() {
+    try {
+        if (OvlInlineSrcEdit) {
+            try { showToast('已经有一处在就地编辑，请先保存（Ctrl+Enter）或取消（Esc）。', 'warning'); } catch (e) {}
+            return;
+        }
+        if (OvlState.editorMode !== 'visual' || OvlVisualLangState.lang !== 'zh') return;
+        if (OvlState.compiling) {
+            try { showToast('正在编译，请等编译结束后再编辑。', 'warning'); } catch (e) {}
+            return;
+        }
+        if (OvlState.ovlSyncBusy) {
+            try { showToast('正在与 Overleaf 同步，请等同步结束后再编辑。', 'warning'); } catch (e) {}
+            return;
+        }
+
+        const pane = document.getElementById('ovlVisualPane');
+        if (!pane) return;
+        const win = ovlWinOf(pane);
+        const sel = win.getSelection();
+        if (!sel || sel.rangeCount === 0 || sel.isCollapsed) return;
+        const range = sel.getRangeAt(0);
+        if (!pane.contains(range.commonAncestorContainer)) return;
+        const rawSelText = String(sel);
+        if (!rawSelText.trim()) return;
+
+        const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+        if (!blocks.length) return;
+        let si = -1, ei = -1;
+        for (let i = 0; i < blocks.length; i++) {
+            if (range.intersectsNode(blocks[i])) { if (si === -1) si = i; ei = i; }
+        }
+        if (si === -1) return;
+        const touched = Array.from(blocks).slice(si, ei + 1);
+
+        let lineFrom = Infinity, lineTo = -Infinity;
+        touched.forEach(function (b) {
+            const a = parseInt(b.getAttribute('data-src-line'), 10);
+            const z = parseInt(b.getAttribute('data-src-line-end'), 10);
+            if (isFinite(a)) lineFrom = Math.min(lineFrom, a);
+            if (isFinite(z)) lineTo = Math.max(lineTo, z); else if (isFinite(a)) lineTo = Math.max(lineTo, a);
+        });
+        if (!isFinite(lineFrom) || !isFinite(lineTo)) return;
+        if (lineTo < lineFrom) lineTo = lineFrom;
+
+        const codeTa = document.getElementById('ovlCodeArea');
+        if (!codeTa || codeTa.disabled) {
+            try { showToast('编辑器未就绪，无法编辑。', 'warning'); } catch (e) {}
+            return;
+        }
+        const chars = ovlGutterLineRangeToChars(codeTa, lineFrom, lineTo);
+        const enText = codeTa.value.slice(chars.start, chars.end);
+
+        let cfg;
+        try { cfg = getApiConfig(); } catch (e) { cfg = null; }
+        const zhText = cfg ? ovlVisualTransCacheGet(enText, cfg) : null;
+        if (zhText == null) {
+            try { showToast('这一块还没有翻译结果，请等翻译完成后再编辑。', 'warning'); } catch (e) {}
+            return;
+        }
+
+        const parent = touched[0].parentNode;
+        if (!parent) return;
+
+        const wrap = document.createElement('div');
+        wrap.className = 'ovl-inline-src-wrap';
+        const ta = document.createElement('textarea');
+        ta.className = 'ovl-inline-src';
+        ta.spellcheck = false;
+        ta.value = zhText;
+        const hint = document.createElement('div');
+        hint.className = 'ovl-inline-src-hint';
+        hint.textContent = 'Ctrl+Enter 回译并保存 · Esc 取消';
+        wrap.appendChild(ta);
+        wrap.appendChild(hint);
+
+        const firstParaStart = touched[0].getAttribute('data-para-start');
+        touched.forEach(function (b) { b.style.display = 'none'; });
+        parent.insertBefore(wrap, touched[0]);
+
+        OvlInlineSrcEdit = {
+            wrap: wrap, ta: ta, blocks: touched, parent: parent,
+            lineFrom: lineFrom, lineTo: lineTo, firstParaStart: firstParaStart,
+            origText: zhText, closing: false,
+            mode: 'zh', origEnText: enText, cfg: cfg
+        };
+
+        ta.addEventListener('input', ovlInlineSrcOnInput);
+        ta.addEventListener('keydown', ovlInlineSrcOnKeydown);
+        ta.addEventListener('blur', ovlInlineSrcOnBlur);
+
+        ovlInlineSrcAutoGrow(ta);
+        ta.focus();
+        ta.setSelectionRange(zhText.length, zhText.length);
+
+        if (typeof ovlHideQuickActions === 'function') ovlHideQuickActions();
+    } catch (e) {
+        console.error('[ovl] inlineZhEditOpen failed', e);
+        try { showToast('打开就地编辑失败：' + (e && e.message ? e.message : String(e)), 'error'); } catch (e2) {}
+    }
+}
+
 function ovlShowQuickActionsAt(x, y, source) {
     // v2 Pass P33：就地编辑源码进行中时，工具条（含「替/简/语/译/关注/复制」六颗按钮）
     // 整体不弹出——不跟就地编辑器抢焦点/抢屏幕空间，用户要用那六颗就先保存/取消当前编辑。
@@ -34690,6 +35023,12 @@ function ovlShowQuickActionsAt(x, y, source) {
         if (zhLocked) b.setAttribute('data-tip', ZH_LOCK_TIP);
         else b.setAttribute('data-tip', qid === 'word.replace' ? '替换' : (qid === 'word.simplify' ? '简化' : '语法修正'));
     });
+    // v2 Pass P63（H6）：「编辑」按钮的 tooltip 在中文预览模式下换一句话，如实说明这次
+    // 编辑的是译文、保存会回译覆盖英文原文——不能沿用旧文案让用户以为编辑的是源码。
+    const editBtn = qa.querySelector('[data-qa="word.edit"]');
+    if (editBtn) {
+        editBtn.setAttribute('data-tip', zhLocked ? '编辑中文译文（保存后回译覆盖英文原文）' : '编辑选中片段的源码');
+    }
     // v2 Pass P8（§1.6 第 8 条 + §3.9）：定点刷新「关注」复选框的勾选态。不能指望
     // focusSyncCheckboxes 的唯一调用点（syncSelectionHighlightLayers 内部）一定会跑到——
     // 那个函数开头有两条提前 return，在 v2 外壳里经常一次都不经过；这里每次弹出工具条都
@@ -34773,7 +35112,15 @@ function ovlBindQuickActions() {
         } else if (id === 'word.edit') {
             // v2 Pass P33：不再弹浮框——Visual 来源就地把选中的 .ovl-visual-block 换成
             // <textarea>，见 ovlInlineSrcEditOpen 函数头注释（约 30546 行附近）。
-            ovlInlineSrcEditOpen(src);
+            // v2 Pass P63（H6）：Visual 中文预览模式下同一颗「编辑」按钮改走
+            // ovlInlineZhEditOpen()——编辑对象换成这个块当前显示的中文译文，保存时先回译
+            // 成英文再校验/预览确认才落盘，不是 ovlInlineSrcEditOpen 那条直接编辑英文源码
+            // 的路（那条在 zh 模式下点开会文不对题：屏幕显示中文，编辑框却是英文源码）。
+            if (src === 'visual' && OvlVisualLangState.lang === 'zh') {
+                ovlInlineZhEditOpen();
+            } else {
+                ovlInlineSrcEditOpen(src);
+            }
         } else {
             ovlRunCmd(id);
         }
@@ -35520,6 +35867,16 @@ let OvlVisTransSeq = 0;
 let OvlVisTransAbort = null;
 const OvlVisTransCache = new Map(); // key=归一化文本 -> 译文，LRU 上限 50
 let OvlVisTransDebounceTimer = null;
+// v2 Pass P63（H5）：这个浮框译文当前对应哪一段真实源码——popup 本身是纯展示（选区一变
+// 就可能整个换掉），要支持"编辑译文 -> 回译写回原文"就必须在请求发出的那一刻把"写回去
+// 该落在源码哪里"记下来，不能等用户点「编辑」时才回头找（那时选区可能已经变了/没了）。
+// null = 这次没法编辑（比如 Visual 中文预览模式下选中的已经是译文本身，不是"待翻译的
+// 英文"，写回语义不成立，应改走 ovlInlineZhEditOpen）。
+//   kind:'code'     { start, end, rawText }                —— Code 模式，字符级精确定位。
+//   kind:'vis-block'{ lineFrom, lineTo }                    —— Visual 英文模式，块级定位
+//                                                               （跟 ovlInlineSrcEditOpen
+//                                                               同一把尺子，不做文本匹配）。
+let OvlVisTransOrigin = null;
 
 function ovlVisTransCacheGet(key) {
     if (!OvlVisTransCache.has(key)) return undefined;
@@ -35571,6 +35928,7 @@ function ovlVisTransHide() {
     try { if (OvlVisTransAbort) OvlVisTransAbort.abort(); } catch (e) {}
     OvlVisTransAbort = null;
     ++OvlVisTransSeq; // 让任何还在飞的响应变成陈旧响应，回来时一个字节都不会写
+    OvlVisTransOrigin = null; // 框关了，写回目标一并作废——防止过期 origin 被下一次编辑误用
     const box = document.getElementById('ovlVisTransBox');
     if (box) { box.classList.remove('ovl-open'); box.hidden = true; }
 }
@@ -35629,8 +35987,170 @@ async function ovlVisTransRequest(text, selRows, promptKind) {
     }
 }
 
+// ==================== v2 Pass P63（H5）：选中即译浮框——译文可编辑 + 回译写回原文 ====================
+// 入口：把 #ovlVisTransBody 从只读展示换成 <textarea> + 「回译并保存」「取消」两颗小按钮。
+// OvlVisTransOrigin 为 null（比如 Visual 中文预览模式下选中的本来就是译文本身，没有
+// "待翻译的英文"可回译到）就拒绝进入编辑态，toast 提示改走中文预览模式下的就地编辑。
+function ovlVisTransEditStart() {
+    try {
+        const origin = OvlVisTransOrigin;
+        if (!origin) {
+            try { showToast('这段译文暂不支持编辑回译，请改用中文预览模式下选中文字直接编辑。', 'warning'); } catch (e) {}
+            return;
+        }
+        if (OvlInlineSrcEdit) {
+            try { showToast('已经有一处在就地编辑，请先保存或取消。', 'warning'); } catch (e) {}
+            return;
+        }
+        const box = document.getElementById('ovlVisTransBox');
+        const body = document.getElementById('ovlVisTransBody');
+        if (!box || !body) return;
+        const zhText = body.textContent || '';
+        if (!zhText.trim()) return;
+        body.innerHTML = '';
+        const ta = document.createElement('textarea');
+        ta.className = 'ovl-vistrans-edit-ta';
+        ta.value = zhText;
+        ta.spellcheck = false;
+        body.appendChild(ta);
+        const actions = document.createElement('div');
+        actions.className = 'ovl-vistrans-edit-actions';
+        const saveBtn = document.createElement('button');
+        saveBtn.type = 'button'; saveBtn.className = 'ovl-vistrans-edit-save'; saveBtn.textContent = '回译并保存';
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button'; cancelBtn.className = 'ovl-vistrans-edit-cancel'; cancelBtn.textContent = '取消';
+        actions.appendChild(saveBtn); actions.appendChild(cancelBtn);
+        body.appendChild(actions);
+        ta.focus();
+        try { ta.setSelectionRange(zhText.length, zhText.length); } catch (e) {}
+        saveBtn.addEventListener('click', function () { ovlVisTransEditSave(ta, origin, zhText); });
+        cancelBtn.addEventListener('click', function () { ovlVisTransEditCancel(zhText); });
+    } catch (e) { console.error('[ovl] visTransEditStart failed', e); }
+}
+
+// 编辑框里退回展示态——不管是用户点了「取消」还是保存流程中途失败/被拒绝，回到原来那份
+// 译文原样展示，不留一个空 textarea 卡在那。
+function ovlVisTransEditCancel(origZh) {
+    try {
+        const body = document.getElementById('ovlVisTransBody');
+        if (body) body.innerHTML = renderFormattedText(origZh);
+    } catch (e) { console.error('[ovl] visTransEditCancel failed', e); }
+}
+
+// 保存：空操作闸（一个字没改就退回展示，不回译不写源码）-> ovlBacktranslateZhToEn 回译
+// （失败直接 toast + 退回展示，源码零改动）-> ovlConfirmDialog 预览确认（取消同样零改动）
+// -> 按 origin 精确写回：Code 来源是字符区间，Visual 英文来源是 data-src-line 块区间，
+// 两条都不做任何文本匹配。
+async function ovlVisTransEditSave(ta, origin, origZh) {
+    const newZh = ta.value;
+    if (newZh === origZh) { ovlVisTransEditCancel(origZh); return; }
+    ta.disabled = true;
+    let newEn = null;
+    try {
+        const base = getApiConfig();
+        const cfg = ovlVisTransConfig(base);
+        newEn = await ovlBacktranslateZhToEn(newZh, cfg, null);
+    } catch (e) {
+        console.error('[ovl] visTransEditSave backtranslate failed', e);
+        try { showToast('回译失败：' + (e && e.message ? e.message : String(e)) + '，原文未改动。', 'error'); } catch (e2) {}
+        ovlVisTransEditCancel(origZh);
+        return;
+    }
+    const origEn = (origin.kind === 'code') ? origin.rawText : ovlVisTransOriginEnText(origin);
+    if (origEn == null) {
+        try { showToast('原文位置已失效（可能已被别处修改），请重新选中后再试。', 'warning'); } catch (e) {}
+        ovlVisTransEditCancel(origZh);
+        return;
+    }
+    let confirmed = false;
+    await new Promise(function (resolve) {
+        try {
+            const html = ovlDiffPreviewHtml(origEn, newEn);
+            ovlConfirmDialog({
+                title: '确认用回译结果覆盖原文？',
+                html: html,
+                confirmLabel: '确认覆盖',
+                onConfirm: function () { confirmed = true; resolve(); },
+                onCancel: function () { confirmed = false; resolve(); }
+            });
+        } catch (e) { console.error('[ovl] visTransEditSave confirm dialog failed', e); confirmed = false; resolve(); }
+    });
+    if (!confirmed) {
+        try { showToast('已取消，原文未改动。', 'info'); } catch (e) {}
+        ovlVisTransEditCancel(origZh);
+        return;
+    }
+
+    try {
+        const ta2 = document.getElementById('ovlCodeArea');
+        if (!ta2 || ta2.disabled) throw new Error('编辑器未就绪');
+        let start, end;
+        if (origin.kind === 'code') {
+            start = origin.start; end = origin.end;
+        } else {
+            const chars = ovlGutterLineRangeToChars(ta2, origin.lineFrom, origin.lineTo);
+            start = chars.start; end = chars.end;
+        }
+        const wasHidden = ta2.style.display === 'none';
+        if (wasHidden) ta2.style.display = '';
+        ta2.focus();
+        ta2.setSelectionRange(start, end);
+        document.execCommand('insertText', false, newEn);
+        if (wasHidden) ta2.style.display = 'none';
+        if (typeof focusNoteTexChanged === 'function') { try { focusNoteTexChanged(); } catch (e) {} }
+        if (origin.kind === 'vis-block' && typeof ovlVisualRender === 'function') ovlVisualRender();
+        try { showToast('已回译并写回原文。', 'success'); } catch (e) {}
+    } catch (e) {
+        console.error('[ovl] visTransEditSave splice failed', e);
+        try { showToast('写回失败：' + (e && e.message ? e.message : String(e)), 'error'); } catch (e2) {}
+    } finally {
+        ovlVisTransHide();
+    }
+}
+
+// Visual 英文来源的 origin 只记了行区间，没记文本本身——写回前重新从 #ovlCodeArea 现取
+// 一遍当前内容（跟 ovlVisualBlockSrcText 同一条纪律：不缓存文本，永远拿最新的），这样
+// 预览对照里的"原文"和真正要被替换掉的字节保证是同一份，不会因为中途源码被别处改过
+// 而对不上。取不到（行号越界，比如源码在编辑过程中被大改）就返回 null，调用方据此拒绝。
+function ovlVisTransOriginEnText(origin) {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta) return null;
+        const chars = ovlGutterLineRangeToChars(ta, origin.lineFrom, origin.lineTo);
+        return ta.value.slice(chars.start, chars.end);
+    } catch (e) { return null; }
+}
+
 // force=true：来自「译」按钮点击（无视 visualTranslate==='off'/'button' 的门槛和长度下限，
 // 用户主动点了就该有反应）。force=false：来自 mouseup/selectionchange 的自动触发。
+// v2 Pass P63（H5）：给 ovlVisTransFromSelection 用的写回定位——跟 ovlInlineSrcEditOpen
+// 的 Visual 分支同一套算法（触及块 -> 合并 data-src-line 行区间），只是这里不马上开编辑器，
+// 只记下"将来如果用户点了浮框里的「编辑」，该往源码哪里写"。中文预览模式（渲染的是译文
+// 本身）算不出有意义的"待翻译原文"位置，直接返回 null——那种场景请走 ovlInlineZhEditOpen。
+function ovlVisTransComputeVisOrigin(pane, range) {
+    try {
+        if (OvlVisualLangState.lang === 'zh') return null;
+        const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+        if (!blocks.length) return null;
+        let si = -1, ei = -1;
+        for (let i = 0; i < blocks.length; i++) {
+            if (range.intersectsNode(blocks[i])) { if (si === -1) si = i; ei = i; }
+        }
+        if (si === -1) return null;
+        const touched = Array.from(blocks).slice(si, ei + 1);
+        let lineFrom = Infinity, lineTo = -Infinity;
+        touched.forEach(function (b) {
+            const a = parseInt(b.getAttribute('data-src-line'), 10);
+            const z = parseInt(b.getAttribute('data-src-line-end'), 10);
+            if (isFinite(a)) lineFrom = Math.min(lineFrom, a);
+            if (isFinite(z)) lineTo = Math.max(lineTo, z); else if (isFinite(a)) lineTo = Math.max(lineTo, a);
+        });
+        if (!isFinite(lineFrom) || !isFinite(lineTo)) return null;
+        if (lineTo < lineFrom) lineTo = lineFrom;
+        return { kind: 'vis-block', lineFrom: lineFrom, lineTo: lineTo };
+    } catch (e) { return null; }
+}
+
 function ovlVisTransFromSelection(force) {
     try {
         const pane = document.getElementById('ovlVisualPane');
@@ -35659,6 +36179,9 @@ function ovlVisTransFromSelection(force) {
         // 这块空当也算成"被选区占用"，浪费掉本可以放浮层的位置（规格 §1 第一条）。
         const selRows = ovlSelectionRowRectsViewport(range);
         if (!selRows.length) { if (!force) ovlVisTransHide(); return; }
+        // v2 Pass P63（H5）：先于请求把写回目标记下来——请求可能是缓存同步命中（下一刻
+        // selRows/range 早就用不上了），必须在这一刻的选区还有效时就算好。
+        OvlVisTransOrigin = ovlVisTransComputeVisOrigin(pane, range);
         ovlVisTransRequest(text, selRows, 'vis');
     } catch (e) { console.error('[ovl] visTransFromSelection failed', e); }
 }
@@ -35712,6 +36235,9 @@ function ovlCodeTransFromSelection() {
         const text = ovlCodeTransText(ta);
         if (!text) return;
         if (!ovlTransLengthOk(text)) return;
+        // v2 Pass P63（H5）：Code 来源有精确字符位置，直接记住这个区间——写回时用它做
+        // execCommand('insertText') 的目标区间，不做任何文本匹配。
+        OvlVisTransOrigin = { kind: 'code', start: ta.selectionStart, end: ta.selectionEnd, rawText: ta.value.slice(ta.selectionStart, ta.selectionEnd) };
         ovlVisTransRequest(text, [ovlCodeSelectionScreenRect(ta)], 'tex');
     } catch (e) { console.error('[ovl] codeTransFromSelection failed', e); }
 }
@@ -35742,6 +36268,7 @@ function ovlBindVisualTranslate() {
     const box = document.getElementById('ovlVisTransBox');
     if (box) box.addEventListener('click', function (e) {
         if (e.target.closest('#ovlVisTransCloseBtn')) { ovlVisTransHide(); return; }
+        if (e.target.closest('#ovlVisTransEditBtn')) { ovlVisTransEditStart(); return; }
         if (e.target.closest('#ovlVisTransCopyBtn')) {
             const body = document.getElementById('ovlVisTransBody');
             const text = body ? body.textContent : '';
