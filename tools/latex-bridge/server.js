@@ -1579,6 +1579,19 @@ function computeOverleafCloneTargetDir(projectId, parentDir, folderName) {
         if (!path.isAbsolute(parentDir)) {
             return { ok: false, error: '存放位置必须是绝对路径: ' + parentDir };
         }
+        // v2 Pass P80 W2（server-endpoints confirmed med）：folderName 来自前端"存放位置"弹窗
+        // 里用户手填的自由文本框（AI-Translator.html 里 folderInput.value.trim()），原来这里
+        // 没有任何 basename/".." 校验——对照 /overleaf/rename-project 对 newName 的双重校验
+        // （ovlValidateRenameName + 路由层再查一遍，注释明确写着是为了防止端点被当成"移动到
+        // 任意地方"的后门），clone 这条同样会真实 mkdir+git clone 写盘的路径原来完全没有同款
+        // 防护。这里复用同一份 ovlValidateRenameName，folderName 必须是不含路径分隔符/".."的
+        // 纯目录名，跟 rename-project 对齐。doOverleafCheckTarget 是纯只读预检（不落盘，函数
+        // 注释已明确说明），不在本次改动范围——真正的写操作只有这里（被 doOverleafClone 调用），
+        // 校验在这个唯一收口点做，checkTarget 预检结果的准确性留给后续 Pass 再补，不影响本次
+        // 修复要堵的安全缺口（拒绝后 doOverleafClone 会把 ok:false/error 原样透传给前端，前端
+        // 已有的 `if (!data || !data.ok)` 分支会正常展示"克隆失败：..."提示，不需要额外改前端）。
+        const nameErr = ovlValidateRenameName(folderName);
+        if (nameErr) return { ok: false, error: '存放文件夹名: ' + nameErr };
         return { ok: true, targetDir: path.join(path.resolve(parentDir), folderName) };
     }
     return { ok: true, targetDir: path.join(cloneRoot, projectId) };
@@ -1798,7 +1811,11 @@ function resolveInProject(projectDir, relPath) {
 // 下面全部文件（跳过 .git），供 move/delete 的响应用，方便前端在执行前后展示确切影响面。
 function collectAffectedRelPaths(base, absPath) {
     let st;
-    try { st = fs.statSync(absPath); } catch (e) { return []; }
+    // v2 Pass P80 W2（server-endpoints confirmed high）：顶层和递归展开都改用 fs.lstatSync（不
+    // 跟随符号链接/junction），跟下面 walk() 里的判断保持一致——原来这里用 fs.statSync 会跟随
+    // 顶层 absPath 本身是符号链接的情况。
+    try { st = fs.lstatSync(absPath); } catch (e) { return []; }
+    if (st.isSymbolicLink()) return [];
     if (!st.isDirectory()) return [path.relative(base, absPath)];
     const out = [];
     (function walk(dir) {
@@ -1808,7 +1825,17 @@ function collectAffectedRelPaths(base, absPath) {
             if (name === '.git') return;
             const full = path.join(dir, name);
             let s;
-            try { s = fs.statSync(full); } catch (e) { return; }
+            try { s = fs.lstatSync(full); } catch (e) { return; }
+            // v2 Pass P80 W2（server-endpoints confirmed high）：这里原来用 fs.statSync（会跟随
+            // 符号链接/NTFS junction），doFsRestore 拿 collectAffectedRelPaths 的结果当"待删除
+            // 候选"用 fs.rmSync 物理删除——项目目录内如果存在一个指向外部的 junction/symlink
+            // （Windows 上 mklink /J 或 npm 在 node_modules 下建的 junction 都不需要管理员权限），
+            // 联接目标里的每个文件都会被这里的递归展开成"检查点之后新建、快照里没有"，恢复时
+            // 物理删除的其实是联接目标里的真实外部文件（已用隔离的临时目录 + PowerShell
+            // New-Item -ItemType Junction 实测复现：fs.lstatSync(junction路径).isSymbolicLink()
+            // === true，改用 lstat 后直接跳过、不展开、联接本身也不纳入候选，doFsRestore 就不会
+            // 再碰它，也不会碰它指向的任何东西）。
+            if (s.isSymbolicLink()) return;
             if (s.isDirectory()) walk(full); else out.push(path.relative(base, full));
         });
     })(absPath);

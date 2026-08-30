@@ -18018,6 +18018,15 @@ function chatBindShell(rootEl) {
             // 维持原状（关闭聊天窗）。
             if (ChatState.pendingConfirms && ChatState.pendingConfirms.length) {
                 e.preventDefault();
+                // v2 Pass P80 W2（zh-pipeline-chat confirmed low）：stopPropagation 只挡这次按键
+                // 继续冒泡到祖先节点，挡不住同一个 document 上另一个独立注册的监听器（比如
+                // ovlConfirmDialog 每次打开时挂的 onKey）——如果这时页面上还开着一个
+                // ovlConfirmDialog（比如删除文件夹确认），这次 Escape 会把两者一起取消，用户
+                // 只想关掉其中一个。这里改用 stopImmediatePropagation：这个处理器在页面初始化
+                // 时就早早注册（chatBindShell），比任何后开的 ovlConfirmDialog 的 onKey 都先
+                // 注册、按 DOM 规范也先执行，调用它能确实拦下同一次事件分发里排在后面的兄弟
+                // 监听器，不只是挡冒泡。
+                e.stopImmediatePropagation();
                 e.stopPropagation();
                 const entry = ChatState.pendingConfirms[ChatState.pendingConfirms.length - 1];
                 try { entry.cancel('按 Esc 取消'); } catch (err2) {}
@@ -24850,6 +24859,17 @@ function ovlSetEditorMode(mode) {
             // 没有对应的统一收口点，这里单独补一次。
             if (typeof ovlScheduleMarkOverlay === 'function') setTimeout(ovlScheduleMarkOverlay, 70);
         }
+        // v2 Pass P80 W2（find-mark confirmed high）：查找态（尤其 usingZh/zhMatches）是照着
+        // 切模式前那个模式的渲染文字算出来的，跨模式切换后完全失效——不重算的话，Enter/
+        // "查找下一个"（含"替换"内部的兜底转发）会用陈旧的 zh 命中态落进 ovlMarkRangeZhVisual
+        // →ovlMarkCenterVisual，读到陈旧的 Visual 几何缓存（OvlVisualBlockRects 没随模式切换
+        // 清空/更新），把 Code/Visual 共用的 #ovlGutter.scrollTop 硬砸成 0——真实代码停在原处，
+        // 行号列瞬间跳顶，直到用户下次手动滚动才重新同步。只在查找栏开着时才有必要重算；
+        // 没开是死状态，下次 ovlFindOpen 自己会调 ovlFindRecompute，不用现在管。
+        const ovlFindPanelEl = document.getElementById('ovlEditorPanel');
+        if (ovlFindPanelEl && ovlFindPanelEl.getAttribute('data-find') === 'open' && typeof ovlFindRecompute === 'function') {
+            ovlFindRecompute(false);
+        }
     } catch (e) {
         console.error('[ovl] setEditorMode failed', e);
     }
@@ -25907,9 +25927,14 @@ function ovlVisualTransCacheKey(text, config) {
 // 命中返回译文字符串，未命中返回 null。命中会顺手把 ts 刷新成"最近使用"，配合淘汰策略。
 // 只有 ts 距上次刷新超过 60s 才真的重写 localStorage（避免同一屏内反复渲染同一块时，每次
 // 命中都要整桶 JSON.stringify 一次，纯粹为了刷新时间戳这么小的收益不值这个成本）。
-function ovlVisualTransCacheGet(text, config) {
+// v2 Pass P80 W2（zh-pipeline-chat confirmed med）：projectIdOverride 是可选的第 3/4 个参数——
+// ovlVisualLangRunQueue 在批次开始时固定住 cfg 的同时也应该固定住 projectId，落盘时传进来用；
+// 不传就退化成原来的"现读 #ovlProjectPathInput"（兼容其它零散调用点，比如整篇翻译路径），
+// 不改变它们的既有行为。根因：懒翻译请求跨越一次真实网络往返，期间用户完全可能切换项目——
+// 落地时如果现读 projectId，译文会被写进切换后的新项目缓存桶，而不是它实际所属的旧项目桶。
+function ovlVisualTransCacheGet(text, config, projectIdOverride) {
     try {
-        const projectId = ovlVisualTransCacheProjectId();
+        const projectId = projectIdOverride || ovlVisualTransCacheProjectId();
         const key = ovlVisualTransCacheKey(text, config);
         const map = ovlVisualTransCacheBucketLoad(projectId);
         const hit = map[key];
@@ -25925,15 +25950,15 @@ function ovlVisualTransCacheGet(text, config) {
         const legacy = ovlVisualTransCacheLegacyLoad();
         const legacyHit = legacy[key];
         if (legacyHit && typeof legacyHit.tgt === 'string') {
-            ovlVisualTransCachePut(text, config, legacyHit.tgt);
+            ovlVisualTransCachePut(text, config, legacyHit.tgt, projectId);
             return legacyHit.tgt;
         }
     } catch (e) {}
     return null;
 }
-function ovlVisualTransCachePut(text, config, tgt) {
+function ovlVisualTransCachePut(text, config, tgt, projectIdOverride) {
     try {
-        const projectId = ovlVisualTransCacheProjectId();
+        const projectId = projectIdOverride || ovlVisualTransCacheProjectId();
         const key = ovlVisualTransCacheKey(text, config);
         const map = ovlVisualTransCacheBucketLoad(projectId);
         map[key] = { tgt: tgt, ts: Date.now() };
@@ -26511,6 +26536,14 @@ async function ovlVisualLangRunQueue() {
     OvlVisualLangState.controller = controller;
     let cfg;
     try { cfg = getApiConfig(); } catch (e) { cfg = null; }
+    // v2 Pass P80 W2（zh-pipeline-chat confirmed med）：跟 cfg 一样在批次开始时固定住——懒翻译
+    // 请求跨一次真实网络往返，期间用户完全可能切换项目（项目历史/重新打开文件夹，这些入口都
+    // 不会让 seq 失配，见 ovlVisualTransCachePut 头部注释）。不固定的话，落地时 ovlVisualTransCachePut
+    // 内部会现读 #ovlProjectPathInput，把译文写进切换后的新项目缓存桶，而不是它实际所属的
+    // 旧项目桶：旧项目下次打开该段落缓存未命中被迫重翻，新项目桶里则多出一条永远命中不到的
+    // 死数据、挤占它自己的淘汰预算。
+    let fixedProjectId;
+    try { fixedProjectId = ovlVisualTransCacheProjectId(); } catch (e) { fixedProjectId = null; }
 
     async function worker() {
         for (;;) {
@@ -26526,8 +26559,23 @@ async function ovlVisualLangRunQueue() {
             try {
                 const tgt = await ovlVisualTranslateBlockText(text, cfg, controller.signal);
                 if (mySeq !== OvlVisualLangState.seq) return; // 陈旧响应（已切走/已取消），丢弃不落地
-                try { ovlVisualTransCachePut(text, cfg, tgt); } catch (e) {}
-                if (document.body.contains(el)) el.innerHTML = ovlVisualRenderChunk(tgt);
+                try { ovlVisualTransCachePut(text, cfg, tgt, fixedProjectId); } catch (e) {}
+                if (document.body.contains(el)) {
+                    el.innerHTML = ovlVisualRenderChunk(tgt);
+                    // v2 Pass P80 W2（zh-pipeline-chat confirmed high）：innerHTML 原地替换后该
+                    // 块（及其后所有块）的真实几何已经变了（中英文断行差异很常见），但 gutter
+                    // 每行缓存的 style.top/height、OvlVisualBlockRects、已经画出的标记覆盖层框
+                    // 全部还停在换块前的旧坐标——全文只有切模式（触发完整 ovlVisualRender）才会
+                    // 被动纠正，scroll/resize 都不会。期间 ovlVisualScrollToLine/
+                    // ovlMarkCenterVisual 这类直接读缓存值定位跳转的调用会给出错误结果，标记
+                    // 覆盖层也会画在换块前的旧几何上。这里补一次真实重画，跟整篇重渲染路径
+                    // （ovlVisualRender 末尾）保持一致；editorMode 仍是 visual 时才有意义做——
+                    // 离开 Visual 模式时 ovlVisualLangCancelInFlight 已经让上面的 mySeq 守卫先
+                    // 短路，这里的判断只是双保险。
+                    if (typeof ovlRenderVisualGutter === 'function' && OvlState.editorMode === 'visual') {
+                        ovlRenderVisualGutter();
+                    }
+                }
                 OvlVisualLangState.done++;
             } catch (err) {
                 if (err && err.name === 'AbortError') return;
@@ -27481,6 +27529,14 @@ function ovlMarkCenterCode(lineFrom, lineTo) {
 // ovlVisualScrollToLine 31270 行附近同一份数据源，那个函数是"对齐顶部"，这里改成居中）。
 function ovlMarkCenterVisual(lineFrom, lineTo) {
     try {
+        // v2 Pass P80 W2（find-mark confirmed high，双保险第二层）：这个函数只对 Visual 模式的
+        // 几何缓存（OvlVisualBlockRects + gutter 的绝对定位 cell）有意义；调用方本该在切模式时
+        // 就清空/重算查找态（见 ovlSetEditorMode 里新补的 ovlFindRecompute 调用），但陈旧调用
+        // 路径（如 ovlMarkRangeZhVisual 兜底分支）原来完全没有模式判断——陈旧的 zh 命中态跨
+        // 模式残留时会带着 Code 模式普通文档流的 gutter cell 走到这里，parseFloat 退化成 0，
+        // 把 Code/Visual 共用的 gutter.scrollTop 硬砸成 0。这里补一道独立的模式早退守卫，跟
+        // 上游的重算是双保险，任一失效另一道兜底。
+        if (OvlState.editorMode !== 'visual') return;
         const pane = document.getElementById('ovlVisualPane');
         const gutter = document.getElementById('ovlGutter');
         if (!pane || !gutter || !OvlVisualBlockRects.length) return;
@@ -28488,6 +28544,40 @@ class OvlRemoteDirHandle {
     }
 }
 
+// v2 Pass P80 W2（viewmodes-synctex confirmed high）：打开/切换到新项目文件夹的几条入口
+// （ovlPickFolder 的 FSA 分支、远程选择器 okBtn、webkit 降级 dirInput change）原来都只重建
+// 文件树 DOM（ovlRenderTree），从不清 PDF 面板/编译产物/当前打开文件这些状态——切到新项目
+// 后 PDF 面板、编译日志、下载按钮仍呈现上一个项目的编译产物，编辑器区仍打开着旧项目的文件，
+// 用户若误以为已经在编辑新项目继续敲字，自动保存会静默写回旧项目目录下的那个文件。收口成
+// 一个函数，在真正切换项目文件夹的入口处统一调用一次。只清 finding 明确点名的这几项
+// （pdfObjectUrl/pdfSourceMode/pdfDirectFile/lastCompile/currentFile），不动 mainDocFile 等
+// 未被指出的字段，避免超出本次确认范围引入新行为变化。
+function ovlResetProjectScopedState() {
+    try {
+        if (typeof ovlAutoSaveTimer !== 'undefined' && ovlAutoSaveTimer) { clearTimeout(ovlAutoSaveTimer); ovlAutoSaveTimer = null; }
+        OvlState.currentFile = null;
+        OvlState.dirty = false;
+        const ta = document.getElementById('ovlCodeArea');
+        if (ta) { ta.value = ''; ta.disabled = true; }
+        if (OvlState.pdfObjectUrl) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} }
+        OvlState.pdfObjectUrl = null;
+        OvlState.pdfSourceMode = 'compiled';
+        OvlState.pdfDirectFile = null;
+        OvlState.lastCompile = null;
+        const pdfPanel = document.getElementById('ovlPdfPanel');
+        if (pdfPanel) pdfPanel.setAttribute('data-pdfsrc', 'compiled');
+        if (typeof ovlUpdateTabUI === 'function') ovlUpdateTabUI();
+        if (typeof ovlRenderGutter === 'function') ovlRenderGutter(true);
+        if (typeof ovlBuildOutline === 'function') ovlBuildOutline();
+        if (typeof ovlUpdatePdfToolbarUI === 'function') ovlUpdatePdfToolbarUI();
+        if (typeof ovlRenderPdfBody === 'function') ovlRenderPdfBody();
+        if (typeof ovlRenderLogCounts === 'function') ovlRenderLogCounts();
+        if (typeof ovlRenderLogList === 'function') ovlRenderLogList();
+        if (typeof ovlRenderLogRaw === 'function') ovlRenderLogRaw();
+        if (typeof ovlRenderLogOtherFiles === 'function') ovlRenderLogOtherFiles();
+    } catch (e) { console.error('[ovl] resetProjectScopedState failed', e); }
+}
+
 async function ovlPickFolder() {
     if (ovlIsRemoteBridge()) { await ovlRemotePickFolder(); return; }
     try {
@@ -28506,6 +28596,7 @@ async function ovlPickFolder() {
             }
             OvlState.usingWebkitFallback = false;
             OvlState.dirHandle = handle;
+            ovlResetProjectScopedState();
             ovlAutoFillProjectPath(handle);
             await ovlRenderTree(handle);
             ovlUpdateTreeToolbtnsVisibility();
@@ -28692,6 +28783,7 @@ function ovlRemotePickFolder() {
                 ovlSetProjectPath(p, { skipWatch: true });
                 OvlState.usingWebkitFallback = false;
                 OvlState.dirHandle = new OvlRemoteDirHandle('.', ovlProjectHistoryBasename(p) || p);
+                ovlResetProjectScopedState();
                 ovlUpdateTreeToolbtnsVisibility();
                 Promise.resolve(ovlRenderTree(OvlState.dirHandle)).then(function () {
                     try { ovlBridgeUpdateWatch(); } catch (e3) {}
@@ -31172,6 +31264,12 @@ async function ovlDoRecompile(opts) {
         try {
             const pdfResp = await ovlBridgeFetch(ovlBridgeUrl('/output/' + data.id + '/output.pdf'));
             const buf = await pdfResp.arrayBuffer();
+            // v2 Pass P80 W2（viewmodes-synctex confirmed high）：这两次 await（POST /compile +
+            // 这次 GET output.pdf）之间用户完全可能点开文件树里的另一个 PDF——ovlOpenPdfDirect
+            // 会新建一份 blob URL 赋给 OvlState.pdfObjectUrl。下面这行原来是裸赋值，没有配套
+            // revoke（对照本函数开头 31146 行、ovlOpenPdfDirect 里都是先 revoke 再赋值），会把
+            // 那份 direct 模式的 blob URL 引用直接丢掉、永不 revoke，是真实的 objectURL 泄漏。
+            if (OvlState.pdfObjectUrl) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} }
             OvlState.pdfObjectUrl = URL.createObjectURL(new Blob([buf], { type: 'application/pdf' }));
             // 页数优先信桥从 .log 里挖出来的 "Output written on ... (N pages, ...)"（真数字）；
             // 桥没给（比如老版本桥/draft 单趟没走到这一行）才退化到明文对象扫描——
@@ -31195,6 +31293,15 @@ async function ovlDoRecompile(opts) {
         ovlSetPdfStatus('编译失败：' + reason, true);
     }
 
+    // v2 Pass P80 W2（viewmodes-synctex confirmed high）：函数开头（31149 行附近）设过一次
+    // pdfSourceMode='compiled'，但如果两次 await 期间用户点了文件树里的 PDF，ovlOpenPdfDirect
+    // 会把它悄悄改回 'direct'，函数结束前从未纠正——"编译永远是权威动作"这条设计意图（同一处
+    // 注释）在这条竞态窗口下被破坏，View Logs/SyncTeX 按钮会被 ovlUpdatePdfToolbarUI 的
+    // isDirect 判断误锁在禁用态，即便这次真的编译出了带 synctex 的 PDF。这里在函数末尾统一
+    // 纠正回来，跟开头呼应，不管中途是否发生过这条竞态。
+    OvlState.pdfSourceMode = 'compiled';
+    OvlState.pdfDirectFile = null;
+    { const ovlP80PdfPanel = document.getElementById('ovlPdfPanel'); if (ovlP80PdfPanel) ovlP80PdfPanel.setAttribute('data-pdfsrc', 'compiled'); }
     ovlUpdatePdfToolbarUI();
     ovlRenderPdfBody();
     ovlRenderLogCounts();
@@ -35018,6 +35125,7 @@ function ovlBindShell() {
                 const files = e.target.files;
                 if (!files || !files.length) return;
                 OvlState.dirHandle = null;
+                ovlResetProjectScopedState();
                 const tree = ovlBuildTreeFromFileList(files);
                 const body = document.getElementById('ovlTreeBody');
                 if (body) {
@@ -35133,6 +35241,14 @@ function ovlApplySettings() {
         // 否则接下来所有换算（查找/标记高亮框、AI 聊天跳转、反向 SyncTeX、outline 跳转……）
         // 还在用旧字号量出来的行高，表现为"高亮框纹丝不动、真实文字整体下移"。
         ovlInvalidateCodeLineH();
+        // v2 Pass P80 W2（find-mark confirmed med）：字号/字体/行高变了之后，正在跑的分片行
+        // 偏移测量任务（ovlRecomputeLineOffsetsChunked，27808 行附近）只在函数开头取样一次
+        // mirror/rowLineH，循环体每片只比对 token 和 ta.value，完全不检测字号/字体是否变化——
+        // 不让它的 token 失效的话，它跑完会用旧字号量出来的数据在这次同步重算之后覆盖回去，
+        // 重新引出 P74 那个"高亮框纹丝不动、真实文字整体下移"的症状。这里让 token 自增，旧
+        // 分片任务下一次 step() 就会发现自己过期、自行放弃（不写脏数据），不需要它感知具体
+        // 是谁改了设置。
+        OvlLineOffsetChunkToken++;
         if (ta) {
             // v2 Polish 2（Bug 2）：软换行不再是设置面板里的一个"开了会错位"的选项——现在
             // white-space:pre-wrap 是 .ovl-code-area 的固定 CSS（1249 行），gutter/三处跳转
