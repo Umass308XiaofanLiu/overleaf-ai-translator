@@ -2130,6 +2130,9 @@ body.ovl-translator-open #ovlTransWin { display: block; }
     color: #1f2937;
 }
 .ovl-findbar input[type="text"].ovl-find-bad { border-color: #ef4444; background: #fef2f2; }
+/* v2 Pass P71：中文显示模式下"替换"输入框置灰——替换只对英文源码生效，中文渲染文字没有
+   对应的源码字符区间，见 ovlFindUpdateReplaceUI。 */
+.ovl-findbar input[type="text"]:disabled { background: #f1f5f9; color: #94a3b8; cursor: not-allowed; }
 .ovl-findtoggle {
     display: inline-flex;
     align-items: center;
@@ -2164,6 +2167,9 @@ body.ovl-translator-open #ovlTransWin { display: block; }
     white-space: nowrap;
 }
 .ovl-findbtn:hover { background: #f1f5f9; }
+/* v2 Pass P71：中文显示模式下"替换"/"替换全部"按钮置灰，见 ovlFindUpdateReplaceUI。 */
+.ovl-findbtn:disabled { color: #94a3b8; cursor: not-allowed; background: #f8fafc; }
+.ovl-findbtn:disabled:hover { background: #f8fafc; }
 .ovl-findclose {
     width: 22px;
     height: 22px;
@@ -3892,7 +3898,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
 const APP_VERSION = '02.02.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-08-28';   // APP_BUILD_DATE_STAMP
+const APP_BUILD_DATE = '2026-08-30';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -24643,6 +24649,9 @@ function ovlSetEditorMode(mode) {
         if (fromMode === 'code' && mode === 'visual') syncLine = ovlCodeTopVisibleLine();
         else if (fromMode === 'visual' && mode === 'code') syncLine = ovlVisualTopVisibleLine();
         OvlState.editorMode = mode;
+        // v2 Pass P71：Code/Visual 切换同样会让"是否处于中文显示模式"这个判据翻转（该判据要求
+        // editorMode==='visual' 且语言为 zh），查找栏"替换"置灰状态要跟着立刻同步。
+        if (typeof ovlFindUpdateReplaceUI === 'function') ovlFindUpdateReplaceUI();
         const ta = document.getElementById('ovlCodeArea');
         const gutter = document.getElementById('ovlGutter');
         const visual = document.getElementById('ovlVisualPane');
@@ -26449,6 +26458,8 @@ function ovlVisualLangSetMode(lang) {
     OvlVisualLangState.total = 0;
     OvlVisualLangState.done = 0;
     ovlVisualLangUpdateMenuUI();
+    // v2 Pass P71：原文/中文切换即时同步查找栏"替换"置灰状态，不等用户重开查找面板。
+    if (typeof ovlFindUpdateReplaceUI === 'function') ovlFindUpdateReplaceUI();
     if (typeof ovlVisualRender === 'function') ovlVisualRender();
 }
 
@@ -30359,9 +30370,43 @@ function ovlFindClose() {
     } catch (e) { console.error('[ovl] findClose failed', e); }
 }
 
+// v2 Pass P71：判断当前是否处于「Visual 中文显示模式」——跟 ovlFindRecompute 里 zhActive 的
+// 判据完全一致（渲染文字是中文，源码 #ovlCodeArea/ta.value 永远是英文，两者不是同一坐标系）。
+// Replace/Replace All 只能对源码字符区间生效，这个模式下必须整体拒绝——原来的行为是
+// OvlFindState.matches 留空、ovlReplaceCurrent 判定"当前项不存在"后转去调 ovlFindNext()，
+// 界面上看起来像是"点了替换，跳到了下一个"，不替换、不报错、不提示，用户根本发现不了自己
+// 点的是"替换"。同一类"静默降级"，跟 P68 的高亮兜底问题师出同源。
+function ovlIsZhVisualMode() {
+    return OvlState.editorMode === 'visual' && typeof OvlVisualLangState !== 'undefined' && OvlVisualLangState.lang === 'zh';
+}
+const OVL_REPLACE_ZH_TIP = '中文显示模式下不能替换(替换作用于英文源码);切回原文模式后可用';
+// 替换输入框 + 两个替换按钮的置灰状态——ovlSetEditorMode（切 Code/Visual）、
+// ovlVisualLangSetMode（切原文/中文）末尾各调一次，两处任一变了都要立刻同步，不等用户
+// 重开查找面板。data-tip 复用现有 [data-tip] 纯 CSS 悬浮提示（跟 ovlOverleafUpdateButtonsUI
+// 里拉取/推送按钮的 disabled+data-tip 套路一致），启用态直接摘掉属性，不留空提示气泡。
+function ovlFindUpdateReplaceUI() {
+    try {
+        const zh = ovlIsZhVisualMode();
+        const els = [
+            document.getElementById('ovlReplaceInput'),
+            document.getElementById('ovlReplaceBtn'),
+            document.getElementById('ovlReplaceAllBtn')
+        ];
+        els.forEach(function (el) {
+            if (!el) return;
+            el.disabled = zh;
+            if (zh) el.setAttribute('data-tip', OVL_REPLACE_ZH_TIP);
+            else el.removeAttribute('data-tip');
+        });
+    } catch (e) { console.error('[ovl] findUpdateReplaceUI failed', e); }
+}
+
 // 替换走 insertText（保住撤销栈），一次只处理"当前项"。
 function ovlReplaceCurrent() {
     try {
+        // v2 Pass P71：按钮/输入框已经 disabled，这里是给快捷键（Enter）/未来其它触发路径的
+        // 兜底闸门——不许再静默转发到 ovlFindNext()。
+        if (ovlIsZhVisualMode()) { showToast(OVL_REPLACE_ZH_TIP, 'info'); return; }
         const ta = document.getElementById('ovlCodeArea');
         const replaceInput = document.getElementById('ovlReplaceInput');
         if (!ta || ta.disabled || !replaceInput) return;
@@ -30391,6 +30436,10 @@ function ovlReplaceCurrent() {
 // （§4.0 M8a 明文要求：4132 行的 main.tex 上不许循环几千次）。代价是占撤销栈一格，这是对的。
 function ovlReplaceAll() {
     try {
+        // v2 Pass P71：同 ovlReplaceCurrent 的兜底闸门——中文模式下查询词是中文，直接拿去
+        // 匹配英文源码 ta.value 必然 0 命中，原来会静默走到"newText === text"分支什么都不做，
+        // 同样必须显式提示而不是悄悄失败。
+        if (ovlIsZhVisualMode()) { showToast(OVL_REPLACE_ZH_TIP, 'info'); return; }
         const ta = document.getElementById('ovlCodeArea');
         const input = document.getElementById('ovlFindInput');
         const replaceInput = document.getElementById('ovlReplaceInput');
@@ -30466,6 +30515,9 @@ function ovlBindFindBar() {
         if (replaceBtn) replaceBtn.addEventListener('click', ovlReplaceCurrent);
         const replaceAllBtn = document.getElementById('ovlReplaceAllBtn');
         if (replaceAllBtn) replaceAllBtn.addEventListener('click', ovlReplaceAll);
+        // v2 Pass P71：绑定时按当前 editorMode/语言状态初始化一次置灰态（正常情况下页面刚
+        // 加载都是 code/original，摘不掉任何东西，纯防御——万一以后默认状态改了不会漏同步）。
+        if (typeof ovlFindUpdateReplaceUI === 'function') ovlFindUpdateReplaceUI();
     } catch (e) {
         console.error('[ovl] bindFindBar failed', e);
     }
