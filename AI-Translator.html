@@ -1839,6 +1839,12 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    display/visibility，靠上面两条 transition 平滑过渡，不是突然消失。淡出动画播完之后
    ovlClearMarkOverlay() 才真的清空 DOM，见该函数调用点。 */
 #ovlVisualMarkOverlay.ovl-mark-fadeout, #ovlCodeMarkOverlay.ovl-mark-fadeout { opacity: 0; }
+/* v2 Pass P73：正向 SyncTeX 近似高亮框容器，挂在单页 .ovl-pdf-page（position:relative）内部，
+   跟 #ovlVisualMarkOverlay 同一套颜色变量/class（.ovl-mark-box）、同一套淡出约定，独立开一个
+   容器只是因为它挂在"某一页"上而不是整个 PDF 面板。 */
+.ovl-pdf-sync-overlay { position: absolute; inset: 0; pointer-events: none; z-index: 5;
+    opacity: 1; transition: opacity 0.6s ease; }
+.ovl-pdf-sync-overlay.ovl-mark-fadeout { opacity: 0; }
 .ovl-visual-raw { white-space: pre-wrap; word-break: break-word; font: 12px/1.5 "SFMono-Regular", Consolas, monospace; color: #374151; }
 .ovl-visual-bar {
     background: #eef1f5; color: #475569; font-size: 12px; padding: 6px 10px;
@@ -23308,7 +23314,7 @@ function ovlShellHtml() {
         // （§2.6.10）。没有编译产物时禁用。v2 Pass P16 起反向（PDF -> 源码）也做出来了——
         // 换了 pdf.js 渲染器之后双击 PDF 画布上的文字就能跳回源码那一行，见 ovlPdfHandleDblClick，
         // 不需要在这里再放一个按钮（Overleaf 本身也是靠双击，不是按钮触发反向）。
-        +         '<button type="button" class="ovl-cmdbtn" id="ovlSyncTexBtn" disabled data-tip="Go to PDF location（SyncTeX 正向，只做到页级定位；反向双击 PDF 里的文字即可）" data-tip-pos="bottom-end">&#8677;</button>'
+        +         '<button type="button" class="ovl-cmdbtn" id="ovlSyncTexBtn" disabled data-tip="在 PDF 中定位（SyncTeX 正向，只做到页级定位；反向双击 PDF 里的文字即可）" data-tip-pos="bottom-end">&#8677;</button>'
         +         '<button type="button" class="ovl-cmdbtn" id="ovlFindBtn" data-cmd="edit.find" data-tip="查找/替换（Ctrl+F）" data-tip-pos="bottom-end">' + Icons.SearchIcon + '</button>'
         // v2 Pass P72：Overleaf 式单栏一键互切胶囊按钮。默认 CSS 隐藏，只在 editor-only
         // 模式下露出（见 #ovlBody[data-view="editor"] #ovlSwitchToPdfBtn 那条属性选择器）。
@@ -32991,8 +32997,16 @@ async function ovlSyncTexForward() {
         });
         const data = await resp.json();
         if (!data || !data.ok) { ovlFlashSaveStatus('SyncTeX 定位失败：' + (data && data.error ? data.error : '未知错误'), true); return; }
-        if (OvlState.viewMode === 'editor') ovlSetViewMode('split');
+        // v2 Pass P73：单栏优先——从 editor-only 正向跳转直接进 pdf-only，不途经 split（跟 B4
+        // 引入的"专注单栏工作流"同一设计哲学）；split 模式下不做任何视图切换（两边本来就都看得见）。
+        if (OvlState.viewMode === 'editor') ovlSetViewMode('pdf');
         ovlPdfSetPage(data.page);
+        if (data.x != null && data.y != null && typeof ovlPdfPaintSyncHighlight === 'function') {
+            // 页面列表建好前 ovlPdfSetPage 会记住目标页自己补滚，但画高亮框需要 entry.viewport
+            // 已就绪——留一点延时兜底不确定的时序（正向跳转发生时通常已有一份编译好的 PDF 在
+            // 正常显示，不是刚编译完那一下子，页面列表大概率已建好）。
+            setTimeout(function () { ovlPdfPaintSyncHighlight(data.page, data.x, data.y); }, 250);
+        }
         // v2 Pass P48：翻页之外顺手用 P37 的 ovlMarkLines 把左栏对应的源码行黄色高亮一次，
         // 跟反向 SyncTeX（双击 PDF 跳回源码那一行会高亮）的体验对称。ovlMarkLines 要 0-based
         // 行号，line 是上面 ovlSyncTexCurrentLine() 换算出来的 1-based，这里减回去。
@@ -34728,6 +34742,39 @@ function ovlPdfApplyView() {
     }
 }
 
+// v2 Pass P73：正向 SyncTeX 近似高亮框（B5 变更 2，可选 nice-to-have）。doSyncTexForward 已经
+// 返回 x/y/h/v（server.js 头部注释确认 x/y 跟 doSyncTexEdit 是同一约定：左上角原点、单位
+// point）——这里只用 (x,y) 当锚点，画一个固定近似尺寸（约一行文字）的框，不拿未经验证语义的
+// h/v 直接当宽高用（诚实声明：h/v 的真实含义——是包围盒宽高还是别的量，比如 TeX 内部 node 的
+// depth/height——没有实测确认过，稳妥起见不采用）。跟反向双击的 convertToPdfPoint 互为逆运算：
+// convertToViewportPoint 把 PDF 原生坐标换回渲染视口 CSS 像素。
+let ovlPdfSyncHighlightFadeTimer = null;
+function ovlPdfPaintSyncHighlight(pageNum, xPt, yPt) {
+    try {
+        const entry = OvlState.pdfPageMap && OvlState.pdfPageMap.get(pageNum);
+        if (!entry || !entry.viewport || !entry.pdfPage) return; // 页面还没渲染出来，安静跳过，不是错误
+        const pageHeightPt = entry.pdfPage.view[3] - entry.pdfPage.view[1]; // page.view = [x0,y0,x1,y1]
+        const pdfX = xPt, pdfY = pageHeightPt - yPt; // 左上角原点 -> 左下角原点（PDF 原生），跟反向那步互为逆运算
+        const pt = entry.viewport.convertToViewportPoint(pdfX, pdfY);
+        const scale = entry.viewport.scale || 1;
+        const boxWPt = 160, boxHPt = 14; // 固定近似值，见上面注释
+        let overlay = entry.container.querySelector('.ovl-pdf-sync-overlay');
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.className = 'ovl-pdf-sync-overlay';
+            entry.container.appendChild(overlay);
+        }
+        overlay.innerHTML = '<div class="ovl-mark-box" style="left:' + pt[0] + 'px;top:'
+            + (pt[1] - boxHPt * scale) + 'px;width:' + (boxWPt * scale) + 'px;height:'
+            + (boxHPt * scale) + 'px;"></div>';
+        overlay.classList.remove('ovl-mark-fadeout');
+        clearTimeout(ovlPdfSyncHighlightFadeTimer);
+        ovlPdfSyncHighlightFadeTimer = window.setTimeout(function () {
+            overlay.classList.add('ovl-mark-fadeout');
+        }, 60000); // 跟 ovlMarkScheduleFadeOut 同一约定：约 60 秒自动淡出
+    } catch (e) { console.error('[ovl] pdf sync highlight failed', e); }
+}
+
 // canvas 双击 -> 反向 SyncTeX（M11，见 tools/latex-bridge/server.js 的 doSyncTexEdit）。
 // 坐标换算：viewport.convertToPdfPoint(cssX, cssY) 把"渲染视口里的 CSS 像素坐标"换算回
 // PDF 原生坐标系（左下角原点，向上为正，单位 = point，不受渲染 scale/旋转影响——pdf.js 内部
@@ -34776,15 +34823,33 @@ async function ovlPdfHandleDblClick(ev, container) {
         });
         const data = await resp.json();
         if (!data || !data.ok) { ovlFlashSaveStatus('反向 SyncTeX 定位失败：' + (data && data.error ? data.error : '未知错误'), true); return; }
-        // M3 阶段桥只认单文件项目（跟 ovlLogJumpToLine 头部注释同一条边界）：跳转只对"当前
-        // 编辑器里已经打开的这个文件"生效，返回的文件名对不上就诚实告知、不假装跳对了。
+        // v2 Pass P73：basename→路径感知比对。原来只比 basename，两个子目录下同名文件（比如
+        // sections/intro.tex 和 appendix/intro.tex）会被误判成"同一个文件"。改成拼绝对路径
+        // 比较（跟 chatAgentSameAsCurrentFile/chatAgentAbsPath 同一套"拼绝对路径 +
+        // toLowerCase() 大小写不敏感比较"模式，Windows 文件系统语义），算不出绝对路径时
+        // （比如 webkitdirectory 只读降级模式下 currentFile 没有 relPath，或项目路径输入框
+        // 是空的）退回原来的 basename 比较，不让"算不出绝对路径"变成一律拒绝。
+        const projectDir = (document.getElementById('ovlProjectPathInput') || {}).value || '';
+        const curRel = OvlState.currentFile && OvlState.currentFile.relPath;
+        const curAbs = (curRel && typeof ovlBridgeAbsPathFor === 'function') ? ovlBridgeAbsPathFor(curRel) : null;
+        const gotAbs = data.file || '';
+        const gotBase = gotAbs ? gotAbs.split(/[\\/]/).pop() : '';
+        // 2026-08-30 本机实测发现的真实边界情况（规格没预料到）：\input 相对路径引入的子文件，
+        // synctex 记录的 Input 路径里会带一个字面的 "/./"（比如
+        // ".../sections/./intro.tex"），主文档（用绝对路径传给 latexmk 编译时）没有这个问题——
+        // 只有 \input{相对路径} 引入的子文件才会出现。不消掉这段会导致本来该匹配的同一个
+        // 文件被误判成"不是同一个"，比原来的 basename 比较更差。统一压掉 "/./" 段再比较。
+        const normPathForCompare = function (p) { return String(p).replace(/[\\/]+/g, '/').replace(/\/\.\//g, '/').toLowerCase(); };
+        const pathMatches = curAbs && gotAbs && normPathForCompare(curAbs) === normPathForCompare(gotAbs);
         const curName = OvlState.currentFile && OvlState.currentFile.name;
-        const gotBase = data.file ? data.file.split(/[\\/]/).pop() : '';
-        if (!curName || gotBase !== curName) {
+        const fallbackMatches = !curAbs && curName && gotBase === curName;
+        if (!pathMatches && !fallbackMatches) {
             ovlFlashSaveStatus('该位置对应「' + (gotBase || '未知文件') + '」，跟当前打开的文件不是同一个，暂不支持自动跨文件跳转（已知限制）', true);
             return;
         }
-        if (OvlState.viewMode === 'pdf') ovlSetViewMode('split'); // 编辑器面板得先可见，跳过去才看得见
+        // v2 Pass P73：单栏优先——从 pdf-only 反向跳转直接进 editor-only，不途经 split（跟正向
+        // 那处同一设计哲学）；split 模式下不做任何视图切换。
+        if (OvlState.viewMode === 'pdf') ovlSetViewMode('editor'); // 编辑器面板得先可见，跳过去才看得见
         const lineIdx = Math.max(0, data.line - 1);
         // v2 Pass P37：反向 SyncTeX 跳转原来只对齐顶部、也没有任何高亮，用户反馈"点了看不出
         // 跳到哪句话"——统一改用 ovlMarkLines（G3 基础设施）：自动判断 Code/Visual、居中、
