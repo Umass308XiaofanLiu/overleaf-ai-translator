@@ -1450,6 +1450,28 @@ body.ovl-shell-active #ovlShell { display: flex; }
 .ovl-body[data-view="pdf"] { grid-template-columns: 40px 188px 1fr; }
 .ovl-body[data-view="pdf"][data-tree="collapsed"] { grid-template-columns: 40px 0px 1fr; }
 .ovl-body[data-view="pdf"] #ovlEditorPanel { display: none; }
+/* v2 Pass P72：Overleaf 式单栏一键互切胶囊按钮（overleaf_reference.md §1/§6-1：editor-only
+   顶栏右侧「Switch to PDF」胶囊、pdf-only 对称位置「‹› Switch to editor」胶囊，split 视图下
+   两者都不出现——回 split 只能走 View 菜单，没有独立一键按钮，跟参考稿一致不额外造）。默认
+   隐藏，只在对应单栏模式下用属性选择器打开，颜色/圆角沿用本文件既有配色（#495365 边框、
+   #2F3A4C 悬停底色、#E7E9EE 文字，跟工具条其余按钮同一套变量，不新引入品牌色）。 */
+.ovl-switch-pane-btn {
+    border: 1px solid #495365;
+    border-radius: 14px;
+    padding: 4px 12px;
+}
+.ovl-switch-pane-btn:hover:not(:disabled) { background: #2F3A4C; border-color: #6b7690; }
+/* 默认隐藏必须用 id 选择器（而不是 .ovl-switch-pane-btn 这个类选择器本身）——这两个按钮
+   同时也各自套着 .ovl-cmdbtn / .ovl-pdf-iconbtn 基础样式，其中 .ovl-cmdbtn 在本文件更靠后
+   的位置显式设了 display:inline-flex；类选择器同特异度时按"源码顺序更靠后的赢"，会盖掉这里
+   写在前面的 display:none。改用 id 选择器把特异度提高一截，不依赖谁写在文件里更靠后。 */
+#ovlSwitchToPdfBtn, #ovlSwitchToEditorBtn { display: none; }
+.ovl-body[data-view="editor"] #ovlSwitchToPdfBtn { display: inline-flex; }
+.ovl-body[data-view="pdf"] #ovlSwitchToEditorBtn { display: inline-flex; }
+/* v2 Pass P72：直显源 PDF（文件树直接点 .pdf，未经编译）模式下才出现的占位按钮，编译模式下
+   永远隐藏——见 ovlOpenPdfDirect / #ovlPdfPanel[data-pdfsrc] 那一组 JS 改动。 */
+.ovl-pdf-direct-only { display: none; }
+#ovlPdfPanel[data-pdfsrc="direct"] .ovl-pdf-direct-only { display: inline-flex; }
 /* v2 Polish：拖拽分栏手柄。editor-only/pdf-only 模式下没有两栏可分，默认 display:none，
    只有 split 视图（§4.0 同一纪律：属性选择器控显隐，不整段重画）才 display:flex 出来。
    拖拽状态用独立的 body[data-ovl-splitdrag] 标志，跟翻译器/聊天窗共用的 data-aichat-drag
@@ -23131,6 +23153,11 @@ const OvlState = {
     ovlSyncBusy: false,
     lastCompile: null,       // 桥 POST /compile 的完整返回：{ok,id,exitCode,pdfExists,pdfSize,log,parsed,counts,files,...}
     pdfObjectUrl: null,      // 当前 <canvas> 渲染用的 blob: URL，换下一版前必须先 URL.revokeObjectURL
+    // v2 Pass P72：直显源 PDF（不是编译产物）时的标记。'compiled'=正常编译链路（默认）；
+    // 'direct'=用户在文件树里点了一个 .pdf 直接打开，pdfObjectUrl 是这份文件的原始字节，
+    // 没有 synctex 数据、没有 lastCompile。
+    pdfSourceMode: 'compiled',
+    pdfDirectFile: null,     // 直显模式下对应的文件树条目 {name, relPath}，供状态提示用；非直显模式下恒 null
     logView: false,
     logFilter: 'all',        // 'all' | 'error' | 'warning' | 'info'
     // ---- v2 Pass D：M4 翻页/缩放；v2 Pass P16 起渲染器从 iframe+PDF Open Parameters 换成
@@ -23283,6 +23310,10 @@ function ovlShellHtml() {
         // 不需要在这里再放一个按钮（Overleaf 本身也是靠双击，不是按钮触发反向）。
         +         '<button type="button" class="ovl-cmdbtn" id="ovlSyncTexBtn" disabled data-tip="Go to PDF location（SyncTeX 正向，只做到页级定位；反向双击 PDF 里的文字即可）" data-tip-pos="bottom-end">&#8677;</button>'
         +         '<button type="button" class="ovl-cmdbtn" id="ovlFindBtn" data-cmd="edit.find" data-tip="查找/替换（Ctrl+F）" data-tip-pos="bottom-end">' + Icons.SearchIcon + '</button>'
+        // v2 Pass P72：Overleaf 式单栏一键互切胶囊按钮。默认 CSS 隐藏，只在 editor-only
+        // 模式下露出（见 #ovlBody[data-view="editor"] #ovlSwitchToPdfBtn 那条属性选择器）。
+        +         '<button type="button" class="ovl-cmdbtn ovl-switch-pane-btn" id="ovlSwitchToPdfBtn"'
+        +           ' data-tip="切换到 PDF（单栏）" data-tip-pos="bottom-end">切换到 PDF</button>'
         +       '</div>'
         +     '</div>'
         // 查找/替换面板（§2.6.4，M8a）：默认隐藏（.ovl-editor-panel 没有 data-find 属性），
@@ -23328,8 +23359,12 @@ function ovlShellHtml() {
         // 照 §3.6.3/§3.6.8 一带同一纪律：CSS 属性选择器控显隐，不整段重画）。
         // 契约见 docs/v2_overleaf_latex_plan.md §3.1：成功 = PDF 存在，不是退出码；
         // 桥离线时这一块必须显式告知怎么启动，不许静默失败。
-        +   '<div class="ovl-pdf-panel" id="ovlPdfPanel" data-logview="closed">'
+        +   '<div class="ovl-pdf-panel" id="ovlPdfPanel" data-logview="closed" data-pdfsrc="compiled">'
         +     '<div class="ovl-pdf-toolbar">'
+        // v2 Pass P72：Overleaf 式单栏一键互切胶囊按钮。默认 CSS 隐藏，只在 pdf-only
+        // 模式下露出（见 #ovlBody[data-view="pdf"] #ovlSwitchToEditorBtn 那条属性选择器）。
+        +       '<button type="button" class="ovl-pdf-iconbtn ovl-switch-pane-btn" id="ovlSwitchToEditorBtn"'
+        +         ' data-tip="切换到编辑器（单栏）" data-tip-pos="bottom">&#8592; 编辑器</button>'
         // M4/§2.6.6：Recompile 是个 split button——左半点了直接编译，右半 ▾ 开编译选项菜单。
         +       '<div class="ovl-recompile-split">'
         +         '<button type="button" class="ovl-recompile-btn ovl-recompile-btn-main" id="ovlRecompileBtn" disabled data-tip="桥接服务未启动，见 tools/latex-bridge/README.md" data-tip-pos="bottom">Recompile</button>'
@@ -23340,6 +23375,10 @@ function ovlShellHtml() {
         +       '<span class="ovl-toolbar-spacer"></span>'
         +       '<button type="button" class="ovl-pdf-iconbtn" id="ovlViewLogsBtn" disabled data-tip="View logs" data-tip-pos="bottom">' + Icons.ScrollIcon + '</button>'
         +       '<button type="button" class="ovl-pdf-iconbtn" id="ovlDownloadPdfBtn" disabled data-tip="Download PDF" data-tip-pos="bottom">&#11015;</button>'
+        // v2 Pass P72：直显源 PDF 模式下的占位按钮——只建 DOM 挂点 + 空回调（弹 toast 提示
+        // 「即将上线」），真实转换逻辑是 P74 的范围，这里不实现。编译模式下永远隐藏。
+        +       '<button type="button" class="ovl-pdf-iconbtn ovl-pdf-direct-only" id="ovlConvertToLatexBtn"'
+        +         ' data-tip="将这份 PDF 转换为 LaTeX 源码（尚未实现）" data-tip-pos="bottom">转换为 LaTeX</button>'
         +       '<button type="button" class="ovl-pdf-iconbtn" id="ovlInvertBtn" disabled data-tip="Invert PDF preview colors" data-tip-pos="bottom">&#9680;</button>'
         +       '<span class="ovl-pdf-sep"></span>'
         +       '<button type="button" class="ovl-pdf-iconbtn" id="ovlPdfPrevPageBtn" disabled data-tip="Previous page" data-tip-pos="bottom">&#8593;</button>'
@@ -27850,7 +27889,14 @@ async function ovlBuildTreeDom(dirHandle, relPrefix) {
                 }
             });
         } else {
-            row.addEventListener('click', function () { ovlOpenFile(h, name, dirHandle, relPath); });
+            // v2 Pass P72：.pdf 分流到直显（不编译，直接喂给 pdf.js 查看器），其余扩展名走
+            // 原来的文本编辑器打开路径。改之前这里对 .pdf 也无脑走 ovlOpenFile()，会把 PDF
+            // 二进制字节当 UTF-8 强行 .text() 解码成乱码塞进 #ovlCodeArea——是真 bug，不是
+            // 没做（见 ovlOpenFile 定义处的注释、test_p72_view_modes.js 用例 B1）。
+            row.addEventListener('click', function () {
+                if (/\.pdf$/i.test(name)) { ovlOpenPdfDirect(h, name, dirHandle, relPath); return; }
+                ovlOpenFile(h, name, dirHandle, relPath);
+            });
         }
         ul.appendChild(li);
     }
@@ -27908,6 +27954,41 @@ async function ovlOpenFile(fileHandle, name, parentHandle, relPath) {
         if (typeof ovlBridgeUpdateWatch === 'function') { try { ovlBridgeUpdateWatch(); } catch (e) {} }
     } catch (e) {
         console.error('[ovl] open file failed', e);
+    }
+}
+
+// v2 Pass P72：点文件树里的 .pdf——不编译，直接把这份文件的字节丢给同一套 pdf.js 查看器
+// （OvlState.pdfObjectUrl + ovlRenderPdfBody()/ovlPdfApplyView()，跟编译产物走的是同一条
+// 展示管线，不新建第二套查看器）。fileHandle.getFile() 对本地 FSA 句柄和 OvlRemoteFileHandle
+// 都已经是二进制安全的（后者内部走 GET /project-asset，P18 起就在给图片缩略图用，这里原样
+// 复用，不新增桥接口，不用改 server.js）。不 touch OvlState.currentFile——编辑器当前打开的
+// .tex 文件不受影响，PDF 面板另外单独跟踪 pdfDirectFile（见 spec_viewmodes.md §5 风险清单 #4/#6）。
+async function ovlOpenPdfDirect(fileHandle, name, parentHandle, relPath) {
+    try {
+        const file = await fileHandle.getFile();
+        const buf = await file.arrayBuffer();
+        if (OvlState.pdfObjectUrl) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} }
+        OvlState.pdfObjectUrl = URL.createObjectURL(new Blob([buf], { type: 'application/pdf' }));
+        OvlState.pdfSourceMode = 'direct';
+        OvlState.pdfDirectFile = { name: name, relPath: relPath || name };
+        // 不手动清 pdfDoc/pdfDocUrl：ovlPdfEnsureDocLoaded 靠比较 pdfDocUrl!==pdfObjectUrl 自己
+        // 判断要不要重新 getDocument()，并在切换时正确 destroy() 旧文档——手动清空反而会让它
+        // 找不到旧引用去 destroy，造成 pdf.js 文档泄漏。
+        OvlState.pdfView = {
+            page: 1,
+            totalPages: (typeof ovlEstimatePdfPageCount === 'function') ? ovlEstimatePdfPageCount(buf) : 1,
+            zoomMode: (typeof ovlPdfResolveDefaultZoomMode === 'function') ? ovlPdfResolveDefaultZoomMode() : 'fitwidth',
+            zoomPct: 100
+        };
+        const panel = document.getElementById('ovlPdfPanel');
+        if (panel) panel.setAttribute('data-pdfsrc', 'direct');
+        ovlSetPdfStatus('直接显示源 PDF · ' + (relPath || name) + '（未编译，无 SyncTeX 数据）', false);
+        if (OvlState.viewMode === 'editor') ovlSetViewMode('pdf'); // 编辑器单栏下 PDF 面板本来被 CSS 隐藏，得先让它露出来
+        ovlUpdatePdfToolbarUI();
+        ovlRenderPdfBody();
+    } catch (e) {
+        console.error('[ovl] open pdf direct failed', e);
+        if (typeof showToast === 'function') showToast('打开 PDF 失败：' + (e && e.message ? e.message : String(e)), 'error');
     }
 }
 
@@ -30614,6 +30695,17 @@ function ovlUpdatePdfToolbarUI() {
     const viewLogsBtn = document.getElementById('ovlViewLogsBtn');
     const dlBtn = document.getElementById('ovlDownloadPdfBtn');
     const online = OvlState.bridgeOnline === true;
+    // v2 Pass P72：直显模式下没有编译产物（lastCompile 恒为 null），View logs/SyncTeX 这类
+    // 依赖 lastCompile 的控件要禁用；翻页/缩放/反色/下载是查看器功能不是编译功能，Overleaf
+    // 里查看任意 PDF 也一样能用，照常可用。
+    // 【规格偏差，v2 Pass P72 执行时发现并按"最小侵入"改正】spec_viewmodes.md §4.4 原设计把
+    // Recompile/编译选项也按 isDirect 禁用，但同一份规格 §6 用例 B5 又要求"直显 PDF 后点回
+    // main.tex 打开，再点 #ovlRecompileBtn 触发真编译退出直显模式"——ovlDoRecompile() 是
+    // pdfSourceMode 退出 direct 的唯一路径（见 §4.6），按原设计禁用 Recompile 会造成一旦
+    // 点过一次文件树里的 .pdf、之后再也没有任何 UI 能触发真编译的死锁，跟风险清单 #1"编译
+    // 永远是权威动作"的既定哲学矛盾。改正：Recompile/编译选项按钮不再受 isDirect 影响，只按
+    // 桥在线/编译中判断（原有逻辑），isDirect 只影响真正依赖 lastCompile 数据的控件。
+    const isDirect = OvlState.pdfSourceMode === 'direct';
     if (btn) {
         btn.disabled = !online || OvlState.compiling;
         btn.textContent = OvlState.compiling ? '编译中…' : 'Recompile';
@@ -30622,20 +30714,21 @@ function ovlUpdatePdfToolbarUI() {
             : '桥接服务未启动，见 tools/latex-bridge/README.md');
     }
     if (coBtn) coBtn.disabled = !online;
-    if (stopBtn) stopBtn.disabled = !OvlState.compiling;
-    const hasPdf = !!(OvlState.lastCompile && OvlState.lastCompile.pdfExists);
-    if (viewLogsBtn) viewLogsBtn.disabled = !OvlState.lastCompile;
-    if (dlBtn) dlBtn.disabled = !hasPdf;
+    if (stopBtn) stopBtn.disabled = !OvlState.compiling; // 不变：直显模式下 compiling 天生是 false
+    const hasPdf = isDirect ? !!OvlState.pdfObjectUrl : !!(OvlState.lastCompile && OvlState.lastCompile.pdfExists);
+    if (viewLogsBtn) viewLogsBtn.disabled = !OvlState.lastCompile || isDirect;
+    if (dlBtn) dlBtn.disabled = !hasPdf; // 直显模式下 hasPdf=true，下载按钮照常可用
 
     // M4：翻页/缩放/反色只在真的有已编译 PDF 时才点得亮——没有编译产物就没有可控对象，
-    // 控件天生禁用，有了 PDF 才解禁（不做一排点不动的按钮）。
+    // 控件天生禁用，有了 PDF 才解禁（不做一排点不动的按钮）。用新 hasPdf（direct/compiled 通吃）。
     ['ovlInvertBtn', 'ovlPdfPrevPageBtn', 'ovlPdfNextPageBtn', 'ovlPdfPageInput', 'ovlPdfZoomOutBtn', 'ovlPdfZoomInBtn', 'ovlZoomMenuBtn'].forEach(function (id) {
         const el = document.getElementById(id);
         if (el) el.disabled = !hasPdf;
     });
-    // M10 SyncTeX 正向：只有真的有 output.synctex.gz 才点得亮（§2.6.10）。
+    // M10 SyncTeX 正向：只有真的有 output.synctex.gz 才点得亮（§2.6.10）。isDirect 时
+    // lastCompile 恒为 null 本来就会自动算出禁用，显式加 isDirect || 只是为了可读性/防御性。
     const syncBtn = document.getElementById('ovlSyncTexBtn');
-    if (syncBtn) syncBtn.disabled = !(OvlState.lastCompile && OvlState.lastCompile.pdfExists && OvlState.lastCompile.synctexExists);
+    if (syncBtn) syncBtn.disabled = isDirect || !(OvlState.lastCompile && OvlState.lastCompile.pdfExists && OvlState.lastCompile.synctexExists);
     ovlUpdatePdfInvertFromSettings();
 }
 
@@ -30825,6 +30918,11 @@ async function ovlDoRecompile(opts) {
 
     OvlState.compiling = true;
     if (OvlState.pdfObjectUrl) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} OvlState.pdfObjectUrl = null; }
+    // v2 Pass P72：真的走编译了，无条件退出直显模式（编译永远是权威动作，见
+    // spec_viewmodes.md §5 风险清单 #1）——不管刚才是不是在直显一份文件树点开的 PDF。
+    OvlState.pdfSourceMode = 'compiled';
+    OvlState.pdfDirectFile = null;
+    { const p = document.getElementById('ovlPdfPanel'); if (p) p.setAttribute('data-pdfsrc', 'compiled'); }
     ovlUpdatePdfToolbarUI();
     ovlRenderPdfBody();
     ovlSetPdfStatus('正在编译…', false, true);
@@ -34646,6 +34744,10 @@ function ovlPdfApplyView() {
 // canvas——全程只用这一份 entry 的数据，不碰 OvlState.pdfView.page 这种"当前页指示器"。
 async function ovlPdfHandleDblClick(ev, container) {
     try {
+        // v2 Pass P72：直显源 PDF（文件树直接点 .pdf，未经编译）没有 synctex 数据可用——
+        // 静默 no-op（连 toast 都不弹），不是"还没渲染完"/"没有 SyncTeX 数据"那类需要告知
+        // 用户的错误状态，是这个模式下天生就不支持的功能，安静跳过即可。
+        if (OvlState.pdfSourceMode === 'direct') return;
         const num = parseInt(container.getAttribute('data-page-num'), 10);
         const entry = OvlState.pdfPageMap && OvlState.pdfPageMap.get(num);
         if (!entry || !entry.viewport || !entry.pdfPage) {
@@ -37649,6 +37751,20 @@ function ovlBindPassD() {
         if (syncTexBtn) syncTexBtn.addEventListener('click', function () {
             if (syncTexBtn.disabled) return;
             ovlSyncTexForward().catch(function (e) { console.error('[ovl] syncTexForward failed', e); });
+        });
+
+        // v2 Pass P72：Overleaf 式单栏一键互切胶囊按钮——纯粹的 ovlSetViewMode() 一行调用，
+        // 不需要新状态、不改 ovlSetViewMode 本体（CSS 属性选择器已经负责两个按钮各自的显隐）。
+        const switchToPdfBtn = document.getElementById('ovlSwitchToPdfBtn');
+        if (switchToPdfBtn) switchToPdfBtn.addEventListener('click', function () { ovlSetViewMode('pdf'); });
+        const switchToEditorBtn = document.getElementById('ovlSwitchToEditorBtn');
+        if (switchToEditorBtn) switchToEditorBtn.addEventListener('click', function () { ovlSetViewMode('editor'); });
+        // v2 Pass P72：「转换为 LaTeX」占位按钮——只留 DOM 挂点 + 空回调，真实转换逻辑是
+        // 后续 Pass 的范围，这里不实现，点击弹提示。
+        const convBtn = document.getElementById('ovlConvertToLatexBtn');
+        if (convBtn) convBtn.addEventListener('click', function () {
+            if (typeof ovlPdfConvertToLatex === 'function') { ovlPdfConvertToLatex(); return; }
+            if (typeof showToast === 'function') showToast('PDF→LaTeX 转换功能即将上线', 'info');
         });
 
         const stopBtn = document.getElementById('ovlStopCompileBtn');
