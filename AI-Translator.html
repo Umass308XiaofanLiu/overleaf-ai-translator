@@ -1928,6 +1928,11 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 }
 .ovl-visual-table-head th { background: #f1f5f9; font-weight: 700; }
 .ovl-visual-table td p, .ovl-visual-table th p { margin: 0; display: inline; }
+/* P77：内层 tabular 不再打平成 "/ + <br>" 文本，渲成真正的嵌套 <table>——缩小字号 + 收窄
+   边框颜色，视觉上跟外层表格区分开，不占满单元格内边距。 */
+.ovl-visual-table-nested { font-size: 11px; margin: 0; }
+.ovl-visual-table-nested th, .ovl-visual-table-nested td { border-color: #e2e8f0; padding: 2px 5px; }
+.ovl-visual-table-nested .ovl-visual-table-head th { background: #f8fafc; }
 .ovl-visual-algo-wrap {
     margin: 10px 0; border: 1px solid #d1d5db; border-radius: 4px; padding: 10px 14px;
     background: #fafafa;
@@ -25183,22 +25188,9 @@ function ovlSplitTableCells(row) {
     cells.push(cur);
     return cells.map(c => c.trim());
 }
-// 单元格内嵌套 \begin{tabular}...\end{tabular}（诊断报告方案 (b)：不递归渲出真正的嵌套
-// <table>——那是更大的工作量，且这次修复的首要目标是"整个外层表格完全不显示"这个更严重的
-// 问题——而是把嵌套 tabular 的内容打平成一段文本：按行 <br> 分隔、按列 " / " 分隔，保留
-// "看得出内容"的效果，不假装做出了跟 Overleaf 一样的真嵌套渲染。）
-function ovlFlattenNestedTabular(nestedTex) {
-    const span = ovlFindTabularSpan(nestedTex);
-    if (!span) return ovlUnwrapSingleParagraph(ovlVisualRenderChunk(nestedTex));
-    const body = nestedTex.slice(span.bodyStart, span.bodyEnd);
-    const rows = ovlSplitTableRows(body);
-    return rows.map(function (row) {
-        const cells = ovlSplitTableCells(row).map(function (c) {
-            return ovlUnwrapSingleParagraph(ovlVisualRenderChunk(c));
-        }).filter(function (c) { return c.trim(); });
-        return cells.join(' / ');
-    }).filter(function (r) { return r; }).join('<br>');
-}
+// 单元格内嵌套 \begin{tabular}...\end{tabular}：P77 之前（诊断报告方案 (b)）打平成一段
+// "按行 <br>、按列 / " 的文本占位——P77 起递归渲出真正的嵌套 <table>，见下方
+// ovlRenderNestedTabularTable，旧的打平函数一并移除。
 // 把外层表格 body 里所有"整体自成一段"的嵌套 tabular 换成不透明占位符（先摘走再切行列，
 // 避免子表自己的 & / \\ 污染外层 ovlSplitTableRows/Cells 的深度计数——这两个函数只认花括号
 // 深度，不认识"\begin{tabular}...\end{tabular}是一整个不可再分的子环境"这件事）。
@@ -25234,39 +25226,102 @@ function ovlParseMulticolumnCell(cell) {
     if (cell.slice(closeIdx + 1).trim()) return null;
     return { span: parseInt(m[1], 10), content: cell.slice(openIdx + 1, closeIdx) };
 }
-// \multirow{n}{width}{content} —— 明确不支持真正的跨行合并（需要跨行的列位置记账，跟
-// \multicolumn 混用时尤其复杂，这次不做）：只剥掉宏壳子，把 content 当普通单元格内容显示，
-// 不生成 rowspan 属性、不删除后续行里对应的空位——效果是"看得到这段文字，但不会真的跨行
-// 合并"，比"整格显示裸 LaTeX 源码"好，但不是完整实现，见任务报告明确列出。
-function ovlStripMultirowWrapper(cell) {
-    const m = /^\s*\\multirow\s*\{[^{}]*\}\s*\{[^{}]*\}\s*\{/.exec(cell);
-    if (!m) return cell;
+// \multirow{n}{width}{content} —— P77：真正的跨行合并。宽度参数（第 2 个花括号，通常是
+// * / 具体长度）忽略不解释；只取行数 n 和内容。返回 { count, content, before, after }（before/
+// after 是宏壳子前后混排的文本，极少见但保留，跟 ovlParseMulticolumnCell 对称）；不是
+// \multirow 整格返回 null，调用方原样把 cell 当普通内容处理。n<=1（含负数——极少见的"向上
+// 跨行"写法，本预览不支持方向语义，一律当作不合并）不生成 rowspan，只当作剥壳显示。
+function ovlParseMultirowCell(cell) {
+    const m = /^\s*\\multirow\s*\{(-?\d+)\}\s*\{[^{}]*\}\s*\{/.exec(cell);
+    if (!m) return null;
     const openIdx = m.index + m[0].length - 1;
     const closeIdx = ovlFindMatchingBrace(cell, openIdx);
-    if (closeIdx === -1) return cell;
-    return cell.slice(0, m.index) + cell.slice(openIdx + 1, closeIdx) + cell.slice(closeIdx + 1);
+    if (closeIdx === -1) return null;
+    return {
+        count: parseInt(m[1], 10),
+        content: cell.slice(openIdx + 1, closeIdx),
+        before: cell.slice(0, m.index),
+        after: cell.slice(closeIdx + 1)
+    };
 }
-// 单元格渲染：先还原嵌套 tabular 占位符（如果有），再走 multicolumn/multirow 处理，最后
-// 递归喂回 ovlVisualRenderChunk 渲染剩余正文。
+// 单元格渲染：先剥 \multirow 拿到 rowspan 行数（P77），再还原嵌套 tabular 占位符（如果
+// 有，P77 起渲成真正的内层 <table>），再走 multicolumn 处理，最后递归喂回
+// ovlVisualRenderChunk 渲染剩余正文。返回 { html, colspan, rowspan }：colspan/rowspan 为 0
+// 表示"不需要该属性"（调用方只在 >1 时才输出 colspan/rowspan 属性）。
 function ovlRenderTableCell(rawCell, nestedTokens) {
-    const cell = ovlStripMultirowWrapper(rawCell);
+    let cell = rawCell;
+    let rowspan = 0;
+    const mr = ovlParseMultirowCell(cell);
+    if (mr) {
+        if (mr.count > 1) rowspan = mr.count; // n<=1（含负数）不生成真正的合并，只剥壳显示
+        cell = mr.before + mr.content + mr.after;
+    }
     const tokM = OVL_NESTED_TABULAR_TOKEN_RE.exec(cell);
     if (tokM) {
         const k = parseInt(tokM[1], 10);
-        const nestedHtml = (k >= 1 && k <= nestedTokens.length) ? ovlFlattenNestedTabular(nestedTokens[k - 1]) : '';
+        const nestedHtml = (k >= 1 && k <= nestedTokens.length) ? ovlRenderNestedTabularTable(nestedTokens[k - 1]) : '';
         const before = cell.slice(0, tokM.index).trim();
         const after = cell.slice(tokM.index + tokM[0].length).trim();
         let html = '';
         if (before) html += ovlUnwrapSingleParagraph(ovlVisualRenderChunk(before));
         html += nestedHtml;
         if (after) html += ovlUnwrapSingleParagraph(ovlVisualRenderChunk(after));
-        return { html: html, colspan: 0 };
+        return { html: html, colspan: 0, rowspan: rowspan };
     }
     const mc = ovlParseMulticolumnCell(cell);
     if (mc) {
-        return { html: mc.content.trim() ? ovlUnwrapSingleParagraph(ovlVisualRenderChunk(mc.content)) : '', colspan: mc.span };
+        return { html: mc.content.trim() ? ovlUnwrapSingleParagraph(ovlVisualRenderChunk(mc.content)) : '', colspan: mc.span, rowspan: rowspan };
     }
-    return { html: cell.trim() ? ovlUnwrapSingleParagraph(ovlVisualRenderChunk(cell)) : '', colspan: 0 };
+    return { html: cell.trim() ? ovlUnwrapSingleParagraph(ovlVisualRenderChunk(cell)) : '', colspan: 0, rowspan: rowspan };
+}
+// 表格 body（tabular/tabularx/longtable 的 \begin...\end 之间那段）渲染成一份完整 <table>
+// 的共用核心：保护内层 tabular（避免污染行/列切分）→ 按行/列切分 → 同一遍扫描里用
+// activeRowspans[列号] 记录"这一列还有几行要被上面的 \multirow 合并单元格吃掉"，命中的
+// 物理单元格（LaTeX 里该列该行照惯例留的空 & 占位）整个跳过、不产出 <td>；命中不到的正常
+// 走 ovlRenderTableCell，colspan/rowspan 一起决定下一列的起始列号。ovlRenderVisualTable
+// （外层表格）和 ovlRenderNestedTabularTable（内层表格，P77 新增）共用这份逻辑，出现三层
+// 及以上嵌套时天然递归复用，不需要额外代码。
+function ovlRenderTabularBodyAsTable(rawBody, extraClass) {
+    const protectedBody = ovlProtectNestedTabular(rawBody);
+    const rows = ovlSplitTableRows(protectedBody.text);
+    if (!rows.length) return '';
+    let html = '<table class="ovl-visual-table' + (extraClass ? ' ' + extraClass : '') + '"><tbody>';
+    const activeRowspans = {};
+    rows.forEach((row, ri) => {
+        const cells = ovlSplitTableCells(row);
+        html += '<tr' + (ri === 0 ? ' class="ovl-visual-table-head"' : '') + '>';
+        let col = 0;
+        cells.forEach(cell => {
+            if (activeRowspans[col] > 0) {
+                // 这个物理单元格是延续行按惯例留的空位（被上面某个 \multirow 合并单元格
+                // 吃掉），跳过不产出 <td>，只推进列号。
+                activeRowspans[col]--;
+                if (activeRowspans[col] <= 0) delete activeRowspans[col];
+                col++;
+                return;
+            }
+            const rendered = ovlRenderTableCell(cell, protectedBody.tokens);
+            const colspanN = rendered.colspan > 1 ? rendered.colspan : 1;
+            const colspanAttr = rendered.colspan > 1 ? ' colspan="' + rendered.colspan + '"' : '';
+            const rowspanAttr = rendered.rowspan > 1 ? ' rowspan="' + rendered.rowspan + '"' : '';
+            html += (ri === 0 ? '<th' : '<td') + colspanAttr + rowspanAttr + '>' + rendered.html + (ri === 0 ? '</th>' : '</td>');
+            if (rendered.rowspan > 1) activeRowspans[col] = rendered.rowspan - 1;
+            col += colspanN;
+        });
+        html += '</tr>';
+    });
+    html += '</tbody></table>';
+    return html;
+}
+// 内层 tabular 渲染：P77 之前打平成 "/ + <br>" 一段文本（诊断报告方案 (b)），现在递归喂回
+// ovlRenderTabularBodyAsTable 渲出真正的 <table>（class 加 ovl-visual-table-nested 缩小字号
+// 跟外层区分），找不到 tabular 环境或渲不出行时兜底退回旧的整段文本渲染。
+function ovlRenderNestedTabularTable(nestedTex) {
+    const span = ovlFindTabularSpan(nestedTex);
+    if (!span) return ovlUnwrapSingleParagraph(ovlVisualRenderChunk(nestedTex));
+    const body = nestedTex.slice(span.bodyStart, span.bodyEnd);
+    const tableHtml = ovlRenderTabularBodyAsTable(body, 'ovl-visual-table-nested');
+    return tableHtml || ovlUnwrapSingleParagraph(ovlVisualRenderChunk(nestedTex));
 }
 function ovlRenderVisualTable(tex) {
     tex = ovlStripLatexCommentsForRender(tex);
@@ -25288,22 +25343,7 @@ function ovlRenderVisualTable(tex) {
     }
     if (tabularSpan) {
         const rawBody = inner.slice(tabularSpan.bodyStart, tabularSpan.bodyEnd);
-        const protectedBody = ovlProtectNestedTabular(rawBody);
-        const rows = ovlSplitTableRows(protectedBody.text);
-        if (rows.length) {
-            html += '<table class="ovl-visual-table"><tbody>';
-            rows.forEach((row, ri) => {
-                const cells = ovlSplitTableCells(row);
-                html += '<tr' + (ri === 0 ? ' class="ovl-visual-table-head"' : '') + '>';
-                cells.forEach(cell => {
-                    const rendered = ovlRenderTableCell(cell, protectedBody.tokens);
-                    const colspanAttr = rendered.colspan > 1 ? ' colspan="' + rendered.colspan + '"' : '';
-                    html += (ri === 0 ? '<th' : '<td') + colspanAttr + '>' + rendered.html + (ri === 0 ? '</th>' : '</td>');
-                });
-                html += '</tr>';
-            });
-            html += '</tbody></table>';
-        }
+        html += ovlRenderTabularBodyAsTable(rawBody);
     } else {
         // 没找到 tabular——诚实退化：不假装解析出了表格，把清过噪声的原文当散文显示。
         html += '<div class="ovl-visual-float-fallback">' + ovlUnwrapSingleParagraph(renderFormattedText(inner)) + '</div>';
@@ -25502,10 +25542,10 @@ function ovlFigThumbExt(relPath) {
 // 打开文件所在目录*写的），P18 原本只会拼"项目根 + 原始相对路径"去请求 /project-asset，
 // 子目录场景下必 404。这里在"加载时"（不是渲染时）算出当前文件的目录 baseDir，生成
 // "相对当前文件目录"和"相对项目根"两组候选，串行试，第一个成功的用。
-// 明确不覆盖：\graphicspath{{...}} 声明的额外搜索路径——正确实现需要先读主文档导言区
-// （Visual 面板渲染的可能是被 \input 的子文件，它自己没有导言区），跟本 Pass"只补目录
-// 上下文"的收敛范围不匹配。未命中的后果是退回 P15 起就有的占位框（图标+文件名），不是
-// 新增故障、也不会显示错的图。见 .claude/tmp/p60_plan.md §2.4。
+// v2 Pass P77：补上 P60 注释（原引用 .claude/tmp/p60_plan.md §2.4）里明确说没做的
+// \graphicspath{{...}} 额外搜索路径——见下方 ovlResolveGraphicsPathDirs/
+// ovlParseGraphicsPathDirs，候选生成在 ovlFigureCandidatePaths 里追加第三组"相对
+// graphicspath 各目录"，PDF 侧编译 cwd 的既有实现不动。
 function ovlDirnameRel(relPath) {
     if (!relPath) return '';
     const norm = String(relPath).replace(/\\/g, '/');
@@ -25530,18 +25570,64 @@ function ovlJoinRelPath(dir, rel) {
     }
     return out.join('/');
 }
-// 生成本次要尝试的候选资源路径：先"相对当前文件目录"（新行为），再"相对项目根"（P18 旧
-// 行为，兜底）；baseDir 为空或 raw 已经是绝对路径时两条会重合，去重后老项目零行为变化。
-// 省略扩展名（graphicx 官方推荐写法 \includegraphics{fig}，真实论文里很常见）时依次尝试
-// pdf/png/jpg/jpeg 四种扩展名，跟 pdflatex 默认搜索顺序一致；已知但前端渲不了的扩展名
-// （.eps/.tikz 等）原样透传、不产出候选，维持占位框。
-function ovlFigureCandidatePaths(baseDir, raw) {
+// v2 Pass P77：\graphicspath{{dir1}{dir2}...} 解析。只认最基础写法——花括号里连续若干个
+// {path} 组，原样按声明顺序返回（跟 pdflatex 搜索顺序一致），不处理内部再套宏展开这种极端
+//情况；没有声明/解析不出返回空数组。
+function ovlParseGraphicsPathDirs(preambleText) {
+    const m = /\\graphicspath\s*\{((?:\s*\{[^{}]*\}\s*)+)\}/.exec(preambleText || '');
+    if (!m) return [];
+    const dirs = [];
+    const dirRe = /\{([^{}]*)\}/g;
+    let dm;
+    while ((dm = dirRe.exec(m[1]))) {
+        const d = dm[1].trim().replace(/\\/g, '/').replace(/\/+$/, '');
+        if (d) dirs.push(d);
+    }
+    return dirs;
+}
+// \graphicspath 只可能声明在真正的导言区——也就是"主文档"（OvlState.mainDocFile，用户可以
+// 通过文件树"设为主文档"显式指定，未设置兜底 main.tex）里，不在被 \input 的子文件里（P60
+// 注释原话：Visual 面板渲染的可能就是子文件本身，它自己没有导言区）。这里读一次主文档原文
+// （只读 /fs/read 端点，不写不改），解析出目录列表并按 projectDir+主文档路径缓存——跟
+// OvlFigThumbCache 同样的"Promise 先占位、终态对象覆盖"缓存写法，同一 key 并发/重复调用
+// 不重复发请求。桥离线/文件缺失/没声明 \graphicspath 统一返回空数组，调用方原样退回 P60
+// 已有的两条候选兜底，是既有降级路径，不是新增故障。
+const OvlGraphicsPathDirsCache = new Map();
+async function ovlResolveGraphicsPathDirs(projectDir) {
+    const mainFile = (typeof OvlState !== 'undefined' && OvlState && OvlState.mainDocFile) || 'main.tex';
+    const key = projectDir + '|' + mainFile;
+    const cached = OvlGraphicsPathDirsCache.get(key);
+    if (cached) return cached;
+    const p = (async function () {
+        try {
+            const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/read'), { projectDir: projectDir, path: mainFile });
+            const text = (data && data.ok === true && typeof data.content === 'string') ? data.content : '';
+            return ovlParseGraphicsPathDirs(text);
+        } catch (e) {
+            return [];
+        }
+    })();
+    OvlGraphicsPathDirsCache.set(key, p);
+    p.then(function (dirs) { OvlGraphicsPathDirsCache.set(key, dirs); });
+    return p;
+}
+// 生成本次要尝试的候选资源路径：先"相对当前文件目录"（P60），再"相对项目根"（P18 旧行为，
+// 兜底），再依次"相对 \graphicspath 声明的每个目录"（P77，extraDirs 为空数组时这组不产出
+// 任何新候选，老项目零行为变化）；baseDir 为空或 raw 已经是绝对路径时前两条会重合，去重后
+// 不重复请求。省略扩展名（graphicx 官方推荐写法 \includegraphics{fig}，真实论文里很常见）
+// 时依次尝试 pdf/png/jpg/jpeg 四种扩展名，跟 pdflatex 默认搜索顺序一致；已知但前端渲不了的
+// 扩展名（.eps/.tikz 等）原样透传、不产出候选，维持占位框。
+function ovlFigureCandidatePaths(baseDir, raw, extraDirs) {
     const norm = String(raw || '').replace(/\\/g, '/').replace(/^\.\//, '');
     if (!norm) return [];
     const bases = [];
     const b1 = ovlJoinRelPath(baseDir, norm);
     if (bases.indexOf(b1) === -1) bases.push(b1);
     if (bases.indexOf(norm) === -1) bases.push(norm);
+    (extraDirs || []).forEach(function (d) {
+        const b = ovlJoinRelPath(d, norm);
+        if (bases.indexOf(b) === -1) bases.push(b);
+    });
     const out = [];
     const KNOWN_EXTS = OVL_FIG_THUMB_RASTER_EXTS.concat(['pdf']);
     for (const base of bases) {
@@ -25553,7 +25639,7 @@ function ovlFigureCandidatePaths(baseDir, raw) {
         }
         // 已知但渲不了的扩展名（.eps/.tikz 等）——不产出候选，维持占位框
     }
-    return out.slice(0, 8); // 候选总数上限 8（2 基 × 4 扩展），超出截断
+    return out.slice(0, bases.length * 4); // 候选总数上限 = 基数 × 4 扩展，超出截断
 }
 
 async function ovlResolveOneFigureCandidate(projectDir, relPath) {
@@ -25605,8 +25691,8 @@ async function ovlResolveOneFigureCandidate(projectDir, relPath) {
     return { ok: false }; // 不认识的扩展名（.eps/.tikz 之类），P15 原始占位框就是给这种情况兜底的
 }
 
-async function ovlResolveFigureThumb(projectDir, baseDir, relPath) {
-    const candidates = ovlFigureCandidatePaths(baseDir, relPath);
+async function ovlResolveFigureThumb(projectDir, baseDir, relPath, extraDirs) {
+    const candidates = ovlFigureCandidatePaths(baseDir, relPath, extraDirs);
     for (const candidate of candidates) {
         const result = await ovlResolveOneFigureCandidate(projectDir, candidate);
         if (result && result.ok) return result;
@@ -25614,11 +25700,13 @@ async function ovlResolveFigureThumb(projectDir, baseDir, relPath) {
     return { ok: false };
 }
 
-function ovlGetFigureThumb(projectDir, baseDir, relPath) {
-    const key = projectDir + ' ' + baseDir + '|' + relPath;
+function ovlGetFigureThumb(projectDir, baseDir, relPath, extraDirs) {
+    // P77：extraDirs（\graphicspath 目录列表）参与 key——不同目录集合下同一个 relPath 可能
+    // 解析到不同文件，不能共用缓存条目。
+    const key = projectDir + ' ' + baseDir + '|' + relPath + '|' + ((extraDirs && extraDirs.length) ? extraDirs.join(',') : '');
     const cached = OvlFigThumbCache.get(key);
     if (cached) return cached; // Promise 或终态对象，直接复用，不重新发起
-    const p = ovlResolveFigureThumb(projectDir, baseDir, relPath).then(function (result) {
+    const p = ovlResolveFigureThumb(projectDir, baseDir, relPath, extraDirs).then(function (result) {
         OvlFigThumbCache.set(key, result); // 用终态对象替换 Promise：以后同 key 的调用同步命中缓存
         return result;
     });
@@ -25660,15 +25748,19 @@ function ovlVisualLoadFigureThumbnails(root) {
     const cf = (typeof OvlState !== 'undefined') && OvlState && OvlState.currentFile;
     const curRel = (cf && (cf.relPath || cf.name)) || (typeof OvlState !== 'undefined' && OvlState.mainDocFile) || '';
     const baseDir = ovlDirnameRel(curRel);
-    boxes.forEach(function (box) {
-        const relPath = box.getAttribute('data-fig-src');
-        if (!relPath) return;
-        const outcome = ovlGetFigureThumb(projectDir, baseDir, relPath);
-        if (outcome && typeof outcome.then === 'function') {
-            outcome.then(function (result) { if (box.isConnected) ovlApplyFigureThumb(box, result); });
-        } else {
-            ovlApplyFigureThumb(box, outcome);
-        }
+    // P77：\graphicspath 目录列表整篇只需读/解析一次主文档（内部有缓存，重复调用天然去重），
+    // 拿到后统一传给这一批 box，不是每个 box 各读一次主文档。
+    ovlResolveGraphicsPathDirs(projectDir).then(function (extraDirs) {
+        boxes.forEach(function (box) {
+            const relPath = box.getAttribute('data-fig-src');
+            if (!relPath) return;
+            const outcome = ovlGetFigureThumb(projectDir, baseDir, relPath, extraDirs);
+            if (outcome && typeof outcome.then === 'function') {
+                outcome.then(function (result) { if (box.isConnected) ovlApplyFigureThumb(box, result); });
+            } else {
+                ovlApplyFigureThumb(box, outcome);
+            }
+        });
     });
 }
 
