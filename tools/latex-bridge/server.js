@@ -50,7 +50,7 @@ try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化�
 // v2 Pass P45：/health 里带的能力/版本自报——见该端点注释。每次给桥新增一个"前端需要能
 // 判断有没有"的能力（新端点、既有端点的行为变化），就在 BRIDGE_CAPABILITIES 里加一个字符串，
 // 版本号也提一位。已经上线的能力不会被撤销，这个数组只做加法。
-const BRIDGE_API_VERSION = 53;
+const BRIDGE_API_VERSION = 54;
 const BRIDGE_CAPABILITIES = [
     'overleaf-clone',          // POST /overleaf/clone
     'overleaf-pull-strategy',  // POST /overleaf/pull 认识 body.strategy（abort/stash/discard）
@@ -64,8 +64,10 @@ const BRIDGE_CAPABILITIES = [
                                 // 新增 POST /overleaf/check-target 校验存放位置
     'overleaf-origin-read',    // v2 Pass P66：只读 POST /overleaf/origin，回读某目录 .git/config 里的
                                 // origin，供前端反查"这个目录到底是哪个 Overleaf 项目"，不写任何东西
-    'overleaf-project-rename'  // v2 Pass P67：POST /overleaf/rename-project，真的重命名磁盘上的项目
+    'overleaf-project-rename', // v2 Pass P67：POST /overleaf/rename-project，真的重命名磁盘上的项目
                                 // 文件夹（只能改成同级兄弟目录），供顶栏项目名双击改名用
+    'fs-restore-respects-gitignore' // v2 Pass P74 §7.2：POST /fs/restore 不再把被 .gitignore
+                                // 忽略的文件算进删除名单，响应新增 skippedIgnored/ignoreWarning 字段
 ];
 
 // v2 Pass P49：监听地址可配（LATEX_BRIDGE_HOST），默认仍是 127.0.0.1——不传就跟以前
@@ -2168,7 +2170,29 @@ async function doFsRestore(projectDir, checkpointRef, opts) {
     const currentSet = new Set(currentFiles);
 
     // 待删除候选：当前有、目标快照没有的文件。
-    const deleteCandidates = currentFiles.filter((rel) => !targetFiles.has(rel));
+    let deleteCandidates = currentFiles.filter((rel) => !targetFiles.has(rel));
+
+    // v2 Pass P74 §7.2：被 .gitignore 忽略的文件从来不会出现在任何检查点树里，旧实现会把
+    // 它们全部当成"检查点之后新建的、可以删"——node_modules/、tests/reports/、.bridge-token、
+    // 以及 PDF→LaTeX 的输出目录都会被一次回退整个删掉（今天已经在删 .bridge-token）。这里
+    // 显式把它们排除在删除名单之外。
+    let skippedIgnored = [];
+    let ignoreWarning = null;
+    const ign = await runGitCommand(['ls-files', '-o', '-i', '--exclude-standard', '-z'],
+        projectDir, null, FS_GIT_TIMEOUT_MS);
+    if (ign.ok) {
+        const list = ign.stdout.split('\0').filter((s) => s.length > 0);
+        if (list.length > 200000) {
+            ignoreWarning = '被忽略的文件超过 20 万个，未做忽略判定（按旧行为处理）。';
+        } else {
+            const ignoredSet = new Set(list);
+            skippedIgnored = deleteCandidates.filter((rel) => ignoredSet.has(rel));
+            deleteCandidates = deleteCandidates.filter((rel) => !ignoredSet.has(rel));
+        }
+    } else {
+        ignoreWarning = '无法判定哪些文件被 .gitignore 忽略（git ls-files 执行失败：'
+            + (ign.stderr || ign.stdout || '未知').slice(0, 200) + '），本次按旧行为处理。';
+    }
 
     // 安全闸门：这批候选里，有哪些其实是 HEAD 里已跟踪的文件——如果有，说明快照残缺，
     // 不是"这些文件是快照之后新建的"，整个恢复必须中止，一个文件都不许删。
@@ -2203,7 +2227,9 @@ async function doFsRestore(projectDir, checkpointRef, opts) {
             willCreate: willCreate,
             willOverwrite: willOverwrite,
             requiresForce: willDelete.length > FS_RESTORE_DELETE_CIRCUIT_BREAKER,
-            circuitBreakerThreshold: FS_RESTORE_DELETE_CIRCUIT_BREAKER
+            circuitBreakerThreshold: FS_RESTORE_DELETE_CIRCUIT_BREAKER,
+            skippedIgnored: skippedIgnored,
+            ignoreWarning: ignoreWarning
         };
     }
 
@@ -2216,7 +2242,9 @@ async function doFsRestore(projectDir, checkpointRef, opts) {
             willDelete: willDelete,
             willCreate: willCreate,
             willOverwrite: willOverwrite,
-            circuitBreakerThreshold: FS_RESTORE_DELETE_CIRCUIT_BREAKER
+            circuitBreakerThreshold: FS_RESTORE_DELETE_CIRCUIT_BREAKER,
+            skippedIgnored: skippedIgnored,
+            ignoreWarning: ignoreWarning
         };
     }
 
@@ -2249,6 +2277,8 @@ async function doFsRestore(projectDir, checkpointRef, opts) {
         restoredTo: checkpointRef,
         filesRestored: targetFiles.size,
         removedExtraFiles: removedExtraFiles,
+        skippedIgnored: skippedIgnored,
+        ignoreWarning: ignoreWarning,
         note: '已恢复到检查点当时的文件内容。已知差异：不保证复原文件权限位；恢复后残留空目录的清理是尽力而为。'
     }, checkpointFields(preCp));
 }
