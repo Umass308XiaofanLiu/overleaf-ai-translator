@@ -50,7 +50,7 @@ try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化�
 // v2 Pass P45：/health 里带的能力/版本自报——见该端点注释。每次给桥新增一个"前端需要能
 // 判断有没有"的能力（新端点、既有端点的行为变化），就在 BRIDGE_CAPABILITIES 里加一个字符串，
 // 版本号也提一位。已经上线的能力不会被撤销，这个数组只做加法。
-const BRIDGE_API_VERSION = 54;
+const BRIDGE_API_VERSION = 55;
 const BRIDGE_CAPABILITIES = [
     'overleaf-clone',          // POST /overleaf/clone
     'overleaf-pull-strategy',  // POST /overleaf/pull 认识 body.strategy（abort/stash/discard）
@@ -66,8 +66,10 @@ const BRIDGE_CAPABILITIES = [
                                 // origin，供前端反查"这个目录到底是哪个 Overleaf 项目"，不写任何东西
     'overleaf-project-rename', // v2 Pass P67：POST /overleaf/rename-project，真的重命名磁盘上的项目
                                 // 文件夹（只能改成同级兄弟目录），供顶栏项目名双击改名用
-    'fs-restore-respects-gitignore' // v2 Pass P74 §7.2：POST /fs/restore 不再把被 .gitignore
+    'fs-restore-respects-gitignore', // v2 Pass P74 §7.2：POST /fs/restore 不再把被 .gitignore
                                 // 忽略的文件算进删除名单，响应新增 skippedIgnored/ignoreWarning 字段
+    'fs-write-binary'          // v2 Pass P75 §7.1：POST /fs/write-binary，base64 → 原样字节落盘，
+                                // 供 PDF→LaTeX 转换写页面栅格图/内嵌图片用（doFsWrite 只能写 utf8 字符串）
 ];
 
 // v2 Pass P49：监听地址可配（LATEX_BRIDGE_HOST），默认仍是 127.0.0.1——不传就跟以前
@@ -2039,6 +2041,43 @@ async function doFsWrite(projectDir, relPath, content, expectedMtimeMs) {
     return Object.assign({ ok: true, path: relPath, bytesWritten: Buffer.byteLength(content, 'utf8'), mtimeMs: newMtimeMs }, checkpointFields(cp));
 }
 
+// v2 Pass P75 §7.1：doFsWrite 只能写 UTF-8 字符串（fs.writeFileSync(..., 'utf8')），PDF→LaTeX
+// 转换产物里的页面栅格图/内嵌图片需要原样字节落盘；远程桥模式下浏览器侧
+// OvlRemoteFileHandle.createWritable().write() 对 Blob/ArrayBuffer 会先 TextDecoder('utf-8')
+// 解码成字符串再走 /fs/write，二进制必被写坏（shim 注释自陈"不承诺任意二进制字节流原样落盘"）。
+// 本端点走 base64 传输 + 服务端原样 Buffer 落盘，绕开这条坑；本地 FSA 句柄写二进制本来就没有
+// 这个问题（ovlPerformUpload 直接 write(arrayBuffer)），前端只在远程模式下才会调用这个端点。
+async function doFsWriteBinary(projectDir, relPath, contentBase64, opts) {
+    opts = opts || {};
+    const skipCheckpoint = !!opts.skipCheckpoint;
+    const r = resolveInProject(projectDir, relPath);
+    if (!r.ok) return { ok: false, error: r.error };
+    if (typeof contentBase64 !== 'string') return { ok: false, error: 'contentBase64 必须是字符串' };
+    const b64 = contentBase64.replace(/\s+/g, '');
+    if (b64.length > 4000000) {
+        return { ok: false, error: '单次二进制写入超过约 3 MB 上限，拒绝' };
+    }
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(b64) || b64.length % 4 !== 0) {
+        return { ok: false, error: 'contentBase64 不是合法的 base64' };
+    }
+    const buf = Buffer.from(b64, 'base64');
+    // 往返自检：Buffer.from 对垃圾输入不报错、只静默丢字节——这是刻意补的一道防线，避免
+    // "看起来正常、实际有损"地写坏二进制文件（本仓库栽过同一类"静默写坏"的地雷）。
+    if (buf.toString('base64') !== b64) {
+        return { ok: false, error: 'base64 解码结果与输入不一致，拒绝写入（避免静默写坏文件）' };
+    }
+    const cp = skipCheckpoint
+        ? { available: false, checkpoint: null, warning: '本次写入按调用方要求跳过了检查点' }
+        : await fsGitCheckpoint(projectDir, 'write-binary ' + relPath);
+    try { fs.mkdirSync(path.dirname(r.resolved), { recursive: true }); }
+    catch (e) { return Object.assign({ ok: false, error: '创建父目录失败: ' + e.message }, checkpointFields(cp)); }
+    try { fs.writeFileSync(r.resolved, buf); }
+    catch (e) { return Object.assign({ ok: false, error: '写入失败: ' + e.message }, checkpointFields(cp)); }
+    let newMtimeMs = null;
+    try { newMtimeMs = fs.statSync(r.resolved).mtimeMs; } catch (e) {}
+    return Object.assign({ ok: true, path: relPath, bytesWritten: buf.length, mtimeMs: newMtimeMs }, checkpointFields(cp));
+}
+
 async function doFsMkdir(projectDir, relPath) {
     const r = resolveInProject(projectDir, relPath);
     if (!r.ok) return { ok: false, error: r.error };
@@ -2567,7 +2606,7 @@ const server = http.createServer(async (req, res) => {
         // v2 Pass P40：/fs/* 受限文件操作端点——见 resolveInProject/fsGitCheckpoint 头部注释。
         // 跟 /overleaf/* 同样能真的改写用户磁盘上的文件，复用同一条跨域白名单纪律。
         if (req.method === 'POST' && (pathname === '/fs/list' || pathname === '/fs/read' || pathname === '/fs/mkdir'
-            || pathname === '/fs/write' || pathname === '/fs/move' || pathname === '/fs/copy' || pathname === '/fs/delete'
+            || pathname === '/fs/write' || pathname === '/fs/write-binary' || pathname === '/fs/move' || pathname === '/fs/copy' || pathname === '/fs/delete'
             || pathname === '/fs/restore' || pathname === '/fs/capabilities')) {
             if (!ovlOriginAllowed(req)) {
                 sendJson(res, 403, { ok: false, error: '拒绝来自外部网页的文件操作请求。这些接口只接受 AI-Translator 页面本身的调用。' });
@@ -2606,6 +2645,12 @@ const server = http.createServer(async (req, res) => {
             if (pathname === '/fs/write') {
                 if (!body.path || typeof body.path !== 'string') { sendJson(res, 400, { ok: false, error: 'path is required' }); return; }
                 sendJson(res, 200, await doFsWrite(projectDir, body.path, body.content, body.expectedMtimeMs));
+                return;
+            }
+            if (pathname === '/fs/write-binary') {
+                if (!body.path || typeof body.path !== 'string') { sendJson(res, 400, { ok: false, error: 'path is required' }); return; }
+                if (typeof body.contentBase64 !== 'string') { sendJson(res, 400, { ok: false, error: 'contentBase64 is required' }); return; }
+                sendJson(res, 200, await doFsWriteBinary(projectDir, body.path, body.contentBase64, { skipCheckpoint: !!body.skipCheckpoint }));
                 return;
             }
             if (pathname === '/fs/move') {

@@ -2296,6 +2296,67 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-ctxmenu-item { padding: 6px 12px; cursor: pointer; white-space: nowrap; }
 .ovl-ctxmenu-item:hover { background: #2F3A4C; }
 
+/* ==================== v2 Pass P75：PDF→LaTeX 转换进度面板（spec_pdf2tex.md §1.5 结论 5、
+   §4.8c）。非模态浮层，独立于 #ovlModalOverlay（那是全应用唯一一份，多分钟任务不能占着），
+   固定右下角，跟 .ovl-ctxmenu 同一个 z-index 区间（1080-1090）。配色沿用本文件既有暗色
+   固定色板（#1B222C/#F4F5F6/#9AA4B2/#495365……），不新增 CSS 变量。 ==================== */
+.ovl-p2t-panel {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    width: 360px;
+    max-width: 92vw;
+    max-height: 80vh;
+    z-index: 1085;
+    background: #1B222C;
+    color: #F4F5F6;
+    border: 1px solid #333B49;
+    border-radius: 8px;
+    box-shadow: 0 24px 60px -12px rgba(0,0,0,0.6);
+    display: flex;
+    flex-direction: column;
+    font-size: 12px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    overflow: hidden;
+}
+.ovl-p2t-panel[hidden] { display: none; }
+.ovl-p2t-head { display: flex; align-items: center; gap: 8px; padding: 10px 12px; border-bottom: 1px solid #2F3A4C; flex: none; }
+.ovl-p2t-title { font-size: 13px; font-weight: 700; flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ovl-p2t-headbtn { width: 22px; height: 22px; border: none; background: transparent; color: #9AA4B2; cursor: pointer; border-radius: 4px; font-size: 13px; line-height: 1; }
+.ovl-p2t-headbtn:hover { background: #2F3A4C; color: #F4F5F6; }
+.ovl-p2t-body { padding: 10px 12px; overflow-y: auto; }
+.ovl-p2t-meta { font-size: 11px; color: #9AA4B2; margin-bottom: 8px; word-break: break-all; line-height: 1.6; }
+.ovl-p2t-bar-track { height: 6px; border-radius: 3px; background: #2F3A4C; overflow: hidden; margin-bottom: 6px; }
+.ovl-p2t-bar-fill { height: 100%; background: #098842; border-radius: 3px; transition: width .25s ease; }
+.ovl-p2t-progtext { font-size: 11px; color: #9AA4B2; margin-bottom: 10px; display: flex; justify-content: space-between; gap: 8px; }
+.ovl-p2t-grid { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 10px; }
+.ovl-p2t-chip {
+    width: 26px; height: 22px; border-radius: 4px; font-size: 10px;
+    display: flex; align-items: center; justify-content: center;
+    background: #2F3A4C; color: #9AA4B2; cursor: default; user-select: none;
+    border: 1px solid transparent;
+}
+.ovl-p2t-chip[data-state="pending"] { background: #2F3A4C; color: #9AA4B2; }
+.ovl-p2t-chip[data-state="running"] { background: #1d4ed8; color: #fff; animation: ovlP2TPulse 1.1s ease-in-out infinite; }
+.ovl-p2t-chip[data-state="ok"] { background: #0aa04e; color: #fff; }
+.ovl-p2t-chip[data-state="suspect"] { background: #eab308; color: #1B222C; }
+.ovl-p2t-chip[data-state="failed"] { background: #dc2626; color: #fff; }
+@keyframes ovlP2TPulse { 0%, 100% { opacity: 1; } 50% { opacity: .55; } }
+.ovl-p2t-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px 12px; border-top: 1px solid #2F3A4C; flex: none; }
+.ovl-p2t-pill {
+    position: fixed; right: 16px; bottom: 16px; z-index: 1085;
+    background: #1B222C; color: #F4F5F6; border: 1px solid #333B49;
+    border-radius: 999px; padding: 8px 14px; font-size: 12px; cursor: pointer;
+    box-shadow: 0 12px 30px -8px rgba(0,0,0,0.6); display: flex; align-items: center; gap: 6px;
+}
+.ovl-p2t-pill[hidden] { display: none; }
+.ovl-p2t-pill:hover { background: #2F3A4C; }
+.ovl-p2t-pill-dot { width: 8px; height: 8px; border-radius: 50%; background: #098842; flex: none; }
+/* v2 Pass P75 §4.8d：设置面板「PDF 转 LaTeX」分类，照抄 .ovl-settings-* 既有布局，不新增类。 */
+.ovl-p2t-testresult { font-size: 11.5px; margin-top: 4px; }
+.ovl-p2t-testresult[data-state="ok"] { color: #4ADE80; }
+.ovl-p2t-testresult[data-state="error"] { color: #F87171; }
+
 .ovl-modal-overlay {
     position: fixed;
     inset: 0;
@@ -23539,6 +23600,10 @@ function ovlPortalHtml() {
         + '<div class="ovl-tip2" id="ovlTip2" hidden></div>'
         // M9：文件树右键菜单，内容按点中的是文件/文件夹动态填充（ovlOpenCtxMenu）。
         + '<div class="ovl-ctxmenu" id="ovlCtxMenu" hidden></div>'
+        // v2 Pass P75（spec_pdf2tex.md §1.5 结论 5）：PDF→LaTeX 转换进度面板——多分钟任务不能用
+        // #ovlModalOverlay（全应用唯一模态位，会挡住编辑器），单独一个非模态浮层，挂在 #ovlPortal
+        // 下天然不跟任何既有弹窗抢挂载点。内容由 ovlP2TPanelRender() 动态填充。
+        + '<div class="ovl-p2t-panel" id="ovlP2TPanel" hidden></div>'
         // M2/M9 共用的通用弹窗（重命名/新建文件/新建文件夹/删除确认……），内容动态填充，
         // 绝不用 window.prompt/confirm/alert（硬约束：会冻结浏览器自动化）。
         + '<div class="ovl-modal-overlay" id="ovlModalOverlay" hidden></div>'
@@ -28035,6 +28100,11 @@ async function ovlOpenPdfDirect(fileHandle, name, parentHandle, relPath) {
         if (OvlState.viewMode === 'editor') ovlSetViewMode('pdf'); // 编辑器单栏下 PDF 面板本来被 CSS 隐藏，得先让它露出来
         ovlUpdatePdfToolbarUI();
         ovlRenderPdfBody();
+        // v2 Pass P75（spec_pdf2tex.md §2 P72→P75 对接约定）：typeof 保护，不影响这个函数本身
+        // 的成功/失败路径；只是"少了自动关联提示"这条 fire-and-forget，不 await。
+        if (typeof window.ovlP2TNotifyPdfOpened === 'function') {
+            window.ovlP2TNotifyPdfOpened({ handle: fileHandle, parentHandle: parentHandle, name: name, relPath: relPath || name, isDir: false });
+        }
     } catch (e) {
         console.error('[ovl] open pdf direct failed', e);
         if (typeof showToast === 'function') showToast('打开 PDF 失败：' + (e && e.message ? e.message : String(e)), 'error');
@@ -29984,7 +30054,9 @@ const OVL_CTX_ITEMS_FILE = ['rename', 'download', 'setmain', 'delete', 'newfile'
 const OVL_CTX_ITEMS_FOLDER = ['rename', 'delete', 'newfile', 'newfolder', 'upload'];
 const OVL_CTX_LABELS = {
     rename: 'Rename', download: 'Download', setmain: 'Set as main document',
-    delete: 'Delete', newfile: 'New file', newfolder: 'New folder', upload: 'Upload'
+    delete: 'Delete', newfile: 'New file', newfolder: 'New folder', upload: 'Upload',
+    // v2 Pass P75（spec_pdf2tex.md §4.8a）：只在 .pdf 上出现，见 ovlOpenCtxMenu 里的过滤逻辑。
+    pdf2tex: '转换为 LaTeX', pdf2texOpen: '打开转换结果', pdf2texRedo: '重新转换…'
 };
 
 function ovlCloseCtxMenu() {
@@ -30005,6 +30077,13 @@ function ovlOpenCtxMenu(x, y, entry) {
             // "Set as main document" 只对非主 .tex 文件出现（§2.6.5 实测原文）。
             const isTex = /\.tex$/i.test(entry.name);
             if (!isTex || (entry.relPath || entry.name) === OvlState.mainDocFile) ids = ids.filter(function (id) { return id !== 'setmain'; });
+            // v2 Pass P75（spec_pdf2tex.md §4.8a）：PDF→LaTeX 三项只在 .pdf 上出现。菜单是同步
+            // 函数，先用同步可得的信息（表里有没有这条 key）决定显示哪几项；changed 的判定是
+            // 异步的（要 entry.handle.getFile()），菜单打开后异步回填 pdf2texRedo 的文案。
+            if (/\.pdf$/i.test(entry.name || '')) {
+                const hasResult = (typeof ovlP2THasResult === 'function') && ovlP2THasResult(entry);
+                ids.push.apply(ids, hasResult ? ['pdf2texOpen', 'pdf2texRedo'] : ['pdf2tex']);
+            }
         }
     }
     if (OvlState.usingWebkitFallback) {
@@ -30026,6 +30105,17 @@ function ovlOpenCtxMenu(x, y, entry) {
     if (r.right > window.innerWidth) menu.style.left = Math.max(4, window.innerWidth - r.width - 4) + 'px';
     if (r.bottom > window.innerHeight) menu.style.top = Math.max(4, window.innerHeight - r.height - 4) + 'px';
     OvlState.ctxEntry = entry;
+    // v2 Pass P75：源 PDF 是否已变化——菜单还开着（同一个 entry）才回填，避免菜单已关闭/
+    // 换了目标之后异步结果落地时误改了别的东西。
+    if (ids.indexOf('pdf2texRedo') !== -1 && typeof ovlP2TResolve === 'function') {
+        Promise.resolve(ovlP2TResolve(entry)).then(function (info) {
+            if (OvlState.ctxEntry !== entry) return;
+            if (info && info.changed) {
+                const item = menu.querySelector('[data-ctx-id="pdf2texRedo"]');
+                if (item) item.textContent = '重新转换（源 PDF 已变化）';
+            }
+        }).catch(function () {});
+    }
 }
 
 // 唯一入口：菜单项点击、头部三个图标按钮，最终都走这里。
@@ -30104,6 +30194,16 @@ function ovlHandleCtxAction(id, entry) {
             if (input) input.click();
             break;
         }
+        // v2 Pass P75（spec_pdf2tex.md §4.8a/H9）：PDF→LaTeX 转换三个入口。
+        case 'pdf2tex':
+            if (typeof ovlP2TStartFromEntry === 'function') ovlP2TStartFromEntry(entry);
+            break;
+        case 'pdf2texOpen':
+            if (typeof ovlP2TOpenResult === 'function') ovlP2TOpenResult(entry);
+            break;
+        case 'pdf2texRedo':
+            if (typeof ovlP2TRedo === 'function') ovlP2TRedo(entry);
+            break;
     }
 }
 
@@ -32484,6 +32584,1148 @@ async function ovlAiMergeApplyFile(fileIdx) {
     }
 }
 
+// =============================================================================
+// v2 Pass P75：PDF → LaTeX 转换（spec_pdf2tex.md §8 H10 主模块）。
+// 一键把一份 PDF 逐页转写成可编辑、可编译的 LaTeX 源码：文件树右键 PDF →「转换为 LaTeX」→
+// 选保存位置 → 逐页 pdf.js render → PNG → jump 视觉模型（浏览器直连，理由见 spec §3.D3）→
+// 剥 <think> → 拼统一前导的 main.tex。生成的 main.tex 走既有 ovlOpenFile 打开，白拿
+// code/visual/中文/翻译缓存整条链路（spec §1.4 结论 4）。
+// =============================================================================
+
+// ---- M2 spike 结论（§6.1）：默认 false，spike 通过后本文件里另一处会把它改成 true。
+// 未通过时提取内嵌图片的能力保持关闭，M1 的整页截图兜底完全不受影响。
+let OVL_P2T_M2_AVAILABLE = false;
+
+const OVL_P2T_TIMEOUT_MS = 240000; // 冷启动实测 153s + 余量（probe_vision.md §5）
+
+// ---- §4.3 逐页 prompt（英文，理由：LaTeX 宏名与"只输出源码"这类约束，Qwen-VL 系列对英文
+// 指令遵循率更高，规格已明确这是可调项）。用数组 + join('\n') 而不是模板字符串，避免大段
+// 反斜杠转义混进模板字符串的转义规则里出错——LaTeX 宏名里的反斜杠在这里全部手动转义成 \\。
+const OVL_P2T_SYSTEM_PROMPT = [
+    "You are a precise PDF-page-to-LaTeX transcriber for academic papers.",
+    "You are given ONE rasterized page image. Transcribe it into LaTeX BODY source.",
+    "",
+    "HARD RULES",
+    "1. Output LaTeX source ONLY. No explanation, no markdown, no ``` fences, no commentary before or after.",
+    "2. Output a BODY FRAGMENT only. NEVER output \\documentclass, \\usepackage, \\begin{document},",
+    "   \\end{document}, \\maketitle, \\bibliographystyle or any other preamble command.",
+    "3. Follow the page's reading order. For a two-column page, transcribe the ENTIRE left column",
+    "   first, then the ENTIRE right column. Never interleave the two columns.",
+    "4. Mathematics: inline math as $...$; displayed math as \\[ ... \\]. Use",
+    "   \\begin{equation}...\\end{equation} only when the page prints an equation number, and then put",
+    "   that printed number in \\tag{...}; never invent a \\label. Transcribe every symbol; never",
+    "   describe a formula in words.",
+    "5. Tables: emit real LaTeX. Use",
+    "   \\begin{table}[htbp]\\centering\\caption{...}\\begin{tabular}{...} ... \\end{tabular}\\end{table}",
+    "   with & column separators, \\\\ row endings, and \\toprule/\\midrule/\\bottomrule (booktabs is",
+    "   loaded). Keep the text of every cell. If the layout is too complex to reproduce exactly,",
+    "   still emit your best tabular and put the line",
+    "   % TODO(pdf2tex): table layout may be inexact",
+    "   immediately before it.",
+    "6. Algorithms / pseudocode: use",
+    "   \\begin{algorithm}[H]\\caption{...}\\begin{algorithmic}[1] ... \\end{algorithmic}\\end{algorithm}",
+    "   with \\State \\If \\ElsIf \\Else \\EndIf \\For \\EndFor \\While \\EndWhile \\Function \\EndFunction",
+    "   \\Return (algorithm and algpseudocode are loaded). If the pseudocode does not map cleanly onto",
+    "   these macros, fall back to \\begin{verbatim} ... \\end{verbatim} and put the line",
+    "   % TODO(pdf2tex): pseudocode kept verbatim",
+    "   immediately before it.",
+    "7. Figures, photos, plots, diagrams, screenshots: do NOT try to redraw them. Emit exactly:",
+    "   \\begin{figure}[htbp]\\centering",
+    "   \\includegraphics[width=\\linewidth]{<one of the file names from AVAILABLE IMAGES>}",
+    "   \\caption{<the caption printed on the page, verbatim; if there is none, write: Figure from page N>}",
+    "   \\end{figure}",
+    "   Use the names from AVAILABLE IMAGES in the order they are listed, top to bottom.",
+    "8. Section headings: \\section{...}, \\subsection{...}, \\subsubsection{...}. Drop the printed",
+    "   numbers (LaTeX numbers them itself).",
+    "9. Citation marks printed as [12], [3,4] or (Smith et al., 2020) must be kept as literal text,",
+    "   exactly as printed. NEVER invent \\cite, \\ref, \\eqref or \\label keys.",
+    "10. Drop all page furniture: running headers and footers, page numbers, journal or conference",
+    "    banners, copyright lines, arXiv stamps, submission notices.",
+    "11. Escape LaTeX specials in prose: % & _ # $ { } ~ ^ and backslash. Prefer ASCII forms:",
+    "    \\'e  \\\"o  ---  --  ``quoted''  \\ldots  \\%  instead of the corresponding Unicode characters.",
+    "12. A paragraph cut off at the top or bottom of the page must still be transcribed as it appears.",
+    "    Do not invent the missing part and do not add a note about it.",
+    "13. If the page has nothing transcribable, output exactly:  % (blank page)"
+].join('\n');
+
+function ovlP2TBuildUserText(job, pageNum, images) {
+    return 'PAGE ' + pageNum + ' of ' + job.total + ', from "' + job.pdfName + '".\n\n'
+        + 'AVAILABLE IMAGES (use these exact paths in \\includegraphics, in this order):\n'
+        + images.join('\n') + '\n\n'
+        + 'Transcribe this page now. Output LaTeX body source only.';
+}
+
+// ---- 小工具 ----
+function ovlP2TPad2(n) { const s = String(n); return s.length >= 2 ? s : ('0' + s); }
+function ovlP2TUint8ToBase64(bytes) {
+    let binary = '';
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(bytes.length, i + chunk)));
+    }
+    return btoa(binary);
+}
+function ovlP2TBlobToDataUrl(blob) {
+    return new Promise(function (resolve, reject) {
+        const reader = new FileReader();
+        reader.onload = function () { resolve(reader.result); };
+        reader.onerror = function () { reject(reader.error || new Error('读取图片数据失败')); };
+        reader.readAsDataURL(blob);
+    });
+}
+function ovlP2TLocalIso(d) {
+    const pad = function (n) { return (n < 10 ? '0' : '') + n; };
+    const off = -d.getTimezoneOffset();
+    const sign = off >= 0 ? '+' : '-';
+    const abs = Math.abs(off);
+    return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T'
+        + pad(d.getHours()) + ':' + pad(d.getMinutes()) + ':' + pad(d.getSeconds())
+        + sign + pad(Math.floor(abs / 60)) + ':' + pad(abs % 60);
+}
+// 失败占位片段里塞的中文原因可能含 LaTeX 特殊字符（尤其截断的 HTTP 错误正文），只在
+// \fbox 分支的正文里做一次轻量转义——% 注释行本身不需要，# 后面照样是注释。
+function ovlP2TEscapeLatexLite(s) {
+    return String(s == null ? '' : s).replace(/[%$#&_{}]/g, '\\$&').replace(/~/g, '\\textasciitilde{}').replace(/\^/g, '\\textasciicircum{}');
+}
+
+// ---- §4.9 二进制/文本写入统一出口：唯一分流点是 ovlP2TWriteBinary。----
+async function ovlP2TMkdirp(relFromProjectRoot) {
+    const parts = String(relFromProjectRoot).replace(/\\/g, '/').split('/').filter(function (p) { return p && p !== '.'; });
+    let dir = OvlState.dirHandle;
+    for (let i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i], { create: true });
+    return dir;
+}
+async function ovlP2TWriteText(relFromProjectRoot, text) {
+    const parts = String(relFromProjectRoot).replace(/\\/g, '/').split('/').filter(function (p) { return p && p !== '.'; });
+    const name = parts.pop();
+    let dir = OvlState.dirHandle;
+    for (let i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i], { create: true });
+    const fh = await dir.getFileHandle(name, { create: true });
+    const w = await fh.createWritable();
+    await w.write(text);
+    await w.close();
+}
+async function ovlP2TWriteBinary(relFromProjectRoot, uint8) {
+    const rel = String(relFromProjectRoot).replace(/\\/g, '/').replace(/^\.\//, '');
+    if (OvlState.dirHandle && !OvlState.dirHandle.__ovlRemote) {
+        const parts = rel.split('/').filter(function (p) { return p && p !== '.'; });
+        const name = parts.pop();
+        let dir = OvlState.dirHandle;
+        for (let i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i], { create: true });
+        const fh = await dir.getFileHandle(name, { create: true });
+        const w = await fh.createWritable();
+        await w.write(uint8);
+        await w.close();
+        return;
+    }
+    const projectDir = ovlRemoteProjectRoot();
+    const b64 = ovlP2TUint8ToBase64(uint8);
+    const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/write-binary'), { projectDir: projectDir, path: rel, contentBase64: b64, skipCheckpoint: true });
+    if (!data || data.ok !== true) throw new Error((data && data.error) || '写入二进制文件失败');
+}
+
+// ---- §4.6 关联表：projectDir|pdfRelPath → {pdf,out,size,mtimeMs,mainMtimeMs,pages,failed,
+//      model,endpoint,at,pipeline}。本地/远程两个 key，形状照抄 ovlOverleafAddrMap*。----
+const OVL_P2T_MAP_MAX = 200;
+function ovlP2TMapLsKey() { return ovlIsRemoteBridge() ? 'ovl.pdf2texMapRemote' : 'ovl.pdf2texMap'; }
+function ovlP2TMapLoad() {
+    try {
+        const raw = localStorage.getItem(ovlP2TMapLsKey());
+        if (!raw) return {};
+        const obj = JSON.parse(raw);
+        return (obj && typeof obj === 'object' && !Array.isArray(obj)) ? obj : {};
+    } catch (e) { return {}; }
+}
+function ovlP2TMapSave(map) {
+    try { localStorage.setItem(ovlP2TMapLsKey(), JSON.stringify(map)); } catch (e) {}
+}
+function ovlP2TKey(projectDir, pdfRelPath) {
+    const np = ovlNormalizeProjectPath(projectDir);
+    let rp = String(pdfRelPath == null ? '' : pdfRelPath).replace(/\\/g, '/').replace(/^\.\//, '');
+    if (/^[a-z]:\//.test(np) || /^\/\//.test(np)) rp = rp.toLowerCase();
+    return np + '|' + rp;
+}
+function ovlP2TMapGet(projectDir, pdfRelPath) {
+    try {
+        const key = ovlP2TKey(projectDir, pdfRelPath);
+        const map = ovlP2TMapLoad();
+        return (map[key] && typeof map[key] === 'object') ? map[key] : null;
+    } catch (e) { return null; }
+}
+function ovlP2TMapSet(projectDir, pdfRelPath, rec) {
+    try {
+        const key = ovlP2TKey(projectDir, pdfRelPath);
+        const map = ovlP2TMapLoad();
+        delete map[key];
+        map[key] = rec;
+        const keys = Object.keys(map);
+        if (keys.length > OVL_P2T_MAP_MAX) {
+            keys.slice(0, keys.length - OVL_P2T_MAP_MAX).forEach(function (k) { delete map[k]; });
+        }
+        ovlP2TMapSave(map);
+    } catch (e) {}
+}
+function ovlP2TMapDelete(projectDir, pdfRelPath) {
+    try {
+        const key = ovlP2TKey(projectDir, pdfRelPath);
+        const map = ovlP2TMapLoad();
+        if (key in map) { delete map[key]; ovlP2TMapSave(map); }
+    } catch (e) {}
+}
+// entry.relPath 是 §1.4 里 li.__ovlEntry 的相对路径；projectDir 统一读 #ovlProjectPathInput
+// （本地/远程共用同一个输入框，ovlVisualTransCacheProjectId 也是这么取的，见 spec §1.3 结论3）。
+function ovlP2THasResult(entry) {
+    try { return !!ovlP2TMapGet(ovlRemoteProjectRoot(), entry.relPath || entry.name); } catch (e) { return false; }
+}
+
+// ---- §4.6 命中逻辑：{rec, outExists, changed, mainEdited} ----
+async function ovlP2TResolve(entry) {
+    const projectDir = ovlRemoteProjectRoot();
+    const pdfRelPath = entry.relPath || entry.name;
+    const rec = ovlP2TMapGet(projectDir, pdfRelPath);
+    if (!rec) return { rec: null, outExists: false, changed: false, mainEdited: false };
+    let outExists = false;
+    try {
+        await ovlResolveHandleForPath(OvlState.dirHandle, rec.out + '/main.tex');
+        outExists = true;
+    } catch (e) {
+        if (e && e.name === 'NotFoundError') {
+            ovlP2TMapDelete(projectDir, pdfRelPath);
+            return { rec: null, outExists: false, changed: false, mainEdited: false };
+        }
+        outExists = false;
+    }
+    let changed = false;
+    try {
+        const f = await entry.handle.getFile();
+        changed = (f.size !== rec.size) || (f.lastModified !== rec.mtimeMs);
+    } catch (e) { changed = false; }
+    let mainEdited = false;
+    if (outExists) {
+        try {
+            const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, rec.out + '/main.tex');
+            const mf = await resolved.handle.getFile();
+            mainEdited = (typeof rec.mainMtimeMs === 'number') && (mf.lastModified !== rec.mainMtimeMs);
+        } catch (e) { mainEdited = false; }
+    }
+    return { rec: rec, outExists: outExists, changed: changed, mainEdited: mainEdited };
+}
+
+// ---- §4.8b 保存位置对话框用：递归列目录，跳过 . 开头/已知输出目录，深度 ≤4，上限 300 ----
+async function ovlP2TCollectDirs(dirHandle) {
+    const projectDir = ovlRemoteProjectRoot();
+    const map = ovlP2TMapLoad();
+    const prefix = ovlNormalizeProjectPath(projectDir) + '|';
+    const knownOutDirs = {};
+    Object.keys(map).forEach(function (k) {
+        if (k.indexOf(prefix) === 0 && map[k] && typeof map[k].out === 'string') {
+            knownOutDirs[map[k].out.replace(/\\/g, '/').replace(/\/+$/, '')] = true;
+        }
+    });
+    const out = [{ path: '.', label: '（项目根）', depth: 0 }];
+    async function walk(handle, relPath, depth) {
+        if (out.length >= 300 || depth > 4) return;
+        let entries = [];
+        try { for await (const pair of handle.entries()) entries.push(pair); } catch (e) { return; }
+        entries.sort(function (a, b) { return a[0].localeCompare(b[0]); });
+        for (let i = 0; i < entries.length; i++) {
+            if (out.length >= 300) return;
+            const name = entries[i][0], h = entries[i][1];
+            if (name.charAt(0) === '.') continue;
+            if (h.kind !== 'directory') continue;
+            const rel = relPath ? relPath + '/' + name : name;
+            if (knownOutDirs[rel]) continue;
+            out.push({ path: rel, label: rel, depth: depth });
+            await walk(h, rel, depth + 1);
+        }
+    }
+    await walk(dirHandle, '', 1);
+    return out;
+}
+async function ovlP2TDirHasEntries(relPath) {
+    try {
+        const parts = String(relPath).replace(/\\/g, '/').split('/').filter(function (p) { return p && p !== '.'; });
+        let dir = OvlState.dirHandle;
+        for (let i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i]);
+        for await (const pair of dir.entries()) { return true; }
+        return false;
+    } catch (e) { return false; }
+}
+
+// ---- §4.8b 保存位置对话框：复用 #ovlModalOverlay（一次性短交互），DOM 照抄 ovlRemotePickFolder
+//      的 .ovl-modal-wide + .ovl-history-list 范式。返回 Promise<{outRel}|null>。----
+function ovlP2TAskOutputDir(entry) {
+    return new Promise(function (resolve) {
+        const overlay = document.getElementById('ovlModalOverlay');
+        if (!overlay) { resolve(null); return; }
+        overlay.innerHTML = '';
+        overlay.hidden = false;
+
+        const box = document.createElement('div');
+        box.className = 'ovl-modal ovl-modal-wide';
+
+        const h = document.createElement('div');
+        h.className = 'ovl-modal-title';
+        h.textContent = '选择转换结果的保存位置';
+        box.appendChild(h);
+
+        const msg = document.createElement('div');
+        msg.className = 'ovl-modal-message';
+        msg.textContent = '转换结果会放在这个目录下面，并且自动加上 .gitignore 不进 git（避免推到 Overleaf 把云端撑爆）。';
+        box.appendChild(msg);
+
+        const dirLabel = document.createElement('div');
+        dirLabel.className = 'ovl-modal-label';
+        dirLabel.textContent = '父目录';
+        box.appendChild(dirLabel);
+
+        const listWrap = document.createElement('div');
+        listWrap.className = 'ovl-history-list';
+        listWrap.id = 'ovlP2TDirList';
+        listWrap.style.maxHeight = '200px';
+        listWrap.style.overflowY = 'auto';
+        box.appendChild(listWrap);
+
+        const nameLabel = document.createElement('div');
+        nameLabel.className = 'ovl-modal-label';
+        nameLabel.textContent = '子文件夹名';
+        box.appendChild(nameLabel);
+        const nameInput = document.createElement('input');
+        nameInput.type = 'text';
+        nameInput.id = 'ovlP2TOutNameInput';
+        nameInput.className = 'ovl-modal-input';
+        nameInput.value = String(entry.name || 'pdf').replace(/\.pdf$/i, '');
+        box.appendChild(nameInput);
+
+        const errEl = document.createElement('div');
+        errEl.className = 'ovl-modal-error';
+        box.appendChild(errEl);
+        const overwriteNote = document.createElement('div');
+        overwriteNote.className = 'ovl-modal-error';
+        overwriteNote.style.color = '#eab308';
+        box.appendChild(overwriteNote);
+
+        const chkRow = document.createElement('label');
+        chkRow.style.cssText = 'display:flex;align-items:center;gap:6px;font-size:12px;color:#E7E9EE;margin-bottom:8px;';
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.id = 'ovlP2TSetDefaultChk';
+        chkRow.appendChild(chk);
+        chkRow.appendChild(document.createTextNode('设为默认保存位置'));
+        box.appendChild(chkRow);
+
+        const btnRow = document.createElement('div');
+        btnRow.className = 'ovl-modal-btns';
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button'; cancelBtn.className = 'ovl-modal-btn'; cancelBtn.textContent = '取消';
+        const okBtn = document.createElement('button');
+        okBtn.type = 'button'; okBtn.className = 'ovl-modal-btn ovl-modal-btn-primary'; okBtn.textContent = '开始转换';
+        btnRow.appendChild(cancelBtn); btnRow.appendChild(okBtn);
+        box.appendChild(btnRow);
+        overlay.appendChild(box);
+
+        let selectedDir = (OvlSettings.pdf2texDefaultOutDir || 'converted');
+        let settled = false;
+        function close() { overlay.hidden = true; overlay.innerHTML = ''; document.removeEventListener('keydown', onKey); }
+        function finish(v) { if (settled) return; settled = true; close(); resolve(v); }
+        function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); finish(null); } }
+        cancelBtn.addEventListener('click', function () { finish(null); });
+        overlay.addEventListener('click', function (e) { if (e.target === overlay) finish(null); });
+        document.addEventListener('keydown', onKey);
+
+        function renderList(dirs) {
+            listWrap.textContent = '';
+            dirs.forEach(function (d) {
+                const row = document.createElement('div');
+                row.className = 'ovl-history-row';
+                row.style.cursor = 'pointer';
+                row.style.paddingLeft = (8 + d.depth * 14) + 'px';
+                row.setAttribute('data-p2t-dir', d.path);
+                row.textContent = (d.depth > 0 ? '📁 ' : '') + d.label;
+                if (d.path === selectedDir) row.style.background = '#2F3A4C';
+                row.addEventListener('click', function () {
+                    selectedDir = d.path;
+                    renderList(dirs);
+                    refreshOverwriteNote();
+                });
+                listWrap.appendChild(row);
+            });
+        }
+        function refreshOverwriteNote() {
+            const nameVal = nameInput.value.trim();
+            if (!nameVal) { overwriteNote.textContent = ''; okBtn.textContent = '开始转换'; return; }
+            const outRel = (selectedDir === '.' || !selectedDir) ? nameVal : (selectedDir + '/' + nameVal);
+            Promise.resolve(ovlP2TDirHasEntries(outRel)).then(function (nonEmpty) {
+                if (nonEmpty) { overwriteNote.textContent = '该目录已有内容，转换会覆盖同名文件'; okBtn.textContent = '覆盖并转换'; }
+                else { overwriteNote.textContent = ''; okBtn.textContent = '开始转换'; }
+            }).catch(function () {});
+        }
+        nameInput.addEventListener('input', refreshOverwriteNote);
+
+        Promise.resolve(ovlP2TCollectDirs(OvlState.dirHandle)).then(function (dirs) {
+            renderList(dirs);
+            refreshOverwriteNote();
+        }).catch(function () { renderList([{ path: '.', label: '（项目根）', depth: 0 }]); });
+
+        okBtn.addEventListener('click', function () {
+            const nameVal = nameInput.value.trim();
+            const nameErr = ovlValidateProjectRenameName(nameVal);
+            if (nameErr) { errEl.textContent = nameErr; return; }
+            errEl.textContent = '';
+            const outRel = (selectedDir === '.' || !selectedDir) ? nameVal : (selectedDir + '/' + nameVal);
+            if (chk.checked) { OvlSettings.pdf2texDefaultOutDir = selectedDir; ovlSaveSettings(); }
+            finish({ outRel: outRel });
+        });
+
+        setTimeout(function () { nameInput.focus(); nameInput.select(); }, 0);
+    });
+}
+
+// ---- §1.1/§4.5.7b：逐页 render → PNG。独立文档实例（job.doc），跟 OvlState.pdfDoc 完全
+//      无关（P18 现成先例，见 ovlResolveOneFigureCandidate）。----
+async function ovlP2TRenderPageToPng(page, maxPx) {
+    const unitViewport = page.getViewport({ scale: 1 });
+    const longest = Math.max(unitViewport.width, unitViewport.height);
+    let scale = (Number(maxPx) || 1800) / longest;
+    scale = Math.max(0.5, Math.min(4, scale));
+    const viewport = page.getViewport({ scale: scale });
+    const canvas = document.createElement('canvas');
+    canvas.width = Math.max(1, Math.ceil(viewport.width));
+    canvas.height = Math.max(1, Math.ceil(viewport.height));
+    const ctx = canvas.getContext('2d');
+    const task = page.render({ canvasContext: ctx, viewport: viewport });
+    await task.promise;
+    const pngBlob = await new Promise(function (resolve) { canvas.toBlob(resolve, 'image/png'); });
+    let sendBlob = pngBlob, sentAsJpeg = false;
+    if (pngBlob && pngBlob.size > 1.5 * 1024 * 1024) {
+        const jpegBlob = await new Promise(function (resolve) { canvas.toBlob(resolve, 'image/jpeg', 0.85); });
+        if (jpegBlob) { sendBlob = jpegBlob; sentAsJpeg = true; }
+    }
+    canvas.width = 0; canvas.height = 0; // §4.5.7i：释放显存
+    return { pngBlob: pngBlob, sendBlob: sendBlob, sentAsJpeg: sentAsJpeg, width: viewport.width, height: viewport.height };
+}
+
+// ---- §4.5「全应用唯一发视觉请求的地方」：不经过 ovlBridgeFetch（不是桥请求）。----
+async function ovlP2TCallVision(pageNum, dataUrl, userText, extSignal) {
+    const endpoint = (OvlSettings.pdf2texVisionEndpoint || '').trim().replace(/\/+$/, '');
+    if (!endpoint) return { ok: false, error: '未配置视觉模型服务地址（见设置 → PDF 转 LaTeX）', retryable: false };
+    const model = (OvlSettings.pdf2texVisionModel || '').trim();
+    if (!model) return { ok: false, error: '未配置视觉模型（见设置 → PDF 转 LaTeX）', retryable: false };
+    const bodyText = JSON.stringify({
+        model: model, temperature: 0.1, max_tokens: 3072, stream: false,
+        messages: [
+            { role: 'system', content: OVL_P2T_SYSTEM_PROMPT },
+            { role: 'user', content: [ { type: 'text', text: userText }, { type: 'image_url', image_url: { url: dataUrl } } ] }
+        ]
+    });
+    async function attemptOnce() {
+        const controller = new AbortController();
+        let extAbortHandler = null;
+        if (extSignal) {
+            if (extSignal.aborted) controller.abort();
+            else { extAbortHandler = function () { controller.abort(); }; extSignal.addEventListener('abort', extAbortHandler); }
+        }
+        const timeoutId = setTimeout(function () { controller.abort(); }, OVL_P2T_TIMEOUT_MS);
+        const startedAt = Date.now();
+        try {
+            let resp;
+            try {
+                resp = await fetch(endpoint + '/chat/completions', {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: bodyText, signal: controller.signal
+                });
+            } catch (e) {
+                const ms = Date.now() - startedAt;
+                if (e && e.name === 'AbortError') {
+                    if (extSignal && extSignal.aborted) return { ok: false, error: '已取消', ms: ms, cancelled: true, retryable: false };
+                    return { ok: false, error: '请求超时（超过 ' + Math.round(OVL_P2T_TIMEOUT_MS / 1000) + ' 秒）', ms: ms, retryable: true };
+                }
+                return { ok: false, error: '连不上视觉模型服务：' + (e && e.message ? e.message : String(e)), ms: ms, retryable: false };
+            }
+            const ms = Date.now() - startedAt;
+            if (resp.status === 429) return { ok: false, error: '模型服务繁忙，稍后重试该页', ms: ms, httpStatus: 429, retryable: false };
+            if (!resp.ok) {
+                let t = ''; try { t = (await resp.text()).slice(0, 200); } catch (e2) {}
+                return { ok: false, error: '视觉模型服务返回错误状态 ' + resp.status + (t ? '：' + t : ''), ms: ms, httpStatus: resp.status, retryable: resp.status >= 500 };
+            }
+            let data;
+            try { data = await resp.json(); } catch (e3) { return { ok: false, error: '视觉模型服务返回的不是合法 JSON', ms: ms, httpStatus: resp.status, retryable: true }; }
+            const content = data && data.choices && data.choices[0] && data.choices[0].message && typeof data.choices[0].message.content === 'string'
+                ? data.choices[0].message.content : null;
+            if (content === null) return { ok: false, error: '视觉模型服务返回格式不符合预期（缺少 choices[0].message.content）', ms: ms, httpStatus: resp.status, retryable: true };
+            return { ok: true, content: content, ms: ms, httpStatus: resp.status };
+        } finally {
+            clearTimeout(timeoutId);
+            if (extAbortHandler) extSignal.removeEventListener('abort', extAbortHandler);
+        }
+    }
+    let result = await attemptOnce();
+    if (!result.ok && result.retryable && !(extSignal && extSignal.aborted)) {
+        await new Promise(function (r) { setTimeout(r, 1500); });
+        result = await attemptOnce();
+    }
+    return result;
+}
+
+// ---- §4.4 thinking 剥离 + 违规前导剥离 + 配平自检，七步照抄，每一步都打标志、绝不静默。----
+function ovlP2TExtractLatex(raw) {
+    const flags = {};
+    const c = xportThinkCut(raw, null); // anchorSrc=null：只触发规则1「整段以 <think> 开头」
+    if (c.allReasoning === true) {
+        return { ok: false, text: '', reason: '模型只输出了思考、没有正文', flags: flags };
+    }
+    let text = c.text;
+    if (!c.cut && /<think>/i.test(text)) {
+        const idx = text.lastIndexOf('</think>');
+        if (idx === -1) return { ok: false, text: '', reason: '模型输出包含未闭合的 <think> 标签', flags: flags };
+        text = text.slice(idx + '</think>'.length);
+        flags.thinkCutFallback = true;
+    }
+    text = ovlAiMergeStripCodeFence(text.trim());
+    const hasDoc = /\\begin\{document\}/.test(text) && /\\end\{document\}/.test(text);
+    if (hasDoc) {
+        const bi = text.indexOf('\\begin{document}');
+        const ei = text.lastIndexOf('\\end{document}');
+        text = text.slice(bi + '\\begin{document}'.length, ei);
+        flags.preambleStripped = true;
+    } else if (/\\documentclass/.test(text)) {
+        return { ok: false, text: '', reason: '模型输出了完整的文档前导但没有 \\begin{document}（疑似跑飞）', flags: flags };
+    }
+    let suspect = false;
+    const envCounts = {};
+    let m;
+    const beginRe = /\\begin\{([a-zA-Z*]+)\}/g;
+    while ((m = beginRe.exec(text))) envCounts[m[1]] = (envCounts[m[1]] || 0) + 1;
+    const endRe = /\\end\{([a-zA-Z*]+)\}/g;
+    while ((m = endRe.exec(text))) envCounts[m[1]] = (envCounts[m[1]] || 0) - 1;
+    Object.keys(envCounts).forEach(function (k) { if (envCounts[k] !== 0) suspect = true; });
+    let dollarCount = 0;
+    for (let i = 0; i < text.length; i++) {
+        if (text[i] === '\\') { i++; continue; }
+        if (text[i] === '$') dollarCount++;
+    }
+    if (dollarCount % 2 !== 0) suspect = true;
+    if (suspect) {
+        text = '% TODO(pdf2tex): 本页环境/数学定界符可能未配平，请人工检查\n' + text;
+        flags.suspect = true;
+    }
+    text = text.trim();
+    if (!text) return { ok: false, text: '', reason: '模型返回了空正文', flags: flags };
+    return { ok: true, text: text, reason: null, flags: flags };
+}
+
+// ---- §4.7 失败页占位片段 ----
+function ovlP2TFailurePlaceholder(num, reason) {
+    const nn = ovlP2TPad2(num);
+    const safeReason = String(reason || '未知原因').replace(/\r?\n/g, ' ');
+    if (OvlSettings.pdf2texSavePageImages !== false) {
+        return '% ==== page ' + num + ' 自动转换失败 ====\n'
+            + '% 原因：' + safeReason + '\n'
+            + '% TODO(pdf2tex): 本页未能转成 LaTeX，下面是原页面截图；请人工补写或点面板里的「重试本页」。\n'
+            + '\\begin{figure}[htbp]\\centering\n'
+            + '\\includegraphics[width=\\linewidth]{assets/pages/page-' + nn + '.png}\n'
+            + '\\caption{第 ' + num + ' 页（自动转换失败，此处为原页面截图）}\n'
+            + '\\end{figure}';
+    }
+    return '% ==== page ' + num + ' 自动转换失败 ====\n'
+        + '% 原因：' + safeReason + '\n'
+        + '% TODO(pdf2tex): 本页未能转成 LaTeX。\n'
+        + '\\begin{center}\\fbox{\\parbox{0.9\\linewidth}{\\centering 第 ' + num + ' 页自动转换失败：' + ovlP2TEscapeLatexLite(safeReason) + '}}\\end{center}';
+}
+
+// ---- §4.2 拼装 main.tex（固定前导模板）----
+function ovlP2TAssembleMain(job) {
+    const failedNums = job.pages.filter(function (p) { return p.state === 'failed'; }).map(function (p) { return p.num; });
+    const failedListStr = failedNums.length ? failedNums.join(', ') : '无';
+    const header = ''
+        + '% !TeX program = pdflatex\n'
+        + '% ─────────────────────────────────────────────────────────────\n'
+        + '% 本文件由 AI-Translator 的「PDF → LaTeX」自动生成（v2 Pass P75）。\n'
+        + '% 来源 PDF   ：' + job.pdfRelPath + '\n'
+        + '% 转换时间   ：' + ovlP2TLocalIso(new Date(job.startedAt)) + '\n'
+        + '% 视觉模型   ：' + job.endpoint + ' / ' + job.model + '\n'
+        + '% 逐页片段   ：pages/ 目录；重新拼装会整体覆盖本文件。\n'
+        + '% 失败页     ：' + failedListStr + '\n'
+        + '% ⚠ 机器转写结果，公式/表格/图注务必人工复核后再使用。\n'
+        + '% ─────────────────────────────────────────────────────────────\n'
+        + '\\documentclass[11pt]{article}\n'
+        + '\\usepackage[utf8]{inputenc}\n'
+        + '\\usepackage[T1]{fontenc}\n'
+        + '\\usepackage{textcomp}\n'
+        + '\\usepackage{lmodern}\n'
+        + '\\usepackage[margin=1in]{geometry}\n'
+        + '\\usepackage{amsmath,amssymb,amsfonts,mathtools}\n'
+        + '\\usepackage{graphicx}\n'
+        + '\\usepackage{booktabs,array,multirow,longtable,tabularx}\n'
+        + '\\usepackage{algorithm}\n'
+        + '\\usepackage[noend]{algpseudocode}\n'
+        + '\\usepackage{url}\n'
+        + '\\usepackage{hyperref}\n'
+        + '\\setlength{\\parskip}{0.4em}\n'
+        + '\\begin{document}\n\n';
+    let body = '';
+    const sorted = job.pages.slice().sort(function (a, b) { return a.num - b.num; });
+    sorted.forEach(function (p) {
+        body += '% ==== page ' + p.num + ' ====\n' + (p.fragment || '') + '\n\n';
+    });
+    return header + body + '\\end{document}\n';
+}
+
+function ovlP2TBuildReadme(job) {
+    const failedNums = job.pages.filter(function (p) { return p.state === 'failed'; }).map(function (p) { return p.num; });
+    const suspectNums = job.pages.filter(function (p) { return p.state === 'suspect'; }).map(function (p) { return p.num; });
+    const thinkFallbackNums = job.pages.filter(function (p) { return p.flags && p.flags.thinkCutFallback; }).map(function (p) { return p.num; });
+    let md = '# PDF → LaTeX 转换记录\n\n';
+    md += '- 来源 PDF：' + job.pdfRelPath + '\n';
+    md += '- 转换时间：' + ovlP2TLocalIso(new Date(job.startedAt)) + '\n';
+    md += '- 视觉模型：' + job.endpoint + ' / ' + job.model + '\n';
+    md += '- 总页数：' + job.total + '\n';
+    md += '- 失败页：' + (failedNums.length ? failedNums.join(', ') : '无') + '\n';
+    md += '- 可疑页（配平检查未通过，已保留 TODO 注释）：' + (suspectNums.length ? suspectNums.join(', ') : '无') + '\n';
+    if (thinkFallbackNums.length) md += '- <think> 非首位启发式剥离（已标记，见 pages/ 对应片段）：' + thinkFallbackNums.join(', ') + '\n';
+    md += '\n⚠ 机器转写结果，公式/表格/图注务必人工复核后再使用。\n';
+    return md;
+}
+
+async function ovlP2TReadExistingPageFragment(outRel, num) {
+    try {
+        const rel = outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex';
+        const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, rel);
+        const file = await resolved.handle.getFile();
+        const text = await file.text();
+        return (text && text.trim()) ? text : null;
+    } catch (e) { return null; }
+}
+
+async function ovlP2TUpdateMapAfterRun(job) {
+    try {
+        const failedNums = job.pages.filter(function (p) { return p.state === 'failed'; }).map(function (p) { return p.num; });
+        let mainMtimeMs = null;
+        try {
+            const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, job.outRel + '/main.tex');
+            const f = await resolved.handle.getFile();
+            mainMtimeMs = f.lastModified;
+        } catch (e) {}
+        ovlP2TMapSet(job.projectDir, job.pdfRelPath, {
+            pdf: job.pdfRelPath, out: job.outRel, size: job.pdfSize, mtimeMs: job.pdfMtimeMs,
+            mainMtimeMs: mainMtimeMs, pages: job.total, failed: failedNums,
+            model: job.model, endpoint: job.endpoint, at: Date.now(), pipeline: 1
+        });
+    } catch (e) { console.error('[ovl] p2t map update failed', e); }
+}
+
+// ---- §4.5 步骤 7：单页转换（渲染 → 写 PNG → 视觉请求 → 剥离/校验 → 写片段）----
+async function ovlP2TConvertOnePage(job, num) {
+    const pageState = job.pages[num - 1];
+    // v2 Pass P75 实测修复：只查 job.cancelled 不够——「取消」之后立刻「继续转换」会把
+    // job.cancelled 重新置回 false（ovlP2TRunPipeline 入口），这时一个还卡在渲染/编码阶段、
+    // 还没来得及碰到下面任何一个 job.cancelled 检查点的「旧」调用会突然以为自己没被取消，
+    // 跟「继续转换」重新发起的「新」调用并发抢同一页——两份视觉请求、两次写盘。
+    // per-page attempt token 解决：每次真正开始跑一页就换一个新 token 存回 pageState，
+    // 旧调用手里拿的还是旧 token，检查点比对「token 还是不是我发的那个」，不是就安静退出，
+    // 不需要 job.cancelled 是否被重置这件事本身保持一致。
+    const myToken = (pageState._token = (pageState._token || 0) + 1);
+    function stillCurrent() { return pageState._token === myToken && !job.cancelled; }
+    pageState.state = 'running';
+    pageState.flags = pageState.flags || {};
+    ovlP2TPanelRender();
+    const startedAt = Date.now();
+    let page = null;
+    try {
+        page = await job.doc.getPage(num);
+        const rendered = await ovlP2TRenderPageToPng(page, OvlSettings.pdf2texMaxPx);
+        if (!stillCurrent()) return;
+        const pngBytes = new Uint8Array(await rendered.pngBlob.arrayBuffer());
+        if (OvlSettings.pdf2texSavePageImages !== false) {
+            await ovlP2TWriteBinary(job.outRel + '/assets/pages/page-' + ovlP2TPad2(num) + '.png', pngBytes);
+        }
+        if (!stillCurrent()) return;
+        if (rendered.sentAsJpeg) pageState.flags.sentAsJpeg = true;
+        const dataUrl = await ovlP2TBlobToDataUrl(rendered.sendBlob);
+        const images = ['- assets/pages/page-' + ovlP2TPad2(num) + '.png   (the full page raster; use it ONLY if this page really contains a figure you cannot reproduce as LaTeX)'];
+        const userText = ovlP2TBuildUserText(job, num, images);
+        const controller = new AbortController();
+        job.aborts.add(controller);
+        let visionResult;
+        try {
+            visionResult = await ovlP2TCallVision(num, dataUrl, userText, controller.signal);
+        } finally {
+            job.aborts.delete(controller);
+        }
+        if (!stillCurrent()) return;
+        const ms = Date.now() - startedAt;
+        if (!visionResult.ok) {
+            pageState.state = 'failed';
+            pageState.reason = visionResult.error;
+            pageState.ms = ms;
+            pageState.fragment = ovlP2TFailurePlaceholder(num, visionResult.error);
+            await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment);
+            return;
+        }
+        const extracted = ovlP2TExtractLatex(visionResult.content);
+        if (!extracted.ok) {
+            pageState.state = 'failed';
+            pageState.reason = extracted.reason;
+            pageState.ms = ms;
+            pageState.fragment = ovlP2TFailurePlaceholder(num, extracted.reason);
+            await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment);
+            return;
+        }
+        pageState.state = extracted.flags.suspect ? 'suspect' : 'ok';
+        pageState.reason = null;
+        pageState.ms = ms;
+        pageState.chars = extracted.text.length;
+        pageState.flags = Object.assign(pageState.flags, extracted.flags);
+        pageState.fragment = extracted.text;
+        await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment);
+    } catch (e) {
+        console.error('[ovl] p2t convert page failed', num, e);
+        pageState.state = 'failed';
+        pageState.reason = '内部错误：' + (e && e.message ? e.message : String(e));
+        pageState.ms = Date.now() - startedAt;
+        pageState.fragment = ovlP2TFailurePlaceholder(num, pageState.reason);
+        try { await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment); } catch (e2) {}
+    } finally {
+        if (page && typeof page.cleanup === 'function') { try { page.cleanup(); } catch (e) {} }
+        ovlP2TPanelRender();
+    }
+}
+
+// ---- §4.5 管线：同一时刻只允许一个 job（OvlP2TState.running 闸门）----
+let OvlP2TState = { job: null, running: false, panelMinimized: false };
+
+async function ovlP2TRunPipeline(job) {
+    OvlP2TState.job = job;
+    OvlP2TState.running = true;
+    job.cancelled = false;
+    job.pages.forEach(function (p) { if (p.state === 'running') p.state = 'pending'; });
+    ovlP2TPanelShow();
+    try {
+        await ovlP2TMkdirp(job.outRel);
+        await ovlP2TWriteText(job.outRel + '/.gitignore', '*'); // 写入顺序硬性：mkdir 后立刻写 .gitignore
+        await ovlP2TMkdirp(job.outRel + '/pages');
+        await ovlP2TMkdirp(job.outRel + '/assets/pages');
+
+        // §4.5 步骤5：续跑判定——pages/page-NN.tex 已存在且非空就沿用，不重新请求
+        for (let i = 1; i <= job.total; i++) {
+            if (job.cancelled) break;
+            if (job.pages[i - 1].state !== 'pending') continue;
+            const already = await ovlP2TReadExistingPageFragment(job.outRel, i);
+            if (already) {
+                job.pages[i - 1].state = 'ok';
+                job.pages[i - 1].fragment = already;
+                job.pages[i - 1].reason = null;
+                job.pages[i - 1].flags = { resumed: true };
+            }
+        }
+        ovlP2TPanelRender();
+
+        // §4.5 步骤6：第一页单跑，吸收冷启动
+        if (!job.cancelled && job.pages[0] && job.pages[0].state === 'pending') {
+            await ovlP2TConvertOnePage(job, 1);
+        }
+        // §4.5 步骤7：其余页用大小为 concurrency 的池
+        const remaining = [];
+        for (let i = 2; i <= job.total; i++) { if (job.pages[i - 1].state === 'pending') remaining.push(i); }
+        const conc = Math.max(1, Math.min(4, job.concurrency || 2));
+        let idx = 0;
+        async function worker() {
+            while (idx < remaining.length) {
+                if (job.cancelled) return;
+                const num = remaining[idx++];
+                await ovlP2TConvertOnePage(job, num);
+            }
+        }
+        const workers = [];
+        for (let w = 0; w < conc; w++) workers.push(worker());
+        await Promise.all(workers);
+
+        if (job.cancelled) { ovlP2TPanelRender(); return; }
+
+        // §4.5 步骤8：拼装
+        const mainText = ovlP2TAssembleMain(job);
+        await ovlP2TWriteText(job.outRel + '/main.tex', mainText);
+        await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job));
+
+        // §4.5 步骤9：收尾——更新关联表 → 刷新文件树 → 打开 main.tex（白拿 code/visual/翻译缓存链路）
+        await ovlP2TUpdateMapAfterRun(job);
+        await ovlRenderTree(OvlState.dirHandle);
+        try {
+            const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, job.outRel + '/main.tex');
+            await ovlOpenFile(resolved.handle, resolved.name, resolved.parentHandle, job.outRel + '/main.tex');
+        } catch (e) { console.error('[ovl] p2t open result after run failed', e); }
+        job.finishedAt = Date.now();
+    } catch (e) {
+        console.error('[ovl] p2t pipeline failed', e);
+        job.pipelineError = (e && e.message) ? e.message : String(e);
+        if (typeof showToast === 'function') showToast('PDF→LaTeX 转换失败：' + job.pipelineError, 'error');
+    } finally {
+        OvlP2TState.running = false;
+        // v2 Pass P75 实测修复：这里原来无条件 job.doc.destroy()——但一次"取消"之后的
+        // "继续转换"、以及完成之后的"重试失败页"都要复用同一个 job.doc 重新 getPage()，
+        // 在这里销毁会让续跑/重试第二次直接内部报错（job.doc 变 null）、一次视觉请求都不发
+        // 就把页面判失败。doc 的生命周期跟"这个 job 还有没有可能被继续/重试"绑定，不是跟
+        // "这一次 runPipeline() 调用有没有跑完"绑定——真正的销毁时机收口到 ovlP2TDestroyJobDoc，
+        // 只在用户明确放弃这个 job（关闭面板/开始转换另一份 PDF）时调用，见该函数定义处。
+        ovlP2TPanelRender();
+    }
+}
+
+// job.doc（pdf.js 文档实例）只在这里销毁——调用点：面板"关闭"/"完成后关闭"清空
+// OvlP2TState.job 之前，以及开始一个新 job 顶替掉可能还留着旧 doc 的旧 job 之前。
+// 不在 ovlP2TRunPipeline 的 finally 里销毁（见上面注释），因为一次 runPipeline() 调用
+// 结束不代表这个 job 已经没用了——取消后继续、完成后重试失败页都要复用同一个 doc。
+async function ovlP2TDestroyJobDoc(job) {
+    if (!job || !job.doc) return;
+    try { await job.doc.destroy(); } catch (e) {}
+    job.doc = null;
+}
+
+function ovlP2TCancel() {
+    const job = OvlP2TState.job;
+    if (!job) return;
+    job.cancelled = true;
+    job.aborts.forEach(function (a) { try { a.abort(); } catch (e) {} });
+    job.pages.forEach(function (p) { if (p.state === 'running') p.state = 'pending'; });
+    ovlP2TPanelRender();
+}
+function ovlP2TContinue() {
+    const job = OvlP2TState.job;
+    if (!job || OvlP2TState.running) return;
+    ovlP2TRunPipeline(job);
+}
+
+// ---- §4.8c「重试失败页」：先做 mainEdited 判定，编辑过就先确认框，跑完重新拼装覆盖 main.tex ----
+async function ovlP2TRetryPages(nums) {
+    const job = OvlP2TState.job;
+    if (!job || !nums || !nums.length) return;
+    if (OvlP2TState.running) { if (typeof showToast === 'function') showToast('已有一个转换在进行中', 'error'); return; }
+    async function doRetry() {
+        OvlP2TState.running = true;
+        job.cancelled = false;
+        nums.forEach(function (n) { if (job.pages[n - 1]) job.pages[n - 1].state = 'pending'; });
+        ovlP2TPanelShow();
+        try {
+            for (let i = 0; i < nums.length; i++) {
+                if (job.cancelled) break;
+                await ovlP2TConvertOnePage(job, nums[i]);
+            }
+            if (!job.cancelled) {
+                await ovlP2TWriteText(job.outRel + '/main.tex', ovlP2TAssembleMain(job));
+                await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job));
+                await ovlP2TUpdateMapAfterRun(job);
+                job.finishedAt = Date.now();
+            }
+        } catch (e) {
+            console.error('[ovl] p2t retry pages failed', e);
+            if (typeof showToast === 'function') showToast('重试失败：' + (e && e.message ? e.message : String(e)), 'error');
+        } finally {
+            OvlP2TState.running = false;
+            ovlP2TPanelRender();
+        }
+    }
+    let mainEdited = false;
+    try {
+        const rec = ovlP2TMapGet(job.projectDir, job.pdfRelPath);
+        if (rec && typeof rec.mainMtimeMs === 'number') {
+            const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, job.outRel + '/main.tex');
+            const mf = await resolved.handle.getFile();
+            mainEdited = mf.lastModified !== rec.mainMtimeMs;
+        }
+    } catch (e) {}
+    if (mainEdited) {
+        ovlConfirmDialog({
+            title: '重试失败页',
+            message: 'main.tex 在上次转换之后被修改过。重试会重新拼装并整体覆盖它。确定继续？',
+            danger: true, confirmLabel: '覆盖并继续', onConfirm: doRetry
+        });
+    } else {
+        doRetry();
+    }
+}
+
+async function ovlP2TDeleteOutDir(job) {
+    const parts = String(job.outRel).replace(/\\/g, '/').split('/').filter(function (p) { return p && p !== '.'; });
+    const name = parts.pop();
+    let dir = OvlState.dirHandle;
+    for (let i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i]);
+    await dir.removeEntry(name, { recursive: true });
+    ovlP2TMapDelete(job.projectDir, job.pdfRelPath);
+}
+
+// ---- §4.5 步骤1-3：前置闸 + 读 PDF 字节 + 开独立 pdf.js 文档实例 ----
+async function ovlP2TBeginJob(entry, outRel) {
+    // 顶替掉可能还留着的上一个 job（用户没点面板「关闭」就直接开始转换另一份 PDF，或对
+    // 同一份 PDF 又点了一次「重新转换」）——它的 doc 这时才是真的没用了，在这里销毁。
+    if (OvlP2TState.job && OvlP2TState.job.doc) await ovlP2TDestroyJobDoc(OvlP2TState.job);
+    let file;
+    try { file = await entry.handle.getFile(); }
+    catch (e) { if (typeof showToast === 'function') showToast('读取 PDF 失败：' + (e && e.message ? e.message : String(e)), 'error'); return; }
+    let buf;
+    try { buf = await file.arrayBuffer(); }
+    catch (e) { if (typeof showToast === 'function') showToast('读取 PDF 字节失败：' + (e && e.message ? e.message : String(e)), 'error'); return; }
+    let doc;
+    try {
+        doc = await pdfjsLib.getDocument({ data: buf, isEvalSupported: false, isOffscreenCanvasSupported: false }).promise;
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('打开 PDF 文档失败：' + (e && e.message ? e.message : String(e)), 'error');
+        return;
+    }
+    const total = doc.numPages;
+    const pages = [];
+    for (let i = 1; i <= total; i++) pages.push({ num: i, state: 'pending', reason: null, ms: null, chars: null, flags: {}, fragment: '' });
+    const job = {
+        id: 'p2t-' + Date.now(),
+        projectDir: ovlRemoteProjectRoot(),
+        pdfRelPath: entry.relPath || entry.name,
+        pdfName: entry.name,
+        pdfSize: file.size,
+        pdfMtimeMs: file.lastModified,
+        outRel: outRel,
+        total: total,
+        concurrency: Math.max(1, Math.min(4, Number(OvlSettings.pdf2texConcurrency) || 2)),
+        model: (OvlSettings.pdf2texVisionModel || '').trim(),
+        endpoint: (OvlSettings.pdf2texVisionEndpoint || '').trim().replace(/\/+$/, ''),
+        pages: pages,
+        startedAt: Date.now(),
+        finishedAt: null,
+        cancelled: false,
+        pipelineError: null,
+        aborts: new Set(),
+        doc: doc
+    };
+    await ovlP2TRunPipeline(job);
+}
+
+// ---- 右键菜单/按钮三个入口 ----
+async function ovlP2TStartFromEntry(entry) {
+    if (OvlP2TState.running) { if (typeof showToast === 'function') showToast('已有一个转换在进行中', 'error'); return; }
+    if (OvlState.usingWebkitFallback) { if (typeof showToast === 'function') showToast('只读降级模式无法写入转换结果', 'error'); return; }
+    if (!OvlState.dirHandle) { if (typeof showToast === 'function') showToast('请先打开一个项目文件夹', 'error'); return; }
+    const picked = await ovlP2TAskOutputDir(entry);
+    if (!picked) return;
+    await ovlP2TBeginJob(entry, picked.outRel);
+}
+async function ovlP2TOpenResult(entry, resolveInfo) {
+    const info = resolveInfo || await ovlP2TResolve(entry);
+    if (!info.rec || !info.outExists) { if (typeof showToast === 'function') showToast('没有找到这个 PDF 的转换结果', 'error'); return; }
+    try {
+        const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, info.rec.out + '/main.tex');
+        await ovlOpenFile(resolved.handle, resolved.name, resolved.parentHandle, info.rec.out + '/main.tex');
+        if (info.changed) {
+            if (typeof showToast === 'function') showToast('源 PDF 已变化（大小/修改时间与上次转换时不同）。当前打开的是上次的转换结果，可在右键菜单选「重新转换」。', 'error');
+        } else if (typeof showToast === 'function') {
+            showToast('已关联上次转换结果（' + info.rec.pages + ' 页），右侧已打开 main.tex', 'info');
+        }
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('打开转换结果失败：' + (e && e.message ? e.message : String(e)), 'error');
+    }
+}
+async function ovlP2TRedo(entry) {
+    if (OvlP2TState.running) { if (typeof showToast === 'function') showToast('已有一个转换在进行中', 'error'); return; }
+    const info = await ovlP2TResolve(entry);
+    if (!info.rec) { await ovlP2TStartFromEntry(entry); return; }
+    function doRun() { ovlP2TBeginJob(entry, info.rec.out); }
+    if (info.mainEdited) {
+        ovlConfirmDialog({
+            title: '重新转换',
+            message: 'main.tex 在上次转换之后被修改过。重新转换会整体覆盖它（pages/ 片段与 assets/ 也会被覆盖）。确定继续？',
+            danger: true, confirmLabel: '覆盖并重新转换', onConfirm: doRun
+        });
+    } else { doRun(); }
+}
+// P72 → P75 对接钩子（spec §2）：typeof 保护，P72 没调也不影响右键菜单。
+async function ovlP2TNotifyPdfOpened(entry) {
+    try {
+        if (!entry || entry.isDir) return;
+        if (!/\.pdf$/i.test(entry.name || '')) return;
+        if (!OvlSettings.pdf2texAutoOpenResult) return;
+        if (OvlP2TState.running) return;
+        const info = await ovlP2TResolve(entry);
+        if (info.rec && info.outExists) await ovlP2TOpenResult(entry, info);
+    } catch (e) { console.error('[ovl] p2t notify pdf opened failed', e); }
+}
+window.ovlP2TNotifyPdfOpened = ovlP2TNotifyPdfOpened;
+window.ovlP2TStartFromEntry = ovlP2TStartFromEntry;
+window.ovlP2THasResult = ovlP2THasResult;
+window.ovlP2TRetryPages = ovlP2TRetryPages;
+
+// P72 遗留的「转换为 LaTeX」占位按钮（#ovlConvertToLatexBtn，直显 PDF 工具条）的真实实现：
+// direct 模式下点击 → 用当前直显的 PDF 走跟右键菜单完全一样的判定（有结果就打开/提示重新
+// 转换，没有就问保存位置）。
+async function ovlPdfConvertToLatex() {
+    if (OvlState.pdfSourceMode !== 'direct' || !OvlState.pdfDirectFile) {
+        if (typeof showToast === 'function') showToast('请先在文件树中直接打开一个 PDF', 'error');
+        return;
+    }
+    let entry;
+    try {
+        const rp = OvlState.pdfDirectFile.relPath || OvlState.pdfDirectFile.name;
+        const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, rp);
+        entry = { handle: resolved.handle, parentHandle: resolved.parentHandle, name: resolved.name, relPath: rp, isDir: false };
+    } catch (e) {
+        if (typeof showToast === 'function') showToast('找不到该 PDF 文件：' + (e && e.message ? e.message : String(e)), 'error');
+        return;
+    }
+    const info = await ovlP2TResolve(entry);
+    if (info.rec && info.outExists) await ovlP2TOpenResult(entry, info);
+    else await ovlP2TStartFromEntry(entry);
+}
+
+// ---- §4.8c 进度面板：非模态浮层，挂 #ovlP2TPanel（不占 #ovlModalOverlay 那个全应用唯一模态位）----
+function ovlP2TPanelShow() { OvlP2TState.panelMinimized = false; ovlP2TPanelRender(); }
+function ovlP2TPanelHide() {
+    const panel = document.getElementById('ovlP2TPanel'); if (panel) panel.hidden = true;
+    const pill = document.getElementById('ovlP2TPill'); if (pill) pill.hidden = true;
+}
+function ovlP2TPanelMinimize() { OvlP2TState.panelMinimized = true; ovlP2TPanelRender(); }
+
+function ovlP2TPanelRender() {
+    const panel = document.getElementById('ovlP2TPanel');
+    let pill = document.getElementById('ovlP2TPill');
+    const job = OvlP2TState.job;
+    if (!job) {
+        if (panel) { panel.hidden = true; panel.innerHTML = ''; }
+        if (pill) pill.hidden = true;
+        return;
+    }
+    const done = job.pages.filter(function (p) { return p.state !== 'pending' && p.state !== 'running'; }).length;
+    const total = job.total;
+    if (OvlP2TState.panelMinimized) {
+        if (panel) panel.hidden = true;
+        if (!pill) {
+            pill = document.createElement('div');
+            pill.className = 'ovl-p2t-pill';
+            pill.id = 'ovlP2TPill';
+            (document.getElementById('ovlPortal') || document.body).appendChild(pill);
+            pill.addEventListener('click', function () { OvlP2TState.panelMinimized = false; ovlP2TPanelRender(); });
+        }
+        pill.hidden = false;
+        pill.innerHTML = '<span class="ovl-p2t-pill-dot"></span><span>PDF→LaTeX ' + done + '/' + total + '</span>';
+        return;
+    }
+    if (pill) pill.hidden = true;
+    if (!panel) return;
+    panel.hidden = false;
+
+    const failedCount = job.pages.filter(function (p) { return p.state === 'failed'; }).length;
+    const running = OvlP2TState.running;
+    const cancelled = job.cancelled;
+    const finished = !!job.finishedAt;
+
+    let statusLine;
+    if (job.pipelineError) statusLine = '转换失败：' + escapeHtml(job.pipelineError);
+    else if (finished) statusLine = failedCount > 0 ? ('已完成，' + failedCount + ' 页失败（已用截图占位）') : '全部完成';
+    else if (cancelled) statusLine = '已取消';
+    else statusLine = '转换中…';
+
+    const elapsedS = Math.round((Date.now() - job.startedAt) / 1000);
+    let etaText = '';
+    if (running && !finished && !cancelled) {
+        const doneTimes = job.pages.map(function (p) { return p.ms; }).filter(function (ms) { return typeof ms === 'number'; });
+        if (doneTimes.length > 0) {
+            doneTimes.sort(function (a, b) { return a - b; });
+            const med = doneTimes[Math.floor(doneTimes.length / 2)];
+            const remaining = Math.max(0, total - done);
+            const conc = Math.max(1, job.concurrency || 1);
+            etaText = '预估剩余 ' + Math.round(Math.ceil(remaining / conc) * med / 1000) + ' 秒';
+        }
+    }
+
+    let html = '';
+    html += '<div class="ovl-p2t-head">';
+    html += '<div class="ovl-p2t-title">PDF → LaTeX 转换</div>';
+    html += '<button type="button" class="ovl-p2t-headbtn" data-p2t="min" title="最小化">&#8212;</button>';
+    html += '<button type="button" class="ovl-p2t-headbtn" data-p2t="close" title="关闭">&times;</button>';
+    html += '</div>';
+    html += '<div class="ovl-p2t-body">';
+    html += '<div class="ovl-p2t-meta">' + escapeHtml(job.pdfName) + ' &rarr; ' + escapeHtml(job.outRel) + '</div>';
+    html += '<div class="ovl-p2t-bar-track"><div class="ovl-p2t-bar-fill" style="width:' + Math.round(total ? (done / total * 100) : 0) + '%"></div></div>';
+    html += '<div class="ovl-p2t-progtext"><span>' + statusLine + '（' + done + '/' + total + ' 页）</span><span>已用时 ' + elapsedS + ' 秒' + (etaText ? '，' + etaText : '') + '</span></div>';
+    html += '<div class="ovl-p2t-grid">';
+    job.pages.forEach(function (p) {
+        let title = '第 ' + p.num + ' 页';
+        if (p.reason) title += '：' + p.reason;
+        if (p.ms) title += '（' + Math.round(p.ms / 1000) + 's）';
+        html += '<div class="ovl-p2t-chip" data-state="' + p.state + '" data-page="' + p.num + '" title="' + escapeAttr(title) + '">' + p.num + '</div>';
+    });
+    html += '</div></div>';
+    html += '<div class="ovl-p2t-actions">';
+    if (running && !finished) {
+        html += '<button type="button" class="ovl-modal-btn ovl-modal-btn-danger" data-p2t="cancel">取消</button>';
+    } else if (cancelled && !finished) {
+        html += '<button type="button" class="ovl-modal-btn ovl-modal-btn-primary" data-p2t="continue">继续转换</button>';
+        html += '<button type="button" class="ovl-modal-btn ovl-modal-btn-danger" data-p2t="deleteout">删除输出目录</button>';
+    } else if (finished) {
+        html += '<button type="button" class="ovl-modal-btn ovl-modal-btn-primary" data-p2t="openresult">打开结果</button>';
+        if (failedCount > 0) html += '<button type="button" class="ovl-modal-btn" data-p2t="retryfailed">重试失败页 (' + failedCount + ')</button>';
+        html += '<button type="button" class="ovl-modal-btn" data-p2t="showdir">显示输出目录</button>';
+        html += '<button type="button" class="ovl-modal-btn" data-p2t="closepanel">关闭</button>';
+    }
+    html += '</div>';
+    panel.innerHTML = html;
+}
+
+function ovlP2TBindPanel() {
+    const panel = document.getElementById('ovlP2TPanel');
+    if (!panel) return;
+    panel.addEventListener('click', function (e) {
+        const btn = e.target.closest('[data-p2t]');
+        if (!btn) return;
+        const action = btn.getAttribute('data-p2t');
+        const job = OvlP2TState.job;
+        if (action === 'min') { ovlP2TPanelMinimize(); return; }
+        if (action === 'close') {
+            if (OvlP2TState.running) {
+                ovlConfirmDialog({
+                    title: '取消转换？', message: '转换正在进行中，关闭面板会取消本次转换。已完成的页面会保留。',
+                    danger: true, confirmLabel: '取消转换',
+                    onConfirm: function () { ovlP2TCancel(); ovlP2TDestroyJobDoc(job); OvlP2TState.job = null; ovlP2TPanelRender(); }
+                });
+            } else { ovlP2TDestroyJobDoc(job); OvlP2TState.job = null; ovlP2TPanelRender(); }
+            return;
+        }
+        if (action === 'cancel') { ovlP2TCancel(); return; }
+        if (action === 'continue') { ovlP2TContinue(); return; }
+        if (action === 'closepanel') { ovlP2TDestroyJobDoc(job); OvlP2TState.job = null; ovlP2TPanelRender(); return; }
+        if (action === 'openresult') {
+            if (job) {
+                ovlResolveHandleForPath(OvlState.dirHandle, job.outRel + '/main.tex').then(function (resolved) {
+                    return ovlOpenFile(resolved.handle, resolved.name, resolved.parentHandle, job.outRel + '/main.tex');
+                }).catch(function (e) { if (typeof showToast === 'function') showToast('打开失败：' + (e && e.message ? e.message : String(e)), 'error'); });
+            }
+            return;
+        }
+        if (action === 'retryfailed') {
+            if (job) {
+                const nums = job.pages.filter(function (p) { return p.state === 'failed'; }).map(function (p) { return p.num; });
+                ovlP2TRetryPages(nums);
+            }
+            return;
+        }
+        if (action === 'showdir') {
+            if (typeof showToast === 'function') showToast('输出目录：' + (job ? job.outRel : ''), 'info');
+            return;
+        }
+        if (action === 'deleteout') {
+            if (!job) return;
+            ovlConfirmDialog({
+                title: '删除输出目录', message: '真的要删除「' + job.outRel + '」吗？已转换的页面会一起删掉，此操作不可撤销。',
+                danger: true, requireTyped: job.outRel.split('/').pop(), confirmLabel: '删除',
+                onConfirm: function () {
+                    ovlP2TDeleteOutDir(job).then(function () {
+                        return ovlP2TDestroyJobDoc(job);
+                    }).then(function () {
+                        OvlP2TState.job = null;
+                        ovlP2TPanelRender();
+                        return ovlRenderTree(OvlState.dirHandle);
+                    }).catch(function (e) { if (typeof showToast === 'function') showToast('删除失败：' + (e && e.message ? e.message : String(e)), 'error'); });
+                }
+            });
+            return;
+        }
+    });
+}
+
 // ---------------------------------------------------------------------------
 // 顶栏「克隆」按钮：POST /overleaf/clone（桥端 doOverleafClone，见
 // tools/latex-bridge/server.js）把一个新的 Overleaf 项目拉到本地。跟拉取/推送共用同一个
@@ -33685,7 +34927,16 @@ const OVL_SETTINGS_DEFAULTS = {
     ovlBridgeAddr: '',
     // 只有桥绑在非 127.0.0.1 地址时才会被真正校验（见 server.js REMOTE_MODE），本地默认
     // 用法不用填。明文存 localStorage，跟这个 App 里其它凭证同一种存法。
-    ovlBridgeToken: ''
+    ovlBridgeToken: '',
+    // ---- v2 Pass P75：PDF → LaTeX 转换（spec_pdf2tex.md §4.8d）----
+    pdf2texDefaultOutDir: 'converted',   // 相对项目根；每次转换仍会弹窗确认，这里只是预选值
+    pdf2texVisionEndpoint: 'http://100.98.164.17:1234/v1', // OpenAI 兼容端点，浏览器直连（不经过本机桥），见 probe_vision.md
+    pdf2texVisionModel: 'qwen3-vl-32b-thinking',
+    pdf2texConcurrency: 2,   // 1-4，调高不一定更快，本地模型多为串行
+    pdf2texMaxPx: 1800,      // 1200/1600/1800/2200，页面栅格最长边
+    pdf2texSavePageImages: true,  // 关掉省磁盘，但失败页只剩文字占位
+    pdf2texAutoOpenResult: true,  // 打开 PDF 时自动打开已有转换结果
+    pdf2texExtractImages: false   // M2 实验开关，spike 结论见 overnight_progress.md「## P75」
 };
 const OVL_FONT_FAMILIES = {
     'ovl-mono-default': '"SFMono-Regular", Consolas, "Courier New", monospace',
@@ -34304,7 +35555,68 @@ async function ovlBridgeTestConnection() {
     }
 }
 
-const OVL_SETTINGS_RENDERERS = { editor: ovlSettingsEditorHtml, spelling: ovlSettingsSpellingHtml, compiler: ovlSettingsCompilerHtml, appearance: ovlSettingsAppearanceHtml, translator: ovlSettingsTranslatorHtml, overleaf: ovlSettingsOverleafHtml, aimerge: ovlSettingsAiMergeHtml, bridge: ovlSettingsBridgeHtml };
+// v2 Pass P75（spec_pdf2tex.md §4.8d）：设置面板「PDF 转 LaTeX」分类。跟 ovlSettingsBridgeHtml
+// 同一套 ovlSetRow/data-setpath 惯例——除了「并发页数」「页面栅格最长边」两个 select 走
+// data-setpath 通用 change 处理（数值白名单已在 ovlBindSettingsModal 里补上），其余全部
+// data-setpath 通用接线，不用单独写事件绑定。
+function ovlSettingsPdf2TexHtml() {
+    const s = OvlSettings;
+    let html = '<div class="ovl-set-category-title">PDF 转 LaTeX</div>';
+    html += '<div class="ovl-set-banner">把一份 PDF 逐页转成可编辑、可编译的 LaTeX 源码：文件树右键 PDF → 「转换为 LaTeX」。'
+        + '视觉理解模型跑在 jump 机器上（LM Studio），浏览器直接连过去，不经过本机桥接服务。</div>';
+    html += ovlSetRow('默认保存位置', '<input type="text" id="ovlP2TDefaultOutDirInput" data-setpath="settings.pdf2texDefaultOutDir" style="width:220px" placeholder="converted" value="' + escapeAttr(s.pdf2texDefaultOutDir) + '">',
+        '相对项目根的目录；每次转换仍会弹窗确认保存位置，这里只是预选值。');
+    html += ovlSetRow('视觉模型服务地址', '<input type="text" id="ovlP2TEndpointInput" data-setpath="settings.pdf2texVisionEndpoint" style="width:260px" placeholder="http://100.98.164.17:1234/v1" value="' + escapeAttr(s.pdf2texVisionEndpoint) + '">',
+        'OpenAI 兼容端点（/chat/completions），浏览器直连，不经过本机桥；需要该服务对 file:// 页面开放 CORS（LM Studio 默认即可）。');
+    html += ovlSetRow('视觉模型', '<input type="text" id="ovlP2TModelInput" data-setpath="settings.pdf2texVisionModel" style="width:220px" placeholder="qwen3-vl-32b-thinking" value="' + escapeAttr(s.pdf2texVisionModel) + '">',
+        '要跟服务端实际加载的模型名一致；必须是真正支持图片输入的视觉模型。');
+    html += ovlSetRow('并发页数', '<select data-setpath="settings.pdf2texConcurrency">'
+        + [1, 2, 3, 4].map(function (n) { return ovlOptTag(n, String(n), s.pdf2texConcurrency); }).join('') + '</select>',
+        '同时在跑的页数。调高不一定更快——本地模型服务多为串行处理，第一页永远单独跑（吸收冷启动）。');
+    html += ovlSetRow('页面栅格最长边', '<select data-setpath="settings.pdf2texMaxPx">'
+        + [1200, 1600, 1800, 2200].map(function (n) { return ovlOptTag(n, n + ' px', s.pdf2texMaxPx); }).join('') + '</select>',
+        '喂给模型的页面截图分辨率。越大越清晰也越慢、请求体越大。');
+    html += ovlSetRow('保留页面截图', '<input type="checkbox" data-setpath="settings.pdf2texSavePageImages"' + (s.pdf2texSavePageImages ? ' checked' : '') + '>',
+        '关掉可以省磁盘（每篇论文页面截图约 6-12 MB），但转换失败的页面就只剩文字占位，没有整页截图兜底。');
+    html += ovlSetRow('打开 PDF 时自动打开已有转换结果', '<input type="checkbox" data-setpath="settings.pdf2texAutoOpenResult"' + (s.pdf2texAutoOpenResult ? ' checked' : '') + '>', '');
+    html += ovlSetRow('提取内嵌图片（实验）', '<input type="checkbox" id="ovlP2TExtractImagesChk" data-setpath="settings.pdf2texExtractImages"'
+        + (s.pdf2texExtractImages ? ' checked' : '') + (OVL_P2T_M2_AVAILABLE ? '' : ' disabled') + '>',
+        OVL_P2T_M2_AVAILABLE ? '尝试直接提取 PDF 里的内嵌位图，而不是整页截图当图源。' : '本机 pdf.js spike 未通过（详见 overnight_progress.md「## P75」），这个能力尚未实现，开关已禁用。');
+    html += ovlSetRow('连接测试', '<button type="button" class="ovl-modal-btn" onclick="ovlP2TTestVisionConnection()">测试连接</button>'
+        + '<span id="ovlP2TTestResult" class="ovl-p2t-testresult"></span>',
+        '按当前输入框里的地址真的打一次 GET <地址>/models，不需要先保存。');
+    return html;
+}
+// 三态结果，形状照抄 ovlBridgeTestConnection：测试中（灰）/ 成功（绿）/ 失败（红）。
+async function ovlP2TTestVisionConnection() {
+    const resultEl = document.getElementById('ovlP2TTestResult');
+    const endpointInput = document.getElementById('ovlP2TEndpointInput');
+    const endpoint = ((endpointInput && endpointInput.value) || '').trim().replace(/\/+$/, '');
+    if (!endpoint) {
+        if (resultEl) { resultEl.textContent = '✗ 请先填写服务地址'; resultEl.setAttribute('data-state', 'error'); }
+        return;
+    }
+    if (resultEl) { resultEl.textContent = '测试中…'; resultEl.removeAttribute('data-state'); }
+    try {
+        const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        const timer = ctl ? setTimeout(function () { ctl.abort(); }, 5000) : null;
+        const opts = ctl ? { signal: ctl.signal } : {};
+        const resp = await fetch(endpoint + '/models', opts);
+        if (timer) clearTimeout(timer);
+        if (!resp.ok) {
+            if (resultEl) { resultEl.textContent = '✗ 连上了，但响应异常（HTTP ' + resp.status + '）'; resultEl.setAttribute('data-state', 'error'); }
+            return;
+        }
+        let data = null;
+        try { data = await resp.json(); } catch (e) { data = null; }
+        const n = (data && Array.isArray(data.data)) ? data.data.length : null;
+        if (resultEl) { resultEl.textContent = '✓ 连接成功' + (n != null ? '（' + n + ' 个模型）' : ''); resultEl.setAttribute('data-state', 'ok'); }
+    } catch (e) {
+        if (resultEl) { resultEl.textContent = '✗ 连不上（地址错误 / 服务未启动 / 网络不通）'; resultEl.setAttribute('data-state', 'error'); }
+    }
+}
+
+const OVL_SETTINGS_RENDERERS = { editor: ovlSettingsEditorHtml, spelling: ovlSettingsSpellingHtml, compiler: ovlSettingsCompilerHtml, appearance: ovlSettingsAppearanceHtml, translator: ovlSettingsTranslatorHtml, overleaf: ovlSettingsOverleafHtml, aimerge: ovlSettingsAiMergeHtml, bridge: ovlSettingsBridgeHtml, pdf2tex: ovlSettingsPdf2TexHtml };
 
 function ovlSettingsModalHtml() {
     return ''
@@ -34320,6 +35632,7 @@ function ovlSettingsModalHtml() {
         +       '<div class="ovl-settings-navitem" data-cat="overleaf">Overleaf 同步</div>'
         +       '<div class="ovl-settings-navitem" data-cat="aimerge">AI 辅助合并</div>'
         +       '<div class="ovl-settings-navitem" data-cat="bridge">远程桥接</div>'
+        +       '<div class="ovl-settings-navitem" data-cat="pdf2tex">PDF 转 LaTeX</div>'
         +     '</div>'
         +     '<div class="ovl-settings-content" id="ovlSettingsContent"></div>'
         +   '</div>'
@@ -34378,7 +35691,8 @@ function ovlBindSettingsModal() {
         const parts = path.split('.');
         const store = parts[0] === 'compile' ? OvlCompileSettings : OvlSettings;
         let val = el.type === 'checkbox' ? el.checked : el.value;
-        if (path === 'settings.fontSize' || path === 'settings.tabSize' || path === 'settings.overleafAutoPullMinutes') val = Number(val);
+        if (path === 'settings.fontSize' || path === 'settings.tabSize' || path === 'settings.overleafAutoPullMinutes'
+            || path === 'settings.pdf2texConcurrency' || path === 'settings.pdf2texMaxPx') val = Number(val);
         store[parts[1]] = val;
         if (parts[0] === 'compile') { ovlSaveCompileSettings(); ovlUpdatePdfToolbarUI(); }
         else { ovlSaveSettings(); ovlApplySettings(); }
@@ -37887,6 +39201,7 @@ function ovlBindPassD() {
         const settingsBtn = document.getElementById('ovlSettingsBtn');
         if (settingsBtn) settingsBtn.addEventListener('click', ovlOpenSettings);
         ovlBindSettingsModal();
+        if (typeof ovlP2TBindPanel === 'function') ovlP2TBindPanel(); // v2 Pass P75：转换进度面板事件委托
         ovlBindTip2();
         ovlBindDropMenus();
         ovlBindMenuBar();
