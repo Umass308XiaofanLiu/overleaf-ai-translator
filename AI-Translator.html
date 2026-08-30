@@ -27182,8 +27182,9 @@ function ovlPaintCodeMarkOverlay() {
         const rowsLast = (OvlState.lineOffsets && OvlState.lineOffsets[OvlMarkState.lineTo])
             ? OvlState.lineOffsets[OvlMarkState.lineTo].rows : 1;
         const rowEnd = ovlVisualRowForLineIndex(OvlMarkState.lineTo) + rowsLast; // exclusive
-        const top = paddingTop + rowStart * OVL_LINE_H - ta.scrollTop;
-        const height = Math.max(OVL_LINE_H, (rowEnd - rowStart) * OVL_LINE_H);
+        const lineH = ovlCodeLineH();
+        const top = paddingTop + rowStart * lineH - ta.scrollTop;
+        const height = Math.max(lineH, (rowEnd - rowStart) * lineH);
         overlay.innerHTML = '<div class="ovl-mark-box" style="left:0;right:0;width:100%;top:'
             + top + 'px;height:' + height + 'px;"></div>';
     } catch (e) { console.error('[ovl] paintCodeMarkOverlay failed', e); }
@@ -27202,6 +27203,21 @@ function ovlPaintCodeMarkOverlay() {
 // 范围限定在"单行内命中"：命中跨越两个逻辑行（正则匹配到了换行符）要跨两个独立的 line-div
 // 拼接 Range，复杂度陡增，且多行命中本身用整行色带呈现也合理——ovlMarkRange 里直接判
 // lineFrom!==lineTo 就不进这个函数，退回行级。
+// v2 Pass P74 修复 BUG-1：.ovl-code-mirror 这个 CSS 类默认字号写死 12px（1734 行附近），
+// 两个离屏镜像（#ovlCodeMirror / #ovlCodeRangeMirror）过去从来没有把这个默认值覆盖成
+// #ovlCodeArea 当前真实的字号/字体/行高——字号一改，镜像还是按 12px 排版量字符宽度/行高，
+// 跟真实编辑器（已经是 16px）的实际渲染结果对不上，量出来的"这一行占几个视觉行"/"字符
+// 落在第几行第几像素"全部失真。用 font 简写一把梭同步 size/family/weight/line-height，
+// 每次拿镜像都现测现同步（字号可能刚被设置面板改过），不缓存判断"是不是变了"——反正后面
+// 紧跟着就是一次 getBoundingClientRect 布局读取，这一步 style 赋值的开销比不上。
+function ovlSyncMirrorFontToCodeArea(mirror) {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || !mirror) return;
+        mirror.style.font = getComputedStyle(ta).font;
+    } catch (e) {}
+}
+
 // 用独立的 #ovlCodeRangeMirror（不是 ovlGetCodeMirror 那个 #ovlCodeMirror）——避免跟
 // ovlRecomputeLineOffsetsChunked 正在进行的分片测量抢同一个容器：那个函数分片累积着挂在
 // #ovlCodeMirror 里的候选行 div，中途被这里的 mirror.textContent='' 清空会让它半路的
@@ -27215,6 +27231,7 @@ function ovlGetCodeRangeMirror() {
         mirror.className = 'ovl-code-mirror';
         document.body.appendChild(mirror);
     }
+    ovlSyncMirrorFontToCodeArea(mirror);
     return mirror;
 }
 
@@ -27247,7 +27264,7 @@ function ovlCodeMirrorMeasureRange(ta, lineIdx, startChar, endChar) {
         if (!rawRects.length) return null;
         const rowStartBase = ovlVisualRowForLineIndex(lineIdx);
         return rawRects.map(function (r) {
-            const localRow = Math.round((r.top - lineDivRect.top) / OVL_LINE_H);
+            const localRow = Math.round((r.top - lineDivRect.top) / ovlCodeLineH());
             return { row: rowStartBase + localRow, left: r.left - lineDivRect.left, width: r.width, height: r.height };
         });
     } catch (e) { console.error('[ovl] codeMirrorMeasureRange failed', e); return null; }
@@ -27266,13 +27283,14 @@ function ovlPaintCodeMarkRangeOverlay(boxes) {
         const paddingTop = 8, paddingLeft = 12; // .ovl-code-area 的 padding: 8px 12px（1591 行附近）
         const gutter = document.getElementById('ovlGutter');
         const gutterW = gutter ? gutter.getBoundingClientRect().width : 48;
+        const lineH = ovlCodeLineH();
         let html = '';
         for (let i = 0; i < boxes.length; i++) {
             const b = boxes[i];
-            const top = paddingTop + b.row * OVL_LINE_H - ta.scrollTop;
+            const top = paddingTop + b.row * lineH - ta.scrollTop;
             const left = gutterW + paddingLeft + b.left - ta.scrollLeft;
             html += '<div class="ovl-mark-box" style="left:' + left + 'px;top:' + top
-                + 'px;width:' + b.width + 'px;height:' + (b.height || OVL_LINE_H) + 'px;"></div>';
+                + 'px;width:' + b.width + 'px;height:' + (b.height || lineH) + 'px;"></div>';
         }
         overlay.innerHTML = html;
         return true;
@@ -27287,7 +27305,7 @@ function ovlMarkCenterCodeRange(boxes) {
         if (!ta || !boxes || !boxes.length) return;
         let rowMin = boxes[0].row, rowMax = boxes[0].row;
         for (let i = 1; i < boxes.length; i++) { rowMin = Math.min(rowMin, boxes[i].row); rowMax = Math.max(rowMax, boxes[i].row); }
-        const midPx = (rowMin + rowMax + 1) / 2 * OVL_LINE_H;
+        const midPx = (rowMin + rowMax + 1) / 2 * ovlCodeLineH();
         let target = midPx - ta.clientHeight / 2;
         const maxScroll = Math.max(0, ta.scrollHeight - ta.clientHeight);
         target = Math.max(0, Math.min(maxScroll, target));
@@ -27351,7 +27369,7 @@ function ovlMarkCenterCode(lineFrom, lineTo) {
         const rowStart = ovlVisualRowForLineIndex(lineFrom);
         const rowsLast = (OvlState.lineOffsets && OvlState.lineOffsets[lineTo]) ? OvlState.lineOffsets[lineTo].rows : 1;
         const rowEnd = ovlVisualRowForLineIndex(lineTo) + rowsLast;
-        const midPx = (rowStart + rowEnd) / 2 * OVL_LINE_H;
+        const midPx = (rowStart + rowEnd) / 2 * ovlCodeLineH();
         let target = midPx - ta.clientHeight / 2;
         const maxScroll = Math.max(0, ta.scrollHeight - ta.clientHeight);
         target = Math.max(0, Math.min(maxScroll, target));
@@ -27541,7 +27559,29 @@ function ovlBindMarkOverlayClearOnSelect() {
 //    （断词在哪个字符不好纯算，仍然要交给浏览器真排版）。main.tex 在 431px 下候选行只剩
 //    1,594 / 4,133（约 39%），总耗时降到 ~0.18s，且逐行跟纯 div 全量版本交叉验证零差异
 //    （见下面 ovlMeasureRowCount 的实现）。
-const OVL_LINE_H = 18; // 12px/1.5，跟 .ovl-code-area/.ovl-gutter 的 CSS font 是同一个常数
+// v2 Pass P74 修复 BUG-1（.claude/tmp/recon_ui_bugs.md）：原来这里是 `const OVL_LINE_H = 18`，
+// 硬编码 12px/1.5 的默认字号行高——字号一改（设置 → 编辑器 → 字号）这个假设就不成立，查找/
+// 标记高亮框、AI 聊天跳转、反向 SyncTeX 点击定位、gutter 拖拽依赖的行偏移表全部跟着错位
+// （16px 字号下实测 -38px）。改成一次性测量缓存：真的从 #ovlCodeArea 的 computed lineHeight
+// 现测，读到就缓存住（多数调用点是逐键/逐帧触发，不能每次都 getComputedStyle），
+// ovlApplySettings() 里字号/字体/行高任一变了就调 ovlInvalidateCodeLineH() 显式失效，
+// 下次读取会重新测量。量不出来（元素还没挂载等）退回旧默认值 18，不让调用方拿到 NaN/0
+// （NaN 会让后续所有行号/像素换算变成 NaN，比"用一个不精确的默认值"更糟）。
+let OvlCodeLineHCache = null;
+function ovlInvalidateCodeLineH() { OvlCodeLineHCache = null; }
+function ovlCodeLineH() {
+    if (OvlCodeLineHCache !== null) return OvlCodeLineHCache;
+    let lh = 18;
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (ta) {
+            const parsed = parseFloat(getComputedStyle(ta).lineHeight);
+            if (!isNaN(parsed) && parsed > 0) lh = parsed;
+        }
+    } catch (e) {}
+    OvlCodeLineHCache = lh;
+    return lh;
+}
 let OvlLineOffsetEditTimer = null;
 let OvlFocusTexTimer = null; // v2 Pass P8（§3.6）：ta input → focusNoteTexChanged 的 600ms 去抖
 
@@ -27553,6 +27593,7 @@ function ovlGetCodeMirror() {
         mirror.className = 'ovl-code-mirror';
         document.body.appendChild(mirror);
     }
+    ovlSyncMirrorFontToCodeArea(mirror); // v2 Pass P74：字号可变，见 ovlSyncMirrorFontToCodeArea 头部注释
     return mirror;
 }
 
@@ -27613,9 +27654,10 @@ function ovlRecomputeLineOffsets() {
 
         // 第四步：批量读——每个候选行 div 自己的高度 / 行高 = 占几个视觉行。读的是已经布局
         // 完成的块级盒子尺寸，是缓存读，不是在文本节点里现查字符位置。
+        const rowLineH = ovlCodeLineH();
         for (let k = 0; k < candidates.length; k++) {
             const h = rowEls[k].getBoundingClientRect().height;
-            offsets[candidates[k]] = { rows: Math.max(1, Math.round(h / OVL_LINE_H)), cumRows: 0 };
+            offsets[candidates[k]] = { rows: Math.max(1, Math.round(h / rowLineH)), cumRows: 0 };
         }
 
         // 第五步：补齐累计视觉行号（这一步只是纯数组遍历求前缀和，跟 DOM 无关，很便宜）。
@@ -27658,6 +27700,7 @@ function ovlRecomputeLineOffsetsChunked(onDone) {
         const charW = ovlMeasureCharWidth(mirror);
         const contentWidthPx = Math.max(0, mirror.clientWidth - 24);
         const charsPerRow = Math.max(1, Math.floor(contentWidthPx / charW));
+        const rowLineH = ovlCodeLineH();
         const offsets = new Array(lines.length);
         const candidates = [];
         for (let i = 0; i < lines.length; i++) {
@@ -27686,7 +27729,7 @@ function ovlRecomputeLineOffsetsChunked(onDone) {
                 mirror.appendChild(frag); // 这一片的批量写
                 for (let k = 0; k < rowEls.length; k++) { // 这一片的批量读，读写不交叉
                     const h = rowEls[k].getBoundingClientRect().height;
-                    offsets[candidates[pos + k]] = { rows: Math.max(1, Math.round(h / OVL_LINE_H)), cumRows: 0 };
+                    offsets[candidates[pos + k]] = { rows: Math.max(1, Math.round(h / rowLineH)), cumRows: 0 };
                 }
                 mirror.textContent = ''; // 量完这一片就清空，不让 mirror 跨帧越堆越大
             }
@@ -27738,7 +27781,7 @@ function ovlCodeTopVisibleLine() {
         if (!OvlState.lineOffsets || OvlState.lineOffsets.length !== n) ovlRecomputeLineOffsets();
         const offs = OvlState.lineOffsets;
         if (!offs || !offs.length) return -1;
-        const targetRow = ta.scrollTop / OVL_LINE_H;
+        const targetRow = ta.scrollTop / ovlCodeLineH();
         let lo = 0;
         for (let i = 0; i < offs.length; i++) {
             if (offs[i].cumRows <= targetRow) lo = i; else break;
@@ -27755,7 +27798,7 @@ function ovlCodeScrollToLine(line) {
         const ta = document.getElementById('ovlCodeArea');
         const gutter = document.getElementById('ovlGutter');
         if (!ta) return;
-        ta.scrollTop = Math.max(0, ovlVisualRowForLineIndex(line) * OVL_LINE_H);
+        ta.scrollTop = Math.max(0, ovlVisualRowForLineIndex(line) * ovlCodeLineH());
         if (gutter) gutter.scrollTop = ta.scrollTop;
     } catch (e) { console.error('[ovl] codeScrollToLine failed', e); }
 }
@@ -28875,6 +28918,16 @@ function ovlValidateProjectRenameName(name) {
     return null; // 合法
 }
 
+// v2 Pass P74（UX）：recon 报告实测发现，这个入口双击-打字-回车的观感很像"改标题"，但实际
+// 是真实的磁盘文件夹重命名（走 ovlOverleafRenameProject → 桥 POST /overleaf/rename-project），
+// 界面上原来没有任何提示——用户很容易低估它的破坏性（详见 .claude/tmp/recon_ui_bugs.md
+// "UX-1"）。这个入口是纯文本原地编辑，不是 ovlPromptDialog/ovlConfirmDialog 那种弹窗，没有
+// opts.label 那样的常驻说明位可用，改用悬停提示——hover 到项目名（双击触发点本身）和编辑态
+// 的输入框都能看到。不用 [data-tip]（那套纯 CSS 提示要求"同一元素上二选一"，会跟下面
+// textEl.title 里已经在用的完整路径提示冲突，见 218 行附近 data-tip 系统的头部注释），
+// 直接拼进原生 title，零新增 DOM、零新增 CSS。
+const OVL_TOPBAR_TITLE_RENAME_HINT = '双击可改名——将同时重命名磁盘上的项目文件夹';
+
 // 读 #ovlProjectPathInput 现算显示名——未打开项目时显示灰色占位并禁用双击（ovlTopbarTitleEnterEdit
 // 自己会因为拿不到路径直接 return）。ovlSetProjectPath 是所有改路径入口的统一收口，这里挂一次
 // 就覆盖了全部入口，不用逐个补。
@@ -28890,7 +28943,8 @@ function ovlTopbarTitleRefresh() {
             textEl.classList.add('ovl-topbar-title-empty');
         } else {
             textEl.textContent = ovlProjectHistoryBasename(p);
-            textEl.title = p; // 完整绝对路径，过长省略号截断的文字靠 title 补全
+            // 完整绝对路径（过长省略号截断的文字靠 title 补全）+ 磁盘操作提示，换行分隔。
+            textEl.title = p + '\n' + OVL_TOPBAR_TITLE_RENAME_HINT;
             textEl.classList.remove('ovl-topbar-title-empty');
         }
     } catch (e) {}
@@ -28909,6 +28963,7 @@ function ovlTopbarTitleEnterEdit() {
         if (!textEl || !inputEl) return;
         OvlTopbarTitleEditing = true;
         inputEl.value = ovlProjectHistoryBasename(p);
+        inputEl.title = OVL_TOPBAR_TITLE_RENAME_HINT; // 正在编辑时悬停输入框同样能看到磁盘操作提示
         textEl.style.display = 'none';
         inputEl.style.display = 'inline-block';
         inputEl.focus();
@@ -29812,7 +29867,8 @@ function ovlPromptDialog(opts) {
 }
 
 // ---- 确认弹窗（删除）：danger 配色；requireTyped 时要求把名字整个打出来才能点确认
-//      （§M9："文件夹删除要再多一道，把文件夹名字打出来"）。绝不用 window.confirm。----
+//      （§M9："文件夹删除要再多一道，把文件夹名字打出来"）。绝不用 window.confirm。
+//      v2 Pass P74 起 Enter=确认（disabled 时不生效）、Escape=取消，跟 ovlPromptDialog 一致。----
 function ovlConfirmDialog(opts) {
     const overlay = document.getElementById('ovlModalOverlay');
     if (!overlay) return;
@@ -29851,15 +29907,26 @@ function ovlConfirmDialog(opts) {
     let settled = false;
     function fireCancelOnce() { if (settled) return; settled = true; if (typeof opts.onCancel === 'function') { try { opts.onCancel(); } catch (e) { console.error('[ovl] confirm onCancel failed', e); } } }
     function close() { overlay.hidden = true; overlay.innerHTML = ''; document.removeEventListener('keydown', onKey); }
-    function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); close(); fireCancelOnce(); } }
-    if (input) input.addEventListener('input', function () { okBtn.disabled = (input.value !== opts.requireTyped); });
-    cancelBtn.addEventListener('click', function () { close(); fireCancelOnce(); });
-    okBtn.addEventListener('click', function () {
+    function doConfirm() {
         if (okBtn.disabled) return;
         settled = true;
         close();
         try { opts.onConfirm(); } catch (e) { console.error('[ovl] confirm onConfirm failed', e); }
-    });
+    }
+    // v2 Pass P74 修复 BUG-2（.claude/tmp/recon_ui_bugs.md）：这里原来只处理 Escape，跟同一套
+    // 弹窗体系里的姊妹弹窗 ovlPromptDialog（重命名/新建文件/新建文件夹）行为不一致——两者视觉
+    // 上完全同构（同一套 .ovl-modal 样式），用户几乎不可能靠外观意识到键盘行为不一样，实测复现：
+    // 打对文件夹名、按 Enter 没反应，还会级联卡住半透明遮罩吞掉后续点击（详见 recon 报告）。
+    // 补 Enter=确认，跟 ovlPromptDialog 的 onKey 同一个模式；requireTyped 且没打对时 doConfirm()
+    // 内部的 okBtn.disabled 检查会挡住，不会绕过"必须打对名字才能删"这道门。这里不影响
+    // Escape 分支——P69 聊天内联卡片"挂起确认时 Escape 优先关卡片、不关聊天窗"那套顺序
+    // （17916 行附近 ChatState.pendingConfirms 的处理）跟 ovlConfirmDialog 是两套独立的
+    // document keydown 监听器，先注册的（聊天面板绑定更早）先执行，这里只加 Enter 分支，
+    // 完全不碰 Escape 的判断逻辑，那套既有顺序不受影响。
+    function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); close(); fireCancelOnce(); } else if (e.key === 'Enter') { e.preventDefault(); doConfirm(); } }
+    if (input) input.addEventListener('input', function () { okBtn.disabled = (input.value !== opts.requireTyped); });
+    cancelBtn.addEventListener('click', function () { close(); fireCancelOnce(); });
+    okBtn.addEventListener('click', doConfirm);
     overlay.addEventListener('click', function (e) { if (e.target === overlay) { close(); fireCancelOnce(); } });
     document.addEventListener('keydown', onKey);
     if (input) setTimeout(function () { input.focus(); }, 0);
@@ -30095,7 +30162,7 @@ function ovlBuildOutline() {
                 const line = before.split('\n').length - 1;
                 // v2 Polish 2（Bug 2）：软换行下 line*18 不再等价于该行的像素位置，改用视觉行号
                 // （ovlVisualRowForLineIndex 里表过期会自己现算一次，见函数注释）。
-                taEl.scrollTop = Math.max(0, ovlVisualRowForLineIndex(line) * OVL_LINE_H - taEl.clientHeight / 2);
+                taEl.scrollTop = Math.max(0, ovlVisualRowForLineIndex(line) * ovlCodeLineH() - taEl.clientHeight / 2);
                 const gutter = document.getElementById('ovlGutter');
                 if (gutter) gutter.scrollTop = taEl.scrollTop;
             });
@@ -30403,7 +30470,7 @@ function ovlFindSelectCurrent() {
         } else {
             // 兜底②：两个都没定义（不该发生），至少保留最早的"贴顶滚动"不至于完全找不到。
             const lineFrom = ta.value.slice(0, r[0]).split('\n').length - 1;
-            ta.scrollTop = Math.max(0, ovlVisualRowForLineIndex(lineFrom) * OVL_LINE_H - ta.clientHeight / 2);
+            ta.scrollTop = Math.max(0, ovlVisualRowForLineIndex(lineFrom) * ovlCodeLineH() - ta.clientHeight / 2);
             const gutter = document.getElementById('ovlGutter');
             if (gutter) gutter.scrollTop = ta.scrollTop;
         }
@@ -33142,7 +33209,7 @@ function ovlLogJumpToLine(line) {
     const end = start + (lines[idx] ? lines[idx].length : 0);
     ta.focus();
     ta.setSelectionRange(start, end);
-    ta.scrollTop = Math.max(0, ovlVisualRowForLineIndex(idx) * OVL_LINE_H - ta.clientHeight / 2);
+    ta.scrollTop = Math.max(0, ovlVisualRowForLineIndex(idx) * ovlCodeLineH() - ta.clientHeight / 2);
     const gutter = document.getElementById('ovlGutter');
     if (gutter) gutter.scrollTop = ta.scrollTop;
     if (OvlState.logView) ovlToggleLogView(); // 跳过去是为了看代码，日志面板挡着就顺手切回去
@@ -33650,6 +33717,10 @@ function ovlApplySettings() {
             el.style.fontFamily = fontFamily;
             el.style.lineHeight = String(lh);
         });
+        // v2 Pass P74 修复 BUG-1：字号/字体/行高任一改变，ovlCodeLineH() 的缓存值必须失效重算，
+        // 否则接下来所有换算（查找/标记高亮框、AI 聊天跳转、反向 SyncTeX、outline 跳转……）
+        // 还在用旧字号量出来的行高，表现为"高亮框纹丝不动、真实文字整体下移"。
+        ovlInvalidateCodeLineH();
         if (ta) {
             // v2 Polish 2（Bug 2）：软换行不再是设置面板里的一个"开了会错位"的选项——现在
             // white-space:pre-wrap 是 .ovl-code-area 的固定 CSS（1249 行），gutter/三处跳转
@@ -33661,6 +33732,16 @@ function ovlApplySettings() {
             ta.lang = OvlSettings.spellLang;
             if (OvlSettings.editorTheme === 'dark') { ta.style.background = '#1e1e1e'; ta.style.color = '#d4d4d4'; }
             else { ta.style.background = ''; ta.style.color = ''; }
+            // v2 Pass P74 修复 BUG-1（续）：OvlState.lineOffsets（每逻辑行占几个视觉行）本身
+            // 也随字号/字体/tabSize 变化失真——ovlVisualRowForLineIndex 只在"逻辑行数变了"时
+            // 才会自动重算，字号变化不改变逻辑行数，所以这里必须显式强制重算一次，不能指望
+            // 它自己发现表过期。ta 不在 Code 模式可见（display:none）时 ovlRecomputeLineOffsets
+            // 会照旧短路返回 false（clientWidth<=0），等切回 Code 模式自然会再算一次。重算完
+            // 顺带重建 gutter（force:true，行数没变但每行占几个视觉行可能变了，续行空槽位数量
+            // 要跟着改）和已激活的查找/标记高亮框（没有激活的标记时是空操作，零开销）。
+            ovlRecomputeLineOffsets();
+            ovlRenderGutter(true);
+            if (typeof ovlScheduleMarkOverlay === 'function') ovlScheduleMarkOverlay();
         }
         if (gutter) {
             // v2 Pass P11：Visual 模式现在也用同一根 gutter（见 ovlSetEditorMode/
@@ -36740,9 +36821,11 @@ function ovlBindVisualGutterSelect() {
 }
 
 // Code 模式：把 textarea 里某个字符位置换算成屏幕像素坐标。复用既有的 .ovl-code-mirror +
-// ovlGetCodeMirror() 基础设施（§2.3.2），不建第二套测量系统。已知既有缺陷（改字号会让
-// lineOffsets/gutter 错位，见 ovlApplySettings 头部注释）本函数不假设 OVL_LINE_H 这个常量
-// 对得上当前字号——用 getComputedStyle(ta) 现测 font/lineHeight/padding，同步到 mirror 上。
+// ovlGetCodeMirror() 基础设施（§2.3.2），不建第二套测量系统。本函数一直不假设行高恒等于
+// 默认字号下的值——用 getComputedStyle(ta) 现测 font/lineHeight/padding，同步到 mirror 上；
+// v2 Pass P74 起 ovlGetCodeMirror() 自己也会同步字体（ovlSyncMirrorFontToCodeArea），
+// 且 ovlCodeLineH() 全局缓存也改成动态测量了，这里保留独立测量只是防御性冗余，不再是
+// 本文件里唯一"不假设字号"的例外实现。
 function ovlCodeSelectionRect(ta, pos) {
     try {
         const text = ta.value;
@@ -36755,7 +36838,7 @@ function ovlCodeSelectionRect(ta, pos) {
         const lineIdx = (text.slice(0, lineStart).match(/\n/g) || []).length;
 
         const cs = getComputedStyle(ta);
-        const lineH = parseFloat(cs.lineHeight) || OVL_LINE_H;
+        const lineH = parseFloat(cs.lineHeight) || ovlCodeLineH();
         const baseRow = (OvlState.lineOffsets && OvlState.lineOffsets[lineIdx])
             ? OvlState.lineOffsets[lineIdx].cumRows : lineIdx;
 
@@ -36788,7 +36871,7 @@ function ovlCodeSelectionRect(ta, pos) {
         // 兜底：量不出来就退化成 textarea 左上角，弹窗仍能显示，只是位置不准——
         // 比抛错让整个选词工具用不了好。
         const r = ta.getBoundingClientRect();
-        return { x: r.left + 12, y: r.top + 8, h: OVL_LINE_H };
+        return { x: r.left + 12, y: r.top + 8, h: ovlCodeLineH() };
     }
 }
 
