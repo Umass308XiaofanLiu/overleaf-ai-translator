@@ -34344,7 +34344,7 @@ async function ovlP2TBeginJob(entry, outRel) {
         pdfMtimeMs: file.lastModified,
         outRel: outRel,
         total: total,
-        concurrency: Math.max(1, Math.min(4, Number(OvlSettings.pdf2texConcurrency) || 2)),
+        concurrency: Math.max(1, Math.min(4, Number(OvlSettings.pdf2texConcurrency) || 3)),
         model: (OvlSettings.pdf2texVisionModel || '').trim(),
         endpoint: (OvlSettings.pdf2texVisionEndpoint || '').trim().replace(/\/+$/, ''),
         pages: pages,
@@ -35798,10 +35798,10 @@ const OVL_SETTINGS_DEFAULTS = {
     ovlBridgeToken: '',
     // ---- v2 Pass P75：PDF → LaTeX 转换（spec_pdf2tex.md §4.8d）----
     pdf2texDefaultOutDir: 'converted',   // 相对项目根；每次转换仍会弹窗确认，这里只是预选值
-    pdf2texVisionEndpoint: 'http://100.98.164.17:1234/v1', // OpenAI 兼容端点，浏览器直连（不经过本机桥），见 probe_vision.md
-    pdf2texVisionModel: 'qwen3-vl-32b-thinking',
-    pdf2texConcurrency: 2,   // 1-4，调高不一定更快，本地模型多为串行
-    pdf2texDisableThinking: false, // v2 Pass P83：关掉视觉模型思考链，更快但可能降质，见 ovlP2TCallVision 上方注释
+    pdf2texVisionEndpoint: 'http://100.98.164.17:1235/v1', // OpenAI 兼容端点，浏览器直连（不经过本机桥）；v2 Pass P84 切到 jump:1235（实测空闲），见 vision_benchmark.md
+    pdf2texVisionModel: 'qwen/qwen3.8-27b', // v2 Pass P84：四格矩阵实测 8/8 满分且指令遵循最稳，见 vision_benchmark.md
+    pdf2texConcurrency: 3,   // 1-4，调高不一定更快，本地模型多为串行；v2 Pass P84 默认提到 3
+    pdf2texDisableThinking: true, // v2 Pass P83：关掉视觉模型思考链，更快但可能降质，见 ovlP2TCallVision 上方注释；v2 Pass P84 实测两模型该任务 reasoning_tokens 恒为 0，默认关闭
     pdf2texMaxPx: 1800,      // 1200/1600/1800/2200，页面栅格最长边
     pdf2texSavePageImages: true,  // 关掉省磁盘，但失败页只剩文字占位
     pdf2texAutoOpenResult: true,  // 打开 PDF 时自动打开已有转换结果
@@ -35817,7 +35817,29 @@ let OvlSettings = Object.assign({}, OVL_SETTINGS_DEFAULTS);
 function ovlLoadSettings() {
     try {
         const raw = localStorage.getItem('ovl.settings');
-        if (raw) OvlSettings = Object.assign({}, OVL_SETTINGS_DEFAULTS, JSON.parse(raw));
+        if (raw) {
+            const parsed = JSON.parse(raw);
+            OvlSettings = Object.assign({}, OVL_SETTINGS_DEFAULTS, parsed);
+            // v2 Pass P84：PDF→LaTeX 视觉模型默认值切换（jump:1235 + qwen/qwen3.8-27b + 并发3）后的
+            // 一次性存量迁移——只有旧存档里的值恰好等于「切换前的旧默认值」才升级到新默认值；
+            // 只要用户手改过（值不等于旧默认），就绝不覆盖，尊重用户自定义。
+            const OVL_P84_OLD_DEFAULTS = {
+                pdf2texVisionEndpoint: 'http://100.98.164.17:1234/v1',
+                pdf2texVisionModel: 'qwen3-vl-32b-thinking',
+                pdf2texConcurrency: 2
+            };
+            const migrated = [];
+            ['pdf2texVisionEndpoint', 'pdf2texVisionModel', 'pdf2texConcurrency'].forEach(function (key) {
+                if (Object.prototype.hasOwnProperty.call(parsed, key) && parsed[key] === OVL_P84_OLD_DEFAULTS[key]) {
+                    OvlSettings[key] = OVL_SETTINGS_DEFAULTS[key];
+                    migrated.push(key);
+                }
+            });
+            if (migrated.length) {
+                console.info('[ovl] P84 一次性迁移 PDF→LaTeX 默认配置到新默认值：', migrated.join(', '));
+                ovlSaveSettings();
+            }
+        }
     } catch (e) { console.warn('[ovl] loadSettings failed', e); }
 }
 function ovlSaveSettings() {
@@ -36443,9 +36465,9 @@ function ovlSettingsPdf2TexHtml() {
         + '视觉理解模型跑在 jump 机器上（LM Studio），浏览器直接连过去，不经过本机桥接服务。</div>';
     html += ovlSetRow('默认保存位置', '<input type="text" id="ovlP2TDefaultOutDirInput" data-setpath="settings.pdf2texDefaultOutDir" style="width:220px" placeholder="converted" value="' + escapeAttr(s.pdf2texDefaultOutDir) + '">',
         '相对项目根的目录；每次转换仍会弹窗确认保存位置，这里只是预选值。');
-    html += ovlSetRow('视觉模型服务地址', '<input type="text" id="ovlP2TEndpointInput" data-setpath="settings.pdf2texVisionEndpoint" style="width:260px" placeholder="http://100.98.164.17:1234/v1" value="' + escapeAttr(s.pdf2texVisionEndpoint) + '">',
+    html += ovlSetRow('视觉模型服务地址', '<input type="text" id="ovlP2TEndpointInput" data-setpath="settings.pdf2texVisionEndpoint" style="width:260px" placeholder="http://100.98.164.17:1235/v1" value="' + escapeAttr(s.pdf2texVisionEndpoint) + '">',
         'OpenAI 兼容端点（/chat/completions），浏览器直连，不经过本机桥；需要该服务对 file:// 页面开放 CORS（LM Studio 默认即可）。');
-    html += ovlSetRow('视觉模型', '<input type="text" id="ovlP2TModelInput" data-setpath="settings.pdf2texVisionModel" style="width:220px" placeholder="qwen3-vl-32b-thinking" value="' + escapeAttr(s.pdf2texVisionModel) + '">',
+    html += ovlSetRow('视觉模型', '<input type="text" id="ovlP2TModelInput" data-setpath="settings.pdf2texVisionModel" style="width:220px" placeholder="qwen/qwen3.8-27b" value="' + escapeAttr(s.pdf2texVisionModel) + '">',
         '要跟服务端实际加载的模型名一致；必须是真正支持图片输入的视觉模型。');
     html += ovlSetRow('并发页数', '<select data-setpath="settings.pdf2texConcurrency">'
         + [1, 2, 3, 4].map(function (n) { return ovlOptTag(n, String(n), s.pdf2texConcurrency); }).join('') + '</select>',
