@@ -366,8 +366,9 @@ body.is-resizing-settings-modal * {
    行本身的 mb-2 / my-4 已经从 renderPairRow 里删掉，space-y-2 也已从两个内容盒删掉，
    所以行距只有这一个来源，滑块能一路调到 0。 */
 /* Pass Sel-Fill：Visual 选区描边框的颜色，跟 --pair-gap 共用这一个 :root（全文件唯一一处
-   真正声明的全局 CSS 变量集中地，--ovl-split-editor-fr/--ovl-split-pdf-fr 那两个是运行时
-   JS setProperty 写的、不在这里静态声明，不算）。用途见下面 .ovl-sel-box（约 1572 行）。 */
+   真正声明的全局 CSS 变量集中地，--ovl-split-left-fr/--ovl-split-right-fr（v2 Pass P82 改名，
+   原 --ovl-split-editor-fr/--ovl-split-pdf-fr）那两个是运行时 JS setProperty 写的、不在这里
+   静态声明，不算）。用途见下面 .ovl-sel-box（约 1572 行）。 */
 :root {
     --pair-gap: 8px;
     --ovl-sel-fill: rgba(59, 130, 246, 0.18);
@@ -1443,12 +1444,17 @@ body.ovl-shell-active #ovlShell { display: flex; }
     /* v2 Polish：编辑器/PDF 两栏中间插一条 6px 的拖拽分栏（#ovlColSplitter，只在 split
        视图下出现，见下面 .ovl-col-splitter 那几条）。比例存在这两个 CSS 变量里，JS 拖拽时
        只改这两个变量，不用整段重算 grid-template-columns 字符串。editor/pdf 单栏模式的
-       grid-template-columns 下面整条覆盖掉（3 栏、没有分栏轨道），跟这条基础规则无关。 */
-    grid-template-columns: 40px 188px var(--ovl-split-editor-fr, 1fr) 6px var(--ovl-split-pdf-fr, 1fr);
+       grid-template-columns 下面整条覆盖掉（3 栏、没有分栏轨道），跟这条基础规则无关。
+       v2 Pass P82：变量改按"视觉方位"命名（left/right 而不是 editor/pdf）——direct 模式下
+       两个面板会用 order 镜像互换视觉位置（见下面 [data-pdfleft="1"] 那组规则），这两个轨道
+       的宽度变量必须跟着"第 3 轨道=左侧内容列、第 5 轨道=右侧内容列"这个物理位置走，不能再
+       跟哪个面板绑死——真正的 editor/pdf 语义换算在 JS 里做（ovlColSplitterApplyRatio()），
+       这里只管两条轨道各自多宽。 */
+    grid-template-columns: 40px 188px var(--ovl-split-left-fr, 1fr) 6px var(--ovl-split-right-fr, 1fr);
     background: #2F3A4C;
     z-index: 1000;
 }
-.ovl-body[data-tree="collapsed"] { grid-template-columns: 40px 0px var(--ovl-split-editor-fr, 1fr) 6px var(--ovl-split-pdf-fr, 1fr); }
+.ovl-body[data-tree="collapsed"] { grid-template-columns: 40px 0px var(--ovl-split-left-fr, 1fr) 6px var(--ovl-split-right-fr, 1fr); }
 .ovl-body[data-view="editor"] { grid-template-columns: 40px 188px 1fr; }
 .ovl-body[data-view="editor"][data-tree="collapsed"] { grid-template-columns: 40px 0px 1fr; }
 .ovl-body[data-view="editor"] #ovlPdfPanel { display: none; }
@@ -1496,6 +1502,20 @@ body.ovl-shell-active #ovlShell { display: flex; }
 }
 .ovl-col-splitter:hover, .ovl-col-splitter.ovl-col-splitter-active { background: #495365; }
 .ovl-body[data-view="split"] .ovl-col-splitter { display: flex; }
+/* v2 Pass P82：PDF 阅读模式镜像布局——用户原始需求原话"直接点击打开的 pdf 显示在左侧……
+   一键转换为 latex 后右侧显示 code/visual 的 latex 代码显示器，这个设计是为了和正常模式下
+   左侧显示 latex 右侧显示 pdf 做出区分"。#ovlBody[data-pdfleft="1"] 由 ovlUpdatePdfToolbarUI()
+   跟 OvlState.pdfSourceMode==='direct' 同步维护（见该函数），只在 direct 模式的 split 视图下
+   生效——编译模式（compiled）、单栏模式（editor-only/pdf-only 只显示一块，没有"左右"可言）
+   都不受影响。只用 CSS order 换 3 个 grid 子项（PDF 面板/分栏手柄/编辑器面板）的视觉顺序，
+   不碰 DOM 结构——分栏拖拽方向判断（ovlColSplitterBeginDrag）、查找栏/覆盖层等一切依赖
+   "元素是不是嵌在 #ovlEditorPanel/#ovlPdfPanel 内部"的既有代码天然不用改，只是随父级一起
+   挪了位置。三个 order 值故意分开写（0/1/2）而不是只标记 pdf/editor 两端——分栏手柄必须显式
+   卡在中间（order:1），否则它会用默认 order:0 跟 PDF 面板打平局，按源码顺序排到 PDF 前面，
+   变成"手柄-PDF-编辑器"这种手柄跑到最左边的错误顺序。 */
+.ovl-body[data-view="split"][data-pdfleft="1"] #ovlPdfPanel { order: 0; }
+.ovl-body[data-view="split"][data-pdfleft="1"] .ovl-col-splitter { order: 1; }
+.ovl-body[data-view="split"][data-pdfleft="1"] #ovlEditorPanel { order: 2; }
 body[data-ovl-splitdrag] { cursor: col-resize !important; user-select: none !important; }
 body[data-ovl-splitdrag] * { user-select: none !important; }
 
@@ -23988,8 +24008,10 @@ function ovlSetViewMode(mode, opts) {
 }
 
 // ==================== v2 Polish：编辑器/PDF 拖拽分栏 ====================
-// 只调两个 CSS 变量（--ovl-split-editor-fr / --ovl-split-pdf-fr），不碰 grid-template-columns
-// 整串字符串——同一条 fr 单位的比例在窗口 resize 时自动保持，不用另外挂 resize 监听器。
+// 只调两个 CSS 变量（--ovl-split-left-fr / --ovl-split-right-fr，v2 Pass P82 从
+// --ovl-split-editor-fr/--ovl-split-pdf-fr 改按视觉方位命名，见 ovlColSplitterApplyRatio
+// 注释），不碰 grid-template-columns 整串字符串——同一条 fr 单位的比例在窗口 resize 时
+// 自动保持，不用另外挂 resize 监听器。
 // 比例只存内存（OvlState.splitEditorFr/splitPdfFr），刷新页面复位，符合任务"session 内
 // 即可，跨刷新是 nice-to-have"的要求。
 const OVL_SPLIT_MIN_COL = 260; // 两边各自的最小宽度，小于这个就不好用了（编辑器放不下几个字/PDF 看不清）
@@ -23998,8 +24020,15 @@ let OvlSplitActiveEnd = null;  // 跟 ovlWinBeginDrag 同一纪律：有拖拽�
 function ovlColSplitterApplyRatio() {
     const body = document.getElementById('ovlBody');
     if (!body) return;
-    body.style.setProperty('--ovl-split-editor-fr', OvlState.splitEditorFr.toFixed(4) + 'fr');
-    body.style.setProperty('--ovl-split-pdf-fr', OvlState.splitPdfFr.toFixed(4) + 'fr');
+    // v2 Pass P82：OvlState.splitEditorFr/splitPdfFr 的语义不变（"编辑器面板/PDF 面板各自
+    // 该占多宽"），但 grid 的第 3/5 轨道现在是"左侧内容列/右侧内容列"（镜像时靠 CSS order
+    // 换了谁在哪一列，见 [data-pdfleft="1"] 那组规则），轨道变量必须按当前是否镜像换算成
+    // 左右，不能再无条件把 editorFr 写死进第 3 轨道——direct 模式下第 3 轨道视觉上是 PDF。
+    const mirrored = body.getAttribute('data-pdfleft') === '1';
+    const leftFr = mirrored ? OvlState.splitPdfFr : OvlState.splitEditorFr;
+    const rightFr = mirrored ? OvlState.splitEditorFr : OvlState.splitPdfFr;
+    body.style.setProperty('--ovl-split-left-fr', leftFr.toFixed(4) + 'fr');
+    body.style.setProperty('--ovl-split-right-fr', rightFr.toFixed(4) + 'fr');
 }
 
 function ovlColSplitterEndActive() {
@@ -24019,8 +24048,16 @@ function ovlColSplitterBeginDrag(ev) {
         const startX = (typeof ev.clientX === 'number') ? ev.clientX : 0;
         // 拖拽期间窗口不太可能同时被 resize，起手量一次总宽度就够（跟 ovlWinBeginDrag 的
         // start 快照是同一个思路：算增量，不是每帧重新量全部祖先）。
-        const availW = editorPanel.getBoundingClientRect().width + pdfPanel.getBoundingClientRect().width;
-        const startEditorW = editorPanel.getBoundingClientRect().width;
+        const editorRectAtStart = editorPanel.getBoundingClientRect();
+        const pdfRectAtStart = pdfPanel.getBoundingClientRect();
+        const availW = editorRectAtStart.width + pdfRectAtStart.width;
+        const startEditorW = editorRectAtStart.width;
+        // v2 Pass P82：direct 模式下整个 split 布局左右镜像（PDF 在左、编辑器在右，见
+        // #ovlBody[data-pdfleft="1"] 那组 CSS order 规则），"鼠标右移=编辑器变宽"这个假设
+        // 只在正常（非镜像）顺序下成立。不猜测/不读 OvlState.pdfSourceMode，直接读拖拽起手
+        // 那一刻两个面板的真实屏幕坐标判断谁在左边——跟"编译永远是权威动作"同一条纪律：
+        // 信真实 DOM 几何，不信状态位（哪怕将来又多一种镜像触发条件，这里也不用跟着改）。
+        const editorIsLeft = editorRectAtStart.left <= pdfRectAtStart.left;
         const pid = ev.pointerId;
         let finished = false;
 
@@ -24055,7 +24092,10 @@ function ovlColSplitterBeginDrag(ev) {
             try {
                 if (e.buttons === 0) { onUp(); return; } // 兜底 pointerup 丢失，跟 ovlWinBeginDrag 修复5同一条
                 const dx = (typeof e.clientX === 'number' ? e.clientX : startX) - startX;
-                const rawEditorW = startEditorW + dx;
+                // v2 Pass P82：镜像时（editorIsLeft===false）鼠标右移是在让左边的 PDF 面板变宽、
+                // 编辑器变窄——换算成"编辑器宽度增量"要取负号，clamp/比例换算逻辑本身不变。
+                const editorDelta = editorIsLeft ? dx : -dx;
+                const rawEditorW = startEditorW + editorDelta;
                 const clampedEditorW = Math.max(OVL_SPLIT_MIN_COL, Math.min(availW - OVL_SPLIT_MIN_COL, rawEditorW));
                 schedule(clampedEditorW / availW);
             } catch (err) {
@@ -24079,7 +24119,7 @@ function ovlColSplitterBeginDrag(ev) {
             rafId = 0;
             flush(); // 落盘前把攒着的那一帧写进去，快拖一下松手不能丢最后一帧
             // v2 Polish 2（Bug 2）：拖分栏结束 = 编辑器列宽定了，重算软换行点。用防抖而不是
-            // 立刻算，是因为 flush() 里的 DOM 写（--ovl-split-editor-fr）到布局真正稳定之间
+            // 立刻算，是因为 flush() 里的 DOM 写（--ovl-split-left-fr/--ovl-split-right-fr）到布局真正稳定之间
             // 隔着一次浏览器重排，150ms 留够这个余量（跟 window resize 用同一个数字，同一条纪律）。
             ovlScheduleLineOffsetRecompute(150);
         }
@@ -31433,6 +31473,15 @@ function ovlUpdatePdfToolbarUI() {
     // 永远是权威动作"的既定哲学矛盾。改正：Recompile/编译选项按钮不再受 isDirect 影响，只按
     // 桥在线/编译中判断（原有逻辑），isDirect 只影响真正依赖 lastCompile 数据的控件。
     const isDirect = OvlState.pdfSourceMode === 'direct';
+    // v2 Pass P82：direct 模式镜像布局的唯一同步点——本函数已经是 pdfSourceMode 每次变化
+    // （进入 direct/编译开始/编译结束/切项目重置）之后都会调用的收敛点（见函数上方各调用
+    // 处的注释），不用在每个改 pdfSourceMode 的地方各自补一遍。CSS 只认这个属性，见
+    // #ovlBody[data-view="split"][data-pdfleft="1"] 那组镜像规则。
+    const mirrorBodyEl = document.getElementById('ovlBody');
+    if (mirrorBodyEl) {
+        if (isDirect) mirrorBodyEl.setAttribute('data-pdfleft', '1');
+        else mirrorBodyEl.removeAttribute('data-pdfleft');
+    }
     if (btn) {
         btn.disabled = !online || OvlState.compiling;
         btn.textContent = OvlState.compiling ? '编译中…' : 'Recompile';
