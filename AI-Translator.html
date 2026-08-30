@@ -7226,7 +7226,15 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
     } catch (e) { effortSent = ''; }
 
     // 构建endpoint - 直接使用/v1/chat/completions
-    const endpoint = `${baseUrl.replace(/\/$/, "")}/v1/chat/completions`;
+    // v2 Pass P81：baseUrl 先归一成 ORIGIN 再拼（跟 xportCapsOrigin/xportFetchCaps 同一套
+    // 归一逻辑，见该函数上方注释）。根因实测：用户按本仓库文档惯例把地址配成
+    // "http://host:1235/v1"（含尾部 /v1，jump provider 的标准写法）时，不归一直接拼会
+    // 变成 "/v1/v1/chat/completions"——jump 侧 LM Studio 对这个路径返回
+    // {"error":"Unexpected endpoint or method."}，readLocalChoice 从这个错误体里读不到
+    // choices，拿到的是空字符串，一路传导到上层被当成"翻译失败/未翻译"。这不是模型指令
+    // 遵循问题，也不是"回显"——是 URL 拼接没有跟 xportCapsOrigin 一样做归一化，两条端点
+    // 构建路径各自为政留下的口子。归一后不管用户写不写尾部 /v1 都能命中真实端点。
+    const endpoint = `${xportCapsOrigin(baseUrl)}/v1/chat/completions`;
 
     try {
         let response = await fetch(endpoint, {
@@ -7299,7 +7307,9 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
 // 获取本地模型列表
 async function fetchLocalModels(baseUrl) {
     // 直接使用/v1/models端点，不设置Content-Type（GET请求不需要）
-    const endpoint = `${baseUrl.replace(/\/$/, "")}/v1/models`;
+    // v2 Pass P81：同 callLocalLLM，baseUrl 先经 xportCapsOrigin 归一，避免用户配成
+    // "http://host:1235/v1" 时拼成 "/v1/v1/models" 404。
+    const endpoint = `${xportCapsOrigin(baseUrl)}/v1/models`;
 
     try {
         const response = await fetch(endpoint);
@@ -26057,12 +26067,71 @@ function ovlVisualNothingToTranslate(maskedText) {
         .trim() === '';
 }
 
+// ==================== v2 Pass P81：回显防毒守卫 ====================
+// 背景（P78 curl 实测记录）：jump 本地模型阵容更换后，现行生产翻译 prompt 在个别模型/
+// 状态下会把源文本原样回显、完全不翻译——这种失败**不会**被 xportBlockOk / ovlVisualCodeCheck
+// 抓到，因为占位符本来就没被动过、"完整性"意义上完全合格，唯一不对的是"正文压根没翻"。
+// 比较位置刻意选在**遮罩后**的 masked.text（发给模型的英文）对 body（模型吐回来的原始
+// 文本，还没解遮罩）——而不是比较最终解遮罩后的 src/译文：一个数学/引用密集的块，
+// 解遮罩后源文本和正确译文本来就会因为大段公式源码逐字相同而"看起来很像"，那是掩码设计
+// 的必然结果、不是回显；只有在遮罩层（占位符之外全是自然语言）比对，"没翻"和"翻了但公式多"
+// 才分得开。
+function ovlVisualNormalizeForEcho(s) {
+    return String(s == null ? '' : s).replace(/\s+/g, '');
+}
+// 短文本用的字符级编辑距离相似度（O(n*m)，滚动数组）。单块文本通常几十到几百字，这个
+// 体量下枚举法足够快，不需要近似算法；超大块（罕见）截断到前 2000 字比较，宁可低估
+// 相似度也不要为了这一守卫拖慢主链路。
+function ovlVisualCharSimilarity(a, b) {
+    a = String(a == null ? '' : a);
+    b = String(b == null ? '' : b);
+    if (!a.length && !b.length) return 1;
+    if (!a.length || !b.length) return 0;
+    if (a.length * b.length > 4000000) { a = a.slice(0, 2000); b = b.slice(0, 2000); }
+    let prev = new Array(b.length + 1);
+    for (let j = 0; j <= b.length; j++) prev[j] = j;
+    for (let i = 1; i <= a.length; i++) {
+        const cur = new Array(b.length + 1);
+        cur[0] = i;
+        for (let j = 1; j <= b.length; j++) {
+            cur[j] = (a[i - 1] === b[j - 1]) ? prev[j - 1] : 1 + Math.min(prev[j - 1], prev[j], cur[j - 1]);
+        }
+        prev = cur;
+    }
+    const dist = prev[b.length];
+    return 1 - (dist / Math.max(a.length, b.length));
+}
+const OVL_VISUAL_ECHO_SIMILARITY_THRESHOLD = 0.92;
+// maskedSrc：发给模型的遮罩后英文原文；rawBody：模型返回、trim 后、还没解遮罩的文本。
+// 去空白后完全相等 = 最强信号，直接判定；否则算字符相似度，≥ 阈值同样判定为回显。
+function ovlVisualIsEchoFailure(maskedSrc, rawBody) {
+    const a = ovlVisualNormalizeForEcho(maskedSrc);
+    const b = ovlVisualNormalizeForEcho(rawBody);
+    if (!a || !b) return false; // 空值交给已有的其它校验路径处理，不归这个守卫管
+    if (a === b) return true;
+    return ovlVisualCharSimilarity(a, b) >= OVL_VISUAL_ECHO_SIMILARITY_THRESHOLD;
+}
+// 并发 worker（最多 3 个）同时踩雷时不刷屏：同一批失败只弹一条 toast。
+let ovlVisualEchoToastAt = 0;
+function ovlVisualEchoToastOnce() {
+    try {
+        const now = Date.now();
+        if (now - ovlVisualEchoToastAt < 2000) return;
+        ovlVisualEchoToastAt = now;
+        if (typeof showToast === 'function') {
+            showToast('翻译结果与原文几乎一样，判定为未翻译成功，已跳过（不会写入缓存）', 'error');
+        }
+    } catch (e) {}
+}
+
 // ---- 单块翻译：代码层掩码 -> 公式/引用层掩码 -> 调模型 -> 两层各自校验 -> 两层各自还原 ----
 // 契约：纯公式/纯代码块（两层掩码后没有可翻的字）原样返回，不占请求；xportBlockOk 校验
 // 不过直接 throw（沿用 P38 既有行为，调用方 ovlVisualLangRunQueue 会标记这一块失败、
 // 不写入缓存、不阻塞其它块）；本层新增的哨兵校验不过则不 throw——直接回退返回原文
 // 并 console.warn，因为这类失败的正确表现是"当作没翻译过"而不是"标记失败等重试"，
-// 绝不能把带哨兵残渣的文本显示给用户。
+// 绝不能把带哨兵残渣的文本显示给用户。P81 新增的回显守卫走的是"标记失败"这条路
+// （不是"回退原文"）——回显是模型没干活，不是"翻译完但某层哨兵没对上"，让它跟其它
+// 真失败一样进 data-ovl-trans-failed、不写缓存，用户能看见失败态、可以重试。
 async function ovlVisualTranslateBlockText(text, config, signal) {
     const src = String(text == null ? '' : text);
     if (!src.trim()) return src;
@@ -26076,10 +26145,16 @@ async function ovlVisualTranslateBlockText(text, config, signal) {
         + '不得改动括号或数字——它们代表被抽走的代码/伪代码/逐字环境，请把每一个都当成一个不可拆分的'
         + '单词对待，直接嵌进对应的译文位置。\n'
         + '3) 只输出翻译结果本身，不要添加任何解释、前后缀、引号或 Markdown 代码块标记。\n'
-        + '4) 保持原文的意思和语气，译成通顺准确的简体中文学术书面语。\n\n'
+        + '4) 保持原文的意思和语气，译成通顺准确的简体中文学术书面语。\n'
+        + '5) 必须真正翻译成中文——禁止原样照抄或复述英文原文，译文里的自然语言部分不应包含未翻译的'
+        + '英文单词或句子（专有名词、缩写、变量名等确实无法翻译的除外）。\n\n'
         + '原文：\n' + masked.text;
     const raw = await callModelPlainText(prompt, config, signal);
     const body = (typeof raw === 'string') ? raw.trim() : '';
+    if (ovlVisualIsEchoFailure(masked.text, body)) {
+        ovlVisualEchoToastOnce();
+        throw new Error('翻译结果与原文几乎相同，判定为未翻译成功（回显防毒守卫拦截）');
+    }
     if (!xportBlockOk(body, masked.map)) {
         throw new Error('翻译结果未通过完整性校验（占位符或公式被改动）');
     }
