@@ -32602,6 +32602,13 @@ let OVL_P2T_M2_AVAILABLE = true;
 
 const OVL_P2T_TIMEOUT_MS = 240000; // 冷启动实测 153s + 余量（probe_vision.md §5）
 
+// v2 Pass P79 加固：真实 jump 复验（P75 progress §3）实测第 2 页失败——模型只输出了未闭合
+// 的 <think>，怀疑 max_tokens=3072 被推理过程吃满，正文根本没轮到输出。命中"截断信号"
+// （finish_reason==='length'，或抽取结果是空/纯思考）就按阶梯升 max_tokens 重跑同一页，
+// 直至封顶；这跟 §5.2 的"可疑页重跑"是两套独立触发条件，互相去重，不叠加放大调用量。
+const OVL_P2T_MAXTOKENS_BASE = 3072; // §4.3 原值
+const OVL_P2T_MAXTOKENS_LADDER = [8192, 16384, 24576]; // 逐档升级，24576 封顶
+
 // ---- §4.3 逐页 prompt（英文，理由：LaTeX 宏名与"只输出源码"这类约束，Qwen-VL 系列对英文
 // 指令遵循率更高，规格已明确这是可调项）。用数组 + join('\n') 而不是模板字符串，避免大段
 // 反斜杠转义混进模板字符串的转义规则里出错——LaTeX 宏名里的反斜杠在这里全部手动转义成 \\。
@@ -33010,13 +33017,15 @@ async function ovlP2TRenderPageToPng(page, maxPx) {
 }
 
 // ---- §4.5「全应用唯一发视觉请求的地方」：不经过 ovlBridgeFetch（不是桥请求）。----
-async function ovlP2TCallVision(pageNum, dataUrl, userText, extSignal) {
+async function ovlP2TCallVision(pageNum, dataUrl, userText, extSignal, maxTokensOverride) {
     const endpoint = (OvlSettings.pdf2texVisionEndpoint || '').trim().replace(/\/+$/, '');
     if (!endpoint) return { ok: false, error: '未配置视觉模型服务地址（见设置 → PDF 转 LaTeX）', retryable: false };
     const model = (OvlSettings.pdf2texVisionModel || '').trim();
     if (!model) return { ok: false, error: '未配置视觉模型（见设置 → PDF 转 LaTeX）', retryable: false };
+    // v2 Pass P79：maxTokensOverride 由阶梯重试外壳传入，未传时回落原值 3072（§4.3）。
+    const effMaxTokens = (typeof maxTokensOverride === 'number' && maxTokensOverride > 0) ? maxTokensOverride : OVL_P2T_MAXTOKENS_BASE;
     const bodyText = JSON.stringify({
-        model: model, temperature: 0.1, max_tokens: 3072, stream: false,
+        model: model, temperature: 0.1, max_tokens: effMaxTokens, stream: false,
         messages: [
             { role: 'system', content: OVL_P2T_SYSTEM_PROMPT },
             { role: 'user', content: [ { type: 'text', text: userText }, { type: 'image_url', image_url: { url: dataUrl } } ] }
@@ -33056,7 +33065,10 @@ async function ovlP2TCallVision(pageNum, dataUrl, userText, extSignal) {
             const content = data && data.choices && data.choices[0] && data.choices[0].message && typeof data.choices[0].message.content === 'string'
                 ? data.choices[0].message.content : null;
             if (content === null) return { ok: false, error: '视觉模型服务返回格式不符合预期（缺少 choices[0].message.content）', ms: ms, httpStatus: resp.status, retryable: true };
-            return { ok: true, content: content, ms: ms, httpStatus: resp.status };
+            // v2 Pass P79：finish_reason==='length' 是"被截断"最直接的信号（LM Studio/OpenAI
+            // 兼容服务都会给），供上层阶梯重试外壳判定要不要换更大 max_tokens 重跑本页。
+            const finishReason = (data.choices[0] && data.choices[0].finish_reason) || null;
+            return { ok: true, content: content, ms: ms, httpStatus: resp.status, finishReason: finishReason, maxTokensUsed: effMaxTokens };
         } finally {
             clearTimeout(timeoutId);
             if (extAbortHandler) extSignal.removeEventListener('abort', extAbortHandler);
@@ -33095,26 +33107,104 @@ function ovlP2TExtractLatex(raw) {
         return { ok: false, text: '', reason: '模型输出了完整的文档前导但没有 \\begin{document}（疑似跑飞）', flags: flags };
     }
     let suspect = false;
+    const suspectReasons = []; // v2 Pass P79：给 §5.2 自动重跑的 follow-up prompt 用的具体项
     const envCounts = {};
     let m;
     const beginRe = /\\begin\{([a-zA-Z*]+)\}/g;
     while ((m = beginRe.exec(text))) envCounts[m[1]] = (envCounts[m[1]] || 0) + 1;
     const endRe = /\\end\{([a-zA-Z*]+)\}/g;
     while ((m = endRe.exec(text))) envCounts[m[1]] = (envCounts[m[1]] || 0) - 1;
-    Object.keys(envCounts).forEach(function (k) { if (envCounts[k] !== 0) suspect = true; });
+    Object.keys(envCounts).forEach(function (k) { if (envCounts[k] !== 0) { suspect = true; suspectReasons.push('\\' + k + '{} environment tags are unbalanced'); } });
     let dollarCount = 0;
     for (let i = 0; i < text.length; i++) {
         if (text[i] === '\\') { i++; continue; }
         if (text[i] === '$') dollarCount++;
     }
-    if (dollarCount % 2 !== 0) suspect = true;
+    if (dollarCount % 2 !== 0) { suspect = true; suspectReasons.push('unescaped $ math delimiters appear an odd number of times'); }
+    // v2 Pass P79（§5.2 第1条）：tabular 弱二次校验——同一张表里每行 & 数量是否一致。
+    // 只标记不修：\hline/\toprule 等纯规则行没有 & 天然跳过，用众数（首行）当基准。
+    const tabularRe = /\\begin\{(tabular\*?|tabularx|longtable)\}(?:\{[^}]*\})?\{[^}]*\}([\s\S]*?)\\end\{\1\}/g;
+    let tm;
+    while ((tm = tabularRe.exec(text))) {
+        const rows = tm[2].split('\\\\').map(function (r) { return r.trim(); })
+            .filter(function (r) { return r && !/^\\(hline|toprule|midrule|bottomrule|cline)\b/.test(r); });
+        if (rows.length < 2) continue;
+        const counts = rows.map(function (r) {
+            let cnt = 0;
+            for (let i = 0; i < r.length; i++) { if (r[i] === '\\') { i++; continue; } if (r[i] === '&') cnt++; }
+            return cnt;
+        });
+        if (counts.some(function (c) { return c !== counts[0]; })) {
+            suspect = true;
+            suspectReasons.push('tabular row cell (&) counts are inconsistent');
+        }
+    }
     if (suspect) {
         text = '% TODO(pdf2tex): 本页环境/数学定界符可能未配平，请人工检查\n' + text;
         flags.suspect = true;
+        flags.suspectReasons = suspectReasons;
     }
     text = text.trim();
     if (!text) return { ok: false, text: '', reason: '模型返回了空正文', flags: flags };
     return { ok: true, text: text, reason: null, flags: flags };
+}
+
+// v2 Pass P79：判定"截断/被 <think> 吃满"信号——命中就该换更大 max_tokens 重跑，
+// 跟"模型输出格式不对"（走 ovlP2TCallVision 自身已有的 5xx/超时重试，同 max_tokens 重来）
+// 是两回事，不要混用。三个具体信号：finish_reason==='length'；抽取判定为"只有思考、没
+// 正文"；抽取判定为"<think> 未闭合"（这两条 extractLatex 判定的原因字符串是固定的，见上）。
+function ovlP2TIsTruncationSignal(visionResult, extracted) {
+    if (visionResult && visionResult.ok && visionResult.finishReason === 'length') return true;
+    if (extracted && extracted.ok === false) {
+        const r = extracted.reason;
+        if (r === '模型只输出了思考、没有正文' || r === '模型输出包含未闭合的 <think> 标签') return true;
+    }
+    return false;
+}
+
+// v2 Pass P79：max_tokens 阶梯重试外壳——单页命中"截断信号"才升档重跑（3072 → 8192 →
+// 16384 → 24576，逐档，24576 封顶），别的失败原因（网络错误/5xx/JSON 解析失败等）已经在
+// ovlP2TCallVision 内部按原逻辑处理，这里不管，第一档没命中截断信号就直接返回。
+// P75 真实 jump 复验实测触发场景：3072 档 <think> 未闭合 → 升到更高档后正文才输出完整。
+async function ovlP2TCallVisionLadder(pageState, num, dataUrl, userText, signal) {
+    const rungs = [OVL_P2T_MAXTOKENS_BASE].concat(OVL_P2T_MAXTOKENS_LADDER);
+    let visionResult = null, extracted = null, attempts = 0, finalMaxTokens = rungs[0];
+    for (let i = 0; i < rungs.length; i++) {
+        attempts++;
+        finalMaxTokens = rungs[i];
+        visionResult = await ovlP2TCallVision(num, dataUrl, userText, signal, rungs[i]);
+        if (signal && signal.aborted) break;
+        extracted = visionResult.ok ? ovlP2TExtractLatex(visionResult.content) : null;
+        if (!ovlP2TIsTruncationSignal(visionResult, extracted)) break; // 没命中截断信号：成功/普通失败都到此为止
+        if (i === rungs.length - 1) break; // 已经封顶，没有更高档位可升了——按最后一次结果计
+    }
+    if (attempts > 1) {
+        pageState.flags = pageState.flags || {};
+        pageState.flags.maxTokensLadderAttempts = attempts;
+        pageState.flags.maxTokensLadderFinal = finalMaxTokens;
+    }
+    return { visionResult: visionResult, extracted: extracted, maxTokensUsed: finalMaxTokens, attempts: attempts };
+}
+
+// ---- §5.2 第2条：可疑页自动重跑一次 ----
+// 触发条件：extractLatex 判定 ok 但 flags.suspect（配平/tabular 弱校验没过）。
+// 与 max_tokens 阶梯去重：这一页如果已经因为"截断信号"被升档重跑过
+// （pageState.flags.maxTokensLadderAttempts > 1），就不再叠加这次重跑——直接保留当前
+// suspect 结果，避免一页最多打到"阶梯 3 次 + suspect 1 次"这种放大调用量的组合。
+// 第二次请求用跟第一次相同的 max_tokens（不是继续升档——可疑不是截断，不该用截断那套档位）。
+async function ovlP2TMaybeRerunSuspect(pageState, num, dataUrl, userText, maxTokensUsed, signal, extracted) {
+    if (!extracted || !extracted.ok || !extracted.flags || !extracted.flags.suspect) return extracted;
+    if (pageState.flags && pageState.flags.maxTokensLadderAttempts > 1) return extracted; // 去重：已经因截断重跑过
+    const detail = (extracted.flags.suspectReasons && extracted.flags.suspectReasons.length)
+        ? extracted.flags.suspectReasons.join('; ') : 'LaTeX environment/math delimiters look unbalanced';
+    const followUpText = userText + '\n\nYour previous attempt for this page produced unbalanced LaTeX (' + detail + '). Fix it and output the corrected fragment only.';
+    const retryResult = await ovlP2TCallVision(num, dataUrl, followUpText, signal, maxTokensUsed);
+    if (pageState.flags) pageState.flags.suspectRerun = true; else pageState.flags = { suspectRerun: true };
+    if (!retryResult.ok) return extracted; // 重跑请求本身失败——保留第一次的可疑结果，不因重跑失败而降级成 failed
+    const retryExtracted = ovlP2TExtractLatex(retryResult.content);
+    if (!retryExtracted.ok) return extracted; // 第二次反而抽取失败——同样保留第一次结果，不用坏结果覆盖能用的结果
+    // spec §5.2：两次都可疑 → 保留第二次结果并保持黄色 chip（不管第二次是否仍 suspect，都是"最终结果"）
+    return retryExtracted;
 }
 
 // ---- §4.7 失败页占位片段 ----
@@ -33186,6 +33276,13 @@ function ovlP2TBuildReadme(job) {
     md += '- 失败页：' + (failedNums.length ? failedNums.join(', ') : '无') + '\n';
     md += '- 可疑页（配平检查未通过，已保留 TODO 注释）：' + (suspectNums.length ? suspectNums.join(', ') : '无') + '\n';
     if (thinkFallbackNums.length) md += '- <think> 非首位启发式剥离（已标记，见 pages/ 对应片段）：' + thinkFallbackNums.join(', ') + '\n';
+    // v2 Pass P79：max_tokens 阶梯重试 / §5.2 可疑页重跑各自触发了哪些页，如实记录（两者
+    // 互相去重，一页不会同时出现在两条里——见 ovlP2TMaybeRerunSuspect 的去重判断）。
+    const ladderNums = job.pages.filter(function (p) { return p.flags && p.flags.maxTokensLadderAttempts > 1; })
+        .map(function (p) { return p.num + '（打了 ' + p.flags.maxTokensLadderAttempts + ' 次，最终 max_tokens=' + p.flags.maxTokensLadderFinal + '）'; });
+    if (ladderNums.length) md += '- max_tokens 阶梯重试触发（首次疑似被 <think> 推理吃满配额）：' + ladderNums.join(', ') + '\n';
+    const suspectRerunNums = job.pages.filter(function (p) { return p.flags && p.flags.suspectRerun; }).map(function (p) { return p.num; });
+    if (suspectRerunNums.length) md += '- 可疑页自动重跑一次（§5.2，保留第二次结果）：' + suspectRerunNums.join(', ') + '\n';
     // M2（§5.1）：每页图片来源——真的提取到内嵌位图 vs 降级回整页截图，两条都如实记录。
     if (OVL_P2T_M2_AVAILABLE && OvlSettings.pdf2texExtractImages) {
         const extractedNums = job.pages.filter(function (p) { return p.flags && p.flags.imagesExtracted; })
@@ -33372,9 +33469,17 @@ async function ovlP2TConvertOnePage(job, num) {
         const userText = ovlP2TBuildUserText(job, num, images);
         const controller = new AbortController();
         job.aborts.add(controller);
-        let visionResult;
+        let visionResult, extracted;
         try {
-            visionResult = await ovlP2TCallVision(num, dataUrl, userText, controller.signal);
+            // v2 Pass P79：原本直发一次 ovlP2TCallVision + ovlP2TExtractLatex，换成阶梯外壳
+            // （命中截断信号才会真的多打请求，正常页跟以前一样只打 1 次）。
+            const ladder = await ovlP2TCallVisionLadder(pageState, num, dataUrl, userText, controller.signal);
+            visionResult = ladder.visionResult;
+            extracted = ladder.extracted;
+            // §5.2 第2条：可疑页自动重跑一次（内部已跟上面的阶梯重试去重）。
+            if (visionResult && visionResult.ok && extracted && extracted.ok && extracted.flags.suspect) {
+                extracted = await ovlP2TMaybeRerunSuspect(pageState, num, dataUrl, userText, ladder.maxTokensUsed, controller.signal, extracted);
+            }
         } finally {
             job.aborts.delete(controller);
         }
@@ -33388,7 +33493,6 @@ async function ovlP2TConvertOnePage(job, num) {
             await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment);
             return;
         }
-        const extracted = ovlP2TExtractLatex(visionResult.content);
         if (!extracted.ok) {
             pageState.state = 'failed';
             pageState.reason = extracted.reason;
@@ -33401,7 +33505,7 @@ async function ovlP2TConvertOnePage(job, num) {
         pageState.reason = null;
         pageState.ms = ms;
         pageState.chars = extracted.text.length;
-        pageState.flags = Object.assign(pageState.flags, extracted.flags);
+        pageState.flags = Object.assign(pageState.flags || {}, extracted.flags);
         pageState.fragment = extracted.text;
         await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment);
     } catch (e) {
