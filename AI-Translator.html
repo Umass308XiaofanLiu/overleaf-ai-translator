@@ -18553,7 +18553,11 @@ const CHAT_AGENT_SINGLE_READ_MAX_BYTES = 200 * 1024;  // 同上，字节上限�
 // 文本协议、同一个 chatAgentRunLoop 主循环，唯一的区别是执行前必须弹 ovlConfirmDialog 拿到用户
 // 逐次确认（见 chatAgentExecWriteTool），绝不提供"这次会话全部允许"之类的批量豁免。
 const CHAT_AGENT_WRITE_TOOLS = ['write_file', 'mkdir', 'move', 'copy', 'delete'];
-const CHAT_AGENT_TOOLS = ['list_dir', 'read_file'].concat(CHAT_AGENT_WRITE_TOOLS);
+// v2 Pass P78（H4）：再补两个"诊断/修 Visual 中文预览渲染错误"专用工具——跟上面 fs 工具是
+// 两条独立能力线（不经过桥的 /fs/*，直接读写页面自己的 OvlVisualLangState / ovlVisualTransCache*），
+// read_block_translation 只读、retranslate_block 会改翻译缓存（需要确认，见 chatAgentExecRetranslateBlock）。
+const CHAT_AGENT_ZH_TOOLS = ['read_block_translation', 'retranslate_block'];
+const CHAT_AGENT_TOOLS = ['list_dir', 'read_file'].concat(CHAT_AGENT_WRITE_TOOLS).concat(CHAT_AGENT_ZH_TOOLS);
 
 // 项目绝对路径：跟 Overleaf 面板"项目绝对路径"输入框共用同一个 DOM 元素（ovlDoRecompile 等
 // 处已有的取法），不新起第二套配置。
@@ -18603,7 +18607,7 @@ function chatAgentToolsSystemBlock() {
         else if (readiness.reason === 'stale-bridge') why = '连着的桥接服务版本过旧（不支持文件操作接口），需要用户重启本地桥接服务';
         return '\n【文件读取工具】这一轮不可用（' + why + '）。'
             + '不要输出 ==TOOL== 块，只能根据上面已经给到你的内容回答，也不要假装自己读过或改过任何'
-            + '没有出现在这段对话里的文件。\n';
+            + '没有出现在这段对话里的文件。\n' + chatAgentZhToolsSystemBlock();
     }
     return '\n【文件读取工具】用户关注的那句话（如果有的话）只是一个起点——需要的话，你可以主动'
         + '读取甚至修改用户项目文件夹里的文件：它的上下文、它 \\ref/\\cite 指向的定义、supp.tex 等'
@@ -18634,7 +18638,39 @@ function chatAgentToolsSystemBlock() {
         + '能直接回答的问题不要绕远路先读文件，更不要没被要求就主动改文件。\n'
         + '5. 不需要工具的时候，正常按 ==CHAT== 格式回答，不要输出空的或试探性的工具块。\n'
         + '6. 写工具执行前用户会看到一个确认弹窗（列出确切路径、受影响的文件清单），你不需要、也没有'
-        + '办法替用户点这个确认——每次调用写工具都会真的弹一次，不存在"用户已经同意过了所以这次不用问"。\n';
+        + '办法替用户点这个确认——每次调用写工具都会真的弹一次，不存在"用户已经同意过了所以这次不用问"。\n'
+        + chatAgentZhToolsSystemBlock();
+}
+
+// v2 Pass P78（H4）：AI 聊天代理诊断/修 Visual 中文预览模式渲染错误的两个工具——跟上面的文件
+// 读写工具是两条独立能力线：不依赖编译桥/项目绝对路径，只依赖"当前页面正处在 Visual + 中文
+// 预览模式"这个前提（chatAgentZhBlockReadiness()），所以哪怕上面文件工具因为没连桥而不可用，
+// 这两个工具的可用性也要独立判断、独立提示，不能被 fs 分支的早退 return 一起噤声。
+function chatAgentZhToolsSystemBlock() {
+    let zhReady;
+    try { zhReady = chatAgentZhBlockReadiness(); } catch (e) { zhReady = { ready: false, reason: 'no-pane' }; }
+    if (!zhReady.ready) {
+        const why = zhReady.reason === 'not-visual' ? '当前不在 Visual 预览模式'
+            : zhReady.reason === 'not-zh' ? '当前 Visual 显示语言是"原文"而不是"中文"'
+            : '找不到 Visual 预览面板';
+        return '\n【中文渲染诊断工具】这一轮不可用（' + why + '）。不要输出 name=read_block_translation'
+            + ' 或 name=retranslate_block 的 ==TOOL== 块。\n';
+    }
+    return '\n【中文渲染诊断工具】专门用来诊断/修复 Visual 中文预览模式下某一块显示不对的问题'
+        + '（比如公式渲不出来、译文明显错误、术语不一致、原文残留没翻）。块按当前屏幕上从上到下的'
+        + '顺序编号，从 0 开始（第一块是 0）。\n'
+        + '只读：\n'
+        + '  · read_block_translation —— 读取某一块的源 LaTeX 片段和它当前渲染出来的中文文本，诊断用。'
+        + '参数：{"blockIndex": 0}（整数，0-based）\n'
+        + '会改动翻译缓存（执行前会先弹一张确认卡片让用户确认，跟写文件工具同一套确认机制）：\n'
+        + '  · retranslate_block —— 使该块当前的翻译缓存失效并重新调用模型翻译（走既有的中文懒翻译'
+        + '队列，不是另开一条翻译路径），用来修复确认过确实翻错/渲染错的块。参数：{"blockIndex": 0}，'
+        + '可选 "reason"（一句话说明为什么要重译，会显示在确认卡片里给用户看）\n'
+        + '调用格式跟上面文件工具完全一样，例如：\n'
+        + '==TOOL name=read_block_translation==\n{"blockIndex":2}\n==TOOLEND==\n'
+        + '规则：先用 read_block_translation 看清楚问题所在，确认确实是翻译/渲染问题（而不是原文本身'
+        + '有歧义、或者只是用户理解有误）之后，才调用 retranslate_block；不要没看过就直接重译，也不要'
+        + '连续对同一块重译多次而不看结果。\n';
 }
 
 // 解析模型这一轮的回复是不是一个工具调用。跟 chatParseEnvelope 同一套"取第一个终止符"纪律，
@@ -18681,6 +18717,12 @@ function chatAgentParseToolCall(raw) {
     }
     if (name === 'delete' && (typeof args.path !== 'string' || !args.path)) {
         out.malformed = true; out.reason = 'delete 缺少必填的 path 参数'; return out;
+    }
+    // v2 Pass P78（H4）：两个中文渲染诊断工具的必填参数校验，同一个模式——block 按当前
+    // Visual 渲染出的块顺序编号，从 0 起，必须是非负整数。
+    if ((name === 'read_block_translation' || name === 'retranslate_block')
+        && !(Number.isInteger(args.blockIndex) && args.blockIndex >= 0)) {
+        out.malformed = true; out.reason = name + ' 缺少必填的 blockIndex 参数（必须是 ≥0 的整数）'; return out;
     }
     out.tool = name;
     out.args = args;
@@ -19345,6 +19387,194 @@ async function chatAgentExecWriteTool(toolName, args, projectDir, signal, pendin
     return { ok: true, uiSummary: built.title + ' 成功', uiDetail: textForModel, textForModel: textForModel, bytes: (args.content ? args.content.length : 0) };
 }
 
+// ============================================================================
+// v2 Pass P78（H4）：AI 聊天代理诊断/修 Visual 中文预览模式渲染错误——两个新工具
+// ============================================================================
+// 跟上面 fs 读写工具是完全独立的一条能力线：不经过桥的 /fs/*，直接读写页面自己已有的
+// Visual 中文渲染状态——块列表用 #ovlVisualPane 里现成的 .ovl-visual-block 元素（按屏幕
+// 上从上到下的顺序，也就是 DOM 顺序，从 0 编号——不新发明一套块 id），源码文本复用
+// ovlVisualBlockSrcText()，缓存复用 ovlVisualTransCache{Get,Put,Delete}（P78 新增的
+// Delete 见上方 P39 小节之前），重译复用现成的 ovlVisualLangRunQueue() 懒翻译队列（jump
+// 本地模型走的正是这条路径的 provider==='local' 分支），绝不额外发明第二套翻译调用。
+//   - chatAgentZhBlockReadiness  这一轮"块级诊断工具"能不能用——跟 chatAgentReadiness()
+//                                同一个模式，但判定条件是"当前在 Visual + 中文模式"，不是
+//                                "桥在线+有项目路径"。系统提示（chatAgentZhToolsSystemBlock）
+//                                和这里必须用同一份判定，不能出现"提示说能用，实际被挡住"。
+//   - chatAgentExecReadBlockTranslation  只读，不需要确认，直接返回该块的源 LaTeX + 当前
+//                                渲染出来的文本，供模型诊断"到底是原文该改还是译文翻错了"。
+//   - chatAgentExecRetranslateBlock      会改动翻译缓存：先弹 chatAgentConfirm（P69 那套
+//                                聊天流内联 .aichat-card，不是新起一套确认 UI）拿用户确认，
+//                                确认后删掉该块当前缓存条目、直接 await ovlVisualTranslateBlockText
+//                                （跟队列 worker 内部调的是同一个翻译原语，只是不经过多 worker
+//                                视口优先调度——那套调度解决的是"一堆块该按什么顺序翻"，跟
+//                                "重译用户已经点名的这一块"无关），成功后写回同一个
+//                                ovlVisualTransCachePut 缓存、用同一个 ovlVisualRenderChunk
+//                                更新 DOM，把"重译前/重译后的渲染文本"都汇报给模型和用户。
+
+// 判定依据跟 chatAgentZhToolsSystemBlock 共用：只在 Visual 编辑模式 + 中文显示语言下才有
+// 意义——脱离这个上下文（比如用户还在 Code 模式，或者 Visual 但显示的是原文）问"某块渲染
+// 成什么样"没有诊断价值，直接明确告知原因，不假装能用、也不返回误导性的空结果。
+function chatAgentZhBlockReadiness() {
+    if (typeof OvlState === 'undefined' || OvlState.editorMode !== 'visual') return { ready: false, reason: 'not-visual' };
+    if (typeof OvlVisualLangState === 'undefined' || OvlVisualLangState.lang !== 'zh') return { ready: false, reason: 'not-zh' };
+    const pane = document.getElementById('ovlVisualPane');
+    if (!pane) return { ready: false, reason: 'no-pane' };
+    return { ready: true, reason: '' };
+}
+
+// 两个工具共用的"取第 idx 块 + 校验范围"逻辑，返回 { ok, el, blocks, msg }。
+function chatAgentZhResolveBlock(pane, blockIndex) {
+    const blocks = Array.from(pane.querySelectorAll('.ovl-visual-block'));
+    const idx = Number(blockIndex);
+    if (!Number.isInteger(idx) || idx < 0 || idx >= blocks.length) {
+        return {
+            ok: false, blocks: blocks, el: null,
+            msg: 'blockIndex 超出范围：当前 Visual 预览共有 ' + blocks.length + ' 块'
+                + (blocks.length ? '（有效范围 0–' + (blocks.length - 1) + '）' : '（页面上目前没有任何块）') + '。'
+        };
+    }
+    return { ok: true, blocks: blocks, el: blocks[idx], msg: '' };
+}
+
+function chatAgentZhReadinessMsg(readiness) {
+    return readiness.reason === 'not-visual' ? '当前不在 Visual 预览模式'
+        : readiness.reason === 'not-zh' ? '当前 Visual 显示语言是"原文"而不是"中文"'
+        : '找不到 Visual 预览面板';
+}
+
+// 只读：读取某一块的源 LaTeX 片段 + 当前渲染出来的中文文本。不弹确认框（跟 list_dir/read_file
+// 同一档），不改动任何状态。
+async function chatAgentExecReadBlockTranslation(args, signal) {
+    const readiness = chatAgentZhBlockReadiness();
+    if (!readiness.ready) {
+        const msg = '无法读取块的渲染译文：' + chatAgentZhReadinessMsg(readiness) + '。';
+        return { ok: false, uiSummary: '读取渲染译文失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const pane = document.getElementById('ovlVisualPane');
+    const resolved = chatAgentZhResolveBlock(pane, args.blockIndex);
+    if (!resolved.ok) {
+        return { ok: false, uiSummary: '读取渲染译文失败', uiDetail: resolved.msg, textForModel: resolved.msg, bytes: 0 };
+    }
+    const el = resolved.el;
+    const idx = Number(args.blockIndex);
+    const srcLatex = (typeof ovlVisualBlockSrcText === 'function' ? ovlVisualBlockSrcText(el) : null) || '';
+    const renderedText = String(el.textContent == null ? '' : el.textContent).trim();
+    const pendingFlag = el.getAttribute('data-ovl-trans-pending') === '1';
+    const failedFlag = el.hasAttribute('data-ovl-trans-failed');
+    const srcLine = el.getAttribute('data-src-line');
+    const srcLineEnd = el.getAttribute('data-src-line-end');
+    const statusText = pendingFlag ? '⏳ 翻译中/待翻译（当前显示的可能还是原文占位）' : (failedFlag ? '❌ 上次翻译失败' : '✅ 已翻译');
+    const text = '块 #' + idx + '（源码第 ' + srcLine + '–' + srcLineEnd + ' 行，本页共 ' + resolved.blocks.length + ' 块）\n'
+        + '状态：' + statusText + '\n'
+        + '【源 LaTeX】\n' + srcLatex + '\n\n'
+        + '【当前渲染文本】\n' + renderedText;
+    return {
+        ok: true,
+        uiSummary: '块 #' + idx + (pendingFlag ? '（待翻译）' : (failedFlag ? '（上次失败）' : '')),
+        uiDetail: text,
+        textForModel: text,
+        bytes: text.length
+    };
+}
+
+// 写（改翻译缓存）：使某一块当前的翻译缓存失效并重新调用模型翻译。跟 fs 写工具同一套确认
+// 纪律——执行前必须弹 chatAgentConfirm（P69 内联 .aichat-card）拿到用户逐次确认，绝不提供
+// 批量豁免；确认/拒绝/失败/成功四种结局都由这个函数自己画一行展示（selfDisplaying，外层
+// chatAgentRunLoop 不重复画行），跟 chatAgentExecWriteTool 的分工完全对齐。取消（AbortSignal）
+// 走 throw AbortError 这条既有通路，跟别的工具一致，调用方 chatAgentRunLoop 已有处理。
+async function chatAgentExecRetranslateBlock(args, signal, pending) {
+    const setLabel = function (t) { try { if (pending && pending.labelEl) pending.labelEl.textContent = t; } catch (e) {} };
+    const idx = Number(args.blockIndex);
+    const readiness = chatAgentZhBlockReadiness();
+    if (!readiness.ready) {
+        const msg = '无法重新翻译该块：' + chatAgentZhReadinessMsg(readiness) + '。';
+        return { ok: false, uiSummary: '重新翻译失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const pane = document.getElementById('ovlVisualPane');
+    const resolved = chatAgentZhResolveBlock(pane, args.blockIndex);
+    if (!resolved.ok) {
+        return { ok: false, uiSummary: '重新翻译失败', uiDetail: resolved.msg, textForModel: resolved.msg, bytes: 0 };
+    }
+    const el = resolved.el;
+    const srcLatex = (typeof ovlVisualBlockSrcText === 'function' ? ovlVisualBlockSrcText(el) : null) || '';
+    if (!srcLatex.trim()) {
+        const msg = '该块取不到源码文本（可能是编辑器内容已经变化），无法重新翻译。';
+        return { ok: false, uiSummary: '重新翻译失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const oldRendered = String(el.textContent == null ? '' : el.textContent).trim();
+    const reason = (typeof args.reason === 'string' && args.reason.trim()) ? args.reason.trim() : '';
+
+    setLabel('等待你确认「重新翻译块 #' + idx + '」…');
+    const msgLines = [
+        '操作：使该块当前的翻译缓存失效并重新调用模型翻译（走既有的 Visual 中文懒翻译队列）。',
+        '块编号：#' + idx + '（源码第 ' + el.getAttribute('data-src-line') + '–' + el.getAttribute('data-src-line-end') + ' 行，本页共 ' + resolved.blocks.length + ' 块）',
+        '',
+        '【源 LaTeX】',
+        srcLatex,
+        '',
+        '【当前渲染文本】',
+        oldRendered || '（空）'
+    ];
+    if (reason) { msgLines.push(''); msgLines.push('AI 给出的理由：' + reason); }
+    const confirmMsg = msgLines.join('\n');
+    const confirmed = await chatAgentConfirm({
+        title: '重新翻译这一块？',
+        message: confirmMsg,
+        confirmLabel: '确认重译'
+    }, signal);
+    if (!confirmed) {
+        const msg = '用户拒绝了该操作。';
+        chatAppendToolRow('🔧 retranslate_block（块 #' + idx + '）· 已被用户取消', confirmMsg);
+        return { ok: false, refused: true, uiSummary: '用户取消', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+
+    setLabel('正在重新翻译块 #' + idx + '…');
+    let cfg = null;
+    try { cfg = getApiConfig(); } catch (e) { cfg = null; }
+    try { if (typeof ovlVisualTransCacheDelete === 'function') ovlVisualTransCacheDelete(srcLatex, cfg); } catch (e) {}
+    el.removeAttribute('data-ovl-trans-failed');
+    el.setAttribute('data-ovl-trans-pending', '1');
+    const label = '重新翻译块 #' + idx;
+
+    // 【实测踩到的坑，别再犯】最初这里是"标 pending 属性 + 踢一下 ovlVisualLangRunQueue() +
+    // 轮询 data-ovl-trans-pending 属性直到它被清掉"——错的：queue 的 worker（见上面
+    // ovlVisualLangRunQueue 的 worker 循环）是在**取到这块的一瞬间**、翻译请求真正发出**之前**
+    // 就摘掉 pending 属性（那是它自己的反竞态设计，防止两个 worker 抢同一块，不是"翻译完成"
+    // 的信号）——用它当完成信号，会在真实网络请求还没返回时就把这轮判成"完成"，读到的是陈旧
+    // 内容却报告成功，是实测 e2e（tools/e2e/test_p78_h4_tools.js）跑真实 jump 时抓到的真错误。
+    // 改成直接 await ovlVisualTranslateBlockText——跟 worker 内部调的是同一个翻译原语、写的是
+    // 同一个 ovlVisualTransCachePut 缓存、渲染用的是同一个 ovlVisualRenderChunk，只是不经过
+    // 多 worker 视口优先调度（那套调度解决的是"一堆块该按什么顺序翻"，跟"重译用户已经点名
+    // 的这一块"无关），换来一个能正确 await 到真结果的单次调用，不再有这个竞态。
+    let newTgt = null, translateErr = null;
+    try {
+        newTgt = await ovlVisualTranslateBlockText(srcLatex, cfg, signal);
+    } catch (e) {
+        if (e && e.name === 'AbortError') { el.removeAttribute('data-ovl-trans-pending'); throw e; }
+        translateErr = e;
+    }
+
+    if (translateErr) {
+        el.removeAttribute('data-ovl-trans-pending');
+        el.setAttribute('data-ovl-trans-failed', '1');
+        const msg = label + ' 失败（模型调用出错：' + ((translateErr && translateErr.message) || String(translateErr))
+            + '。该块已保留原来的内容不受影响，可以再试一次或提醒用户换个 provider/模型）。';
+        chatAppendToolRow('🔧 retranslate_block（块 #' + idx + '）· 失败', msg);
+        return { ok: false, uiSummary: label + ' 失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+
+    try { ovlVisualTransCachePut(srcLatex, cfg, newTgt); } catch (e) {}
+    el.removeAttribute('data-ovl-trans-pending');
+    el.removeAttribute('data-ovl-trans-failed');
+    if (document.body.contains(el) && typeof ovlVisualRenderChunk === 'function') el.innerHTML = ovlVisualRenderChunk(newTgt);
+    try { if (typeof ovlVisualLangProgressUpdate === 'function') ovlVisualLangProgressUpdate(); } catch (e) {}
+
+    const newRendered = String(el.textContent == null ? '' : el.textContent).trim();
+    const text = label + ' 完成。\n【重译前渲染文本】\n' + (oldRendered || '（空）') + '\n\n【重译后渲染文本】\n' + (newRendered || '（空）');
+    chatAppendToolRow('🔧 retranslate_block（块 #' + idx + '）· 完成', text);
+    return { ok: true, uiSummary: label + ' 完成', uiDetail: text, textForModel: text, bytes: newRendered.length };
+}
+
 // 文本协议的多轮工具调用主循环。wire 是这一轮已经装好的消息数组（chatAssembleTurn 的产物，
 // 最后一条是用户这一轮的完整载荷），本函数在它后面追加"assistant 工具调用 → user 工具结果"
 // 这样的往返，直到模型给出不含 ==TOOL== 的最终回复，或撞上下面任一硬上限。
@@ -19401,16 +19631,33 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
         // v2 Pass P43：写工具（write_file/mkdir/move/copy/delete）走 chatAgentExecWriteTool——
         // 那个函数内部自己弹确认框、自己在拿到结果后画展示行（带一键回退），这里不再重复调
         // chatAppendToolRow，避免同一次操作在聊天记录里出现两条重复的行。
+        // v2 Pass P78（H4）：新增两个中文渲染诊断工具，同一套"自己画行 vs 外层画行"分工——
+        // read_block_translation 只读，跟 list_dir/read_file 一样外层统一画行；
+        // retranslate_block 会改翻译缓存，跟 fs 写工具一样自己弹确认卡片、自己画结果行。
         const isWriteTool = CHAT_AGENT_WRITE_TOOLS.indexOf(parsed.tool) !== -1;
+        const isZhReadTool = parsed.tool === 'read_block_translation';
+        const isZhWriteTool = parsed.tool === 'retranslate_block';
+        const selfDisplaying = isWriteTool || isZhWriteTool;
         setLabel(isWriteTool
             ? ('准备执行「' + (CHAT_AGENT_TOOL_LABELS[parsed.tool] || parsed.tool) + '」…')
-            : ('正在' + (parsed.tool === 'read_file' ? '读取' : '查看') + '「' + (parsed.args.path || '.') + '」…'));
+            : isZhWriteTool
+                ? ('准备重新翻译块 #' + parsed.args.blockIndex + '…')
+                : isZhReadTool
+                    ? ('正在读取块 #' + parsed.args.blockIndex + ' 的渲染译文…')
+                    : ('正在' + (parsed.tool === 'read_file' ? '读取' : '查看') + '「' + (parsed.args.path || '.') + '」…'));
         const result = isWriteTool
             ? await chatAgentExecWriteTool(parsed.tool, parsed.args, projectDir, signal, pending)
-            : await chatAgentExecTool(parsed.tool, parsed.args, projectDir, signal);
-        if (!isWriteTool) {
+            : isZhReadTool
+                ? await chatAgentExecReadBlockTranslation(parsed.args, signal)
+                : isZhWriteTool
+                    ? await chatAgentExecRetranslateBlock(parsed.args, signal, pending)
+                    : await chatAgentExecTool(parsed.tool, parsed.args, projectDir, signal);
+        if (!selfDisplaying) {
+            const rowLabel = isZhReadTool
+                ? ('🔧 read_block_translation（块 #' + parsed.args.blockIndex + '）')
+                : ((parsed.tool === 'read_file' ? '🔧 read_file' : '🔧 list_dir') + '（' + (parsed.args.path || '.') + '）');
             chatAppendToolRow(
-                (parsed.tool === 'read_file' ? '🔧 read_file' : '🔧 list_dir') + '（' + (parsed.args.path || '.') + '）· ' + result.uiSummary,
+                rowLabel + '· ' + result.uiSummary,
                 result.uiDetail.length > 4000 ? result.uiDetail.slice(0, 4000) + '\n…（此处仅显示前 4000 字，模型收到的是完整版本）' : result.uiDetail
             );
         }
@@ -25909,6 +26156,20 @@ function ovlVisualTransCachePut(text, config, tgt) {
             ovlVisualTransCacheMaintain(projectId);
         }
     } catch (e) {}
+}
+// v2 Pass P78（H4）：AI 聊天代理"失效重译"工具用——删掉某一块当前缓存的译文，key 算法
+// （ovlVisualTransCacheKey，含内容哈希+lang+provider+model）跟 Get/Put 完全同一套，不然
+// 删的 key 和渲染时查的 key 对不上，等于白删。只删当前项目桶里的这一条，不动别的块/别的
+// 项目、也不碰旧版 v1 全局兜底缓存（那份本来就是只读兜底，留着不影响正确性）。
+function ovlVisualTransCacheDelete(text, config) {
+    try {
+        const projectId = ovlVisualTransCacheProjectId();
+        const key = ovlVisualTransCacheKey(text, config);
+        const map = ovlVisualTransCacheBucketLoad(projectId);
+        if (!(key in map)) return false;
+        delete map[key];
+        return ovlVisualTransCacheSaveBucket(projectId, map);
+    } catch (e) { return false; }
 }
 
 // ==================== v2 Pass P39：Visual 中文模式补齐代码/逐字环境的哨兵保护 ====================
