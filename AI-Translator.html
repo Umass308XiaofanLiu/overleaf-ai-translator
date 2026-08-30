@@ -32592,9 +32592,13 @@ async function ovlAiMergeApplyFile(fileIdx) {
 // code/visual/中文/翻译缓存整条链路（spec §1.4 结论 4）。
 // =============================================================================
 
-// ---- M2 spike 结论（§6.1）：默认 false，spike 通过后本文件里另一处会把它改成 true。
-// 未通过时提取内嵌图片的能力保持关闭，M1 的整页截图兜底完全不受影响。
-let OVL_P2T_M2_AVAILABLE = false;
+// ---- M2 spike 结论（§6.1，2026-08-30 实测通过）：CDP 里用本 Pass 的合成夹具 PDF（3 页，
+// 第 3 页含一张 64×64 内嵌 PNG）真跑过 getOperatorList + page.objs：拿到 1 个 paintImageXObject
+// objId（"img_p2_2"）、page.objs.has 为 true、对象形状是 {width,height,interpolate,kind,data}
+// （kind=2=RGB_24BPP，data.length=12288=64*64*3，形状吻合）、按 kind 展开成 ImageData 再
+// canvas.toBlob('image/png') 还原出 282 字节的有效 PNG、宽高=64×64 与源图完全一致——
+// 通过标准（"拿到 ≥1 个 objId，且能从中还原出宽高正确的 PNG"）达成，本 Pass 打开 M2。
+let OVL_P2T_M2_AVAILABLE = true;
 
 const OVL_P2T_TIMEOUT_MS = 240000; // 冷启动实测 153s + 余量（probe_vision.md §5）
 
@@ -33182,6 +33186,14 @@ function ovlP2TBuildReadme(job) {
     md += '- 失败页：' + (failedNums.length ? failedNums.join(', ') : '无') + '\n';
     md += '- 可疑页（配平检查未通过，已保留 TODO 注释）：' + (suspectNums.length ? suspectNums.join(', ') : '无') + '\n';
     if (thinkFallbackNums.length) md += '- <think> 非首位启发式剥离（已标记，见 pages/ 对应片段）：' + thinkFallbackNums.join(', ') + '\n';
+    // M2（§5.1）：每页图片来源——真的提取到内嵌位图 vs 降级回整页截图，两条都如实记录。
+    if (OVL_P2T_M2_AVAILABLE && OvlSettings.pdf2texExtractImages) {
+        const extractedNums = job.pages.filter(function (p) { return p.flags && p.flags.imagesExtracted; })
+            .map(function (p) { return p.num + '（' + p.flags.imagesExtracted + ' 张）'; });
+        const degradedNums = job.pages.filter(function (p) { return p.flags && p.flags.m2Degraded; }).map(function (p) { return p.num; });
+        md += '- M2 内嵌图片提取：' + (extractedNums.length ? extractedNums.join(', ') : '无') + '\n';
+        if (degradedNums.length) md += '- 第 ' + degradedNums.join(', ') + ' 页图片提取降级（原因见转换日志，已回落整页截图）\n';
+    }
     md += '\n⚠ 机器转写结果，公式/表格/图注务必人工复核后再使用。\n';
     return md;
 }
@@ -33214,6 +33226,98 @@ async function ovlP2TUpdateMapAfterRun(job) {
 }
 
 // ---- §4.5 步骤 7：单页转换（渲染 → 写 PNG → 视觉请求 → 剥离/校验 → 写片段）----
+// ==================== M2（§5.1，spike 通过后开放，见 OVL_P2T_M2_AVAILABLE 头部注释）====================
+// 内嵌位图提取：扫 getOperatorList 找 paintImageXObject，用 CTM 栈换算出页面上的大致位置，
+// 过滤掉面积 <1.5% 页面的小图（logo/装饰线）。顺序：必须先 page.render()（M1 已经渲了）
+// 再 getOperatorList()，让 worker 有机会把图像对象送到主线程（spec §5.1 硬性顺序要求）。
+async function ovlP2TScanPageImages(page) {
+    const ops = await page.getOperatorList();
+    const OPS = pdfjsLib.OPS;
+    const viewport = page.getViewport({ scale: 1 });
+    const pageW = viewport.width, pageH = viewport.height;
+    const pageArea = pageW * pageH;
+    function matMul(m, n) { // m 在前应用，n 是外层（当前）矩阵：右乘 —— 新矩阵 = m * n
+        return [
+            m[0] * n[0] + m[1] * n[2], m[0] * n[1] + m[1] * n[3],
+            m[2] * n[0] + m[3] * n[2], m[2] * n[1] + m[3] * n[3],
+            m[4] * n[0] + m[5] * n[2] + n[4], m[4] * n[1] + m[5] * n[3] + n[5]
+        ];
+    }
+    const stack = [[1, 0, 0, 1, 0, 0]];
+    const found = [];
+    let order = 0;
+    for (let i = 0; i < ops.fnArray.length; i++) {
+        const fn = ops.fnArray[i], args = ops.argsArray[i];
+        if (fn === OPS.save) { stack.push(stack[stack.length - 1].slice()); }
+        else if (fn === OPS.restore) { if (stack.length > 1) stack.pop(); }
+        else if (fn === OPS.transform) { stack[stack.length - 1] = matMul(args, stack[stack.length - 1]); }
+        else if (fn === OPS.setTransform) { stack[stack.length - 1] = args.slice(); }
+        else if (fn === OPS.paintImageXObject || fn === OPS.paintImageXObjectRepeat) {
+            found.push({ objId: args[0], ctm: stack[stack.length - 1].slice(), order: order++ });
+        }
+        // paintImageMaskXObject / paintInlineImageXObject 不处理（掩码/内联小图多为装饰），跳过。
+    }
+    const results = [];
+    found.forEach(function (f) {
+        const m = f.ctm;
+        const corners = [[0, 0], [1, 0], [0, 1], [1, 1]].map(function (p) {
+            return [m[0] * p[0] + m[2] * p[1] + m[4], m[1] * p[0] + m[3] * p[1] + m[5]];
+        });
+        const xs = corners.map(function (c) { return c[0]; }), ys = corners.map(function (c) { return c[1]; });
+        const minX = Math.min.apply(null, xs), maxX = Math.max.apply(null, xs);
+        const minY = Math.min.apply(null, ys), maxY = Math.max.apply(null, ys);
+        const area = Math.abs((maxX - minX) * (maxY - minY));
+        if (pageArea > 0 && (area / pageArea) < 0.015) return; // §5.1 步骤5：面积过滤
+        const midY = (minY + maxY) / 2; // PDF 用户坐标左下原点，y 越大越靠页面上方
+        let vertDesc = 'middle area';
+        if (midY > pageH * 0.66) vertDesc = 'upper area';
+        else if (midY < pageH * 0.33) vertDesc = 'lower area';
+        results.push({ objId: f.objId, order: f.order, vertDesc: vertDesc });
+    });
+    results.sort(function (a, b) { return a.order - b.order; });
+    return results;
+}
+// 取出一个 objId 对应的位图字节，两种形状都处理（{bitmap:ImageBitmap} / {data,kind,width,height}），
+// 都不认识或超时（5s）就返回 null 交调用方降级，绝不抛出中断整页转换。
+async function ovlP2TFetchImageBytes(page, objId) {
+    try {
+        const obj = await new Promise(function (resolve, reject) {
+            let settled = false;
+            try { page.objs.get(objId, function (v) { settled = true; resolve(v); }); }
+            catch (e) { reject(e); return; }
+            setTimeout(function () { if (!settled) reject(new Error('page.objs.get 超时')); }, 5000);
+        });
+        if (!obj || !obj.width || !obj.height) return null;
+        const canvas = document.createElement('canvas');
+        canvas.width = obj.width; canvas.height = obj.height;
+        const ctx = canvas.getContext('2d');
+        if (obj.bitmap) {
+            ctx.drawImage(obj.bitmap, 0, 0);
+        } else if (obj.data) {
+            const GRAYSCALE_1BPP = 1, RGB_24BPP = 2, RGBA_32BPP = 3;
+            const out = ctx.createImageData(obj.width, obj.height);
+            if (obj.kind === RGBA_32BPP) { out.data.set(obj.data); }
+            else if (obj.kind === RGB_24BPP) {
+                for (let i = 0, j = 0; i < obj.data.length; i += 3, j += 4) { out.data[j] = obj.data[i]; out.data[j + 1] = obj.data[i + 1]; out.data[j + 2] = obj.data[i + 2]; out.data[j + 3] = 255; }
+            } else if (obj.kind === GRAYSCALE_1BPP) {
+                for (let i = 0, j = 0; i < obj.data.length; i++, j += 4) { const g = obj.data[i]; out.data[j] = g; out.data[j + 1] = g; out.data[j + 2] = g; out.data[j + 3] = 255; }
+            } else {
+                return null; // 不认识的 kind，降级
+            }
+            ctx.putImageData(out, 0, 0);
+        } else {
+            return null;
+        }
+        const blob = await new Promise(function (resolve) { canvas.toBlob(resolve, 'image/png'); });
+        if (!blob) return null;
+        const bytes = new Uint8Array(await blob.arrayBuffer());
+        canvas.width = 0; canvas.height = 0;
+        return { bytes: bytes, width: obj.width, height: obj.height };
+    } catch (e) {
+        return null;
+    }
+}
+
 async function ovlP2TConvertOnePage(job, num) {
     const pageState = job.pages[num - 1];
     // v2 Pass P75 实测修复：只查 job.cancelled 不够——「取消」之后立刻「继续转换」会把
@@ -33241,7 +33345,30 @@ async function ovlP2TConvertOnePage(job, num) {
         if (!stillCurrent()) return;
         if (rendered.sentAsJpeg) pageState.flags.sentAsJpeg = true;
         const dataUrl = await ovlP2TBlobToDataUrl(rendered.sendBlob);
-        const images = ['- assets/pages/page-' + ovlP2TPad2(num) + '.png   (the full page raster; use it ONLY if this page really contains a figure you cannot reproduce as LaTeX)'];
+        let images = ['- assets/pages/page-' + ovlP2TPad2(num) + '.png   (the full page raster; use it ONLY if this page really contains a figure you cannot reproduce as LaTeX)'];
+        // M2（§5.1）：能提取到内嵌图就换成真实清单；任何一步失败/没找到 → 原样回落 M1
+        // 整页截图行为，并在 flags 里记一笔（README 汇总用），不抛异常、不中断整页转换。
+        if (OVL_P2T_M2_AVAILABLE && OvlSettings.pdf2texExtractImages) {
+            try {
+                const scanned = await ovlP2TScanPageImages(page);
+                if (scanned && scanned.length) {
+                    const extractedLines = [];
+                    for (let k = 0; k < scanned.length; k++) {
+                        if (!stillCurrent()) return;
+                        const fetched = await ovlP2TFetchImageBytes(page, scanned[k].objId);
+                        if (!fetched) continue;
+                        const rel = 'assets/img/page-' + ovlP2TPad2(num) + '-img-' + (k + 1) + '.png';
+                        await ovlP2TWriteBinary(job.outRel + '/' + rel, fetched.bytes);
+                        extractedLines.push('- ' + rel + '   (' + fetched.width + 'x' + fetched.height + ' px, ' + scanned[k].vertDesc + ' of the page)');
+                    }
+                    if (extractedLines.length) { images = extractedLines; pageState.flags.imagesExtracted = extractedLines.length; }
+                    else { pageState.flags.m2Degraded = true; }
+                }
+            } catch (e) {
+                pageState.flags.m2Degraded = true;
+            }
+        }
+        if (!stillCurrent()) return;
         const userText = ovlP2TBuildUserText(job, num, images);
         const controller = new AbortController();
         job.aborts.add(controller);
