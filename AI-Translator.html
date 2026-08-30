@@ -2405,6 +2405,8 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-p2t-testresult { font-size: 11.5px; margin-top: 4px; }
 .ovl-p2t-testresult[data-state="ok"] { color: #4ADE80; }
 .ovl-p2t-testresult[data-state="error"] { color: #F87171; }
+.ovl-p2t-testresult[data-state="fixed"] { color: #eab308; } /* v2 Pass P85：自动修复后成功，跟 suspect chip 同色 */
+.ovl-p2t-verify { margin-bottom: 10px; } /* v2 Pass P85：核验报告区块，跟上面 grid 隔开一点 */
 
 .ovl-modal-overlay {
     position: fixed;
@@ -34155,6 +34157,236 @@ async function ovlP2TConvertOnePage(job, num) {
 // ---- §4.5 管线：同一时刻只允许一个 job（OvlP2TState.running 闸门）----
 let OvlP2TState = { job: null, running: false, panelMinimized: false };
 
+// ==================== v2 Pass P85：转换后整体核验 ====================
+// 用户任务书：main.tex 拼装完成后自动用桥编译一次；编译失败 → 一轮自动修复（把错误日志
+// 关键段 + 出错位置附近的 tex 片段发给文本模型，要求只返回修正后的片段，应用后重编译一次）；
+// 核验报告（编译成功 / 自动修复后成功 / 仍失败 + 低置信页列表）挂在 job.verify 上，由
+// ovlP2TPanelRender 渲染。硬边界：server.js 不动（编译走既有 /compile 端点）；不碰
+// callClaudeAPI/proxyUrl。设置开关 OvlSettings.pdf2texAutoVerify 默认开，关闭则整段跳过。
+
+const OVL_P2T_VERIFY_FIX_TIMEOUT_MS = 60000;
+const OVL_P2T_VERIFY_MAX_ERRORS_IN_EXCERPT = 8;
+const OVL_P2T_VERIFY_SYSTEM_PROMPT = [
+    '你正在修复一份由 PDF 自动转写生成的 LaTeX 论文源码中的编译错误。',
+    '你会看到：①这次 latexmk/pdflatex 编译失败的错误日志摘录；②被怀疑是错误来源的那一页 LaTeX 片段（不含文档前导、不含 \\begin{document}/\\end{document}）。',
+    '只输出修正后的这一页 LaTeX 片段本身：不要任何解释、不要用 ``` 代码围栏包裹、不要输出 "% ==== page" 这类页码注释行（外层会自动加回）、不要输出 \\documentclass 或 \\begin{document}/\\end{document}。',
+    '尽量保持原有文字/公式/表格内容不变，只修正导致编译失败的结构性问题（未闭合的花括号/环境、非法命令等）。',
+    '必须保持 \\cite \\citep \\citet \\ref \\eqref \\label 等命令里的键名逐字不变。'
+].join('\n');
+
+// 从桥 /compile 响应里挑 error 级日志条目拼成给模型看的摘录；parsed 里没有 error 级条目
+// （比如 "Runaway argument" 这类不带 file:line 格式的致命错误）就退化到原始日志末尾若干
+// 字符兜底，永远不返回空字符串——模型没有日志可看等于瞎猜。
+function ovlP2TVerifyBuildErrorExcerpt(compileData) {
+    const parsed = (compileData && Array.isArray(compileData.parsed)) ? compileData.parsed : [];
+    const errors = parsed.filter(function (e) { return e.level === 'error'; }).slice(0, OVL_P2T_VERIFY_MAX_ERRORS_IN_EXCERPT);
+    if (errors.length) {
+        return errors.map(function (e) {
+            return (e.file ? e.file + ':' : '') + (e.line != null ? e.line + ': ' : '') + e.message;
+        }).join('\n');
+    }
+    const log = (compileData && compileData.log) || '';
+    return log ? log.slice(-2000) : '（编译未返回任何日志，可能是桥本身不可达或超时）';
+}
+
+// 挑第一条带具体行号的 error 条目，作为定位"哪一页片段"的锚点；没有就返回 null——上层据此
+// 判定无法定位，直接放弃自动修复，不瞎猜替换哪一段。
+function ovlP2TVerifyFirstErrorLine(compileData) {
+    const parsed = (compileData && Array.isArray(compileData.parsed)) ? compileData.parsed : [];
+    for (let i = 0; i < parsed.length; i++) {
+        const e = parsed[i];
+        if (e.level === 'error' && typeof e.line === 'number' && e.line > 0) return e.line;
+    }
+    return null;
+}
+
+// main.tex 是固定模板前导 + 逐页 "% ==== page N ====" 标记拼起来的（见 ovlP2TAssembleMain），
+// 按标记把出错行落在哪一页区间内摘出整段片段（不是任意行数窗口，避免切在命令中间）。
+// errorLine 是编译日志给的 1-based 行号。返回 null＝没有任何页标记（不该发生，防御性判断）。
+function ovlP2TVerifyLocatePageFragment(mainText, errorLine) {
+    if (typeof errorLine !== 'number' || errorLine <= 0) return null;
+    const lines = String(mainText || '').split('\n');
+    const markerRe = /^% ==== page (\d+) ====$/;
+    const markers = [];
+    for (let i = 0; i < lines.length; i++) {
+        const m = markerRe.exec(lines[i]);
+        if (m) markers.push({ idx: i, num: Number(m[1]) });
+    }
+    if (!markers.length) return null;
+    // 拼装模板结尾固定是独立一行的 "\end{document}"（ovlP2TAssembleMain 最后一页 body 之后
+    // 直接拼接，见该函数注释）——最后一页没有"下一个标记"时，必须以这一行为界，不能用
+    // lines.length（否则最后一页出错时会把 \end{document} 一起吞掉，产出永远缺尾的 main.tex）。
+    let endOfAllPagesIdx = lines.length;
+    for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].trim() === '\\end{document}') { endOfAllPagesIdx = i; break; }
+    }
+    const errIdx = errorLine - 1; // 0-based
+    let target = null;
+    for (let i = 0; i < markers.length; i++) {
+        if (markers[i].idx <= errIdx) target = markers[i]; else break;
+    }
+    if (!target) target = markers[0]; // 出错行落在第一个页标记之前（极端情况）：按第一页处理
+    const targetPos = markers.indexOf(target);
+    const nextMarkerIdx = (targetPos + 1 < markers.length) ? markers[targetPos + 1].idx : endOfAllPagesIdx;
+    // 页片段之间有拼装时留的空行（ovlP2TAssembleMain 每页末尾 '\n\n'）：摘片段时去掉尾部
+    // 空行，回填时统一由 P85 自己重新拼两个空行，不依赖模型照抄空行数。
+    let endIdx = nextMarkerIdx;
+    while (endIdx > target.idx + 1 && lines[endIdx - 1].trim() === '') endIdx--;
+    const bodyLines = lines.slice(target.idx + 1, endIdx); // 不含标记行本身
+    return { pageNum: target.num, markerIdx: target.idx, nextMarkerIdx: nextMarkerIdx, snippet: bodyLines.join('\n') };
+}
+
+// 调修复模型：跟视觉模型同源的文本 /chat/completions（浏览器直连，不经桥），固定关闭思考
+// （chat_template_kwargs.enable_thinking:false + /no_think 后缀，跟 ovlP2TCallVision/
+// ovlAiSuggestMerge 同一套手段）。永不 reject，异常一律收敛成 {ok:false, error}。
+async function ovlP2TVerifyCallFixModel(errorExcerpt, pageSnippet, signal) {
+    const endpointRaw = (OvlSettings.pdf2texVisionEndpoint || '').trim();
+    if (!endpointRaw) return { ok: false, error: '未配置视觉模型服务地址（核验修复复用同一地址，见设置 → PDF 转 LaTeX）' };
+    const endpoint = endpointRaw.replace(/\/+$/, '');
+    const model = (OvlSettings.pdf2texVisionModel || '').trim();
+    if (!model) return { ok: false, error: '未配置视觉模型（核验修复复用同一模型名）' };
+    const controller = new AbortController();
+    const timeoutId = setTimeout(function () { controller.abort(); }, OVL_P2T_VERIFY_FIX_TIMEOUT_MS);
+    let extAbortHandler = null;
+    if (signal) {
+        if (signal.aborted) controller.abort();
+        else { extAbortHandler = function () { controller.abort(); }; signal.addEventListener('abort', extAbortHandler); }
+    }
+    const userText = '【本次 latexmk/pdflatex 编译失败的错误日志摘录】\n' + errorExcerpt
+        + '\n\n【被怀疑是错误来源的这一页 LaTeX 片段】\n' + pageSnippet
+        + '\n\n请只返回修正后的这一页 LaTeX 片段。';
+    try {
+        let resp;
+        try {
+            resp = await fetch(endpoint + '/chat/completions', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+                body: JSON.stringify({
+                    model: model, temperature: 0.1, max_tokens: 4096, stream: false,
+                    chat_template_kwargs: { enable_thinking: false },
+                    messages: [
+                        { role: 'system', content: OVL_P2T_VERIFY_SYSTEM_PROMPT },
+                        { role: 'user', content: userText + '\n/no_think' }
+                    ]
+                })
+            });
+        } catch (e) {
+            if (e && e.name === 'AbortError') return { ok: false, error: '请求超时（超过 ' + Math.round(OVL_P2T_VERIFY_FIX_TIMEOUT_MS / 1000) + ' 秒）或已取消' };
+            return { ok: false, error: '连不上修复模型服务：' + (e && e.message ? e.message : String(e)) };
+        }
+        if (!resp.ok) {
+            let t = ''; try { t = (await resp.text()).slice(0, 200); } catch (e2) {}
+            return { ok: false, error: '修复模型服务返回错误状态 ' + resp.status + (t ? '：' + t : '') };
+        }
+        let data;
+        try { data = await resp.json(); } catch (e3) { return { ok: false, error: '修复模型服务返回的不是合法 JSON' }; }
+        const content = data && data.choices && data.choices[0] && data.choices[0].message && typeof data.choices[0].message.content === 'string'
+            ? data.choices[0].message.content : null;
+        if (content === null) return { ok: false, error: '修复模型服务返回格式不符合预期（缺少 choices[0].message.content）' };
+        let fragment = ovlAiMergeStripCodeFence(content.trim());
+        fragment = fragment.replace(/^%\s*====\s*page\s+\d+\s*====\s*\n?/i, ''); // 模型如果照抄了页码注释行，剥掉，外层自己重建
+        if (!fragment.trim()) return { ok: false, error: '修复模型返回了空内容' };
+        return { ok: true, fragment: fragment };
+    } catch (e) {
+        return { ok: false, error: '调用修复模型时出错：' + (e && e.message ? e.message : String(e)) };
+    } finally {
+        clearTimeout(timeoutId);
+        if (extAbortHandler && signal) signal.removeEventListener('abort', extAbortHandler);
+    }
+}
+
+// 调桥 /compile 编译 job 的 main.tex——核验专用，独立于 ovlDoRecompile()（不动全局
+// OvlState.compiling/pdfSourceMode/lastCompile 等编辑器主状态，避免跟用户当时正在看的
+// 编译/PDF 面板互相打架）。永不 throw，网络失败也收敛成 {ok:false, pdfExists:false, error}。
+async function ovlP2TVerifyCompile(job) {
+    try {
+        const resp = await ovlBridgeFetch(ovlBridgeUrl('/compile'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                projectDir: job.projectDir, mainFile: job.outRel + '/main.tex',
+                engine: OvlCompileSettings.engine, mode: OvlCompileSettings.mode, haltOnError: OvlCompileSettings.haltOnError
+            })
+        });
+        const data = await resp.json();
+        return data || { ok: false, pdfExists: false, error: '桥返回了空响应' };
+    } catch (e) {
+        return { ok: false, pdfExists: false, error: '连不上桥接服务：' + (e && e.message ? e.message : String(e)) };
+    }
+}
+
+// P79 的 suspectReasons（配平/tabular 弱校验未通过）——核验报告里的"低置信页列表"直接复用
+// 这份既有数据，不重新做一遍判定。
+function ovlP2TVerifyLowConfidencePages(job) {
+    return job.pages.filter(function (p) { return p.state === 'suspect'; }).map(function (p) {
+        const reasons = (p.flags && p.flags.suspectReasons && p.flags.suspectReasons.length) ? p.flags.suspectReasons : ['LaTeX 环境/数学定界符配平检查未通过'];
+        return { num: p.num, reasons: reasons };
+    });
+}
+
+// ---- 核验主流程：编译一次；失败→定位出错页→调修复模型→应用→再编译一次。最多一轮，
+// 不循环（修复后仍失败就如实报失败，不会对同一 job 反复重试）。----
+async function ovlP2TRunVerify(job) {
+    job.verify = { state: 'compiling', errorsExcerpt: '', fixSummary: '', fixApplied: false, finalOk: false, compileSecs: null, lowConfidencePages: [] };
+    ovlP2TPanelRender();
+    const firstCompile = await ovlP2TVerifyCompile(job);
+    if (firstCompile && firstCompile.ok && firstCompile.pdfExists) {
+        job.verify.state = 'success';
+        job.verify.finalOk = true;
+        job.verify.compileSecs = (typeof firstCompile.durationMs === 'number') ? (firstCompile.durationMs / 1000).toFixed(1) : null;
+        job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
+        return;
+    }
+    const excerpt = ovlP2TVerifyBuildErrorExcerpt(firstCompile);
+    const errorLine = ovlP2TVerifyFirstErrorLine(firstCompile);
+    let mainText = null;
+    try {
+        const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, job.outRel + '/main.tex');
+        const f = await resolved.handle.getFile();
+        mainText = await f.text();
+    } catch (e) { mainText = null; }
+    const loc = (mainText != null) ? ovlP2TVerifyLocatePageFragment(mainText, errorLine) : null;
+    if (!loc) {
+        job.verify.state = 'failed';
+        job.verify.finalOk = false;
+        job.verify.errorsExcerpt = excerpt;
+        job.verify.fixSummary = '未能从编译日志定位到具体出错页，已跳过自动修复。';
+        job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
+        return;
+    }
+    job.verify.state = 'fixing';
+    ovlP2TPanelRender();
+    const fixResult = await ovlP2TVerifyCallFixModel(excerpt, loc.snippet, null);
+    if (!fixResult.ok) {
+        job.verify.state = 'failed';
+        job.verify.finalOk = false;
+        job.verify.errorsExcerpt = excerpt;
+        job.verify.fixSummary = '自动修复请求失败：' + fixResult.error;
+        job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
+        return;
+    }
+    const lines = mainText.split('\n');
+    const rebuilt = lines.slice(0, loc.markerIdx + 1)
+        .concat(fixResult.fragment.split('\n'))
+        .concat(['', ''])
+        .concat(lines.slice(loc.nextMarkerIdx));
+    await ovlP2TWriteText(job.outRel + '/main.tex', rebuilt.join('\n'));
+    job.verify.fixApplied = true;
+    job.verify.state = 'recompiling';
+    ovlP2TPanelRender();
+    const secondCompile = await ovlP2TVerifyCompile(job);
+    if (secondCompile && secondCompile.ok && secondCompile.pdfExists) {
+        job.verify.state = 'fixed';
+        job.verify.finalOk = true;
+        job.verify.fixSummary = '第 ' + loc.pageNum + ' 页片段自动修复后编译通过（原错误：' + excerpt.split('\n')[0].slice(0, 100) + '）';
+        job.verify.compileSecs = (typeof secondCompile.durationMs === 'number') ? (secondCompile.durationMs / 1000).toFixed(1) : null;
+    } else {
+        job.verify.state = 'failed';
+        job.verify.finalOk = false;
+        job.verify.errorsExcerpt = ovlP2TVerifyBuildErrorExcerpt(secondCompile);
+        job.verify.fixSummary = '已尝试自动修复第 ' + loc.pageNum + ' 页片段一次（一轮上限），重新编译仍失败。';
+    }
+    job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
+}
+
 async function ovlP2TRunPipeline(job) {
     OvlP2TState.job = job;
     OvlP2TState.running = true;
@@ -34207,6 +34439,20 @@ async function ovlP2TRunPipeline(job) {
         const mainText = ovlP2TAssembleMain(job);
         await ovlP2TWriteText(job.outRel + '/main.tex', mainText);
         await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job));
+
+        // v2 Pass P85：转换后整体核验（默认开，设置项关闭则整段跳过——job.verify 不存在，
+        // 面板/后续逻辑等同于 P85 之前）。异常兜底成明确的 failed 状态，绝不让核验本身的
+        // bug 打断"打开 main.tex"这最后一步。
+        if (!job.cancelled && OvlSettings.pdf2texAutoVerify) {
+            try { await ovlP2TRunVerify(job); }
+            catch (e) {
+                console.error('[ovl] p2t verify failed', e);
+                job.verify = job.verify || {};
+                job.verify.state = 'failed';
+                job.verify.finalOk = false;
+                job.verify.fixSummary = '核验过程内部出错：' + (e && e.message ? e.message : String(e));
+            }
+        }
 
         // §4.5 步骤9：收尾——更新关联表 → 刷新文件树 → 打开 main.tex（白拿 code/visual/翻译缓存链路）
         await ovlP2TUpdateMapAfterRun(job);
@@ -34274,6 +34520,18 @@ async function ovlP2TRetryPages(nums) {
             if (!job.cancelled) {
                 await ovlP2TWriteText(job.outRel + '/main.tex', ovlP2TAssembleMain(job));
                 await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job));
+                // v2 Pass P85：重试失败页也会重新拼装 main.tex，同样触发核验（跟主管线同一
+                // 开关/同一函数，不重复实现）。
+                if (OvlSettings.pdf2texAutoVerify) {
+                    try { await ovlP2TRunVerify(job); }
+                    catch (e) {
+                        console.error('[ovl] p2t verify (retry) failed', e);
+                        job.verify = job.verify || {};
+                        job.verify.state = 'failed';
+                        job.verify.finalOk = false;
+                        job.verify.fixSummary = '核验过程内部出错：' + (e && e.message ? e.message : String(e));
+                    }
+                }
                 await ovlP2TUpdateMapAfterRun(job);
                 job.finishedAt = Date.now();
             }
@@ -34474,8 +34732,15 @@ function ovlP2TPanelRender() {
     const cancelled = job.cancelled;
     const finished = !!job.finishedAt;
 
+    // v2 Pass P85：页面全部转换完、main.tex 已拼装之后，核验（编译/修复/重编译）会在
+    // job.finishedAt 真正置位之前再跑一段时间——这段窗口里 finished 仍是 false，单纯说
+    // "转换中…" 不诚实（页面早转完了），用 job.verify.state 单独给一行更准确的文案。
+    const verifyingLabel = (job.verify && (job.verify.state === 'compiling' || job.verify.state === 'fixing' || job.verify.state === 'recompiling'))
+        ? (job.verify.state === 'compiling' ? '页面转换完成，正在核验编译…' : (job.verify.state === 'fixing' ? '核验编译失败，正在尝试自动修复…' : '已应用修复，正在重新编译核验…'))
+        : null;
     let statusLine;
     if (job.pipelineError) statusLine = '转换失败：' + escapeHtml(job.pipelineError);
+    else if (verifyingLabel) statusLine = verifyingLabel;
     else if (finished) statusLine = failedCount > 0 ? ('已完成，' + failedCount + ' 页失败（已用截图占位）') : '全部完成';
     else if (cancelled) statusLine = '已取消';
     else statusLine = '转换中…';
@@ -34515,7 +34780,32 @@ function ovlP2TPanelRender() {
         if (p.ms) title += '（' + Math.round(p.ms / 1000) + 's）';
         html += '<div class="ovl-p2t-chip" data-state="' + p.state + '" data-page="' + p.num + '" title="' + escapeAttr(title) + '">' + p.num + '</div>';
     });
-    html += '</div></div>';
+    html += '</div>';
+    // v2 Pass P85：核验报告——只在核验真的跑过（job.verify 存在，即设置开着）才渲染；
+    // 关闭核验（OvlSettings.pdf2texAutoVerify=false）时 job.verify 从不被赋值，这整块
+    // 天然不出现，等同于 P85 之前的面板。
+    if (job.verify) {
+        if (job.verify.state === 'success' || job.verify.state === 'fixed' || job.verify.state === 'failed') {
+            html += '<div class="ovl-p2t-verify">';
+            if (job.verify.state === 'success') {
+                html += '<div class="ovl-p2t-testresult" data-state="ok">✓ 核验：main.tex 编译成功' + (job.verify.compileSecs != null ? '（' + job.verify.compileSecs + 's）' : '') + '</div>';
+            } else if (job.verify.state === 'fixed') {
+                html += '<div class="ovl-p2t-testresult" data-state="fixed">✓ 核验：自动修复后成功 —— ' + escapeHtml(job.verify.fixSummary || '') + '</div>';
+            } else {
+                const shortErr = job.verify.errorsExcerpt ? job.verify.errorsExcerpt.split('\n')[0].slice(0, 160) : (job.verify.fixSummary || '未知原因');
+                html += '<div class="ovl-p2t-testresult" data-state="error">✗ 核验：仍失败 —— ' + escapeHtml(shortErr) + '，建议人工处理</div>';
+            }
+            const lowConf = job.verify.lowConfidencePages || [];
+            if (lowConf.length) {
+                html += '<div class="ovl-p2t-meta">低置信页（配平/表格弱校验未通过，已保留 TODO 注释）：'
+                    + lowConf.map(function (p) { return '第 ' + p.num + ' 页'; }).join('、') + '</div>';
+            }
+            html += '</div>';
+        } else if (verifyingLabel) {
+            html += '<div class="ovl-p2t-meta">' + escapeHtml(verifyingLabel) + '</div>';
+        }
+    }
+    html += '</div>';
     html += '<div class="ovl-p2t-actions">';
     if (running && !finished) {
         html += '<button type="button" class="ovl-modal-btn ovl-modal-btn-danger" data-p2t="cancel">取消</button>';
@@ -35805,7 +36095,12 @@ const OVL_SETTINGS_DEFAULTS = {
     pdf2texMaxPx: 1800,      // 1200/1600/1800/2200，页面栅格最长边
     pdf2texSavePageImages: true,  // 关掉省磁盘，但失败页只剩文字占位
     pdf2texAutoOpenResult: true,  // 打开 PDF 时自动打开已有转换结果
-    pdf2texExtractImages: false   // M2 实验开关，spike 结论见 overnight_progress.md「## P75」
+    pdf2texExtractImages: false,  // M2 实验开关，spike 结论见 overnight_progress.md「## P75」
+    // ---- v2 Pass P85：转换后整体核验 ----
+    // main.tex 拼装完成后自动用桥编译一次；失败则截取错误日志 + 出错页片段发给修复模型
+    // （复用视觉模型同一 endpoint/模型名，关闭思考），应用修正后再编译一次——最多一轮，不循环。
+    // 默认开；关闭则跳过整段核验，行为等同于 P85 之前（见 ovlP2TRunPipeline/ovlP2TRunVerify）。
+    pdf2texAutoVerify: true
 };
 const OVL_FONT_FAMILIES = {
     'ovl-mono-default': '"SFMono-Regular", Consolas, "Courier New", monospace',
@@ -36483,6 +36778,8 @@ function ovlSettingsPdf2TexHtml() {
     html += ovlSetRow('提取内嵌图片（实验）', '<input type="checkbox" id="ovlP2TExtractImagesChk" data-setpath="settings.pdf2texExtractImages"'
         + (s.pdf2texExtractImages ? ' checked' : '') + (OVL_P2T_M2_AVAILABLE ? '' : ' disabled') + '>',
         OVL_P2T_M2_AVAILABLE ? '尝试直接提取 PDF 里的内嵌位图，而不是整页截图当图源。' : '本机 pdf.js spike 未通过（详见 overnight_progress.md「## P75」），这个能力尚未实现，开关已禁用。');
+    html += ovlSetRow('转换后自动整体核验', '<input type="checkbox" data-setpath="settings.pdf2texAutoVerify"' + (s.pdf2texAutoVerify ? ' checked' : '') + '>',
+        '转换完成后自动编译一次 main.tex；失败会尝试一轮自动修复（把错误日志+出错页片段发给上面同一个模型改写，改动结果只应用一次）后再编译一次，结果显示在转换面板里。关闭则跳过核验，转换完直接结束。');
     html += ovlSetRow('连接测试', '<button type="button" class="ovl-modal-btn" onclick="ovlP2TTestVisionConnection()">测试连接</button>'
         + '<span id="ovlP2TTestResult" class="ovl-p2t-testresult"></span>',
         '按当前输入框里的地址真的打一次 GET <地址>/models，不需要先保存。');
