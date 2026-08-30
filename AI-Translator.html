@@ -33593,13 +33593,26 @@ async function ovlP2TCallVision(pageNum, dataUrl, userText, extSignal, maxTokens
     if (!model) return { ok: false, error: '未配置视觉模型（见设置 → PDF 转 LaTeX）', retryable: false };
     // v2 Pass P79：maxTokensOverride 由阶梯重试外壳传入，未传时回落原值 3072（§4.3）。
     const effMaxTokens = (typeof maxTokensOverride === 'number' && maxTokensOverride > 0) ? maxTokensOverride : OVL_P2T_MAXTOKENS_BASE;
-    const bodyText = JSON.stringify({
+    // v2 Pass P83：「禁用模型思考」开关——两个手段一起上（对不认得这两个手段的模型/服务端都
+    // 是无害的额外字段/文本，不会报错）：
+    //   1) chat_template_kwargs.enable_thinking:false —— Qwen3 系官方模板变量。
+    //   2) prompt 尾部追加 "/no_think" —— 老式 Qwen 模板里同一件事的另一种拼法。
+    // 【经验参数，出处不确定】本文件里另一条本地调用链（xportSystemPrompt 上方注释，约
+    // 8963 行）实测过这两个手段在**那台**服务（qwen3.8-27b @ :1235）上是空操作——但那是
+    // 另一个模型、另一个 LM Studio 实例；这里没有对 qwen3-vl-32b-thinking @ :1234 做过同等
+    // 强度的空操作复验，先照 P83 任务书原样接上，浮出一个用户可关的开关，别的模型/后端
+    // 忽略不认得的字段/文本本就是常规行为，最坏情况等同于没加这个开关。
+    const disableThinking = !!OvlSettings.pdf2texDisableThinking;
+    const effUserText = disableThinking ? (userText + '\n/no_think') : userText;
+    const bodyObj = {
         model: model, temperature: 0.1, max_tokens: effMaxTokens, stream: false,
         messages: [
             { role: 'system', content: OVL_P2T_SYSTEM_PROMPT },
-            { role: 'user', content: [ { type: 'text', text: userText }, { type: 'image_url', image_url: { url: dataUrl } } ] }
+            { role: 'user', content: [ { type: 'text', text: effUserText }, { type: 'image_url', image_url: { url: dataUrl } } ] }
         ]
-    });
+    };
+    if (disableThinking) bodyObj.chat_template_kwargs = { enable_thinking: false };
+    const bodyText = JSON.stringify(bodyObj);
     async function attemptOnce() {
         const controller = new AbortController();
         let extAbortHandler = null;
@@ -34419,15 +34432,17 @@ function ovlP2TPanelRender() {
     else statusLine = '转换中…';
 
     const elapsedS = Math.round((Date.now() - job.startedAt) / 1000);
+    const conc = Math.max(1, job.concurrency || 1);
     let etaText = '';
     if (running && !finished && !cancelled) {
+        // v2 Pass P83（任务书公式）：已完成页均值（算术平均，不是中位数）滚动更新，
+        // 并发下 ETA = 剩余页数 × 单页均值 / 并发度。
         const doneTimes = job.pages.map(function (p) { return p.ms; }).filter(function (ms) { return typeof ms === 'number'; });
         if (doneTimes.length > 0) {
-            doneTimes.sort(function (a, b) { return a - b; });
-            const med = doneTimes[Math.floor(doneTimes.length / 2)];
+            const avgMs = doneTimes.reduce(function (a, b) { return a + b; }, 0) / doneTimes.length;
             const remaining = Math.max(0, total - done);
-            const conc = Math.max(1, job.concurrency || 1);
-            etaText = '预估剩余 ' + Math.round(Math.ceil(remaining / conc) * med / 1000) + ' 秒';
+            const etaS = Math.round(remaining * avgMs / conc / 1000);
+            etaText = '预估剩余 ' + etaS + ' 秒（并发 ' + conc + '）';
         }
     }
 
@@ -34440,7 +34455,10 @@ function ovlP2TPanelRender() {
     html += '<div class="ovl-p2t-body">';
     html += '<div class="ovl-p2t-meta">' + escapeHtml(job.pdfName) + ' &rarr; ' + escapeHtml(job.outRel) + '</div>';
     html += '<div class="ovl-p2t-bar-track"><div class="ovl-p2t-bar-fill" style="width:' + Math.round(total ? (done / total * 100) : 0) + '%"></div></div>';
-    html += '<div class="ovl-p2t-progtext"><span>' + statusLine + '（' + done + '/' + total + ' 页）</span><span>已用时 ' + elapsedS + ' 秒' + (etaText ? '，' + etaText : '') + '</span></div>';
+    // v2 Pass P83：右侧格式改成「第 X/N 页 · 已用 T 秒 · 预估剩余 R 秒（并发 C）」——转换未
+    // 结束时才有 etaText，结束/取消/失败时只到「已用 T 秒」为止（没有剩余可估）。
+    const progRight = '第 ' + done + '/' + total + ' 页 · 已用 ' + elapsedS + ' 秒' + (etaText ? ' · ' + etaText : '');
+    html += '<div class="ovl-p2t-progtext"><span>' + statusLine + '</span><span>' + progRight + '</span></div>';
     html += '<div class="ovl-p2t-grid">';
     job.pages.forEach(function (p) {
         let title = '第 ' + p.num + ' 页';
@@ -35734,6 +35752,7 @@ const OVL_SETTINGS_DEFAULTS = {
     pdf2texVisionEndpoint: 'http://100.98.164.17:1234/v1', // OpenAI 兼容端点，浏览器直连（不经过本机桥），见 probe_vision.md
     pdf2texVisionModel: 'qwen3-vl-32b-thinking',
     pdf2texConcurrency: 2,   // 1-4，调高不一定更快，本地模型多为串行
+    pdf2texDisableThinking: false, // v2 Pass P83：关掉视觉模型思考链，更快但可能降质，见 ovlP2TCallVision 上方注释
     pdf2texMaxPx: 1800,      // 1200/1600/1800/2200，页面栅格最长边
     pdf2texSavePageImages: true,  // 关掉省磁盘，但失败页只剩文字占位
     pdf2texAutoOpenResult: true,  // 打开 PDF 时自动打开已有转换结果
@@ -36382,6 +36401,8 @@ function ovlSettingsPdf2TexHtml() {
     html += ovlSetRow('并发页数', '<select data-setpath="settings.pdf2texConcurrency">'
         + [1, 2, 3, 4].map(function (n) { return ovlOptTag(n, String(n), s.pdf2texConcurrency); }).join('') + '</select>',
         '同时在跑的页数。调高不一定更快——本地模型服务多为串行处理，第一页永远单独跑（吸收冷启动）。');
+    html += ovlSetRow('禁用模型思考', '<input type="checkbox" data-setpath="settings.pdf2texDisableThinking"' + (s.pdf2texDisableThinking ? ' checked' : '') + '>',
+        '更快，但可能降质（v2 Pass P83，经验参数：对不支持这个开关的模型无害地被忽略）。');
     html += ovlSetRow('页面栅格最长边', '<select data-setpath="settings.pdf2texMaxPx">'
         + [1200, 1600, 1800, 2200].map(function (n) { return ovlOptTag(n, n + ' px', s.pdf2texMaxPx); }).join('') + '</select>',
         '喂给模型的页面截图分辨率。越大越清晰也越慢、请求体越大。');
