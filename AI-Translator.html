@@ -1983,6 +1983,20 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    升级"，不是另起一套样式。 */
 .ovl-visual-fig-thumb { max-width: 100%; max-height: 260px; object-fit: contain; border-radius: 2px; }
 .ovl-visual-float-fallback { white-space: pre-wrap; }
+/* v2 Pass P87：flalign/IEEEeqnarray 实测 KaTeX 0.16.9 真不认识这两个环境名（见
+   renderFormattedText 里对应注释），不能强行喂给 KaTeX（会吐刺眼的红色 ParseError），
+   也不能什么样式都不加地把源码混进普通段落文字流（容易被 marked 当 Markdown 语法误解析）；
+   用跟 .ovl-visual-algo-wrap 同一视觉语言的浅灰说明框 + 等宽源码块，明确告知"格式受限，
+   非渲染失败"。 */
+.ovl-math-unsupported {
+    margin: 10px 0; border: 1px solid #d1d5db; border-radius: 4px; padding: 8px 12px;
+    background: #fafafa;
+}
+.ovl-math-unsupported-note { font-size: 12px; color: #6b7280; margin-bottom: 6px; }
+.ovl-math-unsupported-src {
+    font: 12.5px/1.5 "SFMono-Regular", Consolas, monospace; color: #1f2937;
+    white-space: pre-wrap; word-break: break-word; margin: 0;
+}
 
 .ovl-pdf-panel {
     background: #2F3A4C;
@@ -7109,11 +7123,58 @@ function renderFormattedText(text) {
     // 一个红色错误 span 里，导致 Visual 模式里这些内容变成一坨转义乱码而不是"看得懂的
     // 原始标记"。改成只匹配 KaTeX 真的支持、且合理出现在最外层的数学显示环境——
     // 名单跟下面 envMap 本来就有的 5 个一致，不引入这条正则从没验证过的新环境。
-    pushPlaceholder(/\\begin\{(equation|align|gather|multline|eqnarray)(\*?)\}([\s\S]*?)\\end\{\1\2\}/g, 'display', (match, env, star, body) => {
-        // 未加星号（带编号）的一律转换成加星号版本——Visual 模式是只读预览，公式编号跟
-        // 正文里的 \eqref/\ref 没有意义，且编号状态在这里维护不了。
-        const noNumberEnv = env + (star || '*');
+    // v2 Pass P87（问题9 公式渲染缺口修复）：分块层 OVL_VISUAL_MATH_ATOMIC_ENV_RE（约
+    // 26623 行）早就把 cases/alignat/flalign/IEEEeqnarray 当"数学原子块"整段保留，但这里
+    // 当年只挑了 5 个环境名，两层名单没有同步长大——顶层独立出现（没套进 align/equation）
+    // 的这几个环境会被分块层保留成一整块，却在这里被漏判、直接掉进 marked 的普通段落
+    // 渲染，用户看到一整段裸 LaTeX 源码。
+    // 【规格偏差，本次实现时用真实 katex.renderToString 逐个探针验证后发现并按"最小侵入+
+    // 诚实兜底"改正】诊断报告认为"KaTeX 0.16.9 本身原生认识 cases/alignat/flalign"，但
+    // 报告自己的实测表格里 flalign 只验证过"环境识别本身"（A8: hasKatex:false），从没真的
+    // 喂给 KaTeX 渲染过——这次补齐前用探针脚本把 9 种环境逐个真实调用
+    // window.katex.renderToString({throwOnError:false}) 实测：cases/dcases/rcases/
+    // alignat/alignat* 确实成功（hasKatexError:false）；但 flalign/flalign*/
+    // IEEEeqnarray/IEEEeqnarray* 全部真实抛 "No such environment"（hasKatexError:true）——
+    // KaTeX 压根没实现这两个环境，报告这条判断没经过实测就下了结论，这里用实测结果推翻它。
+    // 只把确认能渲染的 cases/dcases/rcases/alignat 加进这条白名单；flalign/IEEEeqnarray
+    // 改用下面单独一段"已知不支持"兜底（不裸露源码、也不硬喂给 KaTeX 生成刺眼的红色
+    // ParseError），呼应用户"对 KaTeX 真不支持的兜底显示别裸源码"的要求。
+    // 刻意不扩 matrix/pmatrix/vmatrix/smallmatrix/array/split/subarray/CD——这几个几乎
+    // 总是嵌套在 equation/align 内部用，顶层独立出现更可能是转换产物拆分错误，保留
+    // "不认识就原样显示源码"这个诚实兜底。
+    // alignat 在环境名和内容之间还有一个列数参数（`\begin{alignat}{2}`），新增第 3 个可选
+    // 捕获组 `(\{[^{}]*\})?` 单独摘出来，再原样拼回 body 前面（`${colSpec||''}${body}`）——
+    // 对不带这个参数的环境（cases 等）该捕获组匹配空字符串，等价于没加过；即使正则贪婪地
+    // 把 body 本该开头的一个裸 `{...}` 误判成"列参数"，重新拼接后落地位置跟没摘之前完全
+    // 一样，不影响渲染结果，不需要为"区分真列参数 vs 碰巧开头的花括号"专门写判断逻辑。
+    pushPlaceholder(/\\begin\{(equation|align|gather|multline|eqnarray|alignat|cases|dcases|rcases)(\*?)\}(\{[^{}]*\})?([\s\S]*?)\\end\{\1\2\}/g, 'display', (match, env, star, colSpec, body) => {
+        // cases/dcases/rcases 在 amsmath 里从来不参与编号，没有"去编号转星号"这回事——
+        // 强行拼一个 cases*/dcases*/rcases* 是 mathtools 才有的扩展变体名，不保证 KaTeX
+        // 认识（会把现在能正常渲染的 cases 改坏成渲染失败），原样保留环境名不动。
+        // 其余（equation/align/gather/multline/eqnarray/alignat）未加星号（带编号）的
+        // 一律转换成加星号版本——Visual 模式是只读预览，公式编号跟正文里的 \eqref/\ref
+        // 没有意义，且编号状态在这里维护不了；alignat/alignat* 探针已验证两种都能正常渲染。
+        const isCasesFamily = (env === 'cases' || env === 'dcases' || env === 'rcases');
+        const noNumberEnv = isCasesFamily ? (env + (star || '')) : (env + (star || '*'));
+        body = (colSpec || '') + body;
         return `\\begin{${noNumberEnv}}${body}\\end{${noNumberEnv}}`;
+    });
+    // flalign/IEEEeqnarray：探针实测 KaTeX 0.16.9 真不认识这两个环境名（见上方大段注释）。
+    // 不裸露源码（现状的"没匹配上、原样进 marked 段落流"）、也不硬喂给 KaTeX 生成一个
+    // 刺眼的红色 "No such environment" ParseError——改成一条独立的"已知格式受限"兜底：
+    // 转义后用等宽字体的说明框包起来展示，明确标注环境名和"暂不支持渲染"，让用户看得出
+    // 这是"这一种排版格式受限"，不是"翻译/渲染出错了"。IEEEeqnarray 的列格式参数
+    // （如 `{rCl}`）跟环境名之间没有花括号数量歧义（这条兜底整体保留原始文本，不拆列参数），
+    // 不需要额外处理。
+    content = content.replace(/\\begin\{(flalign|IEEEeqnarray)(\*?)\}(\{[^{}]*\})?([\s\S]*?)\\end\{\1\2\}/g, (rawMatch, envName) => {
+        const id = `%%LATEX_${placeholders.length}%%`;
+        const esc = String(rawMatch).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        placeholders.push({
+            id,
+            html: '<div class="ovl-math-unsupported"><div class="ovl-math-unsupported-note">KaTeX 暂不支持 '
+                + envName + ' 环境的渲染，以下为原始 LaTeX 源码</div><pre class="ovl-math-unsupported-src">' + esc + '</pre></div>'
+        });
+        return id;
     });
     pushPlaceholder(/\\\[([\s\S]*?)\\\]/g, 'display', (match, p1) => p1);
     pushPlaceholder(/\$\$([\s\S]*?)\$\$/g, 'display', (match, p1) => p1);
@@ -25655,25 +25716,51 @@ function ovlRenderVisualTable(tex) {
 // algorithmicx 的行级关键字：STATE 不打印关键字本身（只显示语句正文，照抄真实 Overleaf/
 // algorithmicx 的排版），FOR/IF/WHILE 一族打印 "for ... do" / "if ... then" / "end for" 等
 // 标签并参与缩进深度计算。
+// v2 Pass P87（问题8 伪代码渲空修复）：补齐 ELSIF/FUNCTION/ENDFUNCTION/PROCEDURE/
+// ENDPROCEDURE/REPEAT/UNTIL/PRINT——本仓库自己的 pdf2tex 系统提示词（OVL_P2T_SYSTEM_PROMPT
+// §4.3）明确要求模型输出 algpseudocode 的混合大小写命令集，只认经典 algorithmic 全大写
+// 关键字的旧表在转换产物上命中率接近 0。
 const OVL_ALGO_KW_LABEL = {
     FOR: 'for', ENDFOR: 'end for',
-    IF: 'if', ELSE: 'else', ENDIF: 'end if',
+    IF: 'if', ELSE: 'else', ELSIF: 'else if', ENDIF: 'end if',
     WHILE: 'while', ENDWHILE: 'end while',
-    REQUIRE: 'Require:', ENSURE: 'Ensure:', RETURN: 'return'
+    FUNCTION: 'function', ENDFUNCTION: 'end function',
+    PROCEDURE: 'procedure', ENDPROCEDURE: 'end procedure',
+    REPEAT: 'repeat', UNTIL: 'until',
+    REQUIRE: 'Require:', ENSURE: 'Ensure:', RETURN: 'return', PRINT: 'print'
 };
+// v2 Pass P87：kwRe 加 'i' 大小写不敏感——旧版只认全大写 \STATE/\IF 这类经典 algorithmic
+// 写法，撞上 algpseudocode 的混合大小写 \State/\If/\ElsIf 命中率是 0（kwRe 一个都不中，
+// ovlParseAlgorithmicLines 返回空数组，整段伪代码渲染成空 innerHTML）。命中后统一
+// normalize 成大写内部标识符（m[1].toUpperCase()）再查 OVL_ALGO_KW_LABEL/后续 kw 比较，
+// 经典全大写包和 algpseudocode 驼峰包两种写法不用调用方先猜是哪一种，都能命中同一套表。
 function ovlParseAlgorithmicLines(body) {
-    const kwRe = /\\(STATE|ENDFOR|FOR|ENDIF|ELSE|IF|ENDWHILE|WHILE|REQUIRE|ENSURE|RETURN)\b/g;
+    const kwRe = /\\(STATE|ENDFOR|FOR|ENDIF|ELSIF|ELSE|IF|ENDWHILE|WHILE|ENDFUNCTION|FUNCTION|ENDPROCEDURE|PROCEDURE|REPEAT|UNTIL|REQUIRE|ENSURE|RETURN|PRINT)\b/gi;
     const matches = [];
     let m;
-    while ((m = kwRe.exec(body))) matches.push({ kw: m[1], start: m.index, kwEnd: kwRe.lastIndex });
+    while ((m = kwRe.exec(body))) matches.push({ kw: m[1].toUpperCase(), start: m.index, kwEnd: kwRe.lastIndex });
     const lines = [];
     for (let idx = 0; idx < matches.length; idx++) {
         const cur = matches[idx];
         let pos = cur.kwEnd;
         let arg = '';
-        if ((cur.kw === 'FOR' || cur.kw === 'IF' || cur.kw === 'WHILE') && body[pos] === '{') {
+        if ((cur.kw === 'FOR' || cur.kw === 'IF' || cur.kw === 'ELSIF' || cur.kw === 'WHILE') && body[pos] === '{') {
             const close = ovlFindMatchingBrace(body, pos);
             if (close !== -1) { arg = body.slice(pos + 1, close); pos = close + 1; }
+        } else if ((cur.kw === 'FUNCTION' || cur.kw === 'PROCEDURE') && body[pos] === '{') {
+            // \Function{name}{args} / \Procedure{name}{args}：两个花括号参数（函数名+参数
+            // 列表），跟 FOR/IF/WHILE 的单参数模式不同——仿照下面 ovlAlgoInlineCallComment
+            // 处理 \CALL{}{} 的手法，摘两个花括号拼成 "name(args)"。
+            const close1 = ovlFindMatchingBrace(body, pos);
+            if (close1 !== -1) {
+                const name = body.slice(pos + 1, close1);
+                let p2 = close1 + 1;
+                if (body[p2] === '{') {
+                    const close2 = ovlFindMatchingBrace(body, p2);
+                    if (close2 !== -1) { arg = name + '(' + body.slice(p2 + 1, close2) + ')'; pos = close2 + 1; }
+                    else { arg = name + '()'; pos = p2; }
+                } else { arg = name + '()'; pos = p2; }
+            }
         }
         const nextStart = (idx + 1 < matches.length) ? matches[idx + 1].start : body.length;
         lines.push({ kw: cur.kw, arg: arg, text: body.slice(pos, nextStart).trim() });
@@ -25697,10 +25784,10 @@ function ovlRenderAlgorithmicLines(lines, numbered) {
         const ln = lines[li];
         const kw = ln.kw;
         let thisDepth = depth;
-        if (kw === 'ENDFOR' || kw === 'ENDIF' || kw === 'ENDWHILE') {
+        if (kw === 'ENDFOR' || kw === 'ENDIF' || kw === 'ENDWHILE' || kw === 'ENDFUNCTION' || kw === 'ENDPROCEDURE' || kw === 'UNTIL') {
             depth = Math.max(0, depth - 1);
             thisDepth = depth;
-        } else if (kw === 'ELSE') {
+        } else if (kw === 'ELSE' || kw === 'ELSIF') {
             thisDepth = Math.max(0, depth - 1);
         }
         let lineNo = '';
@@ -25709,7 +25796,8 @@ function ovlRenderAlgorithmicLines(lines, numbered) {
         if (ln.arg) {
             bodyHtml += ' <span class="ovl-algo-cond">' + ovlAlgoInlineCallComment(ovlUnwrapSingleParagraph(ovlVisualRenderChunk(ln.arg))) + '</span>';
             if (kw === 'FOR' || kw === 'WHILE') bodyHtml += ' <span class="ovl-algo-kw">do</span>';
-            if (kw === 'IF') bodyHtml += ' <span class="ovl-algo-kw">then</span>';
+            if (kw === 'IF' || kw === 'ELSIF') bodyHtml += ' <span class="ovl-algo-kw">then</span>';
+            if (kw === 'FUNCTION' || kw === 'PROCEDURE') bodyHtml += ' <span class="ovl-algo-kw">is</span>';
         }
         if (ln.text) {
             bodyHtml += ' ' + ovlAlgoInlineCallComment(ovlUnwrapSingleParagraph(ovlVisualRenderChunk(ln.text)));
@@ -25720,7 +25808,7 @@ function ovlRenderAlgorithmicLines(lines, numbered) {
             + (kwLabel ? '<span class="ovl-algo-kw">' + kwLabel + '</span>' : '')
             + bodyHtml
             + '</div>';
-        if (kw === 'FOR' || kw === 'IF' || kw === 'WHILE') depth++;
+        if (kw === 'FOR' || kw === 'IF' || kw === 'WHILE' || kw === 'FUNCTION' || kw === 'PROCEDURE' || kw === 'REPEAT') depth++;
     }
     return html;
 }
@@ -26394,8 +26482,22 @@ function ovlVisualTransCacheDelete(text, config) {
 // 模型返回后先用 xportUnmask 还原公式/引用层，再用 ovlVisualCodeCheck 校验我方哨兵
 // 是否完整（不多不少、不重不漏），通过才用 ovlVisualCodeUnmask 还原代码原文；校验不
 // 通过就整块回退显示原文并 console.warn，绝不把带哨兵残渣的文本显示给用户。
+// v2 Pass P87（问题7 漏译修复）：'algorithm' 外壳本身不再整体吞——只保留内层
+// 'algorithmic'/'algorithmicx'/'algorithm2e' 真伪代码。原因：这个函数是逐字符扫描
+// \begin{X}，命中列表里的名字才整段吞成一个不透明 token；'algorithm' 曾经在这个列表里，
+// 导致连同 \caption{...}（自然语言，caption 里的说明文字）一起被吞成一个 code-token，
+// 送进 ovlVisualNothingToTranslate 判定为"整块无可翻内容"，直接原样返回、永远不进模型
+// 翻译队列（用户看到"已完成"但 caption 其实是英文原文）。现在移除 'algorithm' 后，扫描
+// 循环会把 \begin{algorithm}[H]...\caption{...}...\end{algorithm} 的外壳文字原样透传
+// （跟其它正文字符一样逐字符走过去，不做任何特殊处理），只有扫到内层仍在名单里的
+// \begin{algorithmic}...\end{algorithmic} 才会被整体吞成一个 code-token——效果正是
+// 诊断报告"编辑计划"里要的粒度（caption 留在外面正常翻译，伪代码本体保持不透明保护），
+// 不需要新写一个 algorithm 专属分支：ovlVisualCodeEnvEnd 本来就是通用的 \begin/\end 深度
+// 计数，不比对环境名，从 algorithmic 的 \begin 起算照样能配对到它自己的 \end。
+// algorithm2e 保持整体不透明（它的用法是单一 \begin{algorithm2e}...\end{algorithm2e}
+// 自成一体，没有外层 algorithm+内层 algorithmic 的两层结构，不适用同一条透传逻辑）。
 const OVL_VISUAL_CODE_ENV_NAMES = ['verbatim', 'Verbatim', 'lstlisting', 'minted', 'alltt',
-    'algorithm', 'algorithmic', 'algorithmicx', 'algorithm2e'];
+    'algorithmic', 'algorithmicx', 'algorithm2e'];
 function ovlVisualCodeToken(k) { return '〔〔OVLCODE' + k + '〕〕'; }
 const OVL_VISUAL_CODE_TOKEN_RE = /〔〔OVLCODE(\d+)〕〕/g;
 
@@ -31503,10 +31605,22 @@ function ovlUpdatePdfToolbarUI() {
         const el = document.getElementById(id);
         if (el) el.disabled = !hasPdf;
     });
-    // M10 SyncTeX 正向：只有真的有 output.synctex.gz 才点得亮（§2.6.10）。isDirect 时
-    // lastCompile 恒为 null 本来就会自动算出禁用，显式加 isDirect || 只是为了可读性/防御性。
+    // M10 SyncTeX 正向：只有真的有 output.synctex.gz 才点得亮（§2.6.10）。
+    // v2 Pass P87：direct 模式不再恒禁用——这个按钮现在兼职「按 % ==== page N ==== 标记
+    // 页级定位到 PDF」（不依赖 lastCompile/synctex），只要有直显的 PDF 且编辑器可编辑就
+    // 点得亮；是否真的能跳成功（这份 .tex 有没有页标记）留给点击时 ovlSyncTexForward 的
+    // direct 分支去判断、明确提示，不在这里静默假设。
     const syncBtn = document.getElementById('ovlSyncTexBtn');
-    if (syncBtn) syncBtn.disabled = isDirect || !(OvlState.lastCompile && OvlState.lastCompile.pdfExists && OvlState.lastCompile.synctexExists);
+    if (syncBtn) {
+        const codeArea = document.getElementById('ovlCodeArea');
+        if (isDirect) {
+            syncBtn.disabled = !OvlState.pdfObjectUrl || !(codeArea && !codeArea.disabled);
+            syncBtn.setAttribute('data-tip', '页级定位到 PDF 对应页（按 % ==== page N ==== 标记，转换产物专用）');
+        } else {
+            syncBtn.disabled = !(OvlState.lastCompile && OvlState.lastCompile.pdfExists && OvlState.lastCompile.synctexExists);
+            syncBtn.setAttribute('data-tip', '在 PDF 中定位（SyncTeX 正向，只做到页级定位；反向双击 PDF 里的文字即可）');
+        }
+    }
     ovlUpdatePdfInvertFromSettings();
 }
 
@@ -35433,8 +35547,38 @@ function ovlSyncTexCurrentLine() {
 // 已经做出来了，见下面 ovlPdfHandleDblClick + 桥的 /synctex/edit（doSyncTexEdit）。这里的正向
 // 跳转本可以顺手也做到 x/y 级（pdf.js 拿得到坐标），但没在这一轮范围内改——保持只做页级跳转，
 // 跟按钮 tooltip 说的一致，不擅自扩大改动范围。
+// v2 Pass P87（§1.2 编辑器 -> PDF，direct 模式）：不打桥的 /synctex/forward（direct 模式
+// 根本没有 lastCompile/synctex 数据）——用 §1.1 已有的 ovlScanPageMarkers/ovlPageForLine，
+// 取当前光标（Code/Visual 通吃的 ovlSyncTexCurrentLine，1-based）落在哪一页标记区间内，
+// 只做页级（跟按钮改过的 tooltip 说的一致，不擅自做句级——句级只在 PDF->编辑器方向做，
+// 编辑器->PDF 方向没有"双击点周围文字"这个锚点可用）。
+function ovlSyncTexForwardDirect() {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || ta.disabled) { ovlFlashSaveStatus('请先打开一个 .tex 文件并填好项目绝对路径', true); return; }
+        const line = ovlSyncTexCurrentLine();
+        if (line == null) { ovlFlashSaveStatus('请先在左栏点一下你要定位的位置', true); return; }
+        const markers = ovlScanPageMarkers(ta.value);
+        if (!markers.length) {
+            ovlFlashSaveStatus('当前文件没有页标记，可能不是 PDF 转换产物', true);
+            return;
+        }
+        const pageNum = ovlPageForLine(markers, line - 1); // ovlSyncTexCurrentLine 是 1-based，markers.line 是 0-based
+        if (pageNum == null) {
+            ovlFlashSaveStatus('当前光标位置在第一个页标记之前，无法确定对应页', true);
+            return;
+        }
+        if (OvlState.viewMode === 'editor') ovlSetViewMode('pdf'); // 单栏优先：跟正向/反向那两处同一设计哲学
+        ovlPdfSetPage(pageNum);
+        ovlFlashSaveStatus('已跳到 PDF 第 ' + pageNum + ' 页（页级，按 % ==== page N ==== 标记）', false);
+    } catch (e) {
+        console.error('[ovl] syncTexForwardDirect failed', e);
+        ovlFlashSaveStatus('页级定位失败', true);
+    }
+}
 async function ovlSyncTexForward() {
     try {
+        if (OvlState.pdfSourceMode === 'direct') { ovlSyncTexForwardDirect(); return; }
         if (!OvlState.lastCompile || !OvlState.lastCompile.pdfExists || !OvlState.lastCompile.synctexExists) {
             ovlFlashSaveStatus('还没有可用的 SyncTeX 数据，请先 Recompile 一次成功的编译', true);
             return;
@@ -37375,6 +37519,178 @@ function ovlPdfPaintSyncHighlight(pageNum, xPt, yPt) {
 // `synctex help edit`："counted from the top left corner"，doSyncTexEdit 头部注释也记了这条），
 // 所以还要用页高做一次 y 轴翻转：synY = pageHeightPt - pdfY。
 // 2026-08-25 本机用 scratch 文档实测核对过这套换算：双击渲染出来的某一行文字，命中的源码行号
+// ==================== v2 Pass P87：direct 模式源 PDF <-> 转换 tex 双向跳转（问题4） ====================
+// 背景：PDF→LaTeX 转换（ovlP2TOpenResult）打开结果时走的是普通 ovlOpenFile，不碰
+// OvlState.pdfSourceMode/pdfDirectFile；只有 ovlDoRecompile 才会把 pdfSourceMode 强改成
+// 'compiled'。所以"左侧仍显示 direct 源 PDF、右侧编辑器打开的是 PDF→LaTeX 转换产物"是真实
+// 可达状态（split 视图下：先直显一份 PDF，再点「转换为 LaTeX」，完成后开结果，两栏都不触发
+// compiled 切换）。这种场景下原来的 SyncTeX 正向/反向逻辑硬依赖 lastCompile/synctex 数据，
+// 天生不可用——下面这一整套不依赖编译产物，只认 ovlP2TAssembleMain/ovlP2TFailurePlaceholder
+// 生成的 `% ==== page N ====` / `% ==== page N 自动转换失败 ====` 标记做页级映射；句级用
+// pdf.js getTextContent + 归一化模糊匹配做"尽力而为"的精定位，命中不了静默降级到页级
+// （这是这条能力天生的边界，不是 bug）。
+const OVL_PAGE_MARKER_RE = /^%\s*====\s*page\s+(\d+)/;
+// 扫描当前编辑器文本里的全部页标记，Code/Visual、§1 页级、§2 句级共用同一份数据源
+// （每次都现取 ta.value，不缓存——跟 ovlVisualBlockSrcText"不缓存文本本身"同一条既有纪律，
+// 编辑过的文件下次点击自动拿到新内容）。转换产物是逐页顺序拼装的（ovlP2TAssembleMain），
+// markers 天然按 line 升序，不需要额外 sort。
+function ovlScanPageMarkers(taValue) {
+    const lines = String(taValue == null ? '' : taValue).split('\n');
+    const out = [];
+    for (let i = 0; i < lines.length; i++) {
+        const m = OVL_PAGE_MARKER_RE.exec(lines[i].trim()); // trim 兼容行首偶有空白，防御性处理
+        if (m) out.push({ pageNum: parseInt(m[1], 10), line: i });
+    }
+    return out;
+}
+// line：0-based。取"满足 marker.line <= line 的最后一条"（markers 已按 line 升序，遇到第一个
+// 不满足的就能提前退出）——即"当前光标落在哪一页区间内"。一条都不满足（光标在第一个页标记
+// 之前）返回 null。
+function ovlPageForLine(markers, line) {
+    let best = null;
+    for (let i = 0; i < markers.length; i++) {
+        if (markers[i].line <= line) best = markers[i]; else break;
+    }
+    return best ? best.pageNum : null;
+}
+// 给句级匹配用：某一页对应的源码行区间 [startLine, endLine]（含端点）——从这一页自己的
+// marker 行开始，到下一页 marker 出现前一行为止；最后一页到文档末尾。找不到这一页的 marker
+// （PDF 页数比转换产物页标记多，或调用方传了错误的 pageNum）返回 null，调用方按"降级页级"
+// 处理（页级跳转在 §1.1 已经先做过，句级只是锦上添花）。
+function ovlFindPageBlockSourceRange(markers, pageNum, taValue) {
+    const idx = markers.findIndex(function (m) { return m.pageNum === pageNum; });
+    if (idx === -1) return null;
+    const startLine = markers[idx].line;
+    const totalLines = taValue.length ? taValue.split('\n').length : 1;
+    const endLine = (idx + 1 < markers.length) ? (markers[idx + 1].line - 1) : (totalLines - 1);
+    return { startLine: startLine, endLine: Math.max(startLine, endLine) };
+}
+// PDF 抽取文本与源码/翻译产物的 LaTeX 转写之间天然有噪声（连字符断词、页眉页脚、公式/引用
+// 命令在 PDF 可见文字里不存在）——归一化拉平这些差异：连字符断词拼回、折叠空白、大小写不敏感。
+function ovlNormalizeForSentenceMatch(s) {
+    return String(s == null ? '' : s)
+        .replace(/-\s*\n\s*/g, '')   // PDF 常见 "opti-\nmization" 连字符断词
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+}
+function ovlTokenJaccard(a, b) {
+    const ta = a.split(' ').filter(Boolean);
+    const tb = b.split(' ').filter(Boolean);
+    if (!ta.length || !tb.length) return 0;
+    const sb = new Set(tb);
+    let inter = 0;
+    for (let i = 0; i < ta.length; i++) { if (sb.has(ta[i])) inter++; }
+    const union = new Set(ta.concat(tb)).size;
+    return union ? inter / union : 0;
+}
+// "未分句"旧产物（P86 之前，一行可能挤好几句）的过渡方案：按常见句读符号粗切一刀，给一个
+// 比"整行当一句"更细的匹配粒度——即使没有严格一句一行，也能把无关的相邻句子摘出去，降低
+// 误命中概率。lookbehind 在本仓库跑的真实 Chrome（走 CDP 拉起）里是安全的现代 V8 特性。
+function ovlSplitIntoRoughSentences(lineText) {
+    const parts = String(lineText).split(/(?<=[。.!?！？])\s+/).map(function (s) { return s.trim(); }).filter(Boolean);
+    return parts.length ? parts : [lineText];
+}
+// 核心匹配：sourceLines 是某一页源码区间的物理行数组，startLineIdx 是这个区间第一行的绝对
+// 行号（0-based）。两阶段阈值（见 spec_p87_jump.md §2.3）：先按空白折叠的 token 重合率过一遍
+// （便宜、能快速排除明显不相关的候选），候选里再跑一次字符级归一化编辑距离相似度（复用 P81
+// 回显防毒守卫已有的 ovlVisualCharSimilarity 滚动数组实现，不重新写一遍）。两阶段都不设
+// 接近 1.0 的高阈值——双击点本来就只圈中一小段文字，源码那一整"句"（尤其未分句时是一整行）
+// 通常比查询串长得多，要求近似全匹配会系统性把命中率打到 0。找不到达标的候选返回 null，
+// 调用方保持 §1 已经做好的页级跳转，不产生误导性的句级高亮。
+function ovlSentenceLevelMatch(sourceLines, startLineIdx, queryText) {
+    const q = ovlNormalizeForSentenceMatch(queryText);
+    if (!q) return null;
+    const TOKEN_THRESHOLD = 0.5;
+    const CHAR_THRESHOLD = 0.55;
+    let best = -1, bestScore = -Infinity;
+    for (let i = 0; i < sourceLines.length; i++) {
+        const rawLine = sourceLines[i];
+        if (!rawLine || !rawLine.trim()) continue;
+        const segments = ovlSplitIntoRoughSentences(rawLine);
+        for (let s = 0; s < segments.length; s++) {
+            const norm = ovlNormalizeForSentenceMatch(segments[s]);
+            if (!norm) continue;
+            const tokScore = ovlTokenJaccard(norm, q);
+            if (tokScore < TOKEN_THRESHOLD) continue;
+            const charScore = (typeof ovlVisualCharSimilarity === 'function') ? ovlVisualCharSimilarity(norm, q) : tokScore;
+            if (charScore >= CHAR_THRESHOLD && charScore > bestScore) { bestScore = charScore; best = i; }
+        }
+    }
+    if (best === -1) return null;
+    return startLineIdx + best;
+}
+// direct 模式的双击/单击入口（§1.1）：页级保底先跳一次（同步），句级精定位异步尝试、命中才
+// 追加/收窄高亮，不阻塞页级这条已经生效的保底体验。
+function ovlPdfHandleDblClickDirect(ev, container) {
+    try {
+        const num = parseInt(container.getAttribute('data-page-num'), 10);
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || !isFinite(num)) return;
+        const markers = ovlScanPageMarkers(ta.value);
+        const hit = markers.find(function (m) { return m.pageNum === num; });
+        if (!hit) {
+            ovlFlashSaveStatus('当前打开的文件里没有第 ' + num + ' 页的标记，可能不是这份 PDF 的转换结果', true);
+            return;
+        }
+        if (typeof ovlMarkLines === 'function') ovlMarkLines(hit.line, hit.line, { source: 'pdf-direct-page' });
+        ovlPdfDirectTrySentenceLevel(ev, num, markers).catch(function (e) {
+            console.error('[ovl] pdf direct sentence-level match failed', e);
+        });
+    } catch (e) {
+        console.error('[ovl] pdf direct dblclick failed', e);
+    }
+}
+// 句级精定位（§2.2/§2.3）：从 pdf.js 的 entry.pdfPage.getTextContent() 取双击点附近的文本，
+// 归一化模糊匹配该页对应源码区间里的行，命中就用更精确的行号重新 ovlMarkLines 一次
+// （覆盖/收窄 §1.1 已经画出的页级高亮）；找不到就什么都不做，页级高亮原样保留。
+async function ovlPdfDirectTrySentenceLevel(ev, pageNum, markers) {
+    const entry = OvlState.pdfPageMap && OvlState.pdfPageMap.get(pageNum);
+    if (!entry || !entry.pdfPage || !entry.viewport || !entry.canvas) return; // 页面还没渲染完，页级已经生效
+    const rect = entry.canvas.getBoundingClientRect();
+    const cssX = ev.clientX - rect.left;
+    const cssY = ev.clientY - rect.top;
+    const pdfPt = entry.viewport.convertToPdfPoint(cssX, cssY); // [x, y]，左下角原点，向上为正——跟 getTextContent 的 item.transform 同一套坐标系
+    const clickX = pdfPt[0], clickY = pdfPt[1];
+    const tc = await entry.pdfPage.getTextContent();
+    const items = (tc && tc.items) ? tc.items : [];
+    if (!items.length) return;
+    // 找离双击点最近的 text item（包围盒中心到点击点的欧氏距离平方，省一次开方）。
+    let bestItem = null, bestDist = Infinity;
+    for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (!it.str || !it.str.trim()) continue;
+        const tx = it.transform[4], ty = it.transform[5];
+        const w = it.width || 0, h = it.height || Math.abs(it.transform[3]) || 10;
+        const cx = tx + w / 2, cy = ty + h / 2;
+        const dx = cx - clickX, dy = cy - clickY;
+        const dist = dx * dx + dy * dy;
+        if (dist < bestDist) { bestDist = dist; bestItem = it; }
+    }
+    if (!bestItem) return;
+    // 把命中 item 按 y 聚成"一行"（同一基线附近的相邻 item 拼起来，容差取这个 item 高度的
+    // 60%——比整行高度略窄，避免把上下相邻文本行也吸进来）。
+    const baseY = bestItem.transform[5];
+    const lineTol = Math.max(2, (bestItem.height || 10) * 0.6);
+    let queryText = '';
+    for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (!it.str) continue;
+        if (Math.abs(it.transform[5] - baseY) <= lineTol) queryText += it.str;
+    }
+    queryText = queryText.trim();
+    if (!queryText) return;
+    const taNow = document.getElementById('ovlCodeArea');
+    if (!taNow) return;
+    const range = ovlFindPageBlockSourceRange(markers, pageNum, taNow.value);
+    if (!range) return; // 降级：§1.1 页级跳转已经做了
+    const allLines = taNow.value.split('\n');
+    const slice = allLines.slice(range.startLine, range.endLine + 1);
+    const matchLine = ovlSentenceLevelMatch(slice, range.startLine, queryText);
+    if (matchLine == null) return; // 未命中：保留页级高亮，不产生误导性句级框
+    if (typeof ovlMarkLines === 'function') ovlMarkLines(matchLine, matchLine, { source: 'pdf-direct-sentence' });
+}
+
 // 跟那行文字实际所在的 \section 完全对上（不是差一行/镜像颠倒），见交付说明的实测记录。
 // v2 Pass P21：多页并存之后不能再用"当前激活页"这种全局单例（哪一页被双击了才是数据来源，
 // 不是"翻页/滚动状态认为的当前页"——两者在连续滚动视图下经常不是同一页，比如整页都还在
@@ -37384,10 +37700,12 @@ function ovlPdfPaintSyncHighlight(pageNum, xPt, yPt) {
 // canvas——全程只用这一份 entry 的数据，不碰 OvlState.pdfView.page 这种"当前页指示器"。
 async function ovlPdfHandleDblClick(ev, container) {
     try {
-        // v2 Pass P72：直显源 PDF（文件树直接点 .pdf，未经编译）没有 synctex 数据可用——
-        // 静默 no-op（连 toast 都不弹），不是"还没渲染完"/"没有 SyncTeX 数据"那类需要告知
-        // 用户的错误状态，是这个模式下天生就不支持的功能，安静跳过即可。
-        if (OvlState.pdfSourceMode === 'direct') return;
+        // v2 Pass P72：直显源 PDF（文件树直接点 .pdf，未经编译）原来没有 synctex 数据可用，
+        // 静默 no-op。v2 Pass P87：如果这份直显 PDF 是「PDF→LaTeX」转换的来源（右侧编辑器
+        // 开着转换产物、带 % ==== page N ==== 标记），改用不依赖编译产物的页级/句级跳转
+        // （见上面 ovlPdfHandleDblClickDirect）；不是这种场景（没有页标记）时它自己会弹出
+        // 明确的错误提示，不会静默失败。
+        if (OvlState.pdfSourceMode === 'direct') { ovlPdfHandleDblClickDirect(ev, container); return; }
         const num = parseInt(container.getAttribute('data-page-num'), 10);
         const entry = OvlState.pdfPageMap && OvlState.pdfPageMap.get(num);
         if (!entry || !entry.viewport || !entry.pdfPage) {
