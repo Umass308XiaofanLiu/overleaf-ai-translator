@@ -7365,13 +7365,20 @@ function readLocalChoice(data) {
     const usage = (data && data.usage) || {};
     const det = usage.completion_tokens_details || {};
     const rtok = Number(det.reasoning_tokens) || 0;
+    // v2 Pass P102：OpenAI 原生 tool_call 通道——message.tool_calls 是标准形状
+    // [{id, type:'function', function:{name, arguments}}]，逐字段防御后原样透传，不在这里
+    // 解析 arguments 的 JSON（留给调用方按需解析，这里只负责"忠实转述响应体"）。
+    const toolCalls = Array.isArray(msg.tool_calls)
+        ? msg.tool_calls.filter(function (tc) { return tc && tc.function && typeof tc.function.name === 'string' && tc.function.name; })
+        : null;
     return {
         text: content,                  // 答案通道。永远。且只有它。
         reasoning: reasoning,           // 只用于诊断/横幅，绝不当答案
         finish: finish,
         truncated: finish === 'length',
         thinking: reasoning.trim() !== '' || rtok > 0,
-        reasoningTokens: rtok
+        reasoningTokens: rtok,
+        toolCalls: (toolCalls && toolCalls.length) ? toolCalls : null
     };
 }
 
@@ -7398,6 +7405,17 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
     // LM Studio的JSON模式
     if (jsonMode) {
         body.response_format = { type: "json_object" };
+    }
+
+    // v2 Pass P102：OpenAI 原生 tool_call。只有调用方明确传了 opts.tools（非空数组）才带上，
+    // 翻译链路的调用点一个都不传 opts.tools，逐字不受影响（跟 jsonMode/reasoningEffort 同一条
+    // "纯追加、不传就是原行为"纪律）。目前唯一的调用方是 chatCallModel（provider==='local' 且
+    // chatAgentNativeToolsActive() 为真时），带的是 chatAgentBuildOpenAIToolsSchema() 生成的
+    // 标准 OpenAI tools JSON schema。
+    const oTools = (o && Array.isArray(o.tools) && o.tools.length) ? o.tools : null;
+    if (oTools) {
+        body.tools = oTools;
+        body.tool_choice = (o && typeof o.toolChoice === 'string' && o.toolChoice) ? o.toolChoice : 'auto';
     }
 
     // B2：推理档位。**必须显式发，不能靠省略**——实测省略 reasoning_effort 等于关闭推理，
@@ -7434,7 +7452,31 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
             signal
         });
 
-        // 兼容闸：只有当对端**明确点名** reasoning_effort 地 400 时，才摘掉这个字段重试一次，
+        // 兼容闸①（P102 新增，放在 reasoning_effort 闸门**之前**判断）：tools。跟下面
+        // reasoning_effort 那道闸不同——本地推理引擎对不认识的顶层字段吐出来的错误措辞
+        // 千差万别（"Unexpected endpoint or method." / "unrecognized field 'tools'" /
+        // 各种自定义 400），逐一猜测错误文本里有没有点名"tools"既脆弱又没必要：只要这一发
+        // 确实带了 tools 且响应不 ok，就直接认定"这个 endpoint+模型这次不支持原生
+        // tool_call"，摘掉 tools/tool_choice 重试一次，用 toolsUnsupported 把这个判断带给
+        // meta——上层 chatAgentRunLoop 据此记住这个 endpoint+模型组合、之后整个会话都退回
+        // 文本协议，不再反复试错。放在 reasoning_effort 闸门之前是因为：真实请求几乎总是
+        // 同时带着 reasoning_effort（B2 纪律，见上方），如果 tools 才是 400 的真正原因、
+        // 却先被 reasoning_effort 闸门用"没点名 reasoning_effort 就直接抛"的规则拦下，
+        // 会让 tools 兼容闸永远没有机会跑到。
+        let toolsUnsupported = false;
+        if (response && !response.ok && response.status === 400 && body.tools) {
+            toolsUnsupported = true;
+            delete body.tools;
+            delete body.tool_choice;
+            response = await fetch(endpoint, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(body),
+                signal
+            });
+        }
+
+        // 兼容闸②：只有当对端**明确点名** reasoning_effort 地 400 时，才摘掉这个字段重试一次，
         // 并把这个 origin 记进 xportEffortUnsupported，之后不再发。三个实测模型都不会走到这里；
         // 它存在只是为了保证「多一个可选参数」永远不可能把整条翻译链路弄挂。
         if (response && !response.ok && response.status === 400 && body.reasoning_effort) {
@@ -7470,6 +7512,11 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
             meta.finish = choice.finish;
             meta.thinking = choice.thinking;
             meta.reasoningTokens = choice.reasoningTokens;
+            // v2 Pass P102：原生 tool_call 数组（没有就是 null）+ 这一发是否发现 tools
+            // 不被支持（触发过兼容闸①）。两个字段只有 opts.tools 非空时才有意义，其余调用点
+            // （翻译链路）oTools 恒为 null，body.tools 永远不存在，toolsUnsupported 恒为 false。
+            meta.toolCalls = choice.toolCalls;
+            meta.toolsUnsupported = toolsUnsupported;
             // B2：这次到底发出去的是哪个档位（''=没发）。留给排查与验收用，
             // 「UI 说的」和「线上发的」对不上时，这里是唯一能一眼看穿的地方。
             meta.reasoningEffortSent = body.reasoning_effort || '';
@@ -18644,12 +18691,24 @@ async function chatCallModel(messages, systemPrompt, signal, meta, sink) {
         req.stream = !!(sink && ChatState.stream);
         ChatState.lastRequest = req;
         if (req.stream) return await chatStreamLocal(config, full, signal, meta, req, sink);
-        // meta 由 callLocalLLM 用 readLocalChoice 填满：text / reasoning / finish / truncated / thinking
-        return await callLocalLLM(config.localBaseUrl, config.model, full, false, signal, meta, {
+        // v2 Pass P102：chatCallModel 唯一的调用点是 chatAgentRunLoop（sink 恒为 null——上面
+        // req.stream 因此在 agent 循环里恒为 false，这条流式分支从 P42 起就没被这条路径走到过，
+        // 见 chatAgentRunLoop 上方大注释），所以这里加 tools 不会影响到任何流式场景。
+        // chatAgentNativeToolsActive() 判定这一轮要不要走 native（provider==='local' 且这个
+        // endpoint+模型这次会话还没被证实不支持），是的话现算这一轮真正就绪的工具集合——
+        // 可能是空数组（没有任何工具就绪），空数组时不传 tools，等价于原来的纯文本请求。
+        const callOpts = {
             temperature: req.temperature,
             maxTokens: req.maxTokens,
             reasoningEffort: req.reasoningEffort
-        }) || '';
+        };
+        if (chatAgentNativeToolsActive()) {
+            const nativeTools = chatAgentBuildOpenAIToolsSchema();
+            if (nativeTools.length) callOpts.tools = nativeTools;
+        }
+        // meta 由 callLocalLLM 用 readLocalChoice 填满：text / reasoning / finish / truncated /
+        // thinking / toolCalls / toolsUnsupported
+        return await callLocalLLM(config.localBaseUrl, config.model, full, false, signal, meta, callOpts) || '';
     }
     // OpenAI / Claude：temperature 为 null 表示「这个模型上这个参数不可设」（新 OpenAI 模型只接受 1），
     // 那就一个字节都不发 —— 参数条那边同样不画这个控件，两处必须一致，否则就是画了个假控件。
@@ -18862,6 +18921,197 @@ const CHAT_AGENT_P2T_WRITE_TOOLS = ['reconvert_page', 'recrop_figure'];
 const CHAT_AGENT_TOOLS = ['list_dir', 'read_file'].concat(CHAT_AGENT_WRITE_TOOLS).concat(CHAT_AGENT_ZH_TOOLS).concat(CHAT_AGENT_HIGHLIGHT_TOOLS)
     .concat(CHAT_AGENT_STATUS_TOOLS).concat(CHAT_AGENT_COMPILE_TOOLS).concat(CHAT_AGENT_P2T_WRITE_TOOLS);
 
+// ============================================================================
+// v2 Pass P102：本地模型（provider==='local'）路径下的 OpenAI 原生 tool_call 迁移
+// ============================================================================
+// 上面 16 个工具原来全部靠 ==TOOL name=xxx==/==TOOLEND== 文本标记 + 正则解析——模型输出
+// 格式一波动（漏个空格、多包一层反引号）整条调用就废。实测确认 jump 的 qwen3.8-27b /
+// qwen3.6-35b-a3b 都支持 OpenAI 标准的 tools/tool_calls 协议（finish_reason==='tool_calls'）。
+// 这里只迁移 callLocalLLM 这一条路径——callClaudeAPI（是否存在见 chatCallModel 里
+// provider==='claude' 分支）/callOpenAIAPI/chatCallGemini 一个字节都不动，继续走原来的
+// ==TOOL== 文本协议，任务范围明确只要求"仅本地模型路径"。
+//
+// 决策：native 是否生效对某一轮的判定必须在**两个地方**保持完全一致——chatSystemPrompt
+// 构建系统提示时（决定要不要给模型看 ==TOOL== 使用说明）、chatCallModel 真正发请求时
+// （决定要不要带 tools 参数）——否则会出现"提示词说能原生调用，实际发的请求却没带 tools
+// schema"这种自相矛盾。两处调用的都是这同一个函数，且都是纯同步读取（不发任何请求），
+// chatSend 一次 tick 内两处调用之间没有任何 await 能改变这个 Set 的内容，所以天然一致。
+//
+// 会话内记忆："这个 本地 endpoint + 模型 组合已经证实不支持 native"——跟 xportEffortUnsupported
+// 同一个模式（Set<string>），key 用 归一化 origin + 模型 id，不按"整个 provider==='local'"
+// 一刀切（同一次会话里换了个不支持的本地模型，另一个支持的模型不应该被连坐）。
+const ChatAgentNativeToolsUnsupported = new Set();
+function chatAgentNativeToolsKey(config) {
+    return xportCapsOrigin(config && config.localBaseUrl) + '|' + String((config && config.model) || '');
+}
+// 这一轮要不要走 native tool_call。**只在 provider==='local' 且这个 endpoint+模型组合本次
+// 会话里还没被证实不支持时**才为 true——Claude/OpenAI/Gemini 三家永远 false（那几条路径
+// 一个字节都不改，见上方大注释），callClaudeAPI 本身也绝不会被这个开关影响到。
+function chatAgentNativeToolsActive() {
+    try {
+        const c = chatApiConfig();
+        if (c.provider !== 'local' || !c.model) return false;
+        return !ChatAgentNativeToolsUnsupported.has(chatAgentNativeToolsKey(c));
+    } catch (e) { return false; }
+}
+// 证实不支持后调用一次：这个 endpoint+模型 组合本次会话剩余时间全部退回文本协议，不再
+// 反复试错（400 一次、下一轮系统提示就已经换回带 ==TOOL== 说明的文本协议版本）。
+function chatAgentMarkNativeToolsUnsupported(config) {
+    try {
+        const c = config || chatApiConfig();
+        if (c.provider === 'local' && c.model) ChatAgentNativeToolsUnsupported.add(chatAgentNativeToolsKey(c));
+    } catch (e) {}
+}
+
+// 从既有的"六个 ToolsSystemBlock 函数各自的就绪判定"推导出这一轮的 OpenAI tools JSON
+// schema——**只包含这一轮真的就绪的工具**（跟对应 ToolsSystemBlock 的"不可用"分支同一个
+// 判定函数，不重新发明一套），名称/中文描述/参数 schema 从各工具原来给模型看的中文说明
+// 手工对齐搬过来（16 个工具，跟 CHAT_AGENT_TOOLS 一一对应）。不就绪的工具**压根不出现在
+// 数组里**——这比在系统提示里写一句"不要调用它"更硬：native 模式下模型的 tool_calls
+// 只可能引用 tools 参数里出现过的名字，未就绪的工具从协议层面就够不着，不用靠模型自觉。
+function chatAgentBuildOpenAIToolsSchema() {
+    const tools = [];
+    function def(name, description, parameters) {
+        tools.push({
+            type: 'function',
+            function: {
+                name: name,
+                description: description,
+                parameters: parameters || { type: 'object', properties: {}, additionalProperties: false }
+            }
+        });
+    }
+
+    let fsReady = false;
+    try { fsReady = chatAgentReadiness().ready; } catch (e) {}
+    if (fsReady) {
+        def('list_dir', '列出用户项目目录下某个路径的文件/子目录清单。', {
+            type: 'object',
+            properties: { path: { type: 'string', description: '相对项目根目录的路径，用 "." 表示根目录；省略等同于 "."。' } },
+            additionalProperties: false
+        });
+        def('read_file', '读取项目里某个文件的文本内容，可选只读某个行区间，避免一次把大文件整篇读进来。', {
+            type: 'object',
+            properties: {
+                path: { type: 'string', description: '相对项目根目录的路径。' },
+                startLine: { type: 'integer', description: '起始行号，1-based，含端点；省略则从第 1 行开始。' },
+                endLine: { type: 'integer', description: '结束行号，1-based，含端点；省略则读到文件末尾（受单次读取上限截断）。' }
+            },
+            required: ['path'], additionalProperties: false
+        });
+        def('write_file', '写入一个文件：不存在就新建，存在就整体覆盖现有内容（不是增量补丁）。执行前用户会看到确认弹窗，用户拒绝会在工具结果里明确告知。', {
+            type: 'object',
+            properties: {
+                path: { type: 'string', description: '相对项目根目录的路径。' },
+                content: { type: 'string', description: '完整的新文件内容。' }
+            },
+            required: ['path', 'content'], additionalProperties: false
+        });
+        def('mkdir', '新建一个目录（含中间目录）。执行前用户会看到确认弹窗。', {
+            type: 'object',
+            properties: { path: { type: 'string', description: '相对项目根目录的路径。' } },
+            required: ['path'], additionalProperties: false
+        });
+        def('move', '移动/重命名一个文件或目录（目标已存在会失败，不会覆盖）。执行前用户会看到确认弹窗。', {
+            type: 'object',
+            properties: {
+                from: { type: 'string', description: '源相对路径。' },
+                to: { type: 'string', description: '目标相对路径。' }
+            },
+            required: ['from', 'to'], additionalProperties: false
+        });
+        def('copy', '复制一个文件或目录（目标已存在会失败，不会覆盖）。执行前用户会看到确认弹窗。', {
+            type: 'object',
+            properties: {
+                from: { type: 'string', description: '源相对路径。' },
+                to: { type: 'string', description: '目标相对路径。' }
+            },
+            required: ['from', 'to'], additionalProperties: false
+        });
+        def('delete', '删除一个文件或目录（目录会递归删除）。执行前用户会看到确认弹窗，是最高风险的一个操作。', {
+            type: 'object',
+            properties: { path: { type: 'string', description: '相对项目根目录的路径。' } },
+            required: ['path'], additionalProperties: false
+        });
+    }
+
+    let zhReady = false;
+    try { zhReady = chatAgentZhBlockReadiness().ready; } catch (e) {}
+    if (zhReady) {
+        def('read_block_translation', '只读：诊断用，读取 Visual 中文预览模式下某一块（按屏幕从上到下顺序编号，从 0 开始）的源 LaTeX 片段和当前渲染出的中文文本，用来判断是翻译错了还是渲染错了。', {
+            type: 'object',
+            properties: { blockIndex: { type: 'integer', minimum: 0, description: '块序号，0-based，第一块是 0。' } },
+            required: ['blockIndex'], additionalProperties: false
+        });
+        def('retranslate_block', '使某一块当前的翻译缓存失效并重新调用模型翻译（走既有的中文懒翻译队列），用来修复已经确认确实翻错/渲染错的块；先用 read_block_translation 看清楚问题所在再调用这个，不要没看过就直接重译。执行前用户会看到确认弹窗。', {
+            type: 'object',
+            properties: {
+                blockIndex: { type: 'integer', minimum: 0, description: '块序号，0-based。' },
+                reason: { type: 'string', description: '一句话说明为什么要重译，会显示在确认卡片里给用户看。' }
+            },
+            required: ['blockIndex'], additionalProperties: false
+        });
+    }
+
+    let hlReady = false;
+    try { hlReady = chatAgentDocHighlightReadiness().ready; } catch (e) {}
+    if (hlReady) {
+        def('doc_highlight', '在当前右侧文档里定位并高亮若干原文片段——只在用户明确要求"高亮/标出/定位"内容时才调用，不要在普通问答里顺手调用。', {
+            type: 'object',
+            properties: {
+                snippets: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    minItems: 1,
+                    description: '要高亮的原文原样片段列表，每一项必须是确实出现在当前文档里、有把握定位到的原文原样片段（5～20 个字/词左右一段最容易精确定位，不要整段整段地摘）。'
+                }
+            },
+            required: ['snippets'], additionalProperties: false
+        });
+        def('doc_highlight_clear', '清除当前正在显示的高亮。', { type: 'object', properties: {}, additionalProperties: false });
+    }
+
+    let statusReady = false;
+    try { statusReady = chatAgentBlockStatusReadiness().ready; } catch (e) {}
+    if (statusReady) {
+        def('list_block_status', '只读：枚举当前 Visual 文档所有块的渲染/翻译状态。用户问"哪些公式没渲染出来""还有哪些块没翻译/翻错了"这类问题时，先调用这个自己查出清单，不要反问用户要行号；再针对具体几块用 read_block_translation/retranslate_block 逐一处理。', {
+            type: 'object',
+            properties: {
+                filter: {
+                    type: 'string',
+                    enum: CHAT_BLOCK_STATUS_VALUES,
+                    description: '只看某一种状态；省略则返回全部块的状态分布与清单。'
+                }
+            },
+            additionalProperties: false
+        });
+    }
+
+    let compileReady = false;
+    try { compileReady = chatAgentCompileReadiness().ready; } catch (e) {}
+    if (compileReady) {
+        def('compile', '用当前打开的文档触发一次真实编译，验证刚才的改动，免确认。不会更新用户界面上正在显示的 PDF 预览面板。改代码→compile→失败就看错误信息→再改，建议最多尝试 3 轮。', { type: 'object', properties: {}, additionalProperties: false });
+        def('read_compile_log', '只读：读取上一次 compile 调用留下的完整原始编译日志；compile 自带的错误摘要不够看清问题时再用这个。', { type: 'object', properties: {}, additionalProperties: false });
+    }
+
+    let p2tReady = false;
+    try { p2tReady = chatAgentP2TProductReadiness().ready; } catch (e) {}
+    if (p2tReady) {
+        def('reconvert_page', '重新转换 PDF→LaTeX 转换产物里的某一页（沿用既有单页转换+阶梯重试机制），完成后重新拼装 main.tex 并刷新编辑器内容。执行前用户会看到确认弹窗。', {
+            type: 'object',
+            properties: { pageNum: { type: 'integer', minimum: 1, description: 'PDF 页码，从 1 开始。' } },
+            required: ['pageNum'], additionalProperties: false
+        });
+        def('recrop_figure', '重新裁剪 PDF→LaTeX 转换产物里的某张图（题注编号定位），优先复用本次会话已获得过的裁剪区域，否则会对该图所在页发一次视觉模型请求重新定位裁剪区域。执行前用户会看到确认弹窗。', {
+            type: 'object',
+            properties: { figNum: { type: 'integer', minimum: 1, description: '题注里的图号，比如 "Fig. 5" 就是 5。' } },
+            required: ['figNum'], additionalProperties: false
+        });
+    }
+
+    return tools;
+}
+
 // 项目绝对路径：跟 Overleaf 面板"项目绝对路径"输入框共用同一个 DOM 元素（ovlDoRecompile 等
 // 处已有的取法），不新起第二套配置。
 function chatAgentProjectDir() {
@@ -18903,17 +19153,22 @@ function chatAgentBridgeReady() {
 // 调用都拿到一堆连接失败——那是「优雅降级」，不是「假装有能力再报错」。
 function chatAgentToolsSystemBlock() {
     const readiness = chatAgentReadiness();
+    // v2 Pass P102：native 由 tools 参数自描述调用格式，系统提示只需要保留"有哪些工具、
+    // 各自干什么、什么时候该用"的中文语义说明，==TOOL== 文本示例反而会跟真正的 tools
+    // schema 打架（模型可能两套格式混着抄）。
+    const native = chatAgentNativeToolsActive();
     if (!readiness.ready) {
         let why = '还没有连上编译桥接服务，或者没有填写项目绝对路径';
         if (readiness.reason === 'no-bridge') why = '还没有连上编译桥接服务';
         else if (readiness.reason === 'no-projectdir') why = '还没有填写项目绝对路径';
         else if (readiness.reason === 'stale-bridge') why = '连着的桥接服务版本过旧（不支持文件操作接口），需要用户重启本地桥接服务';
         return '\n【文件读取工具】这一轮不可用（' + why + '）。'
-            + '不要输出 ==TOOL== 块，只能根据上面已经给到你的内容回答，也不要假装自己读过或改过任何'
+            + (native ? '' : '不要输出 ==TOOL== 块，')
+            + '只能根据上面已经给到你的内容回答，也不要假装自己读过或改过任何'
             + '没有出现在这段对话里的文件。\n' + chatAgentZhToolsSystemBlock() + chatAgentHighlightToolsSystemBlock()
             + chatAgentBlockStatusToolsSystemBlock() + chatAgentCompileToolsSystemBlock() + chatAgentP2TWriteToolsSystemBlock();
     }
-    return '\n【文件读取工具】用户关注的那句话（如果有的话）只是一个起点——需要的话，你可以主动'
+    const base = '\n【文件读取工具】用户关注的那句话（如果有的话）只是一个起点——需要的话，你可以主动'
         + '读取甚至修改用户项目文件夹里的文件：它的上下文、它 \\ref/\\cite 指向的定义、supp.tex 等'
         + '文件里的相关数据，读完再综合回答，而不是只盯着关注的那一句话猜。可用工具：\n'
         + '只读：\n'
@@ -18926,23 +19181,36 @@ function chatAgentToolsSystemBlock() {
         + '  · mkdir —— 新建一个目录（含中间目录）。参数：{"path":"相对路径"}\n'
         + '  · move —— 移动/重命名一个文件或目录。参数：{"from":"相对路径","to":"相对路径"}（目标已存在会失败，不会覆盖）\n'
         + '  · copy —— 复制一个文件或目录。参数：{"from":"相对路径","to":"相对路径"}（目标已存在会失败，不会覆盖）\n'
-        + '  · delete —— 删除一个文件或目录（目录会递归删除）。参数：{"path":"相对路径"}\n'
-        + '调用格式——**这一轮的整条回复只能是下面这一个块，前后不要有任何别的文字，也不要同时输出 ==CHAT==**：\n'
-        + '==TOOL name=list_dir==\n{"path":"."}\n==TOOLEND==\n'
-        + '或者：\n'
-        + '==TOOL name=read_file==\n{"path":"main.tex","startLine":100,"endLine":160}\n==TOOLEND==\n'
-        + '或者（写工具同一套格式，工具名换成 write_file/mkdir/move/copy/delete）：\n'
-        + '==TOOL name=write_file==\n{"path":"notes/todo.tex","content":"..."}\n==TOOLEND==\n'
-        + '规则：\n'
-        + '1. 一轮最多发起一次工具调用；结果会在下一轮发给你，那时候可以再调用、也可以直接回答。\n'
-        + '2. 读大文件优先用 startLine/endLine 只读需要的那一段。\n'
-        + '3. 工具调用的总轮数和总读取量都有上限，到了上限你会被明确告知，那时必须直接基于已经'
-        + '读到的内容回答，不要再输出 ==TOOL==。\n'
-        + '4. 只有确实需要先看到文件内容才能回答、或者用户明确要求你去看/改某个文件时才调用工具；'
-        + '能直接回答的问题不要绕远路先读文件，更不要没被要求就主动改文件。\n'
-        + '5. 不需要工具的时候，正常按 ==CHAT== 格式回答，不要输出空的或试探性的工具块。\n'
-        + '6. 写工具执行前用户会看到一个确认弹窗（列出确切路径、受影响的文件清单），你不需要、也没有'
-        + '办法替用户点这个确认——每次调用写工具都会真的弹一次，不存在"用户已经同意过了所以这次不用问"。\n'
+        + '  · delete —— 删除一个文件或目录（目录会递归删除）。参数：{"path":"相对路径"}\n';
+    const callFormat = native
+        ? ('规则：\n'
+            + '1. 你可以在同一轮里调用一个或多个工具（支持并行执行），执行完的结果会在下一轮发给你，'
+            + '那时候可以再调用、也可以直接回答。\n'
+            + '2. 读大文件优先用 startLine/endLine 只读需要的那一段。\n'
+            + '3. 工具调用的总轮数和总读取量都有上限，到了上限你会被明确告知，那时必须直接基于已经'
+            + '读到的内容回答，不要再调用工具。\n'
+            + '4. 只有确实需要先看到文件内容才能回答、或者用户明确要求你去看/改某个文件时才调用工具；'
+            + '能直接回答的问题不要绕远路先读文件，更不要没被要求就主动改文件。\n'
+            + '5. 不需要工具的时候，正常按 ==CHAT== 格式回答，不要凭空发起试探性的工具调用。\n'
+            + '6. 写工具执行前用户会看到一个确认弹窗（列出确切路径、受影响的文件清单），你不需要、也没有'
+            + '办法替用户点这个确认——每次调用写工具都会真的弹一次，不存在"用户已经同意过了所以这次不用问"。\n')
+        : ('调用格式——**这一轮的整条回复只能是下面这一个块，前后不要有任何别的文字，也不要同时输出 ==CHAT==**：\n'
+            + '==TOOL name=list_dir==\n{"path":"."}\n==TOOLEND==\n'
+            + '或者：\n'
+            + '==TOOL name=read_file==\n{"path":"main.tex","startLine":100,"endLine":160}\n==TOOLEND==\n'
+            + '或者（写工具同一套格式，工具名换成 write_file/mkdir/move/copy/delete）：\n'
+            + '==TOOL name=write_file==\n{"path":"notes/todo.tex","content":"..."}\n==TOOLEND==\n'
+            + '规则：\n'
+            + '1. 一轮最多发起一次工具调用；结果会在下一轮发给你，那时候可以再调用、也可以直接回答。\n'
+            + '2. 读大文件优先用 startLine/endLine 只读需要的那一段。\n'
+            + '3. 工具调用的总轮数和总读取量都有上限，到了上限你会被明确告知，那时必须直接基于已经'
+            + '读到的内容回答，不要再输出 ==TOOL==。\n'
+            + '4. 只有确实需要先看到文件内容才能回答、或者用户明确要求你去看/改某个文件时才调用工具；'
+            + '能直接回答的问题不要绕远路先读文件，更不要没被要求就主动改文件。\n'
+            + '5. 不需要工具的时候，正常按 ==CHAT== 格式回答，不要输出空的或试探性的工具块。\n'
+            + '6. 写工具执行前用户会看到一个确认弹窗（列出确切路径、受影响的文件清单），你不需要、也没有'
+            + '办法替用户点这个确认——每次调用写工具都会真的弹一次，不存在"用户已经同意过了所以这次不用问"。\n');
+    return base + callFormat
         + chatAgentZhToolsSystemBlock()
         + chatAgentHighlightToolsSystemBlock()
         + chatAgentBlockStatusToolsSystemBlock()
@@ -18957,12 +19225,15 @@ function chatAgentToolsSystemBlock() {
 function chatAgentZhToolsSystemBlock() {
     let zhReady;
     try { zhReady = chatAgentZhBlockReadiness(); } catch (e) { zhReady = { ready: false, reason: 'no-pane' }; }
+    const native = chatAgentNativeToolsActive();
     if (!zhReady.ready) {
         const why = zhReady.reason === 'not-visual' ? '当前不在 Visual 预览模式'
             : zhReady.reason === 'not-zh' ? '当前 Visual 显示语言是"原文"而不是"中文"'
             : '找不到 Visual 预览面板';
-        return '\n【中文渲染诊断工具】这一轮不可用（' + why + '）。不要输出 name=read_block_translation'
-            + ' 或 name=retranslate_block 的 ==TOOL== 块。\n';
+        return native
+            ? ('\n【中文渲染诊断工具】这一轮不可用（' + why + '）。不要调用 read_block_translation 或 retranslate_block 这两个工具。\n')
+            : ('\n【中文渲染诊断工具】这一轮不可用（' + why + '）。不要输出 name=read_block_translation'
+                + ' 或 name=retranslate_block 的 ==TOOL== 块。\n');
     }
     return '\n【中文渲染诊断工具】专门用来诊断/修复 Visual 中文预览模式下某一块显示不对的问题'
         + '（比如公式渲不出来、译文明显错误、术语不一致、原文残留没翻）。块按当前屏幕上从上到下的'
@@ -18974,8 +19245,8 @@ function chatAgentZhToolsSystemBlock() {
         + '  · retranslate_block —— 使该块当前的翻译缓存失效并重新调用模型翻译（走既有的中文懒翻译'
         + '队列，不是另开一条翻译路径），用来修复确认过确实翻错/渲染错的块。参数：{"blockIndex": 0}，'
         + '可选 "reason"（一句话说明为什么要重译，会显示在确认卡片里给用户看）\n'
-        + '调用格式跟上面文件工具完全一样，例如：\n'
-        + '==TOOL name=read_block_translation==\n{"blockIndex":2}\n==TOOLEND==\n'
+        + (native ? '' : ('调用格式跟上面文件工具完全一样，例如：\n'
+            + '==TOOL name=read_block_translation==\n{"blockIndex":2}\n==TOOLEND==\n'))
         + '规则：先用 read_block_translation 看清楚问题所在，确认确实是翻译/渲染问题（而不是原文本身'
         + '有歧义、或者只是用户理解有误）之后，才调用 retranslate_block；不要没看过就直接重译，也不要'
         + '连续对同一块重译多次而不看结果。\n';
@@ -19005,51 +19276,54 @@ function chatAgentParseToolCall(raw) {
     let args;
     try { args = body ? JSON.parse(body) : {}; }
     catch (e) { out.malformed = true; out.reason = '工具参数不是合法 JSON：' + e.message; return out; }
-    if (!args || typeof args !== 'object' || Array.isArray(args)) {
-        out.malformed = true; out.reason = '工具参数必须是一个 JSON 对象'; return out;
-    }
-    if (name === 'read_file' && (typeof args.path !== 'string' || !args.path)) {
-        out.malformed = true; out.reason = 'read_file 缺少必填的 path 参数'; return out;
-    }
-    // v2 Pass P43：五个写工具各自的必填参数校验，跟上面 read_file 那条同一个模式。
-    if (name === 'write_file') {
-        if (typeof args.path !== 'string' || !args.path) { out.malformed = true; out.reason = 'write_file 缺少必填的 path 参数'; return out; }
-        if (typeof args.content !== 'string') { out.malformed = true; out.reason = 'write_file 缺少必填的 content 参数（必须是字符串，哪怕是空字符串也要显式给 ""）'; return out; }
-    }
-    if (name === 'mkdir' && (typeof args.path !== 'string' || !args.path)) {
-        out.malformed = true; out.reason = 'mkdir 缺少必填的 path 参数'; return out;
-    }
-    if ((name === 'move' || name === 'copy')
-        && (typeof args.from !== 'string' || !args.from || typeof args.to !== 'string' || !args.to)) {
-        out.malformed = true; out.reason = name + ' 缺少必填的 from/to 参数（都必须是非空字符串）'; return out;
-    }
-    if (name === 'delete' && (typeof args.path !== 'string' || !args.path)) {
-        out.malformed = true; out.reason = 'delete 缺少必填的 path 参数'; return out;
-    }
-    // v2 Pass P78（H4）：两个中文渲染诊断工具的必填参数校验，同一个模式——block 按当前
-    // Visual 渲染出的块顺序编号，从 0 起，必须是非负整数。
-    if ((name === 'read_block_translation' || name === 'retranslate_block')
-        && !(Number.isInteger(args.blockIndex) && args.blockIndex >= 0)) {
-        out.malformed = true; out.reason = name + ' 缺少必填的 blockIndex 参数（必须是 ≥0 的整数）'; return out;
-    }
-    // v2 Pass P92：doc_highlight 的必填参数——snippets 必须是数组，且至少含一个非空字符串
-    // （全是空字符串/纯空白等价于没给）。doc_highlight_clear 不需要任何参数，{} 就够。
-    if (name === 'doc_highlight'
-        && !(Array.isArray(args.snippets) && args.snippets.some(function (s) { return typeof s === 'string' && s.trim(); }))) {
-        out.malformed = true; out.reason = 'doc_highlight 缺少必填的 snippets 参数（必须是至少含一个非空字符串的数组）'; return out;
-    }
-    // v2 Pass P101：list_block_status（组1）/compile/read_compile_log（组2）参数全部可选，
-    // 不需要必填校验，跟 list_dir 同一档（{} 就够）。reconvert_page/recrop_figure（组3）
-    // 各自一个必填的正整数编号参数，跟 read_block_translation 的 blockIndex 同一个模式。
-    if (name === 'reconvert_page' && !(Number.isInteger(args.pageNum) && args.pageNum >= 1)) {
-        out.malformed = true; out.reason = 'reconvert_page 缺少必填的 pageNum 参数（必须是 ≥1 的整数）'; return out;
-    }
-    if (name === 'recrop_figure' && !(Number.isInteger(args.figNum) && args.figNum >= 1)) {
-        out.malformed = true; out.reason = 'recrop_figure 缺少必填的 figNum 参数（必须是 ≥1 的整数）'; return out;
-    }
+    const v = chatAgentValidateToolArgs(name, args);
+    if (!v.ok) { out.malformed = true; out.reason = v.reason; return out; }
     out.tool = name;
     out.args = args;
     return out;
+}
+
+// v2 Pass P102：16 个工具各自必填参数的校验规则，从原来堆在 chatAgentParseToolCall 里的一串
+// if 抽出来——native tool_call 路径（chatAgentRunLoop 原生分支）用模型自己吐出来的 JSON 参数，
+// 文本协议路径（chatAgentParseToolCall，就在上面）用 ==TOOL==/==TOOLEND== 之间解析出来的 JSON，
+// 两条路径校验规则必须是同一份，不能走样成"native 路径漏了某个必填校验"这种协议特有的裂缝。
+// 逐条错误文案跟改造前逐字一致（P42/P43/P78/P92/P101 的既有回归测试断言的就是这些字符串）。
+function chatAgentValidateToolArgs(name, args) {
+    if (!args || typeof args !== 'object' || Array.isArray(args)) {
+        return { ok: false, reason: '工具参数必须是一个 JSON 对象' };
+    }
+    if (name === 'read_file' && (typeof args.path !== 'string' || !args.path)) {
+        return { ok: false, reason: 'read_file 缺少必填的 path 参数' };
+    }
+    if (name === 'write_file') {
+        if (typeof args.path !== 'string' || !args.path) return { ok: false, reason: 'write_file 缺少必填的 path 参数' };
+        if (typeof args.content !== 'string') return { ok: false, reason: 'write_file 缺少必填的 content 参数（必须是字符串，哪怕是空字符串也要显式给 ""）' };
+    }
+    if (name === 'mkdir' && (typeof args.path !== 'string' || !args.path)) {
+        return { ok: false, reason: 'mkdir 缺少必填的 path 参数' };
+    }
+    if ((name === 'move' || name === 'copy')
+        && (typeof args.from !== 'string' || !args.from || typeof args.to !== 'string' || !args.to)) {
+        return { ok: false, reason: name + ' 缺少必填的 from/to 参数（都必须是非空字符串）' };
+    }
+    if (name === 'delete' && (typeof args.path !== 'string' || !args.path)) {
+        return { ok: false, reason: 'delete 缺少必填的 path 参数' };
+    }
+    if ((name === 'read_block_translation' || name === 'retranslate_block')
+        && !(Number.isInteger(args.blockIndex) && args.blockIndex >= 0)) {
+        return { ok: false, reason: name + ' 缺少必填的 blockIndex 参数（必须是 ≥0 的整数）' };
+    }
+    if (name === 'doc_highlight'
+        && !(Array.isArray(args.snippets) && args.snippets.some(function (s) { return typeof s === 'string' && s.trim(); }))) {
+        return { ok: false, reason: 'doc_highlight 缺少必填的 snippets 参数（必须是至少含一个非空字符串的数组）' };
+    }
+    if (name === 'reconvert_page' && !(Number.isInteger(args.pageNum) && args.pageNum >= 1)) {
+        return { ok: false, reason: 'reconvert_page 缺少必填的 pageNum 参数（必须是 ≥1 的整数）' };
+    }
+    if (name === 'recrop_figure' && !(Number.isInteger(args.figNum) && args.figNum >= 1)) {
+        return { ok: false, reason: 'recrop_figure 缺少必填的 figNum 参数（必须是 ≥1 的整数）' };
+    }
+    return { ok: true };
 }
 
 // 对话窗里那条可折叠的"工具调用"行——用户必须能看清 agent 到底看了什么，见任务硬性要求。
@@ -20249,12 +20523,15 @@ async function chatAgentExecDocHighlightClear() {
 function chatAgentHighlightToolsSystemBlock() {
     let ready;
     try { ready = chatAgentDocHighlightReadiness(); } catch (e) { ready = { ready: false, reason: 'no-doc' }; }
+    const native = chatAgentNativeToolsActive();
     if (!ready.ready) {
         const why = ready.reason === 'not-converted'
             ? '当前右侧还是直接显示的原始 PDF，还没有进行 PDF→LaTeX 转换，没有可高亮的转换产物'
             : '当前没有打开任何文档';
-        return '\n【定位高亮工具】这一轮不可用（' + why + '）。不要输出 name=doc_highlight 或'
-            + ' name=doc_highlight_clear 的 ==TOOL== 块。'
+        return (native
+            ? ('\n【定位高亮工具】这一轮不可用（' + why + '）。不要调用 doc_highlight 或 doc_highlight_clear 这两个工具。')
+            : ('\n【定位高亮工具】这一轮不可用（' + why + '）。不要输出 name=doc_highlight 或'
+                + ' name=doc_highlight_clear 的 ==TOOL== 块。'))
             + (ready.reason === 'not-converted'
                 ? '如果用户是想高亮 PDF 里的内容，请直接回复用户：需要先完成 PDF→LaTeX 转换，转换完成后再让你高亮。'
                 : '') + '\n';
@@ -20270,8 +20547,8 @@ function chatAgentHighlightToolsSystemBlock() {
         + '调用后会在界面上弹出一张卡片，命中的会被高亮并可以用卡片上的按钮跳转，未命中的会在工具'
         + '结果里列出来。\n'
         + '  · doc_highlight_clear —— 清除当前正在显示的高亮，参数是空对象：{}\n'
-        + '调用格式跟其它工具一样：\n'
-        + '==TOOL name=doc_highlight==\n{"snippets":["示例片段一","示例片段二"]}\n==TOOLEND==\n'
+        + (native ? '' : ('调用格式跟其它工具一样：\n'
+            + '==TOOL name=doc_highlight==\n{"snippets":["示例片段一","示例片段二"]}\n==TOOLEND==\n'))
         + '规则：\n'
         + '1. 只在用户明确要求定位/高亮/标出内容时才调用，不要在普通问答里顺手调用。\n'
         + '2. snippets 里的每一项必须是你确实看到过、有把握出现在当前文档里的原文原样片段，'
@@ -20357,9 +20634,12 @@ function chatAgentBlockStatusReadiness() {
 function chatAgentBlockStatusToolsSystemBlock() {
     let ready;
     try { ready = chatAgentBlockStatusReadiness(); } catch (e) { ready = { ready: false, reason: 'no-pane' }; }
+    const native = chatAgentNativeToolsActive();
     if (!ready.ready) {
         const why = ready.reason === 'not-visual' ? '当前不在 Visual 预览模式' : '找不到 Visual 预览面板';
-        return '\n【块状态自查工具】这一轮不可用（' + why + '）。不要输出 name=list_block_status 的 ==TOOL== 块。\n';
+        return native
+            ? ('\n【块状态自查工具】这一轮不可用（' + why + '）。不要调用 list_block_status 这个工具。\n')
+            : ('\n【块状态自查工具】这一轮不可用（' + why + '）。不要输出 name=list_block_status 的 ==TOOL== 块。\n');
     }
     return '\n【块状态自查工具】用户问"哪些公式没渲染出来""还有哪些块没翻译/翻错了"这类问题时，'
         + '不要反问用户要行号——先调用 list_block_status 自己查出清单，再针对具体几块用'
@@ -20368,7 +20648,7 @@ function chatAgentBlockStatusToolsSystemBlock() {
         + '{"filter": "退化裸源码"} 只看某一种状态（可选值：正常渲染 / 退化裸源码 / 翻译失败 / '
         + '回显守卫拦截 / 未翻译）。返回每一块的索引、源码行区间、类型（公式/表格/算法/正文）、'
         + '状态、渲染出来的前 40 字预览。\n'
-        + '调用格式：\n==TOOL name=list_block_status==\n{"filter":"退化裸源码"}\n==TOOLEND==\n';
+        + (native ? '' : '调用格式：\n==TOOL name=list_block_status==\n{"filter":"退化裸源码"}\n==TOOLEND==\n');
 }
 
 async function chatAgentExecListBlockStatus(args) {
@@ -20455,12 +20735,15 @@ function chatAgentCompileReadiness() {
 function chatAgentCompileToolsSystemBlock() {
     let ready;
     try { ready = chatAgentCompileReadiness(); } catch (e) { ready = { ready: false, reason: 'no-doc' }; }
+    const native = chatAgentNativeToolsActive();
     if (!ready.ready) {
         const why = ready.reason === 'direct-mode' ? 'PDF 阅读模式（文件树直接打开的原始 PDF，未编译）下不支持编译，与 UI 上 Recompile 按钮置灰一致'
             : ready.reason === 'no-bridge' ? '还没有连上编译桥接服务'
             : ready.reason === 'no-projectdir' ? '还没有填写项目绝对路径'
             : '当前没有打开任何文档';
-        return '\n【编译工具】这一轮不可用（' + why + '）。不要输出 name=compile 或 name=read_compile_log 的 ==TOOL== 块。'
+        return (native
+            ? ('\n【编译工具】这一轮不可用（' + why + '）。不要调用 compile 或 read_compile_log 这两个工具。')
+            : ('\n【编译工具】这一轮不可用（' + why + '）。不要输出 name=compile 或 name=read_compile_log 的 ==TOOL== 块。'))
             + (ready.reason === 'direct-mode' ? '如果用户想编译，请直接回复：需要先在文件树点开一个 .tex 文件退出 PDF 阅读模式。' : '') + '\n';
     }
     return '\n【编译工具】改完 LaTeX 源码后可以自己编译验证，不用等用户去点 Recompile：\n'
@@ -20470,7 +20753,7 @@ function chatAgentCompileToolsSystemBlock() {
         + '通常不需要再额外调用 read_compile_log。\n'
         + '  · read_compile_log —— 读取上一次 compile 调用留下的完整原始编译日志（不是用户界面上'
         + '"View logs"那一份）。compile 自带的摘要不够看清问题时再用这个。参数是空对象：{}。\n'
-        + '调用格式：\n==TOOL name=compile==\n{}\n==TOOLEND==\n'
+        + (native ? '' : '调用格式：\n==TOOL name=compile==\n{}\n==TOOLEND==\n')
         + '规则：如果用户要求你修好编译错误，建议节奏是"改代码 → compile → 失败就读错误信息（必要时'
         + 'read_compile_log）→ 再改"，最多尝试 3 轮；3 轮后仍失败就如实把最后一次的真实错误信息报告'
         + '给用户，不要无限重试、也不要谎称已经修好。\n';
@@ -20589,9 +20872,13 @@ async function chatAgentP2TVerifyPdfExists(rec) {
 function chatAgentP2TWriteToolsSystemBlock() {
     let ready;
     try { ready = chatAgentP2TProductReadiness(); } catch (e) { ready = { ready: false, reason: 'not-product' }; }
+    const native = chatAgentNativeToolsActive();
     if (!ready.ready) {
-        return '\n【重转/重截图工具】这一轮不可用（当前打开的文档不是 PDF→LaTeX 转换产物的 main.tex，'
-            + '或者本地没有它的转换记录）。不要输出 name=reconvert_page 或 name=recrop_figure 的 ==TOOL== 块。\n';
+        return native
+            ? ('\n【重转/重截图工具】这一轮不可用（当前打开的文档不是 PDF→LaTeX 转换产物的 main.tex，'
+                + '或者本地没有它的转换记录）。不要调用 reconvert_page 或 recrop_figure 这两个工具。\n')
+            : ('\n【重转/重截图工具】这一轮不可用（当前打开的文档不是 PDF→LaTeX 转换产物的 main.tex，'
+                + '或者本地没有它的转换记录）。不要输出 name=reconvert_page 或 name=recrop_figure 的 ==TOOL== 块。\n');
     }
     return '\n【重转/重截图工具】用户可能会说"图 5 截错了重截""第 3 页转得不对重转"——这两个工具'
         + '只在当前打开的文档确实是 PDF→LaTeX 转换产物时可用，执行前都会先弹确认卡片让用户确认'
@@ -20601,7 +20888,7 @@ function chatAgentP2TWriteToolsSystemBlock() {
         + '  · recrop_figure —— 对某张图重新裁剪。参数：{"figNum": 5}（整数，题注里的图号，比如'
         + '"Fig. 5"就是 5；会优先复用本次会话里已经获得过的裁剪区域直接重裁，没有的话会对该图所在'
         + '页发一次视觉模型请求重新定位裁剪区域）\n'
-        + '调用格式：\n==TOOL name=reconvert_page==\n{"pageNum":3}\n==TOOLEND==\n'
+        + (native ? '' : '调用格式：\n==TOOL name=reconvert_page==\n{"pageNum":3}\n==TOOLEND==\n')
         + '规则：如果关联的原始 PDF 已经找不到（被移动/删除），工具会在确认之前明确告知，不会假装成功。\n';
 }
 
@@ -20878,17 +21165,119 @@ async function chatAgentExecRecropFigure(args, signal, pending) {
     return { ok: true, uiSummary: '重新裁剪图 ' + figNum + ' 完成', uiDetail: text, textForModel: text, bytes: text.length };
 }
 
-// 文本协议的多轮工具调用主循环。wire 是这一轮已经装好的消息数组（chatAssembleTurn 的产物，
-// 最后一条是用户这一轮的完整载荷），本函数在它后面追加"assistant 工具调用 → user 工具结果"
-// 这样的往返，直到模型给出不含 ==TOOL== 的最终回复，或撞上下面任一硬上限。
-// 返回值跟原来直接 `await chatCallModel(...)` 完全一样（一段 raw 文本；meta 通过引用原地
-// 填好），调用方 chatSend 后续那一段"陈旧响应丢弃 / meta.aborted / chatRenderAssistant"
-// 逻辑一个字都不用改。
+// v2 Pass P102：单个工具调用"选哪个 exec 函数 / 自己弹确认卡片+自己画结果行 / 外层统一
+// 画行"的分发逻辑，从原来内联在 chatAgentRunLoop 循环体里的一大段 if/else 抽出来——文本
+// 协议路径和下面 native tool_call 路径现在共用同一份分发，不会出现"native 路径漏了某个
+// 工具的确认/画行逻辑"这种协议特有的裂缝。返回值就是各 chatAgentExec* 函数原来的返回形状
+// {ok, uiSummary, uiDetail, textForModel, bytes, ...}，调用方自己决定怎么塞回 wire（两条
+// 协议的"工具结果"消息形状不一样：文本协议塞一条 role:user 的 `[工具结果 · x]` 文本，
+// native 塞一条 role:tool 的 tool_call_id 消息，所以 wire.push 留在各自调用点，不进这里）。
+async function chatAgentDispatchToolCall(toolName, args, projectDir, signal, pending, setLabel) {
+    // v2 Pass P43：写工具（write_file/mkdir/move/copy/delete）走 chatAgentExecWriteTool——
+    // 那个函数内部自己弹确认框、自己在拿到结果后画展示行（带一键回退），这里不再重复调
+    // chatAppendToolRow，避免同一次操作在聊天记录里出现两条重复的行。
+    // v2 Pass P78（H4）：新增两个中文渲染诊断工具，同一套"自己画行 vs 外层画行"分工——
+    // read_block_translation 只读，跟 list_dir/read_file 一样外层统一画行；
+    // retranslate_block 会改翻译缓存，跟 fs 写工具一样自己弹确认卡片、自己画结果行。
+    const isWriteTool = CHAT_AGENT_WRITE_TOOLS.indexOf(toolName) !== -1;
+    const isZhReadTool = toolName === 'read_block_translation';
+    const isZhWriteTool = toolName === 'retranslate_block';
+    // v2 Pass P92：doc_highlight/doc_highlight_clear 自己画那张带上一处/下一处/清除按钮的
+    // 卡片（chatRenderDocHighlightCard/chatHighlightArchiveCard），跟 fs 写工具/retranslate_block
+    // 同一档"自己画行，外层不重复画"，但不需要确认（只读定位+纯前端高亮，不改任何文件/缓存）。
+    const isHighlightTool = toolName === 'doc_highlight' || toolName === 'doc_highlight_clear';
+    // v2 Pass P101：组1（list_block_status）/组2（compile、read_compile_log）都是只读或
+    // 免确认的"浏览类"操作，走 list_dir/read_file 那一档——外层统一画行，自己不重复画。
+    // 组3（reconvert_page、recrop_figure）会真的改动磁盘文件，跟 retranslate_block 同一档——
+    // 自己弹确认卡片、自己画结果行。
+    const isStatusTool = toolName === 'list_block_status';
+    const isCompileTool = toolName === 'compile';
+    const isReadLogTool = toolName === 'read_compile_log';
+    const isP2TWriteTool = CHAT_AGENT_P2T_WRITE_TOOLS.indexOf(toolName) !== -1;
+    const selfDisplaying = isWriteTool || isZhWriteTool || isHighlightTool || isP2TWriteTool;
+    if (setLabel) {
+        setLabel(isWriteTool
+            ? ('准备执行「' + (CHAT_AGENT_TOOL_LABELS[toolName] || toolName) + '」…')
+            : isZhWriteTool
+                ? ('准备重新翻译块 #' + args.blockIndex + '…')
+                : isZhReadTool
+                    ? ('正在读取块 #' + args.blockIndex + ' 的渲染译文…')
+                    : isHighlightTool
+                        ? (toolName === 'doc_highlight' ? '正在定位高亮…' : '正在清除高亮…')
+                        : isStatusTool
+                            ? '正在枚举块状态…'
+                            : isCompileTool
+                                ? '正在编译…'
+                                : isReadLogTool
+                                    ? '正在读取编译日志…'
+                                    : isP2TWriteTool
+                                        ? ('准备' + (toolName === 'reconvert_page' ? ('重新转换第 ' + args.pageNum + ' 页') : ('重新裁剪图 ' + args.figNum)) + '…')
+                                        : ('正在' + (toolName === 'read_file' ? '读取' : '查看') + '「' + (args.path || '.') + '」…'));
+    }
+    const result = isWriteTool
+        ? await chatAgentExecWriteTool(toolName, args, projectDir, signal, pending)
+        : isZhReadTool
+            ? await chatAgentExecReadBlockTranslation(args, signal)
+            : isZhWriteTool
+                ? await chatAgentExecRetranslateBlock(args, signal, pending)
+                : isHighlightTool
+                    ? (toolName === 'doc_highlight' ? await chatAgentExecDocHighlight(args) : await chatAgentExecDocHighlightClear())
+                    : isStatusTool
+                        ? await chatAgentExecListBlockStatus(args)
+                        : isCompileTool
+                            ? await chatAgentExecCompile(args, signal)
+                            : isReadLogTool
+                                ? await chatAgentExecReadCompileLog(args)
+                                : isP2TWriteTool
+                                    ? (toolName === 'reconvert_page' ? await chatAgentExecReconvertPage(args, signal, pending) : await chatAgentExecRecropFigure(args, signal, pending))
+                                    : await chatAgentExecTool(toolName, args, projectDir, signal);
+    if (!selfDisplaying) {
+        const rowLabel = isZhReadTool
+            ? ('🔧 read_block_translation（块 #' + args.blockIndex + '）')
+            : isStatusTool ? '🔧 list_block_status'
+            : isCompileTool ? '🔧 compile'
+            : isReadLogTool ? '🔧 read_compile_log'
+            : ((toolName === 'read_file' ? '🔧 read_file' : '🔧 list_dir') + '（' + (args.path || '.') + '）');
+        chatAppendToolRow(
+            rowLabel + '· ' + result.uiSummary,
+            result.uiDetail.length > 4000 ? result.uiDetail.slice(0, 4000) + '\n…（此处仅显示前 4000 字，模型收到的是完整版本）' : result.uiDetail
+        );
+    }
+    return result;
+}
+
+// 多轮工具调用主循环——文本协议（==TOOL==/==TOOLEND==，全部四家 provider 通用）与 v2 Pass
+// P102 新增的 OpenAI 原生 tool_call（只有 provider==='local' 且 chatAgentNativeToolsActive()
+// 时才可能触发）共用同一个循环、同一份工具分发（chatAgentDispatchToolCall）。wire 是这一轮
+// 已经装好的消息数组（chatAssembleTurn 的产物，最后一条是用户这一轮的完整载荷），本函数在
+// 它后面追加"assistant 工具调用 → 工具结果"这样的往返，直到模型给出不含工具调用的最终
+// 回复，或撞上下面任一硬上限。返回值跟原来直接 `await chatCallModel(...)` 完全一样（一段
+// raw 文本；meta 通过引用原地填好），调用方 chatSend 后续那一段"陈旧响应丢弃 / meta.aborted /
+// chatRenderAssistant"逻辑一个字都不用改。
 //
 // 【已知取舍】循环内部一律不传流式 sink（本地模型的逐字流式展示因此在这条路径上关闭）——
 // 在拿到完整响应之前没法预先知道这一轮是工具调用还是最终答案，索性统一走非流式：简单，
-// 也不会把 ==TOOL== 协议文本泄漏进用户看到的气泡。最终答案因此改成"一次性到达"而不是逐字
-// 流入，跟 openai/claude/gemini 三家原本的行为一致（只有 local 流式这一条路径受影响）。
+// 也不会把工具调用协议文本泄漏进用户看到的气泡。最终答案因此改成"一次性到达"而不是逐字
+// 流入，跟 openai/claude/gemini 三家原本的行为一致（只有 local 流式这一条路径受影响，且
+// 从 P42 起就是这样——P102 不改变这个既有取舍，只是在同一条非流式路径上新增了 native 分支）。
+//
+// 【native 分支设计要点】
+//   · 单工具/并行多工具统一处理：meta.toolCalls 是数组，长度可能是 1 也可能 >1——一律
+//     "全部按顺序 await 执行完，再一次性把 assistant(tool_calls) + 每个 tool_call_id 对应
+//     的 role:tool 消息一起塞进 wire，然后进入下一轮"。**顺序执行**而不是 Promise.all 并发
+//     执行：写类工具的 chatAgentConfirm 确认卡本来就是"一次只挂一张、用户点了才继续"的
+//     串行 UI 交互（P69 设计），批内多个写调用如果并发发起会同时弹出好几张卡、谁也说不清
+//     哪张对应哪个 tool_call_id 的结果——"支持并行工具调用"在这里的含义是"模型一轮里可以
+//     一次性请求多个工具、全部都会被执行并各自拿到回复"，不是"多个工具在墙钟时间上真的
+//     同时执行"，后者需要重新设计确认 UI，超出这次迁移的范围。
+//   · 单个 tool_call 的参数校验复用 chatAgentValidateToolArgs（跟文本协议同一份规则）；
+//     校验失败/JSON 解不出来/工具名不认识，都不中断整轮——把错误信息塞进对应那条
+//     role:tool 消息的 content 里，让模型自己看到错误、自己决定怎么纠正，不像文本协议那样
+//     用"usedRetry 只给一次机会"的整轮重试机制（native 每个 tool_call 本来就有独立的
+//     id/回复通道，没必要再叠一层专门的重试记账）。
+//   · 累计读取预算（CHAT_AGENT_TOTAL_READ_BUDGET）按"整批"检查一次，不是每个 tool_call
+//     单独判断——跟文本协议同一条边界语义（该常量本来就是按"这一轮"设计的，不是按"这一次
+//     调用"）。
 async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
     const projectDir = chatAgentProjectDir();
     let bytesUsed = 0;
@@ -20901,9 +21290,66 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
 
     for (let iter = 1; iter <= CHAT_AGENT_MAX_ITERS; iter++) {
         raw = await chatCallModel(wire, sys, signal, meta, null);
+
+        // v2 Pass P102：callLocalLLM 的兼容闸①证实了这一发的 tools 参数不被支持——记住这个
+        // endpoint+模型组合，下一轮的系统提示（chatSystemPrompt/chatAgentNativeToolsActive）
+        // 就会自动换回带 ==TOOL== 说明的文本协议版本。toolsUnsupported===true 时这一发本来
+        // 就没有 tool_calls（重试请求没带 tools），所以这里不用 continue，往下走到普通的
+        // parsed.isToolCall 分支即可（多半是最终答案或者模型自己"记得"文本协议、直接吐了
+        // ==TOOL== 块——两种情况下面都能正确处理）。
+        if (meta && meta.toolsUnsupported) {
+            chatAgentMarkNativeToolsUnsupported();
+        }
+
+        // ---- native tool_call 分支 ----
+        if (meta && Array.isArray(meta.toolCalls) && meta.toolCalls.length) {
+            if (iter === CHAT_AGENT_MAX_ITERS) break;   // 最后一轮还在要工具：不执行，进入下面的封顶处理
+
+            const toolCallsRaw = meta.toolCalls;
+            wire.push({ role: 'assistant', content: (typeof raw === 'string' ? raw : '') || '', tool_calls: toolCallsRaw });
+
+            const overBudget = bytesUsed >= CHAT_AGENT_TOTAL_READ_BUDGET;
+            for (let ti = 0; ti < toolCallsRaw.length; ti++) {
+                const tc = toolCallsRaw[ti] || {};
+                const tcId = tc.id || ('call_' + ti);
+                const fn = tc.function || {};
+                const toolName = String(fn.name || '');
+                let toolContent;
+                if (overBudget) {
+                    toolContent = '已经达到这一轮的累计读取上限（约 ' + Math.round(CHAT_AGENT_TOTAL_READ_BUDGET / 1024)
+                        + 'KB），不会再执行新的工具调用了。请直接基于目前已经读到的内容回答。';
+                } else if (CHAT_AGENT_TOOLS.indexOf(toolName) === -1) {
+                    toolContent = '不认识的工具名「' + toolName + '」（只支持 ' + CHAT_AGENT_TOOLS.join(' / ') + '）';
+                } else {
+                    let args = null;
+                    try { args = fn.arguments ? JSON.parse(fn.arguments) : {}; } catch (e) { args = undefined; }
+                    const v = (args !== undefined) ? chatAgentValidateToolArgs(toolName, args) : { ok: false, reason: '工具参数不是合法 JSON' };
+                    if (!v.ok) {
+                        toolContent = '工具调用参数有误：' + v.reason;
+                    } else {
+                        const result = await chatAgentDispatchToolCall(toolName, args, projectDir, signal, pending, setLabel);
+                        bytesUsed += result.bytes;
+                        toolContent = result.textForModel;
+                    }
+                }
+                wire.push({ role: 'tool', tool_call_id: tcId, content: toolContent });
+            }
+            setLabel('thinking…');
+            continue;
+        }
+
+        // ---- 文本协议分支（==TOOL==/==TOOLEND==，逐字保留原有行为）----
         const parsed = chatAgentParseToolCall(raw);
 
         if (!parsed.isToolCall) return raw;   // 正常最终回复，交给外层已有的信封解析
+
+        // v2 Pass P102：这一轮明明发了 tools schema（native 生效），模型却还是吐了旧式
+        // ==TOOL== 文本——证明它不会真的用 native 协议，记住它，之后整个会话都退回文本协议，
+        // 不再重复浪费一次"发了 tools 却被无视"的往返。这一轮本身仍按文本协议正常处理下去，
+        // 不浪费模型已经算出来的这次工具调用。
+        if (chatAgentNativeToolsActive()) {
+            chatAgentMarkNativeToolsUnsupported();
+        }
 
         if (parsed.malformed) {
             if (!usedRetry && iter < CHAT_AGENT_MAX_ITERS) {
@@ -20931,74 +21377,7 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
             continue;
         }
 
-        // v2 Pass P43：写工具（write_file/mkdir/move/copy/delete）走 chatAgentExecWriteTool——
-        // 那个函数内部自己弹确认框、自己在拿到结果后画展示行（带一键回退），这里不再重复调
-        // chatAppendToolRow，避免同一次操作在聊天记录里出现两条重复的行。
-        // v2 Pass P78（H4）：新增两个中文渲染诊断工具，同一套"自己画行 vs 外层画行"分工——
-        // read_block_translation 只读，跟 list_dir/read_file 一样外层统一画行；
-        // retranslate_block 会改翻译缓存，跟 fs 写工具一样自己弹确认卡片、自己画结果行。
-        const isWriteTool = CHAT_AGENT_WRITE_TOOLS.indexOf(parsed.tool) !== -1;
-        const isZhReadTool = parsed.tool === 'read_block_translation';
-        const isZhWriteTool = parsed.tool === 'retranslate_block';
-        // v2 Pass P92：doc_highlight/doc_highlight_clear 自己画那张带上一处/下一处/清除按钮的
-        // 卡片（chatRenderDocHighlightCard/chatHighlightArchiveCard），跟 fs 写工具/retranslate_block
-        // 同一档"自己画行，外层不重复画"，但不需要确认（只读定位+纯前端高亮，不改任何文件/缓存）。
-        const isHighlightTool = parsed.tool === 'doc_highlight' || parsed.tool === 'doc_highlight_clear';
-        // v2 Pass P101：组1（list_block_status）/组2（compile、read_compile_log）都是只读或
-        // 免确认的"浏览类"操作，走 list_dir/read_file 那一档——外层统一画行，自己不重复画。
-        // 组3（reconvert_page、recrop_figure）会真的改动磁盘文件，跟 retranslate_block 同一档——
-        // 自己弹确认卡片、自己画结果行。
-        const isStatusTool = parsed.tool === 'list_block_status';
-        const isCompileTool = parsed.tool === 'compile';
-        const isReadLogTool = parsed.tool === 'read_compile_log';
-        const isP2TWriteTool = CHAT_AGENT_P2T_WRITE_TOOLS.indexOf(parsed.tool) !== -1;
-        const selfDisplaying = isWriteTool || isZhWriteTool || isHighlightTool || isP2TWriteTool;
-        setLabel(isWriteTool
-            ? ('准备执行「' + (CHAT_AGENT_TOOL_LABELS[parsed.tool] || parsed.tool) + '」…')
-            : isZhWriteTool
-                ? ('准备重新翻译块 #' + parsed.args.blockIndex + '…')
-                : isZhReadTool
-                    ? ('正在读取块 #' + parsed.args.blockIndex + ' 的渲染译文…')
-                    : isHighlightTool
-                        ? (parsed.tool === 'doc_highlight' ? '正在定位高亮…' : '正在清除高亮…')
-                        : isStatusTool
-                            ? '正在枚举块状态…'
-                            : isCompileTool
-                                ? '正在编译…'
-                                : isReadLogTool
-                                    ? '正在读取编译日志…'
-                                    : isP2TWriteTool
-                                        ? ('准备' + (parsed.tool === 'reconvert_page' ? ('重新转换第 ' + parsed.args.pageNum + ' 页') : ('重新裁剪图 ' + parsed.args.figNum)) + '…')
-                                        : ('正在' + (parsed.tool === 'read_file' ? '读取' : '查看') + '「' + (parsed.args.path || '.') + '」…'));
-        const result = isWriteTool
-            ? await chatAgentExecWriteTool(parsed.tool, parsed.args, projectDir, signal, pending)
-            : isZhReadTool
-                ? await chatAgentExecReadBlockTranslation(parsed.args, signal)
-                : isZhWriteTool
-                    ? await chatAgentExecRetranslateBlock(parsed.args, signal, pending)
-                    : isHighlightTool
-                        ? (parsed.tool === 'doc_highlight' ? await chatAgentExecDocHighlight(parsed.args) : await chatAgentExecDocHighlightClear())
-                        : isStatusTool
-                            ? await chatAgentExecListBlockStatus(parsed.args)
-                            : isCompileTool
-                                ? await chatAgentExecCompile(parsed.args, signal)
-                                : isReadLogTool
-                                    ? await chatAgentExecReadCompileLog(parsed.args)
-                                    : isP2TWriteTool
-                                        ? (parsed.tool === 'reconvert_page' ? await chatAgentExecReconvertPage(parsed.args, signal, pending) : await chatAgentExecRecropFigure(parsed.args, signal, pending))
-                                        : await chatAgentExecTool(parsed.tool, parsed.args, projectDir, signal);
-        if (!selfDisplaying) {
-            const rowLabel = isZhReadTool
-                ? ('🔧 read_block_translation（块 #' + parsed.args.blockIndex + '）')
-                : isStatusTool ? '🔧 list_block_status'
-                : isCompileTool ? '🔧 compile'
-                : isReadLogTool ? '🔧 read_compile_log'
-                : ((parsed.tool === 'read_file' ? '🔧 read_file' : '🔧 list_dir') + '（' + (parsed.args.path || '.') + '）');
-            chatAppendToolRow(
-                rowLabel + '· ' + result.uiSummary,
-                result.uiDetail.length > 4000 ? result.uiDetail.slice(0, 4000) + '\n…（此处仅显示前 4000 字，模型收到的是完整版本）' : result.uiDetail
-            );
-        }
+        const result = await chatAgentDispatchToolCall(parsed.tool, parsed.args, projectDir, signal, pending, setLabel);
         bytesUsed += result.bytes;
         wire.push({ role: 'assistant', content: raw });
         wire.push({ role: 'user', content: '[工具结果 · ' + parsed.tool + ']\n' + result.textForModel });
