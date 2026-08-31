@@ -27134,6 +27134,15 @@ async function ovlVisualLangRunQueue() {
                 try { ovlVisualTransCachePut(text, cfg, tgt, fixedProjectId); } catch (e) {}
                 if (document.body.contains(el)) {
                     el.innerHTML = ovlVisualRenderChunk(tgt);
+                    // v2 Pass P88 全链聚焦实测发现的真缺陷修复：这里的 innerHTML 原地替换是
+                    // ovlVisualLoadFigureThumbnails 唯二调用点（整篇重渲染 ovlVisualRender /
+                    // ovlInlineSrcRerenderLocal）之外的第三条渲染路径，但原来没有跟着调它——
+                    // 如果这一块恰好是 figure/table 块（含 .ovl-visual-fig-box[data-fig-src]
+                    // 占位框），翻译落地后占位框会永远停在"图标+文件名"这个 P15 兜底态，真缩略图
+                    // 再也不会补上，除非用户碰巧触发一次整篇重渲染（切编辑器模式等）。该函数本身
+                    // 是纯异步、幂等、按 data-fig-src 精确定位（见 26123 行），传单个块元素当
+                    // root 只会扫这一块，开销可忽略，不需要跟着传 pane。
+                    if (typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(el);
                     // v2 Pass P80 W2（zh-pipeline-chat confirmed high）：innerHTML 原地替换后该
                     // 块（及其后所有块）的真实几何已经变了（中英文断行差异很常见），但 gutter
                     // 每行缓存的 style.top/height、OvlVisualBlockRects、已经画出的标记覆盖层框
@@ -33927,6 +33936,24 @@ function ovlP2TReflowSentences(text) {
     return out;
 }
 
+// v2 Pass P88 全链聚焦实测发现的真缺陷修复：视觉模型逐页转写经常把 table/algorithm/figure/
+// longtable/equation/align 等原子环境的 \begin{...} 跟前面的标题/正文挤在同一行（真实转写
+// 实测证实——手写 LaTeX 几乎总在浮动体前留一个换行，但模型转写不保证这一点）。Visual 渲染
+// 器的按行分块逻辑（ovlSplitVisualBlocks）依赖"这些环境的 \begin{} 必须独占一行才能被正确
+// 识别成原子块起点"这条隐藏假设，一旦被打破，开始标记跟正文/结束标记被拆进两个不同的块，
+// 表格/算法/图片专用渲染器再也配不齐环境、整段散架退化成裸文字（P88 用真实双栏合成论文夹具
+// + jump :1235 实测复现：伪代码 .ovl-visual-algo-body 和图片 .ovl-visual-figure-wrap 在真实
+// 转换产物上完全渲不出来，公式因为走的是通用 KaTeX 兜底路径未受影响）。这里做一次纯确定性、
+// 零语义改动的规范化：只要这些环境的 \begin{} 前面不是换行或字符串开头，就插入一个换行让它
+// 独占一行——环境前后的空白从不影响 LaTeX 编译，只影响 Visual 端的分块正确性，因此不需要像
+// ovlP2TReflowSentences 那样小心保护区间边界，全文本一次正则替换即可。
+const OVL_P2T_ATOMIC_BEGIN_RE = /\\begin\{(table\*?|tabularx?|longtable|algorithm\*?|algorithmic|figure\*?|equation\*?|align\*?|gather\*?|multline\*?|eqnarray\*?)\}/g;
+function ovlP2TEnsureAtomicEnvOwnLine(text) {
+    return text.replace(OVL_P2T_ATOMIC_BEGIN_RE, function (match, envName, offset, full) {
+        return (offset === 0 || full[offset - 1] === '\n') ? match : '\n' + match;
+    });
+}
+
 // ---- §4.5「全应用唯一发视觉请求的地方」：不经过 ovlBridgeFetch（不是桥请求）。----
 async function ovlP2TCallVision(pageNum, dataUrl, userText, extSignal, maxTokensOverride) {
     const endpoint = (OvlSettings.pdf2texVisionEndpoint || '').trim().replace(/\/+$/, '');
@@ -34581,6 +34608,9 @@ async function ovlP2TConvertOnePage(job, num) {
         // 文件名不影响文本的句子结构，两者互相独立；先裁剪、后分句，避免分句逻辑意外把
         // 已被裁剪流程处理过的残留标记行当成正文处理）。同样绝不因为异常中断整页转换。
         try { finalText = ovlP2TReflowSentences(finalText); } catch (e) { console.error('[ovl] p2t reflow sentences failed', num, e); }
+        // v2 Pass P88：确保 table/algorithm/figure/longtable/equation/align 等原子环境的
+        // \begin{} 独占一行——见该函数上方注释（Visual 分块正确性依赖这条不变量）。
+        try { finalText = ovlP2TEnsureAtomicEnvOwnLine(finalText); } catch (e) { console.error('[ovl] p2t ensure atomic env own line failed', num, e); }
         pageState.fragment = finalText;
         await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment);
     } catch (e) {
