@@ -29131,7 +29131,9 @@ async function ovlBuildTreeDom(dirHandle, relPrefix) {
             // 没做（见 ovlOpenFile 定义处的注释、test_p72_view_modes.js 用例 B1）。
             row.addEventListener('click', function () {
                 if (/\.pdf$/i.test(name)) { ovlOpenPdfDirect(h, name, dirHandle, relPath); return; }
-                ovlOpenFile(h, name, dirHandle, relPath);
+                // v2 Pass P96：文件树是唯一真正代表"用户点击"的入口——见 ovlOpenFile 里
+                // opts.userClick 的说明，只有这里传 true。
+                ovlOpenFile(h, name, dirHandle, relPath, { userClick: true });
             });
         }
         ul.appendChild(li);
@@ -29157,10 +29159,28 @@ async function ovlRenderTree(dirHandle) {
     }
 }
 
-async function ovlOpenFile(fileHandle, name, parentHandle, relPath) {
+async function ovlOpenFile(fileHandle, name, parentHandle, relPath, opts) {
     try {
         const file = await fileHandle.getFile();
         const text = await file.text();
+        // v2 Pass P96（问题3 模式切换对称性）：文件树真实点开任意 .tex 要退出 direct 模式——
+        // 现状 tex→pdf 布局会切（对，见 ovlOpenPdfDirect），但 pdf→tex 不切（错，一直停留在
+        // "左 pdf 右 latex" 的镜像布局，只换右侧内容）。opts.userClick 只有文件树点击这一条
+        // 路径会传 true（见下方 ovlBuildTreeDom 里的绑定）——ovlP2TOpenResult/转换流水线跑完
+        // 自动打开产物/AI 合并重开/P2T 面板"打开结果"按钮这几处既有调用点都不传，维持 P82
+        // 镜像布局不因这些"程序化打开"跳变（P96 spec §3 明文要求："转换完成后程序自动在右侧
+        // 打开产物 tex 的路径不算用户点击"）。退出逻辑照抄 ovlDoRecompile 里退出 direct 时的
+        // 同一套收尾（revoke 旧 blob/清 pdfDirectFile/刷新面板 data-pdfsrc/toolbar/PDF 面板
+        // 本体），不留一份显示着不再相关的旧直显 PDF 的面板。
+        if (opts && opts.userClick && OvlState.pdfSourceMode === 'direct') {
+            if (OvlState.pdfObjectUrl) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} OvlState.pdfObjectUrl = null; }
+            OvlState.pdfSourceMode = 'compiled';
+            OvlState.pdfDirectFile = null;
+            const pdfPanel = document.getElementById('ovlPdfPanel');
+            if (pdfPanel) pdfPanel.setAttribute('data-pdfsrc', 'compiled');
+            if (typeof ovlUpdatePdfToolbarUI === 'function') ovlUpdatePdfToolbarUI();
+            if (typeof ovlRenderPdfBody === 'function') ovlRenderPdfBody();
+        }
         // v2 Pass P56（Bug B）：relPath = 相对项目根、含所有子目录层级的完整路径；调用点没传
         // （旧调用形状/理论上摸不到树节点信息的场景）就退回 name——跟改之前完全一样的旧行为，
         // 不会比修之前更差，只是恢复不了"记不住子目录"这个已知缺陷。
@@ -32029,13 +32049,14 @@ function ovlUpdatePdfToolbarUI() {
     // v2 Pass P72：直显模式下没有编译产物（lastCompile 恒为 null），View logs/SyncTeX 这类
     // 依赖 lastCompile 的控件要禁用；翻页/缩放/反色/下载是查看器功能不是编译功能，Overleaf
     // 里查看任意 PDF 也一样能用，照常可用。
-    // 【规格偏差，v2 Pass P72 执行时发现并按"最小侵入"改正】spec_viewmodes.md §4.4 原设计把
-    // Recompile/编译选项也按 isDirect 禁用，但同一份规格 §6 用例 B5 又要求"直显 PDF 后点回
-    // main.tex 打开，再点 #ovlRecompileBtn 触发真编译退出直显模式"——ovlDoRecompile() 是
-    // pdfSourceMode 退出 direct 的唯一路径（见 §4.6），按原设计禁用 Recompile 会造成一旦
-    // 点过一次文件树里的 .pdf、之后再也没有任何 UI 能触发真编译的死锁，跟风险清单 #1"编译
-    // 永远是权威动作"的既定哲学矛盾。改正：Recompile/编译选项按钮不再受 isDirect 影响，只按
-    // 桥在线/编译中判断（原有逻辑），isDirect 只影响真正依赖 lastCompile 数据的控件。
+    // 【P72 规格偏差记录，v2 Pass P96 起已被下面这条新决定取代】spec_viewmodes.md §4.4 原设计
+    // 把 Recompile/编译选项也按 isDirect 禁用，P72 当时按"最小侵入"改正为不禁用——因为那时
+    // ovlDoRecompile() 是 pdfSourceMode 退出 direct 的唯一路径，禁用会死锁。v2 Pass P96：
+    // 文件树点开任意 .tex 现在会退出 direct 模式（见 ovlOpenFile 的 opts.userClick 分支），
+    // 退出通道不再依赖 Recompile，P72 当时的死锁顾虑已经解除——按用户实测反馈改回"direct
+    // 模式下禁止编译"（PDF 阅读模式本来就不该有一个能编译的按钮，之前留着可点是历史遗留，
+    // 不是有意设计）。ovlDoRecompile() 本体也加了同一条判断兜底（防 Enter 键提交项目路径/
+    // 编译选项菜单里的"从头编译"等不经过这里 disabled 状态检查的调用路径绕过 UI 禁用）。
     const isDirect = OvlState.pdfSourceMode === 'direct';
     // v2 Pass P82：direct 模式镜像布局的唯一同步点——本函数已经是 pdfSourceMode 每次变化
     // （进入 direct/编译开始/编译结束/切项目重置）之后都会调用的收敛点（见函数上方各调用
@@ -32047,13 +32068,18 @@ function ovlUpdatePdfToolbarUI() {
         else mirrorBodyEl.removeAttribute('data-pdfleft');
     }
     if (btn) {
-        btn.disabled = !online || OvlState.compiling;
+        btn.disabled = isDirect || !online || OvlState.compiling;
         btn.textContent = OvlState.compiling ? '编译中…' : 'Recompile';
-        btn.setAttribute('data-tip', online
-            ? ('编译（' + OvlCompileSettings.engine + ' · ' + (OvlCompileSettings.mode === 'draft' ? 'Fast draft' : 'Normal') + '，见 tools/latex-bridge/README.md）')
-            : '桥接服务未启动，见 tools/latex-bridge/README.md');
+        btn.setAttribute('data-tip', isDirect
+            ? 'PDF 阅读模式下不支持编译，点击文件树里的 .tex 文件即可退出'
+            : (online
+                ? ('编译（' + OvlCompileSettings.engine + ' · ' + (OvlCompileSettings.mode === 'draft' ? 'Fast draft' : 'Normal') + '，见 tools/latex-bridge/README.md）')
+                : '桥接服务未启动，见 tools/latex-bridge/README.md'));
     }
-    if (coBtn) coBtn.disabled = !online;
+    if (coBtn) {
+        coBtn.disabled = isDirect || !online;
+        coBtn.setAttribute('data-tip', isDirect ? 'PDF 阅读模式下不支持编译' : 'Toggle compile options menu');
+    }
     if (stopBtn) stopBtn.disabled = !OvlState.compiling; // 不变：直显模式下 compiling 天生是 false
     const hasPdf = isDirect ? !!OvlState.pdfObjectUrl : !!(OvlState.lastCompile && OvlState.lastCompile.pdfExists);
     if (viewLogsBtn) viewLogsBtn.disabled = !OvlState.lastCompile || isDirect;
@@ -32231,6 +32257,15 @@ async function ovlBridgeCheckHealth() {
 async function ovlDoRecompile(opts) {
     opts = opts || {};
     if (OvlState.compiling) return;
+    // v2 Pass P96：direct 模式（PDF 阅读模式，文件树直显源 PDF，未编译）下明确禁止编译——
+    // 跟 ovlUpdatePdfToolbarUI 里按钮置灰同一条设计；这里补一道兜底，防止 Enter 键提交项目
+    // 路径输入框/编译选项菜单里的"从头编译"等不经过按钮 disabled 状态检查的调用路径绕过 UI
+    // 禁用。退出 direct 模式唯一通道现在是点文件树里的任意 .tex（见 ovlOpenFile 的
+    // opts.userClick 分支），不再是"点 Recompile"。
+    if (OvlState.pdfSourceMode === 'direct') {
+        ovlSetPdfStatus('PDF 阅读模式下不支持编译，请先在文件树点开一个 .tex 文件', true);
+        return;
+    }
     const pathInput = document.getElementById('ovlProjectPathInput');
     const projectDir = pathInput ? pathInput.value.trim() : '';
     if (!projectDir) {
@@ -32272,6 +32307,9 @@ async function ovlDoRecompile(opts) {
     if (OvlState.pdfObjectUrl) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} OvlState.pdfObjectUrl = null; }
     // v2 Pass P72：真的走编译了，无条件退出直显模式（编译永远是权威动作，见
     // spec_viewmodes.md §5 风险清单 #1）——不管刚才是不是在直显一份文件树点开的 PDF。
+    // v2 Pass P96 注：本函数顶部现在会在 pdfSourceMode==='direct' 时直接拒绝执行（见上方
+    // 新增判断），这几行因此实际只在"本来就不是 direct"时才会跑到——留着当兜底不删，
+    // 万一将来又有新路径能在 direct 模式下把 compiling 置 true 走到这里，语义依旧正确。
     OvlState.pdfSourceMode = 'compiled';
     OvlState.pdfDirectFile = null;
     { const p = document.getElementById('ovlPdfPanel'); if (p) p.setAttribute('data-pdfsrc', 'compiled'); }
@@ -39664,6 +39702,34 @@ function ovlFindPageBlockSourceRange(markers, pageNum, taValue) {
     const endLine = (idx + 1 < markers.length) ? (markers[idx + 1].line - 1) : (totalLines - 1);
     return { startLine: startLine, endLine: Math.max(startLine, endLine) };
 }
+// v2 Pass P96（问题1 真根因修复）：页级跳转原来直接把 hit.line（页标记 `% ==== page N
+// ====` 自己那一行，一整行注释）喂给 ovlMarkLines——Code 模式下用户看到的就是那行原始
+// 注释（用户反馈"跳到某个页标"，逐字命中）；Visual 模式下更糟：注释行天生不属于任何
+// .ovl-visual-block（§0 已确认注释被整行保护/剥离，不会独立成块），ovlMarkCenterVisual
+// 的"最近前置块"扫描（28576 行 idxFrom 循环）找不到 line<=hit.line 的块时会停在初始默认值
+// 0（文档第一个块），看起来就是"固定跳到开头"；同时 ovlVisualMarkRangeForLines（27982
+// 行，真正画黄色高亮框的那个函数）用的是区间重叠判定 `a<=lineTo && z>=lineFrom`，落在一行
+// 孤立注释上时任何块的 [a,z] 都不包含它，直接返回 null——高亮框整个不画，双重体验事故。
+// 修法：页级目标改成"这一页块的第一条真正内容行"（跳过空行和纯注释行，如失败页占位的
+// "% 原因/% TODO" 两行说明），这一行必然落在某个真实 Visual 块的 [a,z] 区间内（要么是块
+// 自己的起始行，要么被并进更早的段落块），上面两个函数的既有逻辑不用再改，直接对上。
+// 找不到任何内容行（页块整个是空白，理论边界情况）才退回 hit.line 本身，不留 null 空跳。
+function ovlFirstContentLineForPage(markers, pageNum, taValue) {
+    const hit = markers.find(function (m) { return m.pageNum === pageNum; });
+    if (!hit) return null;
+    const range = ovlFindPageBlockSourceRange(markers, pageNum, taValue);
+    if (!range) return hit.line;
+    const lines = taValue.split('\n');
+    for (let i = range.startLine + 1; i <= range.endLine; i++) {
+        const raw = lines[i];
+        if (raw == null) break;
+        const t = raw.trim();
+        if (!t) continue;          // 空行跳过
+        if (/^%/.test(t)) continue; // 纯注释行跳过（页标记本身、失败页占位的原因/TODO 说明）
+        return i;
+    }
+    return hit.line; // 整页都是空白/注释（无正文内容），退回页标记行本身，不产生 null
+}
 // PDF 抽取文本与源码/翻译产物的 LaTeX 转写之间天然有噪声（连字符断词、页眉页脚、公式/引用
 // 命令在 PDF 可见文字里不存在）——归一化拉平这些差异：连字符断词拼回、折叠空白、大小写不敏感。
 function ovlNormalizeForSentenceMatch(s) {
@@ -39732,7 +39798,11 @@ function ovlPdfHandleDblClickDirect(ev, container) {
             ovlFlashSaveStatus('当前打开的文件里没有第 ' + num + ' 页的标记，可能不是这份 PDF 的转换结果', true);
             return;
         }
-        if (typeof ovlMarkLines === 'function') ovlMarkLines(hit.line, hit.line, { source: 'pdf-direct-page' });
+        // v2 Pass P96：页级保底目标改成"这一页第一条正文行"，不再是页标记注释行本身——
+        // 见 ovlFirstContentLineForPage 上方注释（真根因说明）。
+        const pageLevelLine = ovlFirstContentLineForPage(markers, num, ta.value);
+        const pageLevelTarget = (pageLevelLine == null) ? hit.line : pageLevelLine;
+        if (typeof ovlMarkLines === 'function') ovlMarkLines(pageLevelTarget, pageLevelTarget, { source: 'pdf-direct-page' });
         ovlPdfDirectTrySentenceLevel(ev, num, markers).catch(function (e) {
             console.error('[ovl] pdf direct sentence-level match failed', e);
         });
