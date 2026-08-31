@@ -36842,8 +36842,11 @@ const OVL_SETTINGS_DEFAULTS = {
     pdf2texAutoOpenResult: true,  // 打开 PDF 时自动打开已有转换结果
     pdf2texExtractImages: true,   // v2 Pass P86：spike 已通过（见下方注释），默认改开；矢量图/提取
     // 失败兜底靠 §1 的 BBOX 裁剪机制（ovlP2TApplyFigureCrops），不再是"开了也救不了矢量图"
-    // ——见 overnight_progress.md「## P75」「## P86」。P86 不做旧存档迁移（旧用户显式 false
-    // 原样保留，同 P84 对 pdf2texDisableThinking 的既有原则：无法区分"手动关过"与"从未碰过"）。
+    // ——见 overnight_progress.md「## P75」「## P86」「## P89」。P86 当时刻意不做旧存档迁移
+    // （同 P84 对 pdf2texDisableThinking 的原则：无法区分"手动关过"与"从未碰过"），但这导致
+    // 已经用过软件的用户复选框继续显示未勾选，被误判为"默认没改成"。用户明确要求默认开启，
+    // P89 补上一次性存量迁移（见下方 ovlLoadSettings）：旧存档显式 false 一律升级为 true——
+    // 会覆盖极少数手动关过的用户，属用户明确要求的取舍，与 P84 的谨慎原则不同，特此说明差异。
     // ---- v2 Pass P85：转换后整体核验 ----
     // main.tex 拼装完成后自动用桥编译一次；失败则截取错误日志 + 出错页片段发给修复模型
     // （复用视觉模型同一 endpoint/模型名，关闭思考），应用修正后再编译一次——最多一轮，不循环。
@@ -36880,6 +36883,22 @@ function ovlLoadSettings() {
             });
             if (migrated.length) {
                 console.info('[ovl] P84 一次性迁移 PDF→LaTeX 默认配置到新默认值：', migrated.join(', '));
+                ovlSaveSettings();
+            }
+            // v2 Pass P89：图片提取开关（pdf2texExtractImages）P86 把默认值从 false 改成 true，
+            // 但当时刻意不做旧存档迁移（见上方 P86 注释），导致老用户复选框继续显示未勾选，被
+            // 误判成"默认没改成"。用户明确要求默认开启：这里一次性把旧存档里显式的 false 升级
+            // 为 true（无法区分"手动关过"与"从未碰过"，这里明确二选一，会覆盖此前手动关闭者，
+            // 属用户明确要求，与 P84 对 disableThinking 的谨慎保留原则不同）。
+            const migratedP89 = [];
+            ['pdf2texExtractImages'].forEach(function (key) {
+                if (Object.prototype.hasOwnProperty.call(parsed, key) && parsed[key] === false) {
+                    OvlSettings[key] = true;
+                    migratedP89.push(key);
+                }
+            });
+            if (migratedP89.length) {
+                console.info('[ovl] P89 一次性迁移图片提取开关到默认开启：', migratedP89.join(', '));
                 ovlSaveSettings();
             }
         }
@@ -37523,7 +37542,7 @@ function ovlSettingsPdf2TexHtml() {
     html += ovlSetRow('保留页面截图', '<input type="checkbox" data-setpath="settings.pdf2texSavePageImages"' + (s.pdf2texSavePageImages ? ' checked' : '') + '>',
         '关掉可以省磁盘（每篇论文页面截图约 6-12 MB），但转换失败的页面就只剩文字占位，没有整页截图兜底。');
     html += ovlSetRow('打开 PDF 时自动打开已有转换结果', '<input type="checkbox" data-setpath="settings.pdf2texAutoOpenResult"' + (s.pdf2texAutoOpenResult ? ' checked' : '') + '>', '');
-    html += ovlSetRow('提取内嵌图片（实验）', '<input type="checkbox" id="ovlP2TExtractImagesChk" data-setpath="settings.pdf2texExtractImages"'
+    html += ovlSetRow('提取内嵌图片', '<input type="checkbox" id="ovlP2TExtractImagesChk" data-setpath="settings.pdf2texExtractImages"'
         + (s.pdf2texExtractImages ? ' checked' : '') + (OVL_P2T_M2_AVAILABLE ? '' : ' disabled') + '>',
         OVL_P2T_M2_AVAILABLE ? '默认开启：优先提取 PDF 里的内嵌位图；矢量绘制的图表/示意图会由视觉模型标出位置后从页面栅格裁剪。关闭则退回整页截图当图源。' : '本机 pdf.js spike 未通过（详见 overnight_progress.md「## P75」），这个能力尚未实现，开关已禁用。');
     html += ovlSetRow('转换后自动整体核验', '<input type="checkbox" data-setpath="settings.pdf2texAutoVerify"' + (s.pdf2texAutoVerify ? ' checked' : '') + '>',
