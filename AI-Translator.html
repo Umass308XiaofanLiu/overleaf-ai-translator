@@ -5466,6 +5466,18 @@ function focusCount() {
     try { return FocusState.entries.length; } catch (e) { return 0; }
 }
 
+// v2 Pass P99：这一轮**实际发得出去**的关注条目数——跟 focusWireBlock / focusRenderChip
+// 用的是同一个判定 focusResolve，不是另算一套（否则状态条和 chip 区域的数字会对不上）。
+// 供 chatUpdateBar 的「共 N 条消息」状态条并列显示用。
+function focusLiveCount() {
+    try {
+        const entries = FocusState.entries;
+        let n = 0;
+        for (let i = 0; i < entries.length; i++) { if (focusResolve(entries[i]).ok) n++; }
+        return n;
+    } catch (e) { return 0; }
+}
+
 // 这一行、这一侧此刻的真值。正在编辑就读 textarea 缓冲区，否则读已提交的 pair。
 // 和 chatLiveBase 是同一个语义，这里单独包一层只为了「渲染路径调用它绝不可能抛」。
 function focusLiveBase(rowIndex, side) {
@@ -22478,11 +22490,16 @@ function chatAssembleTurn(draft, pushed) {
     // 这里只**解析**关注（解不出来的自己跳过），作废是 focusRevalidate 的事 ——
     // 本函数也被「下一轮大约要花多少」的估算路径调用，估一次算一次绝不能顺手删用户的标记。
     //
-    // ⚠️ **跟着上下文开关走**。关注条目带的是稿子里的原文逐字（整行条目就是一整段），
-    // 所以它是不折不扣的文档正文。上下文关掉了还照发，等于开关上写着「不发文档」、
-    // 实际发了 471 个字节的文档 —— chat-auto-context.md 验收 6 要的是「关掉之后抓包里
-    // 没有一个字的文档正文」。关注是**在整篇上下文里加重点**，没有上下文也就无处可加。
-    const focusBlock = ChatState.autoContext ? focusWireBlock() : '';
+    // v2 Pass P99：与「文档」开关（ChatState.autoContext）**解耦，无条件生成**。旧版曾把
+    // 这行绑在文档开关上（"跟着上下文开关走"——理由是关注条目带的是稿子原文逐字，算文档
+    // 正文的一部分，上下文关掉还照发就等于开关说了谎）。但这个联动是纯粹的实现细节，用户
+    // 的心智模型是「chip 是我手动挑的重点，跟要不要发整篇原文是两件事」：挂了 chip、又顺手
+    // 关了「文档」开关，模型收到的却是「什么标注都没有」——且 UI（focusRenderChip）从不
+    // 提示这个联动，chip 列表照样写着「额外关注 · N 处」，用户没有任何信号知道这一轮全部
+    // 作废。这是一次真实的用户可见 bug（诊断见 .claude/tmp/diag_p99_chips.md）。
+    // 现在：chip 存在就发，不看 doc.on。文档开关只管 ==DOC== 那一块要不要发（下面
+    // `doc.on ? doc.text + ... : ''`），两件事各管各的，互不牵连。
+    const focusBlock = focusWireBlock();
     const sys = chatSystemPrompt(!!ChatState.target, doc.on, !!focusBlock);
     const wire = chatWireHistory();
     // 关注块跟着「这一轮的提问」一起计入 draft 那一项 —— 它和附加选段一样，是最后一条 user 消息的一部分。
@@ -22641,15 +22658,20 @@ function chatUpdateBar() {
         const ro = chatCtxReadout();
         const doc = ro.assembled.doc;
 
+        // v2 Pass P99：这颗 tip 以前说「关掉之后 ==DOC== 和 ==FOCUS== 都不再发」——那是
+        // chatAssembleTurn 里那个已解除的强绑定的直接后果，用户挂着 chip、关了这个开关，
+        // 标注被静默吞掉却毫无提示。现在关注块跟这个开关完全解耦、无条件发送，这里如实改写。
         const ctxTip = ChatState.autoContext
             ? '开着：每一轮都把**左栏整篇原文**（只有原文，没有译文——模型看不到译文）按 [行号] '
               + '重新生成一遍发过去（不是存下来的旧副本）。'
               + '所以压缩之后原文还在、清理之后第一轮就带全文、重译之后带的是新原文。'
-              + '关掉之后 ==DOC== 文档块和 ==FOCUS== 关注块都不再发；但**窗口里已有的对话轮次照旧会发**，'
+              + '关掉之后 ==DOC== 文档块不再发；但**窗口里已有的对话轮次照旧会发**，'
               + '而模型早先的回答里可能引用过你的原文 —— 要连那些一起断掉得再点「清理」。'
-            : '关着：这一轮既不发 ==DOC== 文档块，也不发 ==FOCUS== 关注块（关注条目带的就是稿子原文，'
-              + '它跟着这个开关走）。注意它只管这两块：窗口里已有的对话轮次照旧会发，'
-              + '而模型早先的回答里可能引用过你的原文。要连那些一起断掉，用「清理」开一段新对话。';
+              + '（额外关注的 ==FOCUS== 块不受这个开关影响，挂了 chip 就一定发，见下方「额外关注」区域。）'
+            : '关着：这一轮不发 ==DOC== 文档块（模型看不到整篇原文）。'
+              + '窗口里已有的对话轮次、以及已经挂上的额外关注 chip（==FOCUS== 块）照样会发 —— '
+              + 'chip 是你自己手动挑的重点，跟要不要发整篇原文是两件事，不跟着这个开关走。'
+              + '模型早先的回答里可能引用过你的原文，要连那些一起断掉，用「清理」开一段新对话。';
         // 【这颗按钮的字必须说的是「开关本身」，不是「这一轮碰巧有没有内容可发」】
         // 早先没内容时它写「文档 关（还没有已翻译的内容）」，而开关其实是**开**的、按钮还带着
         // is-on。用户照字面意思去点，反倒把上下文真的关掉了 —— 一个标签把用户推去做它警告的事。
@@ -22679,9 +22701,16 @@ function chatUpdateBar() {
             const sent = Math.min(n, CHAT_HISTORY_MSGS);
             const div = document.createElement('div');
             div.className = 'aichat-status';
-            div.textContent = n > CHAT_HISTORY_MSGS
+            // v2 Pass P99：n 数的是对话轮次，和 FocusState.entries（额外关注 chip）是两套
+            // 完全独立的计数，这条文案语义不改——但用户容易把 chip 数当成「共 N 条」的一部分
+            // （诊断实测：8 chip + 2 条消息，被误读成「怎么才 2 条」）。这里并列补一句「这一轮
+            // 实际发得出去几处标注」，读数就用 focusLiveCount（与 chip 区域同一个判定），零
+            // 处时不额外占地方。
+            const liveFocus = focusLiveCount();
+            const focusSuffix = liveFocus > 0 ? ('（连同 ' + liveFocus + ' 处额外关注一起发）') : '';
+            div.textContent = (n > CHAT_HISTORY_MSGS
                 ? '共 ' + n + ' 条消息；每轮只把最近 ' + sent + ' 条发给模型（更早的不再发，但仍留在窗口里）。'
-                : '共 ' + n + ' 条消息，全部会随下一轮发给模型。';
+                : '共 ' + n + ' 条消息，全部会随下一轮发给模型。') + focusSuffix;
             bar.appendChild(div);
         }
 
