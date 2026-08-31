@@ -2732,13 +2732,22 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 /* ---- Recompile split button（左半矩形+右半圆角 caret，§2.2 实测原文）---- */
 /* v2 Pass P76：显式 align-items:center（原来吃默认值 stretch）——P76 把右半 caret 的
    字符图标放大到 18px 后，如果两边高度靠 stretch 强行拉平，12px 文字的左半主按钮会被
-   撑高、文字在变高的盒子里偏上不居中；改成 center 后两边各自按自己内容居中，互不拉扯。 */
-.ovl-recompile-split { display: flex; flex-shrink: 0; align-items: center; }
-.ovl-recompile-split .ovl-recompile-btn-main { border-radius: 4px 0 0 4px; }
+   撑高、文字在变高的盒子里偏上不居中；改成 center 后两边各自按自己内容居中，互不拉扯。
+   v2 Pass P91（用户截图实测反馈）：P76 的 center 只解决了"内容居中"，没解决"两段本身
+   等高"——caret 18px 字号的自然行盒比主按钮 12px 文字明显更高，两段各自的盒子高度不同，
+   圆角衔接处看起来错位/不平齐。根治：整个 split 容器给一个显式高度，两段都改用
+   flex 内容居中 + box-sizing:border-box + 零上下内边距，高度完全由容器决定、不再受字号
+   驱动的行高影响，两段永远等高，衔接处自然。 */
+.ovl-recompile-split { display: flex; flex-shrink: 0; align-items: stretch; height: 30px; }
+.ovl-recompile-split .ovl-recompile-btn-main,
+.ovl-recompile-split .ovl-recompile-btn-caret {
+    display: flex; align-items: center; justify-content: center; box-sizing: border-box;
+}
+.ovl-recompile-split .ovl-recompile-btn-main { border-radius: 4px 0 0 4px; padding: 0 14px; }
 .ovl-recompile-split .ovl-recompile-btn-caret {
     border-radius: 0 4px 4px 0;
     border-left: 1px solid rgba(255,255,255,0.25);
-    padding: 5px 8px;
+    padding: 0 8px;
 }
 .ovl-pdf-sep { width: 1px; align-self: stretch; margin: 6px 4px; background: rgba(255,255,255,0.12); flex-shrink: 0; }
 .ovl-pdf-pageinput {
@@ -33882,13 +33891,45 @@ const OVL_P2T_PROTECT_RE_LIST = [
     // 合并成一行空格分隔的长串，彻底破坏 §2 聚合阶段依赖的逐行结构。必须作为一个不可分割
     // 区间整体透传，标记行本身也在区间内（不会再被下面的整行注释正则重复处理）。
     /% OVL-REFS-BEGIN\r?\n[\s\S]*?% OVL-REFS-END/g,
-    /^\s*%.*$/gm,                                          // 整行注释（含 page marker/TODO）
-    /^\s*\\(section|subsection|subsubsection|caption|label|includegraphics)\b.*$/gm
+    /^\s*%.*$/gm                                           // 整行注释（含 page marker/TODO）
+    // v2 Pass P91：原来这里还有一条 /^\s*\\(section|...)\b.*$/gm 把 section/caption/label/
+    // includegraphics 所在"整行"都当保护区间——挪到下面 ovlP2TCollectCommandArgSpans，只保护
+    // 命令本身+花括号参数，见该函数头部注释（根因：整行保护会把命令后面挤在同一行的正文也
+    // 一起冻住，永远分不了句）。
 ];
-// 收集所有保护区间并按起始位置排序、合并重叠/相邻区间（比如 \includegraphics 单行正则命中
-// 的范围已经完全落在外层 figure 环境正则命中的范围内部——合并时只算一次）。
-function ovlP2TCollectSpans(text, reList) {
+// v2 Pass P91：section/subsection/subsubsection/caption/label/includegraphics 原来用"整行
+// 正则"保护——如果模型把命令和后面的正文挤在同一行（比如 "\section{Introduction} This paper
+// presents a new approach..."，真实转写常见，模型不保证命令后一定换行），整行会被当成一个
+// 不可分割的保护区间原样透传，命令后面那些正文句子永远不会被分句（用户反馈"\section 后首段
+// 没分句"就是这个根因）。改成只保护"命令本身 + 花括号配平的参数"（复用 ovlFindMatchingBrace，
+// caption 里嵌套 \textbf{} 这类也不会误配对），命令后面同一行的正文交还给正常的缝隙重排逻辑。
+const OVL_P2T_CMDARG_START_RE = /\\(section\*?|subsection\*?|subsubsection\*?|caption|label|includegraphics)(?![a-zA-Z])/g;
+function ovlP2TCollectCommandArgSpans(text) {
     const spans = [];
+    OVL_P2T_CMDARG_START_RE.lastIndex = 0;
+    let m;
+    while ((m = OVL_P2T_CMDARG_START_RE.exec(text))) {
+        let i = OVL_P2T_CMDARG_START_RE.lastIndex;
+        while (i < text.length && /[ \t]/.test(text[i])) i++; // 命令名和 [/{ 之间允许空白（宽松容错）
+        if (text[i] === '[') { // 可选参数（\section[短标题]{标题} / \includegraphics[width=...]{path}）
+            const closeBracket = text.indexOf(']', i);
+            if (closeBracket !== -1) i = closeBracket + 1;
+        }
+        while (i < text.length && /[ \t]/.test(text[i])) i++;
+        if (text[i] === '{') {
+            const closeBrace = ovlFindMatchingBrace(text, i);
+            if (closeBrace !== -1) i = closeBrace + 1;
+        }
+        spans.push({ start: m.index, end: i });
+        OVL_P2T_CMDARG_START_RE.lastIndex = i; // 跳过已消费部分，避免参数内部被重复扫描误命中
+    }
+    return spans;
+}
+// 收集所有保护区间并按起始位置排序、合并重叠/相邻区间（比如 \includegraphics 单行正则命中
+// 的范围已经完全落在外层 figure 环境正则命中的范围内部——合并时只算一次）。extraSpans（P91
+// 新增可选参数）跟正则来源的 spans 一起参与排序合并，不单独一套逻辑。
+function ovlP2TCollectSpans(text, reList, extraSpans) {
+    const spans = (extraSpans || []).map(function (s) { return { start: s.start, end: s.end }; });
     reList.forEach(function (re) {
         re.lastIndex = 0;
         let m;
@@ -33907,13 +33948,27 @@ function ovlP2TCollectSpans(text, reList) {
     return merged;
 }
 function ovlP2TReflowProseChunk(chunk) {
+    // v2 Pass P91（用户实测"重转后仍见明显未分句的行"排查发现的边界坑）：原来对整个 chunk
+    // 直接 split('\n').map(trim).join(' ')，如果 chunk 首/尾本身就是"空白"（典型场景：紧贴在
+    // 保护区间——行内数学/\end{...}/\label{...} 等——旁边的那一段"缝隙"文本，首尾常常就是一个
+    // 换行符），会被这套逐行 trim 连同"分隔用的换行/空格"一起吃掉，导致缝隙重排完之后直接贴
+    // 到相邻保护区间上（"\end{equation}下一句…" 挤成一行、"formula.$E=mc^2$" 连写不留空格）。
+    // 改法：先把 chunk 首尾的原始空白（可能是多个换行，比如两个保护区间之间只夹着空行）摘出
+    // 来原样保留，只对"去掉首尾空白之后的核心内容"做折行合并 + 分句，首尾空白原样拼回——缝隙
+    // 两侧原来有多少空白，重排后还是多少，不再被静默吃掉。纯空白 chunk（比如夹在两个保护区间
+    // 中间的空行）直接原样返回，不当空段落丢弃。
+    const leadWs = (/^\s*/.exec(chunk) || [''])[0];
+    const core0 = chunk.slice(leadWs.length);
+    const trailWs = (/\s*$/.exec(core0) || [''])[0];
+    const body = trailWs ? core0.slice(0, core0.length - trailWs.length) : core0;
+    if (!body) return chunk; // 纯空白（含空 chunk）：原样透传，不处理
     // 按空行分段，每段内部先合并折行（消掉模型输出里的软换行），保护缩写句点，按
     // "[.!?] + 空白 + 大写/引号/左括号" 切分句子，再逐句一行、段落间空一行。
-    return chunk.split(/\n{2,}/).map(function (para) {
+    const processed = body.split(/\n{2,}/).map(function (para) {
         if (!para.trim()) return '';
         let joined = para.split('\n').map(function (l) { return l.trim(); }).filter(Boolean).join(' ');
         OVL_P2T_ABBR.forEach(function (a) {
-            joined = joined.split(a).join(a.slice(0, -1) + OVL_P2T_ABBR_PLACEHOLDER); // "Fig." -> "Fig"
+            joined = joined.split(a).join(a.slice(0, -1) + OVL_P2T_ABBR_PLACEHOLDER); // "Fig." -> "Fig"
         });
         // 单大写字母缩写（人名首字母，如 "J. Smith"）：字母+句点+空白+大写字母 也保护
         joined = joined.replace(/\b([A-Z])\.(\s+[A-Z])/g, '$1' + OVL_P2T_ABBR_PLACEHOLDER + '$2');
@@ -33923,9 +33978,14 @@ function ovlP2TReflowProseChunk(chunk) {
             .filter(Boolean);
         return sentences.join('\n');
     }).filter(function (p) { return p !== ''; }).join('\n\n');
+    return leadWs + processed + trailWs;
 }
 function ovlP2TReflowSentences(text) {
-    const protectedSpans = ovlP2TCollectSpans(text, OVL_P2T_PROTECT_RE_LIST);
+    // v2 Pass P91：command-arg spans（section/caption/label/includegraphics 命令本身，见
+    // ovlP2TCollectCommandArgSpans）跟原来那批整段/整行正则来源不同、分开收集，交给
+    // ovlP2TCollectSpans 统一排序合并（互相重叠/相邻会自动合并成一段，比如 figure 块内部的
+    // \caption{} 天然落在外层 figure 保护区间里，合并后不影响结果）。
+    const protectedSpans = ovlP2TCollectSpans(text, OVL_P2T_PROTECT_RE_LIST, ovlP2TCollectCommandArgSpans(text));
     let out = '', cursor = 0;
     protectedSpans.forEach(function (span) {
         out += ovlP2TReflowProseChunk(text.slice(cursor, span.start));    // 只对"缝隙"里的裸文本重排
@@ -34333,6 +34393,199 @@ async function ovlP2TApplyReferencesPipeline(job, rawMainText) {
     };
 }
 
+// ==================== v2 Pass P91 §2/§4：图片按首次引用定位 + 图片提取三级兜底 ====================
+// §2 用户实测反馈——figure 环境应该插在正文第一次提到 "Fig. X" 的那句话之后，方便对照阅读
+// （模型转写时 figure 落在页面上的原始位置，往往跟文字里第一次提到它的地方隔得很远，甚至隔
+// 好几页）。§4 用户实测反馈——部分图缺失/未截取；M2 位图提取（一级）+ P86 §1 bbox 裁剪
+// （二级）已经是两道兜底，这里补第三级：main.tex 拼装完之后逐张核实，两级都没接住的（仍原样
+// 引用整页截图）重渲该页、按"非纯白像素外接矩形"再裁一次；三级都救不了的明确进核验报告
+// 「图片清单」标"图X提取失败"，绝不静默丢图。
+
+// figure 出现顺序 = 它最终被 LaTeX 编号的顺序（\caption 按 \begin{figure}...\end{figure} 在
+// 源码里出现的先后计数，figure* 跟 figure 共用同一个计数器）——用这个顺序号 X 去匹配正文里
+// "Fig. X" 之类的引用，也用来给核验报告里的图片提取清单编号。§2 的搬移 / §4 的兜底两处必须
+// 用同一份枚举，不能各扫一遍各算各的号。
+const OVL_P2T_FIGURE_ENV_RE = /\\begin\{(figure\*?)\}[\s\S]*?\\end\{\1\}/g;
+function ovlP2TEnumerateFigureBlocks(text) {
+    OVL_P2T_FIGURE_ENV_RE.lastIndex = 0;
+    const blocks = [];
+    let m;
+    while ((m = OVL_P2T_FIGURE_ENV_RE.exec(text))) {
+        blocks.push({ num: blocks.length + 1, start: m.index, end: m.index + m[0].length, text: m[0] });
+    }
+    return blocks;
+}
+
+// "Fig./Figs./Figure/Figures" + 可选句点 + 可选 ~（LaTeX 不断行空格）+ 数字，数字后允许一个
+// 简单的 ", "/"and " 接续列表（"Figs. 1 and 2"/"Figs. 1, 2"）——不处理连字符区间（"Figs. 1-3"）
+// 与三项以上的牛津逗号列表最后一项（"1, 2, and 3" 只认到 "1, 2"），这是已知的、有意为之的
+// 简化，不是本 Pass 要覆盖的范围。
+const OVL_P2T_FIGREF_RE = /\bFig(?:s|ure|ures)?\.?\s*~?\s*(\d+(?:\s*(?:,|and)\s*\d+)*)/gi;
+function ovlP2TPlaceFiguresAtFirstMention(text) {
+    const blocks = ovlP2TEnumerateFigureBlocks(text);
+    if (!blocks.length) return text;
+
+    // 搜索用文本：把所有 figure 块（含它自己的 caption）整体挖空替换成等长空格，坐标跟原文
+    // 一一对应——保证"排除 caption 自身"，也不会误把别的图注里提到的编号当成正文引用。
+    let searchText = text;
+    blocks.forEach(function (b) { searchText = searchText.slice(0, b.start) + ' '.repeat(b.end - b.start) + searchText.slice(b.end); });
+
+    const endDocIdx = text.lastIndexOf('\\end{document}');
+
+    // 单遍顺序扫描，每个编号只认第一次命中；命中位置换算成"该行行尾"（下一个换行符之后，即
+    // 下一行开头），保证插入后不会切进这一句中间。
+    const anchorForFig = {}; // X -> 原文坐标（插入点）
+    OVL_P2T_FIGREF_RE.lastIndex = 0;
+    let rm;
+    while ((rm = OVL_P2T_FIGREF_RE.exec(searchText))) {
+        const nums = rm[1].match(/\d+/g) || [];
+        const nl = searchText.indexOf('\n', rm.index);
+        let lineEnd = nl === -1 ? text.length : nl + 1;
+        if (endDocIdx !== -1 && lineEnd > endDocIdx) lineEnd = endDocIdx; // 防御性兜底：绝不搬到 \end{document} 之后
+        nums.forEach(function (ns) {
+            const n = parseInt(ns, 10);
+            if (n >= 1 && n <= blocks.length && !(n in anchorForFig)) anchorForFig[n] = lineEnd;
+        });
+    }
+
+    const moves = [];
+    blocks.forEach(function (b) {
+        if (!(b.num in anchorForFig)) return; // 没找到引用：保留原位，不强搬
+        const insertAt = anchorForFig[b.num];
+        if (insertAt >= b.start && insertAt <= b.end) return; // 防御性：锚点已排除块内，理论上不会发生
+        moves.push({ start: b.start, end: b.end, insertAt: insertAt, text: b.text });
+    });
+    if (!moves.length) return text;
+
+    // 删除区间：图块本身 + 紧邻其后的所有换行（吞掉原位置留下的空行分隔符，不留双空行）。
+    // 插入：'\n' + 图块原文 + '\n\n'（跟目标句自成一行、图块前后各留一个空行分隔，符合既有
+    // "一句一行" + 浮动体独立成段的排版惯例）。
+    const cuts = moves.map(function (mv) {
+        let e = mv.end;
+        const blankRun = /^\n+/.exec(text.slice(e));
+        if (blankRun) e += blankRun[0].length;
+        return { start: mv.start, end: e };
+    });
+    const inserts = moves.map(function (mv) { return { at: mv.insertAt, text: '\n' + mv.text + '\n\n' }; });
+
+    const TYPE_ORDER = { insert: 0, cutEnd: 1, cutStart: 2 };
+    const events = [];
+    cuts.forEach(function (c) { events.push({ pos: c.start, type: 'cutStart' }); events.push({ pos: c.end, type: 'cutEnd' }); });
+    inserts.forEach(function (ins) { events.push({ pos: ins.at, type: 'insert', text: ins.text }); });
+    events.sort(function (a, b) { return (a.pos - b.pos) || (TYPE_ORDER[a.type] - TYPE_ORDER[b.type]); });
+
+    let out = '', cursor = 0, cutDepth = 0;
+    events.forEach(function (ev) {
+        if (ev.type === 'cutStart') {
+            if (cutDepth === 0) out += text.slice(cursor, ev.pos);
+            cutDepth++;
+            cursor = ev.pos;
+        } else if (ev.type === 'cutEnd') {
+            cutDepth = Math.max(0, cutDepth - 1);
+            if (cutDepth === 0) cursor = ev.pos;
+        } else { // insert
+            if (cutDepth === 0) { out += text.slice(cursor, ev.pos) + ev.text; cursor = ev.pos; }
+            else out += ev.text; // 防御性兜底：理论上插入点已排除在所有 cut 区间外，不会走到这里
+        }
+    });
+    out += text.slice(cursor);
+    return out;
+}
+
+// 非纯白像素的最小外接矩形（页面级 trim）——三级兜底的核心算法：位图提取/bbox 裁剪都救不了
+// 的图（典型：矢量绘制、模型没标 BBOX），最后退而求其次，把整页里"有墨迹的区域"框出来当图，
+// 好过原样塞一整页（往往连带一堆无关正文）。THRESH 定得宽松（<250 才算非背景），防止抗
+// 锯齿边缘/轻微扫描噪声被误判成"背景之外还有一点内容"从而把外接矩形撑到接近整页。
+async function ovlP2TComputeContentBBox(canvas) {
+    const w = canvas.width, h = canvas.height;
+    if (w < 1 || h < 1) return null;
+    const ctx = canvas.getContext('2d');
+    let data;
+    try { data = ctx.getImageData(0, 0, w, h).data; } catch (e) { return null; }
+    const THRESH = 250;
+    let minX = w, minY = h, maxX = -1, maxY = -1;
+    for (let y = 0; y < h; y++) {
+        const rowBase = y * w * 4;
+        for (let x = 0; x < w; x++) {
+            const i = rowBase + x * 4;
+            if (data[i] < THRESH || data[i + 1] < THRESH || data[i + 2] < THRESH) {
+                if (x < minX) minX = x;
+                if (x > maxX) maxX = x;
+                if (y < minY) minY = y;
+                if (y > maxY) maxY = y;
+            }
+        }
+    }
+    if (maxX < minX || maxY < minY) return null; // 全白：没有任何内容，三级也救不了
+    return { x0: minX / w, y0: minY / h, x1: (maxX + 1) / w, y1: (maxY + 1) / h };
+}
+
+// 三种最终文件名形态：assets/img/page-NN-img-K.png（一级，M2 位图）/
+// assets/img/page-NN-crop-K.png（二级，P86 §1 bbox 裁剪）/ assets/img/page-NN-fallback-K.png
+// （三级，本 Pass 新增）——都用同一套 "page-NN-<kind>-K.png" 命名规范，靠文件名本身就能倒推
+// 状态，不需要额外传状态穿过管线。assets/pages/page-NN.png（无后缀，整页截图原样引用）＝前
+// 两级都没接住，是三级兜底要处理的对象。
+const OVL_P2T_PAGE_TIERED_RE = /assets\/img\/page-(\d+)-(img|crop|fallback)-\d+\.png$/;
+const OVL_P2T_PAGE_PLAIN_RE = /assets\/pages\/page-(\d+)\.png$/;
+async function ovlP2TApplyFigurePageCropFallback(job, text) {
+    const blocks = ovlP2TEnumerateFigureBlocks(text);
+    const results = [];
+    if (!blocks.length) return { text: text, results: results };
+    let out = text, offsetShift = 0;
+    const perPageFallbackCounter = {}; // page -> 已经在这一页用过几次三级兜底（文件名去重用）
+    for (let i = 0; i < blocks.length; i++) {
+        const b = blocks[i];
+        const blockTextNow = out.slice(b.start + offsetShift, b.end + offsetShift);
+        const imgMatch = /\\includegraphics\[[^\]]*\]\{([^}]+)\}/.exec(blockTextNow);
+        const imgPath = imgMatch ? imgMatch[1] : null;
+        if (!imgPath) { results.push({ num: b.num, page: null, status: 'failed', reason: '未找到 \\includegraphics 引用' }); continue; }
+        const tiered = OVL_P2T_PAGE_TIERED_RE.exec(imgPath);
+        if (tiered) {
+            const kind = tiered[2];
+            const status = kind === 'img' ? 'bitmap' : (kind === 'crop' ? 'bbox-crop' : 'page-crop-fallback');
+            results.push({ num: b.num, page: parseInt(tiered[1], 10), status: status });
+            continue;
+        }
+        const plain = OVL_P2T_PAGE_PLAIN_RE.exec(imgPath);
+        if (!plain) {
+            // 既不是三级已知产物命名、也不是整页截图（比如手写了别的相对路径）——三级兜底管不到
+            // 这种场景，原样放过，不报失败（不是本机制职责范围内）。
+            results.push({ num: b.num, page: null, status: 'other' });
+            continue;
+        }
+        const pageNum = parseInt(plain[1], 10);
+        try {
+            const page = await job.doc.getPage(pageNum);
+            const rendered = await ovlP2TRenderPageToCanvas(page, OvlSettings.pdf2texMaxPx);
+            const bbox = await ovlP2TComputeContentBBox(rendered.canvas);
+            if (!bbox) {
+                rendered.canvas.width = 0; rendered.canvas.height = 0;
+                results.push({ num: b.num, page: pageNum, status: 'failed', reason: '页面渲染后未检测到任何非空白内容' });
+                continue;
+            }
+            const crop = ovlP2TCropCanvasRegion(rendered.canvas, bbox.x0, bbox.y0, bbox.x1, bbox.y1);
+            rendered.canvas.width = 0; rendered.canvas.height = 0;
+            const blob = await new Promise(function (r) { crop.toBlob(r, 'image/png'); });
+            crop.width = 0; crop.height = 0;
+            if (!blob) {
+                results.push({ num: b.num, page: pageNum, status: 'failed', reason: '裁剪画布编码失败' });
+                continue;
+            }
+            perPageFallbackCounter[pageNum] = (perPageFallbackCounter[pageNum] || 0) + 1;
+            const rel = 'assets/img/page-' + ovlP2TPad2(pageNum) + '-fallback-' + perPageFallbackCounter[pageNum] + '.png';
+            await ovlP2TWriteBinary(job.outRel + '/' + rel, new Uint8Array(await blob.arrayBuffer()));
+            const newBlockText = blockTextNow.split(imgPath).join(rel);
+            const curStart = b.start + offsetShift, curEnd = b.end + offsetShift;
+            out = out.slice(0, curStart) + newBlockText + out.slice(curEnd);
+            offsetShift += newBlockText.length - blockTextNow.length;
+            results.push({ num: b.num, page: pageNum, status: 'page-crop-fallback' });
+        } catch (e) {
+            results.push({ num: b.num, page: pageNum, status: 'failed', reason: '三级兜底裁剪出内部错误：' + (e && e.message ? e.message : String(e)) });
+        }
+    }
+    return { text: out, results: results };
+}
+
 function ovlP2TBuildReadme(job, mainTextForPreview) {
     const failedNums = job.pages.filter(function (p) { return p.state === 'failed'; }).map(function (p) { return p.num; });
     const suspectNums = job.pages.filter(function (p) { return p.state === 'suspect'; }).map(function (p) { return p.num; });
@@ -34364,6 +34617,17 @@ function ovlP2TBuildReadme(job, mainTextForPreview) {
     const cropNums = job.pages.filter(function (p) { return p.flags && p.flags.figureCropsMade; })
         .map(function (p) { return p.num + '（' + p.flags.figureCropsMade + ' 张）'; });
     md += '- 已从整页截图裁出的图片：' + (cropNums.length ? cropNums.join(', ') : '无') + '\n';
+    // v2 Pass P91 §4：图片提取三级兜底（位图提取→bbox 裁剪→逐图页面裁剪兜底）——最终结果
+    // 汇总，任何一张失败都必须明确列出来，绝不静默丢图。
+    const figExtract = job.figureExtraction || [];
+    if (figExtract.length) {
+        const figFallback = figExtract.filter(function (f) { return f.status === 'page-crop-fallback'; }).map(function (f) { return '图' + f.num; });
+        const figFailed = figExtract.filter(function (f) { return f.status === 'failed'; });
+        md += '- 图片提取三级兜底触发（一级位图/二级 bbox 都没接住，改用整页内容外接矩形裁剪）：' + (figFallback.length ? figFallback.join('、') : '无') + '\n';
+        if (figFailed.length) {
+            md += '- ⚠ 图片提取失败（三级都没救回来，需人工补图）：' + figFailed.map(function (f) { return '图' + f.num + '提取失败' + (f.reason ? '（' + f.reason + '）' : ''); }).join('；') + '\n';
+        }
+    }
     // v2 Pass P86 §2：参考文献流水线结果（job.refs 由 ovlP2TApplyReferencesPipeline 产出）。
     if (job.refs) {
         if (job.refs.mode === 'none') md += '- 参考文献：未检测到\n';
@@ -34649,7 +34913,20 @@ const OVL_P2T_VERIFY_SYSTEM_PROMPT = [
 // 从桥 /compile 响应里挑 error 级日志条目拼成给模型看的摘录；parsed 里没有 error 级条目
 // （比如 "Runaway argument" 这类不带 file:line 格式的致命错误）就退化到原始日志末尾若干
 // 字符兜底，永远不返回空字符串——模型没有日志可看等于瞎猜。
-function ovlP2TVerifyBuildErrorExcerpt(compileData) {
+// v2 Pass P91 §5：核验编译超时原来固定 120s（跟桥 server.js 的 COMPILE_TIMEOUT_MS 默认值
+// 一致），真实论文（bibtex + 多张图片，latexmk 要跑好几趟）常常被误杀——用户实测反馈 DeepLaDu
+// 核验就是这么超时的（P90 那次只把超时后的报错文案从乱码修成人话，没动这条 120s 硬限本身）。
+// 改成按页数伸缩：60s 基础 + 每页 20s，封顶 300s；job.total 拿不到就直接用封顶值兜底，不敢
+// 按小值算导致反而更容易误杀。
+const OVL_P2T_VERIFY_TIMEOUT_BASE_MS = 60000;
+const OVL_P2T_VERIFY_TIMEOUT_PER_PAGE_MS = 20000;
+const OVL_P2T_VERIFY_TIMEOUT_CAP_MS = 300000;
+function ovlP2TVerifyComputeTimeoutMs(job) {
+    const total = (job && typeof job.total === 'number' && job.total > 0) ? job.total : null;
+    if (total === null) return OVL_P2T_VERIFY_TIMEOUT_CAP_MS;
+    return Math.min(OVL_P2T_VERIFY_TIMEOUT_CAP_MS, OVL_P2T_VERIFY_TIMEOUT_BASE_MS + OVL_P2T_VERIFY_TIMEOUT_PER_PAGE_MS * total);
+}
+function ovlP2TVerifyBuildErrorExcerpt(compileData, configuredTimeoutMs) {
     const parsed = (compileData && Array.isArray(compileData.parsed)) ? compileData.parsed : [];
     const errors = parsed.filter(function (e) { return e.level === 'error'; }).slice(0, OVL_P2T_VERIFY_MAX_ERRORS_IN_EXCERPT);
     if (errors.length) {
@@ -34666,7 +34943,10 @@ function ovlP2TVerifyBuildErrorExcerpt(compileData) {
     // （那一行完全可能落在正文/字体切换记号中间）。
     if (compileData && compileData.timedOut) {
         const secs = (typeof compileData.durationMs === 'number') ? Math.round(compileData.durationMs / 1000) : null;
-        return '编译超时' + (secs != null ? '（运行 ' + secs + ' 秒后被强制终止）' : '（已被强制终止）')
+        // v2 Pass P91 §5：把本次核验实际用的超时上限也写进摘要——按页数伸缩后用户需要能在
+        // 报告里直接看到"这次到底给了多少秒"，不是仍然一律显示旧的固定 120s 印象。
+        const limitSecs = (typeof configuredTimeoutMs === 'number' && configuredTimeoutMs > 0) ? Math.round(configuredTimeoutMs / 1000) : null;
+        return '编译超时（' + (limitSecs != null ? limitSecs + '秒上限' : '已达上限') + (secs != null ? '，运行 ' + secs + ' 秒后被强制终止' : '') + '）'
             + '，不是语法错误，可能是本页内容导致排版异常缓慢或陷入死循环，无法定位具体出错行';
     }
     const log = (compileData && compileData.log) || '';
@@ -34788,14 +35068,18 @@ async function ovlP2TVerifyCallFixModel(errorExcerpt, pageSnippet, signal) {
 // 调桥 /compile 编译 job 的 main.tex——核验专用，独立于 ovlDoRecompile()（不动全局
 // OvlState.compiling/pdfSourceMode/lastCompile 等编辑器主状态，避免跟用户当时正在看的
 // 编译/PDF 面板互相打架）。永不 throw，网络失败也收敛成 {ok:false, pdfExists:false, error}。
-async function ovlP2TVerifyCompile(job) {
+// timeoutMs（v2 Pass P91 §5 新增，可选）：不传时桥用自己的默认值（COMPILE_TIMEOUT_MS，
+// 120s，其它调用方零回归）；ovlP2TRunVerify 按页数算出的伸缩超时通过这里传给桥。
+async function ovlP2TVerifyCompile(job, timeoutMs) {
     try {
+        const bodyObj = {
+            projectDir: job.projectDir, mainFile: job.outRel + '/main.tex',
+            engine: OvlCompileSettings.engine, mode: OvlCompileSettings.mode, haltOnError: OvlCompileSettings.haltOnError
+        };
+        if (typeof timeoutMs === 'number' && timeoutMs > 0) bodyObj.timeoutMs = timeoutMs;
         const resp = await ovlBridgeFetch(ovlBridgeUrl('/compile'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                projectDir: job.projectDir, mainFile: job.outRel + '/main.tex',
-                engine: OvlCompileSettings.engine, mode: OvlCompileSettings.mode, haltOnError: OvlCompileSettings.haltOnError
-            })
+            body: JSON.stringify(bodyObj)
         });
         const data = await resp.json();
         return data || { ok: false, pdfExists: false, error: '桥返回了空响应' };
@@ -34962,7 +35246,13 @@ function ovlP2TInsertStructTodoText(mainText) {
 // （fixBudgetUsed）：一次核验里，编译修复 + 结构修复合计只让修复模型工作一轮，不是各自一轮。
 // 结构问题不会让一次编译成功的转换被标记成失败（finalOk 只看编译）。----
 async function ovlP2TRunVerify(job) {
-    job.verify = { state: 'compiling', errorsExcerpt: '', fixSummary: '', fixApplied: false, finalOk: false, compileSecs: null, lowConfidencePages: [], structuralIssues: [] };
+    // v2 Pass P91 §5：按页数算一次伸缩超时（60s + 每页 20s，封顶 300s），本次核验全程复用
+    // 同一个值——不按"每次重编译各自重算"，页数在同一个 job 里不会变，没必要重算。
+    const verifyTimeoutMs = ovlP2TVerifyComputeTimeoutMs(job);
+    job.verify = {
+        state: 'compiling', errorsExcerpt: '', fixSummary: '', fixApplied: false, finalOk: false, compileSecs: null,
+        lowConfidencePages: [], structuralIssues: [], figureExtraction: (job.figureExtraction || []), timeoutMs: verifyTimeoutMs
+    };
     ovlP2TPanelRender();
 
     async function readMainText() {
@@ -34979,12 +35269,12 @@ async function ovlP2TRunVerify(job) {
     let compileSecs = null;
 
     // ---- 阶段一：首次编译 ----
-    const firstCompile = await ovlP2TVerifyCompile(job);
+    const firstCompile = await ovlP2TVerifyCompile(job, verifyTimeoutMs);
     compileOk = !!(firstCompile && firstCompile.ok && firstCompile.pdfExists);
     if (compileOk) {
         compileSecs = (typeof firstCompile.durationMs === 'number') ? (firstCompile.durationMs / 1000).toFixed(1) : null;
     } else {
-        const excerpt = ovlP2TVerifyBuildErrorExcerpt(firstCompile);
+        const excerpt = ovlP2TVerifyBuildErrorExcerpt(firstCompile, verifyTimeoutMs);
         const errorLine = ovlP2TVerifyFirstErrorLine(firstCompile);
         const mainText0 = await readMainText();
         const loc = (mainText0 != null) ? ovlP2TVerifyLocatePageFragment(mainText0, errorLine) : null;
@@ -35017,7 +35307,7 @@ async function ovlP2TRunVerify(job) {
         job.verify.fixApplied = true;
         job.verify.state = 'recompiling';
         ovlP2TPanelRender();
-        const secondCompile = await ovlP2TVerifyCompile(job);
+        const secondCompile = await ovlP2TVerifyCompile(job, verifyTimeoutMs);
         compileOk = !!(secondCompile && secondCompile.ok && secondCompile.pdfExists);
         if (compileOk) {
             compileSecs = (typeof secondCompile.durationMs === 'number') ? (secondCompile.durationMs / 1000).toFixed(1) : null;
@@ -35025,7 +35315,7 @@ async function ovlP2TRunVerify(job) {
         } else {
             job.verify.state = 'failed';
             job.verify.finalOk = false;
-            job.verify.errorsExcerpt = ovlP2TVerifyBuildErrorExcerpt(secondCompile);
+            job.verify.errorsExcerpt = ovlP2TVerifyBuildErrorExcerpt(secondCompile, verifyTimeoutMs);
             job.verify.fixSummary = '已尝试自动修复第 ' + loc.pageNum + ' 页片段一次（一轮上限），重新编译仍失败。';
             job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
             // 编译最终仍失败，但仍然如实上报结构检查（不再自动修，预算已耗尽或跟编译问题无关）。
@@ -35062,7 +35352,7 @@ async function ovlP2TRunVerify(job) {
                 job.verify.fixApplied = true;
                 job.verify.state = 'recompiling';
                 ovlP2TPanelRender();
-                const thirdCompile = await ovlP2TVerifyCompile(job);
+                const thirdCompile = await ovlP2TVerifyCompile(job, verifyTimeoutMs);
                 const thirdOk = !!(thirdCompile && thirdCompile.ok && thirdCompile.pdfExists);
                 if (thirdOk) {
                     compileOk = true;
@@ -35075,7 +35365,7 @@ async function ovlP2TRunVerify(job) {
                 } else {
                     job.verify.state = 'failed';
                     job.verify.finalOk = false;
-                    job.verify.errorsExcerpt = ovlP2TVerifyBuildErrorExcerpt(thirdCompile);
+                    job.verify.errorsExcerpt = ovlP2TVerifyBuildErrorExcerpt(thirdCompile, verifyTimeoutMs);
                     job.verify.fixSummary = (fixSummaryParts.length ? fixSummaryParts.join('；') + '；' : '') + '结构修复后重新编译失败，建议人工处理。';
                     job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
                     job.verify.structuralIssues = [Object.assign({}, issue, { autoFixed: false })];
@@ -35156,9 +35446,26 @@ async function ovlP2TRunPipeline(job) {
         // 继续同步产出含 % OVL-REFS-BEGIN/END 原始标记的 body）。
         const refsOutcome = await ovlP2TApplyReferencesPipeline(job, rawMainText);
         job.refs = refsOutcome;
-        await ovlP2TWriteText(job.outRel + '/main.tex', refsOutcome.text);
+        let assembledText = refsOutcome.text;
+        // v2 Pass P91 §4：图片提取三级兜底——main.tex 拼装 + 引用处理完之后，对每张 figure
+        // 逐个核实最终提取到没有，位图/bbox 两级都没接住的再兜一次页面裁剪；结果记进
+        // job.figureExtraction 供核验报告渲染"图片清单"（任何一张最终仍失败都要出现在里面，
+        // 不静默丢图）。
+        try {
+            const fallbackOutcome = await ovlP2TApplyFigurePageCropFallback(job, assembledText);
+            assembledText = fallbackOutcome.text;
+            job.figureExtraction = fallbackOutcome.results;
+        } catch (e) {
+            console.error('[ovl] p2t figure page-crop fallback failed', e);
+            job.figureExtraction = [];
+        }
+        // v2 Pass P91 §2：figure 环境搬到正文第一次提到 "Fig. X" 的那句话之后，方便对照阅读；
+        // 找不到引用的图保留原位，不强搬。
+        try { assembledText = ovlP2TPlaceFiguresAtFirstMention(assembledText); }
+        catch (e) { console.error('[ovl] p2t place figures at first mention failed', e); }
+        await ovlP2TWriteText(job.outRel + '/main.tex', assembledText);
         if (refsOutcome.bibText) await ovlP2TWriteText(job.outRel + '/refs.bib', refsOutcome.bibText);
-        await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job, refsOutcome.text));
+        await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job, assembledText));
 
         // v2 Pass P85：转换后整体核验（默认开，设置项关闭则整段跳过——job.verify 不存在，
         // 面板/后续逻辑等同于 P85 之前）。异常兜底成明确的 failed 状态，绝不让核验本身的
@@ -35533,6 +35840,19 @@ function ovlP2TPanelRender() {
                 html += '<div class="ovl-p2t-meta">结构检查：' + structIssues.map(function (si) {
                     return escapeHtml(si.detail || si.type) + (si.autoFixed ? '（已自动修复）' : '（需要人工核对）');
                 }).join('；') + '</div>';
+            }
+            // v2 Pass P91 §4：图片清单——三级兜底（位图提取→bbox 裁剪→逐图页面裁剪）最终仍
+            // 失败的图，必须在这里明确列出来，绝不静默丢图；三级兜底本身命中了也顺手报一下。
+            const figExtract = job.verify.figureExtraction || [];
+            const figFailed = figExtract.filter(function (f) { return f.status === 'failed'; });
+            if (figFailed.length) {
+                html += '<div class="ovl-p2t-meta" data-figextract="fail">图片清单：' + figFailed.map(function (f) {
+                    return '图' + f.num + '提取失败' + (f.reason ? '（' + escapeHtml(f.reason) + '）' : '');
+                }).join('；') + '</div>';
+            }
+            const figFallback = figExtract.filter(function (f) { return f.status === 'page-crop-fallback'; });
+            if (figFallback.length) {
+                html += '<div class="ovl-p2t-meta" data-figextract="fallback">图片三级兜底裁剪：' + figFallback.map(function (f) { return '图' + f.num; }).join('、') + '</div>';
             }
             html += '</div>';
         } else if (verifyingLabel) {

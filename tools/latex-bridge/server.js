@@ -105,6 +105,13 @@ const WORK_ROOT = path.join(os.tmpdir(), 'ai-translator-latex-bridge');
 try { fs.mkdirSync(WORK_ROOT, { recursive: true }); } catch (e) {}
 
 const COMPILE_TIMEOUT_MS = 120000;
+// v2 Pass P91 §5：核验编译原来固定复用这个 120s 默认值，真实论文（bibtex + 多图，latexmk
+// 要跑好几趟）常被误杀。前端 ovlP2TVerifyCompile 现在按页数算一个伸缩超时，通过请求体
+// timeoutMs 字段传进来（doCompile opts.timeoutMs）；这里只做服务端侧的合理性夹逼，防止
+// 任何调用方（不管前端算错还是外部直接调 /compile）传入荒谬的值把编译进程卡死或秒杀。
+// 不传时保持原来的 COMPILE_TIMEOUT_MS 行为，其它调用方（ovlDoRecompile 等）零回归。
+const COMPILE_TIMEOUT_MIN_MS = 10000;
+const COMPILE_TIMEOUT_MAX_MS = 600000;
 
 // ---------------------------------------------------------------------------
 // v2 Pass P49：远程访问令牌。
@@ -246,10 +253,26 @@ function readBody(req) {
     });
 }
 
-function killTree(pid) {
+// v2 Pass P91 §5 实测发现的真缺陷（不在原定四项范围内，顺手修）：latexmk.exe 在这台机器上
+// 派生 pdflatex.exe 时，实测经过了一层 Git Bash 的 sh.exe（`sh.exe -c "pdflatex ..."`，命令行
+// 里 -output-directory 用的还是正斜杠 /tmp/... 路径，跟 Node 这边 path.join 拼出来的反斜杠
+// 路径字符串对不上）——taskkill /pid <latexmk 的 pid> /T /F 连 latexmk 直接派生的 sh.exe 都
+// 没带走（P91 组 E 用死循环 LaTeX 源测编译超时按页数伸缩时实测复现：两次超时杀掉后各留下一个
+// sh.exe + 一个 pdflatex.exe，都在吃 CPU 空转）。核验超时改按页数伸缩（更短、更常触发）之后
+// 这条隐患会被放大，顺手补上二次扫荡：jobIdHint 传了就按"命令行包含这个编译任务专属的随机
+// job id"精确匹配再杀一遍——job id 是 crypto.randomBytes 生成的唯一字符串，不含路径分隔符，
+// 天然不受正斜杠/反斜杠差异影响，也不会误杀别的编译任务或用户自己手跑的 TeX 进程。
+function killTree(pid, jobIdHint) {
     if (!pid) return;
     if (process.platform === 'win32') {
         try { execSync('taskkill /pid ' + pid + ' /T /F', { stdio: 'ignore' }); } catch (e) {}
+        if (jobIdHint) {
+            try {
+                const escaped = String(jobIdHint).replace(/'/g, "''");
+                const psCmd = "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -like '*" + escaped + "*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+                execSync('powershell -NoProfile -NonInteractive -Command "' + psCmd.replace(/"/g, '\\"') + '"', { stdio: 'ignore', timeout: 8000, windowsHide: true });
+            } catch (e) {}
+        }
     } else {
         try { process.kill(-pid, 'SIGKILL'); } catch (e) { try { process.kill(pid, 'SIGKILL'); } catch (e2) {} }
     }
@@ -447,6 +470,12 @@ function doCompile(projectDir, mainFile, opts) {
     const mode = opts.mode === 'draft' ? 'draft' : 'normal';
     // haltOnError: M4 "Compile error handling" / M7 "Stop on first error"，两处共用同一个桥参数。
     const haltOnError = !!opts.haltOnError;
+    // v2 Pass P91 §5：可选的每次编译超时覆盖值（毫秒），不传或不是正数就落回默认
+    // COMPILE_TIMEOUT_MS；传了就夹逼到 [COMPILE_TIMEOUT_MIN_MS, COMPILE_TIMEOUT_MAX_MS] 之间。
+    let compileTimeoutMs = COMPILE_TIMEOUT_MS;
+    if (typeof opts.timeoutMs === 'number' && isFinite(opts.timeoutMs) && opts.timeoutMs > 0) {
+        compileTimeoutMs = Math.max(COMPILE_TIMEOUT_MIN_MS, Math.min(COMPILE_TIMEOUT_MAX_MS, opts.timeoutMs));
+    }
     return new Promise((resolve) => {
         const id = Date.now().toString(36) + '-' + crypto.randomBytes(4).toString('hex');
         const outdir = path.join(WORK_ROOT, id);
@@ -531,7 +560,7 @@ function doCompile(projectDir, mainFile, opts) {
         const timer = setTimeout(() => {
             if (resolved) return;
             finish(null, true);
-        }, COMPILE_TIMEOUT_MS);
+        }, compileTimeoutMs);
 
         child.stdout.on('data', (c) => stdoutBuf.push(c));
         child.stderr.on('data', (c) => stderrBuf.push(c));
@@ -551,7 +580,7 @@ function doCompile(projectDir, mainFile, opts) {
             clearTimeout(timer);
             if (currentChild === child) { currentChild = null; currentChildId = null; }
             if (timedOut) {
-                try { killTree(child.pid); } catch (e) {}
+                try { killTree(child.pid, id); } catch (e) {}
             }
 
             const durationMs = Date.now() - startedAt;
@@ -2452,7 +2481,8 @@ const server = http.createServer(async (req, res) => {
                 engine: body.engine,
                 mode: body.mode,
                 haltOnError: body.haltOnError,
-                forceClean: body.forceClean
+                forceClean: body.forceClean,
+                timeoutMs: body.timeoutMs // v2 Pass P91 §5：可选，见 doCompile 内部夹逼逻辑
             });
             sendJson(res, 200, result);
             return;
