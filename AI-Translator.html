@@ -4059,7 +4059,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
 const APP_VERSION = '02.02.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-08-30';   // APP_BUILD_DATE_STAMP
+const APP_BUILD_DATE = '2026-08-31';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -34657,8 +34657,27 @@ function ovlP2TVerifyBuildErrorExcerpt(compileData) {
             return (e.file ? e.file + ':' : '') + (e.line != null ? e.line + ': ' : '') + e.message;
         }).join('\n');
     }
+    // v2 Pass P90：走到这里说明 parseLog 没找到任何 "file:line:" 格式的致命错误，不是普通
+    // TeX 语法错误。最常见两种：①编译真超时被桥强制杀掉（timedOut===true，日志停在被杀那一
+    // 瞬间，可能正巧停在正文/公式字体切换标记 OML/... 中间，直接展示是读不通的乱码片段——
+    // 用户实测报过"nite, the con-ver-gence of the p-series,$[][] \OML/lmm/m/it/10.95 []$"这类
+    // 半截乱码）；②TeX 打印了不带 file:line 前缀的致命错误（如 "! Emergency stop."），只在
+    // 日志里以独立一行 "!" 开头出现。两种都不该再退化成"日志最后 2000 字符裸切再取第一行"
+    // （那一行完全可能落在正文/字体切换记号中间）。
+    if (compileData && compileData.timedOut) {
+        const secs = (typeof compileData.durationMs === 'number') ? Math.round(compileData.durationMs / 1000) : null;
+        return '编译超时' + (secs != null ? '（运行 ' + secs + ' 秒后被强制终止）' : '（已被强制终止）')
+            + '，不是语法错误，可能是本页内容导致排版异常缓慢或陷入死循环，无法定位具体出错行';
+    }
     const log = (compileData && compileData.log) || '';
-    return log ? log.slice(-2000) : '（编译未返回任何日志，可能是桥本身不可达或超时）';
+    if (log) {
+        // 优先找日志里最后一条以 "!" 开头的经典 TeX 致命错误标记行（不依赖 file:line 格式），
+        // 比"盲切最后 2000 字符再取第一行"更可能是真正有信息量的那一行。
+        const bangLines = log.split(String.fromCharCode(10)).map(function (l) { return l.trim(); }).filter(function (l) { return l.charAt(0) === '!'; });
+        if (bangLines.length) return bangLines[bangLines.length - 1];
+        return log.slice(-2000);
+    }
+    return '（编译未返回任何日志，可能是桥本身不可达或超时）';
 }
 
 // 挑第一条带具体行号的 error 条目，作为定位"哪一页片段"的锚点；没有就返回 null——上层据此
