@@ -968,6 +968,13 @@ body.is-resizing-settings-modal * {
 #aiChatRoot .aichat-card-confirm-msg { font-size: 11.5px; line-height: 1.6; white-space: pre-line; color: #334155; }
 #aiChatRoot .aichat-btn-danger { background: #dc2626; border-color: #dc2626; color: #ffffff; }
 #aiChatRoot .aichat-btn-danger:hover { background: #b91c1c; color: #ffffff; }
+/* v2 Pass P92：AI 聊天"定位并高亮+上下跳转"卡片——跟上面写工具确认卡同款 .aichat-card 外壳，
+   只加当前处强调色 + 旧卡被新一轮取代后的"已归档"灰化两条修饰，不新起一套卡片骨架。 */
+#aiChatRoot .aichat-card-hl-current { font-size: 11.5px; line-height: 1.6; font-weight: 700; color: #4338ca; }
+#aiChatRoot .aichat-card.aichat-card-hl-active { border-color: #a5b4fc; }
+#aiChatRoot .aichat-card.aichat-card-hl-stale { opacity: 0.5; }
+#aiChatRoot .aichat-card-hl-note { font-size: 10px; color: #94a3b8; }
+#aiChatRoot .aichat-card-hl-note:empty { display: none; }
 /* 挂起确认期间输入框上方的一条细提示——不阻塞输入，只是让用户知道还有事没了结。 */
 #aiChatRoot .aichat-pendinghint {
     font-size: 10.5px;
@@ -18695,7 +18702,12 @@ const CHAT_AGENT_WRITE_TOOLS = ['write_file', 'mkdir', 'move', 'copy', 'delete']
 // 两条独立能力线（不经过桥的 /fs/*，直接读写页面自己的 OvlVisualLangState / ovlVisualTransCache*），
 // read_block_translation 只读、retranslate_block 会改翻译缓存（需要确认，见 chatAgentExecRetranslateBlock）。
 const CHAT_AGENT_ZH_TOOLS = ['read_block_translation', 'retranslate_block'];
-const CHAT_AGENT_TOOLS = ['list_dir', 'read_file'].concat(CHAT_AGENT_WRITE_TOOLS).concat(CHAT_AGENT_ZH_TOOLS);
+// v2 Pass P92：AI 聊天"定位并高亮+上下跳转"——第三条独立能力线，跟上面 fs 工具/zh 诊断工具
+// 平级：不依赖编译桥、不依赖 Visual+中文这个特定前提，只依赖"当前编辑器里已经打开了一份
+// 文档（Code 或 Visual，任意语言）"（见 chatAgentDocHighlightReadiness()）。doc_highlight 只读
+// 定位（不改任何文件/翻译缓存，不需要 chatAgentConfirm 逐次确认），doc_highlight_clear 同档。
+const CHAT_AGENT_HIGHLIGHT_TOOLS = ['doc_highlight', 'doc_highlight_clear'];
+const CHAT_AGENT_TOOLS = ['list_dir', 'read_file'].concat(CHAT_AGENT_WRITE_TOOLS).concat(CHAT_AGENT_ZH_TOOLS).concat(CHAT_AGENT_HIGHLIGHT_TOOLS);
 
 // 项目绝对路径：跟 Overleaf 面板"项目绝对路径"输入框共用同一个 DOM 元素（ovlDoRecompile 等
 // 处已有的取法），不新起第二套配置。
@@ -18745,7 +18757,7 @@ function chatAgentToolsSystemBlock() {
         else if (readiness.reason === 'stale-bridge') why = '连着的桥接服务版本过旧（不支持文件操作接口），需要用户重启本地桥接服务';
         return '\n【文件读取工具】这一轮不可用（' + why + '）。'
             + '不要输出 ==TOOL== 块，只能根据上面已经给到你的内容回答，也不要假装自己读过或改过任何'
-            + '没有出现在这段对话里的文件。\n' + chatAgentZhToolsSystemBlock();
+            + '没有出现在这段对话里的文件。\n' + chatAgentZhToolsSystemBlock() + chatAgentHighlightToolsSystemBlock();
     }
     return '\n【文件读取工具】用户关注的那句话（如果有的话）只是一个起点——需要的话，你可以主动'
         + '读取甚至修改用户项目文件夹里的文件：它的上下文、它 \\ref/\\cite 指向的定义、supp.tex 等'
@@ -18777,7 +18789,8 @@ function chatAgentToolsSystemBlock() {
         + '5. 不需要工具的时候，正常按 ==CHAT== 格式回答，不要输出空的或试探性的工具块。\n'
         + '6. 写工具执行前用户会看到一个确认弹窗（列出确切路径、受影响的文件清单），你不需要、也没有'
         + '办法替用户点这个确认——每次调用写工具都会真的弹一次，不存在"用户已经同意过了所以这次不用问"。\n'
-        + chatAgentZhToolsSystemBlock();
+        + chatAgentZhToolsSystemBlock()
+        + chatAgentHighlightToolsSystemBlock();
 }
 
 // v2 Pass P78（H4）：AI 聊天代理诊断/修 Visual 中文预览模式渲染错误的两个工具——跟上面的文件
@@ -18861,6 +18874,12 @@ function chatAgentParseToolCall(raw) {
     if ((name === 'read_block_translation' || name === 'retranslate_block')
         && !(Number.isInteger(args.blockIndex) && args.blockIndex >= 0)) {
         out.malformed = true; out.reason = name + ' 缺少必填的 blockIndex 参数（必须是 ≥0 的整数）'; return out;
+    }
+    // v2 Pass P92：doc_highlight 的必填参数——snippets 必须是数组，且至少含一个非空字符串
+    // （全是空字符串/纯空白等价于没给）。doc_highlight_clear 不需要任何参数，{} 就够。
+    if (name === 'doc_highlight'
+        && !(Array.isArray(args.snippets) && args.snippets.some(function (s) { return typeof s === 'string' && s.trim(); }))) {
+        out.malformed = true; out.reason = 'doc_highlight 缺少必填的 snippets 参数（必须是至少含一个非空字符串的数组）'; return out;
     }
     out.tool = name;
     out.args = args;
@@ -19713,6 +19732,360 @@ async function chatAgentExecRetranslateBlock(args, signal, pending) {
     return { ok: true, uiSummary: label + ' 完成', uiDetail: text, textForModel: text, bytes: newRendered.length };
 }
 
+// ============================================================================
+// v2 Pass P92：AI 聊天窗"定位并高亮 + 上下跳转"——doc_highlight / doc_highlight_clear
+// ============================================================================
+// 用户原话三个例句：①"你能将 xxx 这篇论文的有关 xxx 的重点内容高亮么？最好 ai 能直接高亮
+// 转换好的 latex 内容对应位置；假如还没进行 pdf 转换 latex，则提示请先进行 latex 转换"
+// ②"高亮多个地方时，希望有上下箭头设计，操控可跳转上一处/下一处"③"这个功能也要在正常的
+// 左侧 latex 右侧 pdf 模式实现，比如：帮我定位 xxx 公式，或所有描述 xxx 的地方"。
+//
+// 设计取舍（拿不准时的决定，写在这里，别指望调用方去猜）：
+//   · 读文档不新造工具——AI 自己已经能看到 ==DOC== 里的原文，或者用既有的 list_dir/read_file
+//     读项目文件，看完后自己判断要高亮哪几处原文片段，再一次性把这些片段交给 doc_highlight。
+//     doc_highlight 本身只管"定位 + 画高亮 + 建导航"，不做任何"理解文档"的工作。
+//   · "多个地方"怎么同时呈现：没有另起一套"多框同时常亮"的重叠层——那需要给
+//     ovlPaintCodeMarkRangeOverlay/ovlPaintMarkOverlayForVisualRange 两条画法各接一份多矩形
+//     输入，并且要在滚动/切模式/重排时各自独立重画，跟现有 OvlMarkState 单槽位设计（同一时刻
+//     只服务一个 [lineFrom,lineTo]/rangeChars/zhVisualRec）正面冲突，返工面太大。改成完全
+//     复用现成的单槽位 ovlMarkRange()/ovlMarkRangeZhVisual()——建一个"命中集合"
+//     （ChatHighlightState.hits），▲/▼ 只是在集合里挪 idx、每次都调用同一个既验证过的单槽位
+//     画法重新画一次、重新居中一次。用户已经在用 Ctrl+F 查找导航习惯了这个"每次跳一处，
+//     跳到哪高亮到哪"的交互（本文件 OvlFindState 那一套），这里是同一套体验搬到 AI 触发的
+//     多片段场景，不是缩水。
+//   · 定位算法两条腿：Code 模式 / Visual 非中文模式下，AI 引用的片段就是源码本身（Visual
+//     非中文时渲染文字跟源码逐词对应，ovlMarkRange 内部本来就会按 OvlState.editorMode 自动
+//     换算到 Visual 坐标——两个场景因此共用同一次"在 ta.value 里定位字符区间"）；Visual 中文
+//     模式下译文是模型生成的，源码里根本没有对应字节，必须复用 P68 已经踩过坑的
+//     ovlFindCollectZhMatches（按渲染出的可见文字、跳过 katex-mathml 隐藏副本逐块扫描）。
+//   · 模糊定位：AI 摘录的原文片段常常跟源码没法逐字节对上（源码里的软换行、多余空格，
+//     AI 复述时会自然地拉直/规整）。两级顺序尝试：①原样大小写不敏感子串 ②把片段按空白切
+//     成词、每个词转义后用 \s+ 拼回去的正则（词内容不变，词间空白量放宽），命中一个算一个，
+//     不整篇跑最长公共子串之类的重量级算法。
+//   · 不需要 chatAgentConfirm 逐次确认——doc_highlight 只读文档 + 只画纯前端高亮覆盖层，
+//     不写任何文件、不改动翻译缓存、Esc/新一轮/点"清除"随时能撤销，跟 list_dir/
+//     read_block_translation 同一档"只读不用确认"，不是漏掉了确认这一步。
+
+// direct 模式（OvlState.pdfSourceMode==='direct'）= 用户在文件树里直接点开了一份原始 PDF，
+// 右侧此刻显示的是这份 PDF 的原始字节，压根没有背后的转换/编译 tex 可高亮——这正是用户例句①
+// 里"假如还没进行 pdf 转换 latex"的那个状态。'compiled'（真实项目编译 / PDF→LaTeX 转换完成
+// 后打开产物）才有 #ovlCodeArea/#ovlVisualPane 可定位，例句③"正常的左侧 latex 右侧 pdf 模式"
+// 本来就是 'compiled'，不会被这条拦。
+function chatAgentDocHighlightReadiness() {
+    try {
+        if (typeof OvlState === 'undefined') return { ready: false, reason: 'no-doc' };
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || !OvlState.currentFile) return { ready: false, reason: 'no-doc' };
+        if (OvlState.pdfSourceMode === 'direct') return { ready: false, reason: 'not-converted' };
+        return { ready: true, reason: '' };
+    } catch (e) { return { ready: false, reason: 'no-doc' }; }
+}
+
+// 跟 OvlFindState（用户手敲查找栏）平行独立的另一套集合——AI 高亮和用户手动查找是两条互不
+// 干扰的交互，不共享 idx/matches，谁清谁的、谁跳谁的。hits 里每一项要么
+// { kind:'range', start, end, label }（Code/Visual 非中文，源码字符区间，交给既有的
+// ovlMarkRange 画）要么 { kind:'zhVisual', rec:{line,lineEnd,text,occurrenceIndex}, label }
+// （Visual 中文，交给既有的 ovlMarkRangeZhVisual 画）。
+const ChatHighlightState = { hits: [], misses: [], idx: -1, cardEl: null };
+const CHAT_HIGHLIGHT_MAX_SNIPPETS = 30;      // 一次 doc_highlight 调用最多接受这么多片段——防止
+                                              // 模型把整篇文档逐句拆开当"片段"灌进来。
+const CHAT_HIGHLIGHT_SNIPPET_MAX_CHARS = 400; // 单个片段过长时截断——定位算法按整段片段找子串，
+                                              // 片段越长越容易因为一处措辞不同就整体失配，
+                                              // 系统提示里也明确要求"摘短片段"，这里是硬上限兜底。
+
+// 把片段按空白切词、每词转义后用 \s+ 拼回去——词内容不变，词间空白量放宽，容忍源码软换行/
+// 多余空格跟 AI 复述时的规整。跟 ovlFindBuildRegex 的转义表同一份字符集，不重新发明。
+function chatHighlightBuildFuzzyRegex(snippet, flags) {
+    const trimmed = String(snippet == null ? '' : snippet).trim();
+    if (!trimmed) return null;
+    const parts = trimmed.split(/\s+/).filter(Boolean).map(function (p) {
+        return p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    });
+    if (!parts.length) return null;
+    try { return new RegExp(parts.join('\\s+'), flags || 'gi'); } catch (e) { return null; }
+}
+
+// Code 模式 / Visual 非中文模式：在源码（#ovlCodeArea 的 ta.value）里定位片段的字符区间。
+// 两级尝试：①大小写不敏感的原样子串（最常见——片段就是源码里一段连续文字）②空白容忍的
+// 模糊正则（源码软换行/多余空格）。都找不到就是真的没命中，不第三次凭空猜测。
+function chatHighlightLocateInSource(text, snippet) {
+    const trimmed = String(snippet == null ? '' : snippet).trim();
+    if (!text || !trimmed) return null;
+    const idx = text.toLowerCase().indexOf(trimmed.toLowerCase());
+    if (idx !== -1) return { start: idx, end: idx + trimmed.length };
+    const re = chatHighlightBuildFuzzyRegex(trimmed, 'i');
+    if (!re) return null;
+    const m = re.exec(text);
+    if (!m) return null;
+    return { start: m.index, end: m.index + m[0].length };
+}
+
+// Visual 中文模式：复用 P68 的 ovlFindCollectZhMatches（按渲染出的可见文字逐块扫描，已经
+// 踩过 katex-mathml 隐藏副本那个坑，不重新写一遍）。同样两级：①转义后的字面量正则
+// ②空白容忍的模糊正则。只取第一处命中——doc_highlight 的语义是"每个片段对应一处"，不是
+// "把这个片段在全文出现的所有地方都找出来"（那样会让"高亮几处"这个数字变得不可预期）。
+function chatHighlightLocateInZhVisual(snippet) {
+    const trimmed = String(snippet == null ? '' : snippet).trim();
+    if (!trimmed) return null;
+    let matches = [];
+    try {
+        const escLit = trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        matches = ovlFindCollectZhMatches(new RegExp(escLit, 'gi'));
+    } catch (e) { matches = []; }
+    if (!matches.length) {
+        const re = chatHighlightBuildFuzzyRegex(trimmed, 'gi');
+        matches = re ? ovlFindCollectZhMatches(re) : [];
+    }
+    return matches.length ? matches[0] : null;
+}
+
+// 对外唯一入口：自动判断当前是 Code / Visual 原文 / Visual 中文，调对应的定位实现。
+// 返回 null=没找到（调用方把这个片段计入 misses，不是报错中断整批）。
+function chatHighlightLocateSnippet(snippetRaw) {
+    const snippet = String(snippetRaw == null ? '' : snippetRaw).trim().slice(0, CHAT_HIGHLIGHT_SNIPPET_MAX_CHARS);
+    if (!snippet) return null;
+    const zhActive = (typeof OvlState !== 'undefined' && OvlState.editorMode === 'visual'
+        && typeof OvlVisualLangState !== 'undefined' && OvlVisualLangState.lang === 'zh');
+    if (zhActive) {
+        const rec = chatHighlightLocateInZhVisual(snippet);
+        return rec ? { kind: 'zhVisual', rec: rec, label: snippet } : null;
+    }
+    const ta = document.getElementById('ovlCodeArea');
+    const found = chatHighlightLocateInSource(ta ? ta.value : '', snippet);
+    return found ? { kind: 'range', start: found.start, end: found.end, label: snippet } : null;
+}
+
+function chatHighlightSnippetPreview(label) {
+    const s = String(label == null ? '' : label).replace(/\s+/g, ' ').trim();
+    return s.length > 60 ? s.slice(0, 60) + '…' : s;
+}
+
+// 跳到集合里第 i 处（自动按长度取模、支持负数循环）：调既有的单槽位画法重画+居中，
+// 再同步一下卡片上"当前第 X/N 处"那行文字。
+function chatHighlightJumpTo(i) {
+    const hits = ChatHighlightState.hits;
+    if (!hits.length) return;
+    const n = hits.length;
+    const idx = ((i % n) + n) % n;
+    ChatHighlightState.idx = idx;
+    const hit = hits[idx];
+    try {
+        if (hit.kind === 'zhVisual') ovlMarkRangeZhVisual(hit.rec);
+        else ovlMarkRange(hit.start, hit.end);
+    } catch (e) { console.error('[chat] highlightJumpTo failed', e); }
+    chatHighlightUpdateCardUI();
+}
+function chatHighlightNext() { chatHighlightJumpTo(ChatHighlightState.idx + 1); }
+function chatHighlightPrev() { chatHighlightJumpTo(ChatHighlightState.idx - 1); }
+
+// 把一张卡片（不管是不是当前挂着的那张）标成"已失效"——按钮全部禁用，补一行说明，但**不从
+// 聊天记录里删掉它**：那是这一轮之前真实发生过的一步，删掉等于篡改历史（跟 P69 结算挂起
+// 确认卡同一条纪律：原地标注，不静默消失）。
+function chatHighlightArchiveCard(cardEl, note) {
+    try {
+        if (!cardEl) return;
+        cardEl.classList.remove('aichat-card-hl-active');
+        cardEl.classList.add('aichat-card-hl-stale');
+        const actions = cardEl.querySelectorAll('.aichat-card-actions button');
+        for (let i = 0; i < actions.length; i++) actions[i].disabled = true;
+        const noteEl = cardEl.querySelector('.aichat-card-hl-note');
+        if (noteEl) noteEl.textContent = note || '';
+    } catch (e) {}
+}
+
+function chatHighlightUpdateCardUI() {
+    try {
+        const card = ChatHighlightState.cardEl;
+        if (!card) return;
+        const cur = card.querySelector('.aichat-card-hl-current');
+        const hits = ChatHighlightState.hits;
+        const idx = ChatHighlightState.idx;
+        if (cur) {
+            cur.textContent = hits.length
+                ? ('▶ 第 ' + (idx + 1) + '/' + hits.length + ' 处：' + chatHighlightSnippetPreview(hits[idx].label))
+                : '（没有可跳转的高亮）';
+        }
+    } catch (e) {}
+}
+
+// 清空当前高亮集合 + 页面上的高亮覆盖层（复用既有的 ovlClearMarkOverlay，不另起一套清空
+// 逻辑）。不动 ChatHighlightState.cardEl 本身——调用方按各自场景决定要不要顺带归档那张卡。
+function chatHighlightClearInternal() {
+    ChatHighlightState.hits = [];
+    ChatHighlightState.misses = [];
+    ChatHighlightState.idx = -1;
+    ChatHighlightState.cardEl = null;
+    try { ovlClearMarkOverlay(); } catch (e) {}
+}
+
+// 渲染卡片："已高亮 N 处 · ▲上一处 ▼下一处 · ✕清除"（用户原话给的三个操作），复用 P69 那套
+// .aichat-card 内联卡片外壳（不是居中模态、不是新起一套 UI）。多轮高亮新卡替换旧集合：
+// 旧卡（如果还挂在聊天记录里）先被 chatHighlightArchiveCard 原地归档，不删除、不重复堆叠。
+function chatRenderDocHighlightCard(hits, misses) {
+    try {
+        const log = document.getElementById('aiChatLog');
+        if (!log) return null;
+        if (ChatHighlightState.cardEl) chatHighlightArchiveCard(ChatHighlightState.cardEl, '（已被新一轮高亮替换）');
+
+        const row = document.createElement('div');
+        row.className = 'aichat-row aichat-row-assistant';
+        const card = document.createElement('div');
+        card.className = 'aichat-card aichat-card-hl aichat-card-hl-active';
+
+        const head = document.createElement('div');
+        head.className = 'aichat-card-head';
+        head.textContent = '🔍 已高亮 ' + hits.length + ' 处';
+        card.appendChild(head);
+
+        const body = document.createElement('div');
+        body.className = 'aichat-card-body';
+
+        const cur = document.createElement('div');
+        cur.className = 'aichat-card-hl-current';
+        cur.textContent = hits.length
+            ? ('▶ 第 1/' + hits.length + ' 处：' + chatHighlightSnippetPreview(hits[0].label))
+            : '（没有可跳转的高亮）';
+        body.appendChild(cur);
+
+        if (misses.length) {
+            const warn = document.createElement('div');
+            warn.className = 'aichat-card-warn';
+            warn.textContent = '⚠ ' + misses.length + ' 处未找到：' + misses.map(chatHighlightSnippetPreview).join('；');
+            body.appendChild(warn);
+        }
+
+        const note = document.createElement('div');
+        note.className = 'aichat-card-hl-note';
+        body.appendChild(note);
+
+        const actions = document.createElement('div');
+        actions.className = 'aichat-card-actions';
+        const prevBtn = document.createElement('button');
+        prevBtn.type = 'button'; prevBtn.className = 'aichat-btn'; prevBtn.textContent = '▲ 上一处';
+        const nextBtn = document.createElement('button');
+        nextBtn.type = 'button'; nextBtn.className = 'aichat-btn'; nextBtn.textContent = '▼ 下一处';
+        const clearBtn = document.createElement('button');
+        clearBtn.type = 'button'; clearBtn.className = 'aichat-btn'; clearBtn.textContent = '✕ 清除';
+        prevBtn.disabled = !hits.length;
+        nextBtn.disabled = !hits.length;
+        prevBtn.addEventListener('click', function () { chatHighlightPrev(); });
+        nextBtn.addEventListener('click', function () { chatHighlightNext(); });
+        clearBtn.addEventListener('click', function () {
+            chatHighlightClearInternal();
+            chatHighlightArchiveCard(card, '（已清除）');
+        });
+        actions.appendChild(prevBtn);
+        actions.appendChild(nextBtn);
+        actions.appendChild(clearBtn);
+        body.appendChild(actions);
+
+        card.appendChild(body);
+        row.appendChild(card);
+        log.appendChild(row);
+        chatScrollToBottom();
+        return card;
+    } catch (e) { console.error('[chat] renderDocHighlightCard failed', e); return null; }
+}
+
+// doc_highlight：只读定位 + 画高亮，不需要 chatAgentConfirm（理由见本节顶部大注释）。
+async function chatAgentExecDocHighlight(args) {
+    const readiness = chatAgentDocHighlightReadiness();
+    if (!readiness.ready) {
+        const msg = readiness.reason === 'not-converted'
+            ? '当前文档还没有进行 PDF→LaTeX 转换（右侧仍是直接显示的原始 PDF，没有可高亮的转换产物）。'
+                + '请先告诉用户需要先完成 LaTeX 转换，转换完成后再调用本工具。'
+            : '当前没有打开任何文档，无法高亮。';
+        return { ok: false, uiSummary: '定位高亮失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const rawList = Array.isArray(args.snippets) ? args.snippets : [];
+    const seen = Object.create(null);
+    const snippets = [];
+    for (let i = 0; i < rawList.length && snippets.length < CHAT_HIGHLIGHT_MAX_SNIPPETS; i++) {
+        const s = String(rawList[i] == null ? '' : rawList[i]).trim();
+        if (!s || seen[s]) continue;
+        seen[s] = true;
+        snippets.push(s);
+    }
+    if (!snippets.length) {
+        const msg = 'snippets 参数为空或全是空字符串，没有可高亮的内容。';
+        return { ok: false, uiSummary: '定位高亮失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+
+    const hits = [];
+    const misses = [];
+    for (let i = 0; i < snippets.length; i++) {
+        const hit = chatHighlightLocateSnippet(snippets[i]);
+        if (hit) hits.push(hit); else misses.push(snippets[i]);
+    }
+
+    ChatHighlightState.hits = hits;
+    ChatHighlightState.misses = misses;
+    ChatHighlightState.idx = -1;
+    const card = chatRenderDocHighlightCard(hits, misses);
+    ChatHighlightState.cardEl = card;
+    if (hits.length) chatHighlightJumpTo(0);
+
+    const text = '已在文档中定位并高亮 ' + hits.length + ' 处'
+        + (misses.length ? '，' + misses.length + ' 处未找到' : '') + '。'
+        + (misses.length ? '\n未命中的片段：\n' + misses.map(function (s) { return '· ' + s; }).join('\n') : '')
+        + '\n界面上已经出现一张带"上一处/下一处/清除"按钮的高亮卡片，用户可以自行点击浏览。'
+        + '你不需要逐条复述每一处高亮具体在哪里，用一两句话总结高亮了什么内容即可；'
+        + '如果有未命中的片段，简要说明可能原因（比如原文措辞跟你摘录的不完全一致、或者这段内容'
+        + '已经被翻译改写、或者你记错了内容），不要谎称已经全部高亮成功。';
+    return {
+        ok: true,
+        uiSummary: '定位高亮：命中 ' + hits.length + ' / 未命中 ' + misses.length,
+        uiDetail: text, textForModel: text, bytes: text.length
+    };
+}
+
+// doc_highlight_clear：清除当前正在显示的高亮集合，无参数。
+async function chatAgentExecDocHighlightClear() {
+    const had = ChatHighlightState.hits.length;
+    const card = ChatHighlightState.cardEl;
+    chatHighlightClearInternal();
+    if (card) chatHighlightArchiveCard(card, '（已清除）');
+    const text = had ? ('已清除高亮（原共 ' + had + ' 处）。') : '当前没有正在显示的高亮，无需清除。';
+    return { ok: true, uiSummary: '清除高亮', uiDetail: text, textForModel: text, bytes: text.length };
+}
+
+// 定位高亮工具的系统提示小节——跟 chatAgentZhToolsSystemBlock 同一个模式：永远由
+// chatAgentToolsSystemBlock() 在两个分支（fs 就绪/不就绪）末尾各拼接一次，不受 fs
+// 工具是否可用影响（这是完全独立的第三条能力线）。
+function chatAgentHighlightToolsSystemBlock() {
+    let ready;
+    try { ready = chatAgentDocHighlightReadiness(); } catch (e) { ready = { ready: false, reason: 'no-doc' }; }
+    if (!ready.ready) {
+        const why = ready.reason === 'not-converted'
+            ? '当前右侧还是直接显示的原始 PDF，还没有进行 PDF→LaTeX 转换，没有可高亮的转换产物'
+            : '当前没有打开任何文档';
+        return '\n【定位高亮工具】这一轮不可用（' + why + '）。不要输出 name=doc_highlight 或'
+            + ' name=doc_highlight_clear 的 ==TOOL== 块。'
+            + (ready.reason === 'not-converted'
+                ? '如果用户是想高亮 PDF 里的内容，请直接回复用户：需要先完成 PDF→LaTeX 转换，转换完成后再让你高亮。'
+                : '') + '\n';
+    }
+    return '\n【定位高亮工具】用户可能会让你"高亮/标出/定位"文档里跟某个主题、某个公式、某处'
+        + '描述有关的内容，例如："帮我把关于 xxx 的重点内容高亮出来（最好是转换好的 LaTeX 内容'
+        + '对应位置）""帮我定位 xxx 公式""所有描述 xxx 的地方都标出来"。这时你需要先读懂当前'
+        + '文档内容（已经在上面的文档上下文里，或者需要的话用 list_dir/read_file 之类工具读取），'
+        + '自己判断哪些原文片段真正对应用户的要求，然后调用：\n'
+        + '  · doc_highlight —— 参数：{"snippets": ["原文片段1", "原文片段2", ...]}。每一项应该是'
+        + '你有把握确实出现在当前右侧文档里的原文原样片段（5～20 个字/词左右一段最容易精确定位，'
+        + '不要整段整段地摘、也不要跨越好几句话拼一条）；一个片段对应一处高亮，想高亮几处就给几条。'
+        + '调用后会在界面上弹出一张卡片，命中的会被高亮并可以用卡片上的按钮跳转，未命中的会在工具'
+        + '结果里列出来。\n'
+        + '  · doc_highlight_clear —— 清除当前正在显示的高亮，参数是空对象：{}\n'
+        + '调用格式跟其它工具一样：\n'
+        + '==TOOL name=doc_highlight==\n{"snippets":["示例片段一","示例片段二"]}\n==TOOLEND==\n'
+        + '规则：\n'
+        + '1. 只在用户明确要求定位/高亮/标出内容时才调用，不要在普通问答里顺手调用。\n'
+        + '2. snippets 里的每一项必须是你确实看到过、有把握出现在当前文档里的原文原样片段，'
+        + '不要凭空编造或大幅度改写；确实找不到就如实告诉用户，不要谎称已经高亮。\n'
+        + '3. 调用之后不需要在回复里逐条复述每一处高亮的具体位置——界面上的卡片已经足够，你只需要'
+        + '一两句话总结高亮了什么内容、命中了几处，如果有未命中的简要说明可能原因。\n';
+}
+
 // 文本协议的多轮工具调用主循环。wire 是这一轮已经装好的消息数组（chatAssembleTurn 的产物，
 // 最后一条是用户这一轮的完整载荷），本函数在它后面追加"assistant 工具调用 → user 工具结果"
 // 这样的往返，直到模型给出不含 ==TOOL== 的最终回复，或撞上下面任一硬上限。
@@ -19775,21 +20148,29 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
         const isWriteTool = CHAT_AGENT_WRITE_TOOLS.indexOf(parsed.tool) !== -1;
         const isZhReadTool = parsed.tool === 'read_block_translation';
         const isZhWriteTool = parsed.tool === 'retranslate_block';
-        const selfDisplaying = isWriteTool || isZhWriteTool;
+        // v2 Pass P92：doc_highlight/doc_highlight_clear 自己画那张带上一处/下一处/清除按钮的
+        // 卡片（chatRenderDocHighlightCard/chatHighlightArchiveCard），跟 fs 写工具/retranslate_block
+        // 同一档"自己画行，外层不重复画"，但不需要确认（只读定位+纯前端高亮，不改任何文件/缓存）。
+        const isHighlightTool = parsed.tool === 'doc_highlight' || parsed.tool === 'doc_highlight_clear';
+        const selfDisplaying = isWriteTool || isZhWriteTool || isHighlightTool;
         setLabel(isWriteTool
             ? ('准备执行「' + (CHAT_AGENT_TOOL_LABELS[parsed.tool] || parsed.tool) + '」…')
             : isZhWriteTool
                 ? ('准备重新翻译块 #' + parsed.args.blockIndex + '…')
                 : isZhReadTool
                     ? ('正在读取块 #' + parsed.args.blockIndex + ' 的渲染译文…')
-                    : ('正在' + (parsed.tool === 'read_file' ? '读取' : '查看') + '「' + (parsed.args.path || '.') + '」…'));
+                    : isHighlightTool
+                        ? (parsed.tool === 'doc_highlight' ? '正在定位高亮…' : '正在清除高亮…')
+                        : ('正在' + (parsed.tool === 'read_file' ? '读取' : '查看') + '「' + (parsed.args.path || '.') + '」…'));
         const result = isWriteTool
             ? await chatAgentExecWriteTool(parsed.tool, parsed.args, projectDir, signal, pending)
             : isZhReadTool
                 ? await chatAgentExecReadBlockTranslation(parsed.args, signal)
                 : isZhWriteTool
                     ? await chatAgentExecRetranslateBlock(parsed.args, signal, pending)
-                    : await chatAgentExecTool(parsed.tool, parsed.args, projectDir, signal);
+                    : isHighlightTool
+                        ? (parsed.tool === 'doc_highlight' ? await chatAgentExecDocHighlight(parsed.args) : await chatAgentExecDocHighlightClear())
+                        : await chatAgentExecTool(parsed.tool, parsed.args, projectDir, signal);
         if (!selfDisplaying) {
             const rowLabel = isZhReadTool
                 ? ('🔧 read_block_translation（块 #' + parsed.args.blockIndex + '）')
