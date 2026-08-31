@@ -29453,7 +29453,14 @@ async function ovlOpenPdfDirect(fileHandle, name, parentHandle, relPath) {
         }
     } catch (e) {
         console.error('[ovl] open pdf direct failed', e);
-        if (typeof showToast === 'function') showToast('打开 PDF 失败：' + (e && e.message ? e.message : String(e)), 'error');
+        const errMsg = '打开 PDF 失败：' + (e && e.message ? e.message : String(e));
+        if (typeof showToast === 'function') showToast(errMsg, 'error');
+        // v2 Pass P101a 热修：诊断 .claude/tmp/diag_pdf_open.md 实测复现——桥模式下大文件
+        // 读取失败时，原来只有一条 3 秒自动消失的 toast，PDF 面板本身没有任何变化痕迹（还
+        // 停在上一份 PDF 或原来的占位文案），用户很容易完全错过那条 toast、以为"点击毫无
+        // 反应"。改成同时写一条持久状态到 #ovlPdfStatus（跟成功路径 ovlSetPdfStatus(...,
+        // false) 用同一个状态条，不会被自动清掉，除非用户下一次操作触发新的状态更新）。
+        if (typeof ovlSetPdfStatus === 'function') ovlSetPdfStatus(errMsg, true);
     }
 }
 
@@ -29640,6 +29647,22 @@ async function ovlRemoteFsJson(url, body) {
     return data;
 }
 
+// v2 Pass P101a 热修：见 OvlRemoteFileHandle.getFile() 内的大注释——已知会经过这个类的两条
+// 场景（P72 PDF 直显、P18 Visual 缩略图）常见的二进制扩展名，命中就直接走 /project-asset，
+// 不先撞桥端 /fs/read 的 1MB 文本大小门槛（那道门槛排在"是不是二进制"判断之前，见
+// .claude/tmp/diag_pdf_open.md）。列表之外的扩展名仍走原有的 /fs/read 探测路径。
+const OVL_REMOTE_KNOWN_BINARY_EXT_RE = /\.(pdf|png|jpe?g|gif|webp|bmp|tiff?|ico|zip|gz|tar|7z|rar|eot|ttf|otf|woff2?|mp3|mp4|mov|avi|wav)$/i;
+// 单独抽出来的 GET /project-asset 字节获取——原来只在 getFile() 里内联一处（data.binary
+// 分支），现在有三处调用（已知扩展名快路径 / /fs/read 失败兜底重试 / 原有 binary 分支），
+// 抽成函数避免同一段 fetch+错误处理逻辑写三遍。失败原样 throw，调用方各自决定怎么处理
+// （快路径直接让异常往外抛；兜底重试分支会 catch 住换成原始 /fs/read 的错误信息）。
+async function ovlRemoteFetchAssetBytes(projectDir, relPath) {
+    const assetUrl = ovlBridgeUrl('/project-asset?projectDir=' + encodeURIComponent(projectDir) + '&path=' + encodeURIComponent(relPath));
+    const assetResp = await ovlBridgeFetch(assetUrl);
+    if (!assetResp.ok) throw new Error('读取远程二进制文件失败：HTTP ' + assetResp.status);
+    return await assetResp.arrayBuffer();
+}
+
 class OvlRemoteFileHandle {
     constructor(relPath, name) {
         this.kind = 'file';
@@ -29656,20 +29679,43 @@ class OvlRemoteFileHandle {
     async isSameEntry(other) {
         return !!(other && other.__ovlRemote && other.kind === 'file' && other.__relPath === this.__relPath);
     }
+    // v2 Pass P101a 热修：诊断见 .claude/tmp/diag_pdf_open.md——桥模式下点文件树里 >1MB 的
+    // PDF 完全无反应（不报错、不 toast 可见、只在 console 留一行）。根因：桥端 doFsRead()
+    // 的 1MB 文本大小门槛（FS_READ_MAX_BYTES，server.js ~1803/2080）排在"是不是二进制"判断
+    // 之前，导致任何 >1MB 的文件在 /fs/read 这一步就被拒绝，永远走不到下面这段本来就有的、
+    // 专门为二进制设计的 100MB 上限 /project-asset 兜底。本次修复不改 server.js（用户真实
+    // 8181 桥不需要重启），纯前端改路由，两条腿：
+    //   1) 已知二进制扩展名（PDF/常见图片等——本类目前仅服务这两种场景：P72 PDF 直显、P18
+    //      Visual 缩略图）直接走 /project-asset，压根不去撞 /fs/read 的 1MB 门槛。
+    //   2) 扩展名不在列表里的文件，仍按原样先尝试 /fs/read；一旦失败（含"文件过大"这类
+    //      1MB 门槛拒绝），兜底重试一次 /project-asset，不要求前端预先猜全所有二进制格式。
+    // 两条路径都不下发 mtimeMs（/project-asset 是纯字节流响应，没有这个字段）——
+    // __lastKnownMtimeMs 只在 createWritable() 的 Ctrl+S 冲突检测里用到（见该字段声明处
+    // 注释），而这个类到目前为止只用来读 PDF/图片这类从不通过编辑器 Ctrl+S 流程回写的
+    // 文件，跟"从未读过就直接写"是同一种已被现有代码接受的降级（expectedMtimeMs 缺失时
+    // 桥端就是跳过冲突检查），不是新引入的缺口。
     async getFile() {
         const projectDir = ovlRemoteProjectRoot();
+        if (OVL_REMOTE_KNOWN_BINARY_EXT_RE.test(this.name || this.__relPath || '')) {
+            const assetBytes = await ovlRemoteFetchAssetBytes(projectDir, this.__relPath);
+            return new File([assetBytes], this.name, { lastModified: Date.now() });
+        }
         const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/read'), { projectDir: projectDir, path: this.__relPath });
-        if (!data || data.ok !== true) throw new Error((data && data.error) || '读取远程文件失败');
+        if (!data || data.ok !== true) {
+            try {
+                const fallbackBytes = await ovlRemoteFetchAssetBytes(projectDir, this.__relPath);
+                return new File([fallbackBytes], this.name, { lastModified: Date.now() });
+            } catch (e2) {
+                throw new Error((data && data.error) || '读取远程文件失败');
+            }
+        }
         this.__lastKnownMtimeMs = (typeof data.mtimeMs === 'number') ? data.mtimeMs : this.__lastKnownMtimeMs;
         let bytes;
         if (data.binary) {
             // /fs/read 对二进制文件不下发字节（避免把 base64 膨胀塞进 JSON），改走既有的
             // GET /project-asset——P18 起就是 Visual 模式缩略图的真实资源来源，同一个鉴权/CORS
             // 通路（ovlBridgeFetch 自动带令牌头），这里原样复用，不新增桥接口。
-            const assetUrl = ovlBridgeUrl('/project-asset?projectDir=' + encodeURIComponent(projectDir) + '&path=' + encodeURIComponent(this.__relPath));
-            const assetResp = await ovlBridgeFetch(assetUrl);
-            if (!assetResp.ok) throw new Error('读取远程二进制文件失败：HTTP ' + assetResp.status);
-            bytes = await assetResp.arrayBuffer();
+            bytes = await ovlRemoteFetchAssetBytes(projectDir, this.__relPath);
         } else {
             bytes = data.content;
         }
