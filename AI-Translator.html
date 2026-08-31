@@ -34978,6 +34978,19 @@ async function ovlP2TApplyFigurePageCropFallback(job, text) {
     for (let i = 0; i < blocks.length; i++) {
         const b = blocks[i];
         const blockTextNow = out.slice(b.start + offsetShift, b.end + offsetShift);
+        // v2 Pass P94 终验修复：ovlP2TFailurePlaceholder()（整页转换失败的占位片段）同样是
+        // \begin{figure}...\end{figure} 包着 assets/pages/page-NN.png（跟"M1 默认整页截图、
+        // 一二级都没接住"长得一模一样），会被下面的 OVL_P2T_PAGE_PLAIN_RE 分支误当成"未接住的
+        // 图片"送去裁剪——占位片段的 caption 明确写着"此处为原页面截图"，三级兜底把它换成裁剪
+        // 后的局部图会让 caption 文字失实，且原始整页截图文件从此在 main.tex 里失去引用（磁盘
+        // 上仍在，只是孤儿文件）。这里往前看一小段，命中失败占位片段的固定标记
+        // "自动转换失败"（ovlP2TFailurePlaceholder 生成的 "% ==== page N 自动转换失败 ====" 注
+        // 释）就跳过，交给整页失败这条独立语义处理，不进三级兜底。
+        const lookback = out.slice(Math.max(0, b.start + offsetShift - 200), b.start + offsetShift);
+        if (lookback.indexOf('自动转换失败') !== -1) {
+            results.push({ num: b.num, page: null, status: 'other' });
+            continue;
+        }
         const imgMatch = /\\includegraphics\[[^\]]*\]\{([^}]+)\}/.exec(blockTextNow);
         const imgPath = imgMatch ? imgMatch[1] : null;
         if (!imgPath) { results.push({ num: b.num, page: null, status: 'failed', reason: '未找到 \\includegraphics 引用' }); continue; }
