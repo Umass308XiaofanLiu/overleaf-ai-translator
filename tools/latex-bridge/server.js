@@ -239,6 +239,20 @@ function sendText(res, code, text, contentType) {
     res.end(body);
 }
 
+// v2 Pass P98：逐请求结构化日志——诊断 ImCDN 核验事故（.claude/tmp/diag_imcdn_verify.md）时
+// 发现 server.js 全程零逐请求日志，出问题只能靠翻 WORK_ROOT 临时目录的时间戳侧面推断，取证
+// 成本高且不精确。这里只打元数据（时间戳/方法/端点/target/jobId/结局），绝不打请求体/响应体/
+// 编译日志正文——避免日志膨胀，也避免任何用户论文内容意外落进 stdout。只加日志，不改任何
+// 响应契约、不动 BRIDGE_API_VERSION。
+function logRequest(fields) {
+    const parts = ['[' + new Date().toISOString() + ']', fields.method || '?', fields.pathname || '?'];
+    if (fields.target) parts.push('target=' + fields.target);
+    if (fields.jobId) parts.push('jobId=' + fields.jobId);
+    parts.push('outcome=' + (fields.outcome || '?'));
+    if (typeof fields.durationMs === 'number') parts.push(fields.durationMs + 'ms');
+    console.log(parts.join(' '));
+}
+
 function readBody(req) {
     return new Promise((resolve, reject) => {
         const chunks = [];
@@ -509,8 +523,14 @@ function doCompile(projectDir, mainFile, opts) {
         const compileCwd = path.dirname(mainAbs);
 
         // 同一时间只允许一个编译在跑；新请求来了先杀掉旧的（§3.1 契约）。
+        // v2 Pass P98：这是纯粹的抢占（新杀旧），不是排队/拒绝——被杀一方的 HTTP 请求仍会走
+        // finish() 正常拿到一个 200 JSON（诊断实录见 .claude/tmp/diag_imcdn_verify.md），客户端
+        // 那边完全看不出"是被抢占的"。显式打一行 preempted 日志，这样下次同类事件能直接从
+        // stdout 确认，不用再靠翻 WORK_ROOT 时间戳侧面推断。
         if (currentChild) {
+            const preemptedJobId = currentChildId;
             try { killTree(currentChild.pid); } catch (e) {}
+            logRequest({ method: 'POST', pathname: '/compile', jobId: preemptedJobId, outcome: 'preempted' });
             currentChild = null;
         }
 
@@ -2398,6 +2418,22 @@ function ovlOriginAllowed(req) {
 // ---------------------------------------------------------------------------
 
 const server = http.createServer(async (req, res) => {
+    // v2 Pass P98：逐请求日志——注册在最前面，覆盖包括 OPTIONS 预检在内的一切请求，收尾
+    // （res 'finish'）时兜底打一行。具体路由处理完之后可以把更精确的 target/jobId/outcome
+    // 写进 req._log*（目前只有 /compile 这么做），没写就按状态码粗略推断 outcome。
+    const _logStartedAt = Date.now();
+    res.on('finish', () => {
+        const outcome = req._logOutcome || (res.statusCode < 400 ? 'ok' : ('error(HTTP ' + res.statusCode + ')'));
+        logRequest({
+            method: req.method,
+            pathname: req._logPathname != null ? req._logPathname : req.url,
+            target: req._logTarget || null,
+            jobId: req._logJobId || null,
+            outcome: outcome,
+            durationMs: Date.now() - _logStartedAt
+        });
+    });
+
     cors(req, res);
 
     if (req.method === 'OPTIONS') {
@@ -2408,6 +2444,7 @@ const server = http.createServer(async (req, res) => {
 
     const u = new URL(req.url, 'http://' + HOST + ':' + PORT);
     const pathname = decodeURIComponent(u.pathname);
+    req._logPathname = pathname;
 
     // v2 Pass P49：统一令牌校验闸门——REMOTE_MODE 下除 /health、GET / 之外的一切路由
     // 都要求正确的访问令牌，放在路由分发之前一次性挡住，不用逐个端点手动加。
@@ -2464,16 +2501,22 @@ const server = http.createServer(async (req, res) => {
             const bodyText = await readBody(req);
             let body;
             try { body = JSON.parse(bodyText || '{}'); } catch (e) {
+                req._logOutcome = 'error(invalid JSON body)';
                 sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
                 return;
             }
             const projectDir = body.projectDir;
             const mainFile = body.mainFile || 'main.tex';
+            // v2 Pass P98：日志用的 target 只取 basename，不落全路径（跟响应体本身对 projectDir
+            // 的处理口径一致，日志量克制，也避免在 stdout 里堆真实用户目录全路径）。
+            req._logTarget = (projectDir ? path.basename(projectDir) : '?') + '/' + path.basename(mainFile);
             if (!projectDir || typeof projectDir !== 'string') {
+                req._logOutcome = 'error(projectDir required)';
                 sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' });
                 return;
             }
             if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) {
+                req._logOutcome = 'error(projectDir not found)';
                 sendJson(res, 400, { ok: false, error: 'projectDir 不存在或不是目录: ' + projectDir });
                 return;
             }
@@ -2484,6 +2527,8 @@ const server = http.createServer(async (req, res) => {
                 forceClean: body.forceClean,
                 timeoutMs: body.timeoutMs // v2 Pass P91 §5：可选，见 doCompile 内部夹逼逻辑
             });
+            req._logJobId = (result && result.id) ? result.id : null;
+            req._logOutcome = (result && result.ok) ? 'ok' : ('error:' + String((result && result.error) || '(no pdf)').slice(0, 160));
             sendJson(res, 200, result);
             return;
         }

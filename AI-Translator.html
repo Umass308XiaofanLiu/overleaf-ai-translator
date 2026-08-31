@@ -35538,6 +35538,13 @@ function ovlP2TVerifyComputeTimeoutMs(job) {
     return Math.min(OVL_P2T_VERIFY_TIMEOUT_CAP_MS, OVL_P2T_VERIFY_TIMEOUT_BASE_MS + OVL_P2T_VERIFY_TIMEOUT_PER_PAGE_MS * total);
 }
 function ovlP2TVerifyBuildErrorExcerpt(compileData, configuredTimeoutMs) {
+    // v2 Pass P98：诊断实录见 .claude/tmp/diag_imcdn_verify.md——compileData.error 是桥/客户端
+    // 在"编译还没真正开始"就早退时给出的具体原因（mkdir 失败/主文件不存在/latexmk 或引擎二进制
+    // 缺失/spawn 失败，以及客户端 fetch 自己 catch 到的异常，见 ovlP2TVerifyCompile），跟下面
+    // parsed/timedOut/log 三条路径互斥（真正跑起来的编译响应从不带 error 字段，见 server.js
+    // finish() 615-631），必须放在最前面原文透传，不能被后面的猜测性兜底文案抢先命中——
+    // 这正是 ImCDN 核验事故里"编译未返回任何日志"这句误导文案吞掉真实原因的根因。
+    if (compileData && compileData.error) return String(compileData.error);
     const parsed = (compileData && Array.isArray(compileData.parsed)) ? compileData.parsed : [];
     const errors = parsed.filter(function (e) { return e.level === 'error'; }).slice(0, OVL_P2T_VERIFY_MAX_ERRORS_IN_EXCERPT);
     if (errors.length) {
@@ -35568,7 +35575,10 @@ function ovlP2TVerifyBuildErrorExcerpt(compileData, configuredTimeoutMs) {
         if (bangLines.length) return bangLines[bangLines.length - 1];
         return log.slice(-2000);
     }
-    return '（编译未返回任何日志，可能是桥本身不可达或超时）';
+    // v2 Pass P98：到这里说明 compileData.error/timedOut/log 三者都没有——真的什么线索都没有。
+    // 不再编"可能是桥本身不可达或超时"这种没有证据支持的具体猜测（诊断证实那次事故里桥全程
+    // 存活、也不是超时），只如实说明"没有信息"，不制造误导性的具体归因。
+    return '（服务端未返回错误信息，也未返回编译日志）';
 }
 
 // 挑第一条带具体行号的 error 条目，作为定位"哪一页片段"的锚点；没有就返回 null——上层据此
@@ -35697,6 +35707,34 @@ async function ovlP2TVerifyCompile(job, timeoutMs) {
     } catch (e) {
         return { ok: false, pdfExists: false, error: '连不上桥接服务：' + (e && e.message ? e.message : String(e)) };
     }
+}
+
+// v2 Pass P98：判定"完全没有日志的编译失败"——{ok:false} 且没有 log 字段（或空字符串），
+// 但带了 error（早退分支/fetch 异常，见 ovlP2TVerifyBuildErrorExcerpt 顶部注释）。这类失败
+// 没有任何可展示给用户或喂给修复模型的日志内容，唯一线索是 error 这一句话；跟"有 log 但内容
+// 是真实 TeX 语法错误"的失败要严格区分开——后者重试结果不会变，重试没有意义。
+function ovlP2TVerifyIsNoLogFailure(compileData) {
+    if (!compileData || compileData.ok) return false;
+    const hasLog = !!(compileData.log && String(compileData.log).length);
+    return !hasLog && !!compileData.error;
+}
+
+// v2 Pass P98：核验编译一旦命中"完全没有日志的失败"，3 秒退避后自动重试一次——常见成因是
+// main.tex 刚写盘的可见性竞态、或被另一次并发编译抢占（server.js doCompile 是"新杀旧"的抢占
+// 语义，见 GOALS.md 已知行为），两者都可能是瞬时状态，重试往往就好了。只重试这一种失败，只
+// 重试一次（不做指数退避/多次重试，避免核验面板卡很久）；重试期间把 job.verify.state 置成
+// 'retrying' 并渲染面板，让用户看到「编译异常，3秒后自动重试…」而不是干等。返回
+// {compileData, retried, firstError}：retried=true 时 firstError 是第一次尝试的 error 原文，
+// 上层最终仍失败时要把它一并拼进报告，不许静默丢弃第一次的错误信息。
+async function ovlP2TVerifyCompileWithRetry(job, timeoutMs) {
+    const first = await ovlP2TVerifyCompile(job, timeoutMs);
+    if (!ovlP2TVerifyIsNoLogFailure(first)) return { compileData: first, retried: false, firstError: null };
+    const firstError = first.error;
+    job.verify.state = 'retrying';
+    ovlP2TPanelRender();
+    await new Promise(function (resolve) { setTimeout(resolve, 3000); });
+    const second = await ovlP2TVerifyCompile(job, timeoutMs);
+    return { compileData: second, retried: true, firstError: firstError };
 }
 
 // P79 的 suspectReasons（配平/tabular 弱校验未通过）——核验报告里的"低置信页列表"直接复用
@@ -35879,13 +35917,22 @@ async function ovlP2TRunVerify(job) {
     let compileOk = false;
     let compileSecs = null;
 
-    // ---- 阶段一：首次编译 ----
-    const firstCompile = await ovlP2TVerifyCompile(job, verifyTimeoutMs);
+    // ---- 阶段一：首次编译（v2 Pass P98：无日志失败自动重试一次，见 ovlP2TVerifyCompileWithRetry）----
+    const firstAttempt = await ovlP2TVerifyCompileWithRetry(job, verifyTimeoutMs);
+    const firstCompile = firstAttempt.compileData;
     compileOk = !!(firstCompile && firstCompile.ok && firstCompile.pdfExists);
     if (compileOk) {
         compileSecs = (typeof firstCompile.durationMs === 'number') ? (firstCompile.durationMs / 1000).toFixed(1) : null;
     } else {
-        const excerpt = ovlP2TVerifyBuildErrorExcerpt(firstCompile, verifyTimeoutMs);
+        let excerpt = ovlP2TVerifyBuildErrorExcerpt(firstCompile, verifyTimeoutMs);
+        // v2 Pass P98：重试过仍失败——两次的真实错误都要保留在报告里，不能只留第二次、把第一次
+        // 静默吞掉（两次不一定是同一个原因，比如第一次是竞态、第二次已经是真实语法错误）。
+        // 无日志失败必然没有 file:line 格式的 error 条目，下面 ovlP2TVerifyFirstErrorLine 恒为
+        // null、loc 恒为 null，这条分支必然直接落进"未能定位出错页"的失败报告，不会流到后续
+        // fixSummaryParts 的"原错误"摘要里，excerpt 前置两行说明不会污染那段文案。
+        if (firstAttempt.retried) {
+            excerpt = '第一次尝试：' + firstAttempt.firstError + '\n重试后：' + excerpt;
+        }
         const errorLine = ovlP2TVerifyFirstErrorLine(firstCompile);
         const mainText0 = await readMainText();
         const loc = (mainText0 != null) ? ovlP2TVerifyLocatePageFragment(mainText0, errorLine) : null;
@@ -36384,8 +36431,10 @@ function ovlP2TPanelRender() {
     // v2 Pass P85：页面全部转换完、main.tex 已拼装之后，核验（编译/修复/重编译）会在
     // job.finishedAt 真正置位之前再跑一段时间——这段窗口里 finished 仍是 false，单纯说
     // "转换中…" 不诚实（页面早转完了），用 job.verify.state 单独给一行更准确的文案。
-    const verifyingLabel = (job.verify && (job.verify.state === 'compiling' || job.verify.state === 'fixing' || job.verify.state === 'recompiling'))
-        ? (job.verify.state === 'compiling' ? '页面转换完成，正在核验编译…' : (job.verify.state === 'fixing' ? '核验编译失败，正在尝试自动修复…' : '已应用修复，正在重新编译核验…'))
+    // v2 Pass P98：新增 'retrying' 状态——编译返回完全没有日志的失败时会先退避重试一次
+    // （见 ovlP2TVerifyCompileWithRetry），面板要如实显示这段等待，不能干等着不说话。
+    const verifyingLabel = (job.verify && (job.verify.state === 'compiling' || job.verify.state === 'fixing' || job.verify.state === 'recompiling' || job.verify.state === 'retrying'))
+        ? (job.verify.state === 'compiling' ? '页面转换完成，正在核验编译…' : (job.verify.state === 'fixing' ? '核验编译失败，正在尝试自动修复…' : (job.verify.state === 'recompiling' ? '已应用修复，正在重新编译核验…' : '编译异常，3秒后自动重试…')))
         : null;
     let statusLine;
     if (job.pipelineError) statusLine = '转换失败：' + escapeHtml(job.pipelineError);
@@ -36867,7 +36916,7 @@ function ovlP2TBatchResolveEntry(item) {
 function ovlP2TBatchItemPhaseLabel() {
     const job = OvlP2TState.job;
     if (!job) return '准备中…';
-    if (job.verify && (job.verify.state === 'compiling' || job.verify.state === 'fixing' || job.verify.state === 'recompiling')) return '核验中…';
+    if (job.verify && (job.verify.state === 'compiling' || job.verify.state === 'fixing' || job.verify.state === 'recompiling' || job.verify.state === 'retrying')) return '核验中…';
     if (job.finishedAt) return '收尾中…';
     const total = job.total || 0;
     const done = job.pages ? job.pages.filter(function (p) { return p.state !== 'pending' && p.state !== 'running'; }).length : 0;
