@@ -33240,8 +33240,15 @@ const OVL_P2T_SYSTEM_PROMPT = [
     "1. Output LaTeX source ONLY. No explanation, no markdown, no ``` fences, no commentary before or after.",
     "2. Output a BODY FRAGMENT only. NEVER output \\documentclass, \\usepackage, \\begin{document},",
     "   \\end{document}, \\maketitle, \\bibliographystyle or any other preamble command.",
-    "3. Follow the page's reading order. For a two-column page, transcribe the ENTIRE left column",
-    "   first, then the ENTIRE right column. Never interleave the two columns.",
+    "3. Follow the page's reading order.",
+    "   a. If content near the TOP of the page spans the page's FULL width (title, authors,",
+    "      affiliations, abstract, keywords) while the page below it is split into two columns,",
+    "      transcribe ALL of that full-width content FIRST, top to bottom, exactly as printed --",
+    "      BEFORE any two-column content below it, even if a column's text visually starts higher",
+    "      on the page than the bottom edge of the full-width block (e.g. a short abstract leaving",
+    "      whitespace above where the columns begin).",
+    "   b. For the two-column part of the page, transcribe the ENTIRE left column first, then the",
+    "      ENTIRE right column. Never interleave the two columns.",
     "4. Mathematics: inline math as $...$; displayed math as \\[ ... \\]. Use",
     "   \\begin{equation}...\\end{equation} only when the page prints an equation number, and then put",
     "   that printed number in \\tag{...}; never invent a \\label. Transcribe every symbol; never",
@@ -33260,11 +33267,20 @@ const OVL_P2T_SYSTEM_PROMPT = [
     "   these macros, fall back to \\begin{verbatim} ... \\end{verbatim} and put the line",
     "   % TODO(pdf2tex): pseudocode kept verbatim",
     "   immediately before it.",
-    "7. Figures, photos, plots, diagrams, screenshots: do NOT try to redraw them. Emit exactly:",
+    "7. Figures, photos, plots, diagrams, screenshots (including vector-drawn charts/diagrams that",
+    "   are NOT separate embedded images): do NOT try to redraw them. For EVERY such figure, first",
+    "   emit ONE comment line giving its bounding box on THIS page image, in this exact form:",
+    "   % BBOX: x0,y0,x1,y1",
+    "   x0,y0 = top-left corner, x1,y1 = bottom-right corner, as fractions of the FULL page image",
+    "   width/height (each in [0.0, 1.0], origin at the page's top-left corner -- normal screen/image",
+    "   coordinates, NOT PDF coordinates). Estimate generously; never cut off part of the figure.",
+    "   Emit this BBOX line for every figure even when you also have a ready-made image file for it",
+    "   in AVAILABLE IMAGES (harmless in that case, it will simply be ignored downstream). Then emit:",
     "   \\begin{figure}[htbp]\\centering",
     "   \\includegraphics[width=\\linewidth]{<one of the file names from AVAILABLE IMAGES>}",
     "   \\caption{<the caption printed on the page, verbatim; if there is none, write: Figure from page N>}",
     "   \\end{figure}",
+    "   The BBOX comment line must be the line immediately before \\begin{figure}, nothing in between.",
     "   Use the names from AVAILABLE IMAGES in the order they are listed, top to bottom.",
     "8. Section headings: \\section{...}, \\subsection{...}, \\subsubsection{...}. Drop the printed",
     "   numbers (LaTeX numbers them itself).",
@@ -33276,7 +33292,25 @@ const OVL_P2T_SYSTEM_PROMPT = [
     "    \\'e  \\\"o  ---  --  ``quoted''  \\ldots  \\%  instead of the corresponding Unicode characters.",
     "12. A paragraph cut off at the top or bottom of the page must still be transcribed as it appears.",
     "    Do not invent the missing part and do not add a note about it.",
-    "13. If the page has nothing transcribable, output exactly:  % (blank page)"
+    "13. If the page has nothing transcribable, output exactly:  % (blank page)",
+    "14. If this page contains part of the paper's References / Bibliography list (the list of cited",
+    "    works, usually near the end of the paper, each entry naming authors/title/venue/year), wrap",
+    "    ONLY the individual reference entries (not any section heading) exactly like this:",
+    "    % OVL-REFS-BEGIN",
+    "    <first reference entry text, verbatim, one entry per line>",
+    "    <second reference entry text, verbatim, one entry per line>",
+    "    ...",
+    "    % OVL-REFS-END",
+    "    Do NOT emit a \\section*{References} heading yourself -- omit it entirely, even if the page",
+    "    prints one; the reference list will be typeset with its own heading later.",
+    "    If this page is a continuation of the reference list from a previous page (more entries,",
+    "    no visible \"References\" heading on this page), still wrap them the same way.",
+    "    Everything else on the page (unrelated body text before the list starts) follows the normal",
+    "    rules above.",
+    "15. Prose formatting: put each sentence on its own line (do not wrap a sentence across multiple",
+    "    lines, and do not put more than one sentence on one line). Separate paragraphs with exactly",
+    "    one blank line. This does NOT apply inside math environments, tables, algorithms, or",
+    "    verbatim blocks -- leave those exactly as their own rules (4/5/6) already specify."
 ].join('\n');
 
 function ovlP2TBuildUserText(job, pageNum, images) {
@@ -33614,7 +33648,11 @@ function ovlP2TAskOutputDir(entry) {
 
 // ---- §1.1/§4.5.7b：逐页 render → PNG。独立文档实例（job.doc），跟 OvlState.pdfDoc 完全
 //      无关（P18 现成先例，见 ovlResolveOneFigureCandidate）。----
-async function ovlP2TRenderPageToPng(page, maxPx) {
+// v2 Pass P86 §1.2：把"算 scale → 建 canvas → render"这一段公共逻辑抽成独立函数（零行为
+// 变化，scale 公式跟原来逐字节一致），供 ovlP2TRenderPageToPng 自己调用、也供 §1.2 的
+// ovlP2TApplyFigureCrops 复用同一份渲染结果做裁剪——两者必须用同一套 scale 计算，否则裁剪
+// 坐标系跟发给模型看的图不是同一张，bbox 会对不上。
+async function ovlP2TRenderPageToCanvas(page, maxPx) {
     const unitViewport = page.getViewport({ scale: 1 });
     const longest = Math.max(unitViewport.width, unitViewport.height);
     let scale = (Number(maxPx) || 1800) / longest;
@@ -33626,6 +33664,11 @@ async function ovlP2TRenderPageToPng(page, maxPx) {
     const ctx = canvas.getContext('2d');
     const task = page.render({ canvasContext: ctx, viewport: viewport });
     await task.promise;
+    return { canvas: canvas, viewport: viewport };
+}
+async function ovlP2TRenderPageToPng(page, maxPx) {
+    const rendered = await ovlP2TRenderPageToCanvas(page, maxPx);
+    const canvas = rendered.canvas, viewport = rendered.viewport;
     const pngBlob = await new Promise(function (resolve) { canvas.toBlob(resolve, 'image/png'); });
     let sendBlob = pngBlob, sentAsJpeg = false;
     if (pngBlob && pngBlob.size > 1.5 * 1024 * 1024) {
@@ -33634,6 +33677,140 @@ async function ovlP2TRenderPageToPng(page, maxPx) {
     }
     canvas.width = 0; canvas.height = 0; // §4.5.7i：释放显存
     return { pngBlob: pngBlob, sendBlob: sendBlob, sentAsJpeg: sentAsJpeg, width: viewport.width, height: viewport.height };
+}
+
+// ==================== v2 Pass P86 §1.2：图片 bbox 裁剪兜底（矢量图/提取失败） ====================
+// system prompt 规则 7 让模型在正文里对"它认定为图"的区域标一行 "% BBOX: x0,y0,x1,y1"（0-1
+// 归一化，紧邻 \begin{figure} 之前）。M1 默认引用的是整页截图（assets/pages/page-NN.png）；
+// 如果该图其实是 M2 已经精确提取到的真实位图（assets/img/...），bbox 没有意义，跳过裁剪，
+// 只清掉注释行。只有仍然引用整页截图的情况（矢量图 / M2 没扫到 / M2 提取失败降级）才真正
+// 从页面栅格上裁一刀，避免把一整页塞进 \includegraphics。
+function clamp01(n) { return Math.max(0, Math.min(1, isFinite(n) ? n : 0)); }
+function ovlP2TCropCanvasRegion(canvas, x0, y0, x1, y1) {
+    const sx = Math.round(x0 * canvas.width), sy = Math.round(y0 * canvas.height);
+    const sw = Math.max(1, Math.round((x1 - x0) * canvas.width));
+    const sh = Math.max(1, Math.round((y1 - y0) * canvas.height));
+    const out = document.createElement('canvas');
+    out.width = sw; out.height = sh;
+    out.getContext('2d').drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
+    return out;
+}
+const OVL_P2T_BBOX_RE = /% BBOX:\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\r?\n\s*\\begin\{figure\}[\s\S]*?\\includegraphics\[[^\]]*\]\{([^}]+)\}/g;
+async function ovlP2TApplyFigureCrops(page, text, job, num, maxPx) {
+    OVL_P2T_BBOX_RE.lastIndex = 0;
+    const matches = [...text.matchAll(OVL_P2T_BBOX_RE)]; // 先收集，避免裁剪写盘是 async 而 replace 是同步
+    if (!matches.length) return { text: text, cropsMade: 0 };
+    let cropsMade = 0, out = text, k = 0, renderedCanvas = null; // 惰性渲染，命中第一条才真的渲一次整页
+    for (let mi = 0; mi < matches.length; mi++) {
+        const mm = matches[mi];
+        const full = mm[0], x0s = mm[1], y0s = mm[2], x1s = mm[3], y1s = mm[4], imgName = mm[5];
+        // 只处理"引用的是整页截图兜底文件"这一种——真正提取到的 M2 位图已经是精确小图，不用再裁
+        if (imgName.indexOf('assets/pages/page-') !== 0) continue;
+        const x0 = clamp01(parseFloat(x0s)), y0 = clamp01(parseFloat(y0s));
+        const x1 = clamp01(parseFloat(x1s)), y1 = clamp01(parseFloat(y1s));
+        // 校验：越界/反向/退化（<2% 页面宽或高）一律跳过，原样保留整页引用，不裁出一张空图
+        if (!(x1 > x0 + 0.02 && y1 > y0 + 0.02)) continue;
+        if (!renderedCanvas) {
+            const rendered = await ovlP2TRenderPageToCanvas(page, maxPx);
+            renderedCanvas = rendered.canvas;
+        }
+        const crop = ovlP2TCropCanvasRegion(renderedCanvas, x0, y0, x1, y1); // 同步，纯 canvas 操作
+        const blob = await new Promise(function (r) { crop.toBlob(r, 'image/png'); });
+        crop.width = 0; crop.height = 0;
+        if (!blob) continue;
+        k++;
+        const rel = 'assets/img/page-' + ovlP2TPad2(num) + '-crop-' + k + '.png';
+        await ovlP2TWriteBinary(job.outRel + '/' + rel, new Uint8Array(await blob.arrayBuffer()));
+        // 只替换 \includegraphics 里的文件名，BBOX 注释行整行删除（裁剪已完成，留着无意义、
+        // 且会被 §2 的参考文献正则误当成别的标记——保持输出里注释行"只有一种用途"）
+        const fixed = full.replace(/^% BBOX:.*\r?\n/, '').replace(imgName, rel);
+        out = out.split(full).join(fixed);
+        cropsMade++;
+    }
+    if (renderedCanvas) { renderedCanvas.width = 0; renderedCanvas.height = 0; } // 用完立刻释放，同 §4.5.7i 纪律
+    // 兜底：没被上面处理到的残留 "% BBOX: ..." 行（比如已经是 M2 真实位图、被 continue 跳过的）
+    // 一律原样剥掉——它们已经完成使命（M2 真实位图不需要裁剪），留在正文里会变成一行游离注释，
+    // 不影响编译（是合法 % 注释）但不美观，剥掉更干净。
+    out = out.replace(/^% BBOX:.*\r?\n(?=\s*\\begin\{figure\})/gm, '');
+    return { text: out, cropsMade: cropsMade };
+}
+
+// ==================== v2 Pass P86 §4：一句一行确定性后处理 ====================
+// prompt 规则 15 只是软约束，本地小模型不可靠，靠这段确定性重排兜底。绝不进入数学/表格/
+// 算法/verbatim/图注/注释/标题命令等保护区间——只重排"裸文本"缝隙。
+const OVL_P2T_ABBR = [
+    'et al.', 'Fig.', 'Figs.', 'Eq.', 'Eqs.', 'Eqn.', 'Eqns.', 'Sec.', 'Secs.',
+    'e.g.', 'i.e.', 'cf.', 'vs.', 'Ref.', 'Refs.', 'approx.', 'resp.', 'etc.',
+    'No.', 'Nos.', 'pp.', 'Vol.', 'Dr.', 'Mr.', 'Mrs.', 'Ms.', 'Prof.', 'St.',
+    'a.m.', 'p.m.'
+];
+const OVL_P2T_ABBR_PLACEHOLDER = ''; // 临时顶替句末标点判定用的句点，处理完再换回来
+const OVL_P2T_PROTECT_RE_LIST = [
+    /\\\[[\s\S]*?\\\]/g,                                   // \[ ... \]
+    /\$\$[\s\S]*?\$\$/g,                                   // $$ ... $$（极少见但防一手）
+    /\$(?:[^$\\]|\\.)*\$/g,                                // $ ... $（含转义 \$ 不误断）
+    /\\begin\{(equation|align|align\*|gather|multline|eqnarray)\}[\s\S]*?\\end\{\1\}/g,
+    /\\begin\{(table|tabular|tabularx|longtable)\}[\s\S]*?\\end\{\1\}/g,
+    /\\begin\{(algorithm|algorithmic)\}[\s\S]*?\\end\{\1\}/g,
+    /\\begin\{verbatim\}[\s\S]*?\\end\{verbatim\}/g,
+    /\\begin\{figure\}[\s\S]*?\\end\{figure\}/g,           // 图注单独一行，不需要句子重排
+    // v2 Pass P86 §2/§4 联调实测坑：% OVL-REFS-BEGIN...END 内部是"一条参考文献一行"（规则
+    // 14 的约定），不是散文——如果不整体保护，reflowProseChunk 会把块内的单换行当软折行
+    // 合并成一行空格分隔的长串，彻底破坏 §2 聚合阶段依赖的逐行结构。必须作为一个不可分割
+    // 区间整体透传，标记行本身也在区间内（不会再被下面的整行注释正则重复处理）。
+    /% OVL-REFS-BEGIN\r?\n[\s\S]*?% OVL-REFS-END/g,
+    /^\s*%.*$/gm,                                          // 整行注释（含 page marker/TODO）
+    /^\s*\\(section|subsection|subsubsection|caption|label|includegraphics)\b.*$/gm
+];
+// 收集所有保护区间并按起始位置排序、合并重叠/相邻区间（比如 \includegraphics 单行正则命中
+// 的范围已经完全落在外层 figure 环境正则命中的范围内部——合并时只算一次）。
+function ovlP2TCollectSpans(text, reList) {
+    const spans = [];
+    reList.forEach(function (re) {
+        re.lastIndex = 0;
+        let m;
+        while ((m = re.exec(text))) {
+            spans.push({ start: m.index, end: m.index + m[0].length });
+            if (m[0].length === 0) re.lastIndex++; // 防死循环
+        }
+    });
+    spans.sort(function (a, b) { return a.start - b.start; });
+    const merged = [];
+    spans.forEach(function (s) {
+        const last = merged[merged.length - 1];
+        if (last && s.start <= last.end) { last.end = Math.max(last.end, s.end); }
+        else merged.push({ start: s.start, end: s.end });
+    });
+    return merged;
+}
+function ovlP2TReflowProseChunk(chunk) {
+    // 按空行分段，每段内部先合并折行（消掉模型输出里的软换行），保护缩写句点，按
+    // "[.!?] + 空白 + 大写/引号/左括号" 切分句子，再逐句一行、段落间空一行。
+    return chunk.split(/\n{2,}/).map(function (para) {
+        if (!para.trim()) return '';
+        let joined = para.split('\n').map(function (l) { return l.trim(); }).filter(Boolean).join(' ');
+        OVL_P2T_ABBR.forEach(function (a) {
+            joined = joined.split(a).join(a.slice(0, -1) + OVL_P2T_ABBR_PLACEHOLDER); // "Fig." -> "Fig"
+        });
+        // 单大写字母缩写（人名首字母，如 "J. Smith"）：字母+句点+空白+大写字母 也保护
+        joined = joined.replace(/\b([A-Z])\.(\s+[A-Z])/g, '$1' + OVL_P2T_ABBR_PLACEHOLDER + '$2');
+        const sentences = joined
+            .split(/(?<=[.!?])\s+(?=[A-Z0-9"'“(\\$])/) // 句末标点+空白+大写/数字/引号/左括号/反斜杠(命令)/$（数学起）
+            .map(function (s) { return s.split(OVL_P2T_ABBR_PLACEHOLDER).join('.').trim(); })
+            .filter(Boolean);
+        return sentences.join('\n');
+    }).filter(function (p) { return p !== ''; }).join('\n\n');
+}
+function ovlP2TReflowSentences(text) {
+    const protectedSpans = ovlP2TCollectSpans(text, OVL_P2T_PROTECT_RE_LIST);
+    let out = '', cursor = 0;
+    protectedSpans.forEach(function (span) {
+        out += ovlP2TReflowProseChunk(text.slice(cursor, span.start));    // 只对"缝隙"里的裸文本重排
+        out += text.slice(span.start, span.end);                          // 保护区间原样透传
+        cursor = span.end;
+    });
+    out += ovlP2TReflowProseChunk(text.slice(cursor));
+    return out;
 }
 
 // ---- §4.5「全应用唯一发视觉请求的地方」：不经过 ovlBridgeFetch（不是桥请求）。----
@@ -33897,7 +34074,125 @@ function ovlP2TAssembleMain(job) {
     return header + body + '\\end{document}\n';
 }
 
-function ovlP2TBuildReadme(job) {
+// ==================== v2 Pass P86 §2：引用列表 → refs.bib ====================
+// prompt 规则 14 让模型用 % OVL-REFS-BEGIN/END 包住参考文献条目原文；这里跨页聚合（页序
+// 天然=聚合顺序，前提是 §3 的顺序修复已生效，聚合本身不重排）→ 一次性文本模型调用解析成
+// BibTeX → 写 refs.bib + 追加 \bibliographystyle/\bibliography；解析失败回退 thebibliography。
+function ovlP2TCollectRawRefLines(rawBody) {
+    const RE = /% OVL-REFS-BEGIN\r?\n([\s\S]*?)% OVL-REFS-END/g;
+    let lines = [], m;
+    RE.lastIndex = 0;
+    while ((m = RE.exec(rawBody))) {
+        m[1].split(/\r?\n/).map(function (s) { return s.trim(); }).filter(Boolean).forEach(function (l) { lines.push(l); });
+    }
+    return lines; // 页序天然=聚合顺序
+}
+
+const OVL_P2T_BIB_TIMEOUT_MS = 60000;
+const OVL_P2T_BIB_SYSTEM_PROMPT = [
+    'You convert a raw list of academic reference/citation entries (mixed formats, various citation',
+    'styles) into a valid BibTeX (.bib) file.',
+    'Output ONE @<type>{...} entry per input reference, in the SAME ORDER as given.',
+    'Citation keys MUST be exactly ref1, ref2, ref3, ... in input order (sequential integers,',
+    'never derived from author names) -- this keeps keys deterministic.',
+    'Only include fields you can actually read from the entry (title, author, year, journal,',
+    'booktitle, publisher, volume, pages, ...). NEVER invent a field you cannot determine.',
+    'Pick the closest BibTeX entry type (@article/@inproceedings/@incollection/@techreport/@misc);',
+    'use @misc if nothing more specific fits.',
+    'Output ONLY raw .bib text. No explanation, no markdown fences, no commentary.'
+].join('\n');
+
+// 调文本模型解析参考文献 → BibTeX：跟视觉模型/§3 结构修复模型同源同一套 fetch/超时/异常
+// 收敛骨架，独立成一份（system prompt/user 消息/返回值形状都不同，且这不是视觉请求，是纯
+// 文本请求，跟"全应用唯一发视觉请求的地方是 ovlP2TCallVision"这条纪律不冲突）。
+async function ovlP2TCallBibParse(rawLines, signal) {
+    const endpointRaw = (OvlSettings.pdf2texVisionEndpoint || '').trim();
+    if (!endpointRaw) return { ok: false, error: '未配置视觉模型服务地址（参考文献解析复用同一地址，见设置 → PDF 转 LaTeX）' };
+    const endpoint = endpointRaw.replace(/\/+$/, '');
+    const model = (OvlSettings.pdf2texVisionModel || '').trim();
+    if (!model) return { ok: false, error: '未配置视觉模型（参考文献解析复用同一模型名）' };
+    const controller = new AbortController();
+    const timeoutId = setTimeout(function () { controller.abort(); }, OVL_P2T_BIB_TIMEOUT_MS);
+    let extAbortHandler = null;
+    if (signal) {
+        if (signal.aborted) controller.abort();
+        else { extAbortHandler = function () { controller.abort(); }; signal.addEventListener('abort', extAbortHandler); }
+    }
+    const userText = rawLines.map(function (l, i) { return (i + 1) + '. ' + l; }).join('\n') + '\n/no_think';
+    try {
+        let resp;
+        try {
+            resp = await fetch(endpoint + '/chat/completions', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+                body: JSON.stringify({
+                    model: model, temperature: 0.1, max_tokens: 4096, stream: false,
+                    chat_template_kwargs: { enable_thinking: false },
+                    messages: [
+                        { role: 'system', content: OVL_P2T_BIB_SYSTEM_PROMPT },
+                        { role: 'user', content: userText }
+                    ]
+                })
+            });
+        } catch (e) {
+            if (e && e.name === 'AbortError') return { ok: false, error: '请求超时（超过 ' + Math.round(OVL_P2T_BIB_TIMEOUT_MS / 1000) + ' 秒）或已取消' };
+            return { ok: false, error: '连不上参考文献解析模型服务：' + (e && e.message ? e.message : String(e)) };
+        }
+        if (!resp.ok) {
+            let t = ''; try { t = (await resp.text()).slice(0, 200); } catch (e2) {}
+            return { ok: false, error: '参考文献解析模型服务返回错误状态 ' + resp.status + (t ? '：' + t : '') };
+        }
+        let data;
+        try { data = await resp.json(); } catch (e3) { return { ok: false, error: '参考文献解析模型服务返回的不是合法 JSON' }; }
+        const content = data && data.choices && data.choices[0] && data.choices[0].message && typeof data.choices[0].message.content === 'string'
+            ? data.choices[0].message.content : null;
+        if (content === null) return { ok: false, error: '参考文献解析模型服务返回格式不符合预期（缺少 choices[0].message.content）' };
+        const bibText = ovlAiMergeStripCodeFence(content.trim());
+        if (!bibText.trim()) return { ok: false, error: '参考文献解析模型返回了空内容' };
+        return { ok: true, bibText: bibText };
+    } catch (e) {
+        return { ok: false, error: '调用参考文献解析模型时出错：' + (e && e.message ? e.message : String(e)) };
+    } finally {
+        clearTimeout(timeoutId);
+        if (extAbortHandler && signal) signal.removeEventListener('abort', extAbortHandler);
+    }
+}
+
+// 校验（不修复，只判定）：不是合法 @entry 开头 / 花括号不配平 / 第一条键名不是 ref1，一律
+// 判失败，交给上层回退 thebibliography。
+function ovlP2TValidateBibText(text) {
+    if (!text || !/^\s*@/.test(text)) return false;           // 必须以 @ 开头
+    const opens = (text.match(/\{/g) || []).length;
+    const closes = (text.match(/\}/g) || []).length;
+    if (opens === 0 || opens !== closes) return false;         // 花括号必须配平
+    if (!/@\w+\s*\{\s*ref1\s*,/.test(text)) return false;      // 第一条键名必须是 ref1（抽查约定是否被遵守）
+    return true;
+}
+
+async function ovlP2TApplyReferencesPipeline(job, rawMainText) {
+    const raw = ovlP2TCollectRawRefLines(rawMainText);
+    // 先把所有 % OVL-REFS-BEGIN...END 标记块从正文里剥掉（不管有没有解析成功，原始标记块
+    // 都不是最终要出现在 main.tex 里的内容——thebibliography 分支会用 raw 重新生成一份）
+    let text = rawMainText.replace(/% OVL-REFS-BEGIN\r?\n[\s\S]*?% OVL-REFS-END\r?\n?/g, '');
+    if (!raw.length) return { text: text, mode: 'none', count: 0 };  // 没检测到 → 零改动
+    let parsed;
+    try { parsed = await ovlP2TCallBibParse(raw); }
+    catch (e) { parsed = { ok: false, error: '调用参考文献解析模型时出内部异常：' + (e && e.message ? e.message : String(e)) }; }
+    if (parsed.ok && ovlP2TValidateBibText(parsed.bibText)) {
+        const injected = text.replace(/\\end\{document\}\s*$/,
+            '\\bibliographystyle{plain}\n\\bibliography{refs}\n\\end{document}\n');
+        return { text: injected, mode: 'bibtex', count: raw.length, bibText: parsed.bibText };
+    }
+    // 回退：thebibliography，逐条 \bibitem，键名同样 ref1..refN 保持跟 bibtex 分支一致的约定
+    const items = raw.map(function (l, i) { return '\\bibitem{ref' + (i + 1) + '} ' + ovlP2TEscapeLatexLite(l); }).join('\n');
+    const block = '\\begin{thebibliography}{' + raw.length + '}\n' + items + '\n\\end{thebibliography}\n';
+    const injected = text.replace(/\\end\{document\}\s*$/, block + '\\end{document}\n');
+    return {
+        text: injected, mode: 'thebibliography', count: raw.length,
+        reason: parsed.ok ? 'BibTeX 解析结果未通过配平/键名格式校验' : parsed.error
+    };
+}
+
+function ovlP2TBuildReadme(job, mainTextForPreview) {
     const failedNums = job.pages.filter(function (p) { return p.state === 'failed'; }).map(function (p) { return p.num; });
     const suspectNums = job.pages.filter(function (p) { return p.state === 'suspect'; }).map(function (p) { return p.num; });
     const thinkFallbackNums = job.pages.filter(function (p) { return p.flags && p.flags.thinkCutFallback; }).map(function (p) { return p.num; });
@@ -33923,6 +34218,26 @@ function ovlP2TBuildReadme(job) {
         const degradedNums = job.pages.filter(function (p) { return p.flags && p.flags.m2Degraded; }).map(function (p) { return p.num; });
         md += '- M2 内嵌图片提取：' + (extractedNums.length ? extractedNums.join(', ') : '无') + '\n';
         if (degradedNums.length) md += '- 第 ' + degradedNums.join(', ') + ' 页图片提取降级（原因见转换日志，已回落整页截图）\n';
+    }
+    // v2 Pass P86 §1：从整页截图裁出的图片（矢量图/M2 未命中时的 bbox 裁剪兜底）。
+    const cropNums = job.pages.filter(function (p) { return p.flags && p.flags.figureCropsMade; })
+        .map(function (p) { return p.num + '（' + p.flags.figureCropsMade + ' 张）'; });
+    md += '- 已从整页截图裁出的图片：' + (cropNums.length ? cropNums.join(', ') : '无') + '\n';
+    // v2 Pass P86 §2：参考文献流水线结果（job.refs 由 ovlP2TApplyReferencesPipeline 产出）。
+    if (job.refs) {
+        if (job.refs.mode === 'none') md += '- 参考文献：未检测到\n';
+        else if (job.refs.mode === 'bibtex') md += '- 参考文献：' + job.refs.count + ' 条，已生成 refs.bib\n';
+        else md += '- 参考文献：' + job.refs.count + ' 条，BibTeX 解析失败，已回退 thebibliography（原因：' + (job.refs.reason || '未知') + '）\n';
+    }
+    // v2 Pass P86 §3：结构检查快照——README 在核验（ovlP2TRunVerify）跑之前就已写盘，这里
+    // 只是转换阶段的一次性静态检测（诚实标注：不是最终结果），修复与否以核验报告/面板为准。
+    if (mainTextForPreview) {
+        const structPreview = ovlP2TVerifyStructuralCheck(mainTextForPreview);
+        if (structPreview.issues && structPreview.issues.length) {
+            md += '- 结构检查（转换阶段快照，最终处理结果以核验报告为准）：' + structPreview.issues.map(function (i) { return i.detail; }).join('；') + '\n';
+        } else {
+            md += '- 结构检查（转换阶段快照）：未发现异常\n';
+        }
     }
     md += '\n⚠ 机器转写结果，公式/表格/图注务必人工复核后再使用。\n';
     return md;
@@ -34139,7 +34454,20 @@ async function ovlP2TConvertOnePage(job, num) {
         pageState.ms = ms;
         pageState.chars = extracted.text.length;
         pageState.flags = Object.assign(pageState.flags || {}, extracted.flags);
-        pageState.fragment = extracted.text;
+        // v2 Pass P86 §1：bbox 裁剪兜底——只在真的命中 "% BBOX:" 标记且引用的是整页截图时
+        // 才会重新渲染一次整页（惰性，见 ovlP2TApplyFigureCrops 内部）。裁剪失败绝不影响
+        // 本页转换结果——原样保留整页截图引用，跟 M2 降级同一纪律。
+        let finalText = extracted.text;
+        try {
+            const cropped = await ovlP2TApplyFigureCrops(page, finalText, job, num, OvlSettings.pdf2texMaxPx);
+            finalText = cropped.text;
+            if (cropped.cropsMade) pageState.flags.figureCropsMade = cropped.cropsMade; // README 汇总用
+        } catch (e) { console.error('[ovl] p2t figure crop failed', num, e); }
+        // v2 Pass P86 §4：一句一行确定性后处理——在裁剪之后执行（裁剪替换 \includegraphics
+        // 文件名不影响文本的句子结构，两者互相独立；先裁剪、后分句，避免分句逻辑意外把
+        // 已被裁剪流程处理过的残留标记行当成正文处理）。同样绝不因为异常中断整页转换。
+        try { finalText = ovlP2TReflowSentences(finalText); } catch (e) { console.error('[ovl] p2t reflow sentences failed', num, e); }
+        pageState.fragment = finalText;
         await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment);
     } catch (e) {
         console.error('[ovl] p2t convert page failed', num, e);
@@ -34322,68 +34650,292 @@ function ovlP2TVerifyLowConfidencePages(job) {
     });
 }
 
-// ---- 核验主流程：编译一次；失败→定位出错页→调修复模型→应用→再编译一次。最多一轮，
-// 不循环（修复后仍失败就如实报失败，不会对同一 job 反复重试）。----
-async function ovlP2TRunVerify(job) {
-    job.verify = { state: 'compiling', errorsExcerpt: '', fixSummary: '', fixApplied: false, finalOk: false, compileSecs: null, lowConfidencePages: [] };
-    ovlP2TPanelRender();
-    const firstCompile = await ovlP2TVerifyCompile(job);
-    if (firstCompile && firstCompile.ok && firstCompile.pdfExists) {
-        job.verify.state = 'success';
-        job.verify.finalOk = true;
-        job.verify.compileSecs = (typeof firstCompile.durationMs === 'number') ? (firstCompile.durationMs / 1000).toFixed(1) : null;
-        job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
-        return;
+// ==================== v2 Pass P86 §3.2：结构检查（章节序异常） ====================
+// 只抓用户实测到的最高频模式："Abstract 排到了第一个 Introduction 标题之后"（或完全没检测
+// 到 Abstract）。不追求穷尽所有可能的章节序问题。除 spec 规定的 {ok,issues} 外，额外带
+// introIndex/abstractIndex（原始字符偏移）供 ovlP2TRunVerify 判断同页/跨页用；调用方（面板/
+// README）只关心 issues 数组本身，多出来的字段无害。
+function ovlP2TVerifyStructuralCheck(mainText) {
+    const text = String(mainText || '');
+    const introRe = /\\section\*?\{\s*\d*\.?\s*Introduction\s*\}/i;
+    const introMatch = introRe.exec(text);
+    if (!introMatch) return { ok: true, issues: [] };            // 没有 Introduction 标题，不做判定
+    // "Abstract" 作为独立短行/段首出现（避免命中正文里偶然出现的单词 "abstract" 一词两义）
+    const abstractRe = /(^|\n)\s*(\\textbf\{)?\s*Abstract\b/i;
+    const beforeText = text.slice(0, introMatch.index);
+    const abstractBeforeMatch = abstractRe.exec(beforeText);
+    if (abstractBeforeMatch) return { ok: true, issues: [] };     // 摘要确实在 Introduction 之前，正常
+    const afterText = text.slice(introMatch.index);
+    const abstractAfterMatch = abstractRe.exec(afterText);
+    if (abstractAfterMatch) {
+        const prefixLen = abstractAfterMatch[1] ? abstractAfterMatch[1].length : 0;
+        const abstractIndex = introMatch.index + abstractAfterMatch.index + prefixLen;
+        return {
+            ok: false,
+            issues: [{ type: 'abstract-after-introduction', detail: 'Abstract 文本出现在第一个 Introduction 标题之后，怀疑顺序错乱' }],
+            introIndex: introMatch.index, abstractIndex: abstractIndex
+        };
     }
-    const excerpt = ovlP2TVerifyBuildErrorExcerpt(firstCompile);
-    const errorLine = ovlP2TVerifyFirstErrorLine(firstCompile);
-    let mainText = null;
+    return {
+        ok: false,
+        issues: [{ type: 'abstract-missing', detail: '未检测到 Abstract 文本（可能转换时漏掉，也可能措辞不含 "Abstract" 一词，不一定是 bug）' }],
+        introIndex: introMatch.index, abstractIndex: null
+    };
+}
+
+// 定位"Introduction 标题所在的页窗口"，并判断 abstractIndex 是否落在同一个页窗口内——同页
+// 返回该页窗口片段（可安全自动修复）；跨页（或没有页标记）返回 null（不做自动修复）。
+function ovlP2TVerifyLocateStructuralPageFragment(mainText, introIndex, abstractIndex) {
+    if (typeof introIndex !== 'number' || typeof abstractIndex !== 'number') return null;
+    const lines = String(mainText || '').split('\n');
+    const markerRe = /^% ==== page (\d+) ====$/;
+    const markers = [];
+    for (let i = 0; i < lines.length; i++) {
+        const m = markerRe.exec(lines[i]);
+        if (m) markers.push({ idx: i, num: Number(m[1]) });
+    }
+    if (!markers.length) return null;
+    let endOfAllPagesIdx = lines.length;
+    for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].trim() === '\\end{document}') { endOfAllPagesIdx = i; break; }
+    }
+    const lineStarts = [];
+    let pos = 0;
+    for (let i = 0; i < lines.length; i++) { lineStarts.push(pos); pos += lines[i].length + 1; }
+    function idxToLine(idx) {
+        let lo = 0, hi = lineStarts.length - 1, ans = 0;
+        while (lo <= hi) { const mid = (lo + hi) >> 1; if (lineStarts[mid] <= idx) { ans = mid; lo = mid + 1; } else hi = mid - 1; }
+        return ans;
+    }
+    function markerFor(lineIdx) {
+        let target = null;
+        for (let i = 0; i < markers.length; i++) { if (markers[i].idx <= lineIdx) target = markers[i]; else break; }
+        return target || markers[0];
+    }
+    const introMarker = markerFor(idxToLine(introIndex));
+    const abstractMarker = markerFor(idxToLine(abstractIndex));
+    if (introMarker.num !== abstractMarker.num) return null; // 跨页，不做自动修复
+    const targetPos = markers.indexOf(introMarker);
+    const nextMarkerIdx = (targetPos + 1 < markers.length) ? markers[targetPos + 1].idx : endOfAllPagesIdx;
+    let endIdx = nextMarkerIdx;
+    while (endIdx > introMarker.idx + 1 && lines[endIdx - 1].trim() === '') endIdx--;
+    const bodyLines = lines.slice(introMarker.idx + 1, endIdx);
+    return { pageNum: introMarker.num, markerIdx: introMarker.idx, nextMarkerIdx: nextMarkerIdx, snippet: bodyLines.join('\n') };
+}
+
+const OVL_P2T_STRUCT_FIX_TIMEOUT_MS = 60000;
+const OVL_P2T_STRUCT_FIX_SYSTEM_PROMPT =
+    '以下是同一页内容，但 Abstract 段落被排到了 Introduction 标题之后，请只调整两个块的先后顺序' +
+    '（Abstract 在前），不要改动、删减或新增任何文字内容，只返回调整后的这一页 LaTeX 片段。' +
+    '不要用 ``` 代码围栏包裹，不要输出 "% ==== page" 这类页码注释行（外层会自动加回）。';
+
+// 结构顺序修复：跟 ovlP2TVerifyCallFixModel 同源同一套 fetch/超时/异常收敛骨架，独立成一份
+// （system prompt/用户消息/用途都不同，两者是并列关系不是取代关系，同 §2 的 bib-parse 调用
+// 同一设计取舍）。
+async function ovlP2TVerifyCallStructFixModel(pageSnippet, signal) {
+    const endpointRaw = (OvlSettings.pdf2texVisionEndpoint || '').trim();
+    if (!endpointRaw) return { ok: false, error: '未配置视觉模型服务地址（结构修复复用同一地址）' };
+    const endpoint = endpointRaw.replace(/\/+$/, '');
+    const model = (OvlSettings.pdf2texVisionModel || '').trim();
+    if (!model) return { ok: false, error: '未配置视觉模型（结构修复复用同一模型名）' };
+    const controller = new AbortController();
+    const timeoutId = setTimeout(function () { controller.abort(); }, OVL_P2T_STRUCT_FIX_TIMEOUT_MS);
+    let extAbortHandler = null;
+    if (signal) {
+        if (signal.aborted) controller.abort();
+        else { extAbortHandler = function () { controller.abort(); }; signal.addEventListener('abort', extAbortHandler); }
+    }
+    const userText = '【这一页的 LaTeX 片段（Abstract 疑似被排到了 Introduction 之后）】\n' + pageSnippet + '\n\n请只返回调整顺序后的这一页 LaTeX 片段。';
     try {
-        const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, job.outRel + '/main.tex');
-        const f = await resolved.handle.getFile();
-        mainText = await f.text();
-    } catch (e) { mainText = null; }
-    const loc = (mainText != null) ? ovlP2TVerifyLocatePageFragment(mainText, errorLine) : null;
-    if (!loc) {
-        job.verify.state = 'failed';
-        job.verify.finalOk = false;
-        job.verify.errorsExcerpt = excerpt;
-        job.verify.fixSummary = '未能从编译日志定位到具体出错页，已跳过自动修复。';
-        job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
-        return;
+        let resp;
+        try {
+            resp = await fetch(endpoint + '/chat/completions', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+                body: JSON.stringify({
+                    model: model, temperature: 0.1, max_tokens: 4096, stream: false,
+                    chat_template_kwargs: { enable_thinking: false },
+                    messages: [
+                        { role: 'system', content: OVL_P2T_STRUCT_FIX_SYSTEM_PROMPT },
+                        { role: 'user', content: userText + '\n/no_think' }
+                    ]
+                })
+            });
+        } catch (e) {
+            if (e && e.name === 'AbortError') return { ok: false, error: '请求超时（超过 ' + Math.round(OVL_P2T_STRUCT_FIX_TIMEOUT_MS / 1000) + ' 秒）或已取消' };
+            return { ok: false, error: '连不上结构修复模型服务：' + (e && e.message ? e.message : String(e)) };
+        }
+        if (!resp.ok) {
+            let t = ''; try { t = (await resp.text()).slice(0, 200); } catch (e2) {}
+            return { ok: false, error: '结构修复模型服务返回错误状态 ' + resp.status + (t ? '：' + t : '') };
+        }
+        let data;
+        try { data = await resp.json(); } catch (e3) { return { ok: false, error: '结构修复模型服务返回的不是合法 JSON' }; }
+        const content = data && data.choices && data.choices[0] && data.choices[0].message && typeof data.choices[0].message.content === 'string'
+            ? data.choices[0].message.content : null;
+        if (content === null) return { ok: false, error: '结构修复模型服务返回格式不符合预期（缺少 choices[0].message.content）' };
+        let fragment = ovlAiMergeStripCodeFence(content.trim());
+        fragment = fragment.replace(/^%\s*====\s*page\s+\d+\s*====\s*\n?/i, '');
+        if (!fragment.trim()) return { ok: false, error: '结构修复模型返回了空内容' };
+        return { ok: true, fragment: fragment };
+    } catch (e) {
+        return { ok: false, error: '调用结构修复模型时出错：' + (e && e.message ? e.message : String(e)) };
+    } finally {
+        clearTimeout(timeoutId);
+        if (extAbortHandler && signal) signal.removeEventListener('abort', extAbortHandler);
     }
-    job.verify.state = 'fixing';
-    ovlP2TPanelRender();
-    const fixResult = await ovlP2TVerifyCallFixModel(excerpt, loc.snippet, null);
-    if (!fixResult.ok) {
-        job.verify.state = 'failed';
-        job.verify.finalOk = false;
-        job.verify.errorsExcerpt = excerpt;
-        job.verify.fixSummary = '自动修复请求失败：' + fixResult.error;
-        job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
-        return;
+}
+
+const OVL_P2T_STRUCT_TODO_LINE = '% TODO(pdf2tex): 检测到 Abstract 疑似排在 Introduction 之后，请人工核对顺序';
+function ovlP2TInsertStructTodoText(mainText) {
+    if (mainText.indexOf(OVL_P2T_STRUCT_TODO_LINE) !== -1) return mainText; // 已插入过，不重复插
+    if (/\\begin\{document\}\s*\n/.test(mainText)) {
+        return mainText.replace(/\\begin\{document\}\s*\n/, function (m) { return m + OVL_P2T_STRUCT_TODO_LINE + '\n'; });
     }
-    const lines = mainText.split('\n');
-    const rebuilt = lines.slice(0, loc.markerIdx + 1)
-        .concat(fixResult.fragment.split('\n'))
-        .concat(['', ''])
-        .concat(lines.slice(loc.nextMarkerIdx));
-    await ovlP2TWriteText(job.outRel + '/main.tex', rebuilt.join('\n'));
-    job.verify.fixApplied = true;
-    job.verify.state = 'recompiling';
+    return OVL_P2T_STRUCT_TODO_LINE + '\n' + mainText; // 防御性兜底：找不到 \begin{document} 就顶格插
+}
+
+// ---- 核验主流程：编译一次；失败→定位出错页→调修复模型→应用→再编译一次。编译核验之后，
+// 无论编译成不成功，都会再做一遍 §3.2 的结构检查——跟编译修复共享同一份"一轮"预算
+// （fixBudgetUsed）：一次核验里，编译修复 + 结构修复合计只让修复模型工作一轮，不是各自一轮。
+// 结构问题不会让一次编译成功的转换被标记成失败（finalOk 只看编译）。----
+async function ovlP2TRunVerify(job) {
+    job.verify = { state: 'compiling', errorsExcerpt: '', fixSummary: '', fixApplied: false, finalOk: false, compileSecs: null, lowConfidencePages: [], structuralIssues: [] };
     ovlP2TPanelRender();
-    const secondCompile = await ovlP2TVerifyCompile(job);
-    if (secondCompile && secondCompile.ok && secondCompile.pdfExists) {
-        job.verify.state = 'fixed';
-        job.verify.finalOk = true;
-        job.verify.fixSummary = '第 ' + loc.pageNum + ' 页片段自动修复后编译通过（原错误：' + excerpt.split('\n')[0].slice(0, 100) + '）';
-        job.verify.compileSecs = (typeof secondCompile.durationMs === 'number') ? (secondCompile.durationMs / 1000).toFixed(1) : null;
+
+    async function readMainText() {
+        try {
+            const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, job.outRel + '/main.tex');
+            const f = await resolved.handle.getFile();
+            return await f.text();
+        } catch (e) { return null; }
+    }
+
+    let fixBudgetUsed = false;
+    const fixSummaryParts = [];
+    let compileOk = false;
+    let compileSecs = null;
+
+    // ---- 阶段一：首次编译 ----
+    const firstCompile = await ovlP2TVerifyCompile(job);
+    compileOk = !!(firstCompile && firstCompile.ok && firstCompile.pdfExists);
+    if (compileOk) {
+        compileSecs = (typeof firstCompile.durationMs === 'number') ? (firstCompile.durationMs / 1000).toFixed(1) : null;
     } else {
-        job.verify.state = 'failed';
-        job.verify.finalOk = false;
-        job.verify.errorsExcerpt = ovlP2TVerifyBuildErrorExcerpt(secondCompile);
-        job.verify.fixSummary = '已尝试自动修复第 ' + loc.pageNum + ' 页片段一次（一轮上限），重新编译仍失败。';
+        const excerpt = ovlP2TVerifyBuildErrorExcerpt(firstCompile);
+        const errorLine = ovlP2TVerifyFirstErrorLine(firstCompile);
+        const mainText0 = await readMainText();
+        const loc = (mainText0 != null) ? ovlP2TVerifyLocatePageFragment(mainText0, errorLine) : null;
+        if (!loc) {
+            job.verify.state = 'failed';
+            job.verify.finalOk = false;
+            job.verify.errorsExcerpt = excerpt;
+            job.verify.fixSummary = '未能从编译日志定位到具体出错页，已跳过自动修复。';
+            job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
+            return;
+        }
+        job.verify.state = 'fixing';
+        ovlP2TPanelRender();
+        const fixResult = await ovlP2TVerifyCallFixModel(excerpt, loc.snippet, null);
+        fixBudgetUsed = true; // 无论成功与否，这一轮预算都算用掉了——不会因为失败就再调第二次
+        if (!fixResult.ok) {
+            job.verify.state = 'failed';
+            job.verify.finalOk = false;
+            job.verify.errorsExcerpt = excerpt;
+            job.verify.fixSummary = '自动修复请求失败：' + fixResult.error;
+            job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
+            return;
+        }
+        const lines = mainText0.split('\n');
+        const rebuilt = lines.slice(0, loc.markerIdx + 1)
+            .concat(fixResult.fragment.split('\n'))
+            .concat(['', ''])
+            .concat(lines.slice(loc.nextMarkerIdx));
+        await ovlP2TWriteText(job.outRel + '/main.tex', rebuilt.join('\n'));
+        job.verify.fixApplied = true;
+        job.verify.state = 'recompiling';
+        ovlP2TPanelRender();
+        const secondCompile = await ovlP2TVerifyCompile(job);
+        compileOk = !!(secondCompile && secondCompile.ok && secondCompile.pdfExists);
+        if (compileOk) {
+            compileSecs = (typeof secondCompile.durationMs === 'number') ? (secondCompile.durationMs / 1000).toFixed(1) : null;
+            fixSummaryParts.push('第 ' + loc.pageNum + ' 页片段自动修复后编译通过（原错误：' + excerpt.split('\n')[0].slice(0, 100) + '）');
+        } else {
+            job.verify.state = 'failed';
+            job.verify.finalOk = false;
+            job.verify.errorsExcerpt = ovlP2TVerifyBuildErrorExcerpt(secondCompile);
+            job.verify.fixSummary = '已尝试自动修复第 ' + loc.pageNum + ' 页片段一次（一轮上限），重新编译仍失败。';
+            job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
+            // 编译最终仍失败，但仍然如实上报结构检查（不再自动修，预算已耗尽或跟编译问题无关）。
+            const mainTextAfterFail = await readMainText();
+            const structAfterFail = ovlP2TVerifyStructuralCheck(mainTextAfterFail || '');
+            job.verify.structuralIssues = structAfterFail.issues.map(function (x) { return Object.assign({}, x, { autoFixed: false }); });
+            return;
+        }
     }
+
+    // ---- 阶段二：编译已成功（首次就成功，或修复后成功）→ 结构检查 ----
+    let mainText = await readMainText();
+    if (mainText == null) mainText = '';
+    const struct = ovlP2TVerifyStructuralCheck(mainText);
+    if (struct.issues.length) {
+        const issue = struct.issues[0]; // 本检查一次最多报 1 条
+        const loc2 = (issue.type === 'abstract-after-introduction')
+            ? ovlP2TVerifyLocateStructuralPageFragment(mainText, struct.introIndex, struct.abstractIndex)
+            : null;
+        if (loc2 && !fixBudgetUsed) {
+            // 同页错序，且这一轮修复预算还没被编译修复占用 → 可安全自动修复
+            job.verify.state = 'fixing';
+            ovlP2TPanelRender();
+            const fixResult2 = await ovlP2TVerifyCallStructFixModel(loc2.snippet, null);
+            fixBudgetUsed = true;
+            if (fixResult2.ok) {
+                const lines2 = mainText.split('\n');
+                const rebuilt2 = lines2.slice(0, loc2.markerIdx + 1)
+                    .concat(fixResult2.fragment.split('\n'))
+                    .concat(['', ''])
+                    .concat(lines2.slice(loc2.nextMarkerIdx));
+                mainText = rebuilt2.join('\n');
+                await ovlP2TWriteText(job.outRel + '/main.tex', mainText);
+                job.verify.fixApplied = true;
+                job.verify.state = 'recompiling';
+                ovlP2TPanelRender();
+                const thirdCompile = await ovlP2TVerifyCompile(job);
+                const thirdOk = !!(thirdCompile && thirdCompile.ok && thirdCompile.pdfExists);
+                if (thirdOk) {
+                    compileOk = true;
+                    compileSecs = (typeof thirdCompile.durationMs === 'number') ? (thirdCompile.durationMs / 1000).toFixed(1) : compileSecs;
+                    fixSummaryParts.push('第 ' + loc2.pageNum + ' 页 Abstract/Introduction 顺序自动修复后编译通过');
+                    const structAfter = ovlP2TVerifyStructuralCheck(mainText);
+                    job.verify.structuralIssues = structAfter.issues.length
+                        ? structAfter.issues.map(function (x) { return Object.assign({}, x, { autoFixed: false }); })
+                        : [Object.assign({}, issue, { autoFixed: true })];
+                } else {
+                    job.verify.state = 'failed';
+                    job.verify.finalOk = false;
+                    job.verify.errorsExcerpt = ovlP2TVerifyBuildErrorExcerpt(thirdCompile);
+                    job.verify.fixSummary = (fixSummaryParts.length ? fixSummaryParts.join('；') + '；' : '') + '结构修复后重新编译失败，建议人工处理。';
+                    job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
+                    job.verify.structuralIssues = [Object.assign({}, issue, { autoFixed: false })];
+                    return;
+                }
+            } else {
+                job.verify.structuralIssues = [Object.assign({}, issue, { autoFixed: false })];
+                fixSummaryParts.push('结构自动修复请求失败：' + fixResult2.error);
+            }
+        } else {
+            // 跨页 / 摘要缺失 / 修复预算已被编译修复占用 → 只报告 + 插入 TODO（不重复插入）
+            job.verify.structuralIssues = struct.issues.map(function (x) { return Object.assign({}, x, { autoFixed: false }); });
+            if (issue.type === 'abstract-after-introduction') {
+                const withTodo = ovlP2TInsertStructTodoText(mainText);
+                if (withTodo !== mainText) { mainText = withTodo; await ovlP2TWriteText(job.outRel + '/main.tex', mainText); }
+            }
+        }
+    }
+
+    job.verify.state = fixSummaryParts.length ? 'fixed' : 'success';
+    job.verify.finalOk = compileOk;
+    job.verify.compileSecs = compileSecs;
+    if (fixSummaryParts.length) job.verify.fixSummary = fixSummaryParts.join('；');
     job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
 }
 
@@ -34436,9 +34988,14 @@ async function ovlP2TRunPipeline(job) {
         if (job.cancelled) { ovlP2TPanelRender(); return; }
 
         // §4.5 步骤8：拼装
-        const mainText = ovlP2TAssembleMain(job);
-        await ovlP2TWriteText(job.outRel + '/main.tex', mainText);
-        await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job));
+        const rawMainText = ovlP2TAssembleMain(job);
+        // v2 Pass P86 §2：参考文献流水线——先装配、后处理引用（ovlP2TAssembleMain 本身不改，
+        // 继续同步产出含 % OVL-REFS-BEGIN/END 原始标记的 body）。
+        const refsOutcome = await ovlP2TApplyReferencesPipeline(job, rawMainText);
+        job.refs = refsOutcome;
+        await ovlP2TWriteText(job.outRel + '/main.tex', refsOutcome.text);
+        if (refsOutcome.bibText) await ovlP2TWriteText(job.outRel + '/refs.bib', refsOutcome.bibText);
+        await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job, refsOutcome.text));
 
         // v2 Pass P85：转换后整体核验（默认开，设置项关闭则整段跳过——job.verify 不存在，
         // 面板/后续逻辑等同于 P85 之前）。异常兜底成明确的 failed 状态，绝不让核验本身的
@@ -34518,8 +35075,14 @@ async function ovlP2TRetryPages(nums) {
                 await ovlP2TConvertOnePage(job, nums[i]);
             }
             if (!job.cancelled) {
-                await ovlP2TWriteText(job.outRel + '/main.tex', ovlP2TAssembleMain(job));
-                await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job));
+                // v2 Pass P86 §2：重试失败页后重新拼装也要重新走一遍参考文献流水线——防止
+                // 某一页重试改动了参考文献条目内容却没同步进 refs.bib（跟主管线同一函数）。
+                const rawRetryText = ovlP2TAssembleMain(job);
+                const refsOutcomeRetry = await ovlP2TApplyReferencesPipeline(job, rawRetryText);
+                job.refs = refsOutcomeRetry;
+                await ovlP2TWriteText(job.outRel + '/main.tex', refsOutcomeRetry.text);
+                if (refsOutcomeRetry.bibText) await ovlP2TWriteText(job.outRel + '/refs.bib', refsOutcomeRetry.bibText);
+                await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job, refsOutcomeRetry.text));
                 // v2 Pass P85：重试失败页也会重新拼装 main.tex，同样触发核验（跟主管线同一
                 // 开关/同一函数，不重复实现）。
                 if (OvlSettings.pdf2texAutoVerify) {
@@ -34799,6 +35362,14 @@ function ovlP2TPanelRender() {
             if (lowConf.length) {
                 html += '<div class="ovl-p2t-meta">低置信页（配平/表格弱校验未通过，已保留 TODO 注释）：'
                     + lowConf.map(function (p) { return '第 ' + p.num + ' 页'; }).join('、') + '</div>';
+            }
+            // v2 Pass P86 §3.2：结构检查——跟"低置信页列表"同一视觉层级（黄色警示，不算硬
+            // 失败，除非编译本身也失败，finalOk 的判定口径不变）。
+            const structIssues = job.verify.structuralIssues || [];
+            if (structIssues.length) {
+                html += '<div class="ovl-p2t-meta">结构检查：' + structIssues.map(function (si) {
+                    return escapeHtml(si.detail || si.type) + (si.autoFixed ? '（已自动修复）' : '（需要人工核对）');
+                }).join('；') + '</div>';
             }
             html += '</div>';
         } else if (verifyingLabel) {
@@ -36095,7 +36666,10 @@ const OVL_SETTINGS_DEFAULTS = {
     pdf2texMaxPx: 1800,      // 1200/1600/1800/2200，页面栅格最长边
     pdf2texSavePageImages: true,  // 关掉省磁盘，但失败页只剩文字占位
     pdf2texAutoOpenResult: true,  // 打开 PDF 时自动打开已有转换结果
-    pdf2texExtractImages: false,  // M2 实验开关，spike 结论见 overnight_progress.md「## P75」
+    pdf2texExtractImages: true,   // v2 Pass P86：spike 已通过（见下方注释），默认改开；矢量图/提取
+    // 失败兜底靠 §1 的 BBOX 裁剪机制（ovlP2TApplyFigureCrops），不再是"开了也救不了矢量图"
+    // ——见 overnight_progress.md「## P75」「## P86」。P86 不做旧存档迁移（旧用户显式 false
+    // 原样保留，同 P84 对 pdf2texDisableThinking 的既有原则：无法区分"手动关过"与"从未碰过"）。
     // ---- v2 Pass P85：转换后整体核验 ----
     // main.tex 拼装完成后自动用桥编译一次；失败则截取错误日志 + 出错页片段发给修复模型
     // （复用视觉模型同一 endpoint/模型名，关闭思考），应用修正后再编译一次——最多一轮，不循环。
@@ -36777,7 +37351,7 @@ function ovlSettingsPdf2TexHtml() {
     html += ovlSetRow('打开 PDF 时自动打开已有转换结果', '<input type="checkbox" data-setpath="settings.pdf2texAutoOpenResult"' + (s.pdf2texAutoOpenResult ? ' checked' : '') + '>', '');
     html += ovlSetRow('提取内嵌图片（实验）', '<input type="checkbox" id="ovlP2TExtractImagesChk" data-setpath="settings.pdf2texExtractImages"'
         + (s.pdf2texExtractImages ? ' checked' : '') + (OVL_P2T_M2_AVAILABLE ? '' : ' disabled') + '>',
-        OVL_P2T_M2_AVAILABLE ? '尝试直接提取 PDF 里的内嵌位图，而不是整页截图当图源。' : '本机 pdf.js spike 未通过（详见 overnight_progress.md「## P75」），这个能力尚未实现，开关已禁用。');
+        OVL_P2T_M2_AVAILABLE ? '默认开启：优先提取 PDF 里的内嵌位图；矢量绘制的图表/示意图会由视觉模型标出位置后从页面栅格裁剪。关闭则退回整页截图当图源。' : '本机 pdf.js spike 未通过（详见 overnight_progress.md「## P75」），这个能力尚未实现，开关已禁用。');
     html += ovlSetRow('转换后自动整体核验', '<input type="checkbox" data-setpath="settings.pdf2texAutoVerify"' + (s.pdf2texAutoVerify ? ' checked' : '') + '>',
         '转换完成后自动编译一次 main.tex；失败会尝试一轮自动修复（把错误日志+出错页片段发给上面同一个模型改写，改动结果只应用一次）后再编译一次，结果显示在转换面板里。关闭则跳过核验，转换完直接结束。');
     html += ovlSetRow('连接测试', '<button type="button" class="ovl-modal-btn" onclick="ovlP2TTestVisionConnection()">测试连接</button>'
