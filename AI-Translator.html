@@ -874,19 +874,46 @@ body.is-resizing-settings-modal * {
 #aiChatRoot .aichat-kv.is-bad > span:last-child { color: #be123c; }
 #aiChatRoot .aichat-panel-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
 /* v2 Pass P45（F4）：AI 能不能读写项目文件的克制状态行——单行、小字号，不要求用户手动关掉，
-   跟标题栏下面直接贴一条即可，颜色区分"可用/不可用"两种状态。 */
+   跟标题栏下面直接贴一条即可，颜色区分"可用/不可用"两种状态。
+   v2 Pass P100：新增的「上下文来源」小字（#aiChatOriginHint）跟这一条**共用同一行**
+   （.aichat-hintrow，各占一个 flex 子项），不是各自单独一整行——实测过独立成行的版本会让
+   聊天窗消息区少掉一行的高度（约 25px），在「写文件确认卡」这类内容本来就贴近窗口底部的
+   场景下，会把确认卡的操作按钮挤出 .aichat-log 的可视/可点击区域（真实 CDP 点击测不到，
+   e2e test_p42 场景 H 在加了这一整行之后当场卡死复现）。合并成一行，两个小字总高度和
+   P100 之前只有 caphint 一条时完全一样，聊天窗其余布局不受影响。 */
+#aiChatRoot .aichat-hintrow {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 10px;
+    border-bottom: 1px solid #e2e8f0;
+    min-width: 0;
+}
 #aiChatRoot .aichat-caphint {
     font-size: 10.5px;
     line-height: 1.5;
-    padding: 4px 10px;
-    border-bottom: 1px solid #e2e8f0;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    flex: 0 0 auto;
+    flex: 1 1 auto;
+    min-width: 0;
 }
-#aiChatRoot .aichat-caphint.is-ready { color: #047857; background: #ecfdf5; }
-#aiChatRoot .aichat-caphint.is-blocked { color: #92400e; background: #fffbeb; }
+#aiChatRoot .aichat-caphint.is-ready { color: #047857; }
+#aiChatRoot .aichat-caphint.is-blocked { color: #92400e; }
+/* v2 Pass P100：上下文来源只读小字——中性配色（不是"能用/不能用"那种二元状态，只是
+   如实说明这一段对话绑的是哪一半），没有点击行为，所以不需要 hover/active 样式。
+   flex:0 1 auto——内容短、优先保住完整，caphint 那截更长，挤压时先紧它的。 */
+#aiChatRoot .aichat-originhint {
+    font-size: 10.5px;
+    line-height: 1.5;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 0 1 auto;
+    min-width: 0;
+    color: #64748b;
+}
 #aiChatRoot .aichat-arcitem {
     display: flex;
     align-items: center;
@@ -17627,10 +17654,16 @@ const ChatState = {
     //   · 压缩只改 messages ⇒ 压缩后文档仍然完整；
     //   · 清理清空 messages ⇒ 新对话第一轮照样带全文；
     //   · 重译换掉 translationPairs ⇒ 下一轮带的是**新**文档。
-    // 上下文开关（默认开）。关掉 = ==DOC== 文档块和 ==FOCUS== 关注块这一轮都不生成
-    // （关注条目带的是稿子原文逐字，所以它必须跟着这个开关走，见 chatAssembleTurn）。
-    // 它**管不着**已经在 ChatState.messages 里的那些轮次 —— 那要靠「清理」。
-    autoContext: true,
+    // v2 Pass P100：删掉了用户手动切换的「文档」开关。现在聊天窗**打开那一刻**按当时的
+    // 界面（AI 翻译器浮层 body.ovl-translator-open / 编辑器主界面）自动绑定一次，全程不因
+    // 中途切界面而改变，只有关闭重开才会按新的打开位置重新绑定——绑定点见 chatOpen()。
+    // '' = 还没绑定过（窗口从没真正打开过）；
+    // 'translator' = 这一段对话每轮发送左栏整篇待翻译原文（chatBuildDocContext，==DOC==，
+    //   逐字复用旧开关开着时的那份函数与截窗/token 保护，没有新造）；
+    // 'editor' = 改发项目文件树结构概览（chatBuildTreeOverview，==TREE==，新增）。
+    // 两种来源都**管不着**已经在 ChatState.messages 里的那些轮次 —— 那要靠「清理」；
+    // 也都不影响 ==FOCUS== 关注块（P99 起无条件发送，不看这个字段）。
+    contextOrigin: '',
     docSnapshot: null,              // { id, from, to, total, hashes:{n:{src,tgt}}, at } —— 本轮发出去的那份文档的指纹
     snapshotSeq: 0,
     // 用量。measured 那一份来自 usage.prompt_tokens（唯一权威），估算那一份来自 chatEstTokens。
@@ -17772,16 +17805,26 @@ function chatShellHtml() {
         // 三颗按钮从左到右：+ 新建对话 → − 最小化 → × 关闭。
         // 每颗都有中文 data-tip；按 data-tip 纪律，它们互相是兄弟、祖先（.aichat-titlebtns）不带 tip。
         +     '<span class="aichat-titlebtns">'
-        +       '<button type="button" class="aichat-iconbtn" id="aiChatNewBtn" data-tip="新建对话：先把当前这段存进「会话」再开一段空的（和面板里的「清理」是同一条代码路径）。文档上下文不受影响 —— 它每轮现生成，新对话第一轮照样带整篇最新原文（左栏，不含译文）。你标出来的关注（黄色高亮 / 勾选框）属于稿子不属于这段对话，**会原样保留**。当前对话是空的时就什么都不做，不会往历史里塞空条目。" data-tip-pos="bottom-end">' + Icons.PlusSmall + '</button>'
+        +       '<button type="button" class="aichat-iconbtn" id="aiChatNewBtn" data-tip="新建对话：先把当前这段存进「会话」再开一段空的（和面板里的「清理」是同一条代码路径）。上下文来源不受影响 —— 它每轮现生成，新对话第一轮照样带上这个窗口当初绑定的那一份（翻译原文或文件树概览，取决于这个对话窗是从哪个界面打开的）。你标出来的关注（黄色高亮 / 勾选框）属于稿子不属于这段对话，**会原样保留**。当前对话是空的时就什么都不做，不会往历史里塞空条目。" data-tip-pos="bottom-end">' + Icons.PlusSmall + '</button>'
         // P3：弹出到独立 OS 窗口。aria-pressed/data-tip 的"已弹出"态由 ovlPopoutSyncButtons 维护。
         +       '<button type="button" class="aichat-iconbtn" id="aiChatPopBtn" aria-pressed="false" data-tip="弹出到独立窗口：可以拖到桌面任意位置，和浏览器分开摆。" data-tip-pos="bottom-end">' + Icons.PopOutSmall + '</button>'
         +       '<button type="button" class="aichat-iconbtn" id="aiChatMinBtn" data-tip="最小化到后台：折叠成一条标题栏停在原地，仍然可以拖。和「关闭」不一样 —— 草稿（连同光标选区）、滚动位置、全部消息、关注标记、用量圆环、窗口尺寸全都留着，展开后逐项还原。折叠期间模型回完了，这里会亮出未读数。点这颗按钮或点标题栏都能展开。" data-tip-pos="bottom-end">' + Icons.MinusSmall + '</button>'
         +       '<button type="button" class="aichat-iconbtn" id="aiChatCloseBtn" data-tip="关掉对话窗（按 Esc 也一样）。位置和大小会记住，下次打开还在原处。" data-tip-pos="bottom-end">' + Icons.XSmall + '</button>'
         +     '</span>'
         +   '</div>'
+        // v2 Pass P100：这一段对话打开那一刻绑定的上下文来源——只读小字，紧贴标题栏下面，
+        // 用户看得见但点不动（设计上「按打开位置自动决定，不再手动切换」，见
+        // ChatState.contextOrigin 的绑定点 chatOpen()）。跟下面 P45 那条能力提示**共用一行**
+        // （.aichat-hintrow）——各自更新、各自独立隐藏/变色，只是不再各占一整行：独立成行的
+        // 版本量出来会多吃掉聊天窗消息区约 25px 高度，在写文件确认卡这类内容贴近窗口底部的
+        // 场景下会把确认卡的按钮挤出可视/可点击区域，真实 CDP 点击测不到（test_p42 场景 H
+        // 复现过，见下面两条规则上方的 CSS 大注释）。
+        +   '<div class="aichat-hintrow" id="aiChatHintRow">'
+        +     '<span class="aichat-originhint" id="aiChatOriginHint" hidden></span>'
         // v2 Pass P45（F4）：AI 能不能直接读写项目文件，克制的一行状态提示——不是每次都要
         // 手动关掉的大横幅，纯展示、不带交互，见 chatUpdateCapabilityHint。
-        +   '<div class="aichat-caphint" id="aiChatCapHint" hidden></div>'
+        +     '<span class="aichat-caphint" id="aiChatCapHint" hidden></span>'
+        +   '</div>'
         +   '<div class="aichat-log" id="aiChatLog"></div>'
         +   '<div class="aichat-footer">'
         // v2 Pass P69：挂起确认卡的细提示——不阻塞输入，只提醒还有事没了结（见 chatUpdatePendingConfirmHint）。
@@ -18271,13 +18314,15 @@ const CHAT_MD_TILDE = '\uE000';
 // 但 `==DOC rows=…==` 需要 `DOC` 这一支；两支都在，逃逸和还原才是互逆的。
 // `FOCUS` 这一支同时吃下 `==FOCUS n=…==` 和 `==FOCUSEND==`（后者是 `==` + `FOCUS` + `END==`，
 // 尾巴那截落进 `[^\n]*==`）。两支都在，逃逸和还原才是互逆的。
+// v2 Pass P100：新增 `TREE` 这一支，同一个理由——文件树概览里装的是用户项目里真实的文件/
+// 目录名，理论上就可能撞上一个刚好长得像 `==TREEEND==` 的文件名，跟 DOC/FOCUS 同一条纪律。
 function chatEscapeDelims(s) {
     return String(s == null ? '' : s)
-        .replace(/^([ \t]*==)(CHAT|EDIT|END|DOC|FOCUS)([^\n]*==[ \t]*)$/gm, '$1' + CHAT_ZWSP + '$2$3');
+        .replace(/^([ \t]*==)(CHAT|EDIT|END|DOC|FOCUS|TREE)([^\n]*==[ \t]*)$/gm, '$1' + CHAT_ZWSP + '$2$3');
 }
 function chatUnescapeDelims(s) {
     return String(s == null ? '' : s)
-        .replace(new RegExp('==' + CHAT_ZWSP + '(CHAT|EDIT|END|DOC|FOCUS)', 'g'), '==$1');
+        .replace(new RegExp('==' + CHAT_ZWSP + '(CHAT|EDIT|END|DOC|FOCUS|TREE)', 'g'), '==$1');
 }
 
 // C7（对话上下文收窄）：左栏（原文/src）此刻是什么语言。只在 hasDoc 为真时才有意义
@@ -18298,23 +18343,43 @@ function chatDocLang() {
 // C7（对话上下文收窄）：docLang 是左栏原文此刻的语言（chatDocLang()）。EDIT 块里的改写正文
 // **必须**用这个语言写，和「用什么语言回答用户」是两回事——那句话回什么语言跟着用户的问题走，
 // 这里的改写文本只跟着原文的语言走，两条规则互不干扰。
-function chatSystemPrompt(hasTarget, hasDoc, hasFocus, docLang) {
+function chatSystemPrompt(hasTarget, hasDoc, hasFocus, docLang, hasTree) {
     const lang = docLang || chatDocLang();
     const focusRule = hasFocus
         ? '\n用户这一轮还标了若干「额外关注」，装在 ==FOCUS …== 与 ==FOCUSEND== 之间。\n'
           + '那是**请你多留意的地方**，不是让你改的地方：没有被明确要求改动之前，'
           + '不要因为某处被标出来就去改写它，更不要为此输出 ==EDIT== 块。\n'
         : '';
-    // v2 Pass P42：只读的文件工具小节。永远都在（不受 hasDoc/hasTarget/hasFocus 影响）——
+    // v2 Pass P100 新增：这一轮带了项目文件树结构概览（==TREE …==/==TREEEND==，只有从编辑器
+    // 主界面打开的对话窗才会有，见 ChatState.contextOrigin/chatBuildTreeOverview）。跟
+    // focusRule 一样单独一段，说清楚这只是「有哪些文件」，不是「文件里写了什么」。
+    const treeRule = hasTree
+        ? '\n用户这一轮还附带了**项目文件树的结构概览**，装在 ==TREE …== 与 ==TREEEND== 之间。\n'
+          + '那只是文件/目录的名字和层级，不是文件内容——不要假装已经看过某个文件里写了什么，\n'
+          + '需要具体内容时，用下面「只读文件工具」小节里的方法主动去读。\n'
+        : '';
+    // v2 Pass P42：只读的文件工具小节。永远都在（不受 hasDoc/hasTarget/hasFocus/hasTree 影响）——
     // 哪怕这一轮什么都没附加，模型也应该知道自己能不能主动去读项目文件夹里的东西。
     const toolsBlock = chatAgentToolsSystemBlock();
-    const base = ''
-        + '你是学术论文翻译工具里的助手。用户正在处理一篇需要翻译的论文，你**只看得到左栏「原文」**'
-        + '（用户正在写、正在改的那份待翻译内容）；右栏的「译文」是翻译结果，你看不到它，'
-        + '也不能改动它——这个工具现在只把左栏的内容当作你的上下文和可能的修改对象。\n'
-        + '这句话回答用什么语言，跟着用户提问的语言走（用户用中文问就用中文答，用英文问就用英文答）；\n'
-        + '但下面 ==EDIT== 块里改写之后的正文是另一回事，**必须永远使用原文的语言**'
-        + '（此刻左栏原文是' + lang.name + '），不会因为你这句话用了别的语言就跟着换，见规则里单独那一条。\n\n'
+    // v2 Pass P100：开场这段「你是谁、看得到什么」按 hasTree 分叉——旧版无论从哪个界面打开
+    // 都说「你只看得到左栏原文」，这句话在编辑器主界面打开的对话窗里是假的：编辑器根本没有
+    // 左栏/右栏这回事，AppState.translationPairs（翻译器的数据）跟 OvlState.currentFile
+    // （编辑器打开的文件）是两套完全独立的状态，调查已确认「文档」开关旧实现从没有过专门为
+    // 编辑器现开的"当前文档"注入机制，只是把翻译器自己的数据无差别发给两个入口——这里改成
+    // 如实说清楚编辑器场景下模型看到的是什么（映射决定见 overnight 进度记录）。
+    const intro = hasTree
+        ? ('你是这个 LaTeX 论文项目编辑器里的助手。用户正在编辑器主界面里工作，'
+            + '你看得到的只有项目文件树的结构概览（文件/目录名，不含内容，见下面 ==TREE== 块）'
+            + (hasFocus ? '，以及用户标出来的「额外关注」段落' : '')
+            + '——具体某个文件写了什么，需要你主动用下面的只读文件工具去读，不要假装已经看过。\n'
+            + '这句话回答用什么语言，跟着用户提问的语言走（用户用中文问就用中文答，用英文问就用英文答）。\n\n')
+        : ('你是学术论文翻译工具里的助手。用户正在处理一篇需要翻译的论文，你**只看得到左栏「原文」**'
+            + '（用户正在写、正在改的那份待翻译内容）；右栏的「译文」是翻译结果，你看不到它，'
+            + '也不能改动它——这个工具现在只把左栏的内容当作你的上下文和可能的修改对象。\n'
+            + '这句话回答用什么语言，跟着用户提问的语言走（用户用中文问就用中文答，用英文问就用英文答）；\n'
+            + '但下面 ==EDIT== 块里改写之后的正文是另一回事，**必须永远使用原文的语言**'
+            + '（此刻左栏原文是' + lang.name + '），不会因为你这句话用了别的语言就跟着换，见规则里单独那一条。\n\n');
+    const base = intro
         + (hasDoc
             ? '用户这一轮附带了**整份待翻译的原文**，装在 ==DOC …== 与 ==DOCEND== 之间，'
               + '每一行都编了号，形如 `[3] 原文：…`。这份文档**只有原文，没有译文**——'
@@ -18325,6 +18390,8 @@ function chatSystemPrompt(hasTarget, hasDoc, hasFocus, docLang) {
             : '')
         + focusRule
         + (focusRule ? '\n' : '')
+        + treeRule
+        + (treeRule ? '\n' : '')
         + toolsBlock
         + (toolsBlock ? '\n' : '')
         + '回复格式（严格遵守，**不要输出 JSON**——==TOOL== 块内部的那段参数除外，见上面工具小节）：\n'
@@ -19191,6 +19258,31 @@ async function chatAgentPreviewAffected(projectDir, relPath, signal) {
         if (e && e.name === 'AbortError') throw e;
         return { ok: false, error: String((e && e.message) || e) };
     }
+}
+
+// v2 Pass P100：聊天窗顶部小字，显示这一次打开绑定的是哪种上下文来源——**只读**展示，
+// 没有点击行为（设计上「按打开位置自动决定，用户不再手动切换」，见 ChatState.contextOrigin
+// 的绑定点 chatOpen()）。只在真正的「关→开」转折点调一次，不随 chatUpdateBar 等高频重画
+// 反复调用——绑定语义本来就是"打开那一刻"，没必要每次都重算一遍同一个字符串。
+function chatRenderOriginHint() {
+    try {
+        const el = document.getElementById('aiChatOriginHint');
+        if (!el) return;
+        const origin = ChatState.contextOrigin;
+        if (origin !== 'editor' && origin !== 'translator') { el.hidden = true; return; }
+        el.hidden = false;
+        if (origin === 'translator') {
+            el.textContent = '上下文：翻译原文';
+            el.title = '这个对话窗是从「AI 翻译器」窗口打开的：每一轮自动带上左栏整篇待翻译原文'
+                + '（按 [行号] 编号，不含译文），外加你手动标出的「额外关注」。打开期间不会变——'
+                + '关掉重开、且当时是在编辑器主界面打开，才会换成文件树概览。';
+        } else {
+            el.textContent = '上下文：编辑器（文件树+标注）';
+            el.title = '这个对话窗是从编辑器主界面打开的：每一轮自动带上项目文件树结构概览'
+                + '（只有文件/目录名，不含内容），外加你手动标出的「额外关注」。打开期间不会变——'
+                + '关掉重开、且当时是在「AI 翻译器」窗口打开，才会换成翻译原文。';
+        }
+    } catch (e) { console.error('[chat] renderOriginHint failed', e); }
 }
 
 // v2 Pass P45（F4）：AI agent 的文件读写能力"能不能用一眼看清"——原来完全没有按钮、没有
@@ -20638,7 +20730,9 @@ function chatParamsSave() {
             stream: !!ChatState.stream,
             keepReasoning: !!ChatState.keepReasoning,
             paramsOpen: !!ChatState.paramsOpen,
-            autoContext: !!ChatState.autoContext,
+            // v2 Pass P100：autoContext 已删除（不再是可持久化的用户选项，contextOrigin
+            // 是每次打开时现算的，不存）。旧存量键就此不再写入——下次保存这个 JSON blob
+            // 会自然把它挤掉，不需要额外的清理代码。
             showThinking: !!ChatState.showThinking,
             autoApprove: !!ChatState.autoApprove
         }));
@@ -20681,7 +20775,8 @@ function chatParamsLoad() {
         if (typeof p.stream === 'boolean') ChatState.stream = p.stream;
         if (typeof p.keepReasoning === 'boolean') ChatState.keepReasoning = p.keepReasoning;
         if (typeof p.paramsOpen === 'boolean') ChatState.paramsOpen = p.paramsOpen;
-        if (typeof p.autoContext === 'boolean') ChatState.autoContext = p.autoContext;
+        // v2 Pass P100：旧存量键 p.autoContext 刻意不再读——即使 localStorage 里还躺着老
+        // 版本存的那个布尔值，也绝不会被读回 ChatState（该字段本身已经删除）。
         if (typeof p.showThinking === 'boolean') ChatState.showThinking = p.showThinking;
         if (typeof p.autoApprove === 'boolean') ChatState.autoApprove = p.autoApprove;
     } catch (e) {}
@@ -22355,6 +22450,21 @@ function chatFmtNum(n) {
     return String(v).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
 }
 
+// v2 Pass P100：token 计数 K 单位化。K = 1024（不是 1000——上下文长度本来就是 2 的幂）。
+// 规则（任务书原话）：分母带 K；分子跟分母共用同一个单位，**不**在分子上重复写 K；
+// 低于 1K 的值恒定显示一位小数（比如 0.5），不许四舍五入成没有信息量的 "0"；
+// 1K 及以上：四舍五入到一位小数，凑巧是整数（比如 245760 → 240）就不画多余的 ".0"，
+// 跟旁边可能出现的 "21.1" 这种真正有小数的值区分开——一眼能看出哪个是凑巧整除的。
+// 只调用点自己决定要不要在结果后面追加 'K'（分母永远追加，分子永远不追加），
+// 这里不内置那个后缀，免得两处调用点各自减一次字符串拼接反而更容易出错。
+function chatFmtK(n) {
+    const v = Math.max(0, Number(n) || 0);
+    const k = v / 1024;
+    if (k < 1) return k.toFixed(1);
+    const r = Math.round(k * 10) / 10;
+    return Number.isInteger(r) ? String(r) : r.toFixed(1);
+}
+
 // —— 文档块 ——
 // C7（对话上下文收窄）：只给**原文**（左栏，被翻译的那一侧），**不给译文**。
 // 用户的原话是「只关联左边的输入内容」——译文是翻译的结果，不是用户在编辑的东西，
@@ -22415,13 +22525,16 @@ function chatCtxWindow() {
 }
 
 // 这一轮的文档上下文。**每次调用都重新读 AppState.translationPairs**。
+// v2 Pass P100：只在这段对话是从「AI 翻译器」窗口打开的（ChatState.contextOrigin ===
+// 'translator'）才生成——旧的「文档」开关删掉了，判据从 ChatState.autoContext 换成了
+// contextOrigin，函数体本身（截窗/token 保险丝/指纹）一个字节没动，逐字复用。
 function chatBuildDocContext() {
     const out = { on: false, text: '', from: 0, to: 0, total: 0, windowed: false,
                   tokens: 0, hashes: null, why: '' };
     try {
         const pairs = Array.isArray(AppState.translationPairs) ? AppState.translationPairs : [];
         out.total = pairs.length;
-        if (!ChatState.autoContext) { out.why = '上下文开关是关的'; return out; }
+        if (ChatState.contextOrigin !== 'translator') { out.why = '这个对话窗绑定的是编辑器上下文，不发送翻译原文'; return out; }
         if (!pairs.length) { out.why = '还没有已翻译的内容'; return out; }
 
         let from = 1, to = pairs.length;
@@ -22477,6 +22590,74 @@ function chatBuildDocContext() {
     return out;
 }
 
+// v2 Pass P100 新增：项目文件树结构概览。只在这段对话是从编辑器主界面打开的
+// （ChatState.contextOrigin === 'editor'）才生成——这是「文档」开关拆分之后编辑器那一半
+// 的新机制，不是复用翻译器那半（chatBuildDocContext 读的是 AppState.translationPairs，
+// 跟编辑器这边打开的项目文件夹毫无关系，调查已确认两者从来就是完全独立的两套状态，
+// 见 progress 记录里的映射决定）。
+//
+// 【为什么不重新走 File System Access 遍历】chatAssembleTurn 是同步函数，可能每次打字都
+// 调一次（chatCtxReadout 的防抖只有 220ms），dirHandle.entries() 也没有同步接口——这里只读
+// 此刻已经渲染在 #ovlTreeBody 里的那份 DOM。没点开过的目录只报目录名 + 「（未展开）」，
+// 不假装知道里面有什么；真实 FSA 建树（ovlBuildTreeDom）和降级路径建树
+// （ovlDomFromFsNode）用的是同一套 class 名（.ovl-tree-ul/.ovl-tree-node/.ovl-tree-row-dir/
+// .ovl-tree-open），这里按 class 走，两条路径不用分别处理。
+const CHAT_TREE_MAX_LINES = 300;   // 概览最多列这么多项，超了就截断、如实告诉模型
+function chatBuildTreeOverview() {
+    const out = { on: false, text: '', tokens: 0, count: 0, truncated: false, why: '' };
+    try {
+        if (ChatState.contextOrigin !== 'editor') { out.why = '这个对话窗绑定的是翻译原文上下文，不发送文件树'; return out; }
+        const body = document.getElementById('ovlTreeBody');
+        const rootUl = body ? body.querySelector(':scope > ul.ovl-tree-ul') : null;
+        if (!rootUl) { out.why = '还没有打开项目文件夹'; return out; }
+
+        const lines = [];
+        let truncated = false;
+        const walk = function (ul, depth) {
+            if (!ul || truncated) return;
+            const kids = ul.children;
+            for (let i = 0; i < kids.length; i++) {
+                if (lines.length >= CHAT_TREE_MAX_LINES) { truncated = true; return; }
+                const li = kids[i];
+                if (!li || !li.classList || !li.classList.contains('ovl-tree-node')) continue;
+                const row = li.querySelector(':scope > .ovl-tree-row');
+                if (!row) continue;
+                const isDir = row.classList.contains('ovl-tree-row-dir');
+                // 目录行文本前面挂着 ▸/▾ 折叠箭头（ovlBuildTreeDom/ovlDomFromFsNode 都这么写），
+                // 概览里只要名字。
+                const name = chatEscapeDelims(String(row.textContent || '').replace(/^[▸▾]\s*/, ''));
+                const indent = '  '.repeat(depth);
+                if (isDir) {
+                    const open = li.classList.contains('ovl-tree-open');
+                    lines.push(indent + name + '/' + (open ? '' : '（未展开）'));
+                    if (open) walk(li.querySelector(':scope > ul.ovl-tree-children'), depth + 1);
+                } else {
+                    lines.push(indent + name);
+                }
+            }
+        };
+        walk(rootUl, 0);
+        out.count = lines.length;
+        out.truncated = truncated;
+        if (!lines.length) { out.why = '项目文件夹是空的'; return out; }
+
+        out.on = true;
+        out.text = '==TREE files=' + out.count + (truncated ? ' truncated=1' : '') + '==\n'
+            + '本轮上下文：项目文件树结构概览，只有文件/目录名，不含任何文件内容。'
+            + '缩进表示层级；目录名后面没写"（未展开）"的，它的直接子项已经列在下面；'
+            + '写了"（未展开）"的目录，用户在文件树里还没点开过，你不知道它下面有什么，'
+            + '不要假装知道，需要时用下面的只读文件工具主动去读。\n'
+            + (truncated ? ('⚠ 这份概览列到第 ' + CHAT_TREE_MAX_LINES + ' 项就截断了，项目里还有更多文件没列出。\n') : '')
+            + lines.join('\n') + '\n==TREEEND==';
+        out.tokens = chatEstTokens(out.text);
+    } catch (e) {
+        console.error('[chat] buildTreeOverview failed', e);
+        out.on = false; out.text = ''; out.tokens = 0;
+        out.why = '生成文件树概览时出错：' + ((e && e.message) || e);
+    }
+    return out;
+}
+
 // 把一整轮要发出去的东西装配好。**这是文档唯一进入 wire 的地方**。
 // pushed=true：调用方（chatSend）已经把这条 user 消息 push 进 ChatState.messages 了，
 //              所以 wire 的最后一条就是它，换成带文档的完整版本。
@@ -22484,27 +22665,27 @@ function chatBuildDocContext() {
 //              （早先这里无条件替换最后一条，估算路径上会把助手那条回复顶掉，算出来偏小。）
 // 返回 { wire, sys, doc, parts }，parts 是分项估算（给用量环的分解面板对账用）。
 function chatAssembleTurn(draft, pushed) {
+    // v2 Pass P100：doc（==DOC== 翻译原文）和 tree（==TREE== 文件树概览）互斥地各管各的一半
+    // ——doc.on 只在 ChatState.contextOrigin==='translator' 时可能为真，tree.on 只在
+    // ==='editor' 时可能为真，两个函数内部各自判自己的门槛，这里不需要再判一次 contextOrigin。
     const doc = chatBuildDocContext();
+    const tree = chatBuildTreeOverview();
     // 关注块**每一轮也是现算的**，和文档块同一条纪律：它从不写进 ChatState.messages，
     // 所以压缩 / 清理都够不着它，而勾掉一处关注下一轮立刻就不带了。
     // 这里只**解析**关注（解不出来的自己跳过），作废是 focusRevalidate 的事 ——
     // 本函数也被「下一轮大约要花多少」的估算路径调用，估一次算一次绝不能顺手删用户的标记。
     //
-    // v2 Pass P99：与「文档」开关（ChatState.autoContext）**解耦，无条件生成**。旧版曾把
-    // 这行绑在文档开关上（"跟着上下文开关走"——理由是关注条目带的是稿子原文逐字，算文档
-    // 正文的一部分，上下文关掉还照发就等于开关说了谎）。但这个联动是纯粹的实现细节，用户
-    // 的心智模型是「chip 是我手动挑的重点，跟要不要发整篇原文是两件事」：挂了 chip、又顺手
-    // 关了「文档」开关，模型收到的却是「什么标注都没有」——且 UI（focusRenderChip）从不
-    // 提示这个联动，chip 列表照样写着「额外关注 · N 处」，用户没有任何信号知道这一轮全部
-    // 作废。这是一次真实的用户可见 bug（诊断见 .claude/tmp/diag_p99_chips.md）。
-    // 现在：chip 存在就发，不看 doc.on。文档开关只管 ==DOC== 那一块要不要发（下面
-    // `doc.on ? doc.text + ... : ''`），两件事各管各的，互不牵连。
+    // v2 Pass P99：与旧的「文档」开关**解耦，无条件生成**——挂了 chip 就一定发，
+    // 不受这个对话窗此刻绑定的是 translator 还是 editor 影响（诊断见 .claude/tmp/diag_p99_chips.md）。
+    // v2 Pass P100：旧开关本身也已经删除，doc.on/tree.on 现在各自看 ChatState.contextOrigin
+    // 是不是恰好等于自己那一半，两者天然互斥（同一时刻最多一个为真），但 focusBlock 这行
+    // 完全不受影响，逐字照旧。
     const focusBlock = focusWireBlock();
-    const sys = chatSystemPrompt(!!ChatState.target, doc.on, !!focusBlock);
+    const sys = chatSystemPrompt(!!ChatState.target, doc.on, !!focusBlock, null, tree.on);
     const wire = chatWireHistory();
     // 关注块跟着「这一轮的提问」一起计入 draft 那一项 —— 它和附加选段一样，是最后一条 user 消息的一部分。
     const tail = (focusBlock ? focusBlock + '\n\n' : '') + chatBuildTargetTurn(draft, !doc.on);
-    const full = (doc.on ? doc.text + '\n\n' : '') + tail;
+    const full = (doc.on ? doc.text + '\n\n' : '') + (tree.on ? tree.text + '\n\n' : '') + tail;
     if (pushed && wire.length) wire[wire.length - 1] = { role: 'user', content: full };
     else wire.push({ role: 'user', content: full });
     let hist = 0;
@@ -22518,9 +22699,11 @@ function chatAssembleTurn(draft, pushed) {
         wire: wire,
         sys: sys,
         doc: doc,
+        tree: tree,
         parts: {
             system: chatEstTokens(sys),
             document: doc.on ? doc.tokens : 0,
+            tree: tree.on ? tree.tokens : 0,
             history: Math.max(0, hist - reasoningBack),
             reasoning: reasoningBack,
             draft: chatEstTokens(tail)
@@ -22554,8 +22737,8 @@ function chatWireReasoningCost() {
 // （比如「回传的思考」）却只改了一边，残差就会凭空多出/少掉那一项，而面板会显得像是估算变差了。
 function chatPartsSum(p) {
     if (!p) return 0;
-    return (Number(p.system) || 0) + (Number(p.document) || 0) + (Number(p.history) || 0)
-         + (Number(p.reasoning) || 0) + (Number(p.draft) || 0);
+    return (Number(p.system) || 0) + (Number(p.document) || 0) + (Number(p.tree) || 0)
+         + (Number(p.history) || 0) + (Number(p.reasoning) || 0) + (Number(p.draft) || 0);
 }
 
 // 当前上下文的「身份」。和上一次实测时的身份一致 ⇒ 环继续显示那个实测值；只要有一处变了
@@ -22565,8 +22748,10 @@ function chatCtxSig(docSig, draftLen) {
     const c = chatModelChoice();
     // keepReasoning 也在身份里：它一开一关，实际发出去的载荷就差了整整一份思考文本，
     // 那时候还把上一轮的实测值当作「现在的用量」显示，就是拿一个已经失效的测量在充数。
+    // v2 Pass P100：autoContext 换成 contextOrigin——它现在是打开那一刻绑死的字符串，
+    // 但换文档/关掉重开等仍然可能让它在两次身份计算之间变化，照旧要占身份的一位。
     return [ChatState.messages.length, docSig, draftLen, c.provider + ':' + c.model,
-            ChatState.autoContext ? 1 : 0, ChatState.target ? 1 : 0,
+            ChatState.contextOrigin || '', ChatState.target ? 1 : 0,
             ChatState.keepReasoning ? 1 : 0, focusSig()].join('|');
 }
 
@@ -22627,8 +22812,10 @@ function chatRingHtml(ro) {
     const shown = (frac > 0 && frac < 0.02) ? 0.02 : frac;      // 最小可见刻度
     const d = chatArcPath(11, 11, 8, shown);
     const pct = (w.known && w.denom > 0) ? (frac * 100) : null;
-    const label = (ro.measured ? '' : '≈') + chatFmtNum(ro.tokens)
-        + (pct === null ? ' tok' : (' / ' + chatFmtNum(w.denom) + '  ' + pct.toFixed(pct < 10 ? 1 : 0) + '%'));
+    // v2 Pass P100：K 单位化——分母不知道时（pct===null）没有共用单位可借，分子自己带 K；
+    // 分母已知时分子跟分母共用一个单位，分子不重复写 K（"21.1/240K"，不是 "21.1K/240K"）。
+    const label = (ro.measured ? '' : '≈') + chatFmtK(ro.tokens)
+        + (pct === null ? 'K tok' : ('/' + chatFmtK(w.denom) + 'K ' + pct.toFixed(pct < 10 ? 1 : 0) + '%'));
     const tip = (ro.measured
             ? '实线 = 实测值：这就是上一轮服务器回报的 usage.prompt_tokens，不是估算。'
             : '虚线 + ≈ = 估算值：这一轮还没发出去（或者内容自上次实测后变了），'
@@ -22647,8 +22834,12 @@ function chatRingHtml(ro) {
         + '</svg><span>' + escapeHtml(label) + '</span></button>';
 }
 
-// 底部状态条：环 + 上下文开关 + 会话 + 「历史怎么裁的」那句老话。
+// 底部状态条：环 + 会话 + 「历史怎么裁的」那句老话。
 // 历史长了要花的是用户的钱（在线模型），不告诉他等于替他做决定。
+// v2 Pass P100：原来这里还有一颗「文档 开/关」按钮（#aiChatCtxToggle）——现在删掉了。
+// 上下文来源不再是用户能中途点着切换的东西，改成聊天窗**打开那一刻**按界面自动绑定
+// （ChatState.contextOrigin，见 chatOpen()），绑定结果显示在窗口顶部的只读小字里
+// （#aiChatOriginHint，chatRenderOriginHint()），不是这条底部状态条的职责了。
 function chatUpdateBar() {
     try {
         const bar = document.getElementById('aiChatBar');
@@ -22656,36 +22847,9 @@ function chatUpdateBar() {
         // 关注清单和状态条一起刷新：它就在输入框上方，用户永远看得见「这一轮会带哪几处重点」。
         try { focusRenderChip(); } catch (eF) {}
         const ro = chatCtxReadout();
-        const doc = ro.assembled.doc;
-
-        // v2 Pass P99：这颗 tip 以前说「关掉之后 ==DOC== 和 ==FOCUS== 都不再发」——那是
-        // chatAssembleTurn 里那个已解除的强绑定的直接后果，用户挂着 chip、关了这个开关，
-        // 标注被静默吞掉却毫无提示。现在关注块跟这个开关完全解耦、无条件发送，这里如实改写。
-        const ctxTip = ChatState.autoContext
-            ? '开着：每一轮都把**左栏整篇原文**（只有原文，没有译文——模型看不到译文）按 [行号] '
-              + '重新生成一遍发过去（不是存下来的旧副本）。'
-              + '所以压缩之后原文还在、清理之后第一轮就带全文、重译之后带的是新原文。'
-              + '关掉之后 ==DOC== 文档块不再发；但**窗口里已有的对话轮次照旧会发**，'
-              + '而模型早先的回答里可能引用过你的原文 —— 要连那些一起断掉得再点「清理」。'
-              + '（额外关注的 ==FOCUS== 块不受这个开关影响，挂了 chip 就一定发，见下方「额外关注」区域。）'
-            : '关着：这一轮不发 ==DOC== 文档块（模型看不到整篇原文）。'
-              + '窗口里已有的对话轮次、以及已经挂上的额外关注 chip（==FOCUS== 块）照样会发 —— '
-              + 'chip 是你自己手动挑的重点，跟要不要发整篇原文是两件事，不跟着这个开关走。'
-              + '模型早先的回答里可能引用过你的原文，要连那些一起断掉，用「清理」开一段新对话。';
-        // 【这颗按钮的字必须说的是「开关本身」，不是「这一轮碰巧有没有内容可发」】
-        // 早先没内容时它写「文档 关（还没有已翻译的内容）」，而开关其实是**开**的、按钮还带着
-        // is-on。用户照字面意思去点，反倒把上下文真的关掉了 —— 一个标签把用户推去做它警告的事。
-        const docLabel = doc.on
-            ? ('文档 ' + doc.from + '–' + doc.to + '/' + doc.total + ' 行' + (doc.windowed ? '（已截窗）' : ''))
-            : (ChatState.autoContext
-                ? ('文档 开' + (doc.why ? '（' + doc.why + '）' : ''))
-                : '文档 关（点一下打开）');
 
         bar.innerHTML = '<div class="aichat-ctxrow">'
             + chatRingHtml(ro)
-            + '<button type="button" class="aichat-minibtn' + (ChatState.autoContext ? ' is-on' : '') + '"'
-            + ' id="aiChatCtxToggle" data-tip="' + escapeAttr(ctxTip) + '" data-tip-pos="top">'
-            + escapeHtml(docLabel) + '</button>'
             + '<span class="aichat-pspacer"></span>'
             + '<button type="button" class="aichat-minibtn' + (ChatState.panel === 'history' ? ' is-on' : '') + '"'
             + ' id="aiChatHistBtn" data-tip="'
@@ -22716,8 +22880,6 @@ function chatUpdateBar() {
 
         const ring = bar.querySelector('#aiChatRingBtn');
         if (ring) ring.addEventListener('click', function () { chatTogglePanel('ctx'); });
-        const ctxBtn = bar.querySelector('#aiChatCtxToggle');
-        if (ctxBtn) ctxBtn.addEventListener('click', function () { chatSetAutoContext(!ChatState.autoContext); });
         const histBtn = bar.querySelector('#aiChatHistBtn');
         if (histBtn) histBtn.addEventListener('click', function () { chatTogglePanel('history'); });
 
@@ -22738,20 +22900,8 @@ function chatRingSoon() {
     } catch (e) {}
 }
 
-function chatSetAutoContext(on) {
-    try {
-        ChatState.autoContext = !!on;
-        chatParamsSave();
-        chatUpdateBar();
-        chatAppendRow('system', on
-            ? '已打开文档上下文：从这一轮起，每次提问都会把左栏整篇原文（按 [行号] 编号，不含译文）一并发过去。'
-            : '已关闭文档上下文：从这一轮起不再发送 ==DOC== 文档块，也不再发送 ==FOCUS== 关注块'
-              + '（关注条目带的就是稿子原文，它跟着这个开关走）。'
-              + '⚠ 但**已经在窗口里的对话轮次照旧会发**，而模型早先的回答里可能引用过你的原文'
-              + '（实测：关掉开关之后，助手上一轮那句「时延满足 $\\alpha_i \\le \\beta$」仍然在历史里发了出去）。'
-              + '要连这些一起断掉，请用「清理」开一段新对话 —— 开关关着 + 对话清空，才是一个字节的文档都不带。');
-    } catch (e) { console.error('[chat] setAutoContext failed', e); }
-}
+// v2 Pass P100：chatSetAutoContext() 整个删除——「文档」开关不存在了，上下文来源不再是
+// 一个用户能点着切换的运行时状态，见 chatOpen() 里 ChatState.contextOrigin 的绑定点。
 
 function chatTogglePanel(name) {
     try {
@@ -22832,6 +22982,7 @@ function chatCtxPanelNode(ro) {
         // 而不能只写「模板开销」假装它是纯粹的模板成本。
         kv('系统提示（估算）', '≈' + chatFmtNum(u.parts.system) + ' tok');
         kv('文档上下文（估算）', '≈' + chatFmtNum(u.parts.document) + ' tok');
+        kv('文件树概览（估算）', '≈' + chatFmtNum(u.parts.tree || 0) + ' tok');
         kv('对话历史（估算）', '≈' + chatFmtNum(u.parts.history) + ' tok');
         chatReasoningSliceRows(kv, u.parts.reasoning, u.reasoningTokens);
         kv('本轮提问（估算）', '≈' + chatFmtNum(u.parts.draft) + ' tok');
@@ -22860,6 +23011,7 @@ function chatCtxPanelNode(ro) {
     } else {
         kv('系统提示', '≈' + chatFmtNum(ro.parts.system) + ' tok');
         kv('文档上下文', '≈' + chatFmtNum(ro.parts.document) + ' tok');
+        kv('文件树概览', '≈' + chatFmtNum(ro.parts.tree || 0) + ' tok');
         kv('对话历史', '≈' + chatFmtNum(ro.parts.history) + ' tok');
         chatReasoningSliceRows(kv, ro.parts.reasoning,
                                (ChatState.usage && ChatState.usage.reasoningTokens) || 0);
@@ -22887,6 +23039,17 @@ function chatCtxPanelNode(ro) {
                            : '。整篇都在，每一轮重新生成，不是存下来的副本。'))
         : ('文档上下文：未发送（' + (doc.why || '已关闭') + '）。');
     box.appendChild(dn);
+
+    // v2 Pass P100 新增：文件树概览的状态说明，跟文档上下文那一行同一个位置、同一套写法。
+    const tree = ro.assembled.tree;
+    if (tree) {
+        const tn = document.createElement('div');
+        tn.className = 'aichat-panel-note';
+        tn.textContent = tree.on
+            ? ('文件树概览：' + tree.count + ' 项' + (tree.truncated ? '（已截断，项目里还有更多）' : '') + '。')
+            : ('文件树概览：未发送（' + (tree.why || '未绑定编辑器上下文') + '）。');
+        box.appendChild(tn);
+    }
 
     // —— 压缩预估：先给数，再动手 ——
     if (ChatState.pendingCompact) {
@@ -22990,7 +23153,8 @@ function chatCompactStart() {
             chatUpdateBar();
             chatAppendRow('error', '压缩帮不上忙：光是文档上下文就要 ≈' + chatFmtNum(doc.tokens)
                 + ' tok，已经超过可用窗口 ' + chatFmtNum(w.denom)
-                + ' tok。把对话压缩到零也装不下。请减少粘贴的段落，或者把「文档」开关关掉再问。');
+                + ' tok。把对话压缩到零也装不下。请减少粘贴的段落，或者把这个对话窗关掉、'
+                + '从编辑器主界面重新打开——那样这一轮就不会带整篇原文，改发文件树概览。');
             return;
         }
         if (msgs.length <= CHAT_COMPACT_KEEP + 1) {
@@ -23691,6 +23855,17 @@ function chatOpen() {
             // 记住是谁把窗口打开的，关的时候把焦点还回去。不还 = 键盘用户被丢在 <body> 上。
             const active = document.activeElement;
             ChatState.lastFocus = (active && active !== document.body) ? active : null;
+            // v2 Pass P100：聊天窗**打开那一刻**按当前界面绑定这一整段对话的上下文来源——
+            // body.ovl-translator-open 是「AI 翻译器」浮层是否正开着的唯一真值
+            // （见 ovlOpenTranslator/ovlCloseTranslator），开着就说明用户此刻是从翻译器窗口
+            // 点的打开对话；没这个 class 就是编辑器主界面（默认视图）。这里只在真正的
+            // 「关→开」转折点判断一次，写进 ChatState.contextOrigin；chatAssembleTurn 全程
+            // 只读它，不会因为窗口开着期间用户切界面而重新绑定——绑定语义就是「打开那一刻」，
+            // 关闭重开才会按新的打开位置重新判一次。弹出到独立 OS 窗口也不影响：弹出只搬
+            // DOM 节点（见 ovlPopOutMoveNodes），ChatState 是同一份 JS 状态，不会被重置。
+            ChatState.contextOrigin = document.body.classList.contains('ovl-translator-open')
+                ? 'translator' : 'editor';
+            try { chatRenderOriginHint(); } catch (eH) {}
         }
         ChatState.open = true;
         // 用户还没碰过尺寸/位置（mode 'auto'）时，每次打开都按当前视口重新自动排一次；
