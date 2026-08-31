@@ -33847,9 +33847,13 @@ const OVL_P2T_SYSTEM_PROMPT = [
     "   % BBOX: x0,y0,x1,y1",
     "   x0,y0 = top-left corner, x1,y1 = bottom-right corner, as fractions of the FULL page image",
     "   width/height (each in [0.0, 1.0], origin at the page's top-left corner -- normal screen/image",
-    "   coordinates, NOT PDF coordinates). Estimate generously; never cut off part of the figure.",
-    "   Emit this BBOX line for every figure even when you also have a ready-made image file for it",
-    "   in AVAILABLE IMAGES (harmless in that case, it will simply be ignored downstream). Then emit:",
+    "   coordinates, NOT PDF coordinates). This box MUST cover the figure's COMPLETE graphical",
+    "   region: if the figure has several sub-panels/sub-plots that share ONE caption below them,",
+    "   give a SINGLE box that covers ALL of the sub-panels together, not just one of them. Do NOT",
+    "   include the caption text itself inside the box. Estimate generously; never cut off part of",
+    "   the figure. This box is used to crop the figure directly out of the page image, so give it",
+    "   even when a ready-made image file is also listed for it in AVAILABLE IMAGES (it is still",
+    "   used downstream to judge whether that image file actually covers the whole figure). Then emit:",
     "   \\begin{figure}[htbp]\\centering",
     "   \\includegraphics[width=\\linewidth]{<one of the file names from AVAILABLE IMAGES>}",
     "   \\caption{<the caption printed on the page, verbatim; if there is none, write: Figure from page N>}",
@@ -34253,12 +34257,19 @@ async function ovlP2TRenderPageToPng(page, maxPx) {
     return { pngBlob: pngBlob, sendBlob: sendBlob, sentAsJpeg: sentAsJpeg, width: viewport.width, height: viewport.height };
 }
 
-// ==================== v2 Pass P86 §1.2：图片 bbox 裁剪兜底（矢量图/提取失败） ====================
-// system prompt 规则 7 让模型在正文里对"它认定为图"的区域标一行 "% BBOX: x0,y0,x1,y1"（0-1
-// 归一化，紧邻 \begin{figure} 之前）。M1 默认引用的是整页截图（assets/pages/page-NN.png）；
-// 如果该图其实是 M2 已经精确提取到的真实位图（assets/img/...），bbox 没有意义，跳过裁剪，
-// 只清掉注释行。只有仍然引用整页截图的情况（矢量图 / M2 没扫到 / M2 提取失败降级）才真正
-// 从页面栅格上裁一刀，避免把一整页塞进 \includegraphics。
+// ==================== v2 Pass P86 §1.2 / v2 Pass P95：图片 bbox 区域裁剪（主路径）+ 内嵌
+// 位图覆盖率优化（次路径） ====================
+// system prompt 规则 7 让模型在正文里对"它认定为图"的完整图形区域（含全部子图、不含题注）
+// 标一行 "% BBOX: x0,y0,x1,y1"（0-1 归一化，紧邻 \begin{figure} 之前）。
+//
+// v2 Pass P95 反转优先级（用户实测铁证：复合图——矢量框架内嵌栅格图层——旧逻辑"抽到一个
+// 内嵌位图图层就算成功"，只留下位图那一小块，比如 DeepLaDu Fig.1 只剩背景地球仪，丢了整个
+// 组合图；横跨双栏的四联图同理只抽出其中一个子图）：不再是"引用 M2 真实位图就无条件跳过
+// 裁剪"，而是默认总是按 bbox 从整页栅格上裁一刀（所见即所得，天然覆盖多子图/矢量标注/双栏
+// 全宽内容），只有当模型引用的内嵌位图的放置矩形（ovlP2TScanPageImages 用 getOperatorList
+// 的 CTM 换算出来的归一化矩形，见 imgRects 参数）覆盖 bbox 面积 ≥90% 时，才认定"这就是整张
+// 图、原生分辨率通常更高，没必要裁"，跳过裁剪直接沿用位图。覆盖率算不出来（M2 关闭 / 引用的
+// 文件不在 imgRects 里）一律按裁剪处理，不猜——放弃优化路径，不代表放弃正确性。
 function clamp01(n) { return Math.max(0, Math.min(1, isFinite(n) ? n : 0)); }
 function ovlP2TCropCanvasRegion(canvas, x0, y0, x1, y1) {
     const sx = Math.round(x0 * canvas.width), sy = Math.round(y0 * canvas.height);
@@ -34269,23 +34280,51 @@ function ovlP2TCropCanvasRegion(canvas, x0, y0, x1, y1) {
     out.getContext('2d').drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
     return out;
 }
+// 内嵌位图的放置矩形覆盖模型 bbox 区域的比例——分子是交集面积，分母固定用 bbox 自身面积
+// （不是并集/不是位图面积），语义是"这个位图盖住了模型标的完整图形区域的百分之多少"，位图比
+// bbox 更大（比如带出血）时会被 Math.min 夹在交集里，比例最高到 1，不会 >1。
+function ovlP2TRectCoverFrac(bboxRect, otherRect) {
+    if (!bboxRect || !otherRect) return 0;
+    const ix0 = Math.max(bboxRect.x0, otherRect.x0), iy0 = Math.max(bboxRect.y0, otherRect.y0);
+    const ix1 = Math.min(bboxRect.x1, otherRect.x1), iy1 = Math.min(bboxRect.y1, otherRect.y1);
+    const iw = Math.max(0, ix1 - ix0), ih = Math.max(0, iy1 - iy0);
+    const interArea = iw * ih;
+    const bboxArea = Math.max(1e-9, (bboxRect.x1 - bboxRect.x0) * (bboxRect.y1 - bboxRect.y0));
+    return interArea / bboxArea;
+}
+const OVL_P2T_BBOX_COVER_THRESHOLD = 0.90;
+// 裁剪专用渲染倍率：bbox 是 0-1 归一化比例，跟渲染分辨率无关，可以放心用比送模型看图那张
+// 更高的分辨率单独重渲一次整页（不是同一张 canvas），换更清晰的裁剪产物——不影响发给模型的
+// 那张图（继续用 OvlSettings.pdf2texMaxPx 原值，两处渲染互不干扰）。
+const OVL_P2T_CROP_RENDER_MULT = 2;
 const OVL_P2T_BBOX_RE = /% BBOX:\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\r?\n\s*\\begin\{figure\}[\s\S]*?\\includegraphics\[[^\]]*\]\{([^}]+)\}/g;
-async function ovlP2TApplyFigureCrops(page, text, job, num, maxPx) {
+// imgRects：{ 相对路径 -> {x0,y0,x1,y1} }，来自本页 M2 提取阶段记录的每张内嵌位图放置矩形
+// （ovlP2TConvertOnePage 里 ovlP2TScanPageImages 的产物）；拿不到（M2 关闭/未命中/调用方
+// 没传）就传 null/undefined/{}，一律按"覆盖率未知"处理，全部走主路径裁剪。
+async function ovlP2TApplyFigureCrops(page, text, job, num, maxPx, imgRects) {
     OVL_P2T_BBOX_RE.lastIndex = 0;
     const matches = [...text.matchAll(OVL_P2T_BBOX_RE)]; // 先收集，避免裁剪写盘是 async 而 replace 是同步
-    if (!matches.length) return { text: text, cropsMade: 0 };
-    let cropsMade = 0, out = text, k = 0, renderedCanvas = null; // 惰性渲染，命中第一条才真的渲一次整页
+    if (!matches.length) return { text: text, cropsMade: 0, bitmapKept: 0 };
+    let cropsMade = 0, bitmapKept = 0, out = text, k = 0, renderedCanvas = null; // 惰性渲染，命中第一条真裁剪才真的渲一次整页
     for (let mi = 0; mi < matches.length; mi++) {
         const mm = matches[mi];
         const full = mm[0], x0s = mm[1], y0s = mm[2], x1s = mm[3], y1s = mm[4], imgName = mm[5];
-        // 只处理"引用的是整页截图兜底文件"这一种——真正提取到的 M2 位图已经是精确小图，不用再裁
-        if (imgName.indexOf('assets/pages/page-') !== 0) continue;
         const x0 = clamp01(parseFloat(x0s)), y0 = clamp01(parseFloat(y0s));
         const x1 = clamp01(parseFloat(x1s)), y1 = clamp01(parseFloat(y1s));
-        // 校验：越界/反向/退化（<2% 页面宽或高）一律跳过，原样保留整页引用，不裁出一张空图
+        // 校验：越界/反向/退化（<2% 页面宽或高）一律跳过，原样保留原引用，交给外层三级兜底判断
         if (!(x1 > x0 + 0.02 && y1 > y0 + 0.02)) continue;
+        const bboxRect = { x0: x0, y0: y0, x1: x1, y1: y1 };
+        const bitmapRect = imgRects && imgRects[imgName];
+        if (bitmapRect && ovlP2TRectCoverFrac(bboxRect, bitmapRect) >= OVL_P2T_BBOX_COVER_THRESHOLD) {
+            // 次路径（优化）：内嵌位图已经覆盖了模型标的完整图形区域 ≥90%——就是整张图，原生
+            // 分辨率通常比裁剪更高，沿用它，只清掉 BBOX 注释行（走下面的兜底 replace）。
+            bitmapKept++;
+            continue;
+        }
+        // 主路径：区域裁剪——不管模型引用的是整页截图兜底、还是覆盖率不够的内嵌位图（复合图
+        // 场景：位图只是其中一层，bbox 才是完整图形区域），一律从整页栅格上按 bbox 裁一刀。
         if (!renderedCanvas) {
-            const rendered = await ovlP2TRenderPageToCanvas(page, maxPx);
+            const rendered = await ovlP2TRenderPageToCanvas(page, (Number(maxPx) || 1800) * OVL_P2T_CROP_RENDER_MULT);
             renderedCanvas = rendered.canvas;
         }
         const crop = ovlP2TCropCanvasRegion(renderedCanvas, x0, y0, x1, y1); // 同步，纯 canvas 操作
@@ -34302,11 +34341,11 @@ async function ovlP2TApplyFigureCrops(page, text, job, num, maxPx) {
         cropsMade++;
     }
     if (renderedCanvas) { renderedCanvas.width = 0; renderedCanvas.height = 0; } // 用完立刻释放，同 §4.5.7i 纪律
-    // 兜底：没被上面处理到的残留 "% BBOX: ..." 行（比如已经是 M2 真实位图、被 continue 跳过的）
-    // 一律原样剥掉——它们已经完成使命（M2 真实位图不需要裁剪），留在正文里会变成一行游离注释，
+    // 兜底：没被上面处理到的残留 "% BBOX: ..." 行（比如覆盖率达标走了次路径位图、或越界/退化
+    // 被 continue 跳过的）一律原样剥掉——它们已经完成使命，留在正文里会变成一行游离注释，
     // 不影响编译（是合法 % 注释）但不美观，剥掉更干净。
     out = out.replace(/^% BBOX:.*\r?\n(?=\s*\\begin\{figure\})/gm, '');
-    return { text: out, cropsMade: cropsMade };
+    return { text: out, cropsMade: cropsMade, bitmapKept: bitmapKept };
 }
 
 // ==================== v2 Pass P86 §4：一句一行确定性后处理 ====================
@@ -34706,6 +34745,9 @@ function ovlP2TAssembleMain(job) {
         + '\\usepackage{algorithm}\n'
         + '\\usepackage[noend]{algpseudocode}\n'
         + '\\usepackage{url}\n'
+        // v2 Pass P95：题注带原文编号改用 \caption*{Fig. X. ...}（星号版本不触发 LaTeX 自己
+        // 的浮动体编号），\caption* 本身是 caption 宏包提供的命令，article.cls 原生不认识。
+        + '\\usepackage{caption}\n'
         + '\\usepackage{hyperref}\n'
         + '\\setlength{\\parskip}{0.4em}\n'
         + '\\begin{document}\n\n';
@@ -34847,15 +34889,77 @@ async function ovlP2TApplyReferencesPipeline(job, rawMainText) {
 // 源码里出现的先后计数，figure* 跟 figure 共用同一个计数器）——用这个顺序号 X 去匹配正文里
 // "Fig. X" 之类的引用，也用来给核验报告里的图片提取清单编号。§2 的搬移 / §4 的兜底两处必须
 // 用同一份枚举，不能各扫一遍各算各的号。
+//
+// v2 Pass P95：题注改成 \caption*{Fig. X. 原题注文字}（原文印刷编号，见
+// ovlP2TReformatFigureCaptions）之后，这个"号"不再是纯位置计数——优先从题注本身解析出的
+// 印刷编号（跟正文 "Fig. X" 引用天然对得上，题注就写着这个号），解析不出来（旧格式题注 /
+// 模型按 prompt 规则 7 兜底写的 "Figure from page N"）才退回位置序号，跟改动前逐字节一致，
+// 不会因为解析失败破坏旧行为。
+const OVL_P2T_CAPTION_LEAD_NUM_RE = /^\s*Fig(?:s|ure|ures)?\.?\s*~?\s*(\d+)\s*[.:\-–—]?\s*/i;
+function ovlP2TParseCaptionLeadNum(captionText) {
+    const m = OVL_P2T_CAPTION_LEAD_NUM_RE.exec(captionText || '');
+    if (!m) return { num: null, rest: captionText || '' };
+    return { num: m[1], rest: captionText.slice(m[0].length) };
+}
 const OVL_P2T_FIGURE_ENV_RE = /\\begin\{(figure\*?)\}[\s\S]*?\\end\{\1\}/g;
 function ovlP2TEnumerateFigureBlocks(text) {
     OVL_P2T_FIGURE_ENV_RE.lastIndex = 0;
     const blocks = [];
     let m;
     while ((m = OVL_P2T_FIGURE_ENV_RE.exec(text))) {
-        blocks.push({ num: blocks.length + 1, start: m.index, end: m.index + m[0].length, text: m[0] });
+        const positional = blocks.length + 1;
+        let num = positional;
+        const capOpen = m[0].search(/\\caption\*?\s*\{/);
+        if (capOpen !== -1) {
+            const braceOpenAbs = m.index + m[0].indexOf('{', capOpen);
+            const braceCloseAbs = ovlFindMatchingBrace(text, braceOpenAbs);
+            if (braceCloseAbs !== -1) {
+                const parsed = ovlP2TParseCaptionLeadNum(text.slice(braceOpenAbs + 1, braceCloseAbs));
+                if (parsed.num !== null) num = parseInt(parsed.num, 10);
+            }
+        }
+        blocks.push({ num: num, start: m.index, end: m.index + m[0].length, text: m[0] });
     }
     return blocks;
+}
+
+// ==================== v2 Pass P95 §4：题注带原文编号 ====================
+// 生成的图题注从 \caption{<原样透传的印刷文字>} 改成 \caption*{Fig. X. <原样文字（已去掉
+// 开头重复的 "Fig. X" 前缀，避免变成 "Fig. 3. Fig. 3. ..."）>}——星号版本（需要
+// \usepackage{caption}，见 ovlP2TAssembleMain）不触发 LaTeX 自己的浮动体编号，图的"号"永远
+// 就是页面上原样印的那个号；解析不出印刷编号（模型按 prompt 规则 7 兜底写了 "Figure from
+// page N"，或本来就没有印刷编号）就退回这张图在文档里的位置序号——跟 ovlP2TEnumerateFigure-
+// Blocks 用同一套解析规则/同一份兜底策略，两处不能各算各的号。
+// 跳过失败占位片段（ovlP2TFailurePlaceholder 生成，caption 是"第 N 页（自动转换失败...）"
+// 这类中文说明文字，不是真实图注，不该套上假的印刷编号）——判定手法跟 P94 的
+// ovlP2TApplyFigurePageCropFallback 一致：往前看一小段找固定标记"自动转换失败"。
+function ovlP2TReformatFigureCaptions(text) {
+    const blocks = ovlP2TEnumerateFigureBlocks(text);
+    if (!blocks.length) return text;
+    let out = text, offsetShift = 0;
+    blocks.forEach(function (b) {
+        const curStart = b.start + offsetShift, curEnd = b.end + offsetShift;
+        const blockTextNow = out.slice(curStart, curEnd);
+        const lookback = out.slice(Math.max(0, curStart - 200), curStart);
+        if (lookback.indexOf('自动转换失败') !== -1) return; // 失败占位片段：不套原文编号格式
+        const capOpen = blockTextNow.search(/\\caption\*?\s*\{/);
+        if (capOpen === -1) return; // 没有 caption（理论上不会发生，防御性跳过）
+        const braceOpenAbs = curStart + blockTextNow.indexOf('{', capOpen);
+        const braceCloseAbs = ovlFindMatchingBrace(out, braceOpenAbs);
+        if (braceCloseAbs === -1) return; // 花括号不配平：原样放过，不装懂（跟仓库既有纪律一致）
+        const capText = out.slice(braceOpenAbs + 1, braceCloseAbs);
+        const parsed = ovlP2TParseCaptionLeadNum(capText);
+        const num = parsed.num !== null ? parsed.num : String(b.num);
+        const restTrimmed = parsed.rest.replace(/^\s+/, '');
+        const newCapInner = 'Fig. ' + num + '.' + (restTrimmed ? ' ' + restTrimmed : '');
+        const cmdStart = curStart + capOpen;
+        const before = out.slice(0, cmdStart);
+        const after = out.slice(braceCloseAbs); // 从原来的 '}' 开始，原样保留
+        const newOut = before + '\\caption*{' + newCapInner + after;
+        offsetShift += newOut.length - out.length;
+        out = newOut;
+    });
+    return out;
 }
 
 // "Fig./Figs./Figure/Figures" + 可选句点 + 可选 ~（LaTeX 不断行空格）+ 数字，数字后允许一个
@@ -35177,7 +35281,14 @@ async function ovlP2TScanPageImages(page) {
         let vertDesc = 'middle area';
         if (midY > pageH * 0.66) vertDesc = 'upper area';
         else if (midY < pageH * 0.33) vertDesc = 'lower area';
-        results.push({ objId: f.objId, order: f.order, vertDesc: vertDesc });
+        // v2 Pass P95：连同放置矩形一并归一化成跟模型 BBOX 同一套坐标系（原点页面左上角，
+        // y 向下为正，0-1 比例）——PDF 用户坐标是左下原点、y 向上为正，所以 y 要翻转：
+        // 页面顶端对应的是 PDF 坐标里较大的 y（maxY），换算成归一化 y0（更靠上）。用来给
+        // §1.2 的裁剪/位图二选一判断算"这张内嵌位图覆盖了模型标的 bbox 区域的百分之多少"。
+        const rect = (pageW > 0 && pageH > 0)
+            ? { x0: minX / pageW, y0: (pageH - maxY) / pageH, x1: maxX / pageW, y1: (pageH - minY) / pageH }
+            : null;
+        results.push({ objId: f.objId, order: f.order, vertDesc: vertDesc, rect: rect });
     });
     results.sort(function (a, b) { return a.order - b.order; });
     return results;
@@ -35251,6 +35362,10 @@ async function ovlP2TConvertOnePage(job, num) {
         if (rendered.sentAsJpeg) pageState.flags.sentAsJpeg = true;
         const dataUrl = await ovlP2TBlobToDataUrl(rendered.sendBlob);
         let images = ['- assets/pages/page-' + ovlP2TPad2(num) + '.png   (the full page raster; use it ONLY if this page really contains a figure you cannot reproduce as LaTeX)'];
+        // v2 Pass P95：每张内嵌位图的放置矩形（归一化，跟模型 BBOX 同一坐标系），供 §1.2 的
+        // 裁剪/位图二选一判断用——文件名 -> {x0,y0,x1,y1}。M2 关闭/没扫到/提取失败时保持空
+        // 对象，ovlP2TApplyFigureCrops 会按"覆盖率未知"全部走裁剪主路径，不猜。
+        let imgRects = {};
         // M2（§5.1）：能提取到内嵌图就换成真实清单；任何一步失败/没找到 → 原样回落 M1
         // 整页截图行为，并在 flags 里记一笔（README 汇总用），不抛异常、不中断整页转换。
         if (OVL_P2T_M2_AVAILABLE && OvlSettings.pdf2texExtractImages) {
@@ -35265,6 +35380,7 @@ async function ovlP2TConvertOnePage(job, num) {
                         const rel = 'assets/img/page-' + ovlP2TPad2(num) + '-img-' + (k + 1) + '.png';
                         await ovlP2TWriteBinary(job.outRel + '/' + rel, fetched.bytes);
                         extractedLines.push('- ' + rel + '   (' + fetched.width + 'x' + fetched.height + ' px, ' + scanned[k].vertDesc + ' of the page)');
+                        if (scanned[k].rect) imgRects[rel] = scanned[k].rect;
                     }
                     if (extractedLines.length) { images = extractedLines; pageState.flags.imagesExtracted = extractedLines.length; }
                     else { pageState.flags.m2Degraded = true; }
@@ -35314,14 +35430,16 @@ async function ovlP2TConvertOnePage(job, num) {
         pageState.ms = ms;
         pageState.chars = extracted.text.length;
         pageState.flags = Object.assign(pageState.flags || {}, extracted.flags);
-        // v2 Pass P86 §1：bbox 裁剪兜底——只在真的命中 "% BBOX:" 标记且引用的是整页截图时
-        // 才会重新渲染一次整页（惰性，见 ovlP2TApplyFigureCrops 内部）。裁剪失败绝不影响
-        // 本页转换结果——原样保留整页截图引用，跟 M2 降级同一纪律。
+        // v2 Pass P86 §1 / P95：bbox 区域裁剪（主路径）——只在真的命中 "% BBOX:" 标记时才会
+        // 重新渲染一次整页（惰性，见 ovlP2TApplyFigureCrops 内部）；内嵌位图覆盖率 ≥90% 走
+        // 次路径（imgRects 传本页 M2 提取到的放置矩形）。裁剪失败绝不影响本页转换结果——原样
+        // 保留原引用，跟 M2 降级同一纪律。
         let finalText = extracted.text;
         try {
-            const cropped = await ovlP2TApplyFigureCrops(page, finalText, job, num, OvlSettings.pdf2texMaxPx);
+            const cropped = await ovlP2TApplyFigureCrops(page, finalText, job, num, OvlSettings.pdf2texMaxPx, imgRects);
             finalText = cropped.text;
             if (cropped.cropsMade) pageState.flags.figureCropsMade = cropped.cropsMade; // README 汇总用
+            if (cropped.bitmapKept) pageState.flags.figureBitmapKept = cropped.bitmapKept; // README 汇总用（次路径命中数）
         } catch (e) { console.error('[ovl] p2t figure crop failed', num, e); }
         // v2 Pass P86 §4：一句一行确定性后处理——在裁剪之后执行（裁剪替换 \includegraphics
         // 文件名不影响文本的句子结构，两者互相独立；先裁剪、后分句，避免分句逻辑意外把
@@ -35902,6 +36020,11 @@ async function ovlP2TRunPipeline(job) {
         const refsOutcome = await ovlP2TApplyReferencesPipeline(job, rawMainText);
         job.refs = refsOutcome;
         let assembledText = refsOutcome.text;
+        // v2 Pass P95 §4：题注带原文编号——必须先于下面两步（三级兜底 / 按首次引用定位）跑，
+        // 两者都经 ovlP2TEnumerateFigureBlocks 从题注解析"号"，要让它们看到的是重新格式化过
+        // 的 \caption*{Fig. X. ...}，不能先搬位置/先编报告号再改格式，否则两处号不一致。
+        try { assembledText = ovlP2TReformatFigureCaptions(assembledText); }
+        catch (e) { console.error('[ovl] p2t reformat figure captions failed', e); }
         // v2 Pass P91 §4：图片提取三级兜底——main.tex 拼装 + 引用处理完之后，对每张 figure
         // 逐个核实最终提取到没有，位图/bbox 两级都没接住的再兜一次页面裁剪；结果记进
         // job.figureExtraction 供核验报告渲染"图片清单"（任何一张最终仍失败都要出现在里面，
