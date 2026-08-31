@@ -18846,7 +18846,21 @@ const CHAT_AGENT_ZH_TOOLS = ['read_block_translation', 'retranslate_block'];
 // 文档（Code 或 Visual，任意语言）"（见 chatAgentDocHighlightReadiness()）。doc_highlight 只读
 // 定位（不改任何文件/翻译缓存，不需要 chatAgentConfirm 逐次确认），doc_highlight_clear 同档。
 const CHAT_AGENT_HIGHLIGHT_TOOLS = ['doc_highlight', 'doc_highlight_clear'];
-const CHAT_AGENT_TOOLS = ['list_dir', 'read_file'].concat(CHAT_AGENT_WRITE_TOOLS).concat(CHAT_AGENT_ZH_TOOLS).concat(CHAT_AGENT_HIGHLIGHT_TOOLS);
+// v2 Pass P101：三组新工具，全部是既有机制的薄封装，跟上面几条能力线同一套 ==TOOL==/
+// ==TOOLEND== 协议、同一个 chatAgentRunLoop 主循环，各自独立判定就绪/独立系统提示小节，
+// 与 P78/P92 同套路（见各自 exec 函数上方的大注释）：
+//   组1 CHAT_AGENT_STATUS_TOOLS：list_block_status——只读枚举 Visual 块渲染/翻译状态，
+//                                免确认，跟 read_block_translation 同档。
+//   组2 CHAT_AGENT_COMPILE_TOOLS：compile/read_compile_log——封装既有编译入口（P85 核验
+//                                同一条路），免确认（跟浏览文件同档，不破坏任何东西）。
+//   组3 CHAT_AGENT_P2T_WRITE_TOOLS：reconvert_page/recrop_figure——封装既有 P75/P79 单页
+//                                重转 + P86/P95 裁剪机制，会改动磁盘文件，走 chatAgentConfirm
+//                                逐次确认，跟 retranslate_block 同一档。
+const CHAT_AGENT_STATUS_TOOLS = ['list_block_status'];
+const CHAT_AGENT_COMPILE_TOOLS = ['compile', 'read_compile_log'];
+const CHAT_AGENT_P2T_WRITE_TOOLS = ['reconvert_page', 'recrop_figure'];
+const CHAT_AGENT_TOOLS = ['list_dir', 'read_file'].concat(CHAT_AGENT_WRITE_TOOLS).concat(CHAT_AGENT_ZH_TOOLS).concat(CHAT_AGENT_HIGHLIGHT_TOOLS)
+    .concat(CHAT_AGENT_STATUS_TOOLS).concat(CHAT_AGENT_COMPILE_TOOLS).concat(CHAT_AGENT_P2T_WRITE_TOOLS);
 
 // 项目绝对路径：跟 Overleaf 面板"项目绝对路径"输入框共用同一个 DOM 元素（ovlDoRecompile 等
 // 处已有的取法），不新起第二套配置。
@@ -18896,7 +18910,8 @@ function chatAgentToolsSystemBlock() {
         else if (readiness.reason === 'stale-bridge') why = '连着的桥接服务版本过旧（不支持文件操作接口），需要用户重启本地桥接服务';
         return '\n【文件读取工具】这一轮不可用（' + why + '）。'
             + '不要输出 ==TOOL== 块，只能根据上面已经给到你的内容回答，也不要假装自己读过或改过任何'
-            + '没有出现在这段对话里的文件。\n' + chatAgentZhToolsSystemBlock() + chatAgentHighlightToolsSystemBlock();
+            + '没有出现在这段对话里的文件。\n' + chatAgentZhToolsSystemBlock() + chatAgentHighlightToolsSystemBlock()
+            + chatAgentBlockStatusToolsSystemBlock() + chatAgentCompileToolsSystemBlock() + chatAgentP2TWriteToolsSystemBlock();
     }
     return '\n【文件读取工具】用户关注的那句话（如果有的话）只是一个起点——需要的话，你可以主动'
         + '读取甚至修改用户项目文件夹里的文件：它的上下文、它 \\ref/\\cite 指向的定义、supp.tex 等'
@@ -18929,7 +18944,10 @@ function chatAgentToolsSystemBlock() {
         + '6. 写工具执行前用户会看到一个确认弹窗（列出确切路径、受影响的文件清单），你不需要、也没有'
         + '办法替用户点这个确认——每次调用写工具都会真的弹一次，不存在"用户已经同意过了所以这次不用问"。\n'
         + chatAgentZhToolsSystemBlock()
-        + chatAgentHighlightToolsSystemBlock();
+        + chatAgentHighlightToolsSystemBlock()
+        + chatAgentBlockStatusToolsSystemBlock()
+        + chatAgentCompileToolsSystemBlock()
+        + chatAgentP2TWriteToolsSystemBlock();
 }
 
 // v2 Pass P78（H4）：AI 聊天代理诊断/修 Visual 中文预览模式渲染错误的两个工具——跟上面的文件
@@ -19019,6 +19037,15 @@ function chatAgentParseToolCall(raw) {
     if (name === 'doc_highlight'
         && !(Array.isArray(args.snippets) && args.snippets.some(function (s) { return typeof s === 'string' && s.trim(); }))) {
         out.malformed = true; out.reason = 'doc_highlight 缺少必填的 snippets 参数（必须是至少含一个非空字符串的数组）'; return out;
+    }
+    // v2 Pass P101：list_block_status（组1）/compile/read_compile_log（组2）参数全部可选，
+    // 不需要必填校验，跟 list_dir 同一档（{} 就够）。reconvert_page/recrop_figure（组3）
+    // 各自一个必填的正整数编号参数，跟 read_block_translation 的 blockIndex 同一个模式。
+    if (name === 'reconvert_page' && !(Number.isInteger(args.pageNum) && args.pageNum >= 1)) {
+        out.malformed = true; out.reason = 'reconvert_page 缺少必填的 pageNum 参数（必须是 ≥1 的整数）'; return out;
+    }
+    if (name === 'recrop_figure' && !(Number.isInteger(args.figNum) && args.figNum >= 1)) {
+        out.malformed = true; out.reason = 'recrop_figure 缺少必填的 figNum 参数（必须是 ≥1 的整数）'; return out;
     }
     out.tool = name;
     out.args = args;
@@ -19854,6 +19881,7 @@ async function chatAgentExecRetranslateBlock(args, signal, pending) {
     try { cfg = getApiConfig(); } catch (e) { cfg = null; }
     try { if (typeof ovlVisualTransCacheDelete === 'function') ovlVisualTransCacheDelete(srcLatex, cfg); } catch (e) {}
     el.removeAttribute('data-ovl-trans-failed');
+    el.removeAttribute('data-ovl-trans-fail-reason'); // v2 Pass P101：新一轮重译开始，清掉上一次失败留下的原因标记
     el.setAttribute('data-ovl-trans-pending', '1');
     const label = '重新翻译块 #' + idx;
 
@@ -19878,6 +19906,7 @@ async function chatAgentExecRetranslateBlock(args, signal, pending) {
     if (translateErr) {
         el.removeAttribute('data-ovl-trans-pending');
         el.setAttribute('data-ovl-trans-failed', '1');
+        el.setAttribute('data-ovl-trans-fail-reason', ovlVisualTransFailReason(translateErr)); // v2 Pass P101：同上，供 list_block_status 用
         const msg = label + ' 失败（模型调用出错：' + ((translateErr && translateErr.message) || String(translateErr))
             + '。该块已保留原来的内容不受影响，可以再试一次或提醒用户换个 provider/模型）。';
         chatAppendToolRow('🔧 retranslate_block（块 #' + idx + '）· 失败', msg);
@@ -19887,6 +19916,7 @@ async function chatAgentExecRetranslateBlock(args, signal, pending) {
     try { ovlVisualTransCachePut(srcLatex, cfg, newTgt); } catch (e) {}
     el.removeAttribute('data-ovl-trans-pending');
     el.removeAttribute('data-ovl-trans-failed');
+    el.removeAttribute('data-ovl-trans-fail-reason'); // v2 Pass P101：重译成功，清掉旧失败原因标记
     if (document.body.contains(el) && typeof ovlVisualRenderChunk === 'function') el.innerHTML = ovlVisualRenderChunk(newTgt);
     try { if (typeof ovlVisualLangProgressUpdate === 'function') ovlVisualLangProgressUpdate(); } catch (e) {}
 
@@ -20250,6 +20280,604 @@ function chatAgentHighlightToolsSystemBlock() {
         + '一两句话总结高亮了什么内容、命中了几处，如果有未命中的简要说明可能原因。\n';
 }
 
+// ============================================================================
+// v2 Pass P101（组1）：list_block_status —— 枚举当前 Visual 文档所有块的渲染/翻译状态
+// ============================================================================
+// 用户场景（任务书原话）："哪些公式没渲染？"——AI 自己查出清单，再配既有 H4 工具
+// （read_block_translation/retranslate_block）逐处处理，不再反问用户要行号。跟 doc_highlight
+// 同一档：只读、不改任何文件/缓存，不需要 chatAgentConfirm。
+//
+// 五种状态的判定依据（全部是已经存在于 DOM/属性上的真实信号，不猜）：
+//   · 未翻译 / 翻译失败 / 回显守卫拦截 —— 读 data-ovl-trans-pending / data-ovl-trans-failed /
+//     data-ovl-trans-fail-reason（后者是 P101 本次新增的埋点，见 ovlVisualTransFailReason()
+//     上方大注释——DOM 里原本只有一个笼统的"失败"标记，事后无法区分"回显守卫拦住的"还是
+//     其它失败，这里补了这一个属性，不是伪造区分）。
+//   · 退化裸源码 —— 两条路径：①块源码声明是 table/algorithm/figure（OVL_VISUAL_FLOAT_DISPATCH_RE，
+//     跟 ovlVisualRenderChunk 的分发判定同一个正则）但渲染出的 DOM 里没有对应类型该有的结构性
+//     标记（<table>/.ovl-visual-algo-body/.ovl-visual-figure-wrap）——对应 ovlRenderVisualTable
+//     内部"没找到 tabular 环境，诚实退化成散文显示"这条路径，以及 ovlVisualRenderChunk 外层
+//     try/catch"float 渲染失败，退回原有的散文渲染路径"这条路径，两者共同点都是"声明的类型
+//     跟渲染出的结构对不上"。②块里出现 KaTeX 自己产出的 .katex-error（throwOnError:false 时
+//     KaTeX 的标准失败表现，公式解析不出来会原样显示带错误样式的源码），覆盖公式渲染失败的
+//     场景（不管是不是整块声明成数学环境，正文里混着的行内公式一样能命中）。
+//   · 正常渲染 —— 以上都不命中的默认状态。
+// 类型（公式/表格/算法/正文）判定：table/longtable→表格，algorithm→算法，块整体是
+// OVL_VISUAL_MATH_ATOMIC_ENV_RE 认识的数学环境→公式，其余（含 figure 块、普通正文段落）
+// 一律归入正文——任务书原话只列了这四类，figure 块不单独占一类，出于遵照任务原文的最小
+// 侵入决定，不是漏做。
+
+const CHAT_BLOCK_STATUS_VALUES = ['正常渲染', '退化裸源码', '翻译失败', '回显守卫拦截', '未翻译'];
+
+// 块源码声明的浮动/数学环境类型，跟 ovlVisualRenderChunk 的分发判定复用同一批正则，不重新
+// 发明。返回 'table'|'algorithm'|'figure'|'math'|null。
+function ovlVisualBlockDeclaredEnv(srcText) {
+    const text = String(srcText == null ? '' : srcText);
+    const floatM = OVL_VISUAL_FLOAT_DISPATCH_RE.exec(text);
+    if (floatM) {
+        if (floatM[1] === 'table' || floatM[2] === 'longtable') return 'table';
+        if (floatM[1] === 'algorithm') return 'algorithm';
+        if (floatM[1] === 'figure') return 'figure';
+    }
+    const mathM = /^\s*\\begin\{([^}]+)\}/.exec(text);
+    if (mathM && OVL_VISUAL_MATH_ATOMIC_ENV_RE.test(mathM[1])) return 'math';
+    return null;
+}
+// 声明的类型渲染出的 DOM 里有没有对应的结构性标记——math/null 类型不用这条判定（用
+// .katex-error 判定），恒真占位。
+function ovlVisualBlockRenderStructOk(el, declaredEnv) {
+    if (declaredEnv === 'table') return !!el.querySelector('table');
+    if (declaredEnv === 'algorithm') return !!el.querySelector('.ovl-visual-algo-body');
+    if (declaredEnv === 'figure') return !!el.querySelector('.ovl-visual-figure-wrap');
+    return true;
+}
+function chatAgentClassifyBlockStatus(el) {
+    let srcText = '';
+    try { srcText = (typeof ovlVisualBlockSrcText === 'function' ? ovlVisualBlockSrcText(el) : null) || ''; } catch (e) {}
+    const declaredEnv = ovlVisualBlockDeclaredEnv(srcText);
+    const type = declaredEnv === 'table' ? '表格' : declaredEnv === 'algorithm' ? '算法' : declaredEnv === 'math' ? '公式' : '正文';
+    const pending = el.getAttribute('data-ovl-trans-pending') === '1';
+    const failed = el.hasAttribute('data-ovl-trans-failed');
+    const failReason = el.getAttribute('data-ovl-trans-fail-reason');
+    let status;
+    if (pending) status = '未翻译';
+    else if (failed && failReason === 'echo') status = '回显守卫拦截';
+    else if (failed) status = '翻译失败';
+    else if (declaredEnv && declaredEnv !== 'math' && !ovlVisualBlockRenderStructOk(el, declaredEnv)) status = '退化裸源码';
+    else if (el.querySelector('.katex-error')) status = '退化裸源码';
+    else status = '正常渲染';
+    return { status: status, type: type };
+}
+
+function chatAgentBlockStatusReadiness() {
+    if (typeof OvlState === 'undefined' || OvlState.editorMode !== 'visual') return { ready: false, reason: 'not-visual' };
+    if (!document.getElementById('ovlVisualPane')) return { ready: false, reason: 'no-pane' };
+    return { ready: true, reason: '' };
+}
+
+function chatAgentBlockStatusToolsSystemBlock() {
+    let ready;
+    try { ready = chatAgentBlockStatusReadiness(); } catch (e) { ready = { ready: false, reason: 'no-pane' }; }
+    if (!ready.ready) {
+        const why = ready.reason === 'not-visual' ? '当前不在 Visual 预览模式' : '找不到 Visual 预览面板';
+        return '\n【块状态自查工具】这一轮不可用（' + why + '）。不要输出 name=list_block_status 的 ==TOOL== 块。\n';
+    }
+    return '\n【块状态自查工具】用户问"哪些公式没渲染出来""还有哪些块没翻译/翻错了"这类问题时，'
+        + '不要反问用户要行号——先调用 list_block_status 自己查出清单，再针对具体几块用'
+        + 'read_block_translation/retranslate_block（中文渲染诊断工具）逐一处理。\n'
+        + '  · list_block_status —— 枚举当前 Visual 文档所有块的状态。参数是空对象 {}，或者可选'
+        + '{"filter": "退化裸源码"} 只看某一种状态（可选值：正常渲染 / 退化裸源码 / 翻译失败 / '
+        + '回显守卫拦截 / 未翻译）。返回每一块的索引、源码行区间、类型（公式/表格/算法/正文）、'
+        + '状态、渲染出来的前 40 字预览。\n'
+        + '调用格式：\n==TOOL name=list_block_status==\n{"filter":"退化裸源码"}\n==TOOLEND==\n';
+}
+
+async function chatAgentExecListBlockStatus(args) {
+    const readiness = chatAgentBlockStatusReadiness();
+    if (!readiness.ready) {
+        const msg = '无法枚举块状态：' + (readiness.reason === 'not-visual' ? '当前不在 Visual 预览模式' : '找不到 Visual 预览面板') + '。';
+        return { ok: false, uiSummary: '枚举块状态失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const pane = document.getElementById('ovlVisualPane');
+    const blocks = Array.from(pane.querySelectorAll('.ovl-visual-block'));
+    const filterRaw = (args && typeof args.filter === 'string') ? args.filter.trim() : '';
+    const filterOk = CHAT_BLOCK_STATUS_VALUES.indexOf(filterRaw) !== -1;
+    const filter = filterOk ? filterRaw : '';
+    const counts = {};
+    CHAT_BLOCK_STATUS_VALUES.forEach(function (s) { counts[s] = 0; });
+    const rows = [];
+    for (let i = 0; i < blocks.length; i++) {
+        const el = blocks[i];
+        const cls = chatAgentClassifyBlockStatus(el);
+        counts[cls.status] = (counts[cls.status] || 0) + 1;
+        if (filter && cls.status !== filter) continue;
+        // v2 Pass P101：预览必须跳过 KaTeX 的隐藏 .katex-mathml 注释文本（里面嵌了原始 TeX
+        // 源码字符串，公式块 el.textContent 会把它跟真正渲染出的可见文字拼在一起，预览会
+        // 变成"渲染结果+裸源码"的乱码）——复用 P68 已经踩过坑的 ovlVisualCollectBlockVisibleText
+        // （同一个跳过 .katex-mathml 的 TreeWalker，不重新写一遍）。
+        let previewSrc = '';
+        try { previewSrc = (typeof ovlVisualCollectBlockVisibleText === 'function' ? ovlVisualCollectBlockVisibleText(el).text : el.textContent) || ''; }
+        catch (e) { previewSrc = String(el.textContent == null ? '' : el.textContent); }
+        const preview = previewSrc.replace(/\s+/g, ' ').trim().slice(0, 40);
+        rows.push({
+            index: i, srcLine: el.getAttribute('data-src-line'), srcLineEnd: el.getAttribute('data-src-line-end'),
+            status: cls.status, type: cls.type, preview: preview
+        });
+    }
+    const header = 'Visual 文档共 ' + blocks.length + ' 块。状态分布：'
+        + CHAT_BLOCK_STATUS_VALUES.map(function (s) { return s + ' ' + counts[s]; }).join('，') + '。'
+        + (filterRaw && !filterOk ? '（⚠ filter 参数「' + filterRaw + '」不是合法状态值，已忽略，本次列出全部块）' : '')
+        + (filter ? ('\n筛选状态「' + filter + '」，共 ' + rows.length + ' 块：\n') : '\n\n');
+    const lines = rows.map(function (r) {
+        return '#' + r.index + '（源码第 ' + r.srcLine + '–' + r.srcLineEnd + ' 行，' + r.type + '，' + r.status + '）：' + (r.preview || '（空）');
+    });
+    const text = header + (lines.length ? lines.join('\n') : (filter ? '（没有匹配「' + filter + '」的块）' : '（没有可枚举的块）'));
+    return {
+        ok: true,
+        uiSummary: '枚举块状态：共 ' + blocks.length + ' 块' + (filter ? '，筛选「' + filter + '」' + rows.length + ' 条' : ''),
+        uiDetail: text, textForModel: text, bytes: text.length
+    };
+}
+
+// ============================================================================
+// v2 Pass P101（组2）：compile / read_compile_log —— 封装既有编译入口
+// ============================================================================
+// compile 复用 P85 核验流程的编译入口（现在共享的 ovlBridgeCompile()，见下方定义附近的
+// 注释——原来只有 ovlP2TVerifyCompile 一处内联，这次抽成通用函数，ovlP2TVerifyCompile 改为
+// 委托，行为一字不变），不碰 OvlState.compiling/pdfSourceMode/lastCompile 这些编辑器主状态——
+// 跟 P85 核验同一条设计原因：AI 自主的"改→compile→读错→再改"迭代循环可能连续编译好几次、
+// 也可能连续失败好几次，不该让用户当时正在看的 PDF 面板跟着一起闪烁/复位。结果存进独立的
+// ChatAgentCompileState，read_compile_log 读的是这一份，不是用户界面"View logs"那份
+// OvlState.lastCompile。超时复用 P91 §5 同款按页伸缩公式（OVL_P2T_VERIFY_TIMEOUT_* 常量，
+// 定义在下方 P85 核验小节），"页数"这个输入换成"上一次真实编译探测到的 PDF 页数"
+// （OvlState.lastCompile.pageCount）——通用文档在第一次编译之前没有页数可言，跟 P2T 场景
+// "job.total=源 PDF 页数"是类比关系不是同一个数字，拿不到就退回封顶值（跟
+// ovlP2TVerifyComputeTimeoutMs 同一条兜底纪律）。系统提示要求"最多 3 轮"是纯 prompt 层面的
+// 引导（任务书原话），不是代码硬编码的计数器——CHAT_AGENT_MAX_ITERS（8 轮工具调用总上限）
+// 已经是结构性硬顶，不需要再加一层。
+
+let ChatAgentCompileState = { data: null, at: 0, mainFile: '' };
+
+function chatAgentComputeCompileTimeoutMs() {
+    const pc = (typeof OvlState !== 'undefined' && OvlState.lastCompile && typeof OvlState.lastCompile.pageCount === 'number' && OvlState.lastCompile.pageCount > 0)
+        ? OvlState.lastCompile.pageCount : null;
+    if (pc === null) return OVL_P2T_VERIFY_TIMEOUT_CAP_MS;
+    return Math.min(OVL_P2T_VERIFY_TIMEOUT_CAP_MS, OVL_P2T_VERIFY_TIMEOUT_BASE_MS + OVL_P2T_VERIFY_TIMEOUT_PER_PAGE_MS * pc);
+}
+
+function chatAgentCompileReadiness() {
+    if (typeof OvlState === 'undefined' || !OvlState.currentFile) return { ready: false, reason: 'no-doc' };
+    if (OvlState.pdfSourceMode === 'direct') return { ready: false, reason: 'direct-mode' };
+    if (OvlState.bridgeOnline !== true) return { ready: false, reason: 'no-bridge' };
+    if (!chatAgentProjectDir()) return { ready: false, reason: 'no-projectdir' };
+    return { ready: true, reason: '' };
+}
+
+function chatAgentCompileToolsSystemBlock() {
+    let ready;
+    try { ready = chatAgentCompileReadiness(); } catch (e) { ready = { ready: false, reason: 'no-doc' }; }
+    if (!ready.ready) {
+        const why = ready.reason === 'direct-mode' ? 'PDF 阅读模式（文件树直接打开的原始 PDF，未编译）下不支持编译，与 UI 上 Recompile 按钮置灰一致'
+            : ready.reason === 'no-bridge' ? '还没有连上编译桥接服务'
+            : ready.reason === 'no-projectdir' ? '还没有填写项目绝对路径'
+            : '当前没有打开任何文档';
+        return '\n【编译工具】这一轮不可用（' + why + '）。不要输出 name=compile 或 name=read_compile_log 的 ==TOOL== 块。'
+            + (ready.reason === 'direct-mode' ? '如果用户想编译，请直接回复：需要先在文件树点开一个 .tex 文件退出 PDF 阅读模式。' : '') + '\n';
+    }
+    return '\n【编译工具】改完 LaTeX 源码后可以自己编译验证，不用等用户去点 Recompile：\n'
+        + '  · compile —— 用当前打开的文档触发一次真实编译（跟核验流程走同一个入口），免确认（只是'
+        + '触发编译，不会破坏任何东西，也**不会**更新用户界面上正在显示的 PDF 预览面板，避免打断用户'
+        + '正在看的内容）。参数是空对象：{}。返回结果会直接说明成功/失败；失败时已经自动带上错误摘要，'
+        + '通常不需要再额外调用 read_compile_log。\n'
+        + '  · read_compile_log —— 读取上一次 compile 调用留下的完整原始编译日志（不是用户界面上'
+        + '"View logs"那一份）。compile 自带的摘要不够看清问题时再用这个。参数是空对象：{}。\n'
+        + '调用格式：\n==TOOL name=compile==\n{}\n==TOOLEND==\n'
+        + '规则：如果用户要求你修好编译错误，建议节奏是"改代码 → compile → 失败就读错误信息（必要时'
+        + 'read_compile_log）→ 再改"，最多尝试 3 轮；3 轮后仍失败就如实把最后一次的真实错误信息报告'
+        + '给用户，不要无限重试、也不要谎称已经修好。\n';
+}
+
+async function chatAgentExecCompile(args, signal) {
+    const readiness = chatAgentCompileReadiness();
+    if (!readiness.ready) {
+        const msg = readiness.reason === 'direct-mode'
+            ? '当前处于 PDF 阅读模式（文件树直接打开的原始 PDF，未编译），这个模式不支持编译。请先在文件树点开一个 .tex 文件退出该模式，或直接告诉用户需要先这么做。'
+            : readiness.reason === 'no-bridge' ? '还没有连上编译桥接服务，无法编译。'
+            : readiness.reason === 'no-projectdir' ? '没有配置项目绝对路径，无法编译。'
+            : '当前没有打开任何文档，无法编译。';
+        return { ok: false, uiSummary: '编译失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const projectDir = chatAgentProjectDir();
+    const mainFile = OvlState.mainDocFile || (OvlState.currentFile && OvlState.currentFile.relPath) || 'main.tex';
+    const timeoutMs = chatAgentComputeCompileTimeoutMs();
+    const data = await ovlBridgeCompile(projectDir, mainFile, timeoutMs, signal);
+    ChatAgentCompileState = { data: data, at: Date.now(), mainFile: mainFile };
+    if (data && data.ok && data.pdfExists) {
+        const kb = Math.round((data.pdfSize || 0) / 1024);
+        const secs = ((data.durationMs || 0) / 1000).toFixed(1);
+        const text = '编译成功：' + mainFile + '（' + kb + ' KB，' + secs + 's）。'
+            + '（这次编译没有更新用户界面上正在显示的 PDF 预览面板——如果用户需要看到编译产物，'
+            + '提醒用户自己点一次 Recompile，或者直接告诉用户已经编译成功即可。）';
+        return { ok: true, uiSummary: '编译成功（' + kb + 'KB, ' + secs + 's）', uiDetail: text, textForModel: text, bytes: text.length };
+    }
+    const excerpt = (typeof ovlP2TVerifyBuildErrorExcerpt === 'function') ? ovlP2TVerifyBuildErrorExcerpt(data, timeoutMs) : ((data && data.error) || '未知错误');
+    const text = '编译失败：' + mainFile + '。\n错误摘要：\n' + excerpt + '\n\n如果需要看完整原始编译日志，可以调用 read_compile_log。';
+    return { ok: false, uiSummary: '编译失败', uiDetail: text, textForModel: text, bytes: text.length };
+}
+
+async function chatAgentExecReadCompileLog(args) {
+    if (!ChatAgentCompileState.data) {
+        const msg = '这一轮还没有调用过 compile，没有编译日志可读。请先调用 compile。';
+        return { ok: false, uiSummary: '读取编译日志失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const log = String(ChatAgentCompileState.data.log || '');
+    if (!log.trim()) {
+        const msg = '上一次 compile（' + ChatAgentCompileState.mainFile + '）没有产出任何日志文本（'
+            + (ChatAgentCompileState.data.error || '可能是编译在写日志之前就早退了') + '）。';
+        return { ok: true, uiSummary: '编译日志为空', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    let body = log;
+    let truncated = false;
+    if (body.length > CHAT_AGENT_SINGLE_READ_MAX_BYTES) {
+        body = body.slice(-CHAT_AGENT_SINGLE_READ_MAX_BYTES); // 编译日志的关键错误通常在末尾，截断保留末尾而不是开头
+        truncated = true;
+    }
+    const text = '上一次 compile（' + ChatAgentCompileState.mainFile + '，' + new Date(ChatAgentCompileState.at).toLocaleTimeString() + '）的完整原始日志'
+        + (truncated ? '（已截断，只保留末尾部分——错误通常在最后）' : '') + '：\n' + body;
+    return { ok: true, uiSummary: '读取编译日志（' + (truncated ? '已截断' : '完整') + '）', uiDetail: text, textForModel: text, bytes: text.length };
+}
+
+// ============================================================================
+// v2 Pass P101（组3）：reconvert_page / recrop_figure —— 封装既有 P75/P79 单页重转 +
+// P86/P95 图片裁剪机制
+// ============================================================================
+// 两个工具只在"当前打开的文档确实是某次 PDF→LaTeX 转换的 main.tex 产物"时可用——判定靠
+// 反查 P75 §4.6 关联表（ovlP2TMapLoad()，按 rec.out 匹配当前文档所在目录），纯同步
+// localStorage 查表，不做任何异步文件系统调用（系统提示要用它同步判定这一轮工具可不可用）。
+// 命中只代表"这是已知的 pdf2tex 输出目录"，不代表关联的源 PDF 这一刻还在磁盘上——那一步
+// 留给下面两个 exec 函数在真正弹确认卡之前异步核实一次，核实失败就把"引导语"当工具结果
+// 返回（不确认、不执行），不假装能用。
+//
+// reconvert_page：优先复用已经在跑的 OvlP2TState.job（这次会话本身就转换过这份 PDF、还没
+// 关面板）；没有匹配的活跃 job（页面刷新过 / 这次会话从没跑过转换，只是打开了历史转换产物）
+// 就现场重建一份同构的 job 外壳——重新打开源 PDF（跟 ovlP2TBeginJob 同一手法），其余各页
+// 的 fragment 从磁盘上已有的 pages/page-NN.tex 片段预填（ovlP2TReadExistingPageFragment，
+// P75 早就为这种"续接"场景准备好的函数），不触发整份重新转换。真正跑单页转换 + 阶梯重试用
+// 的是同一个 ovlP2TConvertOnePage（P79 阶梯重试就在它内部）；跑完照抄 ovlP2TRetryPages() 的
+// 收尾三步（重新拼装 main.tex → 参考文献流水线 → 更新关联表），但跳过它自带的"main.tex 被
+// 手改过"原生确认弹窗——那道弹窗的信息已经并进这里自己的 chatAgentConfirm 卡片文案，不需要
+// 弹两次。
+//
+// recrop_figure："图 X" → 图片文件用 ovlP2TEnumerateFigureBlocks（跟生成题注编号同一套解析
+// 规则）在当前编辑器源码里定位，图片文件名里的 "page-NN" 段直接给出源页码（P86/P95 裁剪
+// 产物的既有命名约定）。"存量 bbox"的设计取舍：P86 主路径裁剪完成后会把 "% BBOX:" 标记行
+// 整行删掉（见 ovlP2TApplyFigureCrops 尾部的兜底 replace），也就是说裁剪一旦完成，原始 bbox
+// 坐标本来就不会持久化在任何地方——"优先用存量 bbox"只能是"本次会话内如果已经为这张图重新
+// 定位过一次 bbox，重复调用直接复用"，不是凭空造一个"读历史 bbox"的功能（历史数据不存在）。
+// 用一个会话级内存缓存（ChatAgentFigureBboxCache）实现，重启页面/关闭聊天窗后清空——拿不准
+// 时的决定，理由如上。没有缓存命中就对该页发一次视觉模型 bbox 定位请求（读设置里的
+// pdf2texVisionEndpoint/pdf2texVisionModel，跟 P75 主链路同一份设置，只是 prompt 换成
+// "只要这一张图的 bbox"，不是整页转写），拿到 bbox 后用跟 P86 裁剪主路径完全相同的两个函数
+// （ovlP2TRenderPageToCanvas + ovlP2TCropCanvasRegion）裁剪，写回同一个文件路径（覆盖），
+// 清空缩略图缓存 + 若在 Visual 模式下刷新该图的缩略图显示。
+
+function chatAgentP2TProductReadiness() {
+    try {
+        if (typeof OvlState === 'undefined' || !OvlState.currentFile || !OvlState.dirHandle) return { ready: false, reason: 'not-product' };
+        const relPath = String(OvlState.currentFile.relPath || OvlState.currentFile.name || '').replace(/\\/g, '/');
+        const m = /^(.*?)\/?main\.tex$/i.exec(relPath);
+        if (!m) return { ready: false, reason: 'not-product' };
+        const curDir = (m[1] || '.').replace(/\/+$/, '') || '.';
+        const projectDir = ovlRemoteProjectRoot();
+        const prefix = ovlNormalizeProjectPath(projectDir) + '|';
+        const map = ovlP2TMapLoad();
+        let rec = null;
+        Object.keys(map).forEach(function (k) {
+            if (rec || k.indexOf(prefix) !== 0) return;
+            const r = map[k];
+            if (r && typeof r.out === 'string' && r.out.replace(/\\/g, '/').replace(/\/+$/, '') === curDir) rec = r;
+        });
+        if (!rec) return { ready: false, reason: 'not-product' };
+        return { ready: true, reason: '', rec: rec, outRel: rec.out, projectDir: projectDir };
+    } catch (e) { return { ready: false, reason: 'not-product' }; }
+}
+
+async function chatAgentP2TVerifyPdfExists(rec) {
+    try { await ovlResolveHandleForPath(OvlState.dirHandle, rec.pdf); return true; }
+    catch (e) { return false; }
+}
+
+function chatAgentP2TWriteToolsSystemBlock() {
+    let ready;
+    try { ready = chatAgentP2TProductReadiness(); } catch (e) { ready = { ready: false, reason: 'not-product' }; }
+    if (!ready.ready) {
+        return '\n【重转/重截图工具】这一轮不可用（当前打开的文档不是 PDF→LaTeX 转换产物的 main.tex，'
+            + '或者本地没有它的转换记录）。不要输出 name=reconvert_page 或 name=recrop_figure 的 ==TOOL== 块。\n';
+    }
+    return '\n【重转/重截图工具】用户可能会说"图 5 截错了重截""第 3 页转得不对重转"——这两个工具'
+        + '只在当前打开的文档确实是 PDF→LaTeX 转换产物时可用，执行前都会先弹确认卡片让用户确认'
+        + '（跟 retranslate_block 同一档，写操作，不提供批量豁免）：\n'
+        + '  · reconvert_page —— 重新转换某一页（沿用既有的单页转换 + 阶梯重试机制），完成后会重新'
+        + '拼装 main.tex 并刷新编辑器内容。参数：{"pageNum": 3}（整数，PDF 页码，从 1 开始）\n'
+        + '  · recrop_figure —— 对某张图重新裁剪。参数：{"figNum": 5}（整数，题注里的图号，比如'
+        + '"Fig. 5"就是 5；会优先复用本次会话里已经获得过的裁剪区域直接重裁，没有的话会对该图所在'
+        + '页发一次视觉模型请求重新定位裁剪区域）\n'
+        + '调用格式：\n==TOOL name=reconvert_page==\n{"pageNum":3}\n==TOOLEND==\n'
+        + '规则：如果关联的原始 PDF 已经找不到（被移动/删除），工具会在确认之前明确告知，不会假装成功。\n';
+}
+
+async function chatAgentP2TEnsureJobForReconvert(readiness) {
+    const existing = OvlP2TState.job;
+    const wantOutRel = String(readiness.outRel).replace(/\\/g, '/').replace(/\/+$/, '');
+    if (existing && existing.projectDir === readiness.projectDir
+        && String(existing.outRel).replace(/\\/g, '/').replace(/\/+$/, '') === wantOutRel) {
+        return existing;
+    }
+    if (OvlP2TState.job && OvlP2TState.job.doc) { try { await ovlP2TDestroyJobDoc(OvlP2TState.job); } catch (e) {} }
+    const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, readiness.rec.pdf);
+    const file = await resolved.handle.getFile();
+    const buf = await file.arrayBuffer();
+    const doc = await pdfjsLib.getDocument({ data: buf, isEvalSupported: false, isOffscreenCanvasSupported: false }).promise;
+    const total = doc.numPages;
+    const pages = [];
+    for (let i = 1; i <= total; i++) {
+        const existingFragment = await ovlP2TReadExistingPageFragment(readiness.outRel, i);
+        pages.push({ num: i, state: existingFragment ? 'ok' : 'pending', reason: null, ms: null, chars: existingFragment ? existingFragment.length : null, flags: {}, fragment: existingFragment || '' });
+    }
+    const job = {
+        id: 'p2t-chat-' + Date.now(), projectDir: readiness.projectDir, pdfRelPath: readiness.rec.pdf,
+        pdfName: String(readiness.rec.pdf).split('/').pop(), pdfSize: file.size, pdfMtimeMs: file.lastModified,
+        outRel: readiness.outRel, total: total,
+        concurrency: Math.max(1, Math.min(4, Number(OvlSettings.pdf2texConcurrency) || 3)),
+        model: (OvlSettings.pdf2texVisionModel || '').trim(), endpoint: (OvlSettings.pdf2texVisionEndpoint || '').trim().replace(/\/+$/, ''),
+        pages: pages, startedAt: Date.now(), finishedAt: null, cancelled: false, pipelineError: null,
+        aborts: new Set(), doc: doc
+    };
+    OvlP2TState.job = job;
+    return job;
+}
+
+async function chatAgentP2TReloadEditorIfCurrent(outRel, newMainText) {
+    try {
+        const cf = OvlState.currentFile;
+        if (!cf) return;
+        const relPath = String(cf.relPath || cf.name || '').replace(/\\/g, '/').replace(/^\.\//, '');
+        const expected = (String(outRel).replace(/\\/g, '/').replace(/\/+$/, '') + '/main.tex').replace(/^\.\//, '');
+        if (relPath !== expected) return; // 重转的不是当前打开的这份文档，不动编辑器
+        if (OvlState.dirty) {
+            chatAppendRow('system', '⚠ AI agent 刚重新转换了当前打开的文档，但你在编辑器里还有未保存的改动——'
+                + '编辑器内容没有被覆盖，磁盘上已经是重新转换后的新内容。保存会覆盖它，请自行决定是保存'
+                + '（覆盖 agent 的结果）还是丢弃本地改动、重新打开这个文件看新内容。');
+            return;
+        }
+        const ta = document.getElementById('ovlCodeArea');
+        if (ta) {
+            ta.value = newMainText;
+            OvlState.lineOffsets = null;
+            if (typeof ovlRecomputeLineOffsets === 'function') ovlRecomputeLineOffsets();
+            if (typeof ovlRenderGutter === 'function') ovlRenderGutter(true);
+            if (typeof ovlBuildOutline === 'function') ovlBuildOutline();
+        }
+        if (OvlState.editorMode === 'visual' && typeof ovlVisualRender === 'function') ovlVisualRender();
+        if (OvlState.dirHandle && !OvlState.usingWebkitFallback && typeof ovlRenderTree === 'function') ovlRenderTree(OvlState.dirHandle);
+    } catch (e) { console.error('[chat-agent] reload editor after reconvert failed', e); }
+}
+
+async function chatAgentP2TReconvertOnePage(readiness, pageNum) {
+    try {
+        const job = await chatAgentP2TEnsureJobForReconvert(readiness);
+        if (pageNum < 1 || pageNum > job.total) return { ok: false, error: '页码超出范围：这份 PDF 共 ' + job.total + ' 页。' };
+        await ovlP2TConvertOnePage(job, pageNum);
+        const rawText = ovlP2TAssembleMain(job);
+        const refsOutcome = await ovlP2TApplyReferencesPipeline(job, rawText);
+        job.refs = refsOutcome;
+        await ovlP2TWriteText(job.outRel + '/main.tex', refsOutcome.text);
+        if (refsOutcome.bibText) await ovlP2TWriteText(job.outRel + '/refs.bib', refsOutcome.bibText);
+        await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job, refsOutcome.text));
+        await ovlP2TUpdateMapAfterRun(job);
+        job.finishedAt = Date.now();
+        await chatAgentP2TReloadEditorIfCurrent(job.outRel, refsOutcome.text);
+        return { ok: true, pageState: job.pages[pageNum - 1] };
+    } catch (e) {
+        return { ok: false, error: '重新转换出错：' + (e && e.message ? e.message : String(e)) };
+    }
+}
+
+async function chatAgentExecReconvertPage(args, signal, pending) {
+    const setLabel = function (t) { try { if (pending && pending.labelEl) pending.labelEl.textContent = t; } catch (e) {} };
+    const readiness = chatAgentP2TProductReadiness();
+    if (!readiness.ready) {
+        const msg = '当前打开的文档不是 PDF→LaTeX 转换产物，无法重新转换某一页。';
+        return { ok: false, uiSummary: '重新转换失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const pageNum = Number(args.pageNum);
+    setLabel('正在核实关联的源 PDF…');
+    const pdfOk = await chatAgentP2TVerifyPdfExists(readiness.rec);
+    if (!pdfOk) {
+        const msg = '关联的原始 PDF「' + readiness.rec.pdf + '」已经找不到（可能被移动或删除），无法重新转换。';
+        return { ok: false, uiSummary: '重新转换失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    if (typeof readiness.rec.pages === 'number' && pageNum > readiness.rec.pages) {
+        const msg = '页码超出范围：这份 PDF 共 ' + readiness.rec.pages + ' 页。';
+        return { ok: false, uiSummary: '重新转换失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+
+    setLabel('等待你确认「重新转换第 ' + pageNum + ' 页」…');
+    const confirmMsg = '操作：重新转换 PDF 第 ' + pageNum + ' 页（沿用既有的单页转换 + 阶梯重试机制），'
+        + '完成后会重新拼装 main.tex（整体覆盖当前内容）并刷新编辑器。\n'
+        + '关联源 PDF：' + readiness.rec.pdf + '\n转换产物目录：' + readiness.outRel;
+    const confirmed = await chatAgentConfirm({ title: '重新转换第 ' + pageNum + ' 页？', message: confirmMsg, confirmLabel: '确认重转' }, signal);
+    if (!confirmed) {
+        const msg = '用户拒绝了该操作。';
+        chatAppendToolRow('🔧 reconvert_page（第 ' + pageNum + ' 页）· 已被用户取消', confirmMsg);
+        return { ok: false, refused: true, uiSummary: '用户取消', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+
+    setLabel('正在重新转换第 ' + pageNum + ' 页…（可能需要几十秒）');
+    const runResult = await chatAgentP2TReconvertOnePage(readiness, pageNum);
+    if (!runResult.ok) {
+        chatAppendToolRow('🔧 reconvert_page（第 ' + pageNum + ' 页）· 失败', runResult.error);
+        return { ok: false, uiSummary: '重新转换失败', uiDetail: runResult.error, textForModel: runResult.error, bytes: 0 };
+    }
+    const stateLabel = runResult.pageState ? runResult.pageState.state : '未知';
+    const text = '第 ' + pageNum + ' 页已重新转换完成（状态：' + stateLabel + '），main.tex 已重新拼装并刷新到编辑器'
+        + '（如果你当时有未保存的改动，编辑器不会被覆盖，见上面单独的提示）。';
+    chatAppendToolRow('🔧 reconvert_page（第 ' + pageNum + ' 页）· 完成', text);
+    return { ok: true, uiSummary: '重新转换第 ' + pageNum + ' 页完成', uiDetail: text, textForModel: text, bytes: text.length };
+}
+
+const ChatAgentFigureBboxCache = {}; // outRel::assetRel -> {x0,y0,x1,y1}，纯会话内存，见本节头部大注释的设计取舍
+
+async function chatAgentP2TRequestFigureBbox(dataUrl, figNum, signal) {
+    const endpoint = (OvlSettings.pdf2texVisionEndpoint || '').trim().replace(/\/+$/, '');
+    const model = (OvlSettings.pdf2texVisionModel || '').trim();
+    if (!endpoint || !model) return { ok: false, error: '未配置视觉模型服务地址/模型名（见设置 → PDF 转 LaTeX）' };
+    const userText = '这张图是一篇论文 PDF 某一页的完整截图。请找出题注编号为 "Fig. ' + figNum + '" 的那张图'
+        + '（完整图形区域：含全部子图/坐标轴/图例，不含题注文字本身），只回复一行，格式严格为：\n'
+        + 'BBOX: x0,y0,x1,y1\n'
+        + '四个数字都是 0 到 1 之间的小数，坐标原点在页面左上角，x 向右为正、y 向下为正。不要输出任何其它文字。';
+    const controller = new AbortController();
+    let extAbortHandler = null;
+    if (signal) { if (signal.aborted) controller.abort(); else { extAbortHandler = function () { controller.abort(); }; signal.addEventListener('abort', extAbortHandler); } }
+    const timeoutId = setTimeout(function () { controller.abort(); }, 60000);
+    try {
+        let resp;
+        try {
+            resp = await fetch(endpoint + '/chat/completions', {
+                method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+                body: JSON.stringify({
+                    model: model, temperature: 0.1, max_tokens: 200, stream: false,
+                    messages: [{ role: 'user', content: [{ type: 'text', text: userText }, { type: 'image_url', image_url: { url: dataUrl } }] }]
+                })
+            });
+        } catch (e) {
+            if (e && e.name === 'AbortError') { if (signal && signal.aborted) throw e; return { ok: false, error: '请求超时' }; }
+            return { ok: false, error: '连不上视觉模型服务：' + (e && e.message ? e.message : String(e)) };
+        }
+        if (!resp.ok) return { ok: false, error: '视觉模型服务返回错误状态 ' + resp.status };
+        let data;
+        try { data = await resp.json(); } catch (e2) { return { ok: false, error: '视觉模型服务返回的不是合法 JSON' }; }
+        const content = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+        if (typeof content !== 'string') return { ok: false, error: '视觉模型服务返回格式不符合预期' };
+        const m = /BBOX:\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)/.exec(content);
+        if (!m) return { ok: false, error: '视觉模型没有返回可识别的 BBOX（原始回复：' + content.trim().slice(0, 200) + '）' };
+        const x0 = clamp01(parseFloat(m[1])), y0 = clamp01(parseFloat(m[2])), x1 = clamp01(parseFloat(m[3])), y1 = clamp01(parseFloat(m[4]));
+        if (!(x1 > x0 + 0.02 && y1 > y0 + 0.02)) return { ok: false, error: '视觉模型返回的 BBOX 无效（越界或退化）：' + content.trim() };
+        return { ok: true, bbox: { x0: x0, y0: y0, x1: x1, y1: y1 } };
+    } finally {
+        clearTimeout(timeoutId);
+        if (extAbortHandler && signal) signal.removeEventListener('abort', extAbortHandler);
+    }
+}
+
+async function chatAgentP2TRefreshFigureDisplay() {
+    try { if (typeof OvlFigThumbCache !== 'undefined') OvlFigThumbCache.clear(); } catch (e) {}
+    try {
+        if (OvlState.editorMode === 'visual' && typeof ovlVisualLoadFigureThumbnails === 'function') {
+            const pane = document.getElementById('ovlVisualPane');
+            if (pane) ovlVisualLoadFigureThumbnails(pane);
+        }
+    } catch (e) { console.error('[chat-agent] refresh figure thumbnail failed', e); }
+}
+
+async function chatAgentP2TRecropRun(readiness, pageNum, assetRel, figNum, cachedBbox, signal) {
+    let doc = null;
+    try {
+        const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, readiness.rec.pdf);
+        const file = await resolved.handle.getFile();
+        const buf = await file.arrayBuffer();
+        doc = await pdfjsLib.getDocument({ data: buf, isEvalSupported: false, isOffscreenCanvasSupported: false }).promise;
+        if (pageNum < 1 || pageNum > doc.numPages) return { ok: false, error: '页码超出范围：这份 PDF 共 ' + doc.numPages + ' 页。' };
+        const page = await doc.getPage(pageNum);
+        let bbox = cachedBbox, viaModel = false;
+        if (!bbox) {
+            const rendered = await ovlP2TRenderPageToPng(page, OvlSettings.pdf2texMaxPx);
+            const dataUrl = await ovlP2TBlobToDataUrl(rendered.sendBlob);
+            const bboxResult = await chatAgentP2TRequestFigureBbox(dataUrl, figNum, signal);
+            if (!bboxResult.ok) return { ok: false, error: '定位裁剪区域失败：' + bboxResult.error };
+            bbox = bboxResult.bbox;
+            viaModel = true;
+        }
+        const cropRendered = await ovlP2TRenderPageToCanvas(page, (Number(OvlSettings.pdf2texMaxPx) || 1800) * OVL_P2T_CROP_RENDER_MULT);
+        const crop = ovlP2TCropCanvasRegion(cropRendered.canvas, bbox.x0, bbox.y0, bbox.x1, bbox.y1);
+        cropRendered.canvas.width = 0; cropRendered.canvas.height = 0;
+        const blob = await new Promise(function (r) { crop.toBlob(r, 'image/png'); });
+        crop.width = 0; crop.height = 0;
+        if (!blob) return { ok: false, error: '裁剪渲染失败（浏览器 canvas.toBlob 返回空）。' };
+        await ovlP2TWriteBinary(readiness.outRel + '/' + assetRel, new Uint8Array(await blob.arrayBuffer()));
+        await chatAgentP2TRefreshFigureDisplay();
+        return { ok: true, bbox: bbox, viaModel: viaModel };
+    } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
+        return { ok: false, error: '重新裁剪出错：' + (e && e.message ? e.message : String(e)) };
+    } finally {
+        if (doc) { try { await doc.destroy(); } catch (e) {} }
+    }
+}
+
+async function chatAgentExecRecropFigure(args, signal, pending) {
+    const setLabel = function (t) { try { if (pending && pending.labelEl) pending.labelEl.textContent = t; } catch (e) {} };
+    const readiness = chatAgentP2TProductReadiness();
+    if (!readiness.ready) {
+        const msg = '当前打开的文档不是 PDF→LaTeX 转换产物，无法重新裁剪图片。';
+        return { ok: false, uiSummary: '重新裁剪失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const figNum = Number(args.figNum);
+    setLabel('正在核实关联的源 PDF…');
+    const pdfOk = await chatAgentP2TVerifyPdfExists(readiness.rec);
+    if (!pdfOk) {
+        const msg = '关联的原始 PDF「' + readiness.rec.pdf + '」已经找不到（可能被移动或删除），无法重新裁剪。';
+        return { ok: false, uiSummary: '重新裁剪失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+
+    const ta = document.getElementById('ovlCodeArea');
+    const mainText = ta ? ta.value : '';
+    const blocks = (typeof ovlP2TEnumerateFigureBlocks === 'function') ? ovlP2TEnumerateFigureBlocks(mainText) : [];
+    const block = blocks.filter(function (b) { return b.num === figNum; })[0];
+    if (!block) {
+        const msg = '在当前文档里找不到图 ' + figNum + '（按题注编号匹配）。';
+        return { ok: false, uiSummary: '重新裁剪失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const imgM = /\\includegraphics(?:\[[^\]]*\])?\{([^}]+)\}/.exec(block.text);
+    if (!imgM) {
+        const msg = '图 ' + figNum + ' 所在的块里没有找到 \\includegraphics，无法定位要重新裁剪的图片文件。';
+        return { ok: false, uiSummary: '重新裁剪失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const assetRel = imgM[1];
+    const pageM = /page-(\d+)/.exec(assetRel);
+    if (!pageM) {
+        const msg = '图 ' + figNum + ' 的图片文件「' + assetRel + '」不是本工具认识的转换产物命名格式，无法定位源页面。';
+        return { ok: false, uiSummary: '重新裁剪失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const pageNum = parseInt(pageM[1], 10);
+
+    setLabel('等待你确认「重新裁剪图 ' + figNum + '」…');
+    const cacheKey = readiness.outRel + '::' + assetRel;
+    const cachedBbox = ChatAgentFigureBboxCache[cacheKey] || null;
+    const confirmMsg = '操作：重新裁剪图 ' + figNum + '（源自第 ' + pageNum + ' 页）。\n'
+        + (cachedBbox
+            ? '复用本次会话里上一次已获得的裁剪区域，直接重新渲染裁剪，不再调用视觉模型。'
+            : ('本次会话还没有这张图的裁剪区域记录，会先对第 ' + pageNum + ' 页发一次视觉模型请求重新'
+                + '定位裁剪区域（模型：' + ((OvlSettings.pdf2texVisionModel || '').trim() || '（未配置）') + '）。'))
+        + '\n完成后会替换文件「' + assetRel + '」并刷新显示。';
+    const confirmed = await chatAgentConfirm({ title: '重新裁剪图 ' + figNum + '？', message: confirmMsg, confirmLabel: '确认重截' }, signal);
+    if (!confirmed) {
+        const msg = '用户拒绝了该操作。';
+        chatAppendToolRow('🔧 recrop_figure（图 ' + figNum + '）· 已被用户取消', confirmMsg);
+        return { ok: false, refused: true, uiSummary: '用户取消', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+
+    setLabel('正在重新裁剪图 ' + figNum + '…');
+    const result = await chatAgentP2TRecropRun(readiness, pageNum, assetRel, figNum, cachedBbox, signal);
+    if (!result.ok) {
+        chatAppendToolRow('🔧 recrop_figure（图 ' + figNum + '）· 失败', result.error);
+        return { ok: false, uiSummary: '重新裁剪失败', uiDetail: result.error, textForModel: result.error, bytes: 0 };
+    }
+    ChatAgentFigureBboxCache[cacheKey] = result.bbox;
+    const text = '图 ' + figNum + '（' + assetRel + '）已重新裁剪完成' + (result.viaModel ? '（调用了一次视觉模型重新定位裁剪区域）' : '（复用了本次会话里上一次的裁剪区域）') + '，显示已刷新。';
+    chatAppendToolRow('🔧 recrop_figure（图 ' + figNum + '）· 完成', text);
+    return { ok: true, uiSummary: '重新裁剪图 ' + figNum + ' 完成', uiDetail: text, textForModel: text, bytes: text.length };
+}
+
 // 文本协议的多轮工具调用主循环。wire 是这一轮已经装好的消息数组（chatAssembleTurn 的产物，
 // 最后一条是用户这一轮的完整载荷），本函数在它后面追加"assistant 工具调用 → user 工具结果"
 // 这样的往返，直到模型给出不含 ==TOOL== 的最终回复，或撞上下面任一硬上限。
@@ -20316,7 +20944,15 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
         // 卡片（chatRenderDocHighlightCard/chatHighlightArchiveCard），跟 fs 写工具/retranslate_block
         // 同一档"自己画行，外层不重复画"，但不需要确认（只读定位+纯前端高亮，不改任何文件/缓存）。
         const isHighlightTool = parsed.tool === 'doc_highlight' || parsed.tool === 'doc_highlight_clear';
-        const selfDisplaying = isWriteTool || isZhWriteTool || isHighlightTool;
+        // v2 Pass P101：组1（list_block_status）/组2（compile、read_compile_log）都是只读或
+        // 免确认的"浏览类"操作，走 list_dir/read_file 那一档——外层统一画行，自己不重复画。
+        // 组3（reconvert_page、recrop_figure）会真的改动磁盘文件，跟 retranslate_block 同一档——
+        // 自己弹确认卡片、自己画结果行。
+        const isStatusTool = parsed.tool === 'list_block_status';
+        const isCompileTool = parsed.tool === 'compile';
+        const isReadLogTool = parsed.tool === 'read_compile_log';
+        const isP2TWriteTool = CHAT_AGENT_P2T_WRITE_TOOLS.indexOf(parsed.tool) !== -1;
+        const selfDisplaying = isWriteTool || isZhWriteTool || isHighlightTool || isP2TWriteTool;
         setLabel(isWriteTool
             ? ('准备执行「' + (CHAT_AGENT_TOOL_LABELS[parsed.tool] || parsed.tool) + '」…')
             : isZhWriteTool
@@ -20325,7 +20961,15 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
                     ? ('正在读取块 #' + parsed.args.blockIndex + ' 的渲染译文…')
                     : isHighlightTool
                         ? (parsed.tool === 'doc_highlight' ? '正在定位高亮…' : '正在清除高亮…')
-                        : ('正在' + (parsed.tool === 'read_file' ? '读取' : '查看') + '「' + (parsed.args.path || '.') + '」…'));
+                        : isStatusTool
+                            ? '正在枚举块状态…'
+                            : isCompileTool
+                                ? '正在编译…'
+                                : isReadLogTool
+                                    ? '正在读取编译日志…'
+                                    : isP2TWriteTool
+                                        ? ('准备' + (parsed.tool === 'reconvert_page' ? ('重新转换第 ' + parsed.args.pageNum + ' 页') : ('重新裁剪图 ' + parsed.args.figNum)) + '…')
+                                        : ('正在' + (parsed.tool === 'read_file' ? '读取' : '查看') + '「' + (parsed.args.path || '.') + '」…'));
         const result = isWriteTool
             ? await chatAgentExecWriteTool(parsed.tool, parsed.args, projectDir, signal, pending)
             : isZhReadTool
@@ -20334,10 +20978,21 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
                     ? await chatAgentExecRetranslateBlock(parsed.args, signal, pending)
                     : isHighlightTool
                         ? (parsed.tool === 'doc_highlight' ? await chatAgentExecDocHighlight(parsed.args) : await chatAgentExecDocHighlightClear())
-                        : await chatAgentExecTool(parsed.tool, parsed.args, projectDir, signal);
+                        : isStatusTool
+                            ? await chatAgentExecListBlockStatus(parsed.args)
+                            : isCompileTool
+                                ? await chatAgentExecCompile(parsed.args, signal)
+                                : isReadLogTool
+                                    ? await chatAgentExecReadCompileLog(parsed.args)
+                                    : isP2TWriteTool
+                                        ? (parsed.tool === 'reconvert_page' ? await chatAgentExecReconvertPage(parsed.args, signal, pending) : await chatAgentExecRecropFigure(parsed.args, signal, pending))
+                                        : await chatAgentExecTool(parsed.tool, parsed.args, projectDir, signal);
         if (!selfDisplaying) {
             const rowLabel = isZhReadTool
                 ? ('🔧 read_block_translation（块 #' + parsed.args.blockIndex + '）')
+                : isStatusTool ? '🔧 list_block_status'
+                : isCompileTool ? '🔧 compile'
+                : isReadLogTool ? '🔧 read_compile_log'
                 : ((parsed.tool === 'read_file' ? '🔧 read_file' : '🔧 list_dir') + '（' + (parsed.args.path || '.') + '）');
             chatAppendToolRow(
                 rowLabel + '· ' + result.uiSummary,
@@ -27288,6 +27943,19 @@ function ovlVisualIsEchoFailure(maskedSrc, rawBody) {
     if (a === b) return true;
     return ovlVisualCharSimilarity(a, b) >= OVL_VISUAL_ECHO_SIMILARITY_THRESHOLD;
 }
+// v2 Pass P101（组1 list_block_status 需要）：翻译失败的具体原因（回显守卫拦截 vs 其它失败）
+// 在这之前只打印到 console.error + 一次性 toast，DOM 上只留了一个笼统的 data-ovl-trans-failed，
+// 事后完全无法区分"是回显守卫拦住的"还是"占位符/公式被改动"之类的其它失败——而任务要求
+// list_block_status 要能报告"回显守卫拦截"这个独立状态，跟"翻译失败"分开。不伪造这个区分
+// （DOM 里本来就没有这个信息，硬猜是不诚实的），改成在失败落地的两个地方（懒翻译队列 worker /
+// retranslate_block 手动重译）额外多打一个 data-ovl-trans-fail-reason 属性——判定依据就是
+// ovlVisualTranslateBlockText 里回显守卫抛出的错误 message 固定含"回显"二字（见上面那处
+// throw new Error('...回显防毒守卫拦截')），不是新发明一套判定，只是把已经存在的信号落到 DOM
+// 上供事后读取。
+function ovlVisualTransFailReason(err) {
+    const msg = String((err && err.message) || err || '');
+    return /回显/.test(msg) ? 'echo' : 'other';
+}
 // 并发 worker（最多 3 个）同时踩雷时不刷屏：同一批失败只弹一条 toast。
 let ovlVisualEchoToastAt = 0;
 function ovlVisualEchoToastOnce() {
@@ -27817,7 +28485,10 @@ async function ovlVisualLangRunQueue() {
                 if (err && err.name === 'AbortError') return;
                 console.error('[ovl] visual block translate failed', err);
                 OvlVisualLangState.done++;
-                if (document.body.contains(el)) el.setAttribute('data-ovl-trans-failed', '1');
+                if (document.body.contains(el)) {
+                    el.setAttribute('data-ovl-trans-failed', '1');
+                    el.setAttribute('data-ovl-trans-fail-reason', ovlVisualTransFailReason(err)); // v2 Pass P101：供 list_block_status 区分"回显守卫拦截"
+                }
             }
             ovlVisualLangProgressUpdate();
         }
@@ -35936,27 +36607,36 @@ async function ovlP2TVerifyCallFixModel(errorExcerpt, pageSnippet, signal) {
     }
 }
 
-// 调桥 /compile 编译 job 的 main.tex——核验专用，独立于 ovlDoRecompile()（不动全局
-// OvlState.compiling/pdfSourceMode/lastCompile 等编辑器主状态，避免跟用户当时正在看的
-// 编译/PDF 面板互相打架）。永不 throw，网络失败也收敛成 {ok:false, pdfExists:false, error}。
-// timeoutMs（v2 Pass P91 §5 新增，可选）：不传时桥用自己的默认值（COMPILE_TIMEOUT_MS，
-// 120s，其它调用方零回归）；ovlP2TRunVerify 按页数算出的伸缩超时通过这里传给桥。
-async function ovlP2TVerifyCompile(job, timeoutMs) {
+// 调桥 /compile 编译任意 mainFile——不动全局 OvlState.compiling/pdfSourceMode/lastCompile
+// 等编辑器主状态，避免跟用户当时正在看的编译/PDF 面板互相打架。永不 throw（AbortError 除外，
+// 原样往上抛，跟仓库别处"取消不是失败"的纪律一致），网络失败也收敛成
+// {ok:false, pdfExists:false, error}。timeoutMs 可选，不传时桥用自己的默认值
+// （COMPILE_TIMEOUT_MS，120s）；signal 可选（v2 Pass P101 新增，供聊天 agent 的 compile 工具
+// 接住用户中止这一轮对话）。
+// v2 Pass P101：原来这段逻辑只内联在 ovlP2TVerifyCompile 一处（P85 核验专用），现在抽成
+// 通用函数——聊天 agent 的 compile 工具（组2）复用同一个入口，跟 P85 核验走的是完全同一条
+// 路径，不是照抄一份平行实现。ovlP2TVerifyCompile 改为委托，行为一字不变（timeoutMs 语义/
+// 请求体字段/错误收敛方式全部照旧，唯一新增的 signal 参数它自己不传，等价于以前）。
+async function ovlBridgeCompile(projectDir, mainFile, timeoutMs, signal) {
     try {
         const bodyObj = {
-            projectDir: job.projectDir, mainFile: job.outRel + '/main.tex',
+            projectDir: projectDir, mainFile: mainFile,
             engine: OvlCompileSettings.engine, mode: OvlCompileSettings.mode, haltOnError: OvlCompileSettings.haltOnError
         };
         if (typeof timeoutMs === 'number' && timeoutMs > 0) bodyObj.timeoutMs = timeoutMs;
         const resp = await ovlBridgeFetch(ovlBridgeUrl('/compile'), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(bodyObj)
+            body: JSON.stringify(bodyObj), signal: signal || undefined
         });
         const data = await resp.json();
         return data || { ok: false, pdfExists: false, error: '桥返回了空响应' };
     } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
         return { ok: false, pdfExists: false, error: '连不上桥接服务：' + (e && e.message ? e.message : String(e)) };
     }
+}
+async function ovlP2TVerifyCompile(job, timeoutMs) {
+    return ovlBridgeCompile(job.projectDir, job.outRel + '/main.tex', timeoutMs);
 }
 
 // v2 Pass P98：判定"完全没有日志的编译失败"——{ok:false} 且没有 log 字段（或空字符串），
