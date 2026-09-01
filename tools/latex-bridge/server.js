@@ -625,7 +625,10 @@ function collectBibScanText(mainAbs, projectDir) {
         // 污染外部 lastIndex，天然没有这个问题，不用手动管理任何状态。行为不变：S3（自指
         // \input 不死循环）、S4（\bibliography 在第二个 \input 里，靠 visited 短路不丢不重复）
         // 两个既有夹具在改动后依旧全过。
-        for (const mm of clean.matchAll(/\\(?:input|include)\{([^}]*)\}/g)) {
+        // v2 Pass P118 核验返修（.claude/tmp/p118_verify.md §三.3）：与 mirrorIncludeDirs() 同一处
+        // 空格盲区——`\input {name}` / `\include {name}`（控制字与 `{` 间有空白）是合法 TeX 写法，
+        // 原正则 `\{` 前无 `\s*` 会漏扫。
+        for (const mm of clean.matchAll(/\\(?:input|include)\s*\{([^}]*)\}/g)) {
             const n = mm[1].trim();
             if (!n) continue;
             const target = resolveIncludedTexFile(n, searchDirs);
@@ -685,6 +688,43 @@ function copyBibResourcesToOutdir(mainAbs, projectDir, outdir) {
     return diag;
 }
 
+// v2 Pass P118（.claude/tmp/p118_diag.md 已用隔离桥实测复现根因）：`\include{<path>}` 在
+// nonstopmode 下会先 `\openout \@partaux` 把 aux 直接写到 `-outdir` 下与 `\include` 参数同名
+// 的相对路径（例如 `\include{chapters/body}` → `outdir/chapters/body.aux`）。若 `chapters/`
+// 子目录在 outdir 里不存在，openout 直接失败，nonstopmode 下升级成 Emergency stop，
+// exitCode=12——跟 latexmk 多趟无关，direct 引擎单趟调用同样会触发，2 级嵌套
+// （`\include{a/b/body}`）必须把 `a/b` 整条链都预建才行，建一层不够。
+// 跟 bib 扫描器同一套思路：复用 collectBibScanText() 沿 \input/\include 展开出的全部可达
+// 源码文本（已剥注释、已递归跟随子文件），抓出全部 \include{} 目标（\input 不触发
+// \openout \@partaux，不需要预建），把每个目标路径的目录部分在 outdir 下整条镜像预建出来。
+// normal 与 draft 两种模式都要挂。静态正则扫描的已知局限与 bib 扫描器同类（\iffalse/宏包裹
+// 的 \include 扫不到）——这只是漏建（回退到当前已知的失败状态，不引入新故障），无假阳性
+// 风险。刻意不感知 \includeonly：已实测 latexmk/pdflatex 对被 \includeonly 排除掉的目标根本
+// 不会尝试 \openout，多建的空目录在一次性临时 outdir 里无副作用，无需多解析一层逗号列表。
+// 控制字与 `{` 之间允许空白（`\include {chapters/body}` 是合法 TeX 写法，TeX 跳过控制字后的
+// 空白）——正则须 `\s*` 容纳，否则这类写法漏建成"知已扫不到"的一种（P118 核验 §三.3）。
+//
+// v2 Pass P118 核验返修（.claude/tmp/p118_verify.md §三.2，阻塞项②）：`path.dirname(target)`
+// 原样喂给 `path.join(outdir, dir)`，对 `..` 零校验——.tex 里一条 `\include{../../../evil/x}`
+// 就能在 outdir **之外**任意可写位置建目录（实测可逃出整个临时目录树落到用户主目录）。这些
+// 目标本来就编不过（TeX 自身 openout_any=paranoid 拒绝往 outdir 之外写 aux，建了也救不回任何
+// 合法场景），收益为零、纯下行，直接跳过——`path.resolve` 后校验落点仍在 outdir 内部才建。
+function mirrorIncludeDirs(mainAbs, projectDir, outdir) {
+    let text;
+    try { text = collectBibScanText(mainAbs, projectDir); } catch (e) { return; }
+    if (!text) return;
+    const outdirAbs = path.resolve(outdir);
+    for (const mm of text.matchAll(/\\include\s*\{([^}]*)\}/g)) {
+        const target = mm[1].trim();
+        if (!target) continue;
+        const dir = path.dirname(target);
+        if (!dir || dir === '.') continue; // 根目录版：outdir 本身已存在，无需再建
+        const destAbs = path.resolve(outdir, dir);
+        if (destAbs !== outdirAbs && !destAbs.startsWith(outdirAbs + path.sep)) continue; // 越界目标：跳过，不建
+        try { fs.mkdirSync(destAbs, { recursive: true }); } catch (e) {}
+    }
+}
+
 function doCompile(projectDir, mainFile, opts) {
     opts = opts || {};
     // engine: pdflatex（默认）/ xelatex / lualatex —— M7 Compiler 分类真的驱动这个。
@@ -724,6 +764,9 @@ function doCompile(projectDir, mainFile, opts) {
         }
         let bibDiag = { referenced: [], found: [], missing: [] };
         if (mode !== 'draft') bibDiag = copyBibResourcesToOutdir(mainAbs, projectDir, outdir);
+        // v2 Pass P118：normal/draft 都要预建 \include{} 目标子目录，问题出在 \include 自身
+        // 的 \openout，与 latexmk 多趟无关。
+        mirrorIncludeDirs(mainAbs, projectDir, outdir);
 
         // v2 Pass P60：编译 cwd 必须是主文件所在目录，不能恒为 projectDir——.tex 内部的
         // \includegraphics{figures/fig.png} 这类相对路径是相对"进程 cwd"解析的（latexmk/
