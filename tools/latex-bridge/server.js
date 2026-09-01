@@ -525,9 +525,39 @@ const ASSET_MAX_BYTES = 100 * 1024 * 1024;
 // 文件本身复制一份到这次编译专用的 outdir 里，bibtex 在自己 cwd 就能找到，BIBINPUTS 那条路
 // 径翻译错不错就无所谓了。只在 normal 模式（会跑 bibtex）时做；draft 模式单趟引擎调用，
 // 压根不碰 bibtex，不需要这一步。
+//
+// v2 Pass P111 §Bug A 追加发现（.claude/tmp/p111_recon_local.md）：上面这套"拷进 outdir"的
+// 机制解决的是 bibtex *真正执行时*的 BIBINPUTS 翻译坑，但 latexmk 在决定"要不要跑 bibtex"
+// 之前还有一道更早的、完全独立的"文件是否存在"预检查——这道检查相对 latexmk 自己的进程 cwd
+// （=doCompile() 里的 compileCwd=path.dirname(mainAbs)）去找 .bib，跟 outdir 不是同一个目录，
+// copyBibResourcesToOutdir 这一步对它完全不起作用。main.tex 挪进子目录、.bib 留在项目根时，
+// 这道预检查会失败，latexmk 直接一票否决 bibtex（从不尝试运行）——真正的修复是 doCompile()
+// 给 spawn 显式设置 BIBINPUTS/BSTINPUTS 环境变量（见下方），这里的注释只是防止后来者以为
+// "这个函数已经处理了 BIBINPUTS 问题"而重复踩坑。
+function findBibRecursive(dir, name, maxDepth) {
+    if (maxDepth <= 0) return null;
+    let entries;
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch (e) { return null; }
+    for (const ent of entries) {
+        if (ent.isFile() && ent.name === name) return path.join(dir, name);
+    }
+    for (const ent of entries) {
+        if (!ent.isDirectory()) continue;
+        const bn = ent.name;
+        if (bn === '.git' || bn === 'node_modules' || bn.charAt(0) === '.') continue; // 跳过噪音目录
+        const found = findBibRecursive(path.join(dir, bn), name, maxDepth - 1);
+        if (found) return found;
+    }
+    return null;
+}
+
+// 返回诊断信息（v2 Pass P111 新增）：{ referenced, found, missing }——分别是 main.tex 里点名的
+// 全部 .bib 文件名（去重）、成功定位并拷贝的、以及哪里都找不到的。调用方（doCompile/finish）
+// 用这份信息在找不到时给出明确中文诊断，不是让引用悄悄变成 [?]。
 function copyBibResourcesToOutdir(mainAbs, projectDir, outdir) {
+    const diag = { referenced: [], found: [], missing: [] };
     let text;
-    try { text = fs.readFileSync(mainAbs, 'utf8'); } catch (e) { return; }
+    try { text = fs.readFileSync(mainAbs, 'utf8'); } catch (e) { return diag; }
     const names = [];
     const reClassic = /\\bibliography\{([^}]*)\}/g;
     const reBiblatex = /\\addbibresource(?:\[[^\]]*\])?\{([^}]*)\}/g;
@@ -540,18 +570,32 @@ function copyBibResourcesToOutdir(mainAbs, projectDir, outdir) {
         if (n) names.push(n.endsWith('.bib') ? n : n + '.bib');
     }
     names.forEach((name) => {
+        if (diag.referenced.indexOf(name) === -1) diag.referenced.push(name);
         // v2 Pass P60：.bib 常跟主 .tex 放同一目录（子目录报告场景），优先在主文件目录找，
         // 找不到再退回项目根（老项目 .bib 放根目录的既有行为零回归）。
         const srcNextToMain = path.join(path.dirname(mainAbs), name);
         const srcAtRoot = path.join(projectDir, name);
-        const src = fs.existsSync(srcNextToMain) ? srcNextToMain : srcAtRoot;
-        if (!fs.existsSync(src)) return; // 两处都找不到就跳过，交给 bibtex 自己按原样报错，不装作成功
+        let src = fs.existsSync(srcNextToMain) ? srcNextToMain : (fs.existsSync(srcAtRoot) ? srcAtRoot : null);
+        if (!src) {
+            // v2 Pass P111（R2 结论）：.bib 放在专门子目录（bib/、references/ 等）时，上面两处
+            // 候选都找不到，加一层"projectDir 下递归查找"兜底，深度上限 8 层防止病态大目录树
+            // 拖慢编译；命中第一个同名文件即用（多个同名 .bib 是用户项目结构问题，不是本函数
+            // 该猜的事）。
+            src = findBibRecursive(projectDir, name, 8);
+        }
+        if (!src) { if (diag.missing.indexOf(name) === -1) diag.missing.push(name); return; } // 哪里都找不到，交给 bibtex 自己按原样报错，不装作成功
         const dest = path.join(outdir, name);
         try {
             fs.mkdirSync(path.dirname(dest), { recursive: true });
             fs.copyFileSync(src, dest);
-        } catch (e) { /* 复制失败不算致命：最坏情况退回旧行为（BIBINPUTS 路径翻译问题依旧） */ }
+            if (diag.found.indexOf(name) === -1) diag.found.push(name);
+        } catch (e) {
+            // 复制失败不算致命：最坏情况退回旧行为（BIBINPUTS 路径翻译问题依旧），但既然找到了
+            // 源文件却没能拷成功，仍然记一笔 missing，好让诊断如实反映"最终没能生效"。
+            if (diag.missing.indexOf(name) === -1) diag.missing.push(name);
+        }
     });
+    return diag;
 }
 
 function doCompile(projectDir, mainFile, opts) {
@@ -591,7 +635,8 @@ function doCompile(projectDir, mainFile, opts) {
             resolve({ ok: false, error: (mode === 'draft' ? engine : 'latexmk') + ' 未找到: ' + compilerBin + '（检查 LATEX_BRIDGE_TEXBIN / TeX Live 是否安装）' });
             return;
         }
-        if (mode !== 'draft') copyBibResourcesToOutdir(mainAbs, projectDir, outdir);
+        let bibDiag = { referenced: [], found: [], missing: [] };
+        if (mode !== 'draft') bibDiag = copyBibResourcesToOutdir(mainAbs, projectDir, outdir);
 
         // v2 Pass P60：编译 cwd 必须是主文件所在目录，不能恒为 projectDir——.tex 内部的
         // \includegraphics{figures/fig.png} 这类相对路径是相对"进程 cwd"解析的（latexmk/
@@ -600,6 +645,26 @@ function doCompile(projectDir, mainFile, opts) {
         // 相对该子目录写时，cwd=projectDir 会让 kpathsea 找不到图。主文件本来就在项目根时
         // path.dirname(mainAbs) === path.resolve(projectDir)，行为不变，零回归。
         const compileCwd = path.dirname(mainAbs);
+
+        // v2 Pass P111 §Bug A：latexmk 在决定要不要跑 bibtex 之前有一道独立的"文件是否存在"
+        // 预检查，是相对它自己的进程 cwd（=compileCwd）去找 .bib 的——跟 copyBibResourcesToOutdir
+        // 拷贝进 outdir 完全不是同一个目录，main.tex 在子目录、.bib 在项目根时这道预检查会失败，
+        // latexmk 直接一票否决 bibtex（从不尝试运行），引用全部变成 [?]（.claude/tmp/
+        // p111_recon_local.md 已用 PowerShell 直跑 latexmk 验证）。显式把 BIBINPUTS/BSTINPUTS
+        // 指向 projectDir + compileCwd + outdir（分号分隔、末尾留空段位保留 kpathsea 默认搜索
+        // 路径，不破坏没有这个问题的既有场景），预检查和真正执行 bibtex 时都能在这些目录里找到
+        // .bib——用原生 Windows 路径字符串（本进程是纯 Node spawn，不经过 MSYS/bash，没有
+        // server.js 517-522 行注释描述的那种 Cygwin 路径转译坑）。只在 normal 模式设置：draft
+        // 模式压根不跑 bibtex，不需要也不该改变它的环境。
+        let compileEnv = process.env;
+        if (mode !== 'draft') {
+            const bibSearchDirs = [projectDir, compileCwd, outdir].filter((d, i, arr) => arr.indexOf(d) === i);
+            const bibInputsValue = bibSearchDirs.join(';') + ';';
+            compileEnv = Object.assign({}, process.env, {
+                BIBINPUTS: bibInputsValue + (process.env.BIBINPUTS || ''),
+                BSTINPUTS: bibInputsValue + (process.env.BSTINPUTS || '')
+            });
+        }
 
         // 同一时间只允许一个编译在跑；新请求来了先杀掉旧的（§3.1 契约）。
         // v2 Pass P98：这是纯粹的抢占（新杀旧），不是排队/拒绝——被杀一方的 HTTP 请求仍会走
@@ -648,7 +713,7 @@ function doCompile(projectDir, mainFile, opts) {
         let stderrBuf = [];
         let child;
         try {
-            child = spawn(compilerBin, args, { cwd: compileCwd, windowsHide: true });
+            child = spawn(compilerBin, args, { cwd: compileCwd, windowsHide: true, env: compileEnv });
         } catch (e) {
             resolve({ ok: false, error: 'spawn ' + (mode === 'draft' ? engine : 'latexmk') + ' failed: ' + e.message });
             return;
@@ -707,6 +772,21 @@ function doCompile(projectDir, mainFile, opts) {
             const parsed = parseLog(logText);
             const counts = { error: 0, warning: 0, info: 0 };
             parsed.forEach((e) => { if (counts[e.level] !== undefined) counts[e.level]++; });
+
+            // v2 Pass P111 §Bug A：main.tex 引用了 .bib（\bibliography{}/\addbibresource{}）
+            // 但 copyBibResourcesToOutdir 在主文件同目录、项目根、以及递归扫描整个项目之后仍然
+            // 一无所获时，不能让引用悄悄变成 [?]——插一条明确的中文 error 诊断到 parsed 数组
+            // 最前面。前端"日志"面板（ovlRenderLogList）直接渲染这个数组，用户不用去猜"为什么
+            // 引用是问号"。找到了的（missing 为空）或压根没引用 .bib 的项目不受影响，不会误报。
+            if (mode !== 'draft' && bibDiag && bibDiag.missing && bibDiag.missing.length) {
+                parsed.unshift({
+                    level: 'error',
+                    file: null,
+                    line: null,
+                    message: '未找到参考文献文件：' + bibDiag.missing.join('、') + '（已在主文件同目录、项目根目录、项目内全部子目录中查找，均未找到）。\\cite 引用将显示为 [?]，请确认文件名拼写，或把该文件放入项目文件夹内。'
+                });
+                counts.error++;
+            }
 
             const synctexPath = path.join(outdir, 'output.synctex.gz');
 
