@@ -685,6 +685,32 @@ function copyBibResourcesToOutdir(mainAbs, projectDir, outdir) {
     return diag;
 }
 
+// v2 Pass P118（.claude/tmp/p118_diag.md 已用隔离桥实测复现根因）：`\include{<path>}` 在
+// nonstopmode 下会先 `\openout \@partaux` 把 aux 直接写到 `-outdir` 下与 `\include` 参数同名
+// 的相对路径（例如 `\include{chapters/body}` → `outdir/chapters/body.aux`）。若 `chapters/`
+// 子目录在 outdir 里不存在，openout 直接失败，nonstopmode 下升级成 Emergency stop，
+// exitCode=12——跟 latexmk 多趟无关，direct 引擎单趟调用同样会触发，2 级嵌套
+// （`\include{a/b/body}`）必须把 `a/b` 整条链都预建才行，建一层不够。
+// 跟 bib 扫描器同一套思路：复用 collectBibScanText() 沿 \input/\include 展开出的全部可达
+// 源码文本（已剥注释、已递归跟随子文件），抓出全部 \include{} 目标（\input 不触发
+// \openout \@partaux，不需要预建），把每个目标路径的目录部分在 outdir 下整条镜像预建出来。
+// normal 与 draft 两种模式都要挂。静态正则扫描的已知局限与 bib 扫描器同类（\iffalse/宏包裹
+// 的 \include 扫不到）——这只是漏建（回退到当前已知的失败状态，不引入新故障），无假阳性
+// 风险。刻意不感知 \includeonly：已实测 latexmk/pdflatex 对被 \includeonly 排除掉的目标根本
+// 不会尝试 \openout，多建的空目录在一次性临时 outdir 里无副作用，无需多解析一层逗号列表。
+function mirrorIncludeDirs(mainAbs, projectDir, outdir) {
+    let text;
+    try { text = collectBibScanText(mainAbs, projectDir); } catch (e) { return; }
+    if (!text) return;
+    for (const mm of text.matchAll(/\\include\{([^}]*)\}/g)) {
+        const target = mm[1].trim();
+        if (!target) continue;
+        const dir = path.dirname(target);
+        if (!dir || dir === '.') continue; // 根目录版：outdir 本身已存在，无需再建
+        try { fs.mkdirSync(path.join(outdir, dir), { recursive: true }); } catch (e) {}
+    }
+}
+
 function doCompile(projectDir, mainFile, opts) {
     opts = opts || {};
     // engine: pdflatex（默认）/ xelatex / lualatex —— M7 Compiler 分类真的驱动这个。
@@ -724,6 +750,9 @@ function doCompile(projectDir, mainFile, opts) {
         }
         let bibDiag = { referenced: [], found: [], missing: [] };
         if (mode !== 'draft') bibDiag = copyBibResourcesToOutdir(mainAbs, projectDir, outdir);
+        // v2 Pass P118：normal/draft 都要预建 \include{} 目标子目录，问题出在 \include 自身
+        // 的 \openout，与 latexmk 多趟无关。
+        mirrorIncludeDirs(mainAbs, projectDir, outdir);
 
         // v2 Pass P60：编译 cwd 必须是主文件所在目录，不能恒为 projectDir——.tex 内部的
         // \includegraphics{figures/fig.png} 这类相对路径是相对"进程 cwd"解析的（latexmk/
