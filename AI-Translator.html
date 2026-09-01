@@ -4161,7 +4161,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.02.04';        // APP_VERSION_STAMP
+const APP_VERSION = '03.03.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -40310,11 +40310,38 @@ function ovlSyncTexCurrentLine() {
             if (!pane) return null;
             const sel = ovlWinOf(pane).getSelection();
             if (!sel || sel.rangeCount === 0) return null;
-            let node = sel.anchorNode;
+            // v2 Pass P114：改用 Range 自身的起点（range.startContainer/startOffset）而不是
+            // sel.anchorNode——两者在"反向拖选"（从后往前拖）时不是同一个点，Range 会自动
+            // 按文档顺序把 startContainer 摆在前面，跟任务书"按选区首部定位"的语义天然对齐；
+            // 更重要的是 gutter 整块选中（ovlVisualGutterSelectRange 用 Range.setStartBefore/
+            // setEndAfter 构造）会把 startContainer 落在目标块的**父节点**上（规范行为，见
+            // Range.setStartBefore：container=node.parentNode，startOffset=node 在其中的
+            // 子节点序号），不是块自己——旧代码用 sel.anchorNode 走 closest() 只查自身+祖先，
+            // 父节点不是块的祖先，永远查不到，误判成"没有可定位的位置"（诊断见
+            // .claude/tmp/p114_diag.md 缺陷2）。
+            const range = sel.getRangeAt(0);
+            let node = range.startContainer;
             if (!node) return null;
             if (node.nodeType !== 1) node = node.parentElement;
             if (!node || !pane.contains(node)) return null;
-            const block = node.closest ? node.closest('.ovl-visual-block[data-src-line]') : null;
+            let block = node.closest ? node.closest('.ovl-visual-block[data-src-line]') : null;
+            if (!block) {
+                // 按 Range 起点位置正向查一次子节点——setStartBefore/setEndAfter 构造的 Range，
+                // range.startContainer.childNodes[range.startOffset] 正好就是目标块本身。
+                const atOffset = (range.startContainer.nodeType === 1)
+                    ? range.startContainer.childNodes[range.startOffset] : null;
+                if (atOffset && atOffset.nodeType === 1) {
+                    block = (atOffset.matches && atOffset.matches('.ovl-visual-block[data-src-line]'))
+                        ? atOffset
+                        : (atOffset.closest ? atOffset.closest('.ovl-visual-block[data-src-line]') : null);
+                }
+            }
+            if (!block) {
+                // 最后兜底：node 的子树里找第一个块——能走到这一步说明选区确实是从某个块开始
+                // 的（只是前两种更精确的定位方式都没能直接命中），仍然比直接判失败更贴近用户
+                // 真实意图。
+                block = node.querySelector ? node.querySelector('.ovl-visual-block[data-src-line]') : null;
+            }
             if (!block) return null;
             const line0 = parseInt(block.getAttribute('data-src-line'), 10);
             return isFinite(line0) ? (line0 + 1) : null;
@@ -40370,7 +40397,7 @@ function ovlSyncTexForwardDirect() {
         const ta = document.getElementById('ovlCodeArea');
         if (!ta || ta.disabled) { ovlFlashSaveStatus('请先打开一个 .tex 文件并填好项目绝对路径', true); return; }
         const line = ovlSyncTexCurrentLine();
-        if (line == null) { ovlFlashSaveStatus('请先在左栏点一下你要定位的位置', true); return; }
+        if (line == null) { ovlFlashSaveStatus('请先选中或点击要定位的内容', true); return; }
         const markers = ovlScanPageMarkers(ta.value);
         if (!markers.length) {
             ovlFlashSaveStatus('当前文件没有页标记，可能不是 PDF 转换产物', true);
@@ -40414,7 +40441,7 @@ async function ovlSyncTexForward() {
         const projectDir = pathInput ? pathInput.value.trim() : '';
         if (!ta || ta.disabled || !projectDir) { ovlFlashSaveStatus('请先打开一个 .tex 文件并填好项目绝对路径', true); return; }
         const line = ovlSyncTexCurrentLine();
-        if (line == null) { ovlFlashSaveStatus('请先在左栏点一下你要定位的位置', true); return; }
+        if (line == null) { ovlFlashSaveStatus('请先选中或点击要定位的内容', true); return; }
         // v2 Pass P48：这里要传的是"这一行实际所在的那个文件"，不是项目的主文档——synctex 的
         // `-i line:col:name` 只按 name 在已编译的 synctex 数据库里查 line 对应哪一页，用户如果
         // 正在编辑一个被 \input 进主文档的子文件，行号是相对这个子文件数的，配上主文档文件名
@@ -42907,6 +42934,121 @@ async function ovlP106TryReverseSentenceHighlight(pageNum, texLineText) {
     } catch (e) { console.error('[ovl] p106 reverse sentence highlight failed', e); return false; }
 }
 
+// ==================== v2 Pass P114：编译模式 PDF -> tex 反向定位的句内细化 ====================
+// 背景（诊断见 .claude/tmp/p114_diag.md）：编译模式下双击 PDF 反向拿到的 data.line 已经是
+// synctex 给出的精确物理行，但 ovlPdfHandleDblClick 原来只调用一次 ovlMarkLines(lineIdx,
+// lineIdx) 就结束——同一行里塞了好几句话时，点第几句都画同一个整行框，体验上退化成"整行"。
+// 这里补一层"已知目标行 -> 句内字符区间"细化：复用 P106 已有的取词/剥数学/打分基础设施，
+// 但比 ovlPdfDirectTrySentenceLevel（direct 模式）更简单——那边不知道具体是哪一行，得在整页
+// 候选窗口里滑窗找最佳匹配；这里 synctex 已经给出了确切的行号，只需要在这一行内部切句子、
+// 找哪一句跟点击处文字重合度最高即可，不用跨行滑窗，误配概率也更低。
+// 只在双击手势下调用（见 ovlPdfHandleDblClick 的 opts.sentenceLevel），单击维持纯行级，
+// 跟任务书"单击保持现有行为不回归"的要求一致——direct 模式的既有句级逻辑（上面这一大段）
+// 一字未动，这里是编译模式独立的新增能力。
+// 按 [.!?] 后跟空白/行尾切句子——只按标点切分位置本身，不消耗任何字符，返回的区间边界
+// 精确落在原始 lineText 坐标系里，供直接换算成 #ovlCodeArea 的绝对字符偏移。数学环境内部
+// 偶尔出现的句号（比如 "$x=1.5$"）会被误切，属于已知局限——切错顶多让候选句子边界跟真实
+// 句子边界差几个字符，不影响"选出哪一句"这个匹配结果本身（打分函数按整句取词，边界差几个
+// 字符不影响词集合）。
+function ovlP114SplitLineIntoSentenceSpans(lineText) {
+    const spans = [];
+    const re = /[^.!?]*[.!?]+(?:\s+|$)|[^.!?]+$/g;
+    let m, guard = 0;
+    while ((m = re.exec(lineText)) !== null) {
+        if (m[0].length === 0) { re.lastIndex++; if (++guard > 5000) break; continue; }
+        spans.push([m.index, m.index + m[0].length]);
+        if (++guard > 5000) break;
+    }
+    return spans;
+}
+// 把一句的原始（未剥数学）文本区间掐头去尾到"第一个非空白字符 ~ 最后一个非空白字符"，
+// 避免高亮框把句子之间的分隔空白也框进去。
+function ovlP114TrimSpan(lineText, start, end) {
+    let s = start, e = end;
+    while (s < e && /\s/.test(lineText[s])) s++;
+    while (e > s && /\s/.test(lineText[e - 1])) e--;
+    return [s, e];
+}
+// 核心：已知目标行原始文本 + PDF 双击点取出的查询词，在这一行内部找哪一句最匹配，返回该句
+// 在 lineText 里的 [start,end) 字符区间（已裁剪首尾空白）；找不到过关的句子返回 null（调用
+// 方原样保留行级高亮，不产生误导性的句内框——跟 ovlP106SentenceLevelMatch 找不到时的降级
+// 纪律一致）。只有一句（或切不出句子边界，比如整行是纯数学环境/无终止标点）时也返回 null——
+// 句内细化对"本来就只有一句"的行没有意义，交给调用方退回整行。
+function ovlP114SentenceRangeInLine(lineText, queryText) {
+    const queryWords = ovlP106ExtractContentWords(queryText);
+    if (queryWords.length < OVL_P106_MIN_OVERLAP_WORDS) return null;
+    const spans = ovlP114SplitLineIntoSentenceSpans(lineText);
+    if (spans.length <= 1) return null;
+    let best = null, bestScore = -Infinity;
+    for (let i = 0; i < spans.length; i++) {
+        const raw = lineText.slice(spans[i][0], spans[i][1]);
+        const srcWords = ovlP106ContentWordsFromTexLine(raw);
+        if (!srcWords.length) continue;
+        const m = ovlP106WordSeqScore(srcWords, queryWords);
+        if (m.overlap >= OVL_P106_MIN_OVERLAP_WORDS
+            && (m.overlap / queryWords.length) >= OVL_P106_MIN_OVERLAP_RATIO
+            && m.score > bestScore) {
+            bestScore = m.score; best = spans[i];
+        }
+    }
+    if (!best) return null;
+    const trimmed = ovlP114TrimSpan(lineText, best[0], best[1]);
+    if (trimmed[0] >= trimmed[1]) return null;
+    return trimmed;
+}
+// 编译模式专用的取词窗口——比 direct 模式共用的 ovlP106ExtractClickQueryText（±20pt）窄得多。
+// direct 模式那套 ±20pt 是为了在"不知道具体哪一行"的整页滑窗搜索里有足够容错；这里已经从
+// synctex 精确拿到了目标行，不需要那么宽的窗口，窗口越宽反而越容易把相邻物理行（尤其一行
+// 内挤了好几句短句、行距只有 13~15pt 的场景）的文字也吸进来，稀释掉真正该句的词重合率、
+// 甚至把相邻句子误判成更佳匹配（P114 测试组A 实测复现：±20pt 窗口下点击某句会被相邻句子
+// "抢走"）。±7pt 窗口在真实测试夹具（约 15pt 行距）下留了约一半行距的安全边际，同时仍然
+// 覆盖单行文字自身的高度（11~12pt 字号的字形本身跨度通常不到 ±7pt），不影响同一行内取词的
+// 完整性。复用 ovlP106ClusterColumnsX/ColumnIndexForX/JoinItemsReadingOrder（列聚类、拼词
+// 逻辑本身不随窗口宽度变化，不用重写），只是窗口常量单独开一份，不改 P106 共用的那个。
+const OVL_P114_CLICK_WINDOW_PT = 7;
+function ovlP114ExtractClickQueryText(items, clickX, clickY) {
+    const columns = ovlP106ClusterColumnsX(items);
+    const colIdx = ovlP106ColumnIndexForX(columns, clickX);
+    const col = colIdx >= 0 ? columns[colIdx] : null;
+    const inWin = [];
+    for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (!it.str || !it.str.trim()) continue;
+        const x0 = it.transform[4], w = it.width || 0;
+        const xc = x0 + w / 2;
+        if (col && (xc < col.min - 6 || xc > col.max + 6)) continue;
+        const h = it.height || Math.abs(it.transform[3]) || 10;
+        const yc = it.transform[5] + h / 2;
+        if (Math.abs(yc - clickY) > OVL_P114_CLICK_WINDOW_PT) continue;
+        inWin.push(it);
+    }
+    return ovlP106JoinItemsReadingOrder(inWin);
+}
+// 对外入口：编译模式 PDF 双击已经拿到 synctex 给出的精确 lineIdx（0-based）之后，尝试句内
+// 细化。clickX/clickY 是调用方已经算好的 PDF 原生坐标（左下角原点，跟 item.transform 同一套，
+// 见 ovlP106ExtractClickQueryText 头部注释），items 是这一页 getTextContent() 的结果（调用方
+// 已经拿到，这里不重复请求一次）。命中就调 ovlMarkRange 画字符级框（Visual 走块内子范围、
+// Code 走精确字符矩形，见 30590 行 ovlMarkRange 头部注释），未命中返回 false，调用方保留
+// 已经画好的行级 ovlMarkLines 结果，不产生误导性提示。
+function ovlPdfSyncTexTrySentenceLevel(items, clickX, clickY, lineIdx) {
+    try {
+        const queryText = ovlP114ExtractClickQueryText(items, clickX, clickY);
+        if (!queryText) return false;
+        const taNow = document.getElementById('ovlCodeArea');
+        if (!taNow) return false;
+        const allLines = taNow.value.split('\n');
+        const lineText = allLines[lineIdx];
+        if (lineText == null) return false;
+        const range = ovlP114SentenceRangeInLine(lineText, queryText);
+        if (!range) return false;
+        const chars = ovlGutterLineRangeToChars(taNow, lineIdx, lineIdx);
+        const absStart = chars.start + range[0], absEnd = chars.start + range[1];
+        if (typeof ovlMarkRange !== 'function') return false;
+        ovlMarkRange(absStart, absEnd, { source: 'pdf-synctex-sentence' });
+        return true;
+    } catch (e) { console.error('[ovl] p114 pdf synctex sentence-level failed', e); return false; }
+}
+
 // direct 模式的双击/单击入口（§1.1）：页级保底先跳一次（同步），句级精定位异步尝试、命中才
 // 追加/收窄高亮，不阻塞页级这条已经生效的保底体验。
 function ovlPdfHandleDblClickDirect(ev, container) {
@@ -42971,7 +43113,7 @@ async function ovlPdfDirectTrySentenceLevel(ev, pageNum, markers) {
 // dblclick 用事件委托绑在 wrap 上，ev.target.closest('.ovl-pdf-page') 精确定位到"鼠标实际落在
 // 哪个页面容器里"，再从 pdfPageMap 按这个容器的 data-page-num 查出它自己的 viewport/pdfPage/
 // canvas——全程只用这一份 entry 的数据，不碰 OvlState.pdfView.page 这种"当前页指示器"。
-async function ovlPdfHandleDblClick(ev, container) {
+async function ovlPdfHandleDblClick(ev, container, opts) {
     try {
         // v2 Pass P72：直显源 PDF（文件树直接点 .pdf，未经编译）原来没有 synctex 数据可用，
         // 静默 no-op。v2 Pass P87：如果这份直显 PDF 是「PDF→LaTeX」转换的来源（右侧编辑器
@@ -43043,6 +43185,18 @@ async function ovlPdfHandleDblClick(ev, container) {
         else if (OvlState.editorMode === 'visual') ovlVisualScrollToLine(lineIdx);
         else ovlCodeScrollToLine(lineIdx);
         ovlFlashSaveStatus('已跳到源码第 ' + data.line + ' 行', false);
+        // v2 Pass P114：只有双击手势才尝试句内细化——单击（250ms 延时那条路径）继续维持纯
+        // 行级，跟任务书"单击保持现有行为不回归"的要求一致；行级高亮已经在上面同步画好，这里
+        // 命中就收窄/覆盖成句级框，找不到就静默保留行级结果，不产生误导性提示或额外弹窗。
+        if (opts && opts.sentenceLevel) {
+            try {
+                const tc = await entry.pdfPage.getTextContent();
+                const items = (tc && tc.items) ? tc.items : [];
+                if (items.length && typeof ovlPdfSyncTexTrySentenceLevel === 'function') {
+                    ovlPdfSyncTexTrySentenceLevel(items, pdfPt[0], pdfPt[1], lineIdx);
+                }
+            } catch (e) { console.error('[ovl] pdf synctex sentence-level failed', e); }
+        }
     } catch (e) {
         console.error('[ovl] pdf reverse syncTex failed', e);
         ovlFlashSaveStatus('反向 SyncTeX 定位失败：连不上桥接服务', true);
@@ -43093,7 +43247,9 @@ function ovlBindPdfCanvasEvents() {
         if (pdfClickTimer) { clearTimeout(pdfClickTimer); pdfClickTimer = null; }
         const container = ev.target.closest('.ovl-pdf-page');
         if (!container) return;
-        ovlPdfHandleDblClick(ev, container).catch(function (e) { console.error('[ovl] pdf dblclick handler failed', e); });
+        // v2 Pass P114：双击才尝试句内细化，跟下面 click（单击，250ms 延时）分道——单击继续
+        // 只传行级，维持原有行为不回归。
+        ovlPdfHandleDblClick(ev, container, { sentenceLevel: true }).catch(function (e) { console.error('[ovl] pdf dblclick handler failed', e); });
     });
     // v2 Pass P21：真正还原"连续滚动"手感的地方——鼠标滚轮/触控板/拖滚动条都是浏览器对这个
     // 可滚动容器的原生行为，不用任何自定义 JS 去接管滚轮事件；这里只是监听 scroll 去更新
