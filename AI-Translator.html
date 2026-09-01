@@ -4161,7 +4161,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.03.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.03.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -42950,11 +42950,31 @@ async function ovlP106TryReverseSentenceHighlight(pageNum, texLineText) {
 // 偶尔出现的句号（比如 "$x=1.5$"）会被误切，属于已知局限——切错顶多让候选句子边界跟真实
 // 句子边界差几个字符，不影响"选出哪一句"这个匹配结果本身（打分函数按整句取词，边界差几个
 // 字符不影响词集合）。
+// v2 Pass P114 返修（核验 .claude/tmp/p114_verify.md 问题③）：学术正文里的常见缩写
+// （"Fig."/"Eq."/"et al."/"e.g."/"i.e." 等）原来会被当成真句子边界误切——且像 "e.g."/"i.e."
+// 这种缩写内部还有一个不跟空白的句点（"e" + "." + "g" + "."），旧正则找不到能收尾的匹配
+// 位置时会静默跳过一段前缀字符，比"切错边界"更糟。改成切句前先用 ovlP114MaskAbbrevPeriods
+// 把已知缩写内部的句点换成一个不属于 [.!?] 的占位字符（长度不变，索引不变，返回的区间仍然
+// 精确落在原始 lineText 坐标系里），让切句正则天然跳过这些位置，不再单独处理。缩写表以外的
+// 场景（数学环境句点等）行为不变，仍是上面那条已知局限。
+const OVL_P114_ABBREV_PATTERNS = [
+    /\bFigs?\./g, /\bEqs?\./g, /\bSecs?\./g, /\bRefs?\./g, /\bNo\./g, /\bapprox\./g,
+    /\bvs\./g, /\bcf\./g, /\bDr\./g, /\bMr\./g, /\bMrs\./g, /\bMs\./g, /\bProf\./g,
+    /\bet\s+al\./g, /\be\.g\./g, /\bi\.e\./g
+];
+function ovlP114MaskAbbrevPeriods(lineText) {
+    let out = lineText;
+    for (let i = 0; i < OVL_P114_ABBREV_PATTERNS.length; i++) {
+        out = out.replace(OVL_P114_ABBREV_PATTERNS[i], function (mm) { return mm.replace(/\./g, '․'); });
+    }
+    return out;
+}
 function ovlP114SplitLineIntoSentenceSpans(lineText) {
     const spans = [];
+    const masked = ovlP114MaskAbbrevPeriods(lineText);
     const re = /[^.!?]*[.!?]+(?:\s+|$)|[^.!?]+$/g;
     let m, guard = 0;
-    while ((m = re.exec(lineText)) !== null) {
+    while ((m = re.exec(masked)) !== null) {
         if (m[0].length === 0) { re.lastIndex++; if (++guard > 5000) break; continue; }
         spans.push([m.index, m.index + m[0].length]);
         if (++guard > 5000) break;
@@ -43024,12 +43044,49 @@ function ovlP114ExtractClickQueryText(items, clickX, clickY) {
     }
     return ovlP106JoinItemsReadingOrder(inWin);
 }
+// v2 Pass P114 返修（核验 .claude/tmp/p114_verify.md 缺陷1，实测复现见 p114_verify.md 第五节）：
+// ±7pt 窗口取到的 queryText 有时就是整条被相邻句子"挤爆"的物理 PDF 行，打分会让共享这一行的
+// 相邻句子反超——不是"极小概率"，在作者自己的夹具上实测误配率 2/15 ≈ 13.3%，且两个失效点都
+// 是 100% 确定性复现（不是偶发抖动）：点句尾词被前一句量大的行尾词稀释、点句首 marker 词被
+// 后一句量大的行首词盖过。这两种情况下打分选出的句子里根本不包含用户实际点击的那个词，会画出
+// 一个"精确却指向错误句子"的框，用户没有任何信号能看出它错了——比"退回整行"更糟。
+// 守卫：算出点击处真正落在哪个词上（不是整条窗口拼出来的文字，是点击坐标本身对应的那一个
+// 词——按 (clickX - item.transform[4]) / item.width 的比例把命中 item 的 str 换算成字符
+// 下标，取该下标所在/最近的空白分隔词，见 ovlP114NearestClickedWord），如果这个词不出现在
+// 打分胜出的句子区间内，说明选中的很可能是被相邻句子"抢分"的结果——退回行级，不画这个框。
+function ovlP114NearestClickedWord(items, clickX, clickY) {
+    let best = null, bestDist = Infinity;
+    for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (!it.str || !it.str.trim()) continue;
+        const h = it.height || Math.abs(it.transform[3]) || 10;
+        const x0 = it.transform[4], w = it.width || 0;
+        const y0 = it.transform[5];
+        const dx = clickX < x0 ? (x0 - clickX) : (clickX > x0 + w ? (clickX - (x0 + w)) : 0);
+        const dy = clickY < y0 ? (y0 - clickY) : (clickY > y0 + h ? (clickY - (y0 + h)) : 0);
+        const dist = dx * dx + dy * dy;
+        if (dist < bestDist) { bestDist = dist; best = it; }
+    }
+    if (!best || !best.str) return null;
+    const str = best.str, w = best.width || 0, x0 = best.transform[4];
+    const per = w > 0 ? w / Math.max(1, str.length) : 0;
+    const charIdx = per > 0 ? Math.round((clickX - x0) / per) : Math.round(str.length / 2);
+    const wordRe = /\S+/g;
+    let m, chosen = null, chosenDist = Infinity;
+    while ((m = wordRe.exec(str)) !== null) {
+        const s = m.index, e = m.index + m[0].length;
+        const d = charIdx < s ? (s - charIdx) : (charIdx > e ? (charIdx - e) : 0);
+        if (d < chosenDist) { chosenDist = d; chosen = m[0]; }
+    }
+    return chosen;
+}
 // 对外入口：编译模式 PDF 双击已经拿到 synctex 给出的精确 lineIdx（0-based）之后，尝试句内
 // 细化。clickX/clickY 是调用方已经算好的 PDF 原生坐标（左下角原点，跟 item.transform 同一套，
 // 见 ovlP106ExtractClickQueryText 头部注释），items 是这一页 getTextContent() 的结果（调用方
-// 已经拿到，这里不重复请求一次）。命中就调 ovlMarkRange 画字符级框（Visual 走块内子范围、
-// Code 走精确字符矩形，见 30590 行 ovlMarkRange 头部注释），未命中返回 false，调用方保留
-// 已经画好的行级 ovlMarkLines 结果，不产生误导性提示。
+// 已经拿到，这里不重复请求一次）。命中且通过 ovlP114NearestClickedWord 守卫就调 ovlMarkRange
+// 画字符级框（Visual 走块内子范围、Code 走精确字符矩形，见 30590 行 ovlMarkRange 头部注释），
+// 未命中/未通过守卫都返回 false，调用方保留已经画好的行级 ovlMarkLines 结果，不产生误导性
+// 提示——这是"找不到就退回行级"和"找错了也要退回行级"的统一降级路径。
 function ovlPdfSyncTexTrySentenceLevel(items, clickX, clickY, lineIdx) {
     try {
         const queryText = ovlP114ExtractClickQueryText(items, clickX, clickY);
@@ -43041,6 +43098,19 @@ function ovlPdfSyncTexTrySentenceLevel(items, clickX, clickY, lineIdx) {
         if (lineText == null) return false;
         const range = ovlP114SentenceRangeInLine(lineText, queryText);
         if (!range) return false;
+        // 守卫：点击处真正落在的那个词必须出现在胜出句区间内，否则说明打分选中的是被相邻
+        // 句子"抢分"的结果（见本函数上方 P114 返修注释），退回行级。点击处落在停用词/短词
+        // （提不出可比较的实词）时无法验证，维持原判——这是本守卫已知未覆盖的残余风险，见
+        // p114_impl.md"已知局限"。
+        const clickedWord = ovlP114NearestClickedWord(items, clickX, clickY);
+        if (clickedWord) {
+            const clickedContentWords = ovlP106ExtractContentWords(clickedWord);
+            if (clickedContentWords.length) {
+                const winningWords = ovlP106ContentWordsFromTexLine(lineText.slice(range[0], range[1]));
+                const covered = clickedContentWords.every(function (w) { return winningWords.indexOf(w) !== -1; });
+                if (!covered) return false;
+            }
+        }
         const chars = ovlGutterLineRangeToChars(taNow, lineIdx, lineIdx);
         const absStart = chars.start + range[0], absEnd = chars.start + range[1];
         if (typeof ovlMarkRange !== 'function') return false;
