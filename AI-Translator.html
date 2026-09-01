@@ -4152,7 +4152,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '02.02.00';        // APP_VERSION_STAMP
+const APP_VERSION = '02.03.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -31062,6 +31062,15 @@ async function ovlOpenFile(fileHandle, name, parentHandle, relPath, opts) {
         // v2 Pass P17：换文件=之前订阅的那个文件的 watch 不再有意义，改订阅这一个（路径缺失/桥
         // 离线时 ovlBridgeUpdateWatch 自己会静默跳过，不影响这里的打开流程）。
         if (typeof ovlBridgeUpdateWatch === 'function') { try { ovlBridgeUpdateWatch(); } catch (e) {} }
+        // v2 Pass P107："打开一个文件"这个动作是"PDF 面板可能正呈现空态"的两个入口之一
+        // （另一个是上面那段 direct 模式退出分支，见函数头部注释）——不管这次打开的是不是
+        // 项目主文档本身，都试一次看有没有缓存可以恢复（ovlBuildCacheMaybeRestore 内部按
+        // mainFile 查缓存，不按"当前打开的这个文件"查）。不 await：读缓存文件是磁盘 IO，
+        // 不该拖慢"打开文件，编辑器区能立刻打字"这个更紧迫的诉求；函数内部已经整体
+        // try/catch，永不向外抛异常，这里的 .catch() 只是兜底防御性写法。
+        if (typeof ovlBuildCacheMaybeRestore === 'function') {
+            ovlBuildCacheMaybeRestore().catch(function (e) { console.warn('[ovl] build cache restore hook failed', e); });
+        }
     } catch (e) {
         console.error('[ovl] open file failed', e);
     }
@@ -33982,7 +33991,10 @@ function ovlUpdatePdfToolbarUI() {
     }
     if (stopBtn) stopBtn.disabled = !OvlState.compiling; // 不变：直显模式下 compiling 天生是 false
     const hasPdf = isDirect ? !!OvlState.pdfObjectUrl : !!(OvlState.lastCompile && OvlState.lastCompile.pdfExists);
-    if (viewLogsBtn) viewLogsBtn.disabled = !OvlState.lastCompile || isDirect;
+    // v2 Pass P107：restoredFromCache 的 lastCompile 是从磁盘缓存拼出来的最小可用状态
+    // （见 ovlBuildCacheMaybeRestore），没有 parsed/counts/log 这些真实编译日志字段——
+    // 点开会看到一个假装"没有日志条目"的空日志面板，不诚实，因此额外禁用。
+    if (viewLogsBtn) viewLogsBtn.disabled = !OvlState.lastCompile || isDirect || OvlState.lastCompile.restoredFromCache === true;
     if (dlBtn) dlBtn.disabled = !hasPdf; // 直显模式下 hasPdf=true，下载按钮照常可用
 
     // M4：翻页/缩放/反色只在真的有已编译 PDF 时才点得亮——没有编译产物就没有可控对象，
@@ -34141,6 +34153,219 @@ async function ovlBridgeCheckHealth() {
     }
 }
 
+// ==================== v2 Pass P107：编译产物持久缓存（"刷新/切回 tex 后 PDF 消失"）====================
+// 用户实测痛点原话："以前编译过了，应当不需要重新编译；除非 main.tex 相对上次编译变了，且
+// 勾选自动编译才自动重编。目前无论刷新还是 pdf→tex 切换，右侧 pdf 都直接消失，必须手动点
+// 编译。" 根因：OvlState.pdfObjectUrl 只是这一次页面会话内存里的一个 blob: URL，刷新页面/
+// 从 direct 模式切回 .tex（ovlOpenFile 顶部会 revoke 掉旧 blob，见该函数注释）之后天生是
+// null，ovlRenderPdfBody() 见到 null 就退化成空态占位文案——编译产物本身其实一直好好地
+// 在磁盘/桥的 WORK_ROOT 临时目录里，只是前端从没想过要去找它、也从没把它另外存过一份。
+//
+// 存取路径照抄 P75（pdf2tex 转换产物输出目录）那一套已经实测验证过的范式：项目内一个隐藏
+// 目录 + 自带内容 '*' 的 .gitignore 自忽略（临时仓库实测过 git add -A 不会暂存、git status
+// 为空，见本仓库 P74 阶段的实测记录），二进制/文本写入直接复用
+// ovlP2TWriteBinary/ovlP2TWriteText（不重新发明一套本地 FSA/远程桥双模式的写入分流），
+// 目录名前缀 '.'（.ovl-cache）会被文件树构建逻辑天然过滤掉（跟 .git 一样，见 ovlBuildTree
+// 附近的 charAt(0)==='.' 过滤），不会作为一个奇怪的空文件夹出现在用户的项目导航里。
+//
+// 是否"源文件变了"用内容哈希判断（ovlVisualHashSrc，P62 翻译缓存同一套哈希函数），不是
+// mtime——这个应用本身就有 Overleaf/git 同步场景，mtime 可能因为 checkout/pull 变化而
+// 内容其实没变，哈希更可靠。是否自动重新编译复用既有的"自动编译"设置
+// （OvlCompileSettings.autoCompile，见 ovlSettingsCompileHtml 附近的复选框）——用户原话
+// 明确写的就是"勾选自动编译才自动重编"，不新增第二个语义重叠的开关。
+const OVL_BUILD_CACHE_DIR = '.ovl-cache';
+let OvlBuildCacheGitignoreEnsured = false;
+// v2 Pass P107 热修（实测 e2e 回归发现）：ovlBuildCacheMaybeRestore 原来每次打开 .tex 都会
+// 现打 1~2 次桥请求（getDirectoryHandle('.ovl-cache') 内部经 OvlRemoteDirHandle.__childExists
+// 调 /fs/list）去确认有没有缓存——项目从来没编译过时，用户在会话里每开一个新文件都要重新
+// 白问一遍桥，纯属浪费，且实测（tools/e2e/test_p73_synctex_singlepane.js 回归）这份额外的
+// 并发请求会跟同一时刻文件树/其他初始化请求抢桥的处理时序，偶发把编译工具条的可见性判断
+// 拖过测试自己的重试窗口。同一个项目里"确认过这份 key 没有缓存"这件事只需要问一次桥，直到
+// 真的有一次成功编译把缓存写出来为止（写成功后自然会命中 pdfObjectUrl 非空的早退，不会再
+// 走到这里）——按 key 记忆"问过、没有"，不是按"是否已经恢复过"记（避免主文档换了/mainDocFile
+// 变了却一直被旧记忆挡住）。切换项目文件夹时唯一权威判断用 OvlState.dirHandle 的引用是否
+// 变了（跟其余状态清理是不是同一次切换无关，这里只关心"缓存记忆是不是这个项目的"）。
+let OvlBuildCacheNoCacheKeys = new Set();
+let OvlBuildCacheCheckedDirHandle = null;
+
+// mainFile 相对路径 -> 缓存文件名安全片段。跟 ovlDoRecompile 里发给 /compile 的 mainFile
+// 用完全同一个取值（OvlState.mainDocFile || currentFile.relPath || 'main.tex' 这条既有
+// 兜底链——见两个调用点），保证"这次编译真正编的是哪个文件"和"缓存查找的是哪个文件"
+// 永远是同一份判断逻辑，不会走两套口径。
+function ovlBuildCacheKey(mainFileRelPath) {
+    const norm = String(mainFileRelPath || 'main.tex').replace(/\\/g, '/').replace(/^\.\//, '');
+    const safe = norm.replace(/\.tex$/i, '').replace(/[^a-zA-Z0-9_-]+/g, '_');
+    return safe || 'main';
+}
+async function ovlBuildCacheEnsureGitignore() {
+    if (OvlBuildCacheGitignoreEnsured) return;
+    try { await ovlP2TWriteText(OVL_BUILD_CACHE_DIR + '/.gitignore', '*'); } catch (e) { return; }
+    OvlBuildCacheGitignoreEnsured = true;
+}
+
+// 编译成功后落盘一份缓存：PDF 字节 + （若有）synctex.gz 字节 + 元数据 JSON（源文件内容哈希
+// +时间，供下次打开时判断"源文件变没变"）。fire-and-forget 调用（见 ovlDoRecompile），失败
+// 只 console.warn，绝不影响"这次编译明明成功了"这个用户可见结果——这是锦上添花的持久化，
+// 不是编译流程本身的一部分。
+async function ovlBuildCacheSave(mainFile, pdfBuf, synctexBuf, extra) {
+    try {
+        if (!OvlState.dirHandle) return;
+        const key = ovlBuildCacheKey(mainFile);
+        // 现读磁盘上 mainFile 的真实内容算哈希——不能信任内存里可能跟磁盘不同步的编辑器
+        // 缓冲区（mainFile 未必是当前打开的文件，见 ovlBuildCacheMaybeRestore 同一处理由）。
+        let sourceHash = null, sourceMtimeMs = null, sourceSize = null;
+        try {
+            const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, mainFile);
+            const f = await resolved.handle.getFile();
+            const text = await f.text();
+            sourceHash = ovlVisualHashSrc(text);
+            sourceMtimeMs = f.lastModified;
+            sourceSize = f.size;
+        } catch (e) { return; } // 读不到源文件就没法建立"内容没变"的判据，放弃这次缓存写入
+        if (!sourceHash) return;
+
+        await ovlBuildCacheEnsureGitignore();
+        await ovlP2TWriteBinary(OVL_BUILD_CACHE_DIR + '/' + key + '.pdf', new Uint8Array(pdfBuf));
+        let synctexCached = false;
+        if (synctexBuf) {
+            try {
+                await ovlP2TWriteBinary(OVL_BUILD_CACHE_DIR + '/' + key + '.synctex.gz', new Uint8Array(synctexBuf));
+                synctexCached = true;
+            } catch (e) { /* synctex 缓存失败不影响 PDF 缓存本身，静默降级 */ }
+        }
+        const meta = {
+            mainFile: mainFile,
+            sourceHash: sourceHash,
+            sourceMtimeMs: sourceMtimeMs,
+            sourceSize: sourceSize,
+            pdfSize: pdfBuf.byteLength,
+            pageCount: (extra && typeof extra.pageCount === 'number') ? extra.pageCount : null,
+            synctexCached: synctexCached,
+            at: new Date().toISOString()
+        };
+        await ovlP2TWriteText(OVL_BUILD_CACHE_DIR + '/' + key + '.meta.json', JSON.stringify(meta));
+    } catch (e) {
+        console.warn('[ovl] build cache save failed', e);
+    }
+}
+
+// 打开 .tex 时尝试从磁盘缓存恢复 PDF 显示。调用点：ovlOpenFile 末尾（覆盖"刷新后首次打开
+// 任意 .tex"和"从 direct 模式点 .tex 切回来"两种场景——原话"无论刷新还是 pdf→tex 切换"）。
+// 触发条件（在调用前由 ovlOpenFile 侧的轻量判断把关，这里再兜底判断一次）：
+//   - 没有正在显示的 PDF（pdfObjectUrl 为空）——已经有 PDF 在显示就不横插一脚。
+//   - 不在 direct 模式（PDF 阅读模式跟"项目编译产物"是两个概念，互不干扰）。
+//   - 没有正在编译。
+//   - 没有"这一次会话已经真的编译过、但失败了"这种情况——lastCompile 存在且
+//     pdfExists===false 说明用户刚看过一次编译失败的提示，这时候悄悄拿旧缓存 PDF 盖上去
+//     会掩盖那次失败，比空态更误导。lastCompile 不存在，或存在但是一次成功编译（比如
+//     direct 模式来回切换把 blob URL revoke 掉了，见 ovlOpenPdfDirect 头部注释），都允许恢复。
+async function ovlBuildCacheMaybeRestore() {
+    try {
+        if (!OvlState.dirHandle) return; // 没打开过项目文件夹，没有 .ovl-cache 可言
+        if (OvlState.pdfObjectUrl || OvlState.pdfSourceMode === 'direct' || OvlState.compiling) return;
+        const lc0 = OvlState.lastCompile;
+        if (lc0 && lc0.pdfExists === false) return; // 刚失败过一次，不拿旧缓存掩盖
+
+        // 跟 ovlDoRecompile 里发给 /compile 的 mainFile 用同一条既有兜底链，保证查的缓存跟
+        // 真去编译时会产出的缓存是同一份 key。
+        const mainFile = OvlState.mainDocFile || (OvlState.currentFile && OvlState.currentFile.relPath) || 'main.tex';
+        const key = ovlBuildCacheKey(mainFile);
+
+        // 切换了项目文件夹（dirHandle 引用变了）就作废旧记忆——不然会拿上一个项目"没有缓存"
+        // 的结论去挡这个新项目。同一个项目内，已经确认问过没有的 key 直接跳过，不重复打桥。
+        if (OvlBuildCacheCheckedDirHandle !== OvlState.dirHandle) {
+            OvlBuildCacheNoCacheKeys = new Set();
+            OvlBuildCacheCheckedDirHandle = OvlState.dirHandle;
+        }
+        if (OvlBuildCacheNoCacheKeys.has(key)) return;
+
+        let meta = null;
+        try {
+            const metaResolved = await ovlResolveHandleForPath(OvlState.dirHandle, OVL_BUILD_CACHE_DIR + '/' + key + '.meta.json');
+            const metaFile = await metaResolved.handle.getFile();
+            meta = JSON.parse(await metaFile.text());
+        } catch (e) { OvlBuildCacheNoCacheKeys.add(key); return; } // 没有缓存条目：维持现状（空态），不是错误
+        if (!meta || typeof meta !== 'object' || !meta.sourceHash) { OvlBuildCacheNoCacheKeys.add(key); return; }
+
+        // 现读磁盘上 mainFile 的真实内容重新算哈希，不能信任 meta 里存的旧内容。
+        let curHash = null;
+        try {
+            const mainResolved = await ovlResolveHandleForPath(OvlState.dirHandle, mainFile);
+            const mainFileObj = await mainResolved.handle.getFile();
+            curHash = ovlVisualHashSrc(await mainFileObj.text());
+        } catch (e) { return; } // mainFile 都读不到，没法比对，放弃
+        const changed = curHash !== meta.sourceHash;
+
+        let pdfBuf = null;
+        try {
+            const pdfResolved = await ovlResolveHandleForPath(OvlState.dirHandle, OVL_BUILD_CACHE_DIR + '/' + key + '.pdf');
+            const pdfFile = await pdfResolved.handle.getFile();
+            pdfBuf = await pdfFile.arrayBuffer();
+        } catch (e) { return; } // meta 在但 PDF 字节丢了（比如被手动删过），静默当没缓存
+
+        // 上面几步都是 await，期间用户完全可能已经手动点了 Recompile / 切去了 direct 模式——
+        // 展示前再确认一次没有更新的状态发生，不覆盖用户这期间产生的新结果。
+        if (OvlState.pdfObjectUrl || OvlState.pdfSourceMode === 'direct' || OvlState.compiling) return;
+
+        OvlState.pdfObjectUrl = URL.createObjectURL(new Blob([pdfBuf], { type: 'application/pdf' }));
+        OvlState.pdfView = {
+            page: 1,
+            totalPages: (typeof meta.pageCount === 'number' && meta.pageCount > 0) ? meta.pageCount : ovlEstimatePdfPageCount(pdfBuf),
+            zoomMode: (typeof ovlPdfResolveDefaultZoomMode === 'function') ? ovlPdfResolveDefaultZoomMode() : 'fitwidth',
+            zoomPct: 100
+        };
+        // restoredFromCache=true 是这份 lastCompile 的关键区分标记：它没有真实的编译日志/
+        // 计数（parsed/counts/log 字段全缺），ovlUpdatePdfToolbarUI 靠这个标记额外禁用
+        // View Logs（否则点开会看到一个假装"没有日志条目"的空日志面板，不诚实）。
+        OvlState.lastCompile = {
+            ok: true, pdfExists: true, synctexExists: false, id: null,
+            pdfSize: pdfBuf.byteLength, pageCount: meta.pageCount || null,
+            restoredFromCache: true, sourceChanged: changed
+        };
+        { const p = document.getElementById('ovlPdfPanel'); if (p) p.setAttribute('data-pdfsrc', 'compiled'); }
+        ovlUpdatePdfToolbarUI();
+        ovlRenderPdfBody();
+        ovlSetPdfStatus(
+            changed
+                ? ('上次编译的结果（源文件已变' + (OvlCompileSettings.autoCompile ? '，正在自动重新编译…）' : '，点右上角 Recompile 更新）'))
+                : '上次编译的结果（源文件未变）',
+            false
+        );
+
+        // 缓存里若有 synctex.gz，起一次 rehydrate 换可用 id，让恢复显示后的正反跳转也能用；
+        // 桥没连上/rehydrate 失败都静默降级（synctexExists 保持 false，按钮天然禁用，不弹错，
+        // 已经展示出来的 PDF 不受影响）。
+        if (meta.synctexCached && OvlState.bridgeOnline) {
+            try {
+                const projectDir = ovlRemoteProjectRoot();
+                const resp = await ovlBridgeFetch(ovlBridgeUrl('/synctex/rehydrate'), {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        projectDir: projectDir,
+                        pdfRelPath: OVL_BUILD_CACHE_DIR + '/' + key + '.pdf',
+                        synctexRelPath: OVL_BUILD_CACHE_DIR + '/' + key + '.synctex.gz'
+                    })
+                });
+                const data = await resp.json();
+                if (data && data.ok && OvlState.lastCompile && OvlState.lastCompile.restoredFromCache) {
+                    OvlState.lastCompile.id = data.id;
+                    OvlState.lastCompile.synctexExists = !!data.synctexExists;
+                    ovlUpdatePdfToolbarUI();
+                }
+            } catch (e) { /* 静默降级，不影响已经显示出来的 PDF */ }
+        }
+
+        // 源已变 + 用户开着"自动编译"：跟 ovlScheduleAutoCompile() 防抖自动编译走同一个
+        // ovlDoRecompile 入口，不重新发明一套编译触发逻辑；不跳过语法检查，待遇跟手动点
+        // Recompile 一致。
+        if (changed && OvlCompileSettings.autoCompile && OvlState.bridgeOnline) {
+            ovlDoRecompile({}).catch(function (e) { console.error('[ovl] build cache auto recompile failed', e); });
+        }
+    } catch (e) {
+        console.warn('[ovl] build cache restore failed', e);
+    }
+}
+
 async function ovlDoRecompile(opts) {
     opts = opts || {};
     if (OvlState.compiling) return;
@@ -34256,6 +34481,23 @@ async function ovlDoRecompile(opts) {
             OvlState.pdfView.totalPages = (typeof data.pageCount === 'number' && data.pageCount > 0)
                 ? data.pageCount
                 : ovlEstimatePdfPageCount(buf);
+            // v2 Pass P107：编译成功，异步把这份 PDF（+ 若有 synctex.gz）落一份持久缓存到
+            // .ovl-cache/，供下次刷新/切回这个 tex 时直接恢复显示（见 ovlBuildCacheSave 头部
+            // 注释）。不 await——缓存写入是磁盘 IO，不该拖慢"编译成功，用户马上要看到 PDF"
+            // 这个更紧迫的路径；失败只在 ovlBuildCacheSave 内部 console.warn，不影响本次编译
+            // 成功的任何用户可见结果。
+            (async function () {
+                let synctexBuf = null;
+                if (data.synctexExists) {
+                    try {
+                        const stResp = await ovlBridgeFetch(ovlBridgeUrl('/output/' + data.id + '/output.synctex.gz'));
+                        if (stResp.ok) synctexBuf = await stResp.arrayBuffer();
+                    } catch (e) { /* 没有 synctex 字节就存不带 synctex 的缓存，不算错误 */ }
+                }
+                if (typeof ovlBuildCacheSave === 'function') {
+                    await ovlBuildCacheSave(mainFile, buf, synctexBuf, { pageCount: OvlState.pdfView.totalPages });
+                }
+            })().catch(function (e) { console.warn('[ovl] build cache pipeline failed', e); });
         } catch (e) {
             console.error('[ovl] fetch compiled pdf failed', e);
         }
@@ -40824,7 +41066,9 @@ function ovlSettingsCompilerHtml() {
     html += ovlSetRow('遇到第一个错误就停止', '<input type="checkbox" data-setpath="compile.haltOnError"' + (c.haltOnError ? ' checked' : '') + '>',
         '遇到第一个错误就停下来，不再往下编译。想快速定位是哪一处写错了的时候好用。');
     html += ovlSetRow('自动编译', '<input type="checkbox" data-setpath="compile.autoCompile"' + (c.autoCompile ? ' checked' : '') + '>',
-        '停止输入约 2.5 秒后自动编译一次，不用每次手动点 Recompile。');
+        '停止输入约 2.5 秒后自动编译一次，不用每次手动点 Recompile。v2 Pass P107：也决定了刷新/'
+        + '重新打开 tex 文件、发现源文件相比上次编译已经变了的时候，要不要自动重新编译——'
+        + '关着就只显示上次编译的旧 PDF 并提示可手动更新。');
     return html;
 }
 function ovlSettingsAppearanceHtml() {

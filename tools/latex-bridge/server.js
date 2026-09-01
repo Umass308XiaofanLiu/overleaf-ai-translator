@@ -50,7 +50,7 @@ try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化�
 // v2 Pass P45：/health 里带的能力/版本自报——见该端点注释。每次给桥新增一个"前端需要能
 // 判断有没有"的能力（新端点、既有端点的行为变化），就在 BRIDGE_CAPABILITIES 里加一个字符串，
 // 版本号也提一位。已经上线的能力不会被撤销，这个数组只做加法。
-const BRIDGE_API_VERSION = 55;
+const BRIDGE_API_VERSION = 56;
 const BRIDGE_CAPABILITIES = [
     'overleaf-clone',          // POST /overleaf/clone
     'overleaf-pull-strategy',  // POST /overleaf/pull 认识 body.strategy（abort/stash/discard）
@@ -68,8 +68,13 @@ const BRIDGE_CAPABILITIES = [
                                 // 文件夹（只能改成同级兄弟目录），供顶栏项目名双击改名用
     'fs-restore-respects-gitignore', // v2 Pass P74 §7.2：POST /fs/restore 不再把被 .gitignore
                                 // 忽略的文件算进删除名单，响应新增 skippedIgnored/ignoreWarning 字段
-    'fs-write-binary'          // v2 Pass P75 §7.1：POST /fs/write-binary，base64 → 原样字节落盘，
+    'fs-write-binary',         // v2 Pass P75 §7.1：POST /fs/write-binary，base64 → 原样字节落盘，
                                 // 供 PDF→LaTeX 转换写页面栅格图/内嵌图片用（doFsWrite 只能写 utf8 字符串）
+    'synctex-cache-rehydrate'  // v2 Pass P107：POST /synctex/rehydrate，把项目内已缓存的
+                                // PDF/output.synctex.gz（通常在 .ovl-cache/ 下）复制进一个新的
+                                // WORK_ROOT/<id> outdir，换回一个可用的 id——供"刷新后从磁盘
+                                // 缓存恢复显示的 PDF"接上现成的 /synctex/forward、/synctex/edit
+                                // （它们只认 id -> outdir 这一种定位方式），不需要真的重新编译
 ];
 
 // v2 Pass P49：监听地址可配（LATEX_BRIDGE_HOST），默认仍是 127.0.0.1——不传就跟以前
@@ -2486,7 +2491,7 @@ const server = http.createServer(async (req, res) => {
         }
 
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /overleaf/check-target, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete, POST /fs/restore, POST /fs/capabilities, POST /ws-ticket. WebSocket on same host:port for disk-change push.');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /synctex/rehydrate, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /overleaf/check-target, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/write-binary, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete, POST /fs/restore, POST /fs/capabilities, POST /ws-ticket. WebSocket on same host:port for disk-change push.');
             return;
         }
 
@@ -2610,6 +2615,57 @@ const server = http.createServer(async (req, res) => {
             if (!isFinite(x) || !isFinite(y)) { sendJson(res, 400, { ok: false, error: 'x/y 必须是有限数字' }); return; }
             const result = await doSyncTexEdit(outdir, page, x, y);
             sendJson(res, 200, result);
+            return;
+        }
+
+        // v2 Pass P107：{projectDir, pdfRelPath, synctexRelPath} -> {ok, id, synctexExists}。
+        // "编译产物持久缓存"恢复显示时用——把项目内已经落盘的缓存文件（通常是 .ovl-cache/
+        // 下的 <key>.pdf + <key>.synctex.gz，路径不强制这个前缀，只要在 projectDir 内）原样
+        // 复制进一份新的 WORK_ROOT/<id>/output.pdf + output.synctex.gz，跟 doCompile() 真的
+        // 编译一次产出的 outdir 形状完全一样——换回的这个 id 直接喂给现成的 /synctex/forward、
+        // /synctex/edit 就能用，不用给这两个端点另开一条"不靠 id"的旁路。只读复制，不跑任何
+        // 编译器；路径校验复用 safeProjectAssetPath 同一条防越权纪律（不许跑出 projectDir）。
+        // pdfRelPath 缺失/文件不存在直接判失败（缓存显然名不副实）；synctexRelPath 缺失/不存在
+        // 静默降级成 synctexExists:false（只有 PDF 没有 synctex 缓存不算错，只是这次恢复的
+        // 显示没法用 SyncTeX 跳转）。
+        if (req.method === 'POST' && pathname === '/synctex/rehydrate') {
+            const bodyText = await readBody(req);
+            let body;
+            try { body = JSON.parse(bodyText || '{}'); } catch (e) {
+                sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
+                return;
+            }
+            const projectDir = body.projectDir;
+            if (!projectDir || typeof projectDir !== 'string') {
+                sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' });
+                return;
+            }
+            if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) {
+                sendJson(res, 400, { ok: false, error: 'projectDir 不存在或不是目录: ' + projectDir });
+                return;
+            }
+            const pdfAbs = safeProjectAssetPath(projectDir, body.pdfRelPath);
+            if (!pdfAbs) { sendJson(res, 400, { ok: false, error: 'invalid pdfRelPath' }); return; }
+            if (!fs.existsSync(pdfAbs) || !fs.statSync(pdfAbs).isFile()) {
+                sendJson(res, 404, { ok: false, error: '缓存的 PDF 文件不存在: ' + body.pdfRelPath });
+                return;
+            }
+            let synctexAbs = null;
+            if (body.synctexRelPath) {
+                const resolved = safeProjectAssetPath(projectDir, body.synctexRelPath);
+                if (resolved && fs.existsSync(resolved) && fs.statSync(resolved).isFile()) synctexAbs = resolved;
+            }
+            const id = Date.now().toString(36) + '-' + crypto.randomBytes(4).toString('hex');
+            const outdir = path.join(WORK_ROOT, id);
+            try {
+                fs.mkdirSync(outdir, { recursive: true });
+                fs.copyFileSync(pdfAbs, path.join(outdir, 'output.pdf'));
+                if (synctexAbs) fs.copyFileSync(synctexAbs, path.join(outdir, 'output.synctex.gz'));
+            } catch (e) {
+                sendJson(res, 500, { ok: false, error: 'rehydrate failed: ' + e.message });
+                return;
+            }
+            sendJson(res, 200, { ok: true, id: id, synctexExists: !!synctexAbs });
             return;
         }
 
