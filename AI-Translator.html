@@ -4161,7 +4161,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.03.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.03.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -13916,6 +13916,13 @@ function adjustPopupPosition(popupId, padding = 10) {
     requestAnimationFrame(() => {
         const popup = document.getElementById(popupId);
         if (!popup) return;
+
+        // v2 Pass P117 返修：上一轮（可能是更窄/更矮的视口）留下的 max-height/overflow-y
+        // 必须先清空再测量，否则本轮在更宽视口下量到的还是被上一轮钳制过的尺寸，导致该弹层
+        // 从此永久卡在当时的高度上（P117 核验第 1 条实质回归）。照抄
+        // ovlClampPopupToViewport 已经做对的复位方式。
+        popup.style.maxHeight = '';
+        popup.style.overflowY = '';
 
         const rect = popup.getBoundingClientRect();
         const viewportWidth = window.innerWidth;
@@ -43852,8 +43859,9 @@ function ovlCompressSteps(natural, min, step) {
 //     point       {x,y}，side:'point' 时的锚点，不传则退回 anchorRect.left/top
 // 返回 {left, top, flippedV, flippedH, shrunk}——只读取/收缩样式（每次调用都先清空上一轮可能
 // 残留的收缩样式，保证同一弹层换了视口尺寸重开时是按"自然尺寸"重新算，不会被上一轮的
-// max-height 卡住），不写 left/top——调用点自己赋值，避免和各处已有的"先隐藏测量再显示"
-// 时序产生冲突。
+// max-height 卡住；v2 Pass P117 返修起，测量前还会把 left/top 临时置零，避免上一轮的
+// left 把 shrink-to-fit 宽度挤压小），最终 left/top 仍由调用点用返回值赋值，避免和各处
+// 已有的"先隐藏测量再显示"时序产生冲突。
 function ovlClampPopupToViewport(el, anchorRect, opts) {
     opts = opts || {};
     const margin = (opts.margin != null) ? opts.margin : 8;
@@ -43865,6 +43873,14 @@ function ovlClampPopupToViewport(el, anchorRect, opts) {
     el.style.maxWidth = '';
     el.style.maxHeight = '';
     el.style.overflowY = '';
+    // v2 Pass P117 返修：弹层若还停在上一轮算出的 left/top 上，position:fixed + 宽度自适应会
+    // 按「可用宽 = 视口宽 − left」做 shrink-to-fit，量到的是被上一轮位置挤压过的宽度（P117
+    // 核验第 2 条契约违背，实测 #ovlQuickActions/#ovlEqPreview 陈旧 left 会让算出的落点贴死
+    // 视口边、弹层保持被挤压的窄形态）。测量前把 left/top 中性化，让浏览器按未受挤压的可用
+    // 空间重新求自然尺寸；调用点随后一律会用本函数的返回值覆盖 left/top，这里不需要也不必
+    // 恢复旧值。
+    el.style.left = '0px';
+    el.style.top = '0px';
     let w = el.offsetWidth, h = el.offsetHeight;
     let shrunk = false;
     if (opts.maxWidth && w > opts.maxWidth) { w = opts.maxWidth; shrunk = true; }
