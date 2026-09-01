@@ -563,6 +563,12 @@ function findBibRecursive(dir, name, maxDepth) {
 //      的目的正相反。
 // 两处都在"读文本"这一步解决：先剥注释，再沿 \input/\include 浅层展开，把展开后的全部文本
 // 拼在一起再跑两条正则；下面两个辅助函数就做这件事。
+//
+// v2 Pass P111c 根治返修（第2轮核验 .claude/tmp/p111_verify.md §5.2）：① 只剥了 % 注释，
+// \iffalse…\fi/\begin{comment}/\begin{verbatim} 等同类"注释掉/不排版"构造换个写法就能重现
+// 同一种假红错——静态文本扫描天生堵不完这类构造。这两个辅助函数本身不再改（继续按"名字有没有
+// 出现在文本里"扫），真正的根治在下面 doCompile()/finish() 里：诊断该不该插入，改成看"这次
+// 编译是否真的有未解析引用的证据"，静态扫描结果降级为"报错时该点名哪个文件"的辅助信息源。
 
 // 剥 LaTeX 行注释：从第一个"未被 \ 转义"的 % 开始到行尾整段删掉。不能用简单的
 // /(?<!\\)%.../ ——负向先行断言只看紧邻的一个字符，真正的字面反斜杠后跟注释（"\\%"，即
@@ -601,7 +607,6 @@ function collectBibScanText(mainAbs, projectDir) {
     const searchDirs = [path.dirname(mainAbs), projectDir].filter((d, i, arr) => arr.indexOf(d) === i);
     const visited = new Set();
     const chunks = [];
-    const reIncludeCmd = /\\(?:input|include)\{([^}]*)\}/g;
     function visit(absPath, depth) {
         let real;
         try { real = fs.realpathSync(absPath); } catch (e) { real = absPath; }
@@ -612,9 +617,15 @@ function collectBibScanText(mainAbs, projectDir) {
         const clean = stripLatexLineComments(raw);
         chunks.push(clean);
         if (depth >= 8 || visited.size >= 64) return; // 防病态深/宽子文件树
-        reIncludeCmd.lastIndex = 0;
-        let mm;
-        while ((mm = reIncludeCmd.exec(clean))) {
+        // v2 Pass P111c（p111_verify.md §5.3 代码质量提示）：原来是模块级共享的 RegExp 对象，
+        // 每次递归手动把 lastIndex 重置为 0 再 exec() 循环——父层调用在子层递归 return 之后会
+        // 从头把自己那段文本重扫一遍（O(n²)），且"共享可变状态 + 手动管理 lastIndex"这种写法
+        // 本身就脆，后面谁改一下调用顺序就容易出真 bug。改成每次调用 visit() 时当场求值一个
+        // 正则字面量喂给 matchAll()——matchAll 内部对 global 正则做的是克隆式迭代，不依赖也不
+        // 污染外部 lastIndex，天然没有这个问题，不用手动管理任何状态。行为不变：S3（自指
+        // \input 不死循环）、S4（\bibliography 在第二个 \input 里，靠 visited 短路不丢不重复）
+        // 两个既有夹具在改动后依旧全过。
+        for (const mm of clean.matchAll(/\\(?:input|include)\{([^}]*)\}/g)) {
             const n = mm[1].trim();
             if (!n) continue;
             const target = resolveIncludedTexFile(n, searchDirs);
@@ -853,8 +864,37 @@ function doCompile(projectDir, mainFile, opts) {
             // 但 copyBibResourcesToOutdir 在主文件同目录、项目根、以及递归扫描整个项目之后仍然
             // 一无所获时，不能让引用悄悄变成 [?]——插一条明确的中文 error 诊断到 parsed 数组
             // 最前面。前端"日志"面板（ovlRenderLogList）直接渲染这个数组，用户不用去猜"为什么
-            // 引用是问号"。找到了的（missing 为空）或压根没引用 .bib 的项目不受影响，不会误报。
-            if (mode !== 'draft' && bibDiag && bibDiag.missing && bibDiag.missing.length) {
+            // 引用是问号"。
+            //
+            // v2 Pass P111c 根治返修（第2轮核验 .claude/tmp/p111_verify.md §5.2 阻塞项）：上面
+            // 这段话原来的判据只有"bibDiag.missing 非空"——纯静态文本扫描结果，跟这次编译到底
+            // 有没有真的出现未解析引用毫无关系。\iffalse…\fi / \begin{comment}…\end{comment}
+            // （comment 宏包）/ \begin{verbatim}…\end{verbatim} 这类"能骗过正则、骗不过 LaTeX
+            // 排版引擎"的构造，会让一次完全健康、引用全部正确解析成 [1] 的编译也被打上同一条
+            // 失实的红色 error（P111 第一次返修只剥了 % 注释，堵不住这些）。这类构造清单本质上
+            // 是打不完的地鼠（\iffalse 之后还有 \if0、条件宏包开关……），根治办法是换判据：
+            // 诊断该不该插，不再单独依赖静态扫描，改成看"这次编译是否真的留下了未解析引用的
+            // 证据"，两个信号取并集——
+            //   ① output.log 里出现 "Citation `xxx' ... undefined" 这类 LaTeX/宏包 Warning
+            //      （parseLog 已把这类行归类成 level:'warning'，直接在 parsed 里找，不用重新
+            //      扫一遍原始日志文本）；
+            //   ② 非 draft 模式下 output.bbl 缺失或 0 字节——这正是 R2（jump 现场）诊断出的
+            //      原始故障信号本身（.claude/tmp/p111_recon_jump.md）：bibtex 真的没能产出可用
+            //      的参考文献列表时必然是这个状态，不会有例外。
+            // 静态扫描（collectBibScanText/stripLatexLineComments，两者完整保留）降级为"证据
+            // 成立之后，报错该点名哪个文件"的辅助信息源——不再是"该不该报错"本身。找到了的
+            // （missing 为空）或压根没引用 .bib 的项目仍然不受影响，不会误报；三种已知构造与
+            // 任何构造不明的未来"注释掉/不排版"写法被这一条规则一次性覆盖，不必逐个语法剥文本。
+            const hasUndefinedCitationWarning = parsed.some((e) =>
+                e.level === 'warning' && /Citation\b[\s\S]*undefined/i.test(e.message || ''));
+            let bblMissingOrEmpty = false;
+            if (mode !== 'draft') {
+                try { bblMissingOrEmpty = fs.statSync(path.join(outdir, 'output.bbl')).size === 0; }
+                catch (e) { bblMissingOrEmpty = true; } // 文件不存在，视同"空"
+            }
+            const hasCompileEvidenceOfUnresolvedCitations = hasUndefinedCitationWarning || bblMissingOrEmpty;
+
+            if (mode !== 'draft' && bibDiag && bibDiag.missing && bibDiag.missing.length && hasCompileEvidenceOfUnresolvedCitations) {
                 parsed.unshift({
                     level: 'error',
                     file: null,
