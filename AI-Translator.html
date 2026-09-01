@@ -4161,7 +4161,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.02.04';        // APP_VERSION_STAMP
+const APP_VERSION = '03.02.05';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -36900,6 +36900,16 @@ const OVL_P2T_PROTECT_RE_LIST = [
     /\\begin\{(algorithm|algorithmic)\}[\s\S]*?\\end\{\1\}/g,
     /\\begin\{verbatim\}[\s\S]*?\\end\{verbatim\}/g,
     /\\begin\{figure\}[\s\S]*?\\end\{figure\}/g,           // 图注单独一行，不需要句子重排
+    // v2 Pass P112：thebibliography 原来完全没被保护——诊断实测根因（.claude/tmp/p112_diag.md）
+    // 就是模型转写参考文献页时输出了 IEEEtran/bibtex 风格的多行前导宏样板（\providecommand{
+    // \BIBforeignlanguage}[2]{{% ... 这类靠每行末尾一个 % 续行的写法），这段内容落在所有保护
+    // 区间之外，被当"裸文本缝隙"送进 ovlP2TReflowProseChunk：逐行 trim 再拼接一个空格，把
+    // 多行样板压成一整条物理行——原来"只吃到行尾"的 % 因此在压扁后的单行里变成从中间开始
+    // 把本该在别行的收尾花括号一并吃掉，TeX 报 Runaway argument / Emergency stop（真实复现见
+    // 诊断第 2 节）。跟其它结构性环境（table/algorithm/figure/verbatim）一样，参考文献列表
+    // 本来就不是需要分句重排的散文，整段原样透传最安全——不管模型这次吐的是标准
+    // \bibitem 列表还是 IEEEtran 那种带前导宏的样板，都不再有任何一行会被跨行合并。
+    /\\begin\{thebibliography\}[\s\S]*?\\end\{thebibliography\}/g,
     // v2 Pass P86 §2/§4 联调实测坑：% OVL-REFS-BEGIN...END 内部是"一条参考文献一行"（规则
     // 14 的约定），不是散文——如果不整体保护，reflowProseChunk 会把块内的单换行当软折行
     // 合并成一行空格分隔的长串，彻底破坏 §2 聚合阶段依赖的逐行结构。必须作为一个不可分割
@@ -36974,8 +36984,24 @@ function ovlP2TReflowProseChunk(chunk) {
     const leadWs = (/^\s*/.exec(chunk) || [''])[0];
     const core0 = chunk.slice(leadWs.length);
     const trailWs = (/\s*$/.exec(core0) || [''])[0];
-    const body = trailWs ? core0.slice(0, core0.length - trailWs.length) : core0;
+    let body = trailWs ? core0.slice(0, core0.length - trailWs.length) : core0;
     if (!body) return chunk; // 纯空白（含空 chunk）：原样透传，不处理
+    // v2 Pass P112 生成侧防御（见 .claude/tmp/p112_diag.md）：走到这里的 body 已经被上层
+    // ovlP2TReflowSentences/OVL_P2T_PROTECT_RE_LIST 证明是"确凿裸文本缝隙"（数学/表格/
+    // 算法/图注/verbatim/thebibliography/整行注释/section 等命令参数全部已经在外层被摘成
+    // 保护区间、不会流到这里）——这种真正的散文里如果模型原样转写了一个字面百分号（比如
+    // "accuracy improved by 50% on the test set"，真实论文正文常见），不转义成 \% 就会在
+    // 拼装进 main.tex 后被 TeX 当成注释起点，吞掉同一物理行后面的全部内容（诊断确认的正是
+    // 这一类故障——只是那次触发点是 thebibliography 前导宏样板被压扁成单行，本处是更通用的
+    // 第二道防线：任何裸文本缝隙里的字面 % 都在拼装前补上转义）。反斜杠转义奇偶判定复用
+    // ovlLatexEscapedAt，跟本文件别处同一套算法，\% 本来就写对的不会被误加成 \\%。规则宁窄
+    // 勿宽：只在这条已经证明是纯散文的分支里做，不碰任何保护区间内部的字符。
+    let escapedBody = '';
+    for (let pi = 0; pi < body.length; pi++) {
+        if (body[pi] === '%' && !ovlLatexEscapedAt(body, pi)) { escapedBody += '\\%'; continue; }
+        escapedBody += body[pi];
+    }
+    body = escapedBody;
     // 按空行分段，每段内部先合并折行（消掉模型输出里的软换行），保护缩写句点，按
     // "[.!?] + 空白 + 大写/引号/左括号" 切分句子，再逐句一行、段落间空一行。
     const processed = body.split(/\n{2,}/).map(function (para) {
@@ -37107,6 +37133,97 @@ async function ovlP2TCallVision(pageNum, dataUrl, userText, extSignal, maxTokens
     return result;
 }
 
+// ==================== v2 Pass P112：结构自检 TeX 语义感知升级 ====================
+// 根因排查见 .claude/tmp/p112_diag.md：用户重转 DeepLaDu 核验编译真实失败，真凶是
+// IEEEtran/bibtex 生成的参考文献前导宏样板（\providecommand{\BIBforeignlanguage}[2]{{% ...）
+// 被压扁成单行后，这一行原来"只注释掉行尾"的 % 变成吞掉了本该在别行收尾的花括号——P104 那套
+// 配平自检从头到尾裸扫描 text，从不剥 % 注释，对这种情况完全无感（% 之后的字符原样计入配平，
+// 跟 TeX 自己"未转义 % 到行尾都是注释"的语义正好相反），也不认识 \verb/verbatim 逐字区间。
+// 这里补一个只服务 pdf2tex 管线自己的"剥离对结构判定无意义的区间"函数——不改动/不复用
+// Visual 渲染那套 ovlStripLatexCommentsForRender（约 27645 行），避免牵动它另外 3 个渲染调用
+// 点；判定口径（% 转义奇偶复用 ovlLatexEscapedAt、逐字宏/环境名单同 XPORT 层）刻意保持一致，
+// 只是独立实现，改动面收在 pdf2tex 自己的代码区。跳过四类"结构判定应忽略"的区间：
+//   1. 未转义的 % 到物理行末（TeX 真实语义是连同换行一起吃掉；这里只吃到 \n 之前、保留换行
+//      本身，好让基于行号的定位——见 ovlP2TFindUnbalancedPageStart——行号不因为剥注释而漂移）；
+//   2. \verb/\verb* 定界符之间的字面字符（花括号在这里没有结构意义）；
+//   3. verbatim/Verbatim/lstlisting/minted/alltt 环境整段（同上，整段跳过）；
+//   4. \url{..}/\href{..}{..}/\nolinkurl{..}/\path{..} 的参数——连同外层定界花括号一起跳过
+//      （跳过而非保留：这类宏的参数花括号本来就自成一对，跳过整段对外层净深度没有任何影响，
+//      比"保留但不计入"更简单也更不容易出错）。
+const OVL_P2T_STRUCT_VERBATIM_ENVS = ['verbatim', 'Verbatim', 'lstlisting', 'minted', 'alltt'];
+const OVL_P2T_STRUCT_RAW_MACRO_RE = /^\\(url|href|nolinkurl|path)\s*\{/;
+function ovlP2TStripInertForStructureCheck(text) {
+    const src = String(text == null ? '' : text);
+    const n = src.length;
+    let out = '';
+    let i = 0;
+    while (i < n) {
+        if (src[i] === '\\') {
+            const vm = /^\\verb\*?([^a-zA-Z\s])/.exec(src.slice(i, i + 8));
+            if (vm) {
+                const delim = vm[1];
+                const closeIdx = src.indexOf(delim, i + vm[0].length);
+                if (closeIdx !== -1) { i = closeIdx + 1; continue; }
+            }
+            const rm = OVL_P2T_STRUCT_RAW_MACRO_RE.exec(src.slice(i, i + 24));
+            if (rm) {
+                const openIdx = i + rm[0].length - 1;
+                const closeIdx = ovlFindMatchingBrace(src, openIdx);
+                if (closeIdx !== -1) { i = closeIdx + 1; continue; }
+            }
+            const bm = /^\\begin\{(verbatim|Verbatim|lstlisting|minted|alltt)\}/.exec(src.slice(i, i + 24));
+            if (bm && OVL_P2T_STRUCT_VERBATIM_ENVS.indexOf(bm[1]) !== -1) {
+                const endTag = '\\end{' + bm[1] + '}';
+                const endIdx = src.indexOf(endTag, i + bm[0].length);
+                if (endIdx !== -1) { i = endIdx + endTag.length; continue; }
+            }
+        }
+        if (src[i] === '%' && !ovlLatexEscapedAt(src, i)) {
+            const nl = src.indexOf('\n', i);
+            i = (nl === -1) ? n : nl; // 停在换行符本身（不吃掉它），后续按行定位的行号才不漂移
+            continue;
+        }
+        out += src[i]; i++;
+    }
+    return out;
+}
+// 花括号净深度 + \begin/\end 环境净差（含每个环境名各自净差，供 suspectReasons 精确点名）+
+// $ 奇偶——三处配平判定共用同一份口径，activeText 必须是已经跑过上面
+// ovlP2TStripInertForStructureCheck 剥离过的文本；§4.4 抽取自检、P112 修复轮页定位（见下）
+// 两处都调它，不各写一套。
+function ovlP2TComputeBraceEnvBalance(activeText) {
+    let braceDepth = 0, braceWentNegative = false;
+    for (let i = 0; i < activeText.length; i++) {
+        if (activeText[i] === '\\') { i++; continue; }
+        if (activeText[i] === '{') braceDepth++;
+        else if (activeText[i] === '}') { braceDepth--; if (braceDepth < 0) braceWentNegative = true; }
+    }
+    const envCounts = {};
+    let m;
+    const beginRe = /\\begin\{([a-zA-Z*]+)\}/g;
+    while ((m = beginRe.exec(activeText))) envCounts[m[1]] = (envCounts[m[1]] || 0) + 1;
+    const endRe = /\\end\{([a-zA-Z*]+)\}/g;
+    while ((m = endRe.exec(activeText))) envCounts[m[1]] = (envCounts[m[1]] || 0) - 1;
+    const envUnbalanced = Object.keys(envCounts).filter(function (k) { return envCounts[k] !== 0; });
+    let dollarCount = 0;
+    for (let i = 0; i < activeText.length; i++) {
+        if (activeText[i] === '\\') { i++; continue; }
+        if (activeText[i] === '$') dollarCount++;
+    }
+    return {
+        brace: braceDepth, braceWentNegative: braceWentNegative,
+        envCounts: envCounts, envUnbalanced: envUnbalanced,
+        dollarOdd: (dollarCount % 2 !== 0)
+    };
+}
+// 一次性判定"这段文本的结构是否配平"（brace 净深度为 0 且未出现负数、环境全部配对、$ 是
+// 偶数次）——P112 修复轮页定位（ovlP2TFindUnbalancedPageStart）用它逐页找第一个不配平的
+// 页，跟 §4.4 抽取自检判定"suspect"的标准是同一套，不重新定义一遍。
+function ovlP2TIsStructurallyBalanced(rawText) {
+    const b = ovlP2TComputeBraceEnvBalance(ovlP2TStripInertForStructureCheck(rawText));
+    return b.brace === 0 && !b.braceWentNegative && b.envUnbalanced.length === 0 && !b.dollarOdd;
+}
+
 // ---- §4.4 thinking 剥离 + 违规前导剥离 + 配平自检，七步照抄，每一步都打标志、绝不静默。----
 function ovlP2TExtractLatex(raw) {
     const flags = {};
@@ -37133,45 +37250,24 @@ function ovlP2TExtractLatex(raw) {
     }
     let suspect = false;
     const suspectReasons = []; // v2 Pass P79：给 §5.2 自动重跑的 follow-up prompt 用的具体项
-    const envCounts = {};
-    let m;
-    const beginRe = /\\begin\{([a-zA-Z*]+)\}/g;
-    while ((m = beginRe.exec(text))) envCounts[m[1]] = (envCounts[m[1]] || 0) + 1;
-    const endRe = /\\end\{([a-zA-Z*]+)\}/g;
-    while ((m = endRe.exec(text))) envCounts[m[1]] = (envCounts[m[1]] || 0) - 1;
-    Object.keys(envCounts).forEach(function (k) { if (envCounts[k] !== 0) { suspect = true; suspectReasons.push('\\' + k + '{} environment tags are unbalanced'); } });
-    let dollarCount = 0;
-    for (let i = 0; i < text.length; i++) {
-        if (text[i] === '\\') { i++; continue; }
-        if (text[i] === '$') dollarCount++;
-    }
-    if (dollarCount % 2 !== 0) { suspect = true; suspectReasons.push('unescaped $ math delimiters appear an odd number of times'); }
-    // v2 Pass P104：用户重转 DeepLaDu 核验编译真实失败实测——真根因是这里，不是 \caption*/
-    // refs.bib（两者已用同一份诊断夹具真实走过 :1235 全管线验证，编译均正常）。既有配平自检
-    // 只查 \begin{}/\end{} 环境对与 $ 奇偶，从没查过裸花括号 { }（比如 \textbf{... 或
-    // \section{... 少打一个收尾 }）——小模型偶发漏打收尾括号时，这类片段原样混进拼装后的
-    // main.tex，TeX 把从那个 { 开始到文件结尾的一切都当成同一个未闭合的命令参数继续扫描
-    // （Runaway argument / File ended while scanning use of ...），最终以 Emergency stop 收场，
-    // 这正是 latexmk 打出 "!  ==> Fatal error occurred, no output PDF file produced!" 的经典
-    // 成因——已用独立合成夹具复现：\textbf{ 缺一个收尾 } 之后接两段正常段落，同一套 /compile
-    // 真实产出这一模一样的日志尾（含 "Runaway argument?" / "! File ended while scanning use of
-    // \textbf ." / "! Emergency stop." / "!  ==> Fatal error occurred, no output PDF file
-    // produced!" 四行）。跟 $ 奇偶检查同一套转义扫描手法（"\\" 之后的下一个字符原样跳过，不
-    // 计入配平——verbatim 块里的裸花括号仍可能误报，这是既有 $ 检查同样接受的已知局限，不是
-    // 新引入的风险）：净深度非 0，或扫描途中出现过负数（先出现 } 后出现配对的 {，比如
-    // "}foo{" 这种更罕见的顺序错乱）都判定不配平。
-    let braceDepth = 0, braceWentNegative = false;
-    for (let i = 0; i < text.length; i++) {
-        if (text[i] === '\\') { i++; continue; }
-        if (text[i] === '{') braceDepth++;
-        else if (text[i] === '}') { braceDepth--; if (braceDepth < 0) braceWentNegative = true; }
-    }
-    if (braceDepth !== 0 || braceWentNegative) { suspect = true; suspectReasons.push('curly braces { } are unbalanced'); }
+    // v2 Pass P112：原来这四处配平判定（环境/$/花括号/tabular &）各自在带 % 注释的原始 text
+    // 上裸扫描，注释里的字面 "\begin{...}"/"{"/"$" 会被误当结构符号计入——真实故障根因（见
+    // .claude/tmp/p112_diag.md）：IEEEtran/bibtex 前导宏样板被压扁成单行后，行内本该只注释掉
+    // 行尾的 % 吞掉了本该在别行收尾的花括号，P104 的裸扫描对这种"%后面还有真代码"的情况完全
+    // 无感。改成先剥离注释/逐字区间得到 activeText，四处判定都基于它，共用同一份
+    // ovlP2TComputeBraceEnvBalance（跟 P112 修复轮页定位同一套判定口径，见 §4.5 附近）。
+    const activeText = ovlP2TStripInertForStructureCheck(text);
+    const balance = ovlP2TComputeBraceEnvBalance(activeText);
+    balance.envUnbalanced.forEach(function (k) { suspect = true; suspectReasons.push('\\' + k + '{} environment tags are unbalanced'); });
+    if (balance.dollarOdd) { suspect = true; suspectReasons.push('unescaped $ math delimiters appear an odd number of times'); }
+    if (balance.brace !== 0 || balance.braceWentNegative) { suspect = true; suspectReasons.push('curly braces { } are unbalanced'); }
     // v2 Pass P79（§5.2 第1条）：tabular 弱二次校验——同一张表里每行 & 数量是否一致。
     // 只标记不修：\hline/\toprule 等纯规则行没有 & 天然跳过，用众数（首行）当基准。
+    // v2 Pass P112：改在 activeText 上找表格（同上——避免注释里的字面 "\begin{tabular}" 文本
+    // 误命中；表格内部真正的 % 注释行本来也不该参与 & 计数）。
     const tabularRe = /\\begin\{(tabular\*?|tabularx|longtable)\}(?:\{[^}]*\})?\{[^}]*\}([\s\S]*?)\\end\{\1\}/g;
     let tm;
-    while ((tm = tabularRe.exec(text))) {
+    while ((tm = tabularRe.exec(activeText))) {
         const rows = tm[2].split('\\\\').map(function (r) { return r.trim(); })
             .filter(function (r) { return r && !/^\\(hline|toprule|midrule|bottomrule|cline)\b/.test(r); });
         if (rows.length < 2) continue;
@@ -38052,6 +38148,16 @@ let OvlP2TState = { job: null, running: false, panelMinimized: false };
 
 const OVL_P2T_VERIFY_FIX_TIMEOUT_MS = 60000;
 const OVL_P2T_VERIFY_MAX_ERRORS_IN_EXCERPT = 8;
+// v2 Pass P112：编译失败→定位→修复→重编译这条链路原来硬编码只给 1 轮预算（fixBudgetUsed 一
+// 用即锁死）。诊断（.claude/tmp/p112_diag.md 第 4 节）实测确认修复轮"确实真实生效过、且修对
+// 了地方"（第一次编译里一大串 \argmin/\underbrace/Not in outer par mode 级联错误在第二次编译
+// 里全部消失），只是同一份文档里恰好还有另一处独立的结构性错误（花括号未闭合）没被同一轮修
+// 复覆盖到——只给 1 轮预算时，这种"改对了一部分、还剩另一部分"的情况必然在第二次编译仍失败后
+// 直接放弃。升到 2 轮：第一轮用不掉、或用完仍失败，就拿第二次编译的新错误信息再定位、再修一
+// 次，两轮都不成功才进入下面人工指引分支。仍然是"总预算"而不是"每种定位手段各给一轮"——跟
+// 结构顺序检查（Abstract/Introduction）共用同一个 job 级 fixBudgetUsed 布尔值的语义不变，
+// 这个布尔值只在这条编译修复链路整体用完之后才置 true。
+const OVL_P2T_VERIFY_MAX_COMPILE_FIX_ROUNDS = 2;
 const OVL_P2T_VERIFY_SYSTEM_PROMPT = [
     '你正在修复一份由 PDF 自动转写生成的 LaTeX 论文源码中的编译错误。',
     '你会看到：①这次 latexmk/pdflatex 编译失败的错误日志摘录；②被怀疑是错误来源的那一页 LaTeX 片段（不含文档前导、不含 \\begin{document}/\\end{document}）。',
@@ -38184,6 +38290,78 @@ function ovlP2TVerifyLocatePageFragment(mainText, errorLine) {
     while (endIdx > target.idx + 1 && lines[endIdx - 1].trim() === '') endIdx--;
     const bodyLines = lines.slice(target.idx + 1, endIdx); // 不含标记行本身
     return { pageNum: target.num, markerIdx: target.idx, nextMarkerIdx: nextMarkerIdx, snippet: bodyLines.join('\n') };
+}
+
+// v2 Pass P112：错误行号有时天生不带（"Runaway argument?" / "! File ended while scanning use
+// of \@argdef." 这类 TeX 扫描到文件尾才报错的失败，见 .claude/tmp/p112_diag.md 第 4 节）——
+// ovlP2TVerifyFirstErrorLine 这时恒为 null，原来的定位链路直接放弃、跳过自动修复。这里补一条
+// 不依赖日志行号的定位手段：main.tex 是逐页拼起来的，正常情况下每一页自己的花括号/环境/$
+// 应该各自净配平；这里在拼装后的 main.tex 上逐页复用 ovlP2TIsStructurallyBalanced（跟 §4.4
+// 抽取自检同一套判定口径）重新检查一遍，第一个不配平的页就是最可能的出错源。之所以要在
+// "拼装后"独立重查一遍而不是只信抽取时的结果：诊断证实本案真正让文档失衡的那一步（多行样板
+// 被压扁成单行）发生在 ovlP2TReflowSentences，晚于抽取时的检查点——P112 已经把
+// thebibliography 收进 reflow 保护区间从根上堵住了这一种诱因（见 OVL_P2T_PROTECT_RE_LIST），
+// 这道复查留作独立的第二道防线，覆盖其它未预见到的"抽取时平、拼装后不平"路径。返回第一个
+// 净不配平页的页内第一行对应的 1-based 全文行号（可以直接喂给 ovlP2TVerifyLocatePageFragment
+// 复用同一套页片段摘取逻辑），全部页各自都配平则返回 null（不是"没有页"，那种情况上层会走
+// 常规 markers.length===0 分支）。
+function ovlP2TFindUnbalancedPageStart(mainText) {
+    const lines = String(mainText || '').split('\n');
+    const markerRe = /^% ==== page (\d+) ====$/;
+    const markers = [];
+    for (let i = 0; i < lines.length; i++) {
+        const m = markerRe.exec(lines[i]);
+        if (m) markers.push({ idx: i, num: Number(m[1]) });
+    }
+    if (!markers.length) return null;
+    let endOfAllPagesIdx = lines.length;
+    for (let i = lines.length - 1; i >= 0; i--) {
+        if (lines[i].trim() === '\\end{document}') { endOfAllPagesIdx = i; break; }
+    }
+    for (let k = 0; k < markers.length; k++) {
+        const start = markers[k].idx + 1;
+        const end = (k + 1 < markers.length) ? markers[k + 1].idx : endOfAllPagesIdx;
+        if (start >= end) continue; // 空页片段，跳过
+        const segment = lines.slice(start, end).join('\n');
+        if (!ovlP2TIsStructurallyBalanced(segment)) return start + 1; // 转成该页第一行的 1-based 全文行号
+    }
+    return null;
+}
+
+// v2 Pass P112：把日志摘录归到一个人话能懂的中文错误类别——核验最终失败的指引不再只说"建议
+// 人工处理"这一句空话（本案诊断过程就是靠人工翻两次编译日志才排查出来的，见 .claude/tmp/
+// p112_diag.md 第 4 节），至少把"大概是哪一类问题"直接摆出来，省去用户自己再读一遍日志分类。
+// 只做粗分类，不追求穷尽 TeX/LaTeX 全部报错类型——分类失败时如实说"未能自动分类"，不硬套。
+function ovlP2TVerifyClassifyErrorCategory(excerpt) {
+    const e = String(excerpt || '');
+    if (/Runaway argument|File ended while scanning use of/.test(e)) {
+        return '花括号/环境未闭合导致的 Runaway argument（TeX 把某个未闭合的 { 之后的全部内容误当成同一个命令的参数继续扫描，直到文件结尾才报 Emergency stop）';
+    }
+    if (/Undefined control sequence/.test(e)) return '未定义的控制序列（\\命令名拼写错误，或缺少对应宏包/未在导言区定义该命令）';
+    var latexErrM = /LaTeX Error:[^\n]*/.exec(e);
+    if (latexErrM) return 'LaTeX Error：' + latexErrM[0].slice(0, 160);
+    var pkgErrM = /Package \S+ Error:[^\n]*/.exec(e);
+    if (pkgErrM) return pkgErrM[0].slice(0, 160);
+    if (/Emergency stop/.test(e)) return '致命错误导致编译提前终止（Emergency stop），日志未给出更具体的分类信息';
+    if (/编译超时/.test(e)) return '编译超时（不是语法错误，可能是本页内容导致排版异常缓慢或陷入死循环）';
+    return '未能自动分类的编译错误（详见下方原始日志摘录）';
+}
+// v2 Pass P112：核验最终失败时组装"文件 + 行号 + 错误类别 + 处理建议"四要素的中文人工处理
+// 指引，取代原来 job.verify.fixSummary 里那句不带定位信息的通用提示。mainFileRel 是相对
+// job.outRel 的 main.tex 路径；loc 是 ovlP2TVerifyLocatePageFragment/
+// ovlP2TFindUnbalancedPageStart 定位出的页片段（可能为 null——两种定位手段都失败时如实说
+// "未能定位"，不编造行号）；roundsUsed 是这次核验里编译修复链路实际用掉的轮数（0～
+// OVL_P2T_VERIFY_MAX_COMPILE_FIX_ROUNDS）。
+function ovlP2TVerifyBuildManualGuidance(mainFileRel, loc, excerpt, roundsUsed) {
+    const category = ovlP2TVerifyClassifyErrorCategory(excerpt);
+    const fileDesc = mainFileRel + (loc ? '（第 ' + loc.pageNum + ' 页片段，源码第 ' + (loc.markerIdx + 2) + ' 行起）' : '');
+    const roundsDesc = roundsUsed > 0
+        ? ('已自动尝试修复 ' + roundsUsed + ' 轮（上限 ' + OVL_P2T_VERIFY_MAX_COMPILE_FIX_ROUNDS + ' 轮）仍未通过编译，')
+        : '未能定位到可自动修复的具体位置，';
+    const advice = loc
+        ? '打开该文件对应位置，检查附近命令的花括号/环境标签是否配平（尤其留意跨物理行用 % 续行的样板文本、\\verb 定界符、嵌套引用），手动补齐后重新编译核验。'
+        : '编译日志未给出可用的行号定位信息，也未能通过逐页配平复查定位到疑似出错页，建议直接打开该文件全文搜索报错信息中的关键词排查。';
+    return roundsDesc + '建议人工处理：\n文件：' + fileDesc + '\n错误类别：' + category + '\n处理建议：' + advice;
 }
 
 // 调修复模型：跟视觉模型同源的文本 /chat/completions（浏览器直连，不经桥），固定关闭思考
@@ -38486,66 +38664,88 @@ async function ovlP2TRunVerify(job) {
 
     // ---- 阶段一：首次编译（v2 Pass P98：无日志失败自动重试一次，见 ovlP2TVerifyCompileWithRetry）----
     const firstAttempt = await ovlP2TVerifyCompileWithRetry(job, verifyTimeoutMs);
-    const firstCompile = firstAttempt.compileData;
-    compileOk = !!(firstCompile && firstCompile.ok && firstCompile.pdfExists);
+    let curCompile = firstAttempt.compileData;
+    compileOk = !!(curCompile && curCompile.ok && curCompile.pdfExists);
     if (compileOk) {
-        compileSecs = (typeof firstCompile.durationMs === 'number') ? (firstCompile.durationMs / 1000).toFixed(1) : null;
+        compileSecs = (typeof curCompile.durationMs === 'number') ? (curCompile.durationMs / 1000).toFixed(1) : null;
     } else {
-        let excerpt = ovlP2TVerifyBuildErrorExcerpt(firstCompile, verifyTimeoutMs);
+        let excerpt = ovlP2TVerifyBuildErrorExcerpt(curCompile, verifyTimeoutMs);
         // v2 Pass P98：重试过仍失败——两次的真实错误都要保留在报告里，不能只留第二次、把第一次
         // 静默吞掉（两次不一定是同一个原因，比如第一次是竞态、第二次已经是真实语法错误）。
-        // 无日志失败必然没有 file:line 格式的 error 条目，下面 ovlP2TVerifyFirstErrorLine 恒为
-        // null、loc 恒为 null，这条分支必然直接落进"未能定位出错页"的失败报告，不会流到后续
-        // fixSummaryParts 的"原错误"摘要里，excerpt 前置两行说明不会污染那段文案。
         if (firstAttempt.retried) {
             excerpt = '第一次尝试：' + firstAttempt.firstError + '\n重试后：' + excerpt;
         }
-        const errorLine = ovlP2TVerifyFirstErrorLine(firstCompile);
-        const mainText0 = await readMainText();
-        const loc = (mainText0 != null) ? ovlP2TVerifyLocatePageFragment(mainText0, errorLine) : null;
-        if (!loc) {
-            job.verify.state = 'failed';
-            job.verify.finalOk = false;
-            job.verify.errorsExcerpt = excerpt;
-            job.verify.fixSummary = '未能从编译日志定位到具体出错页，已跳过自动修复。';
-            job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
-            return;
+        // v2 Pass P112：原来这里只有 1 轮"定位→修复→重编译"预算，且当次编译日志给不出
+        // file:line（比如 "Runaway argument?"/"! File ended while scanning use of ..." 这类
+        // 扫描到文件尾才报错的失败）就直接放弃——诊断（.claude/tmp/p112_diag.md 第 4 节）实测
+        // 确认修复轮"确实真实生效过、且修对了地方"，只是同一份文档里还有另一处独立的结构性
+        // 错误没被同一轮覆盖到。改成最多 OVL_P2T_VERIFY_MAX_COMPILE_FIX_ROUNDS 轮：每轮先尝试
+        // 编译器给出的 file:line，拿不到就用 ovlP2TFindUnbalancedPageStart（TeX 注释语义感知
+        // 的逐页配平复查）自己算一个行号；两种手段这一轮都定位不到才跳出循环，进入下面的人工
+        // 处理指引分支（ovlP2TVerifyBuildManualGuidance）。
+        let roundsUsed = 0;
+        let curMainText = await readMainText();
+        let curExcerpt = excerpt;
+        let lastLoc = null;
+        while (roundsUsed < OVL_P2T_VERIFY_MAX_COMPILE_FIX_ROUNDS && curMainText != null) {
+            const errorLine = ovlP2TVerifyFirstErrorLine(curCompile);
+            let loc = errorLine ? ovlP2TVerifyLocatePageFragment(curMainText, errorLine) : null;
+            let usedExcerpt = curExcerpt;
+            if (!loc) {
+                const structLine = ovlP2TFindUnbalancedPageStart(curMainText);
+                loc = structLine ? ovlP2TVerifyLocatePageFragment(curMainText, structLine) : null;
+                if (loc) {
+                    usedExcerpt = curExcerpt + '\n\n【补充定位】编译器错误信息未带 file:line 行号，经 TeX 注释语义感知的花括号/环境配平复查，定位到第 '
+                        + loc.pageNum + ' 页片段疑似存在未闭合的结构（花括号或环境标签），随片段一并提交修复。';
+                }
+            }
+            if (!loc) break; // 两种定位手段这一轮都失败，跳出循环走人工指引分支
+            lastLoc = loc;
+            job.verify.state = 'fixing';
+            ovlP2TPanelRender();
+            const fixResult = await ovlP2TVerifyCallFixModel(usedExcerpt, loc.snippet, null);
+            fixBudgetUsed = true; // 无论成功与否，这一轮预算都算用掉了
+            roundsUsed++;
+            if (!fixResult.ok) {
+                job.verify.state = 'failed';
+                job.verify.finalOk = false;
+                job.verify.errorsExcerpt = curExcerpt;
+                job.verify.fixSummary = '自动修复请求失败：' + fixResult.error;
+                job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
+                return;
+            }
+            const lines = curMainText.split('\n');
+            const rebuilt = lines.slice(0, loc.markerIdx + 1)
+                .concat(fixResult.fragment.split('\n'))
+                .concat(['', ''])
+                .concat(lines.slice(loc.nextMarkerIdx));
+            curMainText = rebuilt.join('\n');
+            await ovlP2TWriteText(job.outRel + '/main.tex', curMainText);
+            job.verify.fixApplied = true;
+            job.verify.state = 'recompiling';
+            ovlP2TPanelRender();
+            curCompile = await ovlP2TVerifyCompile(job, verifyTimeoutMs);
+            compileOk = !!(curCompile && curCompile.ok && curCompile.pdfExists);
+            if (compileOk) {
+                compileSecs = (typeof curCompile.durationMs === 'number') ? (curCompile.durationMs / 1000).toFixed(1) : null;
+                fixSummaryParts.push('第 ' + loc.pageNum + ' 页片段自动修复后编译通过'
+                    + (roundsUsed > 1 ? '（第 ' + roundsUsed + ' 轮）' : '')
+                    + '（原错误：' + curExcerpt.split('\n')[0].slice(0, 100) + '）');
+                break;
+            }
+            curExcerpt = ovlP2TVerifyBuildErrorExcerpt(curCompile, verifyTimeoutMs);
+            // 循环继续（若还有轮数预算）：用这次重新编译得到的新错误信息重新定位、再修一次。
         }
-        job.verify.state = 'fixing';
-        ovlP2TPanelRender();
-        const fixResult = await ovlP2TVerifyCallFixModel(excerpt, loc.snippet, null);
-        fixBudgetUsed = true; // 无论成功与否，这一轮预算都算用掉了——不会因为失败就再调第二次
-        if (!fixResult.ok) {
+        if (!compileOk) {
             job.verify.state = 'failed';
             job.verify.finalOk = false;
-            job.verify.errorsExcerpt = excerpt;
-            job.verify.fixSummary = '自动修复请求失败：' + fixResult.error;
-            job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
-            return;
-        }
-        const lines = mainText0.split('\n');
-        const rebuilt = lines.slice(0, loc.markerIdx + 1)
-            .concat(fixResult.fragment.split('\n'))
-            .concat(['', ''])
-            .concat(lines.slice(loc.nextMarkerIdx));
-        await ovlP2TWriteText(job.outRel + '/main.tex', rebuilt.join('\n'));
-        job.verify.fixApplied = true;
-        job.verify.state = 'recompiling';
-        ovlP2TPanelRender();
-        const secondCompile = await ovlP2TVerifyCompile(job, verifyTimeoutMs);
-        compileOk = !!(secondCompile && secondCompile.ok && secondCompile.pdfExists);
-        if (compileOk) {
-            compileSecs = (typeof secondCompile.durationMs === 'number') ? (secondCompile.durationMs / 1000).toFixed(1) : null;
-            fixSummaryParts.push('第 ' + loc.pageNum + ' 页片段自动修复后编译通过（原错误：' + excerpt.split('\n')[0].slice(0, 100) + '）');
-        } else {
-            job.verify.state = 'failed';
-            job.verify.finalOk = false;
-            job.verify.errorsExcerpt = ovlP2TVerifyBuildErrorExcerpt(secondCompile, verifyTimeoutMs);
-            job.verify.fixSummary = '已尝试自动修复第 ' + loc.pageNum + ' 页片段一次（一轮上限），重新编译仍失败。';
+            job.verify.errorsExcerpt = curExcerpt;
+            // v2 Pass P112：不再只有一句"建议人工处理"——给出文件+行号+错误类别+处理建议。
+            job.verify.fixSummary = ovlP2TVerifyBuildManualGuidance(job.outRel + '/main.tex', lastLoc, curExcerpt, roundsUsed);
             job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
             // 编译最终仍失败，但仍然如实上报结构检查（不再自动修，预算已耗尽或跟编译问题无关）。
-            const mainTextAfterFail = await readMainText();
-            const structAfterFail = ovlP2TVerifyStructuralCheck(mainTextAfterFail || '');
+            const mainTextAfterFail = (curMainText != null) ? curMainText : ((await readMainText()) || '');
+            const structAfterFail = ovlP2TVerifyStructuralCheck(mainTextAfterFail);
             job.verify.structuralIssues = structAfterFail.issues.map(function (x) { return Object.assign({}, x, { autoFixed: false }); });
             return;
         }
