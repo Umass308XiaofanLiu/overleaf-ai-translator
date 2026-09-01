@@ -1964,6 +1964,15 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 .ovl-visual-body h1 { font-size: 20px; } .ovl-visual-body h2 { font-size: 18px; }
 .ovl-visual-body h3 { font-size: 16px; } .ovl-visual-body h4 { font-size: 14px; }
 .ovl-visual-body h5, .ovl-visual-body h6 { font-size: 13px; }
+/* v2 Pass P116：IEEE 章节编号前缀——挂在 .ovl-visual-block 自己身上的 data-ovl-num 属性
+   （渲染层现算，见 ovlNumComputeForBlock），::before 画出来，跟块内唯一的 h1-h6 标题元素
+   摆成一行（标题命令永远单独成块，见 ovlSplitVisualBlocks 里 isHeading 的 flush 逻辑，这
+   条规则命中时块内保证只有一个标题子元素，不会跟别的内容挤在同一行）。中文模式翻译落地
+   只替换这个 div 的 innerHTML（子节点），data-ovl-num 属性挂在 div 本身，不受影响。 */
+.ovl-visual-block[data-ovl-num] { display: flex; align-items: baseline; gap: 0.35em; }
+.ovl-visual-block[data-ovl-num]::before {
+    content: attr(data-ovl-num); font-weight: 700; color: #111827; flex: 0 0 auto; white-space: nowrap;
+}
 .ovl-visual-body p { margin: 0.6em 0; }
 .ovl-visual-body ul, .ovl-visual-body ol { margin: 0.4em 0 0.6em 1.4em; }
 .ovl-visual-body li { margin: 0.15em 0; }
@@ -4161,7 +4170,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.02.07';        // APP_VERSION_STAMP
+const APP_VERSION = '03.03.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -29324,14 +29333,104 @@ function ovlVisualRenderBlockContent(text) {
     return { html: ovlVisualRenderChunk(text), pending: true };
 }
 
+// ==================== v2 Pass P116：Visual 章节 IEEE 编号 ====================
+// 编号是渲染层产物——不改 LatexFilter 输出/不进 buildStructureTable 的 Markdown、不进
+// ovlVisualBlockSrcText 喂给翻译的源码文本（那个函数按 data-src-line 从 #ovlCodeArea 现切，
+// 编号从来不在源码里）、也不进查找/P37 标注的文本匹配（那两套都是从块的可见 innerHTML /
+// data-src-line 走的，不读 data-ovl-num）——所以数字挂在 .ovl-visual-block 这个 div 自己的
+// data-ovl-num 属性上，配 CSS ::before 显示（AI-Translator.html:1951 附近），不是标题内部
+// 的独立文本节点：中文模式翻译落地是 el.innerHTML = ovlVisualRenderChunk(tgt)（只冲子节点，
+// 见 ovlVisualLangRunQueue 约 29542 行），属性挂在 el 自己身上，天然不会被这行冲掉，零改动
+// 那个函数。
+//
+// 三级计数器：section 罗马数字（I./II./…）、subsection 大写字母（A./B./…）、subsubsection
+// 数字+右括号（1)/2)/…），父级递增清零子级。\section*/\subsection*/\subsubsection* 等星号
+// 变体不参与计数、不产生编号（IEEE/LaTeX 惯例）。\appendix 之后 section 级切到
+// "Appendix A"/"Appendix B" 式且计数器归零（照抄 LaTeX 标准 article.cls 里 \appendix 的语义：
+// \setcounter{section}{0} + \Alph{section}）；subsection/subsubsection 的格式规则本身不因
+// 附录切换而变，只是各自的计数依旧随父级 section 递增而清零。
+function ovlNumToRoman(n) {
+    const map = [[1000, 'M'], [900, 'CM'], [500, 'D'], [400, 'CD'], [100, 'C'], [90, 'XC'],
+        [50, 'L'], [40, 'XL'], [10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I']];
+    let x = Math.max(1, n | 0), out = '';
+    for (let k = 0; k < map.length; k++) { while (x >= map[k][0]) { out += map[k][1]; x -= map[k][0]; } }
+    return out;
+}
+function ovlNumToLetter(n) {
+    // 1->A ... 26->Z ... 27->AA（超过 26 个 section/subsection 极罕见，兜底不报错、不重复）。
+    let x = Math.max(1, n | 0), out = '';
+    while (x > 0) { x--; out = String.fromCharCode(65 + (x % 26)) + out; x = Math.floor(x / 26); }
+    return out;
+}
+const OVL_NUM_APPENDIX_RE = /\\appendix\b/;
+const OVL_NUM_HEADING_RE = /^\s*\\(subsubsection|subsection|section)(\*)?(?:\[[^\]]*\])?\{/;
+// v2 Pass P116 返修（对抗核验 p116_verify.md 问题 1）：直接拿整块原始源码 test \appendix
+// 会被两类"看不见"的假阳性坑——(a) 被注释掉的 `%\appendix`（渲染管线本来就确定性剥离注释，
+// 用户在 Visual 面板里根本看不到这行）(b) verbatim/lstlisting 等逐字环境里的字面 `\appendix`
+// 文本——一起误判成真命令，静默把它之后所有真章节全部翻成 "Appendix A/B/C"。复用仓库里两个
+// 现成工具，不新造轮子：ovlVisualCodeMask（28871 行附近，翻译链路已经在用的"代码/逐字环境
+// 整段抽走换成不透明哨兵"，按环境名做通用 \begin/\end 深度配对，不认 % 为注释，verbatim 内部
+// 字面 % 不会被误伤）先脱壳，再用 ovlLatexActiveText（29221 行，ovlSplitVisualLines 自己也在
+// 用的"逐行摘 % 注释之前的生效文本"）逐行剥注释——顺序不能反：先脱壳保证 verbatim 内容不会
+// 被当成注释误删，脱壳后剩下的才是普通正文，"%" 在这里才真的是注释起点。
+// 已知局限（复用 ovlSplitVisualBlocks 既有行为，本次不动、不属于本次范围）：如果
+// \begin{verbatim}…\end{verbatim} 被空行拦腰切成好几个块（起止标签分落不同块），这里只能看
+// 见"当前这一块"，看不到跨块的"其实还在 verbatim 里面"——夹在中间、独占一行的
+// \section{...} 仍会被 ovlSplitVisualBlocks 的 isHeading 判定切成独立块（连带渲染成假
+// <h2>，是分块器的既有行为，不是这里新引入的），也仍会被当真标题计数。同一块内的
+// \begin{verbatim}...\end{verbatim}（含单行写法 \begin{verbatim}\appendix\end{verbatim}、
+// 单行写法 \begin{verbatim}\section{Fake}\end{verbatim}）不受此局限，正常被掩掉。
+function ovlNumEffectiveText(blockText) {
+    const masked = ovlVisualCodeMask(blockText).text;
+    return masked.split('\n').map(ovlLatexActiveText).join('\n');
+}
+// \appendix 跟标题命令挤在同一行时（比如 "\appendix \section{AppX}"）用来剥掉开头的
+// \appendix 前缀，见下面 headingSrc 那行的注释。
+const OVL_NUM_APPENDIX_LEADING_RE = /^\s*\\appendix\b\s*/;
+// numState 由调用方（ovlVisualRenderBodyWithLines）在每次渲染开始时现建一个新对象传入——
+// 不用模块级共享状态，整篇渲染跟局部段落重渲染各自独立起算，互不污染，也不需要显式重置。
+function ovlNumComputeForBlock(blockText, numState) {
+    const effective = ovlNumEffectiveText(blockText);
+    if (OVL_NUM_APPENDIX_RE.test(effective)) {
+        numState.appendix = true;
+        numState.sec = 0; numState.sub = 0; numState.subsub = 0;
+    }
+    // v2 Pass P116 返修（问题 2，同一根因顺手覆盖）：\appendix 和标题命令挤在同一行时，
+    // ovlSplitVisualBlocks 按整行匹配 isHeading——这一行不是以标题命令开头，不会被单独拆成
+    // 一块，落进普通正文块；原来 OVL_NUM_HEADING_RE 是 ^ 锚定的，永远匹配不上，导致那一节
+    // 一个编号都拿不到（既不是 "Appendix A" 也不是罗马数字）。剥掉开头的 \appendix 前缀后
+    // 再匹配标题正则，紧跟着的标题命令照样能认出来、按（已经在上面设好的）附录状态正常
+    // 编号。
+    const headingSrc = effective.replace(OVL_NUM_APPENDIX_LEADING_RE, '');
+    const m = OVL_NUM_HEADING_RE.exec(headingSrc);
+    if (!m || m[2] === '*') return null; // 非标题行，或星号变体：不编号、不计数
+    const level = m[1];
+    if (level === 'section') {
+        numState.sec++; numState.sub = 0; numState.subsub = 0;
+        return numState.appendix ? ('Appendix ' + ovlNumToLetter(numState.sec)) : (ovlNumToRoman(numState.sec) + '.');
+    }
+    if (level === 'subsection') {
+        numState.sub++; numState.subsub = 0;
+        return ovlNumToLetter(numState.sub) + '.';
+    }
+    numState.subsub++;
+    return numState.subsub + ')';
+}
+
 function ovlVisualRenderBodyWithLines(body, baseLine) {
     const blocks = ovlSplitVisualBlocks(body, baseLine);
     if (!blocks.length) return ovlVisualRenderChunk(body);
     let html = '';
+    const numState = { sec: 0, sub: 0, subsub: 0, appendix: false };
     for (let i = 0; i < blocks.length; i++) {
         const b = blocks[i];
         const blockLineCount = b.text.split('\n').length;
         const blockLineEnd = b.line + blockLineCount - 1;
+        // 每块只算一次（整份 blocks[] 单次线性扫描的一部分，不是每块重新扫全文），标题块
+        // 保证只产出一个子块（ovlSplitVisualBlocks 里 isHeading 命中就立即 flush，块内只有
+        // 这一行），下面按 j===0 只贴到第一个子块上，不会重复。
+        const numLabel = ovlNumComputeForBlock(b.text, numState);
+        const numAttrHtml = numLabel ? ' data-ovl-num="' + escapeAttr(numLabel) + '"' : '';
         const splitEnabled = !b.atomic && OvlSettings.ovlVisualLineBreaks !== false;
         const subs = splitEnabled ? ovlSplitVisualLines(b.text, b.line) : null;
         if (!subs || !subs.length) {
@@ -29341,14 +29440,14 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
             // 黄色标记高亮、单击 PDF 跳转、查找跳转全靠它们，中文模式下也必须继续可用。
             const rc = ovlVisualRenderBlockContent(b.text);
             html += '<div class="ovl-visual-block" data-src-line="' + b.line + '" data-src-line-end="' + blockLineEnd
-                + '" data-para-start="1"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '') + '>' + rc.html + '</div>';
+                + '" data-para-start="1"' + numAttrHtml + (rc.pending ? ' data-ovl-trans-pending="1"' : '') + '>' + rc.html + '</div>';
             continue;
         }
         for (let j = 0; j < subs.length; j++) {
             const sb = subs[j];
             const rc = ovlVisualRenderBlockContent(sb.text);
             html += '<div class="ovl-visual-block" data-src-line="' + sb.line + '" data-src-line-end="' + sb.lineEnd
-                + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '') + '>' + rc.html + '</div>';
+                + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '"' + (j === 0 ? numAttrHtml : '') + (rc.pending ? ' data-ovl-trans-pending="1"' : '') + '>' + rc.html + '</div>';
         }
     }
     return html;
@@ -44114,6 +44213,24 @@ function ovlInlineSrcCancel() {
 // 前后视觉上多长/少长一条空白。任何一步出错都不重新抛出，退回整篇 ovlVisualRender()兜底
 // （它本来就是这个模块最成熟、测得最多的一条路，永远正确，只是没有"只重渲一段"这个优化）。
 function ovlInlineSrcRerenderLocal(st, newText) {
+    // v2 Pass P116：局部 patch 只重算这一小段自己的 IEEE 编号计数器（从 0/A 起算），编辑涉及
+    // 标题命令（\section/\subsection/\subsubsection，含星号变体——星号变体虽不产生编号但会
+    // 让"是不是标题"这件事本身改变，同样必须触发全局重算）或 \appendix 时，这一段之后所有
+    // 块的编号都会跟着挪位，局部 patch 对不上——退化到整篇 ovlVisualRender()，让计数器重新
+    // 完整扫一遍全文（O(n) 一次，不是逐块重算）。纯正文编辑（不含标题/appendix）没碰这两种
+    // 命令，继续走局部 patch，不受影响、不损失性能。newText 是这两个调用点统一好的英文源码
+    // （zh 模式已回译），旧文本优先取 st.origEnText（zh 模式下 st.origText 是中文译文，不能
+    // 拿去跟 LaTeX 命令正则比对）。
+    try {
+        const headingOrAppendixTest = /\\appendix\b|\\(?:subsubsection|subsection|section)\*?(?:\[[^\]]*\])?\{/;
+        const oldEnText = (st && st.origEnText != null) ? st.origEnText : ((st && st.origText != null) ? st.origText : '');
+        if (headingOrAppendixTest.test(oldEnText) || headingOrAppendixTest.test(newText)) {
+            try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (eW) {}
+            try { st.blocks.forEach(function (b) { if (b.parentNode) b.parentNode.removeChild(b); }); } catch (eB) {}
+            if (typeof ovlVisualRender === 'function') ovlVisualRender();
+            return;
+        }
+    } catch (eDetect) { console.error('[ovl] inlineSrcRerenderLocal heading-detect failed, continuing with local patch', eDetect); }
     try {
         const html = ovlVisualRenderBodyWithLines(newText, st.lineFrom);
         const tmp = document.createElement('div');
