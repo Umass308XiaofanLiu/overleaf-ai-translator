@@ -27544,8 +27544,20 @@ function ovlVisualRenderChunk(tex) {
 // 整体删掉之后剩下的文本。跟 stripCommand 是同一种"配平扫描"手法，区别是这里要把摘出来的
 // 参数内容也交回调用方（caption/label 都要「摘出来 + 从原文里去掉」，stripCommand 只做
 // 后一半）。只摘第一处命中；\label 这种预期只出现一次的场景够用，不需要循环摘全部。
+// v2 Pass P105：原正则 `\\cmd\s*\{` 逐字要求命令名后面紧跟（可选空白之后）就是 `{`——
+// P95 之后转换产物的图题注是 `\caption*{Fig. X. ...}`（星号版本，caption 宏包语法，不触发
+// LaTeX 自己的浮动体编号），星号夹在命令名和 `{` 之间直接把整条正则打穿，found 恒为
+// false，题注从此在 Visual 里完全消失，不是渲染错误、是压根没摘出来。同理
+// `\caption[短标题]{长标题}`（可选短标题，出现在 ToC/List of Figures 里的常见写法）里的
+// `[...]` 也会拦在命令名和 `{` 之间，实测这个形态在改之前也是 found:false（同一条正则
+// 缺口，不是新引入的）。这里补一对可选组：`\*?` 吃掉可能的星号，`(?:\[[^\]]*\])?` 吃掉
+// 可能的方括号短标题——都是"有就吃、没有就是空匹配"，不影响没有星号/短标题的原有调用
+// （包括 label 这个另一个调用方——\label 从不带星号/方括号，两个新组永远匹配空字符串，
+// 逐字节回到原来的行为）。短标题参数用 `[^\]]*`（不做嵌套方括号配平）——caption 短标题
+// 里嵌套方括号极罕见，跟本文件 headingRe/algoM 等既有的可选参数正则同一个简化口径，
+// 不为这一个边缘情况单独造一套配平扫描。
 function ovlExtractBraceCommand(str, cmd) {
-    const re = new RegExp('\\\\' + cmd + '\\s*\\{');
+    const re = new RegExp('\\\\' + cmd + '\\*?\\s*(?:\\[[^\\]]*\\])?\\s*\\{');
     const m = re.exec(str);
     if (!m) return { found: false, arg: '', rest: str };
     const openIdx = m.index + m[0].length - 1;
@@ -28306,10 +28318,22 @@ function ovlApplyFigureThumb(box, result) {
     const img = document.createElement('img');
     img.className = 'ovl-visual-fig-thumb';
     img.alt = '';
-    img.src = result.url;
+    // v2 Pass P105：图标框（固定尺寸）换成真图片（真实尺寸，可能更高/更矮）会改变这个
+    // .ovl-visual-block 的渲染高度——而 ovlRenderVisualGutter() 首次量 gutter 格子 top/height
+    // 时这张图还没到，量到的是旧的占位框高度，图一多、到达有先有后，后面所有块的行号会
+    // 整体错位（用户实测复现，图片越多越明显）。跟 P68 字体落地同一个病因（量的时候资源
+    // 还没到位）、同一个药方：资源落地后照原样重新量一遍。load 和 error 两条路径都要触发——
+    // error 分支虽然把 img 整个移除退回文件名兜底，但"移除"这个动作本身也是一次会改变高度
+    // 的 DOM 变化，同样需要重算，不能只挂 onload 一半。必须先挂监听器再赋 src（不对 img
+    // 走缓存命中时的同步/异步细节做假设，先挂后赋是唯一稳妥的写法）。
+    img.onload = function () { if (typeof ovlScheduleVisualGutterAfterImage === 'function') ovlScheduleVisualGutterAfterImage(); };
     // 万一 objectURL/dataURL 本身在插入之后失效（极端情况），静默移除，露出下面的文件名
     // 文字兜底，不换回图标（图标已经被替换掉了），也绝不抛出未捕获异常。
-    img.onerror = function () { try { img.remove(); } catch (e) {} };
+    img.onerror = function () {
+        try { img.remove(); } catch (e) {}
+        if (typeof ovlScheduleVisualGutterAfterImage === 'function') ovlScheduleVisualGutterAfterImage();
+    };
+    img.src = result.url;
     icon.replaceWith(img);
 }
 
@@ -28955,6 +28979,23 @@ const OVL_VISUAL_MATH_ATOMIC_ENV_RE = /^(equation|align|gather|multline|eqnarray
 // 套进 table 反而不合法），必须跟 table/algorithm/figure 一样单独记一档深度，否则
 // ovlSplitVisualBlocks 会把它当普通正文按源码行切散，& / \\ 全部打碎。
 const OVL_VISUAL_FLOAT_ATOMIC_ENV_RE = /^(table|algorithm|figure|longtable)\*?$/;
+// v2 Pass P105：转义感知地数一行里真正生效的裸定界符（\[ \] \( \)）出现次数。判定用的是
+// 跟下面 ovlLatexEscapedAt 同一套"数紧邻前面连续反斜杠的奇偶"算法，但这里奇偶的含义反过来
+// 读：花括号那边"奇数个反斜杠=被转义成字面量"，这里"奇数个反斜杠=真正合并成一个 TeX 控制
+// 符"（\[ 本身就是 \begin{displaymath} 的裸写法，不是"给方括号加转义"）。偶数个（含 0）
+// 时括号只是普通字面字符——最典型的假阳性是换行命令带可选间距 `\\[10pt]`：那个 `[` 前面是
+// 两个反斜杠（偶数，两个反斜杠先配对吃成一个 `\\` 换行控制符，`[` 是跟在后面的裸字符，不是
+// `\[` 数学定界符），必须不误判成公式开始，否则一段很常见的排版写法会被错误地切出一个
+// "开着的公式块"，吞掉后面所有正文直到侥幸遇到下一个真正的 `\]`。ovlSplitVisualBlocks（下面
+// 就近调用）和 ovlLatexLineBalanceDelta（29070 行附近）共用这一个函数，不重新发明。
+function ovlLatexCountBareDelim(text, ch) {
+    const s = String(text == null ? '' : text);
+    let n = 0;
+    for (let i = 0; i < s.length; i++) {
+        if (s[i] === ch && ovlLatexEscapedAt(s, i)) n++;
+    }
+    return n;
+}
 function ovlSplitVisualBlocks(body, baseLine) {
     const lines = body.split('\n');
     const blocks = [];
@@ -28997,6 +29038,17 @@ function ovlSplitVisualBlocks(body, baseLine) {
             if (OVL_VISUAL_MATH_ATOMIC_ENV_RE.test(m[1])) endsMath++;
             if (OVL_VISUAL_FLOAT_ATOMIC_ENV_RE.test(m[1])) endsFloat++;
         }
+        // v2 Pass P105：\[...\]（行间数学的裸写法，不走 \begin{}/\end{} 环境名，上面两个
+        // 正则天生逮不到它）并入同一个 beginsMath/endsMath 计数——让它享有跟 equation/align
+        // 完全一样的待遇：强制单独成块、内部空行不切散、标记成原子块跳过下面的按行细分，
+        // 用户实测复现的"独立公式漏成裸源码"根因就在这里——之前一个跨行的 \[...\] 会被
+        // ovlSplitVisualLines 在中间某一行"花括号/$ 恰好配平"处误切开，\[ 和 \] 分落两个
+        // 独立子块，各自单独扔给 renderFormattedText 时都凑不成完整的 \\\[...\\\] 配对，
+        // 只能原样漏成裸源码。\(...\)（行内数学）跟 $...$ 同一档待遇，不强制单独成块——
+        // 只在 ovlLatexLineBalanceDelta（下面 ovlSplitVisualLines 用到的那个函数）里补了
+        // 跨行配平保护，这里不动它。
+        beginsMath += ovlLatexCountBareDelim(line, '[');
+        endsMath += ovlLatexCountBareDelim(line, ']');
         const entersMathHere = mathDepth === 0 && beginsMath > 0;
         const entersFloatHere = floatDepth === 0 && beginsFloat > 0;
         if (mathDepth === 0 && floatDepth === 0 && (isBlank || isHeading || entersMathHere || entersFloatHere) && cur.length) flush();
@@ -29053,13 +29105,25 @@ function ovlLatexActiveText(line) {
 // 全局正则数，跟 ovlSplitVisualBlocks 数 beginsMath/endsMath 同一个手法，不在这个字符级
 // 循环里做（两者不冲突：\begin{xxx} 里的 { 和 } 一样会被这个循环当普通花括号计入，这正是
 // 需要的——环境名的花括号本来就该参与花括号配平）。
+// v2 Pass P105：补 bracket/paren 两个净变化——\[...\]（行间）/\(...\)（行内）这两种裸数学
+// 定界符原来完全没被这个函数看见，导致跨行的 \[...\]/\(...\) 在"到这一行末花括号/$ 恰好
+// 配平"的地方被 ovlSplitVisualLines 误判成安全切点，从中间拦腰切断——\[ 和 \] 分落两个
+// 独立子块，各自单独渲染时都配不成完整的一对，KaTeX 占位符正则匹配不上，原样漏成裸源码。
+// 用跟花括号/$ 同一套 ovlLatexEscapedAt 奇偶判定区分"真定界符"和"字面括号"（比如换行命令
+// 带可选间距 \\[10pt] 那个 [ 前面是两个反斜杠，偶数，不能误判成 \[ 数学开始）。
 function ovlLatexLineBalanceDelta(activeText) {
-    let brace = 0, dollar = 0, dd = 0;
+    let brace = 0, dollar = 0, dd = 0, bracket = 0, paren = 0;
     for (let i = 0; i < activeText.length; i++) {
         const ch = activeText[i];
         if ((ch === '{' || ch === '}') && ovlLatexEscapedAt(activeText, i)) continue;
         if (ch === '{') { brace++; continue; }
         if (ch === '}') { brace--; continue; }
+        if ((ch === '[' || ch === ']' || ch === '(' || ch === ')') && ovlLatexEscapedAt(activeText, i)) {
+            if (ch === '[') { bracket++; continue; }
+            if (ch === ']') { bracket--; continue; }
+            if (ch === '(') { paren++; continue; }
+            paren--; continue;
+        }
         if (ch === '$' && !ovlLatexEscapedAt(activeText, i)) {
             if (activeText[i + 1] === '$') { dd++; i++; } else { dollar++; }
         }
@@ -29068,7 +29132,7 @@ function ovlLatexLineBalanceDelta(activeText) {
     const beginRe = /\\begin\{/g, endRe = /\\end\{/g;
     while (beginRe.exec(activeText)) env++;
     while (endRe.exec(activeText)) env--;
-    return { brace: brace, env: env, dollar: dollar, dd: dd };
+    return { brace: brace, env: env, dollar: dollar, dd: dd, bracket: bracket, paren: paren };
 }
 
 // 把一个"正文块"（ovlSplitVisualBlocks 判定过 atomic:false 的块，保证内部没有空行）
@@ -29078,10 +29142,15 @@ function ovlLatexLineBalanceDelta(activeText) {
 // 安全规则（三者都配平才切）：到该行末为止 (1) { } 净差为 0 (2) \begin{ 净差为 0
 // （没有未闭合的环境）(3) $ 出现次数是偶数、$$ 出现次数也是偶数。任何一条没满足就把下一行
 // 并进来继续攒，直到平衡——宁可少切一刀，也不切出残缺 LaTeX。
+// v2 Pass P105：新增第 (4)/(5) 条——bracketDepth/parenDepth 也必须归零，即 \[...\]/\(...\)
+// 两种裸数学定界符各自的开合也要配平才能切（\[...\] 正常情况下会在 ovlSplitVisualBlocks
+// 那层就被摘成独立原子块、走不到这里；这里补上纯粹是防御性的第二道保险——万一某种畸形/
+// 嵌套写法躲过了上一层判定，这里仍旧不会把它切散）。行内 \(...\) 不会被上一层拉成原子块，
+// 完全依赖这里的配平保护，是这次真正生效的那一半修复。
 function ovlSplitVisualLines(blockText, blockStartLine) {
     const lines = blockText.split('\n');
     const out = [];
-    let brace = 0, env = 0, dollarCount = 0, ddCount = 0;
+    let brace = 0, env = 0, dollarCount = 0, ddCount = 0, bracketDepth = 0, parenDepth = 0;
     let cur = [];
     let curStart = 0;
     let paraStart = true;
@@ -29104,7 +29173,10 @@ function ovlSplitVisualLines(blockText, blockStartLine) {
         env = Math.max(0, env + d.env);
         dollarCount += d.dollar;
         ddCount += d.dd;
-        const balanced = brace === 0 && env === 0 && (dollarCount % 2 === 0) && (ddCount % 2 === 0);
+        bracketDepth = Math.max(0, bracketDepth + d.bracket);
+        parenDepth = Math.max(0, parenDepth + d.paren);
+        const balanced = brace === 0 && env === 0 && (dollarCount % 2 === 0) && (ddCount % 2 === 0)
+            && bracketDepth === 0 && parenDepth === 0;
         if (balanced) flush(i);
     }
     flush(lines.length - 1); // 兜底：到块尾都没配平（残缺/畸形源码）就把攒的内容整块吐出去，
@@ -43481,6 +43553,53 @@ function ovlBindGutterSelect() {
 let OvlVisualBlockRects = [];
 let OvlVisualGutterSel = { anchorBlock: -1, headBlock: -1, dragging: false, pointerId: null };
 
+// v2 Pass P105：Visual 面板里的图片（figure 缩略图/PDF 转换页面截图，走
+// ovlApplyFigureThumb 那条路径）异步落地时机比 ovlRenderVisualGutter() 首次量高度晚
+// ——量的那一刻块还是占位框的固定尺寸，图一到位，块的真实渲染高度会跳变，而 gutter 已经
+// 画死了旧的 top/height，后面所有块整体错位（用户实测复现，图片越多越明显，根因跟 P68
+// 字体落地是同一类——量的时候资源还没到位）。药方也是同一个：资源落地后照原样重新量一遍，
+// 不新造一套。rAF 合并同一帧内连续到达的多张图/多次尺寸变化，最多重算一次。
+let OvlVisualGutterImageRaf = null;
+function ovlScheduleVisualGutterAfterImage() {
+    if (OvlVisualGutterImageRaf !== null) return;
+    OvlVisualGutterImageRaf = requestAnimationFrame(function () {
+        OvlVisualGutterImageRaf = null;
+        if (OvlState.editorMode === 'visual' && typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
+    });
+}
+// ②号兜底：ResizeObserver 直接观察每个块容器自己的尺寸变化——不止图片，任何异步把块撑高/
+// 压矮的原因（懒加载的公式图、后续可能出现的其它异步内容）都能兜住，不用逐个新增源头再挂
+// 一次 onload。关键坑：规范规定 observe() 第一次注册就会补投一次"当前尺寸"的回调，这不是
+// 真的发生了 resize——如果不甄别，每个块首次挂观察器都会被误判成"变了"，白白多算一轮。这里
+// 用一个 WeakMap 记"这个块上次汇报给 gutter 的高度"（跟下面 forEach 里 getBoundingClientRect
+// 量出来的 h 同步写入），回调里只有跟这个记录量出的高度不一致（真的变了，不是首次投递那次
+// 凑巧对上）才触发重算；块元素的生命周期跟着 ovlVisualRender() 整篇重刷新 DOM 走，
+// WeakMap/WeakSet 都不需要手动清理，块被扔掉后 GC 自然回收对应条目，不会内存泄漏。
+let OvlVisualBlockRO = null;
+const OvlVisualObservedBlocks = (typeof WeakSet !== 'undefined') ? new WeakSet() : null;
+const OvlVisualBlockLastH = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+function ovlEnsureVisualBlockResizeObserver() {
+    if (OvlVisualBlockRO) return OvlVisualBlockRO;
+    if (typeof ResizeObserver === 'undefined') return null;
+    try {
+        OvlVisualBlockRO = new ResizeObserver(function (entries) {
+            let changed = false;
+            for (let i = 0; i < entries.length; i++) {
+                const t = entries[i].target;
+                let h;
+                try { h = t.getBoundingClientRect().height; } catch (e2) { continue; }
+                const last = OvlVisualBlockLastH ? OvlVisualBlockLastH.get(t) : undefined;
+                if (last === undefined || Math.abs(h - last) > 0.5) {
+                    if (OvlVisualBlockLastH) OvlVisualBlockLastH.set(t, h);
+                    changed = true;
+                }
+            }
+            if (changed) ovlScheduleVisualGutterAfterImage();
+        });
+    } catch (e) { OvlVisualBlockRO = null; }
+    return OvlVisualBlockRO;
+}
+
 function ovlRenderVisualGutter() {
     try {
         const gutter = document.getElementById('ovlGutter');
@@ -43514,6 +43633,19 @@ function ovlRenderVisualGutter() {
             cell.textContent = String(ln + 1);
             frag.appendChild(cell);
             OvlVisualBlockRects.push({ line: ln, el: blk });
+            // v2 Pass P105：只对没观察过的块调用一次 observe()——WeakSet 保证每个 DOM 节点
+            // 生命周期内只挂一次，避免"每次 gutter 重算都重新 observe 导致规范里那个初次
+            // 投递又触发一轮 gutter 重算"的死循环。挂之前先把 WeakMap 里的"上次高度"同步
+            // 成这次刚测出来的 h——这样 ResizeObserver 那个必然会来的初次回调量出来的高度
+            // 会跟这里记的一致，被判定成"没变"，不会白触发一轮。
+            if (OvlVisualObservedBlocks && !OvlVisualObservedBlocks.has(blk)) {
+                const ro = ovlEnsureVisualBlockResizeObserver();
+                if (ro) {
+                    OvlVisualObservedBlocks.add(blk);
+                    if (OvlVisualBlockLastH) OvlVisualBlockLastH.set(blk, h);
+                    try { ro.observe(blk); } catch (e3) {}
+                }
+            }
         });
         gutter.innerHTML = '';
         gutter.appendChild(frag);
