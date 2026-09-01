@@ -4161,7 +4161,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.03.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.03.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -13911,18 +13911,86 @@ function copyToClipboard(text) {
     }
 }
 
+// v2 Pass P117 v3（核验第 2 轮返修）：所有权感知的位置属性复位，供 adjustPopupPosition 专用。
+// 背景：v2 版"无条件清空 max-height/overflow-y"是半复位——既抹掉了不属于本函数的属性
+// （renderSynonymPopupOnly 给 #synonymPopup 设的高度上限，清掉后弹窗涨回自然高度，被顶部
+// clamp 分支的嵌套 rAF 压成 0px/26px 高的碎片，实测把 #synonymPopup 在 VH<=600 时打到视口
+// 外，见 p117_verify.md 第 2 轮问题 A），又漏清了自己上一轮设置的翻转态（top/bottom/
+// marginTop/marginBottom），导致 #modelMenuPopup 解除高度上限后落到 top=-676（问题 B）。
+// 根治：只复位"本函数上一轮自己写过"的属性——写在元素 dataset.ovlClamp 里（逗号分隔的
+// 属性名列表），下一轮进来先按这份名单精确复位、名单之外的一个字节都不碰；写的时候把尺寸项
+// （maxWidth/maxHeight/overflowY）和翻转态（transform/left/right/top/bottom/marginTop/
+// marginBottom）算作同一批——要么全在名单里、要么都不在，不再出现"清了上限没清翻转态"这种
+// 半吊子组合态。
+const OVL_ADJUST_POPUP_RESETTABLE = {
+    transform: '', left: '', right: '',
+    top: '', bottom: '', marginTop: '', marginBottom: '',
+    maxWidth: '', maxHeight: '', overflowY: ''
+};
+function ovlAdjustPopupResetOwned(popup) {
+    (popup.dataset.ovlClamp || '').split(',').filter(Boolean).forEach(prop => {
+        if (Object.prototype.hasOwnProperty.call(OVL_ADJUST_POPUP_RESETTABLE, prop)) {
+            popup.style[prop] = OVL_ADJUST_POPUP_RESETTABLE[prop];
+        }
+    });
+}
+
+// v2 Pass P117 v3：最终兜底——不管上面走的是哪条分支、复位逻辑是否百分之百覆盖到所有组合，
+// 这里在落权属标记之前用真实渲染后的 getBoundingClientRect() 再核一遍：只要还有任何一条边
+// 出视口，就退化成"贴边钳制 + max-height/内部滚动"的保守布局——这是本 Pass（弹层视口防溢出）
+// 的主题底线，绝不允许在最后一关仍然放过一个出屏的弹层。用 translate 叠加位移修正（而不是
+// 重新推导 left/top）：#synonymPopup 是 position:fixed、#modelMenuPopup 是 position:absolute，
+// translate 是纯像素级视觉平移，不需要知道也不需要换算它当前用的是哪套坐标系。
+function ovlPopupFinalViewportGuard(popup, padding, owned) {
+    const VW = window.innerWidth, VH = window.innerHeight;
+    let r = popup.getBoundingClientRect();
+    if (r.width === 0 && r.height === 0) return; // 未展开/隐藏态，不是这里要管的事
+
+    const availW = Math.max(0, VW - padding * 2);
+    const availH = Math.max(0, VH - padding * 2);
+    let sizeShrunk = false;
+    if (r.height > availH) { popup.style.maxHeight = availH + 'px'; popup.style.overflowY = 'auto'; sizeShrunk = true; }
+    if (r.width > availW) { popup.style.maxWidth = availW + 'px'; sizeShrunk = true; }
+    if (sizeShrunk) {
+        ['maxHeight', 'overflowY', 'maxWidth'].forEach(p => { if (owned.indexOf(p) === -1) owned.push(p); });
+    }
+
+    // 清空自身可能叠加过的 translate 修正，按"当前实际布局"重新量一次真实溢出量。
+    popup.style.transform = '';
+    r = popup.getBoundingClientRect();
+    let dx = 0, dy = 0;
+    if (r.left < padding) dx = padding - r.left;
+    else if (r.right > VW - padding) dx = (VW - padding) - r.right;
+    if (r.top < padding) dy = padding - r.top;
+    else if (r.bottom > VH - padding) dy = (VH - padding) - r.bottom;
+    if (dx !== 0 || dy !== 0) {
+        popup.style.transform = `translate(${dx}px, ${dy}px)`;
+        if (owned.indexOf('transform') === -1) owned.push('transform');
+    }
+}
+
 // 弹窗位置自动调整函数
+// v2 Pass P117 v3：世代号守卫，防止短时间内两次 adjustAllPopups() 在同一个弹层上打架。
+// 实测复现（组 F 附加真实 #modelMenuPopup 场景）：ovlOpenTranslator() 内部调一次 renderApp()，
+// 调用方紧接着（同一段同步代码、零延迟）自己又调一次 renderApp()——两次 adjustAllPopups()
+// 各给同一个 popupId 排了一条独立的 requestAnimationFrame 回调，回调真正跑起来时元素已经
+// 存在，两条链路各自独立"复位→测量→写 dataset"，后完成的会把先完成的所有权记录整个覆盖掉，
+// 导致部分属性"设了但没记账"——下一轮复位漏清，正是这个 v3 返修要根治的那类半吊子组合态的
+// 又一种成因。只认最后一次调度的世代号：更早的调用即便回调触发了也直接放弃，交给最新一次
+// 全权处理——它测量到的是当下最新的真实 DOM/视口状态，天然涵盖了更早那次想做的事。
+const OVL_ADJUST_POPUP_GEN = {};
 function adjustPopupPosition(popupId, padding = 10) {
+    const gen = (OVL_ADJUST_POPUP_GEN[popupId] = (OVL_ADJUST_POPUP_GEN[popupId] || 0) + 1);
     requestAnimationFrame(() => {
+        if (OVL_ADJUST_POPUP_GEN[popupId] !== gen) return; // 已被更新的一次调用取代
         const popup = document.getElementById(popupId);
         if (!popup) return;
 
-        // v2 Pass P117 返修：上一轮（可能是更窄/更矮的视口）留下的 max-height/overflow-y
-        // 必须先清空再测量，否则本轮在更宽视口下量到的还是被上一轮钳制过的尺寸，导致该弹层
-        // 从此永久卡在当时的高度上（P117 核验第 1 条实质回归）。照抄
-        // ovlClampPopupToViewport 已经做对的复位方式。
-        popup.style.maxHeight = '';
-        popup.style.overflowY = '';
+        // 只复位本函数上一轮自己设过的属性——外部代码（比如 renderSynonymPopupOnly 给
+        // #synonymPopup 设的高度上限）绝不碰，L4906-4912 那条"对 #synonymPopup 恒为空操作"
+        // 的注释语义在这里恢复成立。
+        ovlAdjustPopupResetOwned(popup);
+        const owned = [];
 
         const rect = popup.getBoundingClientRect();
         const viewportWidth = window.innerWidth;
@@ -13932,12 +14000,14 @@ function adjustPopupPosition(popupId, padding = 10) {
         if (rect.right > viewportWidth - padding) {
             const overflow = rect.right - viewportWidth + padding;
             popup.style.transform = `translateX(-${overflow}px)`;
+            owned.push('transform');
         }
 
         // 检查左边是否超出
         if (rect.left < padding) {
             popup.style.left = `${padding}px`;
             popup.style.right = 'auto';
+            owned.push('left', 'right');
         }
 
         // 检查底部是否超出
@@ -13947,20 +14017,31 @@ function adjustPopupPosition(popupId, padding = 10) {
             popup.style.bottom = '100%';
             popup.style.marginTop = '0';
             popup.style.marginBottom = '8px';
+            owned.push('top', 'bottom', 'marginTop', 'marginBottom');
             // v2 Pass P117：翻到上方以后，锚点上方剩余空间可能仍然不够（弹层本身比这块空间还
             // 高）——原逻辑到这里就结束了，弹层顶部会越出视口上沿。这里补一次贴顶 clamp +
             // 内部滚动兜底，不改变"翻到上方"这个已有语义，只保证翻完之后真的落在视口内。
-            // 用嵌套 rAF 是因为 bottom:100% 这条改的是相对锚点的偏移，实际像素位置要等这次
-            // style 写入生效、浏览器完成下一次布局后才量得准。
-            requestAnimationFrame(() => {
-                const flippedRect = popup.getBoundingClientRect();
-                if (flippedRect.top < padding) {
-                    const overflowTop = padding - flippedRect.top;
-                    popup.style.maxHeight = `${Math.max(0, flippedRect.height - overflowTop)}px`;
-                    popup.style.overflowY = 'auto';
-                }
-            });
+            // v2 Pass P117 v3：改成同步重新量（不再嵌套 rAF 等下一帧）——style 写入之后读取
+            // getBoundingClientRect 本身就会强制浏览器立即完成一次布局，量到的就是准确值，
+            // 不需要真的等到下一次绘制。嵌套 rAF 会把"写 dataset"这一步推迟到下一帧，
+            // 期间如果又有一次 adjustAllPopups() 插进来，两条链路会在同一个元素上互相覆盖
+            // 对方的所有权记录——上面 OVL_ADJUST_POPUP_GEN 的世代号守卫只能防住两次"外层调用"
+            // 互相打架，管不到"外层已经赢了、但它自己的嵌套帧还没来得及落地"这个窗口期，
+            // 所以这里干脆把整条判定收进同一个（已经被世代号守卫保护过的）回调里，同步走完。
+            const flippedRect = popup.getBoundingClientRect();
+            if (flippedRect.top < padding) {
+                const overflowTop = padding - flippedRect.top;
+                popup.style.maxHeight = `${Math.max(0, flippedRect.height - overflowTop)}px`;
+                popup.style.overflowY = 'auto';
+                owned.push('maxHeight', 'overflowY');
+            }
         }
+
+        // 最终兜底：无论上面走的是哪条分支，都用真实渲染后的 rect 再核一遍——翻转+clamp 之后
+        // 仍可能出屏（比如翻转空间也不够、maxHeight 撑破了外层 flex 布局），退化成"贴边钳制 +
+        // max-height/内部滚动"的保守布局，绝不允许出屏。
+        ovlPopupFinalViewportGuard(popup, padding, owned);
+        popup.dataset.ovlClamp = owned.join(',');
     });
 }
 
