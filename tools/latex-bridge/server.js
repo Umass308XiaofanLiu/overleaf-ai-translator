@@ -124,8 +124,12 @@ const COMPILE_TIMEOUT_MAX_MS = 600000;
 // ---------------------------------------------------------------------------
 // v2 Pass P49：远程访问令牌。
 // 优先读环境变量 LATEX_BRIDGE_TOKEN；否则读本地令牌文件（同目录 .bridge-token，已加入
-// .gitignore，绝不会被提交）；文件不存在就自动生成一个高强度随机令牌写进去，并在
-// REMOTE_MODE 下的启动日志里打印出来，供用户抄进前端设置。
+// .gitignore，绝不会被提交）；文件不存在就自动生成一个高强度随机令牌写进去。
+// v2 Pass P110f：REMOTE_MODE 下的启动横幅**只播报令牌的来源**（.bridge-token 的绝对路径，
+// 或"来自环境变量 LATEX_BRIDGE_TOKEN"），令牌值本身绝不写进 stdout/stderr/任何日志——
+// start-bridge.ps1 会把 node 的输出 `*>>` 追加重定向到 logs/bridge-stdout-<日期>.log，
+// 打印令牌等于把它明文落盘到一个没有 0600 保护的文件里。回归断言见
+// tools/e2e/test_p110_remote_serving.js 组 J。
 // 令牌只在 REMOTE_MODE 下才会被强制校验（见下面 tokenAuthorized），本地默认用法完全
 // 不受影响——不读令牌文件、不生成、不校验都不会改变现有行为的这句话不成立：其实文件
 // 总会被生成/读取（哪怕本地模式），但只有 REMOTE_MODE 才会真正拿它去挡请求。
@@ -156,6 +160,9 @@ function loadAppHtmlCache() {
         APP_HTML_CACHE = { body: buf, etag: etag };
     });
 }
+
+// 令牌来自环境变量还是 .bridge-token 文件——只用于启动横幅播报"来源"，不含令牌值本身。
+const TOKEN_FROM_ENV = !!process.env.LATEX_BRIDGE_TOKEN;
 
 function loadOrCreateToken() {
     if (process.env.LATEX_BRIDGE_TOKEN) return process.env.LATEX_BRIDGE_TOKEN;
@@ -3223,8 +3230,15 @@ server.listen(PORT, HOST, () => {
         // 才要求令牌。这句话是用户在 jump 上启动桥时唯一会读到的鉴权说明，必须跟代码一致。
         const exemptList = Array.from(TOKEN_EXEMPT_PATHS).join('、');
         console.log('[latex-bridge] 远程模式已启用：以下 ' + TOKEN_EXEMPT_PATHS.size + ' 个路径无需令牌即可访问：' + exemptList + '（其中 GET / 与 GET /AI-Translator.html 会把整个应用页面发给任何能连上这个地址的人，页面本身没有秘密，但是公开的）；除这些路径外的其余所有端点都要求访问令牌（请求头 ' + TOKEN_HEADER + '）。');
-        console.log('[latex-bridge] 访问令牌（请抄进前端设置的"访问令牌"一栏，注意保密，不要发给别人）：');
-        console.log('[latex-bridge]   ' + BRIDGE_TOKEN);
+        // v2 Pass P110f：这里过去会把 BRIDGE_TOKEN 整串打印出来。stdout 会进终端会话历史，
+        // 而 start-bridge.ps1 还会把 node 的 stdout/stderr `*>>` 追加重定向到
+        // logs/bridge-stdout-<日期>.log —— 等于令牌明文落进一个没有 0600 权限保护的日志文件。
+        // 现在只播报**令牌的来源**（文件的绝对路径，或"来自环境变量"），令牌值本身绝不出现在
+        // 任何 stdout/stderr/日志里。回归断言见 tools/e2e/test_p110_remote_serving.js 组 J。
+        console.log('[latex-bridge] 访问令牌来源：' + (TOKEN_FROM_ENV
+            ? '环境变量 LATEX_BRIDGE_TOKEN（本次令牌由环境变量提供）'
+            : TOKEN_FILE));
+        console.log('[latex-bridge] 令牌见上面这个来源，请勿在日志中打印其内容；要抄进前端设置的"访问令牌"一栏时请直接从该来源取值（注意保密，不要发给别人）。');
         console.log('[latex-bridge] 前端设置里的"服务地址"填：http://' + HOST + ':' + PORT);
         console.log('[latex-bridge] 现在也可以直接在同网任意设备的浏览器里打开 http://' + HOST + ':' + PORT + '/ 使用整个应用，服务地址栏留空即默认走同源。');
     }
