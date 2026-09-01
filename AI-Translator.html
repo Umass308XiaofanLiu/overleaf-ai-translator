@@ -4161,7 +4161,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.03.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.03.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -42945,18 +42945,36 @@ async function ovlP106TryReverseSentenceHighlight(pageNum, texLineText) {
 // 只在双击手势下调用（见 ovlPdfHandleDblClick 的 opts.sentenceLevel），单击维持纯行级，
 // 跟任务书"单击保持现有行为不回归"的要求一致——direct 模式的既有句级逻辑（上面这一大段）
 // 一字未动，这里是编译模式独立的新增能力。
-// 按 [.!?] 后跟空白/行尾切句子——只按标点切分位置本身，不消耗任何字符，返回的区间边界
-// 精确落在原始 lineText 坐标系里，供直接换算成 #ovlCodeArea 的绝对字符偏移。数学环境内部
-// 偶尔出现的句号（比如 "$x=1.5$"）会被误切，属于已知局限——切错顶多让候选句子边界跟真实
-// 句子边界差几个字符，不影响"选出哪一句"这个匹配结果本身（打分函数按整句取词，边界差几个
-// 字符不影响词集合）。
-// v2 Pass P114 返修（核验 .claude/tmp/p114_verify.md 问题③）：学术正文里的常见缩写
-// （"Fig."/"Eq."/"et al."/"e.g."/"i.e." 等）原来会被当成真句子边界误切——且像 "e.g."/"i.e."
-// 这种缩写内部还有一个不跟空白的句点（"e" + "." + "g" + "."），旧正则找不到能收尾的匹配
-// 位置时会静默跳过一段前缀字符，比"切错边界"更糟。改成切句前先用 ovlP114MaskAbbrevPeriods
-// 把已知缩写内部的句点换成一个不属于 [.!?] 的占位字符（长度不变，索引不变，返回的区间仍然
-// 精确落在原始 lineText 坐标系里），让切句正则天然跳过这些位置，不再单独处理。缩写表以外的
-// 场景（数学环境句点等）行为不变，仍是上面那条已知局限。
+//
+// v2 Pass P114 返修（核验 .claude/tmp/p114_verify.md 第1轮 问题③）：学术正文里的常见缩写
+// （"Fig."/"Eq."/"et al."/"e.g."/"i.e." 等）会被当成真句子边界误切。新增 ovlP114MaskAbbrevPeriods，
+// 切句前先把已知缩写内部的句点换成一个不属于 [.!?] 的占位字符（长度不变、索引不变），让切句
+// 逻辑天然跳过这些位置。
+//
+// v2 Pass P114c 返修（核验 .claude/tmp/p114_verify.md 第2轮，缺陷1"截头框"，判为实质问题）：
+// 上一版切句用一条正则 /[^.!?]*[.!?]+(?:\s+|$)|[^.!?]+$/g 反复 exec。这条正则在"句点后面
+// 不跟空白"的位置（小数 98.5、不等式 p<0.05、版本号 2.1、URL a.b、倍数 1.2x……缩写表覆盖
+// 不到、学术正文里到处都是）会匹配失败——JS 正则引擎的应对方式是把起点整体后移到下一个
+// 位置重试，第一个能重新匹配上的位置就是该数字之后紧跟的下一个真句号，中间那一段（往往是
+// 整个句子的开头）从此不出现在任何 span 里。这不是"切错边界差几个字符"，是真的丢字符：
+// 实测一行含"98.5 percent"会丢掉句首 13～47 个字符，双击句子中段的词画出一个从数字中间
+// 开始的截头高亮框，用户毫无信号知道被截了头，且被丢的实词（method/reaches 之类）确实
+// 从该 span 的词集合里消失，会影响打分——上一版这段注释写的"顶多差几个字符、不影响选出
+// 哪一句"跟实测相反，已订正。
+// 根治：ovlP114SplitLineIntoSentenceSpans 改成游标锚定的手写扫描，起点 cursor 只前进、
+// 绝不回退：扫到 [.!?] 就吞掉连续的标点游程（"?!"/"..."这类），看紧跟着的字符是不是
+// 空白/行尾——是，就在那收尾一个 span（顺带吞掉收尾处的连续空白，保持"句子含尾随空白"
+// 的边界语义不变）；不是（数字/URL/倍数这类假边界），就把这个标点当普通字符，留在同一个
+// span 里继续往后扫，绝不新开 span、绝不跳过任何字符。硬不变量：
+//   spans.map(s => lineText.slice(s[0], s[1])).join('') === lineText 恒成立，一个字符都不丢
+// ——test_p114_locate.js 组I 直接对≥30条构造行断言这条性质，任何改动这个函数都不许破坏它。
+// 代价（如实记录，不是零成本的修复）：句点后不跟空白时选择不断句、并入当前 span——如果这
+// 类位置在源文本里格式不规范、恰好真的是漏打了空格的两句话分界，会把这两句合并进同一个
+// span，用户体感是这一行的句级细化从"两句"粗化成"一句"，是边界粗化，不是丢字/截头，
+// 符合"宁可句长也不丢字"的底线。ovlP114MaskAbbrevPeriods（上面 P114 返修新增）继续保留，
+// 但职责从"防止丢字"降级为"切得更准的加分项"——新扫描本身已经不会丢字，不做缩写掩码的话
+// 缩写内部的句点会被误判成真边界、多切出几个短 span，打分函数按整句取词会自己挑出词重合率
+// 最高的那个，通常不影响最终选中哪一句。
 const OVL_P114_ABBREV_PATTERNS = [
     /\bFigs?\./g, /\bEqs?\./g, /\bSecs?\./g, /\bRefs?\./g, /\bNo\./g, /\bapprox\./g,
     /\bvs\./g, /\bcf\./g, /\bDr\./g, /\bMr\./g, /\bMrs\./g, /\bMs\./g, /\bProf\./g,
@@ -42969,16 +42987,36 @@ function ovlP114MaskAbbrevPeriods(lineText) {
     }
     return out;
 }
+// v2 Pass P114c：游标锚定扫描，取代原来会丢字的正则版本（根因与不变量见上方大段注释）。
 function ovlP114SplitLineIntoSentenceSpans(lineText) {
-    const spans = [];
     const masked = ovlP114MaskAbbrevPeriods(lineText);
-    const re = /[^.!?]*[.!?]+(?:\s+|$)|[^.!?]+$/g;
-    let m, guard = 0;
-    while ((m = re.exec(masked)) !== null) {
-        if (m[0].length === 0) { re.lastIndex++; if (++guard > 5000) break; continue; }
-        spans.push([m.index, m.index + m[0].length]);
-        if (++guard > 5000) break;
+    const n = masked.length;
+    const spans = [];
+    let start = 0;
+    let i = 0;
+    while (i < n) {
+        const ch = masked[i];
+        if (ch === '.' || ch === '!' || ch === '?') {
+            let j = i + 1;
+            while (j < n && (masked[j] === '.' || masked[j] === '!' || masked[j] === '?')) j++;
+            if (j >= n || /\s/.test(masked[j])) {
+                // 标点后是空白/行尾——真句子边界。收尾时把紧跟的连续空白一并吞进这个 span，
+                // 游标跳到下一个非空白字符，跟旧正则 (?:\s+|$) 的边界语义一致。
+                let k = j;
+                while (k < n && /\s/.test(masked[k])) k++;
+                spans.push([start, k]);
+                start = k;
+                i = k;
+            } else {
+                // 标点后紧跟非空白字符（小数/URL/倍数等假边界）——不是真句子边界，游标只
+                // 跳过这段标点游程本身，绝不后移起点、绝不丢弃 start 到这里之间的任何字符。
+                i = j;
+            }
+        } else {
+            i++;
+        }
     }
+    if (start < n) spans.push([start, n]);
     return spans;
 }
 // 把一句的原始（未剥数学）文本区间掐头去尾到"第一个非空白字符 ~ 最后一个非空白字符"，
