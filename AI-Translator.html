@@ -2506,7 +2506,16 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-modal-overlay {
     position: fixed;
     inset: 0;
-    z-index: 1080;
+    /* v2 Pass P110c（IX2-a 连带发现并修复）：原来是 1080，跟同一份 #ovlPortal 里的
+       .ovl-settings-overlay（1085）/.ovl-quickactions（1086）比是全场最低——只要弹这个
+       弹窗时设置面板/快捷工具条还开着，弹窗就会被压在它们底下，鼠标点哪儿都点不到、连
+       Esc 之外没有任何办法关掉。P110c 之前从没有任何调用点会在设置面板打开的状态下弹
+       #ovlModalOverlay 的窗，这条坑一直没被撞到；P110c 新增的"测试连接"→（远程地址）
+       追加令牌校验探测，第一次真的从设置面板内部触发了它——实测：headless Chrome 里
+       `document.elementFromPoint()` 在按钮的真实屏幕坐标上返回的是设置面板背后的
+       DIV.ovl-setrow，不是弹窗自己的按钮。#ovlModalOverlay 是全应用唯一一份模态挂载点，
+       弹出时本来就该盖住一切（包括设置面板本身），改成全场最高（高于 .ovl-tip2 的 1090）。 */
+    z-index: 1095;
     background: rgba(15, 23, 42, 0.55);
     display: flex;
     align-items: center;
@@ -4152,7 +4161,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.01.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.02.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -13881,8 +13890,25 @@ function isModelCatalogStale(provider) {
     return !!(st && st.at && (Date.now() - st.at) > MODEL_CATALOG_TTL);
 }
 
+// v2 Pass P110：非安全上下文（比如同网内直接用 http://Tailscale-IP/ 打开页面，不是 https 也
+// 不是 localhost）下 navigator.clipboard 整个是 undefined，原来这里无存在性检查、无 fallback，
+// 直接调用会抛 TypeError；两个调用点 copySourceText/copyTargetText 又没包 try/catch，控制台
+// 会报未捕获异常。改成跟文件里已经写好的 ovlClipboardWriteFallback（execCommand('copy') 兜底，
+// 见其定义处注释）同一套降级模式：能用原生剪贴板 API 就用，拒绝/不存在就退到隐藏 textarea +
+// execCommand。ovlClipboardWriteFallback 是普通顶层函数声明，跟本函数一样会被提升，定义顺序
+// （它在文件更后面）不影响这里调用。
 function copyToClipboard(text) {
-    navigator.clipboard.writeText(text);
+    try {
+        if (navigator && navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            navigator.clipboard.writeText(text).catch(function () {
+                try { ovlClipboardWriteFallback(text); } catch (e2) {}
+            });
+        } else {
+            ovlClipboardWriteFallback(text);
+        }
+    } catch (e) {
+        try { ovlClipboardWriteFallback(text); } catch (e2) {}
+    }
 }
 
 // 弹窗位置自动调整函数
@@ -26107,7 +26133,12 @@ function ovlPortalHtml() {
         + '<div class="ovl-layout-menu" id="ovlProjectMenu" hidden>'
         +   '<div class="ovl-layout-menu-item" data-proj="downloadPdf">Download as PDF</div>'
         +   '<div class="ovl-layout-menu-item" data-proj="downloadZip">Download as source (.zip)</div>'
-        +   '<div class="ovl-layout-menu-item" data-proj="makeCopy">Make a copy</div>'
+        // v2 Pass P110：Make a copy 的目标文件夹只能靠 showDirectoryPicker() 选（见
+        // ovlProjectMakeCopy），这个 API 在非安全上下文（!window.isSecureContext，比如同网内
+        // 直接用 http://Tailscale-IP/ 打开页面）下不存在——远程模式已经有自己的短路提示
+        // （ovlIsRemoteBridge() 分支），这里补上"本地模式但页面本身不安全"这条边界情况，
+        // 静态渲染时算一次 window.isSecureContext 就够（运行期不会变）。
+        +   '<div class="ovl-layout-menu-item" data-proj="makeCopy"' + (window.isSecureContext ? '' : ' data-disabled="1" data-tip="本地文件夹模式需要 HTTPS 或本机环境" data-tip-pos="left"') + '>Make a copy</div>'
         +   '<div class="ovl-layout-menu-item" data-proj="rename" data-disabled="1" data-tip="点这里改不了；双击顶栏正中间的项目名可以真的重命名磁盘上的项目文件夹" data-tip-pos="left">Rename</div>'
         +   '<div class="ovl-menu-sep"></div>'
         +   '<div class="ovl-layout-menu-item" data-proj="wordCount">Word count</div>'
@@ -31682,6 +31713,10 @@ function ovlRemoteParentPath(p) {
 // 选一个远程绝对路径，然后把文件树/项目路径都换成它。
 let OvlRemoteFolderDialogOnKey = null;
 function ovlRemoteFolderDialogClose() {
+    // v2 Pass P110b（IX 廉价非阻塞项）：跟其余全部 #ovlModalOverlay 清空点保持同一条不变量——
+    // 清空前先 ovlDismissActiveModal()，避免这个弹窗被当作"当前活跃弹窗"挂着时，自己的关闭
+    // 路径没走 close()+fireCancelOnce() 就把登记表清成陈旧指针。
+    ovlDismissActiveModal();
     const overlay = document.getElementById('ovlModalOverlay');
     if (overlay) { overlay.hidden = true; overlay.innerHTML = ''; }
     if (OvlRemoteFolderDialogOnKey) { document.removeEventListener('keydown', OvlRemoteFolderDialogOnKey); OvlRemoteFolderDialogOnKey = null; }
@@ -31692,6 +31727,7 @@ function ovlRemotePickFolder() {
         const overlay = document.getElementById('ovlModalOverlay');
         if (!overlay) { resolve(); return; }
         if (OvlRemoteFolderDialogOnKey) { document.removeEventListener('keydown', OvlRemoteFolderDialogOnKey); OvlRemoteFolderDialogOnKey = null; }
+        ovlDismissActiveModal();
         overlay.innerHTML = '';
         overlay.hidden = false;
 
@@ -32781,6 +32817,7 @@ function ovlOpenProjectHistoryDialog() {
             document.removeEventListener('keydown', ovlHistoryDialogActiveOnKey);
             ovlHistoryDialogActiveOnKey = null;
         }
+        ovlDismissActiveModal();
         overlay.innerHTML = '';
         overlay.hidden = false;
 
@@ -33119,9 +33156,23 @@ function ovlDownloadEntry(fileHandle, name) {
 //      settled+fireCancelOnce 的写法，跟 ovlConfirmDialog 是同一个模式）——原来 4 个调用点
 //      都没传这个字段，加了之后它们的行为不变（Overleaf 克隆流程需要"取消也要有后续动作"
 //      才补的，见 ovlOverleafCloneFinish）。----
+// v2 Pass P110 核验返修（I1）：#ovlModalOverlay 是全部弹窗共用的唯一挂载点，任何一个新弹窗
+// 打开时都会用 overlay.innerHTML=''把上一个弹窗直接抹掉——旧弹窗的 settled 仍然是 false，
+// onConfirm/onCancel 一个都不会触发，document keydown 监听器也不会被摘掉（泄漏）。依赖
+// onCancel 收尾的调用点（比如令牌弹窗 ovlBridgeTokenPromptOnce 的 pending Promise）会因此
+// 永久卡死。这里用一个模块级"当前活跃弹窗"登记表：谁登记了，谁在被冲掉前就先被当作"取消"
+// 收尾一次（跟用户手动点取消/Esc/点遮罩走同一条 close()+fireCancelOnce() 路径），保证同一
+// 时刻至多一个已登记弹窗处于"未 settle"状态。
+let __ovlActiveModalDismiss = null;
+function ovlDismissActiveModal() {
+    const fn = __ovlActiveModalDismiss;
+    __ovlActiveModalDismiss = null;
+    if (typeof fn === 'function') { try { fn(); } catch (e) { console.warn('[ovl] dismiss active modal failed', e); } }
+}
 function ovlPromptDialog(opts) {
     const overlay = document.getElementById('ovlModalOverlay');
-    if (!overlay) return;
+    if (!overlay) { if (typeof opts.onCancel === 'function') { try { opts.onCancel(); } catch (e) { console.error('[ovl] prompt onCancel failed', e); } } return; }
+    ovlDismissActiveModal();
     overlay.innerHTML = '';
     overlay.hidden = false;
     const box = document.createElement('div');
@@ -33146,7 +33197,8 @@ function ovlPromptDialog(opts) {
 
     let settled = false;
     function fireCancelOnce() { if (settled) return; settled = true; if (typeof opts.onCancel === 'function') { try { opts.onCancel(); } catch (e) { console.error('[ovl] prompt onCancel failed', e); } } }
-    function close() { overlay.hidden = true; overlay.innerHTML = ''; document.removeEventListener('keydown', onKey); }
+    function close() { overlay.hidden = true; overlay.innerHTML = ''; document.removeEventListener('keydown', onKey); if (__ovlActiveModalDismiss === dismissSelf) __ovlActiveModalDismiss = null; }
+    function dismissSelf() { close(); fireCancelOnce(); }
     function doConfirm() {
         const v = input.value;
         const verr = opts.validate ? opts.validate(v) : null;
@@ -33160,6 +33212,7 @@ function ovlPromptDialog(opts) {
     okBtn.addEventListener('click', doConfirm);
     overlay.addEventListener('click', function (e) { if (e.target === overlay) { close(); fireCancelOnce(); } });
     document.addEventListener('keydown', onKey);
+    __ovlActiveModalDismiss = dismissSelf;
     setTimeout(function () { input.focus(); input.select(); }, 0);
 }
 
@@ -33168,7 +33221,8 @@ function ovlPromptDialog(opts) {
 //      v2 Pass P74 起 Enter=确认（disabled 时不生效）、Escape=取消，跟 ovlPromptDialog 一致。----
 function ovlConfirmDialog(opts) {
     const overlay = document.getElementById('ovlModalOverlay');
-    if (!overlay) return;
+    if (!overlay) { if (typeof opts.onCancel === 'function') { try { opts.onCancel(); } catch (e) { console.error('[ovl] confirm onCancel failed', e); } } return; }
+    ovlDismissActiveModal();
     overlay.innerHTML = '';
     overlay.hidden = false;
     const box = document.createElement('div');
@@ -33203,7 +33257,8 @@ function ovlConfirmDialog(opts) {
     // 确认框（Promise 化）用，不影响既有调用方（不传就什么都不做，行为跟以前一模一样）。
     let settled = false;
     function fireCancelOnce() { if (settled) return; settled = true; if (typeof opts.onCancel === 'function') { try { opts.onCancel(); } catch (e) { console.error('[ovl] confirm onCancel failed', e); } } }
-    function close() { overlay.hidden = true; overlay.innerHTML = ''; document.removeEventListener('keydown', onKey); }
+    function close() { overlay.hidden = true; overlay.innerHTML = ''; document.removeEventListener('keydown', onKey); if (__ovlActiveModalDismiss === dismissSelf) __ovlActiveModalDismiss = null; }
+    function dismissSelf() { close(); fireCancelOnce(); }
     function doConfirm() {
         if (okBtn.disabled) return;
         settled = true;
@@ -33226,6 +33281,7 @@ function ovlConfirmDialog(opts) {
     okBtn.addEventListener('click', doConfirm);
     overlay.addEventListener('click', function (e) { if (e.target === overlay) { close(); fireCancelOnce(); } });
     document.addEventListener('keydown', onKey);
+    __ovlActiveModalDismiss = dismissSelf;
     if (input) setTimeout(function () { input.focus(); }, 0);
 }
 
@@ -34038,19 +34094,37 @@ function ovlBindEditorShortcuts() {
 // 新增的「远程桥接」分类（ovlSettingsBridgeHtml）。OvlSettings 在本文件更后面才声明
 // （let OvlSettings = ...），但这几个函数只在真正发请求时才会被调用，届时早已初始化完毕。
 const OVL_BRIDGE_DEFAULT_ORIGIN = 'http://127.0.0.1:8181';
+// v2 Pass P110：同源零配置默认——P110 新增的桥静态托管（GET / 和 GET /AI-Translator.html）
+// 让页面本身可以直接从桥所在地址加载。这种情况下，用户从没在设置里手填过桥地址（addr 为空）
+// 时，与其继续硬编码退回 127.0.0.1:8181（页面既然是从别的地址加载来的，那个地址十有八九连
+// 不通），不如直接假定"页面是从哪个源加载的，桥多半就在那个源"——同源天然免 CORS、免手填。
+// 只在 location.protocol 是 http:/https: 时生效（file:// 打开的行为一字不变——判据用的是
+// location.protocol，不是 location.origin：v2 Pass P110 核验返修实测过，file:// 下
+// location.origin 其实是 "file://"（不是最初以为的 "null"），只是同样不能拿来当桥地址）；
+// 已经手填过地址的用户（addr 非空）
+// 这条分支完全不碰，继续走原来那一行。try/catch 兜底：location 读取异常时安安静静退回
+// 原来的硬编码默认值，不让这条新分支反而制造一个新的失败模式。
 function ovlBridgeOrigin() {
     try {
         const addr = (OvlSettings && OvlSettings.ovlBridgeAddr || '').trim();
-        return addr ? addr.replace(/\/+$/, '') : OVL_BRIDGE_DEFAULT_ORIGIN;
+        if (addr) return addr.replace(/\/+$/, '');
+        try {
+            if (location && (location.protocol === 'http:' || location.protocol === 'https:') && location.origin && location.origin !== 'null') {
+                return location.origin;
+            }
+        } catch (e2) { /* 落到下面的硬编码默认值 */ }
+        return OVL_BRIDGE_DEFAULT_ORIGIN;
     } catch (e) { return OVL_BRIDGE_DEFAULT_ORIGIN; }
 }
 function ovlBridgeUrl(p) { return ovlBridgeOrigin() + p; }
 // v2 Pass P50：判定"远程模式"的唯一权威逻辑——跟桥自己 server.js 里的 REMOTE_MODE
 // （!/^(127\.0\.0\.1|localhost|::1)$/i.test(HOST)）保持同一条规则，前端这边只有这一处判断，
 // 文件树/打开/保存/WS 票据……所有分流点都调这个函数，不再各自重新判断一遍。
-function ovlIsRemoteBridge() {
+// v2 Pass P110c（IX2-a）：可选传入 originArg 复用同一条判定逻辑，去判断"输入框里正在测试
+// 的地址"是不是远程——不传时行为跟以前完全一样（判当前生效的 ovlBridgeOrigin()）。
+function ovlIsRemoteBridge(originArg) {
     try {
-        const origin = ovlBridgeOrigin();
+        const origin = originArg || ovlBridgeOrigin();
         const u = new URL(origin);
         return !/^(127\.0\.0\.1|localhost|::1)$/i.test(u.hostname);
     } catch (e) { return false; }
@@ -34071,11 +34145,53 @@ function ovlBridgeAuthHeaders(existing) {
 // p 既可以是路径（'/compile' 之类，内部再拼 ovlBridgeUrl），也可以是已经拼好的完整 URL
 // （调用点大量是 fetch(ovlBridgeUrl(...)) 这种写法，直接把 ovlBridgeUrl(...) 的结果原样
 // 传进来最省事，不用逐个改成"只传路径"）；opts 跟原生 fetch 第二个参数同形状。
+// v2 Pass P110：本地完全没填过令牌、请求被桥 401 拒绝时，弹一次 ovlPromptDialog 要令牌，
+// 存进设置后自动重试一次——不发明新 UI，复用既有的令牌设置项 + 既有的通用输入框组件。
+// 并发场景下（同一时刻好几个桥请求一起 401，比如文件树刚展开触发了好几个 /fs/list）只弹
+// 一次：所有并发调用共享同一个 pending Promise，弹窗答完/取消后一起继续，不会弹出一排叠在
+// 一起的输入框。
+let __ovlBridgeTokenPromptPending = null;
+function ovlBridgeTokenPromptOnce() {
+    if (__ovlBridgeTokenPromptPending) return __ovlBridgeTokenPromptPending;
+    const p = new Promise(function (resolve) {
+        try {
+            ovlPromptDialog({
+                title: '需要访问令牌',
+                label: '远程桥需要访问令牌，见服务器 .bridge-token 文件',
+                placeholder: '粘贴访问令牌',
+                confirmLabel: '保存并重试',
+                onConfirm: function (v) {
+                    const token = String(v || '').trim();
+                    if (token) {
+                        try { OvlSettings.ovlBridgeToken = token; ovlSaveSettings(); } catch (e) { console.warn('[ovl] save bridge token failed', e); }
+                    }
+                    resolve(token);
+                },
+                onCancel: function () { resolve(''); }
+            });
+        } catch (e) { console.warn('[ovl] bridge token prompt failed', e); resolve(''); }
+    });
+    __ovlBridgeTokenPromptPending = p.then(function (token) { __ovlBridgeTokenPromptPending = null; return token; });
+    return __ovlBridgeTokenPromptPending;
+}
 function ovlBridgeFetch(p, opts) {
     const o = Object.assign({}, opts || {});
     o.headers = ovlBridgeAuthHeaders(o.headers);
     const url = /^https?:\/\//i.test(p || '') ? p : ovlBridgeUrl(p);
-    return fetch(url, o);
+    return fetch(url, o).then(function (resp) {
+        if (resp.status !== 401) return resp;
+        let hasToken = false;
+        try { hasToken = !!(OvlSettings && OvlSettings.ovlBridgeToken && OvlSettings.ovlBridgeToken.trim()); } catch (e) {}
+        // 本地已经填了令牌但还是 401 = 令牌本身不对，不是"从没填过"——不自动弹窗打扰，
+        // 照旧走设置面板「测试连接」那条既有的排查路径，原样把这次 401 交回调用点。
+        if (hasToken) return resp;
+        return ovlBridgeTokenPromptOnce().then(function (token) {
+            if (!token) return resp; // 用户取消：原样把这次 401 交回调用点，不重试
+            const o2 = Object.assign({}, opts || {});
+            o2.headers = ovlBridgeAuthHeaders(o2.headers);
+            return fetch(url, o2);
+        });
+    });
 }
 
 function ovlSetPdfStatus(text, isError, isBusy) {
@@ -34908,6 +35024,7 @@ function ovlOverleafShowDirtyDialog(dirtyFiles, projectDir, gitUrl) {
     const overlay = document.getElementById('ovlModalOverlay');
     if (!overlay) return;
 
+    ovlDismissActiveModal();
     overlay.innerHTML = '';
     overlay.hidden = false;
 
@@ -35029,6 +35146,7 @@ async function ovlOverleafDiscardRollback(projectDir, checkpoint) {
 function ovlOverleafShowStashConflictDialog(data) {
     const overlay = document.getElementById('ovlModalOverlay');
     if (!overlay) return;
+    ovlDismissActiveModal();
     overlay.innerHTML = '';
     overlay.hidden = false;
 
@@ -35758,6 +35876,9 @@ function ovlAiMergeClose() {
         if (OvlAiMergeState._onKey) { try { document.removeEventListener('keydown', OvlAiMergeState._onKey); } catch (e) {} }
     }
     OvlAiMergeState = null;
+    // v2 Pass P110b（IX 廉价非阻塞项）：同上——清空前先 ovlDismissActiveModal()，跟其余全部
+    // #ovlModalOverlay 清空点保持同一条不变量。
+    ovlDismissActiveModal();
     const overlay = document.getElementById('ovlModalOverlay');
     if (overlay) { overlay.hidden = true; overlay.innerHTML = ''; }
 }
@@ -35929,6 +36050,7 @@ function ovlAiMergeRenderDialogInner() {
     if (!OvlAiMergeState) return;
     const overlay = document.getElementById('ovlModalOverlay');
     if (!overlay) return;
+    ovlDismissActiveModal();
     overlay.innerHTML = '';
     overlay.hidden = false;
 
@@ -36410,6 +36532,7 @@ function ovlP2TAskOutputDir(entry) {
     return new Promise(function (resolve) {
         const overlay = document.getElementById('ovlModalOverlay');
         if (!overlay) { resolve(null); return; }
+        ovlDismissActiveModal();
         overlay.innerHTML = '';
         overlay.hidden = false;
 
@@ -39197,6 +39320,7 @@ function ovlP2TBatchPickListDialog(items) {
     return new Promise(function (resolve) {
         const overlay = document.getElementById('ovlModalOverlay');
         if (!overlay) { resolve(null); return; }
+        ovlDismissActiveModal();
         overlay.innerHTML = '';
         overlay.hidden = false;
 
@@ -39316,6 +39440,7 @@ function ovlP2TBatchAskOutRoot(items) {
     return new Promise(function (resolve) {
         const overlay = document.getElementById('ovlModalOverlay');
         if (!overlay) { resolve(null); return; }
+        ovlDismissActiveModal();
         overlay.innerHTML = '';
         overlay.hidden = false;
 
@@ -39718,6 +39843,7 @@ function ovlOverleafPickCloneLocation(projectId, token) {
     return new Promise(function (resolve) {
         const overlay = document.getElementById('ovlModalOverlay');
         if (!overlay) { resolve(null); return; }
+        ovlDismissActiveModal();
         overlay.innerHTML = '';
         overlay.hidden = false;
 
@@ -41611,9 +41737,9 @@ function ovlSettingsAiMergeHtml() {
 function ovlSettingsBridgeHtml() {
     const s = OvlSettings;
     let html = '<div class="ovl-set-category-title">远程桥接</div>';
-    html += '<div class="ovl-set-banner">桥接服务（tools/latex-bridge/server.js）默认只监听本机 127.0.0.1。要跨机访问（比如桥跑在 jump 上，家里/学校的机器连过去），把桥用 LATEX_BRIDGE_HOST 绑到具体的 Tailscale IP（例如 100.98.164.17，不要绑 0.0.0.0），再在下面填桥打印出来的地址和访问令牌。留空 = 用默认地址 http://127.0.0.1:8181，跟以前完全一样。</div>';
-    html += ovlSetRow('服务地址', '<input type="text" id="ovlBridgeAddrInput" data-setpath="settings.ovlBridgeAddr" style="width:260px" placeholder="http://127.0.0.1:8181" value="' + escapeAttr(s.ovlBridgeAddr) + '">',
-        '形如 http://100.98.164.17:8181。留空则用本机默认地址，不会改变现有行为。');
+    html += '<div class="ovl-set-banner">桥接服务（tools/latex-bridge/server.js）默认只监听本机 127.0.0.1。要跨机访问（比如桥跑在 jump 上，家里/学校的机器连过去），把桥用 LATEX_BRIDGE_HOST 绑到具体的 Tailscale IP（例如 100.98.164.17，不要绑 0.0.0.0），再在下面填桥打印出来的地址和访问令牌。留空时用哪个地址取决于本页面是怎么打开的：用 file:// 直接打开这个 HTML 文件 = 用默认地址 http://127.0.0.1:8181，跟以前完全一样；如果本页面就是从桥的 http(s) 地址加载的（v2 Pass P110 起桥可以直接托管这个页面），留空 = 自动用当前页面所在地址（同源零配置，不用手填）。</div>';
+    html += ovlSetRow('服务地址', '<input type="text" id="ovlBridgeAddrInput" data-setpath="settings.ovlBridgeAddr" style="width:260px" placeholder="' + escapeAttr(ovlBridgeOrigin()) + '" value="' + escapeAttr(s.ovlBridgeAddr) + '">',
+        '形如 http://100.98.164.17:8181。留空时：用 file:// 打开本页面 = 用默认地址 http://127.0.0.1:8181（不改变现有行为）；本页面是从桥的 http(s) 地址加载的 = 自动用当前页面所在地址（同源零配置）。上面的输入框占位符实时显示当前会用到的默认地址。');
     html += ovlSetRow('访问令牌', '<input type="password" id="ovlBridgeTokenInput" data-setpath="settings.ovlBridgeToken" style="width:260px" placeholder="桥启动日志里打印的令牌" value="' + escapeAttr(s.ovlBridgeToken) + '">',
         '桥绑在非 127.0.0.1 地址时会强制校验这个令牌，桥第一次以远程地址启动时自动生成并打印在终端日志里，抄过来即可；纯本地跑（默认地址）不需要填。');
     html += ovlSetRow('连接测试', '<button type="button" class="ovl-modal-btn" onclick="ovlBridgeTestConnection()">测试连接</button>'
@@ -41627,7 +41753,7 @@ async function ovlBridgeTestConnection() {
     const resultEl = document.getElementById('ovlBridgeTestResult');
     const addrInput = document.getElementById('ovlBridgeAddrInput');
     const tokenInput = document.getElementById('ovlBridgeTokenInput');
-    const addr = ((addrInput && addrInput.value) || '').trim().replace(/\/+$/, '') || OVL_BRIDGE_DEFAULT_ORIGIN;
+    const addr = ((addrInput && addrInput.value) || '').trim().replace(/\/+$/, '') || ovlBridgeOrigin();
     const token = ((tokenInput && tokenInput.value) || '').trim();
     if (resultEl) { resultEl.textContent = '测试中…'; resultEl.style.color = '#9AA4B2'; }
     try {
@@ -41644,11 +41770,30 @@ async function ovlBridgeTestConnection() {
         }
         let data = null;
         try { data = await resp.json(); } catch (e) { data = null; }
-        if (resp.ok && data && data.ok) {
-            if (resultEl) { resultEl.textContent = '✓ 连接成功（桥 API v' + (data.bridgeApiVersion != null ? data.bridgeApiVersion : '?') + '）'; resultEl.style.color = '#4ade80'; }
-        } else {
+        if (!(resp.ok && data && data.ok)) {
             if (resultEl) { resultEl.textContent = '✗ 连上了，但响应异常（HTTP ' + resp.status + '）'; resultEl.style.color = '#f87171'; }
+            return;
         }
+        const verLabel = '桥 API v' + (data.bridgeApiVersion != null ? data.bridgeApiVersion : '?');
+        // v2 Pass P110c（核验第 3 轮 IX2-a）：/health 在 TOKEN_EXEMPT_PATHS 里，天生测不出令牌
+        // 对不对——远程地址下光探它就报"连接成功"是假阳性（本地默认地址不受影响，下面这段
+        // 直接跳过，行为一字不变）。远程地址时追加一次经 ovlBridgeFetch 的受保护探测（POST
+        // /fs/capabilities，故意不带 projectDir，只为过一次令牌闸门，不产生任何真实文件操作）：
+        // 无令牌/错令牌时这次探测会真的 401，ovlBridgeFetch 内部既有的"弹一次令牌输入框→存下
+        // →自动重试一次"逻辑会接管，跟用户点"打开项目文件夹"触发令牌弹窗走同一条代码路径；
+        // 用户填对令牌重试后过了闸门（预期回落到 400 缺参数，不是 401）才真的算验证过。
+        if (ovlIsRemoteBridge(addr)) {
+            const authResp = await ovlBridgeFetch(addr + '/fs/capabilities', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+            if (authResp.status === 401) {
+                if (resultEl) { resultEl.textContent = '✗ 需要访问令牌（未填写、令牌不正确，或已取消弹窗；见上方"访问令牌"栏）'; resultEl.style.color = '#f87171'; }
+                return;
+            }
+            if (authResp.status !== 200 && authResp.status !== 400) {
+                if (resultEl) { resultEl.textContent = '✗ 连上了，但令牌校验响应异常（HTTP ' + authResp.status + '）'; resultEl.style.color = '#f87171'; }
+                return;
+            }
+        }
+        if (resultEl) { resultEl.textContent = '✓ 连接成功（' + verLabel + '）'; resultEl.style.color = '#4ade80'; }
     } catch (e) {
         if (resultEl) { resultEl.textContent = '✗ 连不上（地址错误 / 桥未启动 / 网络不通）'; resultEl.style.color = '#f87171'; }
     }
@@ -45723,7 +45868,9 @@ function ovlRenderMbFileMenu() {
     html += ovlMbItem({ id: 'newfolder', label: 'New folder', disabled: !hasDir, tip: hasDir ? '' : '请先打开一个可写的项目文件夹' });
     html += ovlMbItem({ id: 'upload', label: 'Upload file', disabled: !hasDir, tip: hasDir ? '' : '请先打开一个可写的项目文件夹' });
     html += ovlMbItem({ sep: 1 });
-    html += ovlMbItem({ id: 'makeCopy', label: 'Make a copy', disabled: !OvlState.dirHandle });
+    // v2 Pass P110：同上（桌面版项目菜单 data-proj="makeCopy" 那处注释）——非安全上下文下
+    // showDirectoryPicker() 不存在，这里跟移动端菜单既有的 disabled/tip 机制走同一套。
+    html += ovlMbItem({ id: 'makeCopy', label: 'Make a copy', disabled: !OvlState.dirHandle || !window.isSecureContext, tip: window.isSecureContext ? '' : '本地文件夹模式需要 HTTPS 或本机环境' });
     // 本地版本历史是 M11（⚪最低优先级，见 §4 里程碑表），这一轮没做——禁用且写清楚，不隐藏。
     html += ovlMbItem({ id: 'history', label: 'Show version history', disabled: true, tip: '未实现：本地版本历史是 M11（最低优先级），见交付说明的遗留清单' });
     html += ovlMbItem({ id: 'wordCount', label: 'Word count' });
