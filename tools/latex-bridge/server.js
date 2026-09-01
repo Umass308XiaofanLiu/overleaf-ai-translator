@@ -2473,8 +2473,19 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
-    const u = new URL(req.url, 'http://' + HOST + ':' + PORT);
-    const pathname = decodeURIComponent(u.pathname);
+    // v2 Pass P110 核验返修（I3）：这两行原来在 try 块之外、且在令牌闸门之前——未鉴权即可远程
+    // 触发（GET // 让 new URL() 抛 TypeError，GET /% 让 decodeURIComponent() 抛 URIError），
+    // 全文又没有 unhandledRejection/uncaughtException 兜底，会直接把整个 Node 进程崩掉退出。
+    // 实测：地址栏多打一个斜杠（.../8181//）就能把桥打死，tailnet 上任何人都不需要令牌。
+    // 单独包一层 try/catch，格式非法就回 400，不再让请求解析阶段的异常有机会冒到进程顶层。
+    let u, pathname;
+    try {
+        u = new URL(req.url, 'http://' + HOST + ':' + PORT);
+        pathname = decodeURIComponent(u.pathname);
+    } catch (e) {
+        sendJson(res, 400, { ok: false, error: '请求路径格式非法' });
+        return;
+    }
     req._logPathname = pathname;
 
     // v2 Pass P49：统一令牌校验闸门——REMOTE_MODE 下除 /health、GET / 之外的一切路由
