@@ -4170,7 +4170,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.03.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.03.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -29364,14 +29364,45 @@ function ovlNumToLetter(n) {
 }
 const OVL_NUM_APPENDIX_RE = /\\appendix\b/;
 const OVL_NUM_HEADING_RE = /^\s*\\(subsubsection|subsection|section)(\*)?(?:\[[^\]]*\])?\{/;
+// v2 Pass P116 返修（对抗核验 p116_verify.md 问题 1）：直接拿整块原始源码 test \appendix
+// 会被两类"看不见"的假阳性坑——(a) 被注释掉的 `%\appendix`（渲染管线本来就确定性剥离注释，
+// 用户在 Visual 面板里根本看不到这行）(b) verbatim/lstlisting 等逐字环境里的字面 `\appendix`
+// 文本——一起误判成真命令，静默把它之后所有真章节全部翻成 "Appendix A/B/C"。复用仓库里两个
+// 现成工具，不新造轮子：ovlVisualCodeMask（28871 行附近，翻译链路已经在用的"代码/逐字环境
+// 整段抽走换成不透明哨兵"，按环境名做通用 \begin/\end 深度配对，不认 % 为注释，verbatim 内部
+// 字面 % 不会被误伤）先脱壳，再用 ovlLatexActiveText（29221 行，ovlSplitVisualLines 自己也在
+// 用的"逐行摘 % 注释之前的生效文本"）逐行剥注释——顺序不能反：先脱壳保证 verbatim 内容不会
+// 被当成注释误删，脱壳后剩下的才是普通正文，"%" 在这里才真的是注释起点。
+// 已知局限（复用 ovlSplitVisualBlocks 既有行为，本次不动、不属于本次范围）：如果
+// \begin{verbatim}…\end{verbatim} 被空行拦腰切成好几个块（起止标签分落不同块），这里只能看
+// 见"当前这一块"，看不到跨块的"其实还在 verbatim 里面"——夹在中间、独占一行的
+// \section{...} 仍会被 ovlSplitVisualBlocks 的 isHeading 判定切成独立块（连带渲染成假
+// <h2>，是分块器的既有行为，不是这里新引入的），也仍会被当真标题计数。同一块内的
+// \begin{verbatim}...\end{verbatim}（含单行写法 \begin{verbatim}\appendix\end{verbatim}、
+// 单行写法 \begin{verbatim}\section{Fake}\end{verbatim}）不受此局限，正常被掩掉。
+function ovlNumEffectiveText(blockText) {
+    const masked = ovlVisualCodeMask(blockText).text;
+    return masked.split('\n').map(ovlLatexActiveText).join('\n');
+}
+// \appendix 跟标题命令挤在同一行时（比如 "\appendix \section{AppX}"）用来剥掉开头的
+// \appendix 前缀，见下面 headingSrc 那行的注释。
+const OVL_NUM_APPENDIX_LEADING_RE = /^\s*\\appendix\b\s*/;
 // numState 由调用方（ovlVisualRenderBodyWithLines）在每次渲染开始时现建一个新对象传入——
 // 不用模块级共享状态，整篇渲染跟局部段落重渲染各自独立起算，互不污染，也不需要显式重置。
 function ovlNumComputeForBlock(blockText, numState) {
-    if (OVL_NUM_APPENDIX_RE.test(blockText)) {
+    const effective = ovlNumEffectiveText(blockText);
+    if (OVL_NUM_APPENDIX_RE.test(effective)) {
         numState.appendix = true;
         numState.sec = 0; numState.sub = 0; numState.subsub = 0;
     }
-    const m = OVL_NUM_HEADING_RE.exec(blockText);
+    // v2 Pass P116 返修（问题 2，同一根因顺手覆盖）：\appendix 和标题命令挤在同一行时，
+    // ovlSplitVisualBlocks 按整行匹配 isHeading——这一行不是以标题命令开头，不会被单独拆成
+    // 一块，落进普通正文块；原来 OVL_NUM_HEADING_RE 是 ^ 锚定的，永远匹配不上，导致那一节
+    // 一个编号都拿不到（既不是 "Appendix A" 也不是罗马数字）。剥掉开头的 \appendix 前缀后
+    // 再匹配标题正则，紧跟着的标题命令照样能认出来、按（已经在上面设好的）附录状态正常
+    // 编号。
+    const headingSrc = effective.replace(OVL_NUM_APPENDIX_LEADING_RE, '');
+    const m = OVL_NUM_HEADING_RE.exec(headingSrc);
     if (!m || m[2] === '*') return null; // 非标题行，或星号变体：不编号、不计数
     const level = m[1];
     if (level === 'section') {
