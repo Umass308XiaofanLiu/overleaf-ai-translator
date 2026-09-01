@@ -3376,7 +3376,18 @@ const server = http.createServer(async (req, res) => {
         // TOKEN_EXEMPT_PATHS——跟其余非豁免端点一样过上面统一的 tokenAuthorized() 闸门：
         // 远程模式必须带对的令牌，本地模式（REMOTE_MODE=false）tokenAuthorized 恒真，不为这
         // 一个端点单独加令牌要求。
+        // v2 Pass P119 核验返修（问题 2）：本地模式下 tokenAuthorized 恒真，仅靠令牌闸门挡不住
+        // 跨站——任意网页只要能诱导用户打开就能对 127.0.0.1:PORT 发一条不触发预检的简单
+        // POST（无自定义头、Content-Type: text/plain），把用户正在用的桥直接打死。跟
+        // /fs/*、/overleaf/* 这些会产生副作用的端点一样，补上 ovlOriginAllowed() 前置闸门：
+        // 只放行"没有 Origin 头的非浏览器调用"（curl/无人值守脚本）、"file:// 页面"、"桥自己
+        // 服务的同源页面"、"localhost/127.0.0.1"，跨站页面一律 403。前端全文 grep 不到任何
+        // UI 调用这个端点（`admin/restart`），加这道闸门不影响现有用法。
         if (req.method === 'POST' && pathname === '/admin/restart') {
+            if (!ovlOriginAllowed(req)) {
+                sendJson(res, 403, { ok: false, error: '拒绝来自外部网页的重启请求。这个接口只接受本机/受信来源的调用。' });
+                return;
+            }
             if (restartScheduled) {
                 // 已经排上了：幂等返回，不重复计时、不重复 kill——避免同一秒内连点两下反而
                 // 制造第二次 killTree/第二次 process.exit 竞态。
