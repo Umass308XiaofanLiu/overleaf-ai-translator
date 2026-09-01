@@ -18918,8 +18918,19 @@ const CHAT_AGENT_HIGHLIGHT_TOOLS = ['doc_highlight', 'doc_highlight_clear'];
 const CHAT_AGENT_STATUS_TOOLS = ['list_block_status'];
 const CHAT_AGENT_COMPILE_TOOLS = ['compile', 'read_compile_log'];
 const CHAT_AGENT_P2T_WRITE_TOOLS = ['reconvert_page', 'recrop_figure'];
+// v2 Pass P103：三条新能力线，同一套 ==TOOL==/==TOOLEND== 协议 + chatAgentRunLoop 主循环，
+// 跟 P101/P92/P78 一样各自独立判定就绪/独立系统提示小节（详见各自 exec 函数上方注释）：
+//   CHAT_AGENT_SEARCH_TOOLS：project_search —— 只读跨文件全文搜索，免确认。
+//   CHAT_AGENT_QA_TOOLS：translation_qa_scan —— 只读批量翻译质量扫描，免确认。
+//   CHAT_AGENT_GLOSSARY_READ_TOOLS / _WRITE_TOOLS：项目术语表——list 只读免确认，
+//   set/remove 会改动持久化的术语表，跟 retranslate_block 同一档，走 chatAgentConfirm。
+const CHAT_AGENT_SEARCH_TOOLS = ['project_search'];
+const CHAT_AGENT_QA_TOOLS = ['translation_qa_scan'];
+const CHAT_AGENT_GLOSSARY_READ_TOOLS = ['glossary_list'];
+const CHAT_AGENT_GLOSSARY_WRITE_TOOLS = ['glossary_set', 'glossary_remove'];
 const CHAT_AGENT_TOOLS = ['list_dir', 'read_file'].concat(CHAT_AGENT_WRITE_TOOLS).concat(CHAT_AGENT_ZH_TOOLS).concat(CHAT_AGENT_HIGHLIGHT_TOOLS)
-    .concat(CHAT_AGENT_STATUS_TOOLS).concat(CHAT_AGENT_COMPILE_TOOLS).concat(CHAT_AGENT_P2T_WRITE_TOOLS);
+    .concat(CHAT_AGENT_STATUS_TOOLS).concat(CHAT_AGENT_COMPILE_TOOLS).concat(CHAT_AGENT_P2T_WRITE_TOOLS)
+    .concat(CHAT_AGENT_SEARCH_TOOLS).concat(CHAT_AGENT_QA_TOOLS).concat(CHAT_AGENT_GLOSSARY_READ_TOOLS).concat(CHAT_AGENT_GLOSSARY_WRITE_TOOLS);
 
 // ============================================================================
 // v2 Pass P102：本地模型（provider==='local'）路径下的 OpenAI 原生 tool_call 迁移
@@ -19109,6 +19120,45 @@ function chatAgentBuildOpenAIToolsSchema() {
         });
     }
 
+    // v2 Pass P103
+    let searchReady = false;
+    try { searchReady = chatAgentSearchReadiness().ready; } catch (e) {}
+    if (searchReady) {
+        def('project_search', '只读：在当前项目目录内跨文件全文搜索一个关键词（只搜索 .tex/.bib/.md/.txt 文本文件，跳过二进制和 .git/node_modules），返回命中的文件、行号和上下文。用户问"哪里提到了 xxx""这个术语/引用在哪些文件出现过"这类跨文件问题时，用这个自己去项目里搜，不要只凭已经读过的少数文件猜。', {
+            type: 'object',
+            properties: {
+                query: { type: 'string', description: '要搜索的关键词/短语（子串匹配）。' },
+                caseSensitive: { type: 'boolean', description: '是否区分大小写，省略默认 false。' }
+            },
+            required: ['query'], additionalProperties: false
+        });
+    }
+
+    let qaScanReady = false;
+    try { qaScanReady = chatAgentQaScanReadiness().ready; } catch (e) {}
+    if (qaScanReady) {
+        def('translation_qa_scan', '只读：批量扫描当前 Visual 中文预览全部块的翻译质量，报告四类问题：回显守卫拦截块、翻译失败块、疑似漏译块（正文拉丁字符占比异常高）、术语不一致（跟项目术语表比对）。用户问"这篇翻译质量怎么样""帮我检查一下翻译"这类整体问题时用这个一次性扫描，不要一块一块猜。', { type: 'object', properties: {}, additionalProperties: false });
+    }
+
+    let glossaryReady = false;
+    try { glossaryReady = chatAgentGlossaryReadiness().ready; } catch (e) {}
+    if (glossaryReady) {
+        def('glossary_list', '只读：列出当前项目持久化的英中术语对照表（最多 50 条）。', { type: 'object', properties: {}, additionalProperties: false });
+        def('glossary_set', '新增或更正项目术语表里的一条英中对照。登记后，之后本项目翻译请求会自动带上这条对照要求模型必须遵守。执行前用户会看到确认弹窗；已满 50 条时新增会被拒绝（更正已有术语不受限）。', {
+            type: 'object',
+            properties: {
+                en: { type: 'string', description: '英文术语。' },
+                zh: { type: 'string', description: '标准中文译法。' }
+            },
+            required: ['en', 'zh'], additionalProperties: false
+        });
+        def('glossary_remove', '从项目术语表删除一条术语。执行前用户会看到确认弹窗。', {
+            type: 'object',
+            properties: { en: { type: 'string', description: '要删除的英文术语。' } },
+            required: ['en'], additionalProperties: false
+        });
+    }
+
     return tools;
 }
 
@@ -19166,7 +19216,8 @@ function chatAgentToolsSystemBlock() {
             + (native ? '' : '不要输出 ==TOOL== 块，')
             + '只能根据上面已经给到你的内容回答，也不要假装自己读过或改过任何'
             + '没有出现在这段对话里的文件。\n' + chatAgentZhToolsSystemBlock() + chatAgentHighlightToolsSystemBlock()
-            + chatAgentBlockStatusToolsSystemBlock() + chatAgentCompileToolsSystemBlock() + chatAgentP2TWriteToolsSystemBlock();
+            + chatAgentBlockStatusToolsSystemBlock() + chatAgentCompileToolsSystemBlock() + chatAgentP2TWriteToolsSystemBlock()
+            + chatAgentSearchToolsSystemBlock() + chatAgentQaToolsSystemBlock() + chatAgentGlossaryToolsSystemBlock();
     }
     const base = '\n【文件读取工具】用户关注的那句话（如果有的话）只是一个起点——需要的话，你可以主动'
         + '读取甚至修改用户项目文件夹里的文件：它的上下文、它 \\ref/\\cite 指向的定义、supp.tex 等'
@@ -19215,7 +19266,10 @@ function chatAgentToolsSystemBlock() {
         + chatAgentHighlightToolsSystemBlock()
         + chatAgentBlockStatusToolsSystemBlock()
         + chatAgentCompileToolsSystemBlock()
-        + chatAgentP2TWriteToolsSystemBlock();
+        + chatAgentP2TWriteToolsSystemBlock()
+        + chatAgentSearchToolsSystemBlock()
+        + chatAgentQaToolsSystemBlock()
+        + chatAgentGlossaryToolsSystemBlock();
 }
 
 // v2 Pass P78（H4）：AI 聊天代理诊断/修 Visual 中文预览模式渲染错误的两个工具——跟上面的文件
@@ -19322,6 +19376,16 @@ function chatAgentValidateToolArgs(name, args) {
     }
     if (name === 'recrop_figure' && !(Number.isInteger(args.figNum) && args.figNum >= 1)) {
         return { ok: false, reason: 'recrop_figure 缺少必填的 figNum 参数（必须是 ≥1 的整数）' };
+    }
+    // v2 Pass P103
+    if (name === 'project_search' && (typeof args.query !== 'string' || !args.query.trim())) {
+        return { ok: false, reason: 'project_search 缺少必填的 query 参数（必须是非空字符串）' };
+    }
+    if ((name === 'glossary_set') && (typeof args.en !== 'string' || !args.en.trim() || typeof args.zh !== 'string' || !args.zh.trim())) {
+        return { ok: false, reason: 'glossary_set 缺少必填的 en/zh 参数（都必须是非空字符串）' };
+    }
+    if (name === 'glossary_remove' && (typeof args.en !== 'string' || !args.en.trim())) {
+        return { ok: false, reason: 'glossary_remove 缺少必填的 en 参数（必须是非空字符串）' };
     }
     return { ok: true };
 }
@@ -21165,6 +21229,424 @@ async function chatAgentExecRecropFigure(args, signal, pending) {
     return { ok: true, uiSummary: '重新裁剪图 ' + figNum + ' 完成', uiDetail: text, textForModel: text, bytes: text.length };
 }
 
+// ============================================================================
+// v2 Pass P103（组1）：project_search —— 项目内跨文件全文搜索
+// ============================================================================
+// 只读，跟 list_dir/read_file 同一档（免确认，外层统一画行）。设计要点（用户批准清单第
+// 5 项，拿不准处已按「Overleaf 惯例 + 最小侵入」拍板，记录在这里）：
+//   · 两种模式没有分裁成两套遍历代码——OvlRemoteDirHandle（桥模式）和原生
+//     FileSystemDirectoryHandle（本地 FSA 模式）本来就共用同一份 entries()/getFile()
+//     接口形状（前者内部就是包了一层 /fs/list、/fs/read，见其类定义），这里对
+//     OvlState.dirHandle 写一份通用递归遍历，物理上天然覆盖任务书说的"桥模式经 /fs
+//     读取"和"本地 FSA 模式遍历句柄"两种情况，不是漏做了分支。
+//   · 降级只读模式（OvlState.usingWebkitFallback===true，webkitdirectory 拿到的是扁平
+//     文件列表、没有真句柄可递归）明确判不可用，不假装能用——这跟既有的 AI 合并
+//     （ovlAiMerge 等处）同一条纪律。
+//   · 白名单只认 .tex/.bib/.md/.txt 四种扩展名（任务书原话），跳过其余一切；跳过的目录
+//     只有 .git（桥端 /fs/list 已经服务端过滤过，这里对本地 FSA 模式补一份同款过滤）和
+//     node_modules（防误入 JS 依赖目录）——没有引入更大的"输出目录"黑名单，因为 pdf2tex
+//     的 converted/ 目录其实是真实可读的 .tex 正文，不能被当产物目录跳过。
+//   · 命中数硬上限 50 条（任务书原话），达到就提前停止递归（不会把整个大项目扫完才截断，
+//     省时间）；另有一个扫描安全网（最多 500 个文本文件 / 最多 4MB），超出会在结果里如实
+//     标注"可能不完整"，防止极端大项目卡死。
+//   · doc_highlight 联动：命中行如果属于当前打开的文档，会在这一条结果里明确标注，并在
+//     系统提示里告诉模型可以直接把该行文本原样作为 doc_highlight 的 snippet 使用，不需要
+//     再多一次 read_file 往返——这就是"联动"的全部含义，不改 doc_highlight 本身的实现。
+const CHAT_AGENT_SEARCH_EXTS = ['.tex', '.bib', '.md', '.txt'];
+const CHAT_AGENT_SEARCH_SKIP_DIRS = ['.git', 'node_modules'];
+const CHAT_AGENT_SEARCH_MAX_RESULTS = 50;
+const CHAT_AGENT_SEARCH_MAX_FILES = 500;   // 安全网，非任务书要求的硬指标
+const CHAT_AGENT_SEARCH_MAX_BYTES = 4 * 1024 * 1024; // 同上
+
+function chatAgentSearchReadiness() {
+    if (typeof OvlState === 'undefined' || !OvlState.dirHandle || OvlState.usingWebkitFallback) return { ready: false, reason: 'no-dir' };
+    return { ready: true, reason: '' };
+}
+
+function chatAgentSearchToolsSystemBlock() {
+    let ready;
+    try { ready = chatAgentSearchReadiness(); } catch (e) { ready = { ready: false, reason: 'no-dir' }; }
+    const native = chatAgentNativeToolsActive();
+    if (!ready.ready) {
+        return native
+            ? ('\n【项目内搜索工具】这一轮不可用（没有已打开的项目目录，或处于降级只读模式）。不要调用 project_search。\n')
+            : ('\n【项目内搜索工具】这一轮不可用（没有已打开的项目目录，或处于降级只读模式）。不要输出 name=project_search 的 ==TOOL== 块。\n');
+    }
+    return '\n【项目内搜索工具】用户问"哪里提到了 xxx""这个术语/引用在哪些文件出现过"这类跨文件问题时，'
+        + '不要只凭已经读过的少数文件猜——调用 project_search 在整个项目里搜（只覆盖 .tex/.bib/.md/.txt 文本文件）：\n'
+        + '  · project_search —— 参数：{"query":"关键词","caseSensitive":false}（caseSensitive 可省略，默认 false）。'
+        + '返回每处命中的文件、行号、上下文（命中行的前后各一行）；命中数超过 50 条会截断并明确提示。'
+        + '命中行如果属于当前打开的文档，会特别标注"属于当前打开文档"，这种情况可以直接把该行文本'
+        + '原样作为 doc_highlight 的 snippet 使用，不需要再额外 read_file。\n'
+        + (native ? '' : '调用格式：\n==TOOL name=project_search==\n{"query":"关键词"}\n==TOOLEND==\n');
+}
+
+async function chatAgentProjectSearchWalk(handle, relDir, needle, caseSensitive, state) {
+    if (state.results.length >= CHAT_AGENT_SEARCH_MAX_RESULTS) return;
+    let iter;
+    try { iter = handle.entries(); } catch (e) { return; }
+    for await (const pair of iter) {
+        if (state.results.length >= CHAT_AGENT_SEARCH_MAX_RESULTS) return;
+        if (state.filesScanned >= CHAT_AGENT_SEARCH_MAX_FILES || state.bytesRead >= CHAT_AGENT_SEARCH_MAX_BYTES) { state.capped = true; return; }
+        const name = pair[0], child = pair[1];
+        const childRel = relDir === '.' ? name : relDir + '/' + name;
+        if (child && child.kind === 'directory') {
+            if (CHAT_AGENT_SEARCH_SKIP_DIRS.indexOf(name) !== -1) continue;
+            await chatAgentProjectSearchWalk(child, childRel, needle, caseSensitive, state);
+            continue;
+        }
+        const extM = /\.[^.\/]+$/.exec(name || '');
+        const ext = extM ? extM[0].toLowerCase() : '';
+        if (CHAT_AGENT_SEARCH_EXTS.indexOf(ext) === -1) continue;
+        state.filesScanned++;
+        let text;
+        try {
+            const file = await child.getFile();
+            state.bytesRead += file.size;
+            text = await file.text();
+        } catch (e) { continue; } // 单个文件读不了不影响整次搜索，安静跳过
+        const lines = text.split(/\r\n|\r|\n/);
+        for (let i = 0; i < lines.length; i++) {
+            const hay = caseSensitive ? lines[i] : lines[i].toLowerCase();
+            if (hay.indexOf(needle) === -1) continue;
+            state.results.push({ file: childRel, line: i + 1, before: i > 0 ? lines[i - 1] : null, match: lines[i], after: i < lines.length - 1 ? lines[i + 1] : null });
+            if (state.results.length >= CHAT_AGENT_SEARCH_MAX_RESULTS) return;
+        }
+    }
+}
+
+async function chatAgentExecProjectSearch(args) {
+    const readiness = chatAgentSearchReadiness();
+    if (!readiness.ready) {
+        const msg = '无法执行项目内搜索：没有已打开的项目目录（或处于降级只读模式，没有可遍历的目录句柄）。';
+        return { ok: false, uiSummary: '项目内搜索失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const query = (args && typeof args.query === 'string') ? args.query.trim() : '';
+    if (!query) {
+        const msg = 'project_search 缺少必填的 query 参数。';
+        return { ok: false, uiSummary: '项目内搜索失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const caseSensitive = !!(args && args.caseSensitive === true);
+    const needle = caseSensitive ? query : query.toLowerCase();
+    const state = { results: [], filesScanned: 0, bytesRead: 0, capped: false };
+    try {
+        await chatAgentProjectSearchWalk(OvlState.dirHandle, '.', needle, caseSensitive, state);
+    } catch (e) {
+        const msg = '项目内搜索时出错：' + ((e && e.message) || String(e));
+        return { ok: false, uiSummary: '项目内搜索失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const curRel = (OvlState.currentFile && (OvlState.currentFile.relPath || OvlState.currentFile.name))
+        ? String(OvlState.currentFile.relPath || OvlState.currentFile.name).replace(/\\/g, '/').replace(/^\.\//, '') : '';
+    const truncated = state.results.length >= CHAT_AGENT_SEARCH_MAX_RESULTS;
+    const lines = state.results.map(function (r) {
+        const isCur = curRel && r.file.replace(/^\.\//, '') === curRel;
+        const ctx = [];
+        if (r.before != null) ctx.push('  ' + (r.line - 1) + '\t' + r.before);
+        ctx.push('▶ ' + r.line + '\t' + r.match);
+        if (r.after != null) ctx.push('  ' + (r.line + 1) + '\t' + r.after);
+        return r.file + '（第 ' + r.line + ' 行' + (isCur ? '，属于当前打开文档，可直接把匹配行文本作为 doc_highlight 的 snippet 使用' : '') + '）：\n' + ctx.join('\n');
+    });
+    const header = '在项目内搜索「' + query + '」，共命中 ' + state.results.length + (truncated ? '+' : '') + ' 处'
+        + '（已扫描 ' + state.filesScanned + ' 个文本文件' + (state.capped ? '，已达到扫描安全上限，结果可能不完整' : '') + '）。';
+    const text = header + (lines.length ? ('\n\n' + lines.join('\n\n')) : '\n（没有找到匹配。）')
+        + (truncated ? ('\n\n（⚠ 已达到单次搜索 ' + CHAT_AGENT_SEARCH_MAX_RESULTS + ' 条结果上限，已截断——如需更多，请缩小关键词范围再搜。）') : '');
+    return {
+        ok: true,
+        uiSummary: '项目内搜索「' + query + '」：' + state.results.length + (truncated ? '+' : '') + ' 处命中',
+        uiDetail: text, textForModel: text, bytes: text.length
+    };
+}
+
+// ============================================================================
+// v2 Pass P103（组2）：translation_qa_scan —— 批量诊断 Visual 中文预览全部块的翻译质量
+// ============================================================================
+// 只读，跟 list_block_status 同一档（免确认，外层统一画行）。复用 P101 组1 的块状态分类
+// （chatAgentClassifyBlockStatus）拿到"回显守卫拦截"/"翻译失败"两类，另外两类是本工具
+// 独有的启发式检测（用户批准清单第 6 项，拿不准处已拍板，如实记录）：
+//   · 疑似漏译：块渲染为"正常渲染"、类型不是"公式"，但可见文字里拉丁字母占比 > 40%
+//     （OVL_QA_LATIN_RATIO_THRESHOLD，经验阈值——正常中文学术译文偶尔出现的英文缩写/
+//     变量名不会把整段拉丁字符占比推过 40%，真被回显守卫漏判的整段未译文字会）。字符
+//     总数（拉丁+汉字）< 6 时跳过，避免短块的统计噪声被误判。
+//   · 术语不一致：只对当前项目术语表（组3）里登记过的术语生效——没有登记的术语本工具
+//     压根不检测（不做无监督的"发现新术语"，明确的已知局限）。算法：对术语表每条
+//     {en, zh}，找出源码里出现过 en（大小写不敏感、词边界）的块；命中数 < 2 直接跳过
+//     （少于两处无所谓"是否一致"）；再看这些块的渲染文字里有没有 zh——分成"符合术语表"
+//     和"未按术语表翻译"两组，两组都非空就判定"不一致"。这是粗粒度的二元划分，不是
+//     精确识别出"具体译成了几种不同的说法"（真做需要额外一次模型归纳调用，超出本次
+//     任务范围）——如实记录这一层局限。
+const OVL_QA_LATIN_RATIO_THRESHOLD = 0.4;
+const OVL_QA_LATIN_MIN_CHARS = 6;
+
+function chatAgentQaScanReadiness() { return chatAgentZhBlockReadiness(); }
+
+function chatAgentQaToolsSystemBlock() {
+    let ready;
+    try { ready = chatAgentQaScanReadiness(); } catch (e) { ready = { ready: false, reason: 'no-pane' }; }
+    const native = chatAgentNativeToolsActive();
+    if (!ready.ready) {
+        const why = chatAgentZhReadinessMsg(ready);
+        return native
+            ? ('\n【翻译质量批量扫描工具】这一轮不可用（' + why + '）。不要调用 translation_qa_scan。\n')
+            : ('\n【翻译质量批量扫描工具】这一轮不可用（' + why + '）。不要输出 name=translation_qa_scan 的 ==TOOL== 块。\n');
+    }
+    return '\n【翻译质量批量扫描工具】用户问"这篇翻译质量怎么样""帮我检查一下翻译"这类整体质量问题时，'
+        + '用这个工具一次性扫描全文，不要一块一块猜：\n'
+        + '  · translation_qa_scan —— 只读，扫描当前 Visual 中文预览全部块，报告四类问题：'
+        + '回显守卫拦截块、翻译失败块、疑似漏译块（正文拉丁字符占比异常高）、术语不一致'
+        + '（跟项目术语表比对，同一术语在不同块译法不统一）。参数是空对象 {}。\n'
+        + (native ? '' : '调用格式：\n==TOOL name=translation_qa_scan==\n{}\n==TOOLEND==\n')
+        + '规则：如果扫描出多个问题块、打算批量重新翻译，**先用一段普通回复（==CHAT==）列出发现的'
+        + '问题清单，征求用户同意**——这是动手前的整体计划确认，跟 retranslate_block 自带的逐块'
+        + '确认卡不是一回事（那是每次调用最后一道用户确认，不能互相替代）。用户明确同意后再逐块'
+        + '调用 retranslate_block 处理；用户没同意、或只是想先看看问题在哪时，只汇报，不要擅自开始'
+        + '批量重译。\n';
+}
+
+function chatAgentQaLatinRatio(text) {
+    const s = String(text == null ? '' : text);
+    const latin = (s.match(/[A-Za-z]/g) || []).length;
+    const han = (s.match(/[一-龥]/g) || []).length;
+    const total = latin + han;
+    if (total < OVL_QA_LATIN_MIN_CHARS) return null;
+    return latin / total;
+}
+
+function chatAgentQaVisibleText(el) {
+    try { return (typeof ovlVisualCollectBlockVisibleText === 'function' ? ovlVisualCollectBlockVisibleText(el).text : el.textContent) || ''; }
+    catch (e) { return String(el.textContent == null ? '' : el.textContent); }
+}
+
+async function chatAgentExecTranslationQaScan(args) {
+    const readiness = chatAgentQaScanReadiness();
+    if (!readiness.ready) {
+        const msg = '无法扫描翻译质量：' + chatAgentZhReadinessMsg(readiness) + '。';
+        return { ok: false, uiSummary: '翻译质量扫描失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const pane = document.getElementById('ovlVisualPane');
+    const blocks = Array.from(pane.querySelectorAll('.ovl-visual-block'));
+    const echoBlocks = [], failedBlocks = [], suspiciousBlocks = [];
+    for (let i = 0; i < blocks.length; i++) {
+        const el = blocks[i];
+        const cls = chatAgentClassifyBlockStatus(el);
+        if (cls.status === '回显守卫拦截') { echoBlocks.push(i); continue; }
+        if (cls.status === '翻译失败') { failedBlocks.push(i); continue; }
+        if (cls.status !== '正常渲染' || cls.type === '公式') continue;
+        const ratio = chatAgentQaLatinRatio(chatAgentQaVisibleText(el));
+        if (ratio !== null && ratio > OVL_QA_LATIN_RATIO_THRESHOLD) suspiciousBlocks.push({ index: i, ratio: ratio });
+    }
+
+    const glossary = ovlGlossaryList();
+    const termIssues = [];
+    glossary.forEach(function (term) {
+        let enRe;
+        try { enRe = new RegExp('\\b' + term.en.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '\\b', 'i'); } catch (e) { return; }
+        const matchedIdx = [];
+        blocks.forEach(function (el, idx) {
+            let srcText = '';
+            try { srcText = (typeof ovlVisualBlockSrcText === 'function' ? ovlVisualBlockSrcText(el) : null) || ''; } catch (e) {}
+            if (enRe.test(srcText)) matchedIdx.push(idx);
+        });
+        if (matchedIdx.length < 2) return;
+        const withTerm = [], withoutTerm = [];
+        matchedIdx.forEach(function (idx) {
+            const visText = chatAgentQaVisibleText(blocks[idx]);
+            if (visText.indexOf(term.zh) !== -1) withTerm.push(idx); else withoutTerm.push(idx);
+        });
+        if (withTerm.length && withoutTerm.length) termIssues.push({ en: term.en, zh: term.zh, withTerm: withTerm, withoutTerm: withoutTerm });
+    });
+
+    const lines = [];
+    lines.push('翻译质量扫描（共 ' + blocks.length + ' 块）：');
+    lines.push('· 回显守卫拦截：' + echoBlocks.length + ' 块' + (echoBlocks.length ? '（#' + echoBlocks.join('、#') + '）' : ''));
+    lines.push('· 翻译失败：' + failedBlocks.length + ' 块' + (failedBlocks.length ? '（#' + failedBlocks.join('、#') + '）' : ''));
+    lines.push('· 疑似漏译（拉丁字符占比异常高，可能是回显守卫没拦住的整段未译文字）：' + suspiciousBlocks.length + ' 块'
+        + (suspiciousBlocks.length ? '（' + suspiciousBlocks.map(function (b) { return '#' + b.index + ' 占比 ' + Math.round(b.ratio * 100) + '%'; }).join('、') + '）' : ''));
+    lines.push('· 术语不一致（对照项目术语表 ' + glossary.length + ' 条）：' + termIssues.length + ' 条术语存在不一致'
+        + (termIssues.length ? '\n' + termIssues.map(function (t) {
+            return '  - 「' + t.en + '」→「' + t.zh + '」：符合的块 #' + t.withTerm.join('、#') + '；未按术语表翻译的块 #' + t.withoutTerm.join('、#');
+        }).join('\n') : ''));
+    const total = echoBlocks.length + failedBlocks.length + suspiciousBlocks.length + termIssues.length;
+    if (total === 0) lines.push('\n没有发现问题。');
+    const text = lines.join('\n');
+    return { ok: true, uiSummary: '翻译质量扫描：' + total + ' 项问题', uiDetail: text, textForModel: text, bytes: text.length };
+}
+
+// ============================================================================
+// v2 Pass P103（组3）：项目术语表 —— glossary_list / glossary_set / glossary_remove
+// ============================================================================
+// 持久化范式照抄 P66（ovlOverleafAddrMapLoad 那一套：单个 JSON 映射表，key 是
+// ovlNormalizeProjectPath 规范化的项目绝对路径，本地/远程分两个 localStorage key），不套
+// P62 翻译缓存那套 index+LRU+字节预算分桶——术语表条目量级小（≤50 条/项目，量级跟 P66 的
+// 地址映射表一样），不需要那套复杂度。跟 P66 的一个不同点：value 存的不是单个字符串而是
+// 一个 {en: zh, ...} 对象——天然按英文术语去重，改译法直接覆盖，不用先查再删再插。
+// 满 50 条时新增被拒绝（不像 P66 淘汰最老的自动腾位置）——术语表是用户主动维护的知识，
+// 静默淘汰旧术语比拒绝新增更危险，交给用户自己先删几条，这是拿不准时的拍板决定。
+const OVL_GLOSSARY_MAX = 50;
+function ovlGlossaryLsKey() { return ovlIsRemoteBridge() ? 'ovl.projectGlossaryByPathRemote' : 'ovl.projectGlossaryByPath'; }
+function ovlGlossaryMapLoad() {
+    try {
+        const raw = localStorage.getItem(ovlGlossaryLsKey());
+        if (!raw) return {};
+        const obj = JSON.parse(raw);
+        return (obj && typeof obj === 'object' && !Array.isArray(obj)) ? obj : {};
+    } catch (e) { return {}; }
+}
+function ovlGlossaryMapSave(map) { try { localStorage.setItem(ovlGlossaryLsKey(), JSON.stringify(map)); } catch (e) {} }
+function ovlGlossaryProjectKey() { try { return ovlNormalizeProjectPath(chatAgentProjectDir()); } catch (e) { return ''; } }
+function ovlGlossaryBucketGet(projectKey) {
+    const map = ovlGlossaryMapLoad();
+    const bucket = map[projectKey];
+    return (bucket && typeof bucket === 'object' && !Array.isArray(bucket)) ? bucket : {};
+}
+function ovlGlossaryList(projectKeyOverride) {
+    const key = (typeof projectKeyOverride === 'string' && projectKeyOverride) ? projectKeyOverride : ovlGlossaryProjectKey();
+    if (!key) return [];
+    const bucket = ovlGlossaryBucketGet(key);
+    return Object.keys(bucket).map(function (en) { return { en: en, zh: bucket[en] }; });
+}
+// 返回 true=成功，false=已满 50 条且是新增（不是更正已有条目）。
+function ovlGlossarySet(projectKey, en, zh) {
+    const key = projectKey || ovlGlossaryProjectKey();
+    if (!key || !en) return false;
+    const map = ovlGlossaryMapLoad();
+    const bucket = ovlGlossaryBucketGet(key);
+    const isNew = !Object.prototype.hasOwnProperty.call(bucket, en);
+    if (isNew && Object.keys(bucket).length >= OVL_GLOSSARY_MAX) return false;
+    bucket[en] = zh;
+    map[key] = bucket;
+    ovlGlossaryMapSave(map);
+    return true;
+}
+function ovlGlossaryRemove(projectKey, en) {
+    const key = projectKey || ovlGlossaryProjectKey();
+    if (!key) return false;
+    const map = ovlGlossaryMapLoad();
+    const bucket = ovlGlossaryBucketGet(key);
+    if (!Object.prototype.hasOwnProperty.call(bucket, en)) return false;
+    delete bucket[en];
+    map[key] = bucket;
+    ovlGlossaryMapSave(map);
+    return true;
+}
+// 翻译 prompt 注入段——「术语对照，必须遵守」。见 ovlVisualTranslateBlockText 调用处的
+// 大注释：只在 provider==='local' 时被拼进 prompt，Claude/OpenAI/Gemini 的 prompt 字节
+// 跟 P103 之前完全一致。
+function ovlGlossaryBuildPromptBlock() {
+    try {
+        const list = ovlGlossaryList();
+        if (!list.length) return '';
+        const lines = list.slice(0, OVL_GLOSSARY_MAX).map(function (t) { return t.en + ' → ' + t.zh; });
+        return '6) 术语对照，必须遵守（下面这些英文术语在原文中出现时，必须按给定的中文译法翻译，不要自创别的说法）：\n'
+            + lines.join('\n') + '\n\n';
+    } catch (e) { return ''; }
+}
+
+function chatAgentGlossaryReadiness() {
+    if (!chatAgentProjectDir()) return { ready: false, reason: 'no-projectdir' };
+    return { ready: true, reason: '' };
+}
+
+function chatAgentGlossaryToolsSystemBlock() {
+    let ready;
+    try { ready = chatAgentGlossaryReadiness(); } catch (e) { ready = { ready: false, reason: 'no-projectdir' }; }
+    const native = chatAgentNativeToolsActive();
+    if (!ready.ready) {
+        return native
+            ? ('\n【项目术语表工具】这一轮不可用（还没有填写项目绝对路径）。不要调用 glossary_list/glossary_set/glossary_remove。\n')
+            : ('\n【项目术语表工具】这一轮不可用（还没有填写项目绝对路径）。不要输出这几个工具的 ==TOOL== 块。\n');
+    }
+    return '\n【项目术语表工具】按项目路径持久化的英中术语对照表——登记后，之后本项目的翻译请求会'
+        + '自动把这份术语表注入给翻译模型，要求"必须遵守"（目前只对本地模型翻译路径生效）：\n'
+        + '  · glossary_list —— 只读，列出当前项目的术语表（最多 50 条）。参数是空对象 {}。\n'
+        + '  · glossary_set —— 新增或更正一条术语。参数：{"en":"英文术语","zh":"标准中文译法"}。'
+        + '执行前用户会看到确认弹窗。已满 50 条时新增会被拒绝（更正已有术语不受此限制）。\n'
+        + '  · glossary_remove —— 删除一条术语。参数：{"en":"英文术语"}。执行前用户会看到确认弹窗。\n'
+        + (native ? '' : '调用格式：\n==TOOL name=glossary_set==\n{"en":"...","zh":"..."}\n==TOOLEND==\n');
+}
+
+async function chatAgentExecGlossaryList(args) {
+    const readiness = chatAgentGlossaryReadiness();
+    if (!readiness.ready) {
+        const msg = '无法读取项目术语表：还没有填写项目绝对路径。';
+        return { ok: false, uiSummary: '读取术语表失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const list = ovlGlossaryList();
+    const text = list.length
+        ? ('当前项目术语表共 ' + list.length + ' 条：\n' + list.map(function (t) { return '  · ' + t.en + ' → ' + t.zh; }).join('\n'))
+        : '当前项目术语表是空的。';
+    return { ok: true, uiSummary: '项目术语表（' + list.length + ' 条）', uiDetail: text, textForModel: text, bytes: text.length };
+}
+
+async function chatAgentExecGlossarySet(args, signal, pending) {
+    const setLabel = function (t) { try { if (pending && pending.labelEl) pending.labelEl.textContent = t; } catch (e) {} };
+    const readiness = chatAgentGlossaryReadiness();
+    if (!readiness.ready) {
+        const msg = '无法登记术语：还没有填写项目绝对路径。';
+        return { ok: false, uiSummary: '登记术语失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const en = (args && typeof args.en === 'string') ? args.en.trim() : '';
+    const zh = (args && typeof args.zh === 'string') ? args.zh.trim() : '';
+    if (!en || !zh) {
+        const msg = 'glossary_set 缺少必填的 en/zh 参数。';
+        return { ok: false, uiSummary: '登记术语失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const projectKey = ovlGlossaryProjectKey();
+    const existing = ovlGlossaryBucketGet(projectKey);
+    const isNew = !Object.prototype.hasOwnProperty.call(existing, en);
+    setLabel('等待你确认登记术语「' + en + '」…');
+    const confirmMsg = '操作：' + (isNew ? '新增' : '更正') + '项目术语表条目。\n英文：' + en + '\n中文译法：' + zh
+        + (isNew ? '' : ('\n（原译法：' + existing[en] + '）'))
+        + '\n\n登记后，之后本项目的翻译请求会自动带上这条对照，要求模型必须遵守（目前只对本地模型'
+        + '翻译路径生效）。';
+    const confirmed = await chatAgentConfirm({ title: (isNew ? '新增' : '更正') + '术语？', message: confirmMsg, confirmLabel: '确认' + (isNew ? '新增' : '更正') }, signal);
+    if (!confirmed) {
+        const msg = '用户拒绝了该操作。';
+        chatAppendToolRow('🔧 glossary_set（' + en + '）· 已被用户取消', confirmMsg);
+        return { ok: false, refused: true, uiSummary: '用户取消', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const ok = ovlGlossarySet(projectKey, en, zh);
+    if (!ok) {
+        const msg = '登记失败：项目术语表已达到 ' + OVL_GLOSSARY_MAX + ' 条上限，请先删除几条不需要的术语再新增。';
+        chatAppendToolRow('🔧 glossary_set（' + en + '）· 失败', msg);
+        return { ok: false, uiSummary: '登记术语失败（已满）', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const text = (isNew ? '已新增' : '已更正') + '术语：' + en + ' → ' + zh + '。';
+    chatAppendToolRow('🔧 glossary_set（' + en + '）· 完成', text);
+    return { ok: true, uiSummary: text, uiDetail: text, textForModel: text, bytes: text.length };
+}
+
+async function chatAgentExecGlossaryRemove(args, signal, pending) {
+    const setLabel = function (t) { try { if (pending && pending.labelEl) pending.labelEl.textContent = t; } catch (e) {} };
+    const readiness = chatAgentGlossaryReadiness();
+    if (!readiness.ready) {
+        const msg = '无法删除术语：还没有填写项目绝对路径。';
+        return { ok: false, uiSummary: '删除术语失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const en = (args && typeof args.en === 'string') ? args.en.trim() : '';
+    if (!en) {
+        const msg = 'glossary_remove 缺少必填的 en 参数。';
+        return { ok: false, uiSummary: '删除术语失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    const projectKey = ovlGlossaryProjectKey();
+    const existing = ovlGlossaryBucketGet(projectKey);
+    if (!Object.prototype.hasOwnProperty.call(existing, en)) {
+        const msg = '术语表里没有「' + en + '」这一条，无需删除。';
+        return { ok: false, uiSummary: '删除术语失败', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    setLabel('等待你确认删除术语「' + en + '」…');
+    const confirmMsg = '操作：从项目术语表删除一条。\n英文：' + en + '\n当前中文译法：' + existing[en];
+    const confirmed = await chatAgentConfirm({ title: '删除术语？', message: confirmMsg, confirmLabel: '确认删除', danger: true }, signal);
+    if (!confirmed) {
+        const msg = '用户拒绝了该操作。';
+        chatAppendToolRow('🔧 glossary_remove（' + en + '）· 已被用户取消', confirmMsg);
+        return { ok: false, refused: true, uiSummary: '用户取消', uiDetail: msg, textForModel: msg, bytes: 0 };
+    }
+    ovlGlossaryRemove(projectKey, en);
+    const text = '已删除术语：' + en + '。';
+    chatAppendToolRow('🔧 glossary_remove（' + en + '）· 完成', text);
+    return { ok: true, uiSummary: text, uiDetail: text, textForModel: text, bytes: text.length };
+}
+
 // v2 Pass P102：单个工具调用"选哪个 exec 函数 / 自己弹确认卡片+自己画结果行 / 外层统一
 // 画行"的分发逻辑，从原来内联在 chatAgentRunLoop 循环体里的一大段 if/else 抽出来——文本
 // 协议路径和下面 native tool_call 路径现在共用同一份分发，不会出现"native 路径漏了某个
@@ -21194,7 +21676,14 @@ async function chatAgentDispatchToolCall(toolName, args, projectDir, signal, pen
     const isCompileTool = toolName === 'compile';
     const isReadLogTool = toolName === 'read_compile_log';
     const isP2TWriteTool = CHAT_AGENT_P2T_WRITE_TOOLS.indexOf(toolName) !== -1;
-    const selfDisplaying = isWriteTool || isZhWriteTool || isHighlightTool || isP2TWriteTool;
+    // v2 Pass P103：project_search/translation_qa_scan/glossary_list 只读免确认，外层统一
+    // 画行，同 list_dir/read_file 那一档；glossary_set/glossary_remove 会改动持久化的术语表，
+    // 跟 retranslate_block/P2T 写工具同一档——自己弹确认卡片、自己画结果行。
+    const isSearchTool = toolName === 'project_search';
+    const isQaScanTool = toolName === 'translation_qa_scan';
+    const isGlossaryListTool = toolName === 'glossary_list';
+    const isGlossaryWriteTool = CHAT_AGENT_GLOSSARY_WRITE_TOOLS.indexOf(toolName) !== -1;
+    const selfDisplaying = isWriteTool || isZhWriteTool || isHighlightTool || isP2TWriteTool || isGlossaryWriteTool;
     if (setLabel) {
         setLabel(isWriteTool
             ? ('准备执行「' + (CHAT_AGENT_TOOL_LABELS[toolName] || toolName) + '」…')
@@ -21212,7 +21701,15 @@ async function chatAgentDispatchToolCall(toolName, args, projectDir, signal, pen
                                     ? '正在读取编译日志…'
                                     : isP2TWriteTool
                                         ? ('准备' + (toolName === 'reconvert_page' ? ('重新转换第 ' + args.pageNum + ' 页') : ('重新裁剪图 ' + args.figNum)) + '…')
-                                        : ('正在' + (toolName === 'read_file' ? '读取' : '查看') + '「' + (args.path || '.') + '」…'));
+                                        : isSearchTool
+                                            ? ('正在项目内搜索「' + (args.query || '') + '」…')
+                                            : isQaScanTool
+                                                ? '正在扫描翻译质量…'
+                                                : isGlossaryListTool
+                                                    ? '正在读取项目术语表…'
+                                                    : isGlossaryWriteTool
+                                                        ? ('准备' + (toolName === 'glossary_set' ? '登记术语「' + args.en + '」' : '删除术语「' + args.en + '」') + '…')
+                                                        : ('正在' + (toolName === 'read_file' ? '读取' : '查看') + '「' + (args.path || '.') + '」…'));
     }
     const result = isWriteTool
         ? await chatAgentExecWriteTool(toolName, args, projectDir, signal, pending)
@@ -21230,13 +21727,24 @@ async function chatAgentDispatchToolCall(toolName, args, projectDir, signal, pen
                                 ? await chatAgentExecReadCompileLog(args)
                                 : isP2TWriteTool
                                     ? (toolName === 'reconvert_page' ? await chatAgentExecReconvertPage(args, signal, pending) : await chatAgentExecRecropFigure(args, signal, pending))
-                                    : await chatAgentExecTool(toolName, args, projectDir, signal);
+                                    : isSearchTool
+                                        ? await chatAgentExecProjectSearch(args)
+                                        : isQaScanTool
+                                            ? await chatAgentExecTranslationQaScan(args)
+                                            : isGlossaryListTool
+                                                ? await chatAgentExecGlossaryList(args)
+                                                : isGlossaryWriteTool
+                                                    ? (toolName === 'glossary_set' ? await chatAgentExecGlossarySet(args, signal, pending) : await chatAgentExecGlossaryRemove(args, signal, pending))
+                                                    : await chatAgentExecTool(toolName, args, projectDir, signal);
     if (!selfDisplaying) {
         const rowLabel = isZhReadTool
             ? ('🔧 read_block_translation（块 #' + args.blockIndex + '）')
             : isStatusTool ? '🔧 list_block_status'
             : isCompileTool ? '🔧 compile'
             : isReadLogTool ? '🔧 read_compile_log'
+            : isSearchTool ? ('🔧 project_search（' + (args.query || '') + '）')
+            : isQaScanTool ? '🔧 translation_qa_scan'
+            : isGlossaryListTool ? '🔧 glossary_list'
             : ((toolName === 'read_file' ? '🔧 read_file' : '🔧 list_dir') + '（' + (args.path || '.') + '）');
         chatAppendToolRow(
             rowLabel + '· ' + result.uiSummary,
@@ -28362,6 +28870,13 @@ async function ovlVisualTranslateBlockText(text, config, signal) {
     const codeMasked = ovlVisualCodeMask(src);
     const masked = xportMask(codeMasked.text);
     if (ovlVisualNothingToTranslate(masked.text)) return src;
+    // v2 Pass P103：项目术语表注入（用户批准清单第 6 项）。这个 prompt 是 callModelPlainText
+    // 四家 provider 共用的同一份字符串（callModelPlainText 内部按 config.provider 分发到
+    // callLocalLLM/callOpenAIAPI/callClaudeAPI/callGeminiAPI），任务书原话"若 Claude 翻译
+    // 路径的 prompt 在禁区内，则术语注入只作用于本地路径并如实记录"——这里主动收窄成只在
+    // config.provider==='local' 时才拼这一段：Claude/OpenAI/Gemini 收到的 prompt 字节跟
+    // P103 之前逐字节相同（不引入行为变化），且绝不触碰 callClaudeAPI 函数体本身。
+    const glossaryBlock = (config && config.provider === 'local') ? ovlGlossaryBuildPromptBlock() : '';
     const prompt = '你是学术论文翻译助手，把下面的 LaTeX 片段翻译成简体中文学术书面语。硬性规则：\n'
         + '1) 文本中所有形如 [[数字]] 的占位符必须原样保留在译文里、不得翻译、不得增删、不得改动方括号或数字——'
         + '它们代表被抽走的公式/引用/命令，请把每一个都当成一个不可拆分的单词对待，直接嵌进对应的译文位置。\n'
@@ -28372,6 +28887,7 @@ async function ovlVisualTranslateBlockText(text, config, signal) {
         + '4) 保持原文的意思和语气，译成通顺准确的简体中文学术书面语。\n'
         + '5) 必须真正翻译成中文——禁止原样照抄或复述英文原文，译文里的自然语言部分不应包含未翻译的'
         + '英文单词或句子（专有名词、缩写、变量名等确实无法翻译的除外）。\n\n'
+        + glossaryBlock
         + '原文：\n' + masked.text;
     const raw = await callModelPlainText(prompt, config, signal);
     const body = (typeof raw === 'string') ? raw.trim() : '';
