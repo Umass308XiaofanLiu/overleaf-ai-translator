@@ -551,13 +551,89 @@ function findBibRecursive(dir, name, maxDepth) {
     return null;
 }
 
-// 返回诊断信息（v2 Pass P111 新增）：{ referenced, found, missing }——分别是 main.tex 里点名的
-// 全部 .bib 文件名（去重）、成功定位并拷贝的、以及哪里都找不到的。调用方（doCompile/finish）
-// 用这份信息在找不到时给出明确中文诊断，不是让引用悄悄变成 [?]。
+// v2 Pass P111 返修（.claude/tmp/p111_verify.md 问题 1+2）：copyBibResourcesToOutdir 原来直接对
+// mainAbs 原始文本跑 \bibliography{}/\addbibresource{} 正则，有两处漏洞：
+//   ① 不剥 LaTeX 行注释（%…）。用户切换 bib 方案时把旧的 \bibliography/\addbibresource 写法
+//      注释掉留着是极常见习惯——旧写法照样被正则认出来，若那个名字在项目里哪里都不存在
+//      （它当然不存在，只活在注释里），就会往用户完全健康的编译结果里插一条对本次编译失实的
+//      红色 error 诊断，点名一个用户根本不认识、只存在于注释里的文件名。
+//   ② 只读 mainAbs 一个文件，不跟 \input{}/\include{}。长论文用子文件拆章节是标配写法，
+//      \bibliography 常常写在被 \input 进来的子文件里而不是 main.tex 本身——这种布局下引用
+//      名字压根不会被发现，后面的递归兜底、诊断都无从触发，退回完全静默的 [?]，跟本函数存在
+//      的目的正相反。
+// 两处都在"读文本"这一步解决：先剥注释，再沿 \input/\include 浅层展开，把展开后的全部文本
+// 拼在一起再跑两条正则；下面两个辅助函数就做这件事。
+
+// 剥 LaTeX 行注释：从第一个"未被 \ 转义"的 % 开始到行尾整段删掉。不能用简单的
+// /(?<!\\)%.../ ——负向先行断言只看紧邻的一个字符，真正的字面反斜杠后跟注释（"\\%"，即
+// TeX 源码里的 "\textbackslash{}" 这类场景之外、直接双反斜杠加百分号）会被错判成转义；标准
+// 做法是数连续反斜杠个数，偶数（含 0）个才是未转义。
+function stripLatexLineComments(text) {
+    return text.split(/\r\n|\r|\n/).map((line) => {
+        let searchFrom = 0;
+        while (true) {
+            const idx = line.indexOf('%', searchFrom);
+            if (idx === -1) return line;
+            let backslashes = 0;
+            let j = idx - 1;
+            while (j >= 0 && line.charAt(j) === '\\') { backslashes++; j--; }
+            if (backslashes % 2 === 0) return line.slice(0, idx); // 未转义，注释从这里开始，砍掉
+            searchFrom = idx + 1; // 是 \% 转义，不是注释，继续往后找下一个 %
+        }
+    }).join('\n');
+}
+
+// 在候选目录里定位 \input{name}/\include{name} 指向的 .tex 文件——候选目录顺序（主文件所在
+// 目录优先，项目根兜底）跟本函数其余部分找 .bib 的候选顺序保持一致。
+function resolveIncludedTexFile(name, searchDirs) {
+    const withExt = name.endsWith('.tex') ? name : name + '.tex';
+    for (const dir of searchDirs) {
+        const p = path.join(dir, withExt);
+        if (fs.existsSync(p)) return p;
+    }
+    return null;
+}
+
+// 从 mainAbs 出发，沿 \input{}/\include{} 浅层展开收集全部文本（已剥注释）。深度上限 8、
+// 累计文件数上限 64，防病态深/宽子文件树；用 realpath 去重防止 \input 自环死循环。单个子
+// 文件读失败（不存在/权限问题）静默跳过，不影响主文件及其余子文件已扫到的部分。
+function collectBibScanText(mainAbs, projectDir) {
+    const searchDirs = [path.dirname(mainAbs), projectDir].filter((d, i, arr) => arr.indexOf(d) === i);
+    const visited = new Set();
+    const chunks = [];
+    const reIncludeCmd = /\\(?:input|include)\{([^}]*)\}/g;
+    function visit(absPath, depth) {
+        let real;
+        try { real = fs.realpathSync(absPath); } catch (e) { real = absPath; }
+        if (visited.has(real)) return;
+        visited.add(real);
+        let raw;
+        try { raw = fs.readFileSync(absPath, 'utf8'); } catch (e) { return; }
+        const clean = stripLatexLineComments(raw);
+        chunks.push(clean);
+        if (depth >= 8 || visited.size >= 64) return; // 防病态深/宽子文件树
+        reIncludeCmd.lastIndex = 0;
+        let mm;
+        while ((mm = reIncludeCmd.exec(clean))) {
+            const n = mm[1].trim();
+            if (!n) continue;
+            const target = resolveIncludedTexFile(n, searchDirs);
+            if (target) visit(target, depth + 1);
+        }
+    }
+    visit(mainAbs, 0);
+    return chunks.join('\n');
+}
+
+// 返回诊断信息（v2 Pass P111 新增）：{ referenced, found, missing }——分别是 main.tex（及其
+// \input/\include 展开出的子文件）里点名的全部 .bib 文件名（去重）、成功定位并拷贝的、以及
+// 哪里都找不到的。调用方（doCompile/finish）用这份信息在找不到时给出明确中文诊断，不是让
+// 引用悄悄变成 [?]。
 function copyBibResourcesToOutdir(mainAbs, projectDir, outdir) {
     const diag = { referenced: [], found: [], missing: [] };
     let text;
-    try { text = fs.readFileSync(mainAbs, 'utf8'); } catch (e) { return diag; }
+    try { text = collectBibScanText(mainAbs, projectDir); } catch (e) { return diag; }
+    if (!text) return diag;
     const names = [];
     const reClassic = /\\bibliography\{([^}]*)\}/g;
     const reBiblatex = /\\addbibresource(?:\[[^\]]*\])?\{([^}]*)\}/g;
