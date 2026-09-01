@@ -125,6 +125,13 @@ const COMPILE_TIMEOUT_MAX_MS = 600000;
 const TOKEN_HEADER = 'x-latex-bridge-token';
 const TOKEN_FILE = path.join(__dirname, '.bridge-token');
 
+// v2 Pass P110：桥顺带把 AI-Translator.html 自己 serve 出去——同一台机器/同一个 Tailscale
+// 地址上，浏览器直接打开 http(s)://<桥地址>/ 就能拿到整个 App，不用再手动往目标机器拷一份
+// 文件。路径写死相对 server.js（__dirname/../../AI-Translator.html，即仓库根），不接受任何
+// 请求参数拼路径——这是唯一的两条静态路由（GET / 和 GET /AI-Translator.html），不是通用静态
+// 目录服务，杜绝路径穿越这一整类问题（见下面 serveAppHtml 的固定路径读取）。
+const APP_HTML_PATH = path.join(__dirname, '..', '..', 'AI-Translator.html');
+
 function loadOrCreateToken() {
     if (process.env.LATEX_BRIDGE_TOKEN) return process.env.LATEX_BRIDGE_TOKEN;
     try {
@@ -196,10 +203,14 @@ function consumeWsTicket(ticket) {
 }
 
 // /health 是唯一豁免令牌校验的端点（前端要靠它探活，探活本身不该要求先有令牌）；
-// GET / 是人读的欢迎页，同样豁免。除此之外的一切路由（/fs/*、/overleaf/*、/compile、
-// /stop、/clear、/pick-folder、/synctex/*、/output/*、/project-asset、/wordcount……）
-// 全部经过下面路由分发前的统一校验，不再逐个端点手动加。
-const TOKEN_EXEMPT_PATHS = new Set(['/health', '/']);
+// GET / 是人读的欢迎页，同样豁免。v2 Pass P110：GET / 和 GET /AI-Translator.html 现在都是
+// serve 页面本身（见 serveAppHtml），必须豁免——否则出现"要令牌才能加载到能填令牌的输入框"
+// 的死锁；页面本身没有秘密，加载后它发出的其它一切请求仍然照常过令牌闸门，鉴权模型不变。
+// GET /favicon.ico 同样豁免（浏览器自动请求，早于任何令牌可用，见 favicon 处理）。除此之外
+// 的一切路由（/fs/*、/overleaf/*、/compile、/stop、/clear、/pick-folder、/synctex/*、
+// /output/*、/project-asset、/wordcount……）全部经过下面路由分发前的统一校验，不再逐个端点
+// 手动加。
+const TOKEN_EXEMPT_PATHS = new Set(['/health', '/', '/AI-Translator.html', '/routes', '/favicon.ico']);
 
 let currentChild = null;
 let currentChildId = null;
@@ -236,6 +247,26 @@ function sendJson(res, code, obj) {
 function sendText(res, code, text, contentType) {
     const body = Buffer.from(text, 'utf8');
     res.writeHead(code, { 'Content-Type': (contentType || 'text/plain; charset=utf-8'), 'Content-Length': body.length });
+    res.end(body);
+}
+
+// v2 Pass P110：把 AI-Translator.html 自己 serve 出去。二进制安全读取——不带 'utf8' 编码参数，
+// fs.readFileSync 直接给一个 Buffer，原样按字节吐出去（该文件含约 27000 个 NUL 字节，走字符串
+// 编码会破坏它）。路径固定死（APP_HTML_PATH），不吃任何请求参数，跟"通用静态目录服务"是两回事，
+// 不存在路径穿越的问题。找不到文件（比如仓库结构被改过）就老实 500，不是这条路由的正常状态。
+function serveAppHtml(res) {
+    let body;
+    try {
+        body = fs.readFileSync(APP_HTML_PATH);
+    } catch (e) {
+        sendJson(res, 500, { ok: false, error: '读取 AI-Translator.html 失败：' + (e && e.message ? e.message : String(e)) });
+        return;
+    }
+    res.writeHead(200, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-cache',
+        'Content-Length': body.length
+    });
     res.end(body);
 }
 
@@ -2485,8 +2516,28 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
+        // v2 Pass P110：GET / 和 GET /AI-Translator.html 都直接把整个 App 页面 serve 出去——
+        // 同网内任何设备打开 http(s)://<桥地址>/ 就能用整个 App，不用再手动往目标机器拷一份
+        // AI-Translator.html。旧版这里是一句纯文本端点列表（诊断用），改造后端点列表挪到
+        // GET /routes（同样豁免令牌，纯诊断，不影响任何现有调用点——全仓库搜过，没有代码
+        // 依赖 GET / 返回那句纯文本）。
         if (req.method === 'GET' && pathname === '/') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /overleaf/check-target, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete, POST /fs/restore, POST /fs/capabilities, POST /ws-ticket. WebSocket on same host:port for disk-change push.');
+            serveAppHtml(res);
+            return;
+        }
+        if (req.method === 'GET' && pathname === '/AI-Translator.html') {
+            serveAppHtml(res);
+            return;
+        }
+        if (req.method === 'GET' && pathname === '/routes') {
+            sendText(res, 200, 'AI-Translator latex-bridge is running. GET /, GET /AI-Translator.html, POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /overleaf/check-target, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete, POST /fs/restore, POST /fs/capabilities, POST /ws-ticket. WebSocket on same host:port for disk-change push.');
+            return;
+        }
+        // v2 Pass P110：浏览器打开页面会自动请求 favicon.ico——204 是最省事的"没有，但也不算
+        // 错误"回应，不占日志噪音、不牵扯任何静态资源。
+        if (req.method === 'GET' && pathname === '/favicon.ico') {
+            res.writeHead(204);
+            res.end();
             return;
         }
 
