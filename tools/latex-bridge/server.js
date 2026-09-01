@@ -84,6 +84,9 @@ const PORT = process.env.LATEX_BRIDGE_PORT ? parseInt(process.env.LATEX_BRIDGE_P
 // 绑在 127.0.0.1/localhost/::1 之外的地址时才算"远程模式"——只有这时才强制校验访问令牌，
 // 纯本地跑（默认）保持零配置，行为跟没有这套令牌机制之前逐字节一致。
 const REMOTE_MODE = !/^(127\.0\.0\.1|localhost|::1)$/i.test(HOST);
+// v2 Pass P110c：桥自己实际监听的这个地址，供 ovlOriginAllowed() 认出"页面就是从这个桥自己
+// 加载的"（P110 起支持的用法：同网设备浏览器直接打开 http://<桥地址>/ 使用整个应用）。
+const SELF_ORIGIN = 'http://' + HOST + ':' + PORT;
 
 // TeX Live 路径（规划 §1.4 实测）。允许用 LATEX_BRIDGE_TEXBIN 环境变量覆盖，方便别的机器上跑。
 const TEXBIN = process.env.LATEX_BRIDGE_TEXBIN || 'E:\\texlive\\2025\\bin\\windows';
@@ -2474,6 +2477,13 @@ function ovlOriginAllowed(req) {
     const origin = req.headers.origin;
     if (!origin) return true;              // 非浏览器发起
     if (origin === 'null') return true;    // file:// 页面（本 App 的正常打开方式）
+    // v2 Pass P110c（核验第 3 轮 IX2-a 连带发现并修复）：页面就是从桥自己的地址加载的——
+    // REMOTE_MODE 下这条同源请求以前会被下面那条只认 localhost/127.0.0.1 的白名单当成
+    // "外部网页跨站发起"一律拒掉（实测：GET http://<桥地址>/ 打开整个应用后，哪怕访问令牌
+    // 填对了，POST /fs/* 一律 403，P110 主打的"同网设备浏览器直接打开使用"这条路径的文件
+    // 操作完全不可用）。真正的防线本来就是上面路由分发前的 tokenAuthorized() 令牌闸门，这里
+    // 放行"桥自己服务的页面发起的同源请求"不会削弱那条防线，只是不再误伤合法用法。
+    if (origin === SELF_ORIGIN) return true;
     return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
 }
 
@@ -2524,7 +2534,7 @@ const server = http.createServer(async (req, res) => {
     // v2 Pass P49：统一令牌校验闸门——REMOTE_MODE 下除 TOKEN_EXEMPT_PATHS 里的路径外，
     // 一切路由都要求正确的访问令牌，放在路由分发之前一次性挡住，不用逐个端点手动加。
     // v2 Pass P110b（IX1）：豁免集在 P110 已扩到 5 条（/health、/、/AI-Translator.html、
-    // /routes、/favicon.ico，见 213 行 TOKEN_EXEMPT_PATHS），不再只是 /health、GET /——
+    // /routes、/favicon.ico，见 233 行 TOKEN_EXEMPT_PATHS），不再只是 /health、GET /——
     // 改这个 Set 时记得同步改上面 REMOTE_MODE 启动横幅那句话，那是用户唯一会读到的鉴权说明。
     // 本地默认模式（REMOTE_MODE=false）tokenAuthorized 恒真，这段代码不改变任何现有行为。
     if (!TOKEN_EXEMPT_PATHS.has(pathname) && !tokenAuthorized(req)) {
