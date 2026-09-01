@@ -4223,7 +4223,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.03.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.03.03';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -5563,6 +5563,12 @@ function focusMakeEntry(o) {
         // 任何拦截，这是刻意的宽松默认，不是遗漏：旧条目没有这个信息可判，宁可维持它 P115c 之前
         // 就有的行为，也不要瞎猜一个项目把它锁死。只有**新建**的 tex 条目才会真正被这层守卫管到。
         project: (o.kind === 'tex' && o.project != null) ? String(o.project) : '',
+        // v2 Pass P115d（第 3 轮终核）：这条 tex 标注最近一次"确认有效"时的 __ovlProjectEpoch
+        // 快照——建条目时（focusToggleOvlSelection）和从 localStorage 读回时（focusLoad）都
+        // 传的是"此刻的"当前值，focusRevalidate 解出来（rt.ok）时会把它刷新成当时的当前值。
+        // 只有 e.project 非空的条目会被 focusEntryEpochAmbiguous() 真正管到，见该函数注释；
+        // 非 tex 条目/旧条目（project===''）留 0 也不影响任何判断。
+        epoch: Math.max(0, Math.floor(Number(o.epoch) || 0)),
         lineFrom: Math.max(0, Math.floor(Number(o.lineFrom) || 0)),      // 0-based，只用于显示
         lineTo: Math.max(0, Math.floor(Number(o.lineTo) || 0)),          // 0-based 含端点，只用于显示
         // v2 Pass P115：跨文件持久化之后，tex 条目会在"文件不是当前打开的这个"时静默挂起
@@ -5671,13 +5677,34 @@ function focusResolve(e) {
 // 串项目。key 在 ovlFileTextCacheEnsure 发起读取时**同步**取一次快照（不是读完之后再算）：
 // 读盘是异步的，如果换项目发生在读盘过程中，用读完之后的"当前项目"去算 key，会把旧项目的
 // 内容写进新项目的桶——这正是"边替换 key 边留原样竞态"会重新引入同一个洞的地方。
-const OvlFileTextCache = new Map();       // "projectKey|relPath" -> { text, at, failed }
+const OvlFileTextCache = new Map();       // "epoch|projectKey|relPath" -> { text, at, failed }
 const __ovlFileTextLoading = new Set();   // 防止同一个文件被并发发起多次读取（同样按 key）
 let __ovlFileTextCacheGen = 0;
 
+// v2 Pass P115d（第 3 轮终核·唯一阻塞项的根修）：__ovlProjectEpoch 是"这个会话里发生过几次
+// 真正的换项目事件"的代际计数——跟上面的 __ovlFileTextCacheGen（"缓存变过几次"）不是一回事，
+// 别混用。存在的理由：核验对抗报告第 3 轮实测（scratchpad\r3_realflow.js）——三条"换项目"
+// 入口只有本地「打开项目文件夹…」（ovlPickFolder 的 FSA 分支）走 ovlAutoFillProjectPath，
+// 它是刻意保守的（P55）：猜不出真实绝对路径、或桥离线时一律不覆盖 #ovlProjectPathInput。
+// 于是 OvlFileTextCache/FocusState.entries 一直在用的"项目身份"（fileWatchProjectKey()，
+// 也就是这个输入框的当下值）可能压根没跟着变，尽管 OvlState.dirHandle 已经真的换成了另一个
+// 文件夹——严重A/严重B 的守卫全靠这串字符串，字符串没跟上等于隔离形同虚设。
+// 递增时机：见 ovlPickFolder（FSA 分支，用 isSameEntry() 判"是不是真的换了文件夹"再决定要不要
+// 推进）、ovlRemotePickFolder 的"选择此文件夹"、ovlProjectHistoryOpenEntry 的 openViaBridge、
+// 以及"继续上次的项目"横幅——四处都是真实会切换 OvlState.dirHandle 的地方，逐个调用点旁边
+// 有各自的理由注释，不重复。
+// 用法：ovlFileTextCacheKey() 把它并进缓存键——换项目之后即使身份字符串没变，key 也会变，
+// 必然是这次事件之后的新读数，绝不会拿旧项目留下的缓存顶替（这一条本身就已经堵死严重A，
+// 不依赖下面 focusEntryEpochAmbiguous 判对判错）。focusResolveTex 另外拿它跟条目建立时记的
+// e.epoch 比：字符串相同但 epoch 落后 ⇒ 不能再无条件信任"看起来还是原来那个项目"（哪怕
+// e.file 就是当前打开的文件——"当前打开的文件"本身也可能是刚从新文件夹里读出来的同名文件），
+// 强制走一次磁盘内容重验才能判定继续有效还是该保守灰显——这一条堵严重B。字符串不同就不需要
+// 看 epoch，focusEntryCrossProject() 原有逻辑已经能确定。
+let __ovlProjectEpoch = 0;
+
 function ovlFileTextCacheKey(relPath) {
-    try { return fileWatchProjectKey() + '|' + String(relPath == null ? '' : relPath); }
-    catch (e) { return '|' + String(relPath == null ? '' : relPath); }
+    try { return __ovlProjectEpoch + '|' + fileWatchProjectKey() + '|' + String(relPath == null ? '' : relPath); }
+    catch (e) { return __ovlProjectEpoch + '|' + '|' + String(relPath == null ? '' : relPath); }
 }
 function ovlFileTextCacheGet(relPath) {
     try { return OvlFileTextCache.get(ovlFileTextCacheKey(relPath)) || null; } catch (e) { return null; }
@@ -5772,6 +5799,15 @@ function focusEntryCrossProject(e) {
     catch (err) { return false; }
 }
 
+// v2 Pass P115d（第 3 轮终核·唯一阻塞项）：字符串相同 ≠ 确定是同一个项目——见
+// __ovlProjectEpoch 头注释。这个函数判的是"不能排除换过项目"，跟上面 focusEntryCrossProject()
+// 判的"能确定换过项目"是两件事，不要合并：字符串不同就已经能确定，压根不需要看 epoch
+// （focusResolveTex 里两条判断顺序也是这样安排的，先问能不能确定，问不出来才问能不能排除）。
+function focusEntryEpochAmbiguous(e) {
+    try { return !!(e && e.kind === 'tex' && e.project && !focusEntryCrossProject(e) && e.epoch !== __ovlProjectEpoch); }
+    catch (err) { return false; }
+}
+
 function focusResolveTex(e) {
     const out = { ok: false, start: 0, end: 0, text: '', why: '', pending: false, crossProject: false };
     try {
@@ -5790,8 +5826,23 @@ function focusResolveTex(e) {
         // 项目根找不到），要么两个目录下的同名文件互相冒充（basename 相同就判"是当前文件"）。
         // 用 relPath||name 是这个文件里其它地方（focusRenderChip/chatBuildFileWatchBlock/
         // ovlAiMergeApplyFile 等）早就在用的同一个既有惯例，这里补齐，不是新发明一套。
+        //
+        // v2 Pass P115d（第 3 轮终核·唯一阻塞项的根修）：上面 focusEntryCrossProject() 只能
+        // 在身份字符串确实不同的时候拦下——本地「打开项目文件夹…」这条真实入口在拿不到可信
+        // 绝对路径/桥离线时不会更新那个字符串，字符串相同在这里只代表"没法靠字符串排除"，不
+        // 代表"确定还是原来那个项目"。所以：epoch 落后时，哪怕 e.file 就是当前打开的文件，也
+        // 不能再无条件信任 ta.value——"当前打开的文件"本身可能是刚从一个新文件夹里读出来的
+        // 同名文件（核验对抗报告第 3 轮 RF2/RF3 实测正是这样复现的）。这时强制并入下面"不是
+        // 当前文件"那条磁盘缓存路径：缓存 key 已经掺了 epoch（见 ovlFileTextCacheKey），换项目
+        // 之后这里必然是缓存未命中，一定会对着**此刻真正打开的这个 OvlState.dirHandle** 重新
+        // 读一次盘，不会拿旧项目残留的缓存或旧项目遗留的编辑器缓冲区顶替。读盘验出来的内容跟
+        // quote 对得上，才叫验过；对不上就落进下面"真正解不出来"那一支，跟普通失效同一套
+        // "灰显、不删除、可以手动 × 掉重新标注"处理——见 focusRevalidate 对 rt.ok 的分支：验过
+        // 会顺带把 e.epoch 刷新到当前值，之后除非再发生一次真正的换项目事件，不会重复走这条
+        // 重验路径。
+        const epochAmbiguous = focusEntryEpochAmbiguous(e);
         const cur = (OvlState && OvlState.currentFile) ? (OvlState.currentFile.relPath || OvlState.currentFile.name || '') : '';
-        if (!e.file || e.file === cur) {
+        if (!epochAmbiguous && (!e.file || e.file === cur)) {
             const ta = document.getElementById('ovlCodeArea');
             if (!ta || ta.disabled || !ta.value) { out.why = '编辑器里现在没有打开文件'; return out; }
             return focusResolveTexAgainst(e, ta.value, out);
@@ -5800,9 +5851,13 @@ function focusResolveTex(e) {
         // 顺手在项目树里按 basename 搜一次，唯一命中就回写成完整 relPath（见
         // ovlFocusMigrateLegacyFile 头注释）。命中之后 e.file 会变，本次调用仍按旧值走，
         // 下一次 focusRevalidate（迁移完成后会自动触发一次）用新值就能正常解析。
-        if (e.file.indexOf('/') === -1) {
+        if (e.file && e.file.indexOf('/') === -1) {
             try { ovlFocusMigrateLegacyFile(e.file).catch(function () {}); } catch (err) {}
         }
+        // v2 Pass P115d：epochAmbiguous 分支下 e.file 理论上不该是空字符串（tex 条目建条目时
+        // 一定记了当时打开的文件），这里只是防御性兜底，不让空字符串喂给 ovlFileTextCacheGet
+        // 拼出一个"缺 relPath"的缓存 key。
+        if (!e.file) { out.why = '编辑器里现在没有打开文件'; return out; }
         const cached = ovlFileTextCacheGet(e.file);
         if (!cached) {
             ovlFileTextCacheEnsure(e.file);
@@ -5814,8 +5869,47 @@ function focusResolveTex(e) {
             out.why = '文件「' + e.file + '」读取失败（可能已被删除或移动）';
             return out;
         }
-        return focusResolveTexAgainst(e, cached.text, out);
+        // v2 Pass P115d：只有 epochAmbiguous 这一支才需要收紧判定——普通"不是当前打开的文件"
+        // 的跨文件解析（身份已经通过字符串确认、只是没有 epoch 存疑）继续走原有的宽松
+        // focusResolveTexAgainst（全文件搜一遍，允许内容挪了位置/被追加，这是既有测试组
+        // F/L 依赖的既定行为，不能收紧）。身份存疑时不能直接复用这套宽松判定——那套逻辑是
+        // 设计给"已确认同一个项目、只是内容挪了位置/被追加"这种场景用的，换到"不确定是不是
+        // 同一个项目"的场景下反而是漏洞：两个项目共享一句模板文字、只在后面各自续了不同的
+        // 尾巴，是完全可能撞上的真实情形（核验对抗报告第 3 轮 RF2/RF3 实测：乙项目那一行是
+        // "甲项目原句 + 乙独有的尾巴"，indexOf() 一样能在乙的内容里找到甲那句话的前缀，宽松
+        // 判定会把 quote 刷成乙那一整行、原样把乙的内容发出去——跟严重B 想堵的洞是同一个洞，
+        // 只是换了个触发路径）。这里改用 focusEntryReverifyExact：要求存下来的 offset 位置
+        // 此刻依然是**逐字节相同的整行**（不多不少），这是能拿到的最强证据——两个不同项目的
+        // 文件在同一个偏移量上逐字节重现同一整行内容，概率低到可以忽略，即使真撞上了，两边
+        // 内容本来就完全一致，发错了也没有实际差别。验不过一律落进下面"真正解不出来"那一支，
+        // 跟普通失效同一套"灰显、不删除、可以手动 × 掉重新标注"处理——绝不把这条边界失败
+        // 悄悄升级成"看起来解出来了"。
+        if (!epochAmbiguous) {
+            return focusResolveTexAgainst(e, cached.text, out);
+        }
+        if (focusEntryReverifyExact(e, cached.text)) {
+            return focusResolveTexAgainst(e, cached.text, out);
+        }
+        out.why = '这条标注的身份暂时无法确认（原来的位置内容对不上了）——为避免用错项目的内容，已保守灰显，请重新标注';
+        return out;
     } catch (err) { out.why = '复核时出错'; return out; }
+}
+
+// v2 Pass P115d：专供 focusResolveTex 的 epochAmbiguous 分支用的"逐字核对"——只有原来存的
+// 整行内容，此刻依然逐字节原样出现在原来存的那个偏移量、且前后都是行边界（不是"这一行前面
+// 多了几个字/后面多了几个字"这种宽松包含），才算通过。tex 条目一律 whole:true（见
+// focusMakeEntry 注释），"quote 就是整行"这个前提在这里恒成立，不需要另外判断 e.whole。
+function focusEntryReverifyExact(e, base) {
+    try {
+        const q = String((e && e.quote) || '');
+        if (!q || typeof base !== 'string') return false;
+        const off = Math.max(0, Math.floor(Number(e.offset) || 0));
+        if (base.slice(off, off + q.length) !== q) return false;
+        const beforeOk = (off === 0) || (base.charAt(off - 1) === '\n');
+        const afterIdx = off + q.length;
+        const afterOk = (afterIdx === base.length) || (base.charAt(afterIdx) === '\n');
+        return beforeOk && afterOk;
+    } catch (err) { return false; }
 }
 
 // v2 Pass P115 返修（严重 1 附带项）：把「裸文件名」当路径解析键的旧数据做一次性搬迁。
@@ -6450,6 +6544,11 @@ function focusRevalidate(reason) {
                     e.lineFrom = rt.lineFrom;
                     e.lineTo = rt.lineTo;
                     if (e.invalid) { e.invalid = false; changedInvalid = true; }
+                    // v2 Pass P115d：真正解出来了（不管是走 ta.value 快路径，还是身份存疑之后
+                    // 走磁盘缓存重验通过）——把 epoch 戳刷新到当前值，"已经用这次事件之后的
+                    // 真实内容核对过一遍"，focusEntryEpochAmbiguous() 下次就不会再判它存疑，
+                    // 不用每次复核都重新走一遍磁盘缓存路径。
+                    if (e.project) e.epoch = __ovlProjectEpoch;
                     keep.push(e);
                 } else if (rt.pending || rt.crossProject) {
                     // 「还没读到」≠「你的标记失效了」—— 和下面 pair 那条"一份文档都没有就
@@ -6549,7 +6648,12 @@ function focusLoad() {
                     // v2 Pass P115c（严重 B）：P115c 之前存的旧条目没有这一键，
                     // focusMakeEntry 里 o.project==null 会落成 ''（不限定项目），
                     // 不是这里的新校验把它们吃掉。
-                    project: typeof e.project === 'string' ? e.project : ''
+                    project: typeof e.project === 'string' ? e.project : '',
+                    // v2 Pass P115d：epoch 不落盘、不从 localStorage 读回（它是"这个会话里换过
+                    // 几次项目"的纯运行时计数，跨会话没有意义）——一律盖成读盘这一刻的当前值，
+                    // 语义是"刚恢复、还没经历过这个会话里的任何一次换项目事件"，接下来第一次真
+                    // 的换项目才会让它变得"落后"。
+                    epoch: __ovlProjectEpoch
                 }));
                 continue;
             }
@@ -7046,7 +7150,10 @@ function focusToggleOvlSelection(el) {
                 lineFrom: r.lineFrom, lineTo: r.lineTo,
                 // v2 Pass P115c（严重 B）：记下此刻所属的项目——只有从这里新建的条目才会被
                 // focusEntryCrossProject() 真正管到，见 focusMakeEntry 头注释。
-                project: fileWatchProjectKey()
+                project: fileWatchProjectKey(),
+                // v2 Pass P115d：记下此刻的 __ovlProjectEpoch——后续任何一次真正的换项目事件
+                // 都会让它变得"落后"，见 focusEntryEpochAmbiguous() 头注释。
+                epoch: __ovlProjectEpoch
             }))) { if (el) el.checked = false; return; }
             try { __focusTexSig = focusTexDocSig(); } catch (e) {}
         } else if (!want && at !== -1) {
@@ -32396,6 +32503,26 @@ function ovlResetProjectScopedState() {
     } catch (e) { console.error('[ovl] resetProjectScopedState failed', e); }
 }
 
+// v2 Pass P115d（第 3 轮终核·唯一阻塞项）：本地「打开项目文件夹…」这条真实入口的身份字符串
+// （#ovlProjectPathInput）不可靠——下面 ovlAutoFillProjectPath 是刻意保守的（P55），猜不出
+// 真实绝对路径、或桥离线时一律不覆盖它。不能拿这串字符串判断"是不是真的换了文件夹"，改用
+// FSA 句柄自己的 isSameEntry()：新旧 dirHandle 都存在、都支持 isSameEntry、且比对结果是
+// true，才认为"就是同一个文件夹"，不推进 __ovlProjectEpoch（省一轮没必要的磁盘重验——
+// 见 focusEntryEpochAmbiguous 头注释，判"存疑"本身不便宜，能确认就不必让所有条目都走一遍）。
+// 除此之外一律按"换了项目"处理——没有上一个 handle 可比（首次打开）、isSameEntry 不存在
+// （某些实现的 FSA 句柄可能没有这个方法）、比对抛错、或者明确判定不同，四种情况都保守地推进
+// epoch。"拿不准就当换了"是这个文件里到处都在用的规矩，这里反过来放宽会重新引入严重A/严重B。
+async function ovlBumpProjectEpochIfChanged(prevHandle, newHandle) {
+    let same = false;
+    try {
+        if (prevHandle && newHandle && typeof newHandle.isSameEntry === 'function') {
+            same = await newHandle.isSameEntry(prevHandle);
+        }
+    } catch (e) { same = false; }
+    if (!same) __ovlProjectEpoch++;
+    return same;
+}
+
 async function ovlPickFolder() {
     if (ovlIsRemoteBridge()) { await ovlRemotePickFolder(); return; }
     try {
@@ -32413,7 +32540,12 @@ async function ovlPickFolder() {
                 throw e;
             }
             OvlState.usingWebkitFallback = false;
+            const __ovlPrevDirHandle = OvlState.dirHandle;
             OvlState.dirHandle = handle;
+            // v2 Pass P115d：必须在 ovlResetProjectScopedState()/ovlAutoFillProjectPath() 之前
+            // await 完——后面 OvlFileTextCache 的读取、FocusState 条目的身份判定用的都是这次
+            // 事件之后的 __ovlProjectEpoch，不能让它们抢在判定完成之前用旧值跑。
+            await ovlBumpProjectEpochIfChanged(__ovlPrevDirHandle, handle);
             ovlResetProjectScopedState();
             ovlAutoFillProjectPath(handle);
             await ovlRenderTree(handle);
@@ -32606,6 +32738,11 @@ function ovlRemotePickFolder() {
                 ovlSetProjectPath(p, { skipWatch: true });
                 OvlState.usingWebkitFallback = false;
                 OvlState.dirHandle = new OvlRemoteDirHandle('.', ovlProjectHistoryBasename(p) || p);
+                // v2 Pass P115d：这条入口的身份字符串（上面 ovlSetProjectPath）本来就会正确
+                // 更新，不需要像 ovlPickFolder 那样判断"是不是同一个文件夹"——但仍然无条件递增
+                // __ovlProjectEpoch，双保险：哪怕字符串判定这一侧将来出现遗漏，epoch 这道闸依然
+                // 兜得住（见 __ovlProjectEpoch 头注释）。
+                __ovlProjectEpoch++;
                 ovlResetProjectScopedState();
                 ovlUpdateTreeToolbtnsVisibility();
                 Promise.resolve(ovlRenderTree(OvlState.dirHandle)).then(function () {
@@ -32776,6 +32913,12 @@ function ovlShowReopenBanner(handle, perm) {
                 if (p !== 'granted') { ovlShowTreeError('权限被拒绝，请改用上面的「打开项目文件夹」重新选择。'); return; }
                 OvlState.usingWebkitFallback = false;
                 OvlState.dirHandle = handle;
+                // v2 Pass P115d：这条"继续上次的项目"只在 OvlState.dirHandle 之前为空时才会
+                // 出现（见 ovlShowReopenBanner 头部的 if (OvlState.dirHandle) return 门槛），
+                // 没有上一个 handle 可比对，直接按"换了项目"处理——跟 ovlPickFolder 里
+                // "没有上一个 handle 时 ovlBumpProjectEpochIfChanged 也会推进"是同一个结论，
+                // 这里没有真正的 isSameEntry 判断可省，直接递增。
+                __ovlProjectEpoch++;
                 ovlAutoFillProjectPath(handle);
                 ovlUpdateTreeToolbtnsVisibility();
                 return ovlRenderTree(handle);
@@ -33368,6 +33511,10 @@ function ovlProjectHistoryOpenEntry(entry, onClosed) {
             // 未保存正文可能被下一次自动保存写进新项目同名相对路径。两处调用 openViaBridge()
             // 的分支（isRemoteEntry===true 的远程分支、isRemoteEntry===false 的本地桥分支）共用
             // 这一个闭包，一并修复。
+            // v2 Pass P115d：这条入口的身份字符串在函数最开头就已经 ovlSetProjectPath(entry.path,
+            // …) 过（本地桥分支/远程分支都会先跑到那一行），本来就可信——跟 ovlRemotePickFolder
+            // 的"选择此文件夹"同一条理由，无条件递增即可，双保险见 __ovlProjectEpoch 头注释。
+            __ovlProjectEpoch++;
             ovlResetProjectScopedState();
             ovlUpdateTreeToolbtnsVisibility();
             return Promise.resolve(ovlRenderTree(handle)).then(function () {
