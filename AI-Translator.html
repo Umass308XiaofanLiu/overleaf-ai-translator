@@ -28078,13 +28078,29 @@ function ovlExtractIncludegraphicsBasename(str) {
     const parts = p.split(/[\\/]/);
     return parts[parts.length - 1] || p;
 }
+// v2 Pass P109 §B：解析 \includegraphics[...] 里的 width= 选项，只认 "系数\linewidth" /
+// "系数\textwidth"（系数可省略，省略即 1，比如裸 \linewidth）——跟生成端 §A emit 的形状一一
+// 对应，其它单位（cm/in/\columnwidth 等）不在本 Pass 范围内，原样忽略、退回 null（调用方按
+// "没有 width=" 处理，维持改动前行为）。没有 [...] 选项本身（正则第一步就没匹配到）同样返回
+// null。
+function ovlExtractIncludegraphicsWidthFrac(str) {
+    const m = /\\includegraphics\s*\[([^\]]*)\]\s*\{[^{}]*\}/.exec(str);
+    if (!m) return null;
+    const wm = /(?:^|,)\s*width\s*=\s*([0-9]*\.?[0-9]+)?\s*\\(?:linewidth|textwidth)\b/i.exec(m[1]);
+    if (!wm) return null;
+    const coef = wm[1] ? parseFloat(wm[1]) : 1;
+    return (isFinite(coef) && coef > 0) ? coef : null;
+}
 // relPath：\includegraphics{...} 里原样的相对路径（用来向桥要真缩略图）；basename 只用来
 // 显示。relPath 为 null（正则没匹配到）时退化成纯 "(no image)" 占位，不带 data-fig-src，
-// ovlVisualLoadFigureThumbnails 天然跳过它。
-function ovlRenderFigurePlaceholder(relPath) {
+// ovlVisualLoadFigureThumbnails 天然跳过它。widthFrac：上面解析出的 width= 系数，undefined/
+// null/非正数一律不带 data-fig-width 属性——ovlApplyFigureThumb 读不到这个属性时维持 P18
+// 原有的 CSS 固定尺寸展示，是本 Pass 显式要求的"无 width= 时维持现状"。
+function ovlRenderFigurePlaceholder(relPath, widthFrac) {
     const basename = relPath ? (relPath.split(/[\\/]/).pop() || relPath) : null;
     const srcAttr = relPath ? (' data-fig-src="' + escapeHtml(relPath) + '"') : '';
-    return '<div class="ovl-visual-fig-box"' + srcAttr + '>'
+    const widthAttr = (typeof widthFrac === 'number' && isFinite(widthFrac) && widthFrac > 0) ? (' data-fig-width="' + widthFrac + '"') : '';
+    return '<div class="ovl-visual-fig-box"' + srcAttr + widthAttr + '>'
         + '<div class="ovl-visual-fig-icon">' + Icons.ImageIcon + '</div>'
         + '<div class="ovl-visual-fig-name">' + (basename ? escapeHtml(basename) : '(no image)') + '</div>'
         + '</div>';
@@ -28106,12 +28122,12 @@ function ovlRenderVisualFigure(tex) {
     const boxes = [];
     let mm;
     while ((mm = minipageRe.exec(inner))) {
-        boxes.push(ovlRenderFigurePlaceholder(ovlExtractIncludegraphicsPath(mm[1])));
+        boxes.push(ovlRenderFigurePlaceholder(ovlExtractIncludegraphicsPath(mm[1]), ovlExtractIncludegraphicsWidthFrac(mm[1])));
     }
     if (!boxes.length) {
         // 没有 minipage 子图——直接在整个 figure 体里找一张 \includegraphics。
         const relPath = ovlExtractIncludegraphicsPath(inner);
-        if (relPath) boxes.push(ovlRenderFigurePlaceholder(relPath));
+        if (relPath) boxes.push(ovlRenderFigurePlaceholder(relPath, ovlExtractIncludegraphicsWidthFrac(inner)));
     }
     let html = '<div class="ovl-visual-figure-wrap">';
     html += '<div class="ovl-visual-fig-row">' + boxes.join('') + '</div>';
@@ -28330,6 +28346,34 @@ function ovlApplyFigureThumb(box, result) {
     const img = document.createElement('img');
     img.className = 'ovl-visual-fig-thumb';
     img.alt = '';
+    // v2 Pass P109 §B：占位框渲染时（ovlRenderFigurePlaceholder）如果从 \includegraphics 的
+    // width= 选项解析出了系数（data-fig-width），按"系数 × 当前 Visual 面板内容宽度（
+    // .ovl-visual-body，跟正文栏宽同一个参照物，含 max-width:860px 那道封顶）、上限 100%"
+    // 直接把图片撑到对应像素宽——不依赖下面那条 max-height:260px 的 CSS 兜底（连带清掉
+    // fig-box 自己的 dashed 边框/内边距/最小高度，让 img 独占整行，不然 14px 内边距会把算出
+    // 来的像素宽度再挤掉一圈，跟"占面板宽度 XX%"的断言对不上）。没有 data-fig-width（旧文档
+    // 没有 width= 选项，或者面板还没量出宽度）时这段整体跳过，图片维持 P18 原有的
+    // max-height:260px 固定尺寸展示——即"无 width= 时维持现状"，不是额外新增的判断分支。
+    const p109WidthFracRaw = box.getAttribute('data-fig-width');
+    const p109WidthFrac = p109WidthFracRaw ? parseFloat(p109WidthFracRaw) : NaN;
+    if (isFinite(p109WidthFrac) && p109WidthFrac > 0) {
+        const p109BodyEl = box.closest('.ovl-visual-body');
+        const p109ContentW = p109BodyEl ? p109BodyEl.clientWidth : 0;
+        if (p109ContentW > 0) {
+            const p109Px = Math.max(1, Math.round(Math.min(p109WidthFrac, 1) * p109ContentW));
+            box.style.padding = '0';
+            box.style.border = 'none';
+            box.style.background = 'transparent';
+            box.style.minHeight = '0';
+            box.style.flex = '0 0 auto';
+            box.style.display = 'block';
+            img.style.display = 'block';
+            img.style.width = p109Px + 'px';
+            img.style.maxWidth = '100%';
+            img.style.height = 'auto';
+            img.style.maxHeight = 'none';
+        }
+    }
     // v2 Pass P105：图标框（固定尺寸）换成真图片（真实尺寸，可能更高/更矮）会改变这个
     // .ovl-visual-block 的渲染高度——而 ovlRenderVisualGutter() 首次量 gutter 格子 top/height
     // 时这张图还没到，量到的是旧的占位框高度，图一多、到达有先有后，后面所有块的行号会
@@ -36215,11 +36259,80 @@ function ovlP2TCropCanvasRegion(canvas, x0, y0, x1, y1) {
 // 那张图（继续用 OvlSettings.pdf2texMaxPx 原值，两处渲染互不干扰）。
 const OVL_P2T_CROP_RENDER_MULT = 2;
 const OVL_P2T_BBOX_RE = /% BBOX:\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\r?\n\s*\\begin\{figure\}[\s\S]*?\\includegraphics\[[^\]]*\]\{([^}]+)\}/g;
+
+// ==================== v2 Pass P109 §A：按 bbox 真实占比 emit \includegraphics 宽度 ====================
+// 纯函数，不碰 page/canvas——只吃已经换算成 pt 的 bbox 左右边界 + 本页文字列聚类结果
+// （ovlP106ClusterColumnsX 的输出，同一份聚类逻辑跟 P106 双击取词/反查高亮共用，不另起一套
+// 双栏判定），方便单测直接喂合成数据。返回 null = 几何数据不足以计算（没有可提取文字/bbox
+// 退化），调用方原样保留旧行为 width=\linewidth、不加星号——"旧行为"只在这条兜底路径上出现，
+// 不是默认路径。
+// 判据：单栏文档（columns.length===1）用该栏栏宽当 \linewidth 基准；双栏及以上，先看 bbox 是不是
+// "跨栏"——①占整版正文宽度（最左栏左沿到最右栏右沿）比例 > 0.55，或②横向压过第一栏右沿到
+// 第二栏左沿之间的装订缝隙本身，两条满足其一就判跨栏，用 figure* + width=frac\textwidth；不
+// 跨栏则找 bbox 中心最近的那一栏，按栏宽算 frac，用 figure + width=frac\linewidth（twocolumn
+// 文档非星号 figure 里 \linewidth 本来就等于 \columnwidth）。frac 统一夹到 [0.10, 1.00]，两位小数。
+const OVL_P2T_FIGWIDTH_CROSSCOL_RATIO = 0.55;
+const OVL_P2T_FIGWIDTH_MIN_FRAC = 0.10;
+const OVL_P2T_FIGWIDTH_MAX_FRAC = 1.00;
+function ovlP2TClampFigFrac(x) {
+    if (!isFinite(x)) return OVL_P2T_FIGWIDTH_MAX_FRAC;
+    const c = Math.max(OVL_P2T_FIGWIDTH_MIN_FRAC, Math.min(OVL_P2T_FIGWIDTH_MAX_FRAC, x));
+    return Math.round(c * 100) / 100;
+}
+function ovlP2TComputeFigureWidth(bboxLeftPt, bboxRightPt, columns) {
+    if (!(bboxRightPt > bboxLeftPt) || !columns || !columns.length) return null; // 几何缺失/退化 -> 兜底
+    const bboxWidthPt = bboxRightPt - bboxLeftPt;
+    if (!(bboxWidthPt > 0)) return null;
+    if (columns.length === 1) {
+        const colWidthPt = columns[0].max - columns[0].min;
+        if (!(colWidthPt > 0)) return null;
+        return { frac: ovlP2TClampFigFrac(bboxWidthPt / colWidthPt), starred: false, unit: 'linewidth' };
+    }
+    const sorted = columns.slice().sort(function (a, b) { return a.min - b.min; });
+    const first = sorted[0], last = sorted[sorted.length - 1];
+    const textWidthPt = last.max - first.min;
+    if (!(textWidthPt > 0)) return null;
+    const ratioToText = bboxWidthPt / textWidthPt;
+    const gutterMin = first.max, gutterMax = sorted[1].min;
+    const spansGutter = gutterMax > gutterMin && bboxLeftPt < gutterMin - 0.5 && bboxRightPt > gutterMax + 0.5;
+    if (ratioToText > OVL_P2T_FIGWIDTH_CROSSCOL_RATIO || spansGutter) {
+        return { frac: ovlP2TClampFigFrac(ratioToText), starred: true, unit: 'textwidth' };
+    }
+    const centerPt = (bboxLeftPt + bboxRightPt) / 2;
+    let best = sorted[0], bestDist = Infinity;
+    for (let i = 0; i < sorted.length; i++) {
+        const c = sorted[i];
+        const d = centerPt < c.min ? (c.min - centerPt) : (centerPt > c.max ? (centerPt - c.max) : 0);
+        if (d < bestDist) { bestDist = d; best = c; }
+    }
+    const colWidthPt = best.max - best.min;
+    if (!(colWidthPt > 0)) return null;
+    return { frac: ovlP2TClampFigFrac(bboxWidthPt / colWidthPt), starred: false, unit: 'linewidth' };
+}
+
 async function ovlP2TApplyFigureCrops(page, text, job, num, maxPx) {
     OVL_P2T_BBOX_RE.lastIndex = 0;
     const matches = [...text.matchAll(OVL_P2T_BBOX_RE)]; // 先收集，避免裁剪写盘是 async 而 replace 是同步
     if (!matches.length) return { text: text, cropsMade: 0 };
     let cropsMade = 0, out = text, k = 0, renderedCanvas = null; // 惰性渲染，命中第一条真裁剪才真的渲一次整页
+    // v2 Pass P109 §A：本页文字列聚类 + 页宽（pt）惰性算一次、缓存复用——取不到（异常/没有可
+    // 提取文字，比如纯图页）就是几何数据缺失，本页所有 figure 一律走 ovlP2TComputeFigureWidth
+    // 的兜底分支（返回 null，宽度不动）。跟"渲染整页 canvas 惰到第一条真裁剪"同一节奏，不在
+    // 没有 BBOX 命中时白跑一次 getTextContent。
+    let pageGeomCache = null;
+    async function ovlP2TFigurePageGeom() {
+        if (pageGeomCache) return pageGeomCache;
+        try {
+            const viewport = page.getViewport({ scale: 1 });
+            const pageWidthPt = viewport && viewport.width;
+            const content = await page.getTextContent();
+            const columns = ovlP106ClusterColumnsX((content && content.items) || []);
+            pageGeomCache = (pageWidthPt > 0 && columns.length) ? { ok: true, pageWidthPt: pageWidthPt, columns: columns } : { ok: false };
+        } catch (e) {
+            pageGeomCache = { ok: false };
+        }
+        return pageGeomCache;
+    }
     for (let mi = 0; mi < matches.length; mi++) {
         const mm = matches[mi];
         const full = mm[0], x0s = mm[1], y0s = mm[2], x1s = mm[3], y1s = mm[4], imgName = mm[5];
@@ -36243,8 +36356,41 @@ async function ovlP2TApplyFigureCrops(page, text, job, num, maxPx) {
         await ovlP2TWriteBinary(job.outRel + '/' + rel, new Uint8Array(await blob.arrayBuffer()));
         // 只替换 \includegraphics 里的文件名，BBOX 注释行整行删除（裁剪已完成，留着无意义、
         // 且会被 §2 的参考文献正则误当成别的标记——保持输出里注释行"只有一种用途"）
-        const fixed = full.replace(/^% BBOX:.*\r?\n/, '').replace(imgName, rel);
+        let fixed = full.replace(/^% BBOX:.*\r?\n/, '').replace(imgName, rel);
+        // v2 Pass P109 §A：按 bbox 相对本页文字列宽度算出真实占比，改写 width= 系数（跨栏时
+        // 连 figure 环境本身也换成 figure*）。几何数据缺失/算不出来（ovlP2TComputeFigureWidth
+        // 返回 null）就是唯一的兜底路径——width=\linewidth、figure 环境都原样不动，等价于本
+        // Pass 之前的旧行为，不是额外加的一层判断。
+        let widthResult = null;
+        try {
+            const geom = await ovlP2TFigurePageGeom();
+            if (geom && geom.ok) {
+                widthResult = ovlP2TComputeFigureWidth(x0 * geom.pageWidthPt, x1 * geom.pageWidthPt, geom.columns);
+            }
+        } catch (e) { widthResult = null; }
+        if (widthResult) {
+            fixed = fixed.replace(/\\includegraphics\s*\[[^\]]*\]\s*\{([^}]+)\}/, function (_m2, fname) {
+                return '\\includegraphics[width=' + widthResult.frac.toFixed(2) + '\\' + widthResult.unit + ']{' + fname + '}';
+            });
+            if (widthResult.starred) {
+                fixed = fixed.replace(/\\begin\{figure\}(\s*\[[^\]]*\])?/, '\\begin{figure*}[tbp]');
+            }
+        }
         out = out.split(full).join(fixed);
+        if (widthResult && widthResult.starred) {
+            // \end{figure} 不在 full/fixed 覆盖范围内（正则只匹配到 \includegraphics 为止），
+            // 星号化了 \begin 就必须找到紧随其后的第一个 \end{figure}（图块间不嵌套，紧跟着
+            // 的那一个必然是自己的收尾）一并改成 \end{figure*}，环境名两端才配对。
+            const idx = out.indexOf(fixed);
+            if (idx !== -1) {
+                const tail = out.slice(idx + fixed.length);
+                const endM = /\\end\{figure\}/.exec(tail);
+                if (endM) {
+                    const absStart = idx + fixed.length + endM.index;
+                    out = out.slice(0, absStart) + '\\end{figure*}' + out.slice(absStart + endM[0].length);
+                }
+            }
+        }
         cropsMade++;
     }
     if (renderedCanvas) { renderedCanvas.width = 0; renderedCanvas.height = 0; } // 用完立刻释放，同 §4.5.7i 纪律
