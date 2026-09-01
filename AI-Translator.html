@@ -1598,7 +1598,7 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    会把左边纯文字的主按钮一起拉高，见下面新增的 align-items:center 那条规则一并修正。 */
 #ovlStopCompileBtn, #ovlInvertBtn, #ovlPdfPrevPageBtn, #ovlPdfNextPageBtn,
 #ovlPdfZoomOutBtn, #ovlPdfZoomInBtn, #ovlDownloadPdfBtn, #ovlCompileOptionsBtn,
-#ovlSyncTexBtn, #ovlToolbarOverflowBtn, #ovlOpenTranslatorBtn,
+#ovlToolbarOverflowBtn, #ovlOpenTranslatorBtn,
 .ovl-cmdbtn[data-cmd="edit.undo"], .ovl-cmdbtn[data-cmd="edit.redo"],
 .ovl-cmdbtn[data-cmd="ins.mathInline"], .ovl-cmdbtn[data-cmd="ins.symbol"] {
     font-size: 18px;
@@ -2955,6 +2955,10 @@ body.ovl-translator-open #ovlTransWin { display: block; }
    区别只是它不需要再起一条分组分隔线（复制已经画了那条 border-left），也不再是工具条
    最后一颗（不用强行给右侧圆角），跟其余按钮一样用默认的四角 4px 圆角即可。 */
 .ovl-quickactions button[data-qa="word.edit"] {
+    width: auto; padding: 0 8px; font-size: 11px; margin-left: 2px;
+}
+/* v2 Pass P106：「定位」紧跟在「编辑」右边，同样是两个汉字，沿用同一条宽度/字号规则。 */
+.ovl-quickactions button[data-qa="word.locate"] {
     width: auto; padding: 0 8px; font-size: 11px; margin-left: 2px;
 }
 .ovl-breadcrumb {
@@ -25952,10 +25956,13 @@ function ovlShellHtml() {
         // 进度提示紧跟在整个 Code/Visual 胶囊右侧，没有翻译在跑时用 hidden 隐藏，不占位置。
         +         '<span class="ovl-visual-lang-progress" id="ovlVisualLangProgress" hidden></span>'
         // M10 SyncTeX 正向（源码 -> PDF）：真跑 tools/latex-bridge 的 synctex.exe view 子命令
-        // （§2.6.10）。没有编译产物时禁用。v2 Pass P16 起反向（PDF -> 源码）也做出来了——
-        // 换了 pdf.js 渲染器之后双击 PDF 画布上的文字就能跳回源码那一行，见 ovlPdfHandleDblClick，
-        // 不需要在这里再放一个按钮（Overleaf 本身也是靠双击，不是按钮触发反向）。
-        +         '<button type="button" class="ovl-cmdbtn" id="ovlSyncTexBtn" disabled data-tip="在 PDF 中定位（SyncTeX 正向，只做到页级定位；反向双击 PDF 里的文字即可）" data-tip-pos="bottom-end">&#8677;</button>'
+        // （§2.6.10）。反向（PDF -> 源码）双击 PDF 画布上的文字就能跳回源码那一行，见
+        // ovlPdfHandleDblClick。v2 Pass P106（用户实测反馈问题3）：正向入口原来是紧挨着工具条
+        // 右上角的一颗独立按钮（#ovlSyncTexBtn）——用户反馈这颗按钮跟"选中文字弹出框"的定位/
+        // 编辑类操作割裂。移除这颗按钮，入口改到选中文字弹出框「编辑」右侧新增的「定位」按钮
+        // （data-qa="word.locate"，见 ovlPortalHtml 里 #ovlQuickActions + ovlQaLocateInPdf），
+        // 两处点击背后调用的都是同一个 ovlSyncTexForward()，行为不变；Code 模式下没有选区时
+        // 弹出框不出现，另挂了 Ctrl+Alt+L 快捷键等效触发（见 Ctrl+S 快捷键紧邻的新增监听器）。
         +         '<button type="button" class="ovl-cmdbtn" id="ovlFindBtn" data-cmd="edit.find" data-tip="查找/替换（Ctrl+F）" data-tip-pos="bottom-end">' + Icons.SearchIcon + '</button>'
         // v2 Pass P72：Overleaf 式单栏一键互切胶囊按钮。默认 CSS 隐藏，只在 editor-only
         // 模式下露出（见 #ovlBody[data-view="editor"] #ovlSwitchToPdfBtn 那条属性选择器）。
@@ -26155,6 +26162,11 @@ function ovlPortalHtml() {
         // 就地把选中的块变成一个 <textarea>（见该函数头注释，约 30546 行）；Code 来源本来
         // 就是在编辑可编辑源码，没有"渲染态 -> 源码"的转换要做，退化成把焦点带回文本框。
         +   '<button type="button" data-qa="word.edit" data-tip="编辑选中片段的源码" data-tip-pos="top">编辑</button>'
+        // v2 Pass P106（用户实测反馈问题3）：主工具条右上角原来独立的「在 PDF 中定位」按钮
+        // （#ovlSyncTexBtn）移除，入口搬到这里——跟「编辑」同一条选中文字弹出框，点击复用
+        // 同一个 ovlSyncTexForward()（见 ovlQaLocateInPdf）：tex 模式走 SyncTeX 正向（原按钮
+        // 行为不变），direct 模式走新写的文本反查句级定位（见 ovlP106TryReverseSentenceHighlight）。
+        +   '<button type="button" data-qa="word.locate" data-tip="定位到 PDF 对应位置" data-tip-pos="top">定位</button>'
         + '</div>'
         // M7 Editor「Equation preview」：光标落在 $...$ 里时用既有 KaTeX 渲染一个悬浮预览。
         + '<div class="ovl-eqpreview" id="ovlEqPreview"></div>'
@@ -33907,22 +33919,9 @@ function ovlUpdatePdfToolbarUI() {
         const el = document.getElementById(id);
         if (el) el.disabled = !hasPdf;
     });
-    // M10 SyncTeX 正向：只有真的有 output.synctex.gz 才点得亮（§2.6.10）。
-    // v2 Pass P87：direct 模式不再恒禁用——这个按钮现在兼职「按 % ==== page N ==== 标记
-    // 页级定位到 PDF」（不依赖 lastCompile/synctex），只要有直显的 PDF 且编辑器可编辑就
-    // 点得亮；是否真的能跳成功（这份 .tex 有没有页标记）留给点击时 ovlSyncTexForward 的
-    // direct 分支去判断、明确提示，不在这里静默假设。
-    const syncBtn = document.getElementById('ovlSyncTexBtn');
-    if (syncBtn) {
-        const codeArea = document.getElementById('ovlCodeArea');
-        if (isDirect) {
-            syncBtn.disabled = !OvlState.pdfObjectUrl || !(codeArea && !codeArea.disabled);
-            syncBtn.setAttribute('data-tip', '页级定位到 PDF 对应页（按 % ==== page N ==== 标记，转换产物专用）');
-        } else {
-            syncBtn.disabled = !(OvlState.lastCompile && OvlState.lastCompile.pdfExists && OvlState.lastCompile.synctexExists);
-            syncBtn.setAttribute('data-tip', '在 PDF 中定位（SyncTeX 正向，只做到页级定位；反向双击 PDF 里的文字即可）');
-        }
-    }
+    // v2 Pass P106：#ovlSyncTexBtn 已移除（主工具条右上角的独立"在 PDF 中定位"按钮下线，
+    // 入口移进选中弹出框的「定位」按钮，见 ovlQaLocateInPdf），不再需要按模式维护它的
+    // disabled/tooltip 状态。
     ovlUpdatePdfInvertFromSettings();
 }
 
@@ -39521,6 +39520,32 @@ function ovlSyncTexCurrentLine() {
     const before = ta.value.slice(0, ta.selectionStart);
     return before.split('\n').length;
 }
+// v2 Pass P106：优先用户真正选中的文字（Visual DOM 选区 / Code textarea 选区）当句级查询串——
+// 比"当前行/当前块首行"更精确，尤其 Visual 块可能横跨多个源码行/句子时，选区文字才是用户
+// 真正想定位的那一句。没有选区（比如 Ctrl+Alt+L 快捷键在纯光标位置触发）时返回 null，
+// 调用方退回整行文本兜底。
+function ovlSyncTexCurrentSentenceText() {
+    try {
+        if (OvlState.editorMode === 'visual') {
+            const pane = document.getElementById('ovlVisualPane');
+            if (!pane) return null;
+            const sel = ovlWinOf(pane).getSelection();
+            if (sel && !sel.isCollapsed && sel.rangeCount > 0) {
+                const range = sel.getRangeAt(0);
+                if (pane.contains(range.commonAncestorContainer)) {
+                    const t = sel.toString();
+                    if (t && t.trim()) return t;
+                }
+            }
+        } else {
+            const taSel = document.getElementById('ovlCodeArea');
+            if (taSel && !taSel.disabled && taSel.selectionEnd > taSel.selectionStart) {
+                return taSel.value.slice(taSel.selectionStart, taSel.selectionEnd);
+            }
+        }
+    } catch (e) { /* 取不到选区就退回 null，不阻断调用方的整行兜底 */ }
+    return null;
+}
 
 // ---- M10 SyncTeX 正向（源码 -> PDF），§2.6.10 ----
 // 真跑桥的 /synctex/forward（桥内部调 TeX Live 自带的 synctex.exe view，本机 2026-08-24 实测
@@ -39554,6 +39579,19 @@ function ovlSyncTexForwardDirect() {
         if (OvlState.viewMode === 'editor') ovlSetViewMode('pdf'); // 单栏优先：跟正向/反向那两处同一设计哲学
         ovlPdfSetPage(pageNum);
         ovlFlashSaveStatus('已跳到 PDF 第 ' + pageNum + ' 页（页级，按 % ==== page N ==== 标记）', false);
+        // v2 Pass P106（用户实测反馈问题2）：页级保底之后，尽力做一次句级精定位——跟 PDF->tex
+        // 方向共用同一套"剥数学取词"匹配（见 ovlP106TryReverseSentenceHighlight），查询词优先
+        // 用用户真正选中的文字（ovlSyncTexCurrentSentenceText，没有选区则退回整行），在这一页
+        // 的 getTextContent 里反查最佳命中窗口、画出精确高亮框；找不到静默保留页级结果，不产生
+        // 误导性提示（跟正方向 ovlPdfDirectTrySentenceLevel 同一条纪律）。延时等页面渲染稳定，
+        // 跟正向 ovlSyncTexForward 里画近似高亮框那处 setTimeout(250) 同一惯例。
+        const queryRaw = ovlSyncTexCurrentSentenceText() || (ta.value.split('\n')[line - 1] || '');
+        setTimeout(function () {
+            if (typeof ovlP106TryReverseSentenceHighlight !== 'function') return;
+            ovlP106TryReverseSentenceHighlight(pageNum, queryRaw).then(function (hit) {
+                if (hit) ovlFlashSaveStatus('已跳到 PDF 第 ' + pageNum + ' 页并定位到对应句（句级）', false);
+            }).catch(function (e) { console.error('[ovl] p106 reverse sentence highlight failed', e); });
+        }, 250);
     } catch (e) {
         console.error('[ovl] syncTexForwardDirect failed', e);
         ovlFlashSaveStatus('页级定位失败', true);
@@ -39608,6 +39646,17 @@ async function ovlSyncTexForward() {
     } catch (e) {
         console.error('[ovl] syncTexForward failed', e);
         ovlFlashSaveStatus('SyncTeX 定位失败：连不上桥接服务', true);
+    }
+}
+// v2 Pass P106（用户实测反馈问题3）：定位入口从主工具条搬进选中文字弹出框的「编辑」右侧——
+// 直接复用 ovlSyncTexForward()，它内部已经按 OvlState.pdfSourceMode 分叉（tex 模式走 synctex
+// 正向；direct 模式走上面新写的文本反查），且用的 ovlSyncTexCurrentLine()/
+// ovlSyncTexCurrentSentenceText() 读的正是 Code/Visual 当前选区——弹出框本来就是"选中了文字"
+// 才会出现，选区此刻仍然有效（跟同一条工具条上「复制」「编辑」两颗既有按钮点击后依然读取
+// 选区的既有假设一致，见 ovlCopyLatexSource/ovlInlineSrcEditOpen）。
+function ovlQaLocateInPdf() {
+    if (typeof ovlSyncTexForward === 'function') {
+        ovlSyncTexForward().catch(function (e) { console.error('[ovl] qa locate in pdf failed', e); });
     }
 }
 
@@ -39898,6 +39947,23 @@ function ovlBindShell() {
             if (document.body.classList.contains('ovl-translator-open')) return;
             e.preventDefault();
             ovlSaveCurrentFile();
+        });
+
+        // v2 Pass P106（用户实测反馈问题3，"code 模式若无选中弹出框"缺口）：Code 模式下光标
+        // 没有选中任何文字时，选中弹出框（#ovlQuickActions）根本不会出现，「定位」按钮无从点起。
+        // 调查了现状：文件树/gutter 之外没有任何既有右键菜单基础设施可复用（全仓库唯一的
+        // contextmenu 监听器只服务文件树）——新起一整套右键菜单是能省的最大一块改动，按"最小
+        // 侵入"选快捷键：Ctrl+Alt+L（Locate），挂在 document 上（跟 Ctrl+S 同一惯例，不要求
+        // 焦点必须在 textarea 里），直接调 ovlSyncTexForward()——它本来就不依赖选区存在（没有
+        // 选区时 ovlSyncTexCurrentLine() 退回"光标所在整行"），Visual 模式下也顺手可用。
+        document.addEventListener('keydown', function (e) {
+            if (!(e.ctrlKey || e.metaKey) || !e.altKey || (e.key || '').toLowerCase() !== 'l') return;
+            if (!document.body.classList.contains('ovl-shell-active')) return;
+            if (document.body.classList.contains('ovl-translator-open')) return;
+            e.preventDefault();
+            if (typeof ovlSyncTexForward === 'function') {
+                ovlSyncTexForward().catch(function (e2) { console.error('[ovl] ctrl+alt+l locate failed', e2); });
+            }
         });
 
         // M2：改完没保存就要关页面时拦一下。这是浏览器原生的 beforeunload 提示，不是
@@ -41659,6 +41725,355 @@ function ovlSentenceLevelMatch(sourceLines, startLineIdx, queryText) {
     if (best === -1) return null;
     return startLineIdx + best;
 }
+
+// ==================== v2 Pass P106：真句级双向跳转（用户实测反馈问题 1/2） ====================
+// 背景：P87 的句级匹配在真实论文上恒失败退化——用户给出的失败样本特征是句子含大量行内数学
+// （如 "$g(\lambda|\mathcal{G}...)$"）。根因是上面的旧匹配（ovlNormalizeForSentenceMatch +
+// ovlTokenJaccard，见上方）拿 tex 侧原始 LaTeX 源码（含 $...$、\command{}）直接跟 PDF 侧纯
+// 文本做全词 token 比较——LaTeX 数学环境在 PDF 里渲染成符号/公式排版，跟源码字面的
+// "$g(\lambda|\mathcal{G}$" 完全对不上，稍微有点数学的句子 token 重合率必然被拉到阈值以下。
+// 上面三个旧函数原样保留不动（test_p87_render_jump.js #31/#32 直接按函数名单测这两个纯
+// 函数，不能破坏），这里新写一套"剥数学环境与命令后只取纯词序列"的匹配，接管真实调用点
+// （ovlPdfDirectTrySentenceLevel / 新增的编辑器->PDF 反查 ovlP106TryReverseSentenceHighlight）。
+
+// 极简英文停用词表：只覆盖论文里常见虚词，不追求语言学完整——目的是把"the/of/in"这类必然在
+// 任意两个无关句子间共现的词滤掉，不让它们污染重合计数。
+const OVL_P106_STOPWORDS = new Set([
+    'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or', 'but', 'is', 'are', 'was', 'were',
+    'be', 'been', 'being', 'with', 'as', 'by', 'that', 'this', 'these', 'those', 'it', 'its', 'we', 'our',
+    'from', 'which', 'can', 'also', 'not', 'have', 'has', 'had', 'than', 'into', 'such', 'then', 'when',
+    'where', 'while', 'they', 'their', 'his', 'her', 'she', 'he', 'you', 'your', 'if', 'so', 'no', 'do',
+    'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'one', 'two', 'all', 'any',
+    'each', 'more', 'most', 'other', 'some', 'only', 'own', 'same'
+]);
+// 剥离 LaTeX 数学环境/内联数学/纯引用类命令——只留下 PDF 渲染时真正会显示成可读英文单词的
+// 部分。不追求 100% 正确（嵌套花括号/自定义宏等边界情况不处理，已知遗留见 progress 记录），
+// 只要把"公式渣"清干净到不会污染词序列匹配就够用。
+function ovlP106StripMathAndCommands(s) {
+    let t = String(s == null ? '' : s);
+    t = t.replace(/%.*$/gm, ' '); // 行内 LaTeX 注释
+    t = t.replace(/\\begin\{(equation|align|gather|multline|eqnarray|math|displaymath|array)\*?\}[\s\S]*?\\end\{\1\*?\}/g, ' ');
+    t = t.replace(/\\\[[\s\S]*?\\\]/g, ' ');       // \[ ... \]
+    t = t.replace(/\\\([\s\S]*?\\\)/g, ' ');       // \( ... \)
+    t = t.replace(/\$\$[\s\S]*?\$\$/g, ' ');       // $$ ... $$
+    t = t.replace(/\$(?:[^$\\]|\\.)*\$/g, ' ');    // $ ... $（内联数学，容忍转义字符）
+    // 纯引用类命令：参数是 key/id，不是可读英文，整体连参数一起去掉。
+    t = t.replace(/\\(cite\w*|ref|eqref|label|footnote|url|href|includegraphics|input|bibliography\w*)\*?(\[[^\]]*\])?\{[^{}]*\}/g, ' ');
+    // 剩余命令：命令名本身不是可读文字（\textbf、\emph 等排版命令），去掉命令名和方括号选项，
+    // 花括号本身也去掉但保留花括号里的文字（\textbf{important} 在 PDF 里确实会显示 "important"）。
+    t = t.replace(/\\[a-zA-Z@]+\*?/g, ' ');
+    t = t.replace(/\[[^\]\n]*\]/g, ' ');
+    t = t.replace(/[{}$~^_]/g, ' ');
+    return t;
+}
+// 从任意文本（tex 侧剥完数学后的纯文本，或 pdf.js 侧本来就是纯文本）里提取"实词"：只保留
+// 纯字母 token、长度 >= 3、不在停用词表里。大小写不敏感（全部转小写后比较）。
+function ovlP106ExtractContentWords(s) {
+    const raw = String(s == null ? '' : s).toLowerCase();
+    const all = raw.match(/[a-z]+/g) || [];
+    return all.filter(function (w) { return w.length >= 3 && !OVL_P106_STOPWORDS.has(w); });
+}
+function ovlP106ContentWordsFromTexLine(texLine) {
+    return ovlP106ExtractContentWords(ovlP106StripMathAndCommands(texLine));
+}
+// 词重叠率 + 顺序加权打分（任务书原话："按词重叠率+顺序加权打分"）。srcWords/queryWords 均为
+// 已提取好的实词数组（小写）。贪心顺序匹配：query 里每个词优先在 src 里"上一个匹配点之后"
+// 找最近的一次出现（命中记一次"顺序内命中"，推进 searchFrom）；顺序内找不到，退回 src 全范围
+// 找一次未用过的出现（命中计入重合但不计入顺序分，也不推进 searchFrom）。
+// 返回 { overlap, score }：overlap 是命中的词数（按位置去重，不按词种类去重，允许重复词各自
+// 计一次），score = 重合率*0.6 + 顺序命中率*0.4。
+function ovlP106WordSeqScore(srcWords, queryWords) {
+    if (!queryWords.length || !srcWords.length) return { overlap: 0, score: 0 };
+    const used = new Array(srcWords.length).fill(false);
+    let overlap = 0, ordered = 0, searchFrom = 0;
+    for (let qi = 0; qi < queryWords.length; qi++) {
+        const qw = queryWords[qi];
+        let found = -1;
+        for (let i = searchFrom; i < srcWords.length; i++) {
+            if (!used[i] && srcWords[i] === qw) { found = i; break; }
+        }
+        if (found !== -1) {
+            used[found] = true; overlap++; ordered++; searchFrom = found + 1;
+            continue;
+        }
+        for (let i = 0; i < srcWords.length; i++) {
+            if (!used[i] && srcWords[i] === qw) { found = i; break; }
+        }
+        if (found !== -1) { used[found] = true; overlap++; }
+    }
+    const overlapRatio = overlap / queryWords.length;
+    const orderRatio = ordered / queryWords.length;
+    return { overlap: overlap, score: overlapRatio * 0.6 + orderRatio * 0.4 };
+}
+// 命中门槛（任务书原话）：重合实词数 >= 4 才算命中；另加最低重合率下限，防止长论文里偶然凑够
+// 4 个常见学术词（model/data/method/result 之类）就误判——纯粹词数达标但占查询词比例很低的
+// 情况仍然拒绝。
+const OVL_P106_MIN_OVERLAP_WORDS = 4;
+const OVL_P106_MIN_OVERLAP_RATIO = 0.4;
+// 核心：在某一页对应的源码行区间里，用"剥数学取词"的新算法找最佳命中行。跟旧的
+// ovlSentenceLevelMatch 同一调用形状（sourceLines/startLineIdx/queryText -> 命中的绝对行号或
+// null），但内部匹配算法完全不同——旧函数原样保留供纯函数回归测试用，这个函数接管真实调用点。
+function ovlP106SentenceLevelMatch(sourceLines, startLineIdx, queryText) {
+    const queryWords = ovlP106ExtractContentWords(queryText); // PDF 侧文本本来就是纯文字，不需要剥数学
+    if (queryWords.length < OVL_P106_MIN_OVERLAP_WORDS) return null; // 查询串太短，句级无从谈起
+    let best = -1, bestScore = -Infinity;
+    for (let i = 0; i < sourceLines.length; i++) {
+        const raw = sourceLines[i];
+        if (!raw || !raw.trim()) continue;
+        const srcWords = ovlP106ContentWordsFromTexLine(raw);
+        if (!srcWords.length) continue;
+        const m = ovlP106WordSeqScore(srcWords, queryWords);
+        if (m.overlap >= OVL_P106_MIN_OVERLAP_WORDS
+            && (m.overlap / queryWords.length) >= OVL_P106_MIN_OVERLAP_RATIO
+            && m.score > bestScore) {
+            bestScore = m.score; best = i;
+        }
+    }
+    if (best === -1) return null;
+    return startLineIdx + best;
+}
+
+// ---- PDF 侧：x 聚类（识别双栏）+ 阅读顺序拼词，供双击取词（§1）和反查画框（§2）共用 ----
+function ovlP106ClusterColumnsX(items) {
+    const spans = [];
+    for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (!it.str || !it.str.trim()) continue;
+        const x0 = it.transform[4], x1 = x0 + (it.width || 0);
+        spans.push([x0, x1]);
+    }
+    if (!spans.length) return [];
+    spans.sort(function (a, b) { return a[0] - b[0]; });
+    let totalMin = spans[0][0], totalMax = spans[0][1];
+    for (let i = 1; i < spans.length; i++) { if (spans[i][1] > totalMax) totalMax = spans[i][1]; }
+    // 单栏文档天然只聚出一类；双栏中间的装订缝隙比这个阈值大就能正确分开。
+    // 阈值取值：真实两栏合成夹具（fixtures/p106_mathcol_project，LaTeX multicol 默认
+    // \columnsep=10pt——多数真实论文模板的栏间距不会比这更窄，IEEE/ACM 等常见模板普遍在
+    // 14~24pt）实测量出的真实栏间缝隙约 9.96pt；而同一份数据里，同一栏内任意两个相邻文本
+    // item 的包围盒间距实测恒为 0（相邻/重叠，pdf.js 的包围盒天然衔接），不存在"栏内也有
+    // 大间距"的噪声。取 8pt 地板（略小于最窄实测缝隙，留安全边际）+ 页宽 1% 作为宽页面的
+    // 次要修正项——原来的 18pt 地板/5% 宽度比例会把这条 ~10pt 的真实缝隙也吞并成一栏
+    // （2026-08-31 用真实 latexmk 编译两栏夹具实测复现，见 overnight_progress.md P106 小节）。
+    const GAP = Math.max(8, (totalMax - totalMin) * 0.01);
+    const clusters = [{ min: spans[0][0], max: spans[0][1] }];
+    for (let i = 1; i < spans.length; i++) {
+        const x0 = spans[i][0], x1 = spans[i][1];
+        const last = clusters[clusters.length - 1];
+        if (x0 - last.max > GAP) clusters.push({ min: x0, max: x1 });
+        else last.max = Math.max(last.max, x1);
+    }
+    return clusters;
+}
+function ovlP106ColumnIndexForX(columns, x) {
+    if (!columns.length) return -1;
+    for (let i = 0; i < columns.length; i++) {
+        if (x >= columns[i].min - 4 && x <= columns[i].max + 4) return i;
+    }
+    let best = 0, bestDist = Infinity;
+    for (let i = 0; i < columns.length; i++) {
+        const c = columns[i];
+        const d = x < c.min ? (c.min - x) : (x > c.max ? (x - c.max) : 0);
+        if (d < bestDist) { bestDist = d; best = i; }
+    }
+    return best;
+}
+// items（已按需要过滤好，比如同一列/同一窗口内）按阅读顺序拼接成一段文本：先按 y 从大到小
+// 分行（PDF 原生坐标系向上为正，从大到小即从上到下），行内按 x 从小到大；跨行边界识别连字符
+// 断词（"opti-" 后紧跟一个小写字母开头的新行 -> 去掉连字符直接拼，不是插空格）。
+function ovlP106JoinItemsReadingOrder(items) {
+    if (!items.length) return '';
+    const withY = [];
+    for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        const h = it.height || Math.abs(it.transform[3]) || 10;
+        withY.push({ it: it, y: it.transform[5], h: h });
+    }
+    withY.sort(function (a, b) { return b.y - a.y; });
+    const tol = Math.max(2, withY[0].h * 0.5);
+    const lines = [];
+    for (let i = 0; i < withY.length; i++) {
+        const rec = withY[i];
+        let line = null;
+        for (let j = 0; j < lines.length; j++) { if (Math.abs(lines[j].y - rec.y) <= tol) { line = lines[j]; break; } }
+        if (!line) { line = { y: rec.y, items: [] }; lines.push(line); }
+        line.items.push(rec.it);
+    }
+    lines.sort(function (a, b) { return b.y - a.y; });
+    for (let i = 0; i < lines.length; i++) {
+        lines[i].items.sort(function (a, b) { return a.transform[4] - b.transform[4]; });
+    }
+    let out = '';
+    for (let li = 0; li < lines.length; li++) {
+        let lineText = '';
+        const its = lines[li].items;
+        for (let i = 0; i < its.length; i++) {
+            const s = its[i].str;
+            if (i > 0) {
+                const prev = its[i - 1];
+                const gap = its[i].transform[4] - (prev.transform[4] + (prev.width || 0));
+                const avgCharW = (prev.width || 4) / Math.max(1, prev.str.length);
+                if (gap > avgCharW * 0.35 && !/\s$/.test(lineText)) lineText += ' ';
+            }
+            lineText += s;
+        }
+        if (li === 0) { out = lineText; continue; }
+        if (/[a-zA-Z]-$/.test(out.trim()) && /^[a-z]/.test(lineText.trim())) {
+            out = out.replace(/-\s*$/, '') + lineText.trim();
+        } else {
+            out += ' ' + lineText;
+        }
+    }
+    return out.replace(/\s+/g, ' ').trim();
+}
+// §1.①：双击点取词——同列（x 聚类）±20pt 竖向窗口内的 items，按阅读顺序拼接。窗口用 pdf.js
+// 原生坐标（跟 item.transform 同一单位——本文件里各处早已把它当"px"量级用，见
+// ovlPdfPaintSyncHighlight 头部注释同一处理），不是 CSS 像素。
+const OVL_P106_CLICK_WINDOW_PT = 20;
+function ovlP106ExtractClickQueryText(items, clickX, clickY) {
+    const columns = ovlP106ClusterColumnsX(items);
+    const colIdx = ovlP106ColumnIndexForX(columns, clickX);
+    const col = colIdx >= 0 ? columns[colIdx] : null;
+    const inWin = [];
+    for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (!it.str || !it.str.trim()) continue;
+        const x0 = it.transform[4], w = it.width || 0;
+        const xc = x0 + w / 2;
+        if (col && (xc < col.min - 6 || xc > col.max + 6)) continue;
+        const h = it.height || Math.abs(it.transform[3]) || 10;
+        const yc = it.transform[5] + h / 2;
+        if (Math.abs(yc - clickY) > OVL_P106_CLICK_WINDOW_PT) continue;
+        inWin.push(it);
+    }
+    return ovlP106JoinItemsReadingOrder(inWin);
+}
+// §2 反方向（编辑器 -> PDF，direct 模式句级）：把整页 items 按"列"分组，列内再按 y 分行
+// （物理行，非逻辑句——一句可能跨 1~3 个物理行），供滑窗匹配用。
+function ovlP106BuildColumnLines(items) {
+    const columns = ovlP106ClusterColumnsX(items);
+    if (!columns.length) return [];
+    const byCol = [];
+    for (let i = 0; i < columns.length; i++) byCol.push([]);
+    for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (!it.str || !it.str.trim()) continue;
+        const x0 = it.transform[4], w = it.width || 0;
+        const ci = ovlP106ColumnIndexForX(columns, x0 + w / 2);
+        if (ci >= 0) byCol[ci].push(it);
+    }
+    return byCol.map(function (colItems) {
+        if (!colItems.length) return [];
+        const withY = colItems.map(function (it) {
+            const h = it.height || Math.abs(it.transform[3]) || 10;
+            return { it: it, y: it.transform[5], h: h };
+        });
+        const tol = Math.max(2, withY[0].h * 0.5);
+        const lines = [];
+        for (let i = 0; i < withY.length; i++) {
+            const rec = withY[i];
+            let line = null;
+            for (let j = 0; j < lines.length; j++) { if (Math.abs(lines[j].y - rec.y) <= tol) { line = lines[j]; break; } }
+            if (!line) { line = { y: rec.y, items: [] }; lines.push(line); }
+            line.items.push(rec.it);
+        }
+        lines.sort(function (a, b) { return b.y - a.y; });
+        lines.forEach(function (l) { l.items.sort(function (a, b) { return a.transform[4] - b.transform[4]; }); });
+        return lines;
+    });
+}
+// 精确包围盒画高亮（跟 ovlPdfPaintSyncHighlight 的固定近似框不同——这里有 pdf.js 真实 item
+// 坐标，能画出贴合文字的精确框，可能跨 1~3 行各画一个）。复用同一个 .ovl-pdf-sync-overlay
+// 容器 + 淡出计时器（ovlPdfSyncHighlightFadeTimer，在上面 ovlPdfPaintSyncHighlight 附近已经
+// 声明过，这里不重复声明）。
+function ovlP106PaintHighlightForItems(pageNum, items) {
+    try {
+        const entry = OvlState.pdfPageMap && OvlState.pdfPageMap.get(pageNum);
+        if (!entry || !entry.viewport || !items || !items.length) return false;
+        const withY = items.map(function (it) {
+            const h = it.height || Math.abs(it.transform[3]) || 10;
+            return { it: it, y: it.transform[5], h: h };
+        });
+        const tol = Math.max(2, withY[0].h * 0.5);
+        const rows = [];
+        for (let i = 0; i < withY.length; i++) {
+            const rec = withY[i];
+            let row = null;
+            for (let j = 0; j < rows.length; j++) { if (Math.abs(rows[j].y - rec.y) <= tol) { row = rows[j]; break; } }
+            if (!row) { row = { y: rec.y, items: [] }; rows.push(row); }
+            row.items.push(rec.it);
+        }
+        let overlay = entry.container.querySelector('.ovl-pdf-sync-overlay');
+        if (!overlay) {
+            overlay = document.createElement('div');
+            overlay.className = 'ovl-pdf-sync-overlay';
+            entry.container.appendChild(overlay);
+        }
+        let html = '';
+        rows.forEach(function (row) {
+            let xMin = Infinity, xMax = -Infinity, yMin = Infinity, yMax = -Infinity;
+            row.items.forEach(function (it) {
+                const x0 = it.transform[4], w = it.width || 0;
+                const h = it.height || Math.abs(it.transform[3]) || 10;
+                const y0 = it.transform[5];
+                if (x0 < xMin) xMin = x0;
+                if (x0 + w > xMax) xMax = x0 + w;
+                if (y0 < yMin) yMin = y0;
+                if (y0 + h > yMax) yMax = y0 + h;
+            });
+            const p0 = entry.viewport.convertToViewportPoint(xMin, yMin);
+            const p1 = entry.viewport.convertToViewportPoint(xMax, yMax);
+            const left = Math.min(p0[0], p1[0]) - 2, top = Math.min(p0[1], p1[1]) - 2;
+            const w = Math.abs(p1[0] - p0[0]) + 4, h = Math.abs(p1[1] - p0[1]) + 4;
+            html += '<div class="ovl-mark-box" style="left:' + left + 'px;top:' + top + 'px;width:' + w + 'px;height:' + h + 'px;"></div>';
+        });
+        overlay.innerHTML = html;
+        overlay.classList.remove('ovl-mark-fadeout');
+        clearTimeout(ovlPdfSyncHighlightFadeTimer);
+        ovlPdfSyncHighlightFadeTimer = window.setTimeout(function () { overlay.classList.add('ovl-mark-fadeout'); }, 60000);
+        const firstBox = overlay.querySelector('.ovl-mark-box');
+        if (firstBox && firstBox.scrollIntoView) firstBox.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        return true;
+    } catch (e) { console.error('[ovl] p106 paint highlight for items failed', e); return false; }
+}
+// §2：编辑器 -> PDF 句级反查——用当前行/选区的"剥数学取词"结果，去这一页的 getTextContent
+// 按列滑窗（1~3 个物理行为一组，句子可能换行）找最佳命中窗口，命中就画精确高亮框。找不到
+// 静默返回 false，调用方（ovlSyncTexForwardDirect）保留已经做好的页级跳转，不产生误导性的
+// 句级框。
+async function ovlP106TryReverseSentenceHighlight(pageNum, texLineText) {
+    try {
+        const entry = OvlState.pdfPageMap && OvlState.pdfPageMap.get(pageNum);
+        if (!entry || !entry.pdfPage) return false;
+        const queryWords = ovlP106ContentWordsFromTexLine(texLineText);
+        if (queryWords.length < OVL_P106_MIN_OVERLAP_WORDS) return false;
+        const tc = await entry.pdfPage.getTextContent();
+        const items = (tc && tc.items) ? tc.items : [];
+        if (!items.length) return false;
+        const colLines = ovlP106BuildColumnLines(items);
+        let best = null, bestScore = -Infinity;
+        for (let ci = 0; ci < colLines.length; ci++) {
+            const lines = colLines[ci];
+            for (let winSize = 1; winSize <= 3; winSize++) {
+                for (let s = 0; s + winSize <= lines.length; s++) {
+                    const winLines = lines.slice(s, s + winSize);
+                    let winItems = [];
+                    for (let k = 0; k < winLines.length; k++) winItems = winItems.concat(winLines[k].items);
+                    const text = ovlP106JoinItemsReadingOrder(winItems);
+                    const srcWords = ovlP106ExtractContentWords(text);
+                    if (!srcWords.length) continue;
+                    const m = ovlP106WordSeqScore(srcWords, queryWords);
+                    if (m.overlap >= OVL_P106_MIN_OVERLAP_WORDS
+                        && (m.overlap / queryWords.length) >= OVL_P106_MIN_OVERLAP_RATIO
+                        && m.score > bestScore) {
+                        bestScore = m.score; best = winItems;
+                    }
+                }
+            }
+        }
+        if (!best) return false;
+        return ovlP106PaintHighlightForItems(pageNum, best);
+    } catch (e) { console.error('[ovl] p106 reverse sentence highlight failed', e); return false; }
+}
+
 // direct 模式的双击/单击入口（§1.1）：页级保底先跳一次（同步），句级精定位异步尝试、命中才
 // 追加/收窄高亮，不阻塞页级这条已经生效的保底体验。
 function ovlPdfHandleDblClickDirect(ev, container) {
@@ -41698,30 +42113,10 @@ async function ovlPdfDirectTrySentenceLevel(ev, pageNum, markers) {
     const tc = await entry.pdfPage.getTextContent();
     const items = (tc && tc.items) ? tc.items : [];
     if (!items.length) return;
-    // 找离双击点最近的 text item（包围盒中心到点击点的欧氏距离平方，省一次开方）。
-    let bestItem = null, bestDist = Infinity;
-    for (let i = 0; i < items.length; i++) {
-        const it = items[i];
-        if (!it.str || !it.str.trim()) continue;
-        const tx = it.transform[4], ty = it.transform[5];
-        const w = it.width || 0, h = it.height || Math.abs(it.transform[3]) || 10;
-        const cx = tx + w / 2, cy = ty + h / 2;
-        const dx = cx - clickX, dy = cy - clickY;
-        const dist = dx * dx + dy * dy;
-        if (dist < bestDist) { bestDist = dist; bestItem = it; }
-    }
-    if (!bestItem) return;
-    // 把命中 item 按 y 聚成"一行"（同一基线附近的相邻 item 拼起来，容差取这个 item 高度的
-    // 60%——比整行高度略窄，避免把上下相邻文本行也吸进来）。
-    const baseY = bestItem.transform[5];
-    const lineTol = Math.max(2, (bestItem.height || 10) * 0.6);
-    let queryText = '';
-    for (let i = 0; i < items.length; i++) {
-        const it = items[i];
-        if (!it.str) continue;
-        if (Math.abs(it.transform[5] - baseY) <= lineTol) queryText += it.str;
-    }
-    queryText = queryText.trim();
+    // v2 Pass P106：取词换成"双击点同列（x 聚类）±20pt 竖向窗口"（见 ovlP106ExtractClickQueryText），
+    // 替换旧的"只取同一基线 y"——那种取法在双栏论文上会把左右两栏文字混在一起，且窗口只有一行
+    // 高，句子稍微换行就取不全。
+    const queryText = ovlP106ExtractClickQueryText(items, clickX, clickY);
     if (!queryText) return;
     const taNow = document.getElementById('ovlCodeArea');
     if (!taNow) return;
@@ -41729,7 +42124,9 @@ async function ovlPdfDirectTrySentenceLevel(ev, pageNum, markers) {
     if (!range) return; // 降级：§1.1 页级跳转已经做了
     const allLines = taNow.value.split('\n');
     const slice = allLines.slice(range.startLine, range.endLine + 1);
-    const matchLine = ovlSentenceLevelMatch(slice, range.startLine, queryText);
+    // v2 Pass P106：匹配换成"剥数学环境与命令后取纯词序列"（见 ovlP106SentenceLevelMatch），
+    // 修复真实论文里句子含大量行内数学（$...$）时旧的逐字符/全 token 匹配恒失败退化的问题。
+    const matchLine = ovlP106SentenceLevelMatch(slice, range.startLine, queryText);
     if (matchLine == null) return; // 未命中：保留页级高亮，不产生误导性句级框
     if (typeof ovlMarkLines === 'function') ovlMarkLines(matchLine, matchLine, { source: 'pdf-direct-sentence' });
 }
@@ -43266,6 +43663,9 @@ function ovlBindQuickActions() {
             } else {
                 ovlInlineSrcEditOpen(src);
             }
+        } else if (id === 'word.locate') {
+            // v2 Pass P106：主工具条「在 PDF 中定位」按钮已移除，这是新入口。
+            ovlQaLocateInPdf();
         } else {
             ovlRunCmd(id);
         }
@@ -44770,11 +45170,9 @@ function ovlBindPassD() {
         ovlBindVisualSelOverlay(); // Pass Sel-Outline：Visual 选区描边叠加层
         ovlBindMarkOverlayClearOnSelect(); // v2 Pass P37：黄色标记高亮——Esc/新选区清空
 
-        const syncTexBtn = document.getElementById('ovlSyncTexBtn');
-        if (syncTexBtn) syncTexBtn.addEventListener('click', function () {
-            if (syncTexBtn.disabled) return;
-            ovlSyncTexForward().catch(function (e) { console.error('[ovl] syncTexForward failed', e); });
-        });
+        // v2 Pass P106：#ovlSyncTexBtn 的点击绑定已随按钮一起移除——新入口
+        // #ovlQuickActions [data-qa="word.locate"] 走事件委托（见 ovlBindQuickActions），
+        // 不需要在这里单独绑。
 
         // v2 Pass P72：Overleaf 式单栏一键互切胶囊按钮——纯粹的 ovlSetViewMode() 一行调用，
         // 不需要新状态、不改 ovlSetViewMode 本体（CSS 属性选择器已经负责两个按钮各自的显隐）。
