@@ -4172,7 +4172,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.03.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.04.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -28999,58 +28999,93 @@ function ovlVisualCharSimilarity(a, b) {
     return 1 - (dist / Math.max(a.length, b.length));
 }
 const OVL_VISUAL_ECHO_SIMILARITY_THRESHOLD = 0.92;
-// v2 Pass P113（诊断见 .claude/tmp/p113_diag.md 机制③）：译文里有没有中文字符，是判断
-// "模型是否真的动过手"最直接的信号——这里单独抽出来，供 ovlVisualIsEchoFailure 复用，
-// 也避免在守卫函数内联一个不带名字的正则容易被后人看漏。
-function ovlVisualHasCjk(s) {
-    return /[一-鿿]/.test(String(s == null ? '' : s));
+
+// ==================== v2 Pass P113c：回显守卫语义化重写（核验 .claude/tmp/p113_verify.md 阻断1） ====================
+// 背景：P113 v2 返修用一张 `^` 锚定的元注释白名单（"以下是翻译结果："等固定短语）去剥包装
+// 语，只覆盖了核验报告里逐字引用的那两个例子——换一句客套话（"好的，以下是翻译结果："）
+// 或换一种装饰形状（markdown 加粗"**译文**："、纯英文标签"Translation:"、无中文的标签式
+// 包装）就绕过去了，整段英文回显被当"翻译成功"永久写进缓存（第2轮实测 8 种同类包装净
+// 回归）。这里废弃那张白名单（连同 ovlVisualHasCjk/ovlVisualStripEchoWrapper 一起），改成
+// 不依赖具体措辞的结构判定：
+//   1) 剥掉两层掩码占位符（[[N]]/〔〔OVLCODEk〕〕）和残留的反斜杠命令/花括号，只留下译文
+//      与原文里"真正是人话"的那部分（ovlVisualExtractProse，跟 P106 剥数学取纯词序列同一
+//      个思路，见 ovlP106StripMathAndCommands）；
+//   2) 规范化：去空白 + 去掉所有标点/装饰符号，只留字母数字（ovlVisualNormalizeProse）——
+//      包装语具体用什么标点、方括号、书名号、星号都不用一一枚举；
+//   3) 用"半整体（fitting）编辑距离"（ovlVisualFitAlignSimilarity）判断：原文散文是不是
+//      整段、基本未改动地嵌在译文散文的某处——不管译文前后多包了什么、多长的包装语，
+//      pattern（原文）必须完整找到，text（译文）两端允许免费跳过任意长度；
+//   4) 相似度已经高到"几乎是同一段内容"时，再看译文里的中文字符数量有没有超过"译文比
+//      原文多出来的长度"这个"包装预算"——包装语加的中文字符数天然不会超过它自己占用的
+//      长度（核心内容一个字都没变中文，中文全在外面裹着的那层），没超预算就说明中文只是
+//      装饰纸，判回显；一旦超过，只有一种可能——核心内容内部真的发生了替换（哪怕只换了
+//      一个字，比如"整句几乎不变、但确实把其中一个词换成了中文"这种 P113 有意放行的校准
+//      边界：译文跟原文长度相同，多出来的预算是 0，只要有 1 个中文字符就必然超过预算），
+//      不是纯装饰，放行。
+// 这套判据完全不依赖包装语的具体词形/语言/标点，天然覆盖裸回显、已知的 8 种包装、任何
+// 未来的新包装，以及"数学重句：散文部分真的变成了中文"这条放行边界——不需要为每一种新
+// 包装再加一条正则，也不需要靠"含不含中文"这个粗糙信号。
+function ovlVisualCountCjk(s) {
+    const m = String(s == null ? '' : s).match(/[一-鿿]/g);
+    return m ? m.length : 0;
 }
-// v2 Pass P113 返修（核验 p113_verify.md 问题1，阻断回归）：ovlVisualHasCjk 原样当"放行"的
-// 充分条件，挡不住真实小模型最常见的失败形态之一——整段英文原样照抄，外面套一句"译文："
-// 或"以下是翻译结果：…（完）"这类元注释——这类包装词恰好靠"含中文=放行"混进去，被当成
-// 翻译成功永久写进缓存（实测：block DOM latin=226/cjk=2，99% 仍是英文）。
-// 本想直接照诊断报告"修复要点"第3条的建议、复用 chatAgentQaLatinRatio 补一道拉丁占比检测，
-// 但实测验证发现这条路走不通：占比统计天然分不开"整段回显+8字元注释包装"（拉丁占比约99%）
-// 和 P113 自己刻意要放行的校准边界 G5/PROBELEGIT007"高相似度译文里只换了1个字符"（拉丁
-// 占比同样约99%）——两者在字符统计上几乎是同一个数字，任何统一阈值要么两个都拦、要么两个
-// 都放，没有中间地带。真正能分开的信号不是"中文字符有多少个"，而是"这句中文是不是真的
-// 嵌在正文里"：元注释固定长在整段最前/最后、且是一句独立的"声明式"短语（"XX："或"（XX）"
-// 这种形状），跟嵌进句子中间替换掉原文内容的真翻译在结构上不同。这里只剥掉这一类已被证实
-// 存在的元注释包装（不是泛泛猜"漏译"——"翻译不完整/敷衍翻译"这一层诊断报告本来就划给
-// translation_qa_scan 的拉丁占比启发式，那是只读扫描、不阻断翻译流程，见该函数上方大注释），
-// 剥完之后如果连一个汉字都不剩，说明中文只是包装纸，交给下面已有的相似度判定去拦；剥完
-// 之后仍有汉字（比如 G9：真实译文恰好也用"译文："开头当 label，但 label 之后是完整的中文
-// 正文），说明模型确实翻了，照样放行，不会矫枉过正。
-const OVL_VISUAL_ECHO_PREAMBLE_RE = /^[\s　]*(?:以下(?:是|为)(?:的)?(?:翻译结果|译文)|译文如下|翻译如下|中文翻译|中文译文|翻译结果|译文)[\s　]*[:：][\s　]*/;
-const OVL_VISUAL_ECHO_POSTAMBLE_RE = /[\s　]*[（(][\s　]*(?:完|译完|翻译完|翻译完成|全文完|结束)[\s　]*[)）][\s　]*$/;
-function ovlVisualStripEchoWrapper(s) {
-    return String(s == null ? '' : s).replace(OVL_VISUAL_ECHO_PREAMBLE_RE, '').replace(OVL_VISUAL_ECHO_POSTAMBLE_RE, '');
+// 从"两层掩码后的文本"里提炼纯散文：先剥掉本模块自己的两种占位符（[[N]] 与
+// 〔〔OVLCODEk〕〕），再剥掉残留的反斜杠命令名与花括号/方括号（xportMask 对"参数是正文"
+// 的命令——如 \textbf{...}——故意不遮，命令名和花括号会原样留在掩码文本里）。传入未掩码
+// 的纯英文/中文句子（比如单测直接构造的探针）时，这一步是空操作，不影响结果。
+function ovlVisualExtractProse(s) {
+    let t = String(s == null ? '' : s);
+    t = t.replace(/\[\[\s*\d+\s*\]\]/g, ' ');
+    t = t.replace(OVL_VISUAL_CODE_TOKEN_RE, ' ');
+    t = t.replace(/\\[a-zA-Z@]+\*?/g, ' ');
+    t = t.replace(/[{}\[\]]/g, ' ');
+    return t;
+}
+// 规范化：去空白 + 去掉所有标点/符号装饰，只保留跨语言都有意义的"字"（字母/数字）。
+function ovlVisualNormalizeProse(s) {
+    return String(s == null ? '' : s).replace(/[^\p{L}\p{N}]+/gu, '');
+}
+// 半整体（fitting）编辑距离相似度：pattern 必须整段被找到（不能只对齐一部分），text
+// 允许在两端自由跳过任意长度不计代价——标准编辑距离 DP，只是把首行/末行的边界条件从
+// "必须对齐到端点"换成"自由起点/自由终点"。跟 ovlVisualCharSimilarity（P87/P106 也在
+// 用，不能改）是两个不同的函数：那个是对称的整体相似度，这个是不对称的"pattern 是否
+// （基本未改动地）嵌在 text 的某处"。
+function ovlVisualFitAlignSimilarity(pattern, text) {
+    const p0 = String(pattern == null ? '' : pattern);
+    const t0 = String(text == null ? '' : text);
+    if (!p0.length || !t0.length) return 0;
+    let p = p0, t = t0;
+    if (p.length * t.length > 4000000) { p = p.slice(0, 2000); t = t.slice(0, 2000); }
+    const n = p.length, m = t.length;
+    let prev = new Array(m + 1).fill(0); // 自由起点：text 前面跳过任意字符不计代价
+    for (let i = 1; i <= n; i++) {
+        const cur = new Array(m + 1);
+        cur[0] = i;
+        for (let j = 1; j <= m; j++) {
+            const cost = p[i - 1] === t[j - 1] ? 0 : 1;
+            cur[j] = Math.min(prev[j - 1] + cost, prev[j] + 1, cur[j - 1] + 1);
+        }
+        prev = cur;
+    }
+    let best = prev[0];
+    for (let j = 1; j <= m; j++) if (prev[j] < best) best = prev[j]; // 自由终点
+    return 1 - best / n;
 }
 // maskedSrc：发给模型的遮罩后英文原文；rawBody：模型返回、trim 后、还没解遮罩的文本。
-// 去空白后完全相等 = 最强信号，直接判定为回显。
-//
-// v2 Pass P113 校准（诊断机制③"精细扫描"结果）：旧版剩下那条分支纯看字符级编辑距离相似度，
-// 跟译文里有没有中文字符完全无关——这是问题所在，不是它本来的设计意图（P81 背景注释原话
-// 是"防止模型整段一字不译地回显"）。实测发现：一旦模型做出任何像样的翻译动作（哪怕只翻了
-// 一小段），相似度就会因为中文/英文字符逐字符必然不相等而断崖式跌破阈值，"放行"本来就是
-// 编辑距离算法的必然副作用，不是谁设计出来的行为——这里把它改写成显式、可解释的规则：
-// 译文剥掉上面那层元注释包装后只要还含有中文字符，就说明模型确实动过手，不管译得完不完整，
-// 都不归"回显"这个守卫管（"翻译不完整/敷衍翻译"是另一类问题——漏译，不该由这道守卫承担）。
-// 只有剥掉包装后仍不含中文字符、且跟源文本编辑距离相似度仍然很高时，才判定为"换了个方式
-// 回显"（比如只做了无关痛痒的改写但完全没有翻译成中文，或者整段回显外面套了句包装），
-// 继续沿用原有阈值——相似度这一步比较的也是剥掉包装之后的文本（bStripped），不是带着包装
-// 的原文：包装词的长度是固定的（"以下是翻译结果：…（完）"这类大约 10 个字），对短句子而言
-// 这几个字占的比例不小，如果拿带包装的原文去跟源文本比编辑距离，短句子会被这几个字的
-// "稀释"拖到阈值以下、反而漏判——剥掉包装后再比，包装词本身完全不影响判定，只看"刨去
-// 包装，剩下的到底是不是照抄"。
 function ovlVisualIsEchoFailure(maskedSrc, rawBody) {
-    const a = ovlVisualNormalizeForEcho(maskedSrc);
-    const b = ovlVisualNormalizeForEcho(rawBody);
-    if (!a || !b) return false; // 空值交给已有的其它校验路径处理，不归这个守卫管
-    if (a === b) return true;
-    const bStripped = ovlVisualNormalizeForEcho(ovlVisualStripEchoWrapper(rawBody));
-    if (ovlVisualHasCjk(bStripped)) return false; // 剥掉元注释包装后仍有中文——真翻译，放行
-    return ovlVisualCharSimilarity(a, bStripped || b) >= OVL_VISUAL_ECHO_SIMILARITY_THRESHOLD;
+    const rawA = ovlVisualNormalizeForEcho(maskedSrc);
+    const rawB = ovlVisualNormalizeForEcho(rawBody);
+    if (!rawA || !rawB) return false; // 空值交给已有的其它校验路径处理，不归这个守卫管
+    if (rawA === rawB) return true; // 去空白后逐字节相同——最强信号，直接判回显
+    const proseIn = ovlVisualNormalizeProse(ovlVisualExtractProse(maskedSrc));
+    const proseOut = ovlVisualNormalizeProse(ovlVisualExtractProse(rawBody));
+    if (!proseIn) return false; // 剥完掩码/命令后原文本来就没有散文可比，不归这个守卫管
+    if (proseOut === proseIn) return true;
+    const similarity = ovlVisualFitAlignSimilarity(proseIn, proseOut);
+    if (similarity < OVL_VISUAL_ECHO_SIMILARITY_THRESHOLD) return false; // 内容实质不同，不是回显
+    const cjk = ovlVisualCountCjk(proseOut);
+    const wrapBudget = Math.max(0, proseOut.length - proseIn.length); // 译文比原文多出来的"包装预算"
+    return !(cjk > wrapBudget); // 中文没超预算=全是装饰纸，判回显；超了=核心内容真的被换过，放行
 }
 // v2 Pass P101（组1 list_block_status 需要）：翻译失败的具体原因（回显守卫拦截 vs 其它失败）
 // 在这之前只打印到 console.error + 一次性 toast，DOM 上只留了一个笼统的 data-ovl-trans-failed，
@@ -29078,6 +29113,77 @@ function ovlVisualEchoToastOnce() {
     } catch (e) {}
 }
 
+// ==================== v2 Pass P113c：equation 内 \text{}/\textrm{}/\mbox{} 散文翻译 ====================
+// 背景（核验 .claude/tmp/p113_verify.md 问题2）：xportMask 把整个数学环境（equation/cases/…）
+// 当一个不透明 token 整体抽走，LaTeX 里专门用来在数学模式里插入普通文字的 \text{}/\textrm{}/
+// \mbox{} 命令——里面包着的英文散文——被一并吞掉，模型从未见过这段文字，"无可译内容"的
+// 判定和进度文案因此对这些块撒谎（真实 DeepLaDu 550 块产物普查：76 个"豁免"块里有 5 个
+// 其实是这种情况，全文另有 10 处落在非豁免块里、同样被悄悄留成英文）。
+// 做法：在 xportMask 介入之前，把顶层 \text/\textrm/\mbox{...} 整体换成一个不参与主翻译
+// 流程的哨兵（ovlVisualTextProseExtract）——数学环境该怎么被 xportMask 整体吞成 [[N]] 还
+// 怎么吞（不动 xportMask 一行代码，风险最低），哨兵会原样躺在被吞走的那个占位符字符串
+// 内部，随主流程的掩码/解掩码逐字节往返；抽出来的散文单独用一次性的小请求翻译
+// （ovlVisualTranslateTextProseFragment，复用同一套 xportMask/xportUnmask/xportBlockOk/
+// 回显守卫——天然支持散文里嵌 $i$ 这类简单内联数学，不需要另起一套掩码方案），译完最后
+// 一步把哨兵换回 \text{译文}，公式其余部分逐字节不动。任何一步失败（模型调用异常、回显、
+// 完整性校验不过）都保守回退成原始英文散文，不阻断整块翻译、不抛异常。
+function ovlVisualTextProseToken(k) { return '〖〖OVLTP' + k + '〗〗'; }
+// 用 xportMatchBrace（跟 xportMask 自己用的是同一个函数）做正确的花括号深度匹配，天然
+// 支持 \text{...} 内容里嵌套花括号（比如 \text{a \emph{b} c}）；配不平（截断/写坏的 LaTeX）
+// 就放过不抽，原样留在文本里——不比现状更差，只是这一处退回"没抽出来"，不是新增风险。
+function ovlVisualTextProseExtract(text) {
+    const src = String(text == null ? '' : text);
+    const n = src.length;
+    let out = '';
+    let i = 0;
+    const items = []; // { sentinel, prose, cmd }
+    while (i < n) {
+        if (src[i] === '\\') {
+            const cm = /^\\(text|textrm|mbox)\{/.exec(src.slice(i, i + 10));
+            if (cm) {
+                const braceOpen = i + cm[0].length - 1;
+                const braceEnd = xportMatchBrace(src, braceOpen, 4000);
+                if (braceEnd !== -1) {
+                    const prose = src.slice(braceOpen + 1, braceEnd - 1);
+                    if (prose.trim()) {
+                        const k = items.length + 1;
+                        const sentinel = ovlVisualTextProseToken(k);
+                        items.push({ sentinel: sentinel, prose: prose, cmd: cm[1] });
+                        out += sentinel;
+                        i = braceEnd;
+                        continue;
+                    }
+                }
+            }
+        }
+        out += src[i]; i++;
+    }
+    return { text: out, items: items };
+}
+// 单独翻译一段从 \text{} 里抽出来的短散文——复用生产翻译原语同一套掩码/校验/回显守卫，
+// 不新写一套。任何一步不满意（无真实变化/完整性校验不过/模型调用异常）都保守返回原文，
+// 让调用方原样把英文塞回 \text{}——不比现状（这段文字以前完全没送到模型面前）更差。
+async function ovlVisualTranslateTextProseFragment(prose, config, signal) {
+    const src = String(prose == null ? '' : prose);
+    if (!src.trim()) return src;
+    const masked = xportMask(src);
+    if (ovlVisualNothingToTranslate(masked.text)) return src; // 剥完内联数学后一个字都不剩（罕见）
+    const prompt = '你是学术论文翻译助手，把下面这个从 LaTeX 数学环境的 \\text{} 命令里取出的英文'
+        + '短语翻译成简体中文学术书面语。硬性规则：\n'
+        + '1) 文本中所有形如 [[数字]] 的占位符必须原样保留在译文里、不得翻译、不得增删、不得改动'
+        + '方括号或数字——它们代表被抽走的内联数学/命令。\n'
+        + '2) 只输出翻译结果本身，不要添加任何解释、前后缀、引号或 Markdown 代码块标记。\n'
+        + '3) 必须真正翻译成中文——禁止原样照抄或复述英文原文。\n\n'
+        + '原文：\n' + masked.text;
+    let raw;
+    try { raw = await callModelPlainText(prompt, config, signal); } catch (e) { return src; }
+    const body = (typeof raw === 'string') ? raw.trim() : '';
+    if (!body) return src;
+    if (ovlVisualIsEchoFailure(masked.text, body)) return src;
+    if (!xportBlockOk(body, masked.map)) return src;
+    return xportUnmask(body, masked.map);
+}
+
 // ---- 单块翻译：代码层掩码 -> 公式/引用层掩码 -> 调模型 -> 两层各自校验 -> 两层各自还原 ----
 // 契约：纯公式/纯代码块（两层掩码后没有可翻的字）原样返回，不占请求，这是本函数内**唯一**
 // 会把"没有真正翻译"当成功返回的路径（meta.skipped=true，见下）。除此之外的任何失败——
@@ -29102,7 +29208,9 @@ function ovlVisualEchoToastOnce() {
 // 供进度提示如实报告"K 个块跳过（纯公式/代码）"，不再跟"真正翻译成功"混为一谈。选块的
 // 逻辑本身（ovlVisualLangCollectPending）不按块类型过滤，table/algorithm/figure/数学
 // 环境全部一样正常入队；两层掩码后一个字都不剩，本来就没有自然语言可译，现在才是本函数内
-// 真正唯一一条"返回值等于原文但算作成功"的路径。
+// 真正唯一一条"返回值等于原文但算作成功"的路径——v2 Pass P113c 起，这条路径额外要求块里
+// 也没有抽出任何 \text{} 散文（见 meta.textProseHandled/meta.partialTextProse：块里有
+// \text{} 散文时，即使主体（数学/代码）本身两层掩码后没有可翻的字，也不再算"跳过"，见下）。
 async function ovlVisualTranslateBlockText(text, config, signal, meta) {
     // v2 Pass P108：翻译也是一次"实质操作"，标记当前项目为最近（去抖，不影响本函数的返回
     // 值/时序——发生在真正开始翻译逻辑之前，纯 fire-and-forget）。
@@ -29110,44 +29218,68 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta) {
     const src = String(text == null ? '' : text);
     if (!src.trim()) return src;
     const codeMasked = ovlVisualCodeMask(src);
-    const masked = xportMask(codeMasked.text);
-    if (ovlVisualNothingToTranslate(masked.text)) { if (meta) meta.skipped = true; return src; }
-    // v2 Pass P103：项目术语表注入（用户批准清单第 6 项）。这个 prompt 是 callModelPlainText
-    // 四家 provider 共用的同一份字符串（callModelPlainText 内部按 config.provider 分发到
-    // callLocalLLM/callOpenAIAPI/callClaudeAPI/callGeminiAPI），任务书原话"若 Claude 翻译
-    // 路径的 prompt 在禁区内，则术语注入只作用于本地路径并如实记录"——这里主动收窄成只在
-    // config.provider==='local' 时才拼这一段：Claude/OpenAI/Gemini 收到的 prompt 字节跟
-    // P103 之前逐字节相同（不引入行为变化），且绝不触碰 callClaudeAPI 函数体本身。
-    const glossaryBlock = (config && config.provider === 'local') ? ovlGlossaryBuildPromptBlock() : '';
-    const prompt = '你是学术论文翻译助手，把下面的 LaTeX 片段翻译成简体中文学术书面语。硬性规则：\n'
-        + '1) 文本中所有形如 [[数字]] 的占位符必须原样保留在译文里、不得翻译、不得增删、不得改动方括号或数字——'
-        + '它们代表被抽走的公式/引用/命令，请把每一个都当成一个不可拆分的单词对待，直接嵌进对应的译文位置。\n'
-        + '2) 文本中所有形如 〔〔OVLCODE数字〕〕 的占位符同样必须原样保留在译文里、不得翻译、不得增删、'
-        + '不得改动括号或数字——它们代表被抽走的代码/伪代码/逐字环境，请把每一个都当成一个不可拆分的'
-        + '单词对待，直接嵌进对应的译文位置。\n'
-        + '3) 只输出翻译结果本身，不要添加任何解释、前后缀、引号或 Markdown 代码块标记。\n'
-        + '4) 保持原文的意思和语气，译成通顺准确的简体中文学术书面语。\n'
-        + '5) 必须真正翻译成中文——禁止原样照抄或复述英文原文，译文里的自然语言部分不应包含未翻译的'
-        + '英文单词或句子（专有名词、缩写、变量名等确实无法翻译的除外）。\n\n'
-        + glossaryBlock
-        + '原文：\n' + masked.text;
-    const raw = await callModelPlainText(prompt, config, signal);
-    const body = (typeof raw === 'string') ? raw.trim() : '';
-    if (ovlVisualIsEchoFailure(masked.text, body)) {
-        ovlVisualEchoToastOnce();
-        throw new Error('翻译结果与原文几乎相同，判定为未翻译成功（回显防毒守卫拦截）');
+    // v2 Pass P113c：先把顶层 \text/\textrm/\mbox{} 散文抽走，避免被下面 xportMask 的数学
+    // 环境整体掩码吞掉、永远送不到模型面前（见本函数上方大注释）。绝大多数块没有这类命令，
+    // ovlVisualTextProseExtract 对它们是空操作（items.length===0），逐字节不影响现有行为。
+    const textProseMasked = ovlVisualTextProseExtract(codeMasked.text);
+    const masked = xportMask(textProseMasked.text);
+    const mainNothing = ovlVisualNothingToTranslate(masked.text);
+    if (mainNothing && !textProseMasked.items.length) { if (meta) meta.skipped = true; return src; }
+    let afterCodeUnmask;
+    if (mainNothing) {
+        // 主体（数学/代码）确实没有可译内容，但抽出了 \text{} 散文——只翻这部分，主体
+        // 原样返回，不为空转的主体占一次整块翻译请求，也不当"回显/完整性校验失败"处理。
+        afterCodeUnmask = ovlVisualCodeUnmask(textProseMasked.text, codeMasked.map);
+        if (meta) meta.partialTextProse = true; // 供进度文案跟"纯跳过"区分开，见调用方
+    } else {
+        // v2 Pass P103：项目术语表注入（用户批准清单第 6 项）。这个 prompt 是 callModelPlainText
+        // 四家 provider 共用的同一份字符串（callModelPlainText 内部按 config.provider 分发到
+        // callLocalLLM/callOpenAIAPI/callClaudeAPI/callGeminiAPI），任务书原话"若 Claude 翻译
+        // 路径的 prompt 在禁区内，则术语注入只作用于本地路径并如实记录"——这里主动收窄成只在
+        // config.provider==='local' 时才拼这一段：Claude/OpenAI/Gemini 收到的 prompt 字节跟
+        // P103 之前逐字节相同（不引入行为变化），且绝不触碰 callClaudeAPI 函数体本身。
+        const glossaryBlock = (config && config.provider === 'local') ? ovlGlossaryBuildPromptBlock() : '';
+        const prompt = '你是学术论文翻译助手，把下面的 LaTeX 片段翻译成简体中文学术书面语。硬性规则：\n'
+            + '1) 文本中所有形如 [[数字]] 的占位符必须原样保留在译文里、不得翻译、不得增删、不得改动方括号或数字——'
+            + '它们代表被抽走的公式/引用/命令，请把每一个都当成一个不可拆分的单词对待，直接嵌进对应的译文位置。\n'
+            + '2) 文本中所有形如 〔〔OVLCODE数字〕〕 的占位符同样必须原样保留在译文里、不得翻译、不得增删、'
+            + '不得改动括号或数字——它们代表被抽走的代码/伪代码/逐字环境，请把每一个都当成一个不可拆分的'
+            + '单词对待，直接嵌进对应的译文位置。\n'
+            + '3) 只输出翻译结果本身，不要添加任何解释、前后缀、引号或 Markdown 代码块标记。\n'
+            + '4) 保持原文的意思和语气，译成通顺准确的简体中文学术书面语。\n'
+            + '5) 必须真正翻译成中文——禁止原样照抄或复述英文原文，译文里的自然语言部分不应包含未翻译的'
+            + '英文单词或句子（专有名词、缩写、变量名等确实无法翻译的除外）。\n\n'
+            + glossaryBlock
+            + '原文：\n' + masked.text;
+        const raw = await callModelPlainText(prompt, config, signal);
+        const body = (typeof raw === 'string') ? raw.trim() : '';
+        if (ovlVisualIsEchoFailure(masked.text, body)) {
+            ovlVisualEchoToastOnce();
+            throw new Error('翻译结果与原文几乎相同，判定为未翻译成功（回显防毒守卫拦截）');
+        }
+        if (!xportBlockOk(body, masked.map)) {
+            throw new Error('翻译结果未通过完整性校验（占位符或公式被改动）');
+        }
+        const afterXport = xportUnmask(body, masked.map);
+        if (!ovlVisualCodeCheck(afterXport, codeMasked.map)) {
+            // v2 Pass P113 返修（问题3）：不再回退返回原文——那条路会被调用方当"翻译成功"落地
+            // 并写进缓存（详见本函数上方大注释）。改成跟 xportBlockOk 一样直接 throw，走统一的
+            // 失败标记/不入缓存/可见重试角标路径。
+            throw new Error('翻译结果未通过完整性校验（代码/逐字环境哨兵残留或数量不匹配）');
+        }
+        afterCodeUnmask = ovlVisualCodeUnmask(afterXport, codeMasked.map);
     }
-    if (!xportBlockOk(body, masked.map)) {
-        throw new Error('翻译结果未通过完整性校验（占位符或公式被改动）');
+    // v2 Pass P113c：回填 \text{} 散文译文——无论主体走的是上面哪条分支都要做。逐个把
+    // 哨兵换回 \text{译文}（或 \textrm{}/\mbox{}，看原来是哪个命令），公式其余部分不变。
+    if (textProseMasked.items.length) {
+        for (const item of textProseMasked.items) {
+            let translated = item.prose;
+            try { translated = await ovlVisualTranslateTextProseFragment(item.prose, config, signal); } catch (e) {}
+            afterCodeUnmask = afterCodeUnmask.split(item.sentinel).join('\\' + item.cmd + '{' + translated + '}');
+        }
+        if (meta) meta.textProseHandled = textProseMasked.items.length;
     }
-    const afterXport = xportUnmask(body, masked.map);
-    if (!ovlVisualCodeCheck(afterXport, codeMasked.map)) {
-        // v2 Pass P113 返修（问题3）：不再回退返回原文——那条路会被调用方当"翻译成功"落地
-        // 并写进缓存（详见本函数上方大注释）。改成跟 xportBlockOk 一样直接 throw，走统一的
-        // 失败标记/不入缓存/可见重试角标路径。
-        throw new Error('翻译结果未通过完整性校验（代码/逐字环境哨兵残留或数量不匹配）');
-    }
-    return ovlVisualCodeUnmask(afterXport, codeMasked.map);
+    return afterCodeUnmask;
 }
 
 // ==================== v2 Pass P63（H5/H6）：中文 -> 英文回译 ====================
@@ -29675,11 +29807,20 @@ async function ovlVisualLangRunQueue() {
             if (!queue.length) return;
             const el = queue[0];
             el.removeAttribute('data-ovl-trans-pending');
+            // v2 Pass P113c（核验 .claude/tmp/p113_verify.md 次要2）：从"摘掉 pending"到下面
+            // "done++"之间要 await 一次真实网络往返，这段窗口里这块块既不再算 pending、也还
+            // 没算 done——ovlVisualLangSyncAfterRender 如果恰好在这个窗口里被别处触发
+            // （比如另一路径又调了一次整篇重渲染），会把这块也数进"已完成"（total-pending），
+            // 之后这里的 done++ 再补一次，就重复计了（实测 {total:8,done:9/11}）。打一个
+            // "在途"标记，同一个窗口内让 ovlVisualLangSyncAfterRender 的重算把它排除在外——
+            // 见下面 ovlVisualLangSyncAfterRender 里的 inflight 一起用。
+            el.setAttribute('data-ovl-trans-inflight', '1');
             const text = ovlVisualBlockSrcText(el);
-            if (text == null || !text.trim()) continue;
+            if (text == null || !text.trim()) { el.removeAttribute('data-ovl-trans-inflight'); continue; }
             const meta = {}; // v2 Pass P113：接住"两层掩码后无可翻内容"这条显式豁免信号
             try {
                 const tgt = await ovlVisualTranslateBlockText(text, cfg, controller.signal, meta);
+                el.removeAttribute('data-ovl-trans-inflight');
                 if (mySeq !== OvlVisualLangState.seq) return; // 陈旧响应（已切走/已取消），丢弃不落地
                 try { ovlVisualTransCachePut(text, cfg, tgt, fixedProjectId, meta.skipped); } catch (e) {} // v2 Pass P113 返修（问题2）：跟着译文一起落盘 skipped 标记
                 if (document.body.contains(el)) {
@@ -29708,11 +29849,12 @@ async function ovlVisualLangRunQueue() {
                         ovlRenderVisualGutter();
                     }
                 }
-                OvlVisualLangState.done++;
+                OvlVisualLangState.done = Math.min(OvlVisualLangState.total, OvlVisualLangState.done + 1); // 钳制：双保险，见下方 inflight 才是根治
             } catch (err) {
+                el.removeAttribute('data-ovl-trans-inflight');
                 if (err && err.name === 'AbortError') return;
                 console.error('[ovl] visual block translate failed', err);
-                OvlVisualLangState.done++;
+                OvlVisualLangState.done = Math.min(OvlVisualLangState.total, OvlVisualLangState.done + 1);
                 if (document.body.contains(el)) {
                     el.setAttribute('data-ovl-trans-failed', '1');
                     el.setAttribute('data-ovl-trans-fail-reason', ovlVisualTransFailReason(err)); // v2 Pass P101：供 list_block_status 区分"回显守卫拦截"
@@ -29739,8 +29881,15 @@ function ovlVisualLangSyncAfterRender() {
     if (!pane) return;
     const total = pane.querySelectorAll('.ovl-visual-block').length;
     const pending = pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-pending="1"]').length;
+    // v2 Pass P113c（核验 .claude/tmp/p113_verify.md 次要2，done>total 计数窗口）：worker
+    // 摘掉 pending 到真正 done++ 之间有一次 await，那段窗口里的块既不是 pending 也还不是
+    // done——只减 pending 会把它错数成"已完成"，等 worker 那头的 done++ 真的落地，就比
+    // 应有值多算一次（实测 {total:8,done:9}/{total:8,done:11}）。inflight 是 worker 在那段
+    // 窗口内显式打的标记，这里一并减掉，让 done 只数"真的已经落地"的块；Math.max 兜底防止
+    // 极端时序下减出负数。
+    const inflight = pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-inflight="1"]').length;
     OvlVisualLangState.total = total;
-    OvlVisualLangState.done = total - pending;
+    OvlVisualLangState.done = Math.max(0, total - pending - inflight);
     ovlVisualLangProgressUpdate();
     if (pending > 0) ovlVisualLangRunQueue();
 }
