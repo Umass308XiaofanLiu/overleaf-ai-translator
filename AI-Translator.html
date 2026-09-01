@@ -4172,7 +4172,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.03.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.03.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -20296,7 +20296,7 @@ async function chatAgentExecRetranslateBlock(args, signal, pending) {
         return { ok: false, uiSummary: label + ' 失败', uiDetail: msg, textForModel: msg, bytes: 0 };
     }
 
-    try { ovlVisualTransCachePut(srcLatex, cfg, newTgt); } catch (e) {}
+    try { ovlVisualTransCachePut(srcLatex, cfg, newTgt, null, meta.skipped); } catch (e) {} // v2 Pass P113 返修（问题2）：跟着译文一起落盘 skipped 标记
     el.removeAttribute('data-ovl-trans-pending');
     el.removeAttribute('data-ovl-trans-failed');
     el.removeAttribute('data-ovl-trans-fail-reason'); // v2 Pass P101：重译成功，清掉旧失败原因标记
@@ -28551,7 +28551,11 @@ function ovlVisualLoadFigureThumbnails(root) {
 // lang: 'original' | 'zh'；seq: 每次切换/取消都 ++，worker 循环拿旧 seq 的响应一律丢弃；
 // controller: 当前这一批后台翻译共用的 AbortSignal 来源；running: 调度器是不是已经在跑，
 // 避免同一时刻起两组并发 worker。
-const OvlVisualLangState = { lang: 'original', seq: 0, controller: null, running: false, total: 0, done: 0 };
+// v2 Pass P113 返修（问题5）：adhocControllers 装的是"批量懒翻译队列之外"单独发起的翻译
+// 请求各自的 AbortController（目前只有 ovlVisualBlockRetryClick 一个来源）——批量队列自己
+// 的 controller 字段管的是那一批 worker 共用的一个 controller，跟单块请求不是同一回事，
+// 不能塞进同一个字段里互相覆盖。ovlVisualLangCancelInFlight 统一处理这两类。
+const OvlVisualLangState = { lang: 'original', seq: 0, controller: null, running: false, total: 0, done: 0, adhocControllers: [] };
 
 // ---- 缓存：源码块哈希 + 语言 + provider/model -> 译文 ----
 // 32 位 FNV-1a 起手 + 一个简单的第二哈希叠加，纯粹是为了在字符串很短时也不至于经常撞
@@ -28761,7 +28765,18 @@ function ovlVisualTransCacheKey(text, config) {
 // 不传就退化成原来的"现读 #ovlProjectPathInput"（兼容其它零散调用点，比如整篇翻译路径），
 // 不改变它们的既有行为。根因：懒翻译请求跨越一次真实网络往返，期间用户完全可能切换项目——
 // 落地时如果现读 projectId，译文会被写进切换后的新项目缓存桶，而不是它实际所属的旧项目桶。
-function ovlVisualTransCacheGet(text, config, projectIdOverride) {
+// v2 Pass P113 返修（核验 p113_verify.md 问题2，阻断回归）：ovlVisualTransCacheGet 原来
+// 只回传译文字符串，"这块是不是豁免（纯公式/代码，没有真正翻译）"这个信号在缓存里从来没
+// 存过——worker 第一次翻译时确实在 DOM 上打了 data-ovl-trans-skipped，但那只是当次渲染的
+// 副作用；下一次整篇重渲染（切编辑器模式/改断行开关/编辑源码都会触发 ovlVisualRender）
+// 命中缓存直接吐译文，属性没人补打，进度提示现从 DOM 数标记就把这块当"正常翻译成功"，
+// skipN 归零、整条提示静默隐藏——用户实测（真实 DeepLaDu 550 块产物）复现：队列刚跑完
+// "已翻译474/550，76个块跳过"，跑一次 ovlVisualRender() 后就变成 hidden=true。
+// 修法：缓存条目本身多存一个 skipped 标记，跟译文一起落盘/一起回放——ovlVisualTransCacheGet
+// 保持原有签名（只回传字符串，两个既有调用点 ovlVisualRenderBlockContent/inlineZhSave 的
+// enText 读取都不需要这层信息，不动它们），新增 ovlVisualTransCacheGetMeta 内部实现，
+// Get 委托给它取 .tgt，避免两份查找逻辑分叉。
+function ovlVisualTransCacheGetMeta(text, config, projectIdOverride) {
     try {
         const projectId = projectIdOverride || ovlVisualTransCacheProjectId();
         const key = ovlVisualTransCacheKey(text, config);
@@ -28773,24 +28788,34 @@ function ovlVisualTransCacheGet(text, config, projectIdOverride) {
                 hit.ts = now;
                 if (ovlVisualTransCacheSaveBucket(projectId, map)) ovlVisualTransCacheIndexTouch(projectId);
             }
-            return hit.tgt;
+            return { tgt: hit.tgt, skipped: !!hit.skipped };
         }
         // 新桶未命中——查一次旧版全局缓存兜底，命中就提升进新桶（不删旧的、旧的不再增长）。
+        // 旧版缓存条目本来就没有 skipped 字段（早于 P113），提升时用 !!undefined = false，
+        // 逐字节兼容旧数据。
         const legacy = ovlVisualTransCacheLegacyLoad();
         const legacyHit = legacy[key];
         if (legacyHit && typeof legacyHit.tgt === 'string') {
-            ovlVisualTransCachePut(text, config, legacyHit.tgt, projectId);
-            return legacyHit.tgt;
+            ovlVisualTransCachePut(text, config, legacyHit.tgt, projectId, legacyHit.skipped);
+            return { tgt: legacyHit.tgt, skipped: !!legacyHit.skipped };
         }
     } catch (e) {}
     return null;
 }
-function ovlVisualTransCachePut(text, config, tgt, projectIdOverride) {
+// 命中返回译文字符串，未命中返回 null——不携带 skipped 信息，只想要译文正文的调用点
+// （ovlVisualRenderBlockContent 之外的其它调用点，比如就地编辑读缓存）继续用这个。
+function ovlVisualTransCacheGet(text, config, projectIdOverride) {
+    const meta = ovlVisualTransCacheGetMeta(text, config, projectIdOverride);
+    return meta ? meta.tgt : null;
+}
+// skipped：这条译文是不是"两层掩码后无可翻内容"的豁免路径产出的（跟 ovlVisualTranslateBlockText
+// 的 meta.skipped 同一个语义）——跟译文一起落盘，读缓存那一侧才有信息可以照实回放属性。
+function ovlVisualTransCachePut(text, config, tgt, projectIdOverride, skipped) {
     try {
         const projectId = projectIdOverride || ovlVisualTransCacheProjectId();
         const key = ovlVisualTransCacheKey(text, config);
         const map = ovlVisualTransCacheBucketLoad(projectId);
-        map[key] = { tgt: tgt, ts: Date.now() };
+        map[key] = { tgt: tgt, ts: Date.now(), skipped: !!skipped };
         ovlVisualTransCacheEvictToBudget(map, OVL_VISUAL_TRANS_CACHE_PROJECT_BUDGET_CHARS);
         if (ovlVisualTransCacheSaveBucket(projectId, map)) {
             ovlVisualTransCacheIndexTouch(projectId);
@@ -28980,6 +29005,27 @@ const OVL_VISUAL_ECHO_SIMILARITY_THRESHOLD = 0.92;
 function ovlVisualHasCjk(s) {
     return /[一-鿿]/.test(String(s == null ? '' : s));
 }
+// v2 Pass P113 返修（核验 p113_verify.md 问题1，阻断回归）：ovlVisualHasCjk 原样当"放行"的
+// 充分条件，挡不住真实小模型最常见的失败形态之一——整段英文原样照抄，外面套一句"译文："
+// 或"以下是翻译结果：…（完）"这类元注释——这类包装词恰好靠"含中文=放行"混进去，被当成
+// 翻译成功永久写进缓存（实测：block DOM latin=226/cjk=2，99% 仍是英文）。
+// 本想直接照诊断报告"修复要点"第3条的建议、复用 chatAgentQaLatinRatio 补一道拉丁占比检测，
+// 但实测验证发现这条路走不通：占比统计天然分不开"整段回显+8字元注释包装"（拉丁占比约99%）
+// 和 P113 自己刻意要放行的校准边界 G5/PROBELEGIT007"高相似度译文里只换了1个字符"（拉丁
+// 占比同样约99%）——两者在字符统计上几乎是同一个数字，任何统一阈值要么两个都拦、要么两个
+// 都放，没有中间地带。真正能分开的信号不是"中文字符有多少个"，而是"这句中文是不是真的
+// 嵌在正文里"：元注释固定长在整段最前/最后、且是一句独立的"声明式"短语（"XX："或"（XX）"
+// 这种形状），跟嵌进句子中间替换掉原文内容的真翻译在结构上不同。这里只剥掉这一类已被证实
+// 存在的元注释包装（不是泛泛猜"漏译"——"翻译不完整/敷衍翻译"这一层诊断报告本来就划给
+// translation_qa_scan 的拉丁占比启发式，那是只读扫描、不阻断翻译流程，见该函数上方大注释），
+// 剥完之后如果连一个汉字都不剩，说明中文只是包装纸，交给下面已有的相似度判定去拦；剥完
+// 之后仍有汉字（比如 G9：真实译文恰好也用"译文："开头当 label，但 label 之后是完整的中文
+// 正文），说明模型确实翻了，照样放行，不会矫枉过正。
+const OVL_VISUAL_ECHO_PREAMBLE_RE = /^[\s　]*(?:以下(?:是|为)(?:的)?(?:翻译结果|译文)|译文如下|翻译如下|中文翻译|中文译文|翻译结果|译文)[\s　]*[:：][\s　]*/;
+const OVL_VISUAL_ECHO_POSTAMBLE_RE = /[\s　]*[（(][\s　]*(?:完|译完|翻译完|翻译完成|全文完|结束)[\s　]*[)）][\s　]*$/;
+function ovlVisualStripEchoWrapper(s) {
+    return String(s == null ? '' : s).replace(OVL_VISUAL_ECHO_PREAMBLE_RE, '').replace(OVL_VISUAL_ECHO_POSTAMBLE_RE, '');
+}
 // maskedSrc：发给模型的遮罩后英文原文；rawBody：模型返回、trim 后、还没解遮罩的文本。
 // 去空白后完全相等 = 最强信号，直接判定为回显。
 //
@@ -28988,18 +29034,23 @@ function ovlVisualHasCjk(s) {
 // 是"防止模型整段一字不译地回显"）。实测发现：一旦模型做出任何像样的翻译动作（哪怕只翻了
 // 一小段），相似度就会因为中文/英文字符逐字符必然不相等而断崖式跌破阈值，"放行"本来就是
 // 编辑距离算法的必然副作用，不是谁设计出来的行为——这里把它改写成显式、可解释的规则：
-// 译文只要含有中文字符，就说明模型确实动过手，不管译得完不完整，都不归"回显"这个守卫管
-// （"翻译不完整/敷衍翻译"是另一类问题——漏译，不该由这道守卫承担，参见诊断报告"修复要点"
-// 第3条：机制③的漏译面收窄需要另一层独立的拉丁字符占比检测，不是靠回显守卫顺带做）。
-// 只有译文完全不含中文字符、且跟源文本编辑距离相似度仍然很高时，才判定为"换了个方式回显"
-// （比如只做了无关痛痒的改写但完全没有翻译成中文），继续沿用原有阈值。
+// 译文剥掉上面那层元注释包装后只要还含有中文字符，就说明模型确实动过手，不管译得完不完整，
+// 都不归"回显"这个守卫管（"翻译不完整/敷衍翻译"是另一类问题——漏译，不该由这道守卫承担）。
+// 只有剥掉包装后仍不含中文字符、且跟源文本编辑距离相似度仍然很高时，才判定为"换了个方式
+// 回显"（比如只做了无关痛痒的改写但完全没有翻译成中文，或者整段回显外面套了句包装），
+// 继续沿用原有阈值——相似度这一步比较的也是剥掉包装之后的文本（bStripped），不是带着包装
+// 的原文：包装词的长度是固定的（"以下是翻译结果：…（完）"这类大约 10 个字），对短句子而言
+// 这几个字占的比例不小，如果拿带包装的原文去跟源文本比编辑距离，短句子会被这几个字的
+// "稀释"拖到阈值以下、反而漏判——剥掉包装后再比，包装词本身完全不影响判定，只看"刨去
+// 包装，剩下的到底是不是照抄"。
 function ovlVisualIsEchoFailure(maskedSrc, rawBody) {
     const a = ovlVisualNormalizeForEcho(maskedSrc);
     const b = ovlVisualNormalizeForEcho(rawBody);
     if (!a || !b) return false; // 空值交给已有的其它校验路径处理，不归这个守卫管
     if (a === b) return true;
-    if (ovlVisualHasCjk(b)) return false; // 含中文字符的输出一律放行——不归回显守卫管
-    return ovlVisualCharSimilarity(a, b) >= OVL_VISUAL_ECHO_SIMILARITY_THRESHOLD;
+    const bStripped = ovlVisualNormalizeForEcho(ovlVisualStripEchoWrapper(rawBody));
+    if (ovlVisualHasCjk(bStripped)) return false; // 剥掉元注释包装后仍有中文——真翻译，放行
+    return ovlVisualCharSimilarity(a, bStripped || b) >= OVL_VISUAL_ECHO_SIMILARITY_THRESHOLD;
 }
 // v2 Pass P101（组1 list_block_status 需要）：翻译失败的具体原因（回显守卫拦截 vs 其它失败）
 // 在这之前只打印到 console.error + 一次性 toast，DOM 上只留了一个笼统的 data-ovl-trans-failed，
@@ -29028,23 +29079,30 @@ function ovlVisualEchoToastOnce() {
 }
 
 // ---- 单块翻译：代码层掩码 -> 公式/引用层掩码 -> 调模型 -> 两层各自校验 -> 两层各自还原 ----
-// 契约：纯公式/纯代码块（两层掩码后没有可翻的字）原样返回，不占请求；xportBlockOk 校验
-// 不过直接 throw（沿用 P38 既有行为，调用方 ovlVisualLangRunQueue 会标记这一块失败、
-// 不写入缓存、不阻塞其它块）；本层新增的哨兵校验不过则不 throw——直接回退返回原文
-// 并 console.warn，因为这类失败的正确表现是"当作没翻译过"而不是"标记失败等重试"，
-// 绝不能把带哨兵残渣的文本显示给用户。P81 新增的回显守卫走的是"标记失败"这条路
-// （不是"回退原文"）——回显是模型没干活，不是"翻译完但某层哨兵没对上"，让它跟其它
-// 真失败一样进 data-ovl-trans-failed、不写缓存，用户能看见失败态、可以重试。
+// 契约：纯公式/纯代码块（两层掩码后没有可翻的字）原样返回，不占请求，这是本函数内**唯一**
+// 会把"没有真正翻译"当成功返回的路径（meta.skipped=true，见下）。除此之外的任何失败——
+// 回显守卫拦截、xportBlockOk 完整性校验不过、ovlVisualCodeCheck 哨兵校验不过——一律 throw
+// （调用方 ovlVisualLangRunQueue / chatAgentExecRetranslateBlock / ovlVisualBlockRetryClick
+// 统一标记这一块失败、不写入缓存、给出可见重试角标，用户能看见失败态、可以重试，不阻塞
+// 其它块）。
+// v2 Pass P113 返修（核验 p113_verify.md 问题3，阻断回归）：ovlVisualCodeCheck 这一支原来
+// 是"不 throw，回退返回原文并 console.warn"——本意是"当作没翻译过"，但调用方（worker/
+// 重译入口）并不知道这层区别，实际效果是把原样返回的英文当"翻译成功"落地：innerHTML 换成
+// 英文、ovlVisualTransCachePut 把英文永久写进缓存，跟真正的豁免路径（meta.skipped）在
+// DOM/进度/缓存上完全看不出区别（实测：adv.js MARKALGOC，stub 丢掉一个 OVLCODE 哨兵，
+// 新旧构建都 failed=false/skipped=null，缓存里存的就是英文原文）。真实小模型漏掉/改动
+// 〔〔OVLCODEk〕〕哨兵是常见事件——这是本函数曾经存在但没有被上面这段文档承认过的"第二条
+// 静默返回英文的路径"，现在跟 xportBlockOk 一样直接 throw，不再有例外。
 // v2 Pass P113（诊断机制①）：新增可选的第 4 个参数 meta——调用方（懒翻译队列 worker /
 // 块级强制重译入口）传一个空对象进来，函数会在"两层掩码后没有可翻的字"这条唯一合法的
 // 豁免路径上把 meta.skipped 置为 true 再返回。不传 meta（已有的三参数调用点，比如
 // test_p38/p39/p81/p103 里直接调用这个函数做纯函数断言）行为逐字节不变——这条豁免以前
 // 完全隐性：返回值和"翻译成功"长得一模一样，进度计数、缓存、DOM 上都看不出这块其实没有
 // 被模型翻译过。现在通过这个显式信号，调用方可以据此打 data-ovl-trans-skipped 属性，
-// 供进度提示如实报告"K 个块跳过（纯公式/代码）"，不再跟"真正翻译成功"混为一谈。这也是
-// 队列入队环节唯一允许的例外——选块的逻辑本身（ovlVisualLangCollectPending）不按块类型
-// 过滤，table/algorithm/figure/数学环境全部一样正常入队，唯一会被跳过实际翻译的只有这里：
-// 两层掩码后一个字都不剩，本来就没有自然语言可译。
+// 供进度提示如实报告"K 个块跳过（纯公式/代码）"，不再跟"真正翻译成功"混为一谈。选块的
+// 逻辑本身（ovlVisualLangCollectPending）不按块类型过滤，table/algorithm/figure/数学
+// 环境全部一样正常入队；两层掩码后一个字都不剩，本来就没有自然语言可译，现在才是本函数内
+// 真正唯一一条"返回值等于原文但算作成功"的路径。
 async function ovlVisualTranslateBlockText(text, config, signal, meta) {
     // v2 Pass P108：翻译也是一次"实质操作"，标记当前项目为最近（去抖，不影响本函数的返回
     // 值/时序——发生在真正开始翻译逻辑之前，纯 fire-and-forget）。
@@ -29084,8 +29142,10 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta) {
     }
     const afterXport = xportUnmask(body, masked.map);
     if (!ovlVisualCodeCheck(afterXport, codeMasked.map)) {
-        console.warn('[ovl] visual 中文模式：代码/逐字环境哨兵残留或数量不匹配，回退显示原文', src.slice(0, 120));
-        return src;
+        // v2 Pass P113 返修（问题3）：不再回退返回原文——那条路会被调用方当"翻译成功"落地
+        // 并写进缓存（详见本函数上方大注释）。改成跟 xportBlockOk 一样直接 throw，走统一的
+        // 失败标记/不入缓存/可见重试角标路径。
+        throw new Error('翻译结果未通过完整性校验（代码/逐字环境哨兵残留或数量不匹配）');
     }
     return ovlVisualCodeUnmask(afterXport, codeMasked.map);
 }
@@ -29358,14 +29418,18 @@ function ovlSplitVisualLines(blockText, blockStartLine) {
 // v2 Pass P38：一个块该渲染原文还是译文——lang!=='zh' 时逐字节沿用旧行为（原样渲染原文，
 // 保证"切回 Original 瞬时、不调模型"）；lang==='zh' 时先查缓存，命中直接渲译文，未命中就
 // 先渲原文占位（不留空白）并标 pending=true，交给 ovlVisualLangRunQueue() 后台补上。
+// v2 Pass P113 返修（问题2）：返回值多一个 skipped 字段——缓存命中且这条译文本来就是
+// "两层掩码后无可翻内容"的豁免路径产出的，调用方（下面 ovlVisualRenderBodyWithLines）据此
+// 重新打上 data-ovl-trans-skipped，跟首次翻译落地时打的是同一个属性、同一个语义，只是
+// 换了个信息来源（首次是 worker 的 meta.skipped，重渲染是缓存里存的 skipped 标记）。
 function ovlVisualRenderBlockContent(text) {
-    if (OvlVisualLangState.lang !== 'zh') return { html: ovlVisualRenderChunk(text), pending: false };
+    if (OvlVisualLangState.lang !== 'zh') return { html: ovlVisualRenderChunk(text), pending: false, skipped: false };
     try {
         const cfg = (typeof getApiConfig === 'function') ? getApiConfig() : null;
-        const cached = cfg ? ovlVisualTransCacheGet(text, cfg) : null;
-        if (cached != null) return { html: ovlVisualRenderChunk(cached), pending: false };
+        const meta = cfg ? ovlVisualTransCacheGetMeta(text, cfg) : null;
+        if (meta != null) return { html: ovlVisualRenderChunk(meta.tgt), pending: false, skipped: !!meta.skipped };
     } catch (e) {}
-    return { html: ovlVisualRenderChunk(text), pending: true };
+    return { html: ovlVisualRenderChunk(text), pending: true, skipped: false };
 }
 
 function ovlVisualRenderBodyWithLines(body, baseLine) {
@@ -29385,14 +29449,16 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
             // 黄色标记高亮、单击 PDF 跳转、查找跳转全靠它们，中文模式下也必须继续可用。
             const rc = ovlVisualRenderBlockContent(b.text);
             html += '<div class="ovl-visual-block" data-src-line="' + b.line + '" data-src-line-end="' + blockLineEnd
-                + '" data-para-start="1"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '') + '>' + rc.html + '</div>';
+                + '" data-para-start="1"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
+                + (rc.skipped ? ' data-ovl-trans-skipped="1"' : '') + '>' + rc.html + '</div>'; // v2 Pass P113 返修（问题2）
             continue;
         }
         for (let j = 0; j < subs.length; j++) {
             const sb = subs[j];
             const rc = ovlVisualRenderBlockContent(sb.text);
             html += '<div class="ovl-visual-block" data-src-line="' + sb.line + '" data-src-line-end="' + sb.lineEnd
-                + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '') + '>' + rc.html + '</div>';
+                + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
+                + (rc.skipped ? ' data-ovl-trans-skipped="1"' : '') + '>' + rc.html + '</div>'; // v2 Pass P113 返修（问题2）
         }
     }
     return html;
@@ -29529,6 +29595,14 @@ function ovlVisualLangCancelInFlight() {
         try { OvlVisualLangState.controller.abort(); } catch (e) {}
         OvlVisualLangState.controller = null;
     }
+    // v2 Pass P113 返修（问题5）：单块重试角标点击（ovlVisualBlockRetryClick）自己开的
+    // AbortController 不挂在上面这个共享 controller 上（那个只属于批量队列这一批），语言
+    // 切换/离开 Visual 时要跟着一起取消，否则用户点了重试角标又立刻切走语言，请求还在
+    // 后台白跑一次模型调用，且 seq 已经不等，回来的结果本来就会被丢弃，不如直接掐掉。
+    if (OvlVisualLangState.adhocControllers && OvlVisualLangState.adhocControllers.length) {
+        OvlVisualLangState.adhocControllers.forEach(function (c) { try { c.abort(); } catch (e) {} });
+        OvlVisualLangState.adhocControllers.length = 0;
+    }
     OvlVisualLangState.running = false;
 }
 
@@ -29607,7 +29681,7 @@ async function ovlVisualLangRunQueue() {
             try {
                 const tgt = await ovlVisualTranslateBlockText(text, cfg, controller.signal, meta);
                 if (mySeq !== OvlVisualLangState.seq) return; // 陈旧响应（已切走/已取消），丢弃不落地
-                try { ovlVisualTransCachePut(text, cfg, tgt, fixedProjectId); } catch (e) {}
+                try { ovlVisualTransCachePut(text, cfg, tgt, fixedProjectId, meta.skipped); } catch (e) {} // v2 Pass P113 返修（问题2）：跟着译文一起落盘 skipped 标记
                 if (document.body.contains(el)) {
                     el.innerHTML = ovlVisualRenderChunk(tgt);
                     if (meta.skipped) el.setAttribute('data-ovl-trans-skipped', '1'); // v2 Pass P113：跟"翻译成功"区分开，供进度提示如实报告
@@ -29762,17 +29836,37 @@ function ovlVisualRemoveRetryBadge(el) {
 //
 // P113 铁律：拒绝/失败结果绝不能写进缓存——下面只有 try 的成功分支才调用
 // ovlVisualTransCachePut，catch 分支完全不碰缓存，跟 worker/聊天工具的失败分支保持同一条纪律。
+//
+// v2 Pass P113 返修（核验 p113_verify.md 问题5，次要/并发面）：原实现缺三样东西，跟
+// ovlVisualLangRunQueue 的 worker（同一份翻译原语的另一个调用方）比起来不是同一条纪律：
+//   1. 没有 seq 陈旧性校验——单块重译跨一次真实网络往返，期间用户切语言/切回 Original
+//      会让 ovlVisualLangCancelInFlight() 把 seq++，这里以前对此一无所知，回来的结果照样
+//      当成"当前有效"写缓存/改 DOM。
+//   2. ovlVisualTransCachePut 没固定 projectId——现读当前项目，用户切完项目后回来，译文
+//      会被写进新项目的缓存桶而不是它实际所属的旧项目桶（worker 头部大注释讲过同一个坑，
+//      那边用 fixedProjectId 解决了，这个新入口没有跟上）。
+//   3. 不传 AbortSignal——请求发出后就算已经确定要丢弃结果，也没法真的取消掉那次网络调用。
+// 下面用跟 worker 相同的手法补齐：mySeq/fixedProjectId 在请求发出前固定住；自己开一个
+// AbortController 登记进 OvlVisualLangState.adhocControllers（ovlVisualLangCancelInFlight
+// 见上，语言切换时会一并 abort 掉）；await 回来先判 mySeq 有没有变，变了就直接丢弃，不碰
+// 缓存也不碰 DOM。
 async function ovlVisualBlockRetryClick(el) {
     if (!el || el.getAttribute('data-ovl-trans-retrying') === '1') return;
     const srcLatex = (typeof ovlVisualBlockSrcText === 'function') ? ovlVisualBlockSrcText(el) : null;
     if (srcLatex == null || !srcLatex.trim()) return;
     let cfg = null;
     try { cfg = getApiConfig(); } catch (e) { cfg = null; }
+    const mySeq = OvlVisualLangState.seq;
+    let fixedProjectId;
+    try { fixedProjectId = ovlVisualTransCacheProjectId(); } catch (e) { fixedProjectId = null; }
+    const controller = new AbortController();
+    OvlVisualLangState.adhocControllers.push(controller);
     el.setAttribute('data-ovl-trans-retrying', '1');
     try {
         const meta = {};
-        const tgt = await ovlVisualTranslateBlockText(srcLatex, cfg, null, meta);
-        try { ovlVisualTransCachePut(srcLatex, cfg, tgt); } catch (e) {}
+        const tgt = await ovlVisualTranslateBlockText(srcLatex, cfg, controller.signal, meta);
+        if (mySeq !== OvlVisualLangState.seq) return; // 陈旧响应（语言已切走/已取消），丢弃不落地
+        try { ovlVisualTransCachePut(srcLatex, cfg, tgt, fixedProjectId, meta.skipped); } catch (e) {}
         if (document.body.contains(el)) {
             el.removeAttribute('data-ovl-trans-failed');
             el.removeAttribute('data-ovl-trans-fail-reason');
@@ -29783,6 +29877,8 @@ async function ovlVisualBlockRetryClick(el) {
             if (typeof ovlRenderVisualGutter === 'function' && OvlState.editorMode === 'visual') ovlRenderVisualGutter();
         }
     } catch (err) {
+        if (err && err.name === 'AbortError') return; // 用户主动切走/取消，静默丢弃，不算失败
+        if (mySeq !== OvlVisualLangState.seq) return; // 陈旧错误同样丢弃，不往已经切走的上下文报失败
         if (document.body.contains(el)) {
             el.setAttribute('data-ovl-trans-failed', '1');
             el.setAttribute('data-ovl-trans-fail-reason', ovlVisualTransFailReason(err));
@@ -29792,6 +29888,8 @@ async function ovlVisualBlockRetryClick(el) {
             showToast('重新翻译失败：' + ((err && err.message) || String(err)), 'error');
         }
     } finally {
+        const idx = OvlVisualLangState.adhocControllers.indexOf(controller);
+        if (idx !== -1) OvlVisualLangState.adhocControllers.splice(idx, 1);
         el.removeAttribute('data-ovl-trans-retrying');
         try { if (typeof ovlVisualLangProgressUpdate === 'function') ovlVisualLangProgressUpdate(); } catch (e) {}
     }
