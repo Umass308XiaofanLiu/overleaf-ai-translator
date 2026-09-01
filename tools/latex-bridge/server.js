@@ -132,6 +132,23 @@ const TOKEN_FILE = path.join(__dirname, '.bridge-token');
 // 目录服务，杜绝路径穿越这一整类问题（见下面 serveAppHtml 的固定路径读取）。
 const APP_HTML_PATH = path.join(__dirname, '..', '..', 'AI-Translator.html');
 
+// v2 Pass P110b（N-1 非阻塞项，实测：并发 40 次无令牌 GET / 累计下发 108MB，每请求同步
+// fs.readFileSync 2.8MB 会阻塞事件循环、跟同时在跑的编译请求抢同一个线程）：启动时异步读一次、
+// 缓存成 Buffer + 算好 ETag，后续每个请求直接吐缓存，不再逐请求碰磁盘。缓存在 server.listen()
+// 之前发起（见文件末尾），但不阻塞监听——万一还没读完就有请求先进来，serveAppHtml 会退回原来的
+// 同步 readFileSync 兜底，正确性不受影响，只是那一次请求没吃到缓存的加速。
+let APP_HTML_CACHE = null; // { body: Buffer, etag: string } | null
+function loadAppHtmlCache() {
+    fs.readFile(APP_HTML_PATH, (err, buf) => {
+        if (err) {
+            console.warn('[latex-bridge] 预读 AI-Translator.html 到缓存失败（不影响服务，每次请求会退回同步读取）：' + (err && err.message));
+            return;
+        }
+        const etag = '"' + crypto.createHash('sha1').update(buf).digest('hex') + '"';
+        APP_HTML_CACHE = { body: buf, etag: etag };
+    });
+}
+
 function loadOrCreateToken() {
     if (process.env.LATEX_BRIDGE_TOKEN) return process.env.LATEX_BRIDGE_TOKEN;
     try {
@@ -251,20 +268,36 @@ function sendText(res, code, text, contentType) {
 }
 
 // v2 Pass P110：把 AI-Translator.html 自己 serve 出去。二进制安全读取——不带 'utf8' 编码参数，
-// fs.readFileSync 直接给一个 Buffer，原样按字节吐出去（该文件含约 27000 个 NUL 字节，走字符串
-// 编码会破坏它）。路径固定死（APP_HTML_PATH），不吃任何请求参数，跟"通用静态目录服务"是两回事，
-// 不存在路径穿越的问题。找不到文件（比如仓库结构被改过）就老实 500，不是这条路由的正常状态。
-function serveAppHtml(res) {
-    let body;
-    try {
-        body = fs.readFileSync(APP_HTML_PATH);
-    } catch (e) {
-        sendJson(res, 500, { ok: false, error: '读取 AI-Translator.html 失败：' + (e && e.message ? e.message : String(e)) });
+// 原样按字节吐出去（该文件含约 27000 个 NUL 字节，走字符串编码会破坏它）。路径固定死
+// （APP_HTML_PATH），不吃任何请求参数，跟"通用静态目录服务"是两回事，不存在路径穿越的问题。
+// 找不到文件（比如仓库结构被改过）就老实 500，不是这条路由的正常状态。
+// v2 Pass P110b（N-1 非阻塞项）：优先用启动时预读好的 APP_HTML_CACHE（含 ETag），命中
+// If-None-Match 直接 304 空体；缓存还没就绪（启动瞬间的极小窗口，或预读失败）才退回逐请求同步
+// readFileSync 兜底，保证正确性不依赖缓存是否命中。
+function serveAppHtml(req, res) {
+    let body, etag;
+    if (APP_HTML_CACHE) {
+        body = APP_HTML_CACHE.body;
+        etag = APP_HTML_CACHE.etag;
+    } else {
+        try {
+            body = fs.readFileSync(APP_HTML_PATH);
+        } catch (e) {
+            sendJson(res, 500, { ok: false, error: '读取 AI-Translator.html 失败：' + (e && e.message ? e.message : String(e)) });
+            return;
+        }
+        etag = '"' + crypto.createHash('sha1').update(body).digest('hex') + '"';
+    }
+    const inm = req && req.headers && req.headers['if-none-match'];
+    if (inm && inm === etag) {
+        res.writeHead(304, { 'ETag': etag, 'Cache-Control': 'no-cache' });
+        res.end();
         return;
     }
     res.writeHead(200, {
         'Content-Type': 'text/html; charset=utf-8',
         'Cache-Control': 'no-cache',
+        'ETag': etag,
         'Content-Length': body.length
     });
     res.end(body);
@@ -2488,8 +2521,11 @@ const server = http.createServer(async (req, res) => {
     }
     req._logPathname = pathname;
 
-    // v2 Pass P49：统一令牌校验闸门——REMOTE_MODE 下除 /health、GET / 之外的一切路由
-    // 都要求正确的访问令牌，放在路由分发之前一次性挡住，不用逐个端点手动加。
+    // v2 Pass P49：统一令牌校验闸门——REMOTE_MODE 下除 TOKEN_EXEMPT_PATHS 里的路径外，
+    // 一切路由都要求正确的访问令牌，放在路由分发之前一次性挡住，不用逐个端点手动加。
+    // v2 Pass P110b（IX1）：豁免集在 P110 已扩到 5 条（/health、/、/AI-Translator.html、
+    // /routes、/favicon.ico，见 213 行 TOKEN_EXEMPT_PATHS），不再只是 /health、GET /——
+    // 改这个 Set 时记得同步改上面 REMOTE_MODE 启动横幅那句话，那是用户唯一会读到的鉴权说明。
     // 本地默认模式（REMOTE_MODE=false）tokenAuthorized 恒真，这段代码不改变任何现有行为。
     if (!TOKEN_EXEMPT_PATHS.has(pathname) && !tokenAuthorized(req)) {
         sendJson(res, 401, { ok: false, error: '缺少或错误的访问令牌，请在设置里填写桥启动日志打印的访问令牌' });
@@ -2533,11 +2569,11 @@ const server = http.createServer(async (req, res) => {
         // GET /routes（同样豁免令牌，纯诊断，不影响任何现有调用点——全仓库搜过，没有代码
         // 依赖 GET / 返回那句纯文本）。
         if (req.method === 'GET' && pathname === '/') {
-            serveAppHtml(res);
+            serveAppHtml(req, res);
             return;
         }
         if (req.method === 'GET' && pathname === '/AI-Translator.html') {
-            serveAppHtml(res);
+            serveAppHtml(req, res);
             return;
         }
         if (req.method === 'GET' && pathname === '/routes') {
@@ -3104,6 +3140,8 @@ if (WebSocket && WebSocket.Server) {
     console.warn('[latex-bridge] "ws" 模块没装上（npm install 到 tools/latex-bridge 下），磁盘外部改动推送这一块会不可用，其余 HTTP 功能不受影响');
 }
 
+loadAppHtmlCache(); // v2 Pass P110b：异步发起，不阻塞下面的 listen()
+
 server.listen(PORT, HOST, () => {
     console.log('[latex-bridge] listening on http://' + HOST + ':' + PORT);
     console.log('[latex-bridge] latexmk: ' + LATEXMK + (fs.existsSync(LATEXMK) ? ' (found)' : ' (MISSING!)'));
@@ -3113,10 +3151,16 @@ server.listen(PORT, HOST, () => {
         console.warn('[latex-bridge]    设备，强烈建议改绑到具体的 Tailscale IP（例如 100.x.x.x），而不是 0.0.0.0。');
     }
     if (REMOTE_MODE) {
-        console.log('[latex-bridge] 远程模式已启用：除 /health 外的所有端点都要求访问令牌（请求头 ' + TOKEN_HEADER + '）。');
+        // v2 Pass P110b（IX1）：如实播报豁免范围——TOKEN_EXEMPT_PATHS 现在是 5 条，不是 1 条。
+        // GET / 与 GET /AI-Translator.html 会把整份应用页面（无秘密，但完整）发给任何能连上
+        // 这个地址的人，不需要令牌；除这 5 条以外的一切端点（含文件读写、编译、Overleaf 同步）
+        // 才要求令牌。这句话是用户在 jump 上启动桥时唯一会读到的鉴权说明，必须跟代码一致。
+        const exemptList = Array.from(TOKEN_EXEMPT_PATHS).join('、');
+        console.log('[latex-bridge] 远程模式已启用：以下 ' + TOKEN_EXEMPT_PATHS.size + ' 个路径无需令牌即可访问：' + exemptList + '（其中 GET / 与 GET /AI-Translator.html 会把整个应用页面发给任何能连上这个地址的人，页面本身没有秘密，但是公开的）；除这些路径外的其余所有端点都要求访问令牌（请求头 ' + TOKEN_HEADER + '）。');
         console.log('[latex-bridge] 访问令牌（请抄进前端设置的"访问令牌"一栏，注意保密，不要发给别人）：');
         console.log('[latex-bridge]   ' + BRIDGE_TOKEN);
         console.log('[latex-bridge] 前端设置里的"服务地址"填：http://' + HOST + ':' + PORT);
+        console.log('[latex-bridge] 现在也可以直接在同网任意设备的浏览器里打开 http://' + HOST + ':' + PORT + '/ 使用整个应用，服务地址栏留空即默认走同源。');
     }
 });
 
