@@ -4223,7 +4223,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.03.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.03.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -5558,6 +5558,11 @@ function focusMakeEntry(o) {
         // 'tex' = 编辑器源码行范围。tex 条目固定 rowIndex:-1、side:'src'、whole:true（§3.2 理由）。
         kind: (o.kind === 'tex') ? 'tex' : 'pair',
         file: o.file == null ? '' : String(o.file),                      // 显示 + 跨文件重锚定用
+        // v2 Pass P115c（严重 B）：这条 tex 标注建条目那一刻所属的项目（fileWatchProjectKey()）。
+        // 空字符串 = 没记录（P115c 之前存的旧条目，或非 tex 条目）——按"不限定项目"处理，不做
+        // 任何拦截，这是刻意的宽松默认，不是遗漏：旧条目没有这个信息可判，宁可维持它 P115c 之前
+        // 就有的行为，也不要瞎猜一个项目把它锁死。只有**新建**的 tex 条目才会真正被这层守卫管到。
+        project: (o.kind === 'tex' && o.project != null) ? String(o.project) : '',
         lineFrom: Math.max(0, Math.floor(Number(o.lineFrom) || 0)),      // 0-based，只用于显示
         lineTo: Math.max(0, Math.floor(Number(o.lineTo) || 0)),          // 0-based 含端点，只用于显示
         // v2 Pass P115：跨文件持久化之后，tex 条目会在"文件不是当前打开的这个"时静默挂起
@@ -5655,36 +5660,53 @@ function focusResolve(e) {
 // __ovlFileTextCacheGen 是"这份缓存变过几次"的代际计数——focusSig()/fileWatchSig() 把它
 // 编进身份串，缓存从"还没读到"变成"读到了"这一刻，即使没有任何人手动改标注/取消关注，
 // 发出去的载荷字节数也真的变了，上下文用量环必须能感知到，不能继续显示一个已经过期的实测值。
-const OvlFileTextCache = new Map();       // relPath -> { text, at, failed }
-const __ovlFileTextLoading = new Set();   // 防止同一个文件被并发发起多次读取
+//
+// v2 Pass P115c（严重 A 返修）：key 原来只有 relPath，"换项目文件夹"是随时可做、不需要
+// 刷新的动作（ovlPickFolder / 远程 openViaBridge / 项目历史三条入口都不重载页面），两个
+// 项目共用同一个相对路径（main.tex、sections/method.tex 这种在 LaTeX 项目里几乎必然重名）
+// 时，上一个项目读到的内容会被当成新项目同路径文件的内容发给模型——实测见
+// 核验对抗报告【严重 A】。改成 `projectKey|relPath`（跟 fileWatchProjectKey()/
+// ovlP2TKey 同一个既有范式，不是新发明一套），彻底按项目分桶，而不是在"换项目"那几个分散
+// 入口里各自记得清缓存——即使某个入口以后漏调 ovlResetProjectScopedState()，缓存本身也不会
+// 串项目。key 在 ovlFileTextCacheEnsure 发起读取时**同步**取一次快照（不是读完之后再算）：
+// 读盘是异步的，如果换项目发生在读盘过程中，用读完之后的"当前项目"去算 key，会把旧项目的
+// 内容写进新项目的桶——这正是"边替换 key 边留原样竞态"会重新引入同一个洞的地方。
+const OvlFileTextCache = new Map();       // "projectKey|relPath" -> { text, at, failed }
+const __ovlFileTextLoading = new Set();   // 防止同一个文件被并发发起多次读取（同样按 key）
 let __ovlFileTextCacheGen = 0;
 
+function ovlFileTextCacheKey(relPath) {
+    try { return fileWatchProjectKey() + '|' + String(relPath == null ? '' : relPath); }
+    catch (e) { return '|' + String(relPath == null ? '' : relPath); }
+}
 function ovlFileTextCacheGet(relPath) {
-    try { return OvlFileTextCache.get(relPath) || null; } catch (e) { return null; }
+    try { return OvlFileTextCache.get(ovlFileTextCacheKey(relPath)) || null; } catch (e) { return null; }
 }
 function ovlFileTextCacheInvalidate(relPath) {
-    try { if (relPath) OvlFileTextCache.delete(relPath); } catch (e) {}
+    try { if (relPath) OvlFileTextCache.delete(ovlFileTextCacheKey(relPath)); } catch (e) {}
 }
 // 后台把"当前没打开、但有标注/关注需要它内容"的文件读进缓存；读完广播一次复核 + 聊天状态条
 // 刷新。不 await——调用方（focusResolveTex 的跨文件分支 / chatBuildFileWatchBlock）自己先
 // 按"缓存里还没有"报一个不算失效的中间态（pending），等这次读完再回来对上。
 function ovlFileTextCacheEnsure(relPath) {
     try {
-        if (!relPath || OvlFileTextCache.has(relPath) || __ovlFileTextLoading.has(relPath)) return;
+        if (!relPath) return;
+        const key = ovlFileTextCacheKey(relPath);   // 同步取一次快照，见上方 P115c 注释
+        if (OvlFileTextCache.has(key) || __ovlFileTextLoading.has(key)) return;
         if (!OvlState || !OvlState.dirHandle) return;   // 没有打开项目文件夹，读不了，留着 pending
-        __ovlFileTextLoading.add(relPath);
+        __ovlFileTextLoading.add(key);
         Promise.resolve(ovlResolveHandleForPath(OvlState.dirHandle, relPath))
             .then(function (r) { return r.handle.getFile(); })
             .then(function (f) { return f.text(); })
-            .then(function (text) { OvlFileTextCache.set(relPath, { text: text, at: Date.now(), failed: false }); })
+            .then(function (text) { OvlFileTextCache.set(key, { text: text, at: Date.now(), failed: false }); })
             .catch(function () {
                 // 读不到（文件被删了/路径错了/句柄过期）——落一个"失败"标记而不是继续留空，
                 // 否则每一次复核都会重新发起一次必然失败的读取，读盘失败会一直重试到天荒地老。
                 // 真被删掉的文件，用户自己会看到对应标注/chip 变灰，手动 × 掉。
-                OvlFileTextCache.set(relPath, { text: '', at: Date.now(), failed: true });
+                OvlFileTextCache.set(key, { text: '', at: Date.now(), failed: true });
             })
             .finally(function () {
-                __ovlFileTextLoading.delete(relPath);
+                __ovlFileTextLoading.delete(key);
                 __ovlFileTextCacheGen++;
                 try { focusRevalidate('跨文件内容读取完成'); } catch (e) {}
                 try { if (typeof fileWatchRenderChip === 'function') fileWatchRenderChip(); } catch (e) {}
@@ -5741,9 +5763,28 @@ function focusResolveTexAgainst(e, base, out) {
 // 刚敲的字关注不到）；不是当前文件 → 从 OvlFileTextCache 找该文件的磁盘内容，缓存没有就
 // 触发一次后台读取并报 pending（不是失败——"还没读到"和"读到了但对不上"是两回事，前者
 // 不该被当场判定为失效）。
+// v2 Pass P115c（严重 B）：这条 tex 标注建条目时记的项目（e.project）跟**当前打开的项目**
+// 是不是同一个。空 e.project（没记录，旧条目）永远返回 false——见 focusMakeEntry 里的注释，
+// 宽松默认只作用于新条目。用同一个 fileWatchProjectKey() 判身份，跟文件级关注、磁盘缓存
+// （ovlFileTextCacheKey）三处共用同一把尺子，不是又发明一套。
+function focusEntryCrossProject(e) {
+    try { return !!(e && e.kind === 'tex' && e.project && e.project !== fileWatchProjectKey()); }
+    catch (err) { return false; }
+}
+
 function focusResolveTex(e) {
-    const out = { ok: false, start: 0, end: 0, text: '', why: '', pending: false };
+    const out = { ok: false, start: 0, end: 0, text: '', why: '', pending: false, crossProject: false };
     try {
+        // v2 Pass P115c（严重 B）：这条标注属于另一个项目——绝不能用当前项目打开的同名文件、
+        // 或者当前项目磁盘缓存里同 relPath 的内容去解析/重新锚定它，哪怕两个项目路径撞名。
+        // 完全不参与本次解析：不摸 ta.value、不摸 OvlFileTextCache、不触发任何读盘，quote/offset
+        // 原样不动。等用户切回它所属的那个项目，fileWatchProjectKey() 重新对上，下一次调用这个
+        // 函数会跳过这一支、走回正常路径——不需要额外的"恢复"代码，身份判定本身就是活的。
+        if (focusEntryCrossProject(e)) {
+            out.crossProject = true;
+            out.why = '这条标注属于另一个项目，切回原项目后会自动恢复';
+            return out;
+        }
         // v2 Pass P115 返修（严重 1/2）：这里必须跟 ovlResolveHandleForPath 的解析口径
         // （逐级 relPath、不搜索）保持一致，否则要么子目录文件永远解析不到（basename 在
         // 项目根找不到），要么两个目录下的同名文件互相冒充（basename 相同就判"是当前文件"）。
@@ -5794,12 +5835,15 @@ const __ovlFocusLegacyMigrateAttempted = new Set();
 async function ovlFocusFindUniqueFileByBasename(dirHandle, basename, capBudget) {
     const matches = [];
     let budget = Math.max(1, capBudget | 0);
+    let exhausted = false;   // v2 Pass P115c（非阻塞 b）：预算耗尽 ≠ 遍历完，见下方注释
     async function walk(handle, relDir) {
-        if (matches.length > 1 || budget <= 0) return;
+        if (matches.length > 1) return;
+        if (budget <= 0) { exhausted = true; return; }
         let iter;
         try { iter = handle.entries(); } catch (e) { return; }
         for await (const pair of iter) {
-            if (matches.length > 1 || budget <= 0) return;
+            if (matches.length > 1) return;
+            if (budget <= 0) { exhausted = true; return; }
             budget--;
             const name = pair[0], child = pair[1];
             const childRel = relDir === '.' ? name : relDir + '/' + name;
@@ -5812,6 +5856,11 @@ async function ovlFocusFindUniqueFileByBasename(dirHandle, basename, capBudget) 
         }
     }
     try { await walk(dirHandle, '.'); } catch (e) {}
+    // v2 Pass P115c（非阻塞 b）：预算耗尽时，就算此刻只看到一处匹配，也不能确定它在整个项目
+    // 里真的是唯一的——树里可能还有没搜到的地方也叫这个 basename。按"有歧义"处理，宁可不
+    // 搬迁：跟 matches.length > 1 那支同一条纪律（这个文件里到处都在用），"拿不准就不猜"，
+    // 不能让预算这个实现细节悄悄放宽了"唯一命中才搬"这道门槛。
+    if (exhausted) return null;
     return matches.length === 1 ? matches[0] : null;
 }
 
@@ -5819,8 +5868,13 @@ async function ovlFocusMigrateLegacyFile(basename) {
     try {
         if (!basename || basename.indexOf('/') !== -1) return null;
         if (__ovlFocusLegacyMigrateAttempted.has(basename)) return null;
-        __ovlFocusLegacyMigrateAttempted.add(basename);
+        // v2 Pass P115c（严重 C）：dirHandle 判定必须在"记为已尝试"**之前**。原来的顺序是
+        // 先 add 再判 dirHandle——页面启动时 chatBoot() 会先 focusLoad()+focusRenderChip()，
+        // 那一刻项目还没挂载（dirHandle 为 null），这一次"尝试"就被白白消耗掉了，该 basename
+        // 本会话再也不会重搜。实测见核验对抗报告【严重 C】（M6/M7：刷新后连
+        // 聊天窗都没手动开过，搬迁就已经被吃掉一次）。没有项目根本谈不上"搜过"，不该计数。
         if (!OvlState || !OvlState.dirHandle) return null;
+        __ovlFocusLegacyMigrateAttempted.add(basename);
         const found = await ovlFocusFindUniqueFileByBasename(OvlState.dirHandle, basename, CHAT_AGENT_SEARCH_MAX_FILES);
         if (!found || found === basename) return null;   // 就在根目录、本来就对，不用改
         let changed = false;
@@ -5941,6 +5995,32 @@ function focusClearAll() {
             try { chatAppendRow('system', '已清空全部 ' + n + ' 处「额外关注」。文档上下文不受影响，下一轮照样带整篇。'); } catch (e) {}
         }
     } catch (e) { console.error('[focus] clearAll failed', e); }
+}
+
+// v2 Pass P115c（非阻塞 a）：P115 起失效条目"不删除只灰显"，FOCUS_MAX=40 满了之后新标注
+// 会被 focusAdd 直接拒绝，用户只能一条条点 × ——加这个一键清理，只删 e.invalid 的条目，
+// 不碰"属于其它项目"（切回原项目会自动恢复，不该被这个入口误删）也不碰仍然有效的条目。
+// 走 ovlConfirmDialog（不用 window.confirm，见项目规范文档 UI 规范），删的是真数据，要一道确认。
+function focusClearInvalid() {
+    try {
+        const n = FocusState.entries.reduce(function (acc, e) { return acc + (e.invalid ? 1 : 0); }, 0);
+        if (!n) { try { showToast('目前没有失效的关注需要清理。', 'info'); } catch (e) {} return; }
+        ovlConfirmDialog({
+            title: '清理全部失效关注',
+            message: '将删除 ' + n + ' 处已失效的「额外关注」（原文找不到对应内容的那些）。仍然有效、'
+                + '以及暂时属于其它项目的条目不受影响。此操作不可撤销。',
+            confirmLabel: '清理 ' + n + ' 处',
+            danger: true,
+            onConfirm: function () {
+                try {
+                    FocusState.entries = FocusState.entries.filter(function (e) { return !e.invalid; });
+                    FocusState.seq++;
+                    focusAfterChange();
+                    try { chatAppendRow('system', '已清理 ' + n + ' 处失效的「额外关注」。'); } catch (e) {}
+                } catch (e) { console.error('[focus] clearInvalid onConfirm failed', e); }
+            }
+        });
+    } catch (e) { console.error('[focus] clearInvalid failed', e); }
 }
 
 // 行上那颗复选框：整行关注。el 是那个 <input>，它的 checked 已经被浏览器翻好了。
@@ -6371,9 +6451,13 @@ function focusRevalidate(reason) {
                     e.lineTo = rt.lineTo;
                     if (e.invalid) { e.invalid = false; changedInvalid = true; }
                     keep.push(e);
-                } else if (rt.pending) {
+                } else if (rt.pending || rt.crossProject) {
                     // 「还没读到」≠「你的标记失效了」—— 和下面 pair 那条"一份文档都没有就
                     // 什么都不作废"是同一条纪律：数据不在手上，不代表标记指错了地方。
+                    // v2 Pass P115c（严重 B）：「属于另一个项目」同样不是"标记失效了"——不碰
+                    // e.invalid、不碰 e.quote/e.offset，原样保留。UI 侧（focusRenderChip）会
+                    // 用 focusEntryCrossProject() 现算一遍，灰显并注明"属于其它项目"，跟这里
+                    // 完全不需要一个持久化的 crossProject 标记来同步——身份判定本身就是活的。
                     keep.push(e);
                 } else {
                     // v2 Pass P115：真正解不出来了（文字被改写/删掉，或跨文件读盘失败）——
@@ -6461,7 +6545,11 @@ function focusLoad() {
                 out.push(focusMakeEntry({
                     kind: 'tex', rowIndex: -1, side: 'src', whole: true,
                     quote: e.quote, offset: e.offset, file: e.file,
-                    lineFrom: e.lineFrom, lineTo: e.lineTo
+                    lineFrom: e.lineFrom, lineTo: e.lineTo,
+                    // v2 Pass P115c（严重 B）：P115c 之前存的旧条目没有这一键，
+                    // focusMakeEntry 里 o.project==null 会落成 ''（不限定项目），
+                    // 不是这里的新校验把它们吃掉。
+                    project: typeof e.project === 'string' ? e.project : ''
                 }));
                 continue;
             }
@@ -6655,6 +6743,21 @@ function focusRenderChip() {
         label.setAttribute('data-tip-pos', 'top-start');
         const spacer = document.createElement('span');
         spacer.className = 'aichat-focus-spacer';
+        // v2 Pass P115c（非阻塞 a）：FOCUS_MAX=40 条同时存在时，失效条目"不删除只灰显"的
+        // 设计（P115 起）会把上限占满、新标注被直接拒绝（focusAdd 的 toast"先取消几处再加"），
+        // 用户只能一条条点 × ——加一个一键清理入口。只在真有失效条目时才出现，不喧宾夺主。
+        let invalidCount = 0;
+        for (let i = 0; i < entries.length; i++) { if (entries[i].invalid) invalidCount++; }
+        let clearInvalid = null;
+        if (invalidCount > 0) {
+            clearInvalid = document.createElement('button');
+            clearInvalid.type = 'button';
+            clearInvalid.className = 'aichat-focus-clear';
+            clearInvalid.textContent = '清理全部失效';
+            clearInvalid.setAttribute('data-tip', '一次性删除全部 ' + invalidCount + ' 处已失效的关注（不影响仍然有效、或暂时属于其它项目的条目）。');
+            clearInvalid.setAttribute('data-tip-pos', 'top');
+            clearInvalid.addEventListener('click', function () { focusClearInvalid(); });
+        }
         const clear = document.createElement('button');
         clear.type = 'button';
         clear.className = 'aichat-focus-clear';
@@ -6664,14 +6767,19 @@ function focusRenderChip() {
         clear.addEventListener('click', function () { focusClearAll(); });
         head.appendChild(label);
         head.appendChild(spacer);
+        if (clearInvalid) head.appendChild(clearInvalid);
         head.appendChild(clear);
         box.appendChild(head);
 
         const curFile = (OvlState && OvlState.currentFile) ? (OvlState.currentFile.relPath || OvlState.currentFile.name) : '';
         for (let i = 0; i < entries.length; i++) {
             const e = entries[i];
+            // v2 Pass P115c（严重 B）：现算，不读存下来的标记——身份判定要活的，见
+            // focusEntryCrossProject 头注释；灰显复用 is-invalid 同一套视觉（用户看到的都是
+            // "这条现在不能用"），文案分开写清楚"为什么"。
+            const crossProj = focusEntryCrossProject(e);
             const row = document.createElement('div');
-            row.className = 'aichat-focus-item' + (e.invalid ? ' is-invalid' : '');
+            row.className = 'aichat-focus-item' + ((e.invalid || crossProj) ? ' is-invalid' : '');
             const kind = document.createElement('span');
             // v2 Pass P8（§3.4 表第 8 条）：tex 条目的种类标签是"源码"，跟 pair 的"整行/片段"分开。
             kind.className = 'aichat-focus-kind' + (e.whole ? ' is-row' : '');
@@ -6684,8 +6792,14 @@ function focusRenderChip() {
                 // 同一时刻可能同时挂着好几个文件的标注，不带文件名用户分不清哪条是哪条。
                 const fileLabel = e.file || '(未命名)';
                 txt.textContent = fileLabel + '：“' + focusEllipsis(e.quote, 26) + '”'
-                    + (e.invalid ? ' · 失效' : (okById[e.id] ? '' : ' · 现在解不出来，这一轮不发'));
-                if (e.invalid) {
+                    + (crossProj ? ' · 属于其它项目' : (e.invalid ? ' · 失效' : (okById[e.id] ? '' : ' · 现在解不出来，这一轮不发')));
+                if (crossProj) {
+                    // v2 Pass P115c（严重 B）：不是"失效"——引文/偏移原样保留，不会被这个
+                    // 项目的内容改写；切回它所属的那个项目就自动恢复，不需要用户做任何事。
+                    txt.setAttribute('data-tip', '这处标记是在另一个项目里建的，当前项目下不会参与解析或发送，'
+                        + '也不会被这个项目的同名文件改写内容。切回它所属的那个项目会自动恢复有效。');
+                    txt.setAttribute('data-tip-pos', 'top-start');
+                } else if (e.invalid) {
                     txt.setAttribute('data-tip', '这处标记在文件「' + fileLabel
                         + '」里已经找不到对应的文字了（可能被编辑或删除），不会再发给模型。'
                         + '不会自动消失——确认不需要了就点 × 移除。');
@@ -6882,6 +6996,9 @@ function focusIndexOfTexAt(start, end) {
     for (let i = 0; i < FocusState.entries.length; i++) {
         const e = FocusState.entries[i];
         if (e.kind !== 'tex') continue;
+        // v2 Pass P115c（严重 B）：跨项目条目连"偏移碰巧对上"这种弱匹配都不认——两个项目
+        // 的同 relPath 文件偏移撞上纯属巧合，绝不能让复选框显示成"已勾选"。
+        if (focusEntryCrossProject(e)) continue;
         if (e.file && cur && e.file !== cur) continue;
         const r = focusResolveTex(e);
         if (r.ok && r.start === start && r.end === end) return i;
@@ -6926,7 +7043,10 @@ function focusToggleOvlSelection(el) {
             if (!focusAdd(focusMakeEntry({
                 kind: 'tex', rowIndex: -1, side: 'src', whole: true,
                 quote: r.quote, offset: r.start, file: f,
-                lineFrom: r.lineFrom, lineTo: r.lineTo
+                lineFrom: r.lineFrom, lineTo: r.lineTo,
+                // v2 Pass P115c（严重 B）：记下此刻所属的项目——只有从这里新建的条目才会被
+                // focusEntryCrossProject() 真正管到，见 focusMakeEntry 头注释。
+                project: fileWatchProjectKey()
             }))) { if (el) el.checked = false; return; }
             try { __focusTexSig = focusTexDocSig(); } catch (e) {}
         } else if (!want && at !== -1) {
@@ -6990,6 +7110,9 @@ function focusTexGutterLines() {
         for (let i = 0; i < FocusState.entries.length; i++) {
             const e = FocusState.entries[i];
             if (e.kind !== 'tex') continue;
+            // v2 Pass P115c（严重 B）：同上，跨项目条目不画 gutter——r.ok 本来就会是 false
+            // （focusResolveTex 里已经拦），这里显式跳过只是让"为什么不画"读起来更直白。
+            if (focusEntryCrossProject(e)) continue;
             if (e.file && cur && e.file !== cur) continue;
             const r = focusResolveTex(e);
             if (!r.ok) continue;
