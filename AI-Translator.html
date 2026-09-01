@@ -4223,7 +4223,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.03.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.03.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -5744,11 +5744,23 @@ function focusResolveTexAgainst(e, base, out) {
 function focusResolveTex(e) {
     const out = { ok: false, start: 0, end: 0, text: '', why: '', pending: false };
     try {
-        const cur = (OvlState && OvlState.currentFile && OvlState.currentFile.name) ? OvlState.currentFile.name : '';
+        // v2 Pass P115 返修（严重 1/2）：这里必须跟 ovlResolveHandleForPath 的解析口径
+        // （逐级 relPath、不搜索）保持一致，否则要么子目录文件永远解析不到（basename 在
+        // 项目根找不到），要么两个目录下的同名文件互相冒充（basename 相同就判"是当前文件"）。
+        // 用 relPath||name 是这个文件里其它地方（focusRenderChip/chatBuildFileWatchBlock/
+        // ovlAiMergeApplyFile 等）早就在用的同一个既有惯例，这里补齐，不是新发明一套。
+        const cur = (OvlState && OvlState.currentFile) ? (OvlState.currentFile.relPath || OvlState.currentFile.name || '') : '';
         if (!e.file || e.file === cur) {
             const ta = document.getElementById('ovlCodeArea');
             if (!ta || ta.disabled || !ta.value) { out.why = '编辑器里现在没有打开文件'; return out; }
             return focusResolveTexAgainst(e, ta.value, out);
+        }
+        // v2 Pass P115 返修：e.file 不含 '/' 时可能是这次返修之前存下的裸文件名旧条目——
+        // 顺手在项目树里按 basename 搜一次，唯一命中就回写成完整 relPath（见
+        // ovlFocusMigrateLegacyFile 头注释）。命中之后 e.file 会变，本次调用仍按旧值走，
+        // 下一次 focusRevalidate（迁移完成后会自动触发一次）用新值就能正常解析。
+        if (e.file.indexOf('/') === -1) {
+            try { ovlFocusMigrateLegacyFile(e.file).catch(function () {}); } catch (err) {}
         }
         const cached = ovlFileTextCacheGet(e.file);
         if (!cached) {
@@ -5763,6 +5775,67 @@ function focusResolveTex(e) {
         }
         return focusResolveTexAgainst(e, cached.text, out);
     } catch (err) { out.why = '复核时出错'; return out; }
+}
+
+// v2 Pass P115 返修（严重 1 附带项）：把「裸文件名」当路径解析键的旧数据做一次性搬迁。
+// 背景：这次返修之前，focusToggleOvlSelection 建条目时把 e.file 存成
+// OvlState.currentFile.name（裸文件名，不含目录），子目录文件（如 sections/method.tex）
+// 落盘后就只剩 "method.tex"。上面把 e.file 统一改成 relPath 之后，这些旧条目如果什么都
+// 不做，会从"跨文件全部失效"的旧 bug 变成"跨文件全部读不到文件"（直接拿裸文件名去项目根
+// 找，大概率 NotFoundError）——用户在这次修复上线前已经标过的东西不该白白作废。
+// 搬迁规则：项目树里按 basename **唯一**命中才回写 e.file；零命中或命中不止一处一律不猜、
+// 原样保留——「有歧义就是中止」是这个文件里到处都在用的规矩（跟 focusResolveTexAgainst 的
+// "出现不止一处就作废"同一条纪律），猜错目录、把标注悄悄接到不相干的同名文件上，正是
+// 【严重 2】要堵住的那类风险，搬迁逻辑绝不能重新引入它。
+// 每个 basename 每个会话只搜一次（不管成功与否），避免每次 focusResolveTex 被调用都重新
+// 遍历一次整棵项目树。
+const __ovlFocusLegacyMigrateAttempted = new Set();
+
+async function ovlFocusFindUniqueFileByBasename(dirHandle, basename, capBudget) {
+    const matches = [];
+    let budget = Math.max(1, capBudget | 0);
+    async function walk(handle, relDir) {
+        if (matches.length > 1 || budget <= 0) return;
+        let iter;
+        try { iter = handle.entries(); } catch (e) { return; }
+        for await (const pair of iter) {
+            if (matches.length > 1 || budget <= 0) return;
+            budget--;
+            const name = pair[0], child = pair[1];
+            const childRel = relDir === '.' ? name : relDir + '/' + name;
+            if (child && child.kind === 'directory') {
+                if (CHAT_AGENT_SEARCH_SKIP_DIRS.indexOf(name) !== -1) continue;
+                await walk(child, childRel);
+                continue;
+            }
+            if (name === basename) matches.push(childRel);
+        }
+    }
+    try { await walk(dirHandle, '.'); } catch (e) {}
+    return matches.length === 1 ? matches[0] : null;
+}
+
+async function ovlFocusMigrateLegacyFile(basename) {
+    try {
+        if (!basename || basename.indexOf('/') !== -1) return null;
+        if (__ovlFocusLegacyMigrateAttempted.has(basename)) return null;
+        __ovlFocusLegacyMigrateAttempted.add(basename);
+        if (!OvlState || !OvlState.dirHandle) return null;
+        const found = await ovlFocusFindUniqueFileByBasename(OvlState.dirHandle, basename, CHAT_AGENT_SEARCH_MAX_FILES);
+        if (!found || found === basename) return null;   // 就在根目录、本来就对，不用改
+        let changed = false;
+        for (let i = 0; i < FocusState.entries.length; i++) {
+            const e2 = FocusState.entries[i];
+            if (e2.kind === 'tex' && e2.file === basename) { e2.file = found; changed = true; }
+        }
+        if (!changed) return found;
+        try { focusSave(); } catch (e) {}
+        try { ovlFileTextCacheInvalidate(basename); } catch (e) {}
+        try { focusRevalidate('文件路径已自动迁移'); } catch (e) {}
+        try { if (typeof fileWatchRenderChip === 'function') fileWatchRenderChip(); } catch (e) {}
+        try { if (ChatState && ChatState.open) chatUpdateBar(); } catch (e) {}
+        return found;
+    } catch (e) { return null; }
 }
 
 // 0-based 逻辑行号。只在建条目/复核时调（低频），不进任何热路径。
@@ -6498,7 +6571,11 @@ function focusWireBlock() {
                 items.push(groupHeader
                     + '[关注 ' + n + ']  LaTeX 源码 · 文件「' + chatEscapeDelims(e.file || '(未命名)') + '」'
                     + ' · 第 ' + (e.lineFrom + 1) + (e.lineTo > e.lineFrom ? ('–' + (e.lineTo + 1)) : '') + ' 行\n'
-                    + '  ⚠ 这几行来自**用户正在编辑的 .tex 源文件**，不是上面 ==DOC== 里那份按 [n] 编号的原文。'
+                    // v2 Pass P115 返修（非阻塞·合并提醒）：跨文件持久化之后，这条不一定来自
+                    // 用户此刻正在编辑的那份文件——文案不能再断言"正在编辑"，只说明它是 .tex
+                    // 源文件即可，文件名已经在上一行标出来了。
+                    + '  ⚠ 这几行来自用户项目里的 .tex 源文件（不一定是当前正在编辑的那一份），'
+                    + '不是上面 ==DOC== 里那份按 [n] 编号的原文。'
                     + '不要用 [n] 行号去指认它，也不要为它输出 ==EDIT== 块 —— 这个工具改不了编辑器里的文件。\n'
                     + '  内容：' + chatEscapeDelims(r.text));
             }
@@ -6508,7 +6585,7 @@ function focusWireBlock() {
             + '用户额外标出了以下 ' + items.length + ' 处，请在回答时重点留意它们。\n'
             + '⚠ 这是**关注**，不是修改授权：没有被明确要求改动之前，一个字都不要改，也不要因为'
             + '它们被标出来就输出 ==EDIT== 块。\n'
-            + (hasTexItems ? '其中标着「LaTeX 源码」的几处来自用户正在编辑的 .tex 文件，**不在**上面的 ==DOC== 编号体系里；'
+            + (hasTexItems ? '其中标着「LaTeX 源码」的几处来自用户项目里的 .tex 文件（不一定是当前正在编辑的那一份），**不在**上面的 ==DOC== 编号体系里；'
                 + '这几行只是起点——如果下面【文件读取工具】小节里的工具可用，需要看这个文件的其余部分、'
                 + '它 \\ref/\\cite 指向的定义、或者 supp.tex 等别的文件，主动去读；没读过的部分依然'
                 + '不要假装看过，也不要为它们输出 ==EDIT== 块。\n' : '')
@@ -6798,7 +6875,10 @@ function focusOvlSelectionRange() {
 // 只读 #ovlCodeArea/Visual 面板，添加入口交互本身没变），所以这里也只比对属于当前文件的
 // 条目——跨文件条目解出来的偏移是另一个文件缓冲区里的数，拿去跟当前选区比只会是巧合命中。
 function focusIndexOfTexAt(start, end) {
-    const cur = (OvlState && OvlState.currentFile && OvlState.currentFile.name) ? OvlState.currentFile.name : '';
+    // v2 Pass P115 返修（中 3）：跟 focusResolveTex/focusRenderChip 用同一个 relPath||name
+    // 口径——之前这里单用 name，会跟"用 relPath 解析"的 focusResolveTex 判断出两套不同的
+    // "是不是当前文件"，子目录文件的复选框状态因此永远对不上真实可解析状态。
+    const cur = (OvlState && OvlState.currentFile) ? (OvlState.currentFile.relPath || OvlState.currentFile.name || '') : '';
     for (let i = 0; i < FocusState.entries.length; i++) {
         const e = FocusState.entries[i];
         if (e.kind !== 'tex') continue;
@@ -6839,7 +6919,10 @@ function focusToggleOvlSelection(el) {
                 try { showToast('这几行的内容在文件里出现了不止一处，无法唯一定位。多选一两行相邻内容再试。', 'warning'); } catch (e) {}
                 return;
             }
-            const f = (OvlState.currentFile && OvlState.currentFile.name) ? OvlState.currentFile.name : '';
+            // v2 Pass P115 返修（严重 1）：存 relPath（跨目录文件的解析键），不再存裸文件名——
+            // 裸文件名喂给严格逐级解析、不做搜索的 ovlResolveHandleForPath 时，子目录文件必然
+            // NotFoundError；同名文件之间用裸文件名互相冒充，也正是【严重 2】的根因。
+            const f = (OvlState.currentFile && (OvlState.currentFile.relPath || OvlState.currentFile.name)) ? (OvlState.currentFile.relPath || OvlState.currentFile.name) : '';
             if (!focusAdd(focusMakeEntry({
                 kind: 'tex', rowIndex: -1, side: 'src', whole: true,
                 quote: r.quote, offset: r.start, file: f,
@@ -6864,7 +6947,10 @@ function focusTexDocSig() {
     try {
         const ta = document.getElementById('ovlCodeArea');
         if (!ta) return '';
-        const name = (OvlState && OvlState.currentFile && OvlState.currentFile.name) ? OvlState.currentFile.name : '';
+        // v2 Pass P115 返修：同一口径统一成 relPath||name，避免两个同名文件之间的编辑被误判成
+        // "同一份文档没变"（这个签名只用来判断要不要跑一次 focusRevalidate 防抖，不参与身份
+        // 判定本身，但既然别处都在改口径，这里留着旧口径只会制造新的不一致，顺手一起改）。
+        const name = (OvlState && OvlState.currentFile) ? (OvlState.currentFile.relPath || OvlState.currentFile.name || '') : '';
         return name + ':' + ta.value.length + ':' + chatRowHash(ta.value);
     } catch (e) { return ''; }
 }
@@ -6899,7 +6985,8 @@ function focusTexGutterLines() {
     try {
         const ta = document.getElementById('ovlCodeArea');
         if (!ta || ta.disabled || !ta.value) return out;
-        const cur = (OvlState && OvlState.currentFile && OvlState.currentFile.name) ? OvlState.currentFile.name : '';
+        // v2 Pass P115 返修（中 3）：同上，统一成 relPath||name 口径。
+        const cur = (OvlState && OvlState.currentFile) ? (OvlState.currentFile.relPath || OvlState.currentFile.name || '') : '';
         for (let i = 0; i < FocusState.entries.length; i++) {
             const e = FocusState.entries[i];
             if (e.kind !== 'tex') continue;
