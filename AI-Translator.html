@@ -36111,19 +36111,24 @@ async function ovlP2TRenderPageToPng(page, maxPx) {
     return { pngBlob: pngBlob, sendBlob: sendBlob, sentAsJpeg: sentAsJpeg, width: viewport.width, height: viewport.height };
 }
 
-// ==================== v2 Pass P86 §1.2 / v2 Pass P95：图片 bbox 区域裁剪（主路径）+ 内嵌
-// 位图覆盖率优化（次路径） ====================
+// ==================== v2 Pass P86 §1.2：图片 bbox 区域裁剪 ====================
 // system prompt 规则 7 让模型在正文里对"它认定为图"的完整图形区域（含全部子图、不含题注）
 // 标一行 "% BBOX: x0,y0,x1,y1"（0-1 归一化，紧邻 \begin{figure} 之前）。
 //
-// v2 Pass P95 反转优先级（用户实测铁证：复合图——矢量框架内嵌栅格图层——旧逻辑"抽到一个
-// 内嵌位图图层就算成功"，只留下位图那一小块，比如 DeepLaDu Fig.1 只剩背景地球仪，丢了整个
-// 组合图；横跨双栏的四联图同理只抽出其中一个子图）：不再是"引用 M2 真实位图就无条件跳过
-// 裁剪"，而是默认总是按 bbox 从整页栅格上裁一刀（所见即所得，天然覆盖多子图/矢量标注/双栏
-// 全宽内容），只有当模型引用的内嵌位图的放置矩形（ovlP2TScanPageImages 用 getOperatorList
-// 的 CTM 换算出来的归一化矩形，见 imgRects 参数）覆盖 bbox 面积 ≥90% 时，才认定"这就是整张
-// 图、原生分辨率通常更高，没必要裁"，跳过裁剪直接沿用位图。覆盖率算不出来（M2 关闭 / 引用的
-// 文件不在 imgRects 里）一律按裁剪处理，不猜——放弃优化路径，不代表放弃正确性。
+// v2 Pass P104（用户拍板彻底移除，见 progress「## P104」根因记录）：P95 曾加过"内嵌位图放置
+// 矩形覆盖 bbox 面积 ≥90% 就跳过裁剪、直接沿用位图"这条优化路径（当时用 imgRects/
+// ovlP2TRectCoverFrac/OVL_P2T_BBOX_COVER_THRESHOLD 实现）——用户重转 DeepLaDu 实测铁证：
+// 第一页"标题+摘要+复合图"场景下，模型对 Fig.1 给出的 bbox 本身就只圈住了复合图里那一小块
+// 内嵌栅格层（没有覆盖整个矢量框架+栅格组合），覆盖率优化把这个偏小的 bbox 判成"跟位图重合
+// 度够高，直接用位图"，图重转之后仍然只截到内嵌位图——复现的正是 P95 想修的原始 bug，只是
+// 触发路径从"旧逻辑无条件信任位图"变成"覆盖率优化被一个错误的小 bbox 骗过"，说明"信不信
+// 位图"这条决策分支本身就是不稳的。用户拍板：整条决策彻底删掉，图片一律走 bbox 区域裁剪——
+// bbox 合法就无条件从整页栅格上裁，不再判断"内嵌位图是不是已经够用了"。M2 位图提取机制
+// （ovlP2TScanPageImages/ovlP2TFetchImageBytes）函数本身保留，但退出"图片选择"决策路径——
+// 仍在 ovlP2TConvertOnePage 里跑，产物只作为"模型可引用的候选文件名"（更清晰、原生分辨率），
+// 一旦模型给出合法 bbox，这个引用必然会被裁剪产物覆盖掉；bbox 缺失/不合法时残留的 M2 位图
+// 引用交给 ovlP2TApplyFigurePageCropFallback（三级兜底）当"整页裁剪兜底"统一处理，不再原样
+// 放过（该函数同步改动，见其头部注释）。
 function clamp01(n) { return Math.max(0, Math.min(1, isFinite(n) ? n : 0)); }
 function ovlP2TCropCanvasRegion(canvas, x0, y0, x1, y1) {
     const sx = Math.round(x0 * canvas.width), sy = Math.round(y0 * canvas.height);
@@ -36134,32 +36139,16 @@ function ovlP2TCropCanvasRegion(canvas, x0, y0, x1, y1) {
     out.getContext('2d').drawImage(canvas, sx, sy, sw, sh, 0, 0, sw, sh);
     return out;
 }
-// 内嵌位图的放置矩形覆盖模型 bbox 区域的比例——分子是交集面积，分母固定用 bbox 自身面积
-// （不是并集/不是位图面积），语义是"这个位图盖住了模型标的完整图形区域的百分之多少"，位图比
-// bbox 更大（比如带出血）时会被 Math.min 夹在交集里，比例最高到 1，不会 >1。
-function ovlP2TRectCoverFrac(bboxRect, otherRect) {
-    if (!bboxRect || !otherRect) return 0;
-    const ix0 = Math.max(bboxRect.x0, otherRect.x0), iy0 = Math.max(bboxRect.y0, otherRect.y0);
-    const ix1 = Math.min(bboxRect.x1, otherRect.x1), iy1 = Math.min(bboxRect.y1, otherRect.y1);
-    const iw = Math.max(0, ix1 - ix0), ih = Math.max(0, iy1 - iy0);
-    const interArea = iw * ih;
-    const bboxArea = Math.max(1e-9, (bboxRect.x1 - bboxRect.x0) * (bboxRect.y1 - bboxRect.y0));
-    return interArea / bboxArea;
-}
-const OVL_P2T_BBOX_COVER_THRESHOLD = 0.90;
 // 裁剪专用渲染倍率：bbox 是 0-1 归一化比例，跟渲染分辨率无关，可以放心用比送模型看图那张
 // 更高的分辨率单独重渲一次整页（不是同一张 canvas），换更清晰的裁剪产物——不影响发给模型的
 // 那张图（继续用 OvlSettings.pdf2texMaxPx 原值，两处渲染互不干扰）。
 const OVL_P2T_CROP_RENDER_MULT = 2;
 const OVL_P2T_BBOX_RE = /% BBOX:\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\r?\n\s*\\begin\{figure\}[\s\S]*?\\includegraphics\[[^\]]*\]\{([^}]+)\}/g;
-// imgRects：{ 相对路径 -> {x0,y0,x1,y1} }，来自本页 M2 提取阶段记录的每张内嵌位图放置矩形
-// （ovlP2TConvertOnePage 里 ovlP2TScanPageImages 的产物）；拿不到（M2 关闭/未命中/调用方
-// 没传）就传 null/undefined/{}，一律按"覆盖率未知"处理，全部走主路径裁剪。
-async function ovlP2TApplyFigureCrops(page, text, job, num, maxPx, imgRects) {
+async function ovlP2TApplyFigureCrops(page, text, job, num, maxPx) {
     OVL_P2T_BBOX_RE.lastIndex = 0;
     const matches = [...text.matchAll(OVL_P2T_BBOX_RE)]; // 先收集，避免裁剪写盘是 async 而 replace 是同步
-    if (!matches.length) return { text: text, cropsMade: 0, bitmapKept: 0 };
-    let cropsMade = 0, bitmapKept = 0, out = text, k = 0, renderedCanvas = null; // 惰性渲染，命中第一条真裁剪才真的渲一次整页
+    if (!matches.length) return { text: text, cropsMade: 0 };
+    let cropsMade = 0, out = text, k = 0, renderedCanvas = null; // 惰性渲染，命中第一条真裁剪才真的渲一次整页
     for (let mi = 0; mi < matches.length; mi++) {
         const mm = matches[mi];
         const full = mm[0], x0s = mm[1], y0s = mm[2], x1s = mm[3], y1s = mm[4], imgName = mm[5];
@@ -36167,16 +36156,9 @@ async function ovlP2TApplyFigureCrops(page, text, job, num, maxPx, imgRects) {
         const x1 = clamp01(parseFloat(x1s)), y1 = clamp01(parseFloat(y1s));
         // 校验：越界/反向/退化（<2% 页面宽或高）一律跳过，原样保留原引用，交给外层三级兜底判断
         if (!(x1 > x0 + 0.02 && y1 > y0 + 0.02)) continue;
-        const bboxRect = { x0: x0, y0: y0, x1: x1, y1: y1 };
-        const bitmapRect = imgRects && imgRects[imgName];
-        if (bitmapRect && ovlP2TRectCoverFrac(bboxRect, bitmapRect) >= OVL_P2T_BBOX_COVER_THRESHOLD) {
-            // 次路径（优化）：内嵌位图已经覆盖了模型标的完整图形区域 ≥90%——就是整张图，原生
-            // 分辨率通常比裁剪更高，沿用它，只清掉 BBOX 注释行（走下面的兜底 replace）。
-            bitmapKept++;
-            continue;
-        }
-        // 主路径：区域裁剪——不管模型引用的是整页截图兜底、还是覆盖率不够的内嵌位图（复合图
-        // 场景：位图只是其中一层，bbox 才是完整图形区域），一律从整页栅格上按 bbox 裁一刀。
+        // 区域裁剪——不管模型引用的是整页截图兜底、还是 M2 提取到的内嵌位图，bbox 一旦合法，
+        // 一律从整页栅格上按它裁一刀（v2 Pass P104：不再有"位图已经够用就跳过裁剪"这条分支，
+        // 见函数头部注释）。
         if (!renderedCanvas) {
             const rendered = await ovlP2TRenderPageToCanvas(page, (Number(maxPx) || 1800) * OVL_P2T_CROP_RENDER_MULT);
             renderedCanvas = rendered.canvas;
@@ -36195,11 +36177,11 @@ async function ovlP2TApplyFigureCrops(page, text, job, num, maxPx, imgRects) {
         cropsMade++;
     }
     if (renderedCanvas) { renderedCanvas.width = 0; renderedCanvas.height = 0; } // 用完立刻释放，同 §4.5.7i 纪律
-    // 兜底：没被上面处理到的残留 "% BBOX: ..." 行（比如覆盖率达标走了次路径位图、或越界/退化
-    // 被 continue 跳过的）一律原样剥掉——它们已经完成使命，留在正文里会变成一行游离注释，
-    // 不影响编译（是合法 % 注释）但不美观，剥掉更干净。
+    // 兜底：没被上面处理到的残留 "% BBOX: ..." 行（越界/退化被 continue 跳过的）一律原样剥
+    // 掉——它们已经完成使命，留在正文里会变成一行游离注释，不影响编译（是合法 % 注释）但不
+    // 美观，剥掉更干净。
     out = out.replace(/^% BBOX:.*\r?\n(?=\s*\\begin\{figure\})/gm, '');
-    return { text: out, cropsMade: cropsMade, bitmapKept: bitmapKept };
+    return { text: out, cropsMade: cropsMade };
 }
 
 // ==================== v2 Pass P86 §4：一句一行确定性后处理 ====================
@@ -36467,6 +36449,27 @@ function ovlP2TExtractLatex(raw) {
         if (text[i] === '$') dollarCount++;
     }
     if (dollarCount % 2 !== 0) { suspect = true; suspectReasons.push('unescaped $ math delimiters appear an odd number of times'); }
+    // v2 Pass P104：用户重转 DeepLaDu 核验编译真实失败实测——真根因是这里，不是 \caption*/
+    // refs.bib（两者已用同一份诊断夹具真实走过 :1235 全管线验证，编译均正常）。既有配平自检
+    // 只查 \begin{}/\end{} 环境对与 $ 奇偶，从没查过裸花括号 { }（比如 \textbf{... 或
+    // \section{... 少打一个收尾 }）——小模型偶发漏打收尾括号时，这类片段原样混进拼装后的
+    // main.tex，TeX 把从那个 { 开始到文件结尾的一切都当成同一个未闭合的命令参数继续扫描
+    // （Runaway argument / File ended while scanning use of ...），最终以 Emergency stop 收场，
+    // 这正是 latexmk 打出 "!  ==> Fatal error occurred, no output PDF file produced!" 的经典
+    // 成因——已用独立合成夹具复现：\textbf{ 缺一个收尾 } 之后接两段正常段落，同一套 /compile
+    // 真实产出这一模一样的日志尾（含 "Runaway argument?" / "! File ended while scanning use of
+    // \textbf ." / "! Emergency stop." / "!  ==> Fatal error occurred, no output PDF file
+    // produced!" 四行）。跟 $ 奇偶检查同一套转义扫描手法（"\\" 之后的下一个字符原样跳过，不
+    // 计入配平——verbatim 块里的裸花括号仍可能误报，这是既有 $ 检查同样接受的已知局限，不是
+    // 新引入的风险）：净深度非 0，或扫描途中出现过负数（先出现 } 后出现配对的 {，比如
+    // "}foo{" 这种更罕见的顺序错乱）都判定不配平。
+    let braceDepth = 0, braceWentNegative = false;
+    for (let i = 0; i < text.length; i++) {
+        if (text[i] === '\\') { i++; continue; }
+        if (text[i] === '{') braceDepth++;
+        else if (text[i] === '}') { braceDepth--; if (braceDepth < 0) braceWentNegative = true; }
+    }
+    if (braceDepth !== 0 || braceWentNegative) { suspect = true; suspectReasons.push('curly braces { } are unbalanced'); }
     // v2 Pass P79（§5.2 第1条）：tabular 弱二次校验——同一张表里每行 & 数量是否一致。
     // 只标记不修：\hline/\toprule 等纯规则行没有 & 天然跳过，用众数（首行）当基准。
     const tabularRe = /\\begin\{(tabular\*?|tabularx|longtable)\}(?:\{[^}]*\})?\{[^}]*\}([\s\S]*?)\\end\{\1\}/g;
@@ -36717,8 +36720,18 @@ async function ovlP2TApplyReferencesPipeline(job, rawMainText) {
     try { parsed = await ovlP2TCallBibParse(raw); }
     catch (e) { parsed = { ok: false, error: '调用参考文献解析模型时出内部异常：' + (e && e.message ? e.message : String(e)) }; }
     if (parsed.ok && ovlP2TValidateBibText(parsed.bibText)) {
+        // v2 Pass P104 真根因排查顺手修：prompt 规则 9 明确要求模型把正文里的引用标记
+        // （"[12]"/"(Smith et al., 2020)" 等）原样当纯文本保留，绝不发明 \cite/\ref/\eqref/
+        // \label——这条规则本身没错（小模型编不出真实对应的 key），但连带后果是正文永远不会
+        // 出现任何 \cite{...}，而 bibtex 只把被 \cite 过的条目塞进最终的
+        // thebibliography——用真实诊断夹具（含双栏正文+参考文献列表）走过一遍全管线 :1235
+        // 验证：refs.bib 解析成功、main.tex 编译 ok=true，但编译日志里有
+        // "Empty `thebibliography' environment" 警告，PDF 里整个参考文献列表都是空的——用户
+        // 明明在原文里看到了完整的引用列表，转换结果却悄悄把它丢了，只是不报错，比编译失败更
+        // 隐蔽。补一行 \nocite{*}（bibtex 标准手法：强制把 .bib 里所有条目当作"被引用"处理），
+        // 让 §2 聚合出来的参考文献真的出现在编译产物里，不依赖正文里根本不存在的 \cite。
         const injected = text.replace(/\\end\{document\}\s*$/,
-            '\\bibliographystyle{plain}\n\\bibliography{refs}\n\\end{document}\n');
+            '\\nocite{*}\n\\bibliographystyle{plain}\n\\bibliography{refs}\n\\end{document}\n');
         return { text: injected, mode: 'bibtex', count: raw.length, bibText: parsed.bibText };
     }
     // 回退：thebibliography，逐条 \bibitem，键名同样 ref1..refN 保持跟 bibtex 分支一致的约定
@@ -36922,9 +36935,17 @@ async function ovlP2TComputeContentBBox(canvas) {
 
 // 三种最终文件名形态：assets/img/page-NN-img-K.png（一级，M2 位图）/
 // assets/img/page-NN-crop-K.png（二级，P86 §1 bbox 裁剪）/ assets/img/page-NN-fallback-K.png
-// （三级，本 Pass 新增）——都用同一套 "page-NN-<kind>-K.png" 命名规范，靠文件名本身就能倒推
-// 状态，不需要额外传状态穿过管线。assets/pages/page-NN.png（无后缀，整页截图原样引用）＝前
-// 两级都没接住，是三级兜底要处理的对象。
+// （三级）——都用同一套 "page-NN-<kind>-K.png" 命名规范，靠文件名本身就能倒推状态，不需要
+// 额外传状态穿过管线。assets/pages/page-NN.png（无后缀，整页截图原样引用）同样是三级兜底要
+// 处理的对象。
+//
+// v2 Pass P104：ovlP2TApplyFigureCrops 删掉"位图覆盖率够高就跳过裁剪"那条决策之后，一级
+// （img，M2 原始位图）不再可能是"经过判断、确认够用"的最终产物——只要模型给出了合法 bbox，
+// 二级裁剪必然会把它替换成 crop 文件；一个 figure 块的 \includegraphics 走到这里仍然引用
+// "-img-" 命名，唯一的原因是那张图的 bbox 缺失/不合法（ovlP2TApplyFigureCrops 里越界/反向/
+// 退化的 continue 分支）。所以"img"档不再是终态、原样放过，而是并入下面跟"整页截图"完全
+// 一样的三级兜底：从它所在的那一页重新渲染、按非空白像素外接矩形裁一次，绝不留一张"没人
+// 判断过是否完整"的位图静默进最终文档。
 const OVL_P2T_PAGE_TIERED_RE = /assets\/img\/page-(\d+)-(img|crop|fallback)-\d+\.png$/;
 const OVL_P2T_PAGE_PLAIN_RE = /assets\/pages\/page-(\d+)\.png$/;
 async function ovlP2TApplyFigurePageCropFallback(job, text) {
@@ -36953,20 +36974,27 @@ async function ovlP2TApplyFigurePageCropFallback(job, text) {
         const imgPath = imgMatch ? imgMatch[1] : null;
         if (!imgPath) { results.push({ num: b.num, page: null, status: 'failed', reason: '未找到 \\includegraphics 引用' }); continue; }
         const tiered = OVL_P2T_PAGE_TIERED_RE.exec(imgPath);
-        if (tiered) {
-            const kind = tiered[2];
-            const status = kind === 'img' ? 'bitmap' : (kind === 'crop' ? 'bbox-crop' : 'page-crop-fallback');
+        let pageNum;
+        if (tiered && tiered[2] !== 'img') {
+            // 'crop'（二级 bbox 裁剪）或 'fallback'（更早一轮已经三级兜底过）：已经是确定的最
+            // 终产物，不需要再动。
+            const status = tiered[2] === 'crop' ? 'bbox-crop' : 'page-crop-fallback';
             results.push({ num: b.num, page: parseInt(tiered[1], 10), status: status });
             continue;
+        } else if (tiered) {
+            // kind === 'img'：bbox 缺失/不合法，M2 位图原样留到了这一步——按上面注释并入三级
+            // 兜底，pageNum 直接从文件名解析，不用再猜它属于哪一页。
+            pageNum = parseInt(tiered[1], 10);
+        } else {
+            const plain = OVL_P2T_PAGE_PLAIN_RE.exec(imgPath);
+            if (!plain) {
+                // 既不是三级已知产物命名、也不是整页截图（比如手写了别的相对路径）——三级兜底
+                // 管不到这种场景，原样放过，不报失败（不是本机制职责范围内）。
+                results.push({ num: b.num, page: null, status: 'other' });
+                continue;
+            }
+            pageNum = parseInt(plain[1], 10);
         }
-        const plain = OVL_P2T_PAGE_PLAIN_RE.exec(imgPath);
-        if (!plain) {
-            // 既不是三级已知产物命名、也不是整页截图（比如手写了别的相对路径）——三级兜底管不到
-            // 这种场景，原样放过，不报失败（不是本机制职责范围内）。
-            results.push({ num: b.num, page: null, status: 'other' });
-            continue;
-        }
-        const pageNum = parseInt(plain[1], 10);
         try {
             const page = await job.doc.getPage(pageNum);
             const rendered = await ovlP2TRenderPageToCanvas(page, OvlSettings.pdf2texMaxPx);
@@ -37216,12 +37244,12 @@ async function ovlP2TConvertOnePage(job, num) {
         if (rendered.sentAsJpeg) pageState.flags.sentAsJpeg = true;
         const dataUrl = await ovlP2TBlobToDataUrl(rendered.sendBlob);
         let images = ['- assets/pages/page-' + ovlP2TPad2(num) + '.png   (the full page raster; use it ONLY if this page really contains a figure you cannot reproduce as LaTeX)'];
-        // v2 Pass P95：每张内嵌位图的放置矩形（归一化，跟模型 BBOX 同一坐标系），供 §1.2 的
-        // 裁剪/位图二选一判断用——文件名 -> {x0,y0,x1,y1}。M2 关闭/没扫到/提取失败时保持空
-        // 对象，ovlP2TApplyFigureCrops 会按"覆盖率未知"全部走裁剪主路径，不猜。
-        let imgRects = {};
-        // M2（§5.1）：能提取到内嵌图就换成真实清单；任何一步失败/没找到 → 原样回落 M1
-        // 整页截图行为，并在 flags 里记一笔（README 汇总用），不抛异常、不中断整页转换。
+        // v2 Pass P104（用户拍板，见 ovlP2TApplyFigureCrops 头部注释的完整根因）：M2 内嵌位图
+        // 提取退出了"图片选择"决策——不再记录每张位图的放置矩形喂给裁剪函数做覆盖率判断，只
+        // 是单纯把提取到的位图文件名列进 AVAILABLE IMAGES，给模型一个比整页截图更清晰的候选
+        // 引用；只要模型之后给出合法 BBOX，这个引用必然会被 ovlP2TApplyFigureCrops 的区域裁剪
+        // 覆盖掉。任何一步失败/没找到 → 原样回落 M1 整页截图行为，并在 flags 里记一笔（README
+        // 汇总用），不抛异常、不中断整页转换。
         if (OVL_P2T_M2_AVAILABLE && OvlSettings.pdf2texExtractImages) {
             try {
                 const scanned = await ovlP2TScanPageImages(page);
@@ -37234,7 +37262,6 @@ async function ovlP2TConvertOnePage(job, num) {
                         const rel = 'assets/img/page-' + ovlP2TPad2(num) + '-img-' + (k + 1) + '.png';
                         await ovlP2TWriteBinary(job.outRel + '/' + rel, fetched.bytes);
                         extractedLines.push('- ' + rel + '   (' + fetched.width + 'x' + fetched.height + ' px, ' + scanned[k].vertDesc + ' of the page)');
-                        if (scanned[k].rect) imgRects[rel] = scanned[k].rect;
                     }
                     if (extractedLines.length) { images = extractedLines; pageState.flags.imagesExtracted = extractedLines.length; }
                     else { pageState.flags.m2Degraded = true; }
@@ -37284,16 +37311,15 @@ async function ovlP2TConvertOnePage(job, num) {
         pageState.ms = ms;
         pageState.chars = extracted.text.length;
         pageState.flags = Object.assign(pageState.flags || {}, extracted.flags);
-        // v2 Pass P86 §1 / P95：bbox 区域裁剪（主路径）——只在真的命中 "% BBOX:" 标记时才会
-        // 重新渲染一次整页（惰性，见 ovlP2TApplyFigureCrops 内部）；内嵌位图覆盖率 ≥90% 走
-        // 次路径（imgRects 传本页 M2 提取到的放置矩形）。裁剪失败绝不影响本页转换结果——原样
-        // 保留原引用，跟 M2 降级同一纪律。
+        // v2 Pass P86 §1 / P104：bbox 区域裁剪——只在真的命中 "% BBOX:" 标记时才会重新渲染一次
+        // 整页（惰性，见 ovlP2TApplyFigureCrops 内部）；bbox 合法就无条件裁剪，不再有"位图已经
+        // 够用就跳过"这条判断。裁剪失败绝不影响本页转换结果——原样保留原引用，跟 M2 降级同一
+        // 纪律（残留的 M2 位图引用会在 ovlP2TApplyFigurePageCropFallback 三级兜底里被处理掉）。
         let finalText = extracted.text;
         try {
-            const cropped = await ovlP2TApplyFigureCrops(page, finalText, job, num, OvlSettings.pdf2texMaxPx, imgRects);
+            const cropped = await ovlP2TApplyFigureCrops(page, finalText, job, num, OvlSettings.pdf2texMaxPx);
             finalText = cropped.text;
             if (cropped.cropsMade) pageState.flags.figureCropsMade = cropped.cropsMade; // README 汇总用
-            if (cropped.bitmapKept) pageState.flags.figureBitmapKept = cropped.bitmapKept; // README 汇总用（次路径命中数）
         } catch (e) { console.error('[ovl] p2t figure crop failed', num, e); }
         // v2 Pass P86 §4：一句一行确定性后处理——在裁剪之后执行（裁剪替换 \includegraphics
         // 文件名不影响文本的句子结构，两者互相独立；先裁剪、后分句，避免分句逻辑意外把
@@ -37385,11 +37411,30 @@ function ovlP2TVerifyBuildErrorExcerpt(compileData, configuredTimeoutMs) {
     }
     const log = (compileData && compileData.log) || '';
     if (log) {
-        // 优先找日志里最后一条以 "!" 开头的经典 TeX 致命错误标记行（不依赖 file:line 格式），
-        // 比"盲切最后 2000 字符再取第一行"更可能是真正有信息量的那一行。
-        const bangLines = log.split(String.fromCharCode(10)).map(function (l) { return l.trim(); }).filter(function (l) { return l.charAt(0) === '!'; });
-        if (bangLines.length) return bangLines[bangLines.length - 1];
-        return log.slice(-2000);
+        // v2 Pass P104：用户重转 DeepLaDu 核验失败实测——旧逻辑取"最后一条以 '!' 开头的行"，
+        // 但 latexmk/pdflatex 收尾几乎总会再打一行 "! ==> Fatal error occurred, no output PDF
+        // file produced!" 这类总结行，天生排在所有具体错误行之后、永远是"最后一条"，却完全不
+        // 包含任何定位信息——用户看到的摘要因此变成整段日志里最没用的那一行。真正描述出错原因
+        // 的那一行（Undefined control sequence / LaTeX Error / Package ... Error 等）几乎总是
+        // 日志里最早出现的具体 "!" 行；经典 TeX 报错格式紧跟着通常还会有一行 "l.NNN ..."（出错
+        // 的具体源码行号），一并带上这至多 2 行原始上下文，比孤零零一行更有信息量，也顺带满足
+        // "若有 file:line 一并给出"——这类定位信息几乎总落在紧跟着的那一两行里。
+        const rawLines = log.split(String.fromCharCode(10));
+        const isSummaryBang = function (trimmed) { return /^!\s*==>/.test(trimmed); };
+        let pickIdx = -1;
+        for (let i = 0; i < rawLines.length; i++) {
+            const t = rawLines[i].trim();
+            if (t.charAt(0) === '!' && !isSummaryBang(t)) { pickIdx = i; break; }
+        }
+        if (pickIdx === -1) {
+            // 全日志只有总结行、没有任何具体错误行（极少见）：退回旧兜底——最后一条 "!" 行，
+            // 聊胜于无；再没有就裸切日志尾部。
+            const bangLines = rawLines.map(function (l) { return l.trim(); }).filter(function (l) { return l.charAt(0) === '!'; });
+            if (bangLines.length) return bangLines[bangLines.length - 1];
+            return log.slice(-2000);
+        }
+        const ctxEnd = Math.min(rawLines.length, pickIdx + 3); // 出错行本身 + 其后最多 2 行原始上下文
+        return rawLines.slice(pickIdx, ctxEnd).map(function (l) { return l.replace(/\r$/, ''); }).join('\n');
     }
     // v2 Pass P98：到这里说明 compileData.error/timedOut/log 三者都没有——真的什么线索都没有。
     // 不再编"可能是桥本身不可达或超时"这种没有证据支持的具体猜测（诊断证实那次事故里桥全程
@@ -38094,10 +38139,29 @@ async function ovlP2TDeleteOutDir(job) {
 }
 
 // ---- §4.5 步骤1-3：前置闸 + 读 PDF 字节 + 开独立 pdf.js 文档实例 ----
+// v2 Pass P104（用户拍板 B② 排查项）：重转进同一输出目录（「重新转换」按钮，outRel 复用
+// 上次的目录）时，assets/img/ 里的文件名靠"页号+序号"确定性命名（page-NN-img-K.png / page-
+// NN-crop-K.png），单个文件会被同名覆盖，但*张数*不保证跨两次转换一致——M2 原始位图张数由
+// PDF 内容决定、天然稳定，但裁剪产物张数取决于这一轮模型给了几条合法 bbox，换一次模型调用
+// （重新转换本质就是整套视觉请求重打一遍）完全可能比上次少。上次多出来的那几张裁剪图不会被
+// 这次覆盖，成了磁盘上没有任何 main.tex 引用它们的孤儿文件——不会被裁剪/兜底逻辑误当作候选
+// （选图逻辑从不扫目录，只认自己刚写的文件名），但会误导人工检查 assets/img/ 目录内容（以为
+// 那几张图还在用）。在这里整体清空 assets/img/ 再开始这一轮，让每次转换的资产目录都是这一轮
+// 的真实产物、不留前朝遗迹；找不到目录（首次转换，目录还不存在）就当没这回事，不报错。
+async function ovlP2TCleanAssetsImgDir(outRel) {
+    try {
+        const parts = String(outRel).replace(/\\/g, '/').split('/').filter(function (p) { return p && p !== '.'; });
+        parts.push('assets');
+        let dir = OvlState.dirHandle;
+        for (let i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i]);
+        await dir.removeEntry('img', { recursive: true });
+    } catch (e) { /* 目录本来就不存在（首次转换）或其它读取失败：视为没有旧资产要清，不中断转换 */ }
+}
 async function ovlP2TBeginJob(entry, outRel) {
     // 顶替掉可能还留着的上一个 job（用户没点面板「关闭」就直接开始转换另一份 PDF，或对
     // 同一份 PDF 又点了一次「重新转换」）——它的 doc 这时才是真的没用了，在这里销毁。
     if (OvlP2TState.job && OvlP2TState.job.doc) await ovlP2TDestroyJobDoc(OvlP2TState.job);
+    await ovlP2TCleanAssetsImgDir(outRel);
     let file;
     try { file = await entry.handle.getFile(); }
     catch (e) { if (typeof showToast === 'function') showToast('读取 PDF 失败：' + (e && e.message ? e.message : String(e)), 'error'); return; }
@@ -40930,9 +40994,13 @@ function ovlSettingsPdf2TexHtml() {
     html += ovlSetRow('保留页面截图', '<input type="checkbox" data-setpath="settings.pdf2texSavePageImages"' + (s.pdf2texSavePageImages ? ' checked' : '') + '>',
         '关掉可以省磁盘（每篇论文页面截图约 6-12 MB），但转换失败的页面就只剩文字占位，没有整页截图兜底。');
     html += ovlSetRow('打开 PDF 时自动打开已有转换结果', '<input type="checkbox" data-setpath="settings.pdf2texAutoOpenResult"' + (s.pdf2texAutoOpenResult ? ' checked' : '') + '>', '');
-    html += ovlSetRow('提取内嵌图片', '<input type="checkbox" id="ovlP2TExtractImagesChk" data-setpath="settings.pdf2texExtractImages"'
+    html += ovlSetRow('提取图片', '<input type="checkbox" id="ovlP2TExtractImagesChk" data-setpath="settings.pdf2texExtractImages"'
         + (s.pdf2texExtractImages ? ' checked' : '') + (OVL_P2T_M2_AVAILABLE ? '' : ' disabled') + '>',
-        OVL_P2T_M2_AVAILABLE ? '默认开启：优先提取 PDF 里的内嵌位图；矢量绘制的图表/示意图会由视觉模型标出位置后从页面栅格裁剪。关闭则退回整页截图当图源。' : '本机 pdf.js spike 未通过（详见 overnight_progress.md「## P75」），这个能力尚未实现，开关已禁用。');
+        // v2 Pass P104：原名"提取内嵌图片"改成"提取图片"——用户拍板删掉了"内嵌位图覆盖率够
+        // 高就直接沿用"这条决策后，是否提取内嵌位图已经不再影响最终图片是否被裁剪（bbox 合法
+        // 就一律裁剪，跟这个开关无关）；本开关现在只控制"要不要额外生成内嵌位图这份素材资产"，
+        // 存储键沿用 pdf2texExtractImages 不做迁移。
+        OVL_P2T_M2_AVAILABLE ? '默认开启：额外提取 PDF 里的内嵌位图作为候选引用文件（原生分辨率通常优于整页截图），供视觉模型在没有合法 bbox 时兜底引用；图片最终是否走区域裁剪只看 bbox 是否合法，跟本开关无关。关闭则只用整页截图当图源。' : '本机 pdf.js spike 未通过（详见 overnight_progress.md「## P75」），这个能力尚未实现，开关已禁用。');
     html += ovlSetRow('转换后自动整体核验', '<input type="checkbox" data-setpath="settings.pdf2texAutoVerify"' + (s.pdf2texAutoVerify ? ' checked' : '') + '>',
         '转换完成后自动编译一次 main.tex；失败会尝试一轮自动修复（把错误日志+出错页片段发给上面同一个模型改写，改动结果只应用一次）后再编译一次，结果显示在转换面板里。关闭则跳过核验，转换完直接结束。');
     html += ovlSetRow('连接测试', '<button type="button" class="ovl-modal-btn" onclick="ovlP2TTestVisionConnection()">测试连接</button>'
