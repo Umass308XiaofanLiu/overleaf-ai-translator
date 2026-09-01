@@ -50,7 +50,7 @@ try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化�
 // v2 Pass P45：/health 里带的能力/版本自报——见该端点注释。每次给桥新增一个"前端需要能
 // 判断有没有"的能力（新端点、既有端点的行为变化），就在 BRIDGE_CAPABILITIES 里加一个字符串，
 // 版本号也提一位。已经上线的能力不会被撤销，这个数组只做加法。
-const BRIDGE_API_VERSION = 57;
+const BRIDGE_API_VERSION = 58;
 const BRIDGE_CAPABILITIES = [
     'overleaf-clone',          // POST /overleaf/clone
     'overleaf-pull-strategy',  // POST /overleaf/pull 认识 body.strategy（abort/stash/discard）
@@ -70,11 +70,18 @@ const BRIDGE_CAPABILITIES = [
                                 // 忽略的文件算进删除名单，响应新增 skippedIgnored/ignoreWarning 字段
     'fs-write-binary',         // v2 Pass P75 §7.1：POST /fs/write-binary，base64 → 原样字节落盘，
                                 // 供 PDF→LaTeX 转换写页面栅格图/内嵌图片用（doFsWrite 只能写 utf8 字符串）
-    'synctex-cache-rehydrate'  // v2 Pass P107：POST /synctex/rehydrate，把项目内已缓存的
+    'synctex-cache-rehydrate', // v2 Pass P107：POST /synctex/rehydrate，把项目内已缓存的
                                 // PDF/output.synctex.gz（通常在 .ovl-cache/ 下）复制进一个新的
                                 // WORK_ROOT/<id> outdir，换回一个可用的 id——供"刷新后从磁盘
                                 // 缓存恢复显示的 PDF"接上现成的 /synctex/forward、/synctex/edit
                                 // （它们只认 id -> outdir 这一种定位方式），不需要真的重新编译
+    'admin-restart'            // v2 Pass P119：POST /admin/restart——桥自己主动以非零退出码
+                                // (process.exit(1)) 退出，把"拉起新进程"这件事交给外部计划
+                                // 任务的自愈配置（本机 LatexBridge-AutoStart / jump 侧对应任务
+                                // 的 RestartCount 设置），供无人值守场景在改完 server.js 后不
+                                // 需要人手动重启桥。跟其余端点一样过统一令牌闸门，不进
+                                // TOKEN_EXEMPT_PATHS——远程模式必须带令牌，本地模式沿用
+                                // tokenAuthorized() 现行语义（无需令牌），没有特殊豁免。
 ];
 
 // v2 Pass P49：监听地址可配（LATEX_BRIDGE_HOST），默认仍是 127.0.0.1——不传就跟以前
@@ -246,6 +253,11 @@ const TOKEN_EXEMPT_PATHS = new Set(['/health', '/', '/AI-Translator.html', '/rou
 
 let currentChild = null;
 let currentChildId = null;
+
+// v2 Pass P119：POST /admin/restart 的排程状态——一旦排上，1 秒退出窗口内的重复调用直接
+// 幂等返回，不重复计时、不重复触发下面的 killTree/process.exit。进程一退出这个变量自然
+// 归零（跟着整个进程消失），不需要显式重置。
+let restartScheduled = false;
 
 // ---------------------------------------------------------------------------
 // 小工具
@@ -2838,7 +2850,7 @@ const server = http.createServer(async (req, res) => {
             return;
         }
         if (req.method === 'GET' && pathname === '/routes') {
-            sendText(res, 200, 'AI-Translator latex-bridge is running. GET /, GET /AI-Translator.html, POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /synctex/rehydrate, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /overleaf/check-target, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/write-binary, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete, POST /fs/restore, POST /fs/capabilities, POST /ws-ticket. WebSocket on same host:port for disk-change push.');
+            sendText(res, 200, 'AI-Translator latex-bridge is running. GET /, GET /AI-Translator.html, POST /compile, POST /stop, POST /wordcount, POST /synctex/forward, POST /synctex/edit, POST /synctex/rehydrate, POST /pick-folder, GET /health, GET /output/:id/:file, GET /project-asset?projectDir=&path=, POST /clear, POST /overleaf/pull, POST /overleaf/push, POST /overleaf/clone, POST /overleaf/check-target, POST /fs/list, POST /fs/read, POST /fs/write, POST /fs/write-binary, POST /fs/mkdir, POST /fs/move, POST /fs/copy, POST /fs/delete, POST /fs/restore, POST /fs/capabilities, POST /ws-ticket, POST /admin/restart. WebSocket on same host:port for disk-change push.');
             return;
         }
         // v2 Pass P110：浏览器打开页面会自动请求 favicon.ico——204 是最省事的"没有，但也不算
@@ -3355,6 +3367,38 @@ const server = http.createServer(async (req, res) => {
         // 一次性、60 秒过期，绝不是长期令牌的替代品——长期令牌永远只走请求头，不出现在任何 URL。
         if (req.method === 'POST' && pathname === '/ws-ticket') {
             sendJson(res, 200, { ok: true, ticket: createWsTicket(), expiresInMs: WS_TICKET_TTL_MS });
+            return;
+        }
+
+        // v2 Pass P119：桥自重启——无人值守场景改完 server.js 后没有"人"去走
+        // overnight_constraints.md 那套手动重启流程，这个端点让桥自己主动退出，交给外部计划
+        // 任务的自愈配置重新拉起新进程（详见 README「桥自重启」一节）。不进
+        // TOKEN_EXEMPT_PATHS——跟其余非豁免端点一样过上面统一的 tokenAuthorized() 闸门：
+        // 远程模式必须带对的令牌，本地模式（REMOTE_MODE=false）tokenAuthorized 恒真，不为这
+        // 一个端点单独加令牌要求。
+        if (req.method === 'POST' && pathname === '/admin/restart') {
+            if (restartScheduled) {
+                // 已经排上了：幂等返回，不重复计时、不重复 kill——避免同一秒内连点两下反而
+                // 制造第二次 killTree/第二次 process.exit 竞态。
+                sendJson(res, 200, { ok: true, alreadyScheduled: true });
+                return;
+            }
+            restartScheduled = true;
+            sendJson(res, 200, { ok: true, message: '桥将在1秒后退出,由计划任务自动拉起' });
+            setTimeout(() => {
+                // 收尾：用现有 killTree 机制把当前还在跑的编译子进程树（如果有）杀干净。带上
+                // jobIdHint（即 currentChildId）触发二次扫荡——见 killTree 头部注释：
+                // taskkill /T /F 在 latexmk 经过一层 sh.exe 包装派生 pdflatex 时，实测杀不干净
+                // 这层 sh.exe 自己派生出的孙进程；/admin/restart 的定位是"干净收尾"，不能只做
+                // /stop 那种单纯 taskkill，必须带上二次扫荡这一环。
+                const jobIdHint = currentChildId;
+                try { killTree(currentChild && currentChild.pid, jobIdHint); } catch (e) {}
+                currentChild = null;
+                currentChildId = null;
+                // 非零退出码——外部计划任务据此判定"任务失败"才会触发它的 RestartCount 自愈，
+                // 退出码 0 不会。这不是错误，是故意的信号。
+                process.exit(1);
+            }, 1000);
             return;
         }
 
