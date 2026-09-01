@@ -4161,7 +4161,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.03.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.03.03';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -42968,10 +42968,15 @@ async function ovlP106TryReverseSentenceHighlight(pageNum, texLineText) {
 // span 里继续往后扫，绝不新开 span、绝不跳过任何字符。硬不变量：
 //   spans.map(s => lineText.slice(s[0], s[1])).join('') === lineText 恒成立，一个字符都不丢
 // ——test_p114_locate.js 组I 直接对≥30条构造行断言这条性质，任何改动这个函数都不许破坏它。
-// 代价（如实记录，不是零成本的修复）：句点后不跟空白时选择不断句、并入当前 span——如果这
-// 类位置在源文本里格式不规范、恰好真的是漏打了空格的两句话分界，会把这两句合并进同一个
-// span，用户体感是这一行的句级细化从"两句"粗化成"一句"，是边界粗化，不是丢字/截头，
-// 符合"宁可句长也不丢字"的底线。ovlP114MaskAbbrevPeriods（上面 P114 返修新增）继续保留，
+// 代价（如实记录，不是零成本的修复；v2 Pass P114d 核验第3轮实测订正——之前两轮都把触发面
+// 写窄了，见 .claude/tmp/p114_verify.md 第3轮问题②）：触发条件 = 真句号后紧跟任意非空白
+// 字符，主力**不是**"源文本格式不规范/漏打空格"，而是完全规范的英文/LaTeX 写法——引号收尾
+// （He said "it works." Then...）、单引号收尾（'done.' We...）、右括号收尾（(we verified
+// it.) We...）、右花括号收尾（\emph{here.} The...）、行内公式收尾（$x < 1.$ The...）、脚注/
+// 反斜杠命令收尾（\footnote{See Ref. 3.} We...），实测 6/6 全部触发。后果 = 该处不断句、
+// 并入当前 span，合并成更粗的 span；极端情况下整行只剩 1 段，ovlP114SentenceRangeInLine 因
+// spans.length<=1 返回 null，退回行级——是安全降级，不是丢字/截头（join 不变量在这些位置
+// 依然恒真，不丢字不截头）。ovlP114MaskAbbrevPeriods（上面 P114 返修新增）继续保留，
 // 但职责从"防止丢字"降级为"切得更准的加分项"——新扫描本身已经不会丢字，不做缩写掩码的话
 // 缩写内部的句点会被误判成真边界、多切出几个短 span，打分函数按整句取词会自己挑出词重合率
 // 最高的那个，通常不影响最终选中哪一句。
