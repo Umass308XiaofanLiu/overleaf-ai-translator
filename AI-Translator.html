@@ -4161,7 +4161,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.02.05';        // APP_VERSION_STAMP
+const APP_VERSION = '03.03.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -13940,6 +13940,19 @@ function adjustPopupPosition(popupId, padding = 10) {
             popup.style.bottom = '100%';
             popup.style.marginTop = '0';
             popup.style.marginBottom = '8px';
+            // v2 Pass P117：翻到上方以后，锚点上方剩余空间可能仍然不够（弹层本身比这块空间还
+            // 高）——原逻辑到这里就结束了，弹层顶部会越出视口上沿。这里补一次贴顶 clamp +
+            // 内部滚动兜底，不改变"翻到上方"这个已有语义，只保证翻完之后真的落在视口内。
+            // 用嵌套 rAF 是因为 bottom:100% 这条改的是相对锚点的偏移，实际像素位置要等这次
+            // style 写入生效、浏览器完成下一次布局后才量得准。
+            requestAnimationFrame(() => {
+                const flippedRect = popup.getBoundingClientRect();
+                if (flippedRect.top < padding) {
+                    const overflowTop = padding - flippedRect.top;
+                    popup.style.maxHeight = `${Math.max(0, flippedRect.height - overflowTop)}px`;
+                    popup.style.overflowY = 'auto';
+                }
+            });
         }
     });
 }
@@ -26277,9 +26290,17 @@ function ovlToggleLayoutMenu() {
     const willOpen = menu.hasAttribute('hidden');
     if (!willOpen) { ovlCloseLayoutMenu(); return; }
     const r = btn.getBoundingClientRect();
-    menu.style.top = (r.bottom + 4) + 'px';
-    menu.style.right = (window.innerWidth - r.right) + 'px';
+    // v2 Pass P117：原来只靠 `right: 视口宽-按钮右边` 贴右锚，水平方向天然不会右溢出，但完全
+    // 没管底部——按钮太靠视口下边缘（如窄高度屏幕）时菜单会越出视口下沿。借统一钳制助手补上
+    // 垂直方向的翻转/clamp；水平方向换成等价的 left 坐标（数值上和原来的 right 锚点算出来是
+    // 同一个像素位置，正常路径下观感不变），只是多了一层最终双轴兜底。
+    menu.style.visibility = 'hidden';
     menu.removeAttribute('hidden');
+    menu.style.right = 'auto';
+    const cl = ovlClampPopupToViewport(menu, r, { rawLeft: r.right - menu.offsetWidth, rawTop: r.bottom + 4 });
+    menu.style.left = cl.left + 'px';
+    menu.style.top = cl.top + 'px';
+    menu.style.visibility = '';
 }
 
 function ovlSetViewMode(mode, opts) {
@@ -29612,9 +29633,14 @@ function ovlToggleVisualLangMenu() {
     const willOpen = menu.hasAttribute('hidden');
     if (!willOpen) { ovlCloseVisualLangMenu(); return; }
     const r = btn.getBoundingClientRect();
-    menu.style.top = (r.bottom + 4) + 'px';
-    menu.style.left = r.left + 'px';
+    // v2 Pass P117：贴按钮左下角展开的菜单，按钮太靠视口右/下边缘时原来会直接出界——
+    // 借统一钳制助手补上溢出保护。测量真实尺寸前先解除 hidden（visibility 挡住闪烁）。
+    menu.style.visibility = 'hidden';
     menu.removeAttribute('hidden');
+    const cl = ovlClampPopupToViewport(menu, r, { rawLeft: r.left, rawTop: r.bottom + 4 });
+    menu.style.left = cl.left + 'px';
+    menu.style.top = cl.top + 'px';
+    menu.style.visibility = '';
 }
 function ovlVisualLangUpdateMenuUI() {
     const menu = document.getElementById('ovlVisualLangMenu');
@@ -43348,9 +43374,14 @@ function ovlToggleZoomMenu() {
     if (!willOpen) return;
     ovlRenderZoomMenu();
     const r = btn.getBoundingClientRect();
-    menu.style.top = (r.bottom + 4) + 'px';
-    menu.style.left = Math.max(4, r.right - 200) + 'px';
+    // v2 Pass P117：原来硬编码菜单宽 200px 来算贴右边界的 left，按钮太靠左/菜单实际更宽时会
+    // 算错；改成解除 hidden 后量出真实 offsetWidth，再交给统一钳制助手做右/下溢出保护。
+    menu.style.visibility = 'hidden';
     menu.hidden = false;
+    const cl = ovlClampPopupToViewport(menu, r, { rawLeft: r.right - menu.offsetWidth, rawTop: r.bottom + 4 });
+    menu.style.left = cl.left + 'px';
+    menu.style.top = cl.top + 'px';
+    menu.style.visibility = '';
 }
 function ovlBindZoomMenu() {
     const menu = document.getElementById('ovlZoomMenu');
@@ -43405,9 +43436,14 @@ function ovlToggleCompileOptionsMenu() {
     if (!willOpen) return;
     ovlRenderCompileOptionsMenu();
     const r = btn.getBoundingClientRect();
-    menu.style.top = (r.bottom + 4) + 'px';
-    menu.style.left = Math.max(4, r.right - 220) + 'px';
+    // v2 Pass P117：同 ovlToggleZoomMenu——硬编码菜单宽 220px 换成量出的真实 offsetWidth，
+    // 交给统一钳制助手做右/下溢出保护（这个菜单条目多，窄视口下最容易触发底部越界）。
+    menu.style.visibility = 'hidden';
     menu.hidden = false;
+    const cl = ovlClampPopupToViewport(menu, r, { rawLeft: r.right - menu.offsetWidth, rawTop: r.bottom + 4 });
+    menu.style.left = cl.left + 'px';
+    menu.style.top = cl.top + 'px';
+    menu.style.visibility = '';
 }
 function ovlBindCompileOptionsMenu() {
     const menu = document.getElementById('ovlCompileOptionsMenu');
@@ -43458,9 +43494,15 @@ function ovlToggleProjectMenu() {
     ovlCloseLayoutMenu();
     if (!willOpen) return;
     const r = btn.getBoundingClientRect();
-    menu.style.top = (r.bottom + 4) + 'px';
-    menu.style.right = (window.innerWidth - r.right) + 'px';
+    // v2 Pass P117：同 ovlToggleLayoutMenu 的处理——贴右锚只管了水平，这里补垂直方向的
+    // 翻转/clamp，水平换成等价的 left 坐标（正常路径像素位置不变）。
+    menu.style.visibility = 'hidden';
     menu.hidden = false;
+    menu.style.right = 'auto';
+    const cl = ovlClampPopupToViewport(menu, r, { rawLeft: r.right - menu.offsetWidth, rawTop: r.bottom + 4 });
+    menu.style.left = cl.left + 'px';
+    menu.style.top = cl.top + 'px';
+    menu.style.visibility = '';
 }
 function ovlProjectDownloadPdf() {
     if (!OvlState.lastCompile || !OvlState.lastCompile.pdfExists) { ovlFlashSaveStatus('还没有编译出 PDF，请先 Recompile', true); return; }
@@ -43783,6 +43825,84 @@ function ovlCompressSteps(natural, min, step) {
     while (v > min) { steps.push(v); v -= step; }
     steps.push(min);
     return steps;
+}
+
+// v2 Pass P117：统一弹层视口钳制助手（施工前盘点见项目内部工作笔记）。语义抄自本仓库里
+// 两个已经做对了的范式实现——ovlTip2PositionFor(单轴翻转+双轴 clamp 兜底) 和下面这个
+// ovlPlaceFloating(候选位+避让)——但这两个都是"自己算默认位置"的专用实现，改不动别处的锚定
+// 菜单/悬浮框；这里抽的是它们共同的**收尾**部分："算出一个默认位置 → 缺口方向翻转 → 无论如何
+// 最后都做一次双轴 Math.max/Math.min 兜底"，给剩下那批完全没有 clamp 或 clamp 有缺口的调用点用。
+//   el         —— 已插入 DOM、此刻可测量真实尺寸的弹层元素（原生 [hidden] 默认 display:none，
+//                 调用点必须先解除 hidden 才能量出非零的 offsetWidth/offsetHeight——助手本身
+//                 不碰 hidden/visibility，测量前的显示时序由各调用点自己负责，见各处 “v2 Pass
+//                 P117” 注释）。
+//   anchorRect —— 锚点 DOMRect（或等价 {left,top,right,bottom,width,height}）；side:'point' /
+//                 传了 rawLeft+rawTop 时可以不传（此时不做翻转，只做纯 clamp）。
+//   opts:
+//     side        'below'(默认，菜单类，展开在锚点下方) | 'right'(锚点右侧展开，如 tooltip)
+//                 | 'point'(贴光标/点击点，配 opts.point，默认不翻转)
+//     align       'start'(默认，左边缘对齐锚点左边) | 'end'(右边缘对齐锚点右边，"贴右边界"菜单用)
+//     gap         锚点与弹层间距，默认 4
+//     margin      安全边距，默认 8
+//     preferFlipV 下方放不下时是否允许翻到锚点上方，默认跟 side 走（'point' 默认不翻，其余默认翻）
+//     maxWidth/maxHeight  调用点自己已知的收缩上限（px）；不传时助手仍会在弹层本身比可用视口
+//                 还大时自动收缩（不然 clamp 的数学式在超大弹层上不成立），并加内部滚动
+//     rawLeft/rawTop  跳过按 side/align 算默认位置这一步，直接对这组已算好的坐标做钳制收尾——
+//                 给"已有一套贴锚点逻辑、只想复用同一份兜底 clamp"的调用点用
+//     point       {x,y}，side:'point' 时的锚点，不传则退回 anchorRect.left/top
+// 返回 {left, top, flippedV, flippedH, shrunk}——只读取/收缩样式（每次调用都先清空上一轮可能
+// 残留的收缩样式，保证同一弹层换了视口尺寸重开时是按"自然尺寸"重新算，不会被上一轮的
+// max-height 卡住），不写 left/top——调用点自己赋值，避免和各处已有的"先隐藏测量再显示"
+// 时序产生冲突。
+function ovlClampPopupToViewport(el, anchorRect, opts) {
+    opts = opts || {};
+    const margin = (opts.margin != null) ? opts.margin : 8;
+    const gap = (opts.gap != null) ? opts.gap : 4;
+    const side = opts.side || 'below';
+    const align = opts.align || 'start';
+    const preferFlipV = (opts.preferFlipV != null) ? opts.preferFlipV : (side !== 'point');
+    const VW = innerWidth, VH = innerHeight;
+    el.style.maxWidth = '';
+    el.style.maxHeight = '';
+    el.style.overflowY = '';
+    let w = el.offsetWidth, h = el.offsetHeight;
+    let shrunk = false;
+    if (opts.maxWidth && w > opts.maxWidth) { w = opts.maxWidth; shrunk = true; }
+    if (opts.maxHeight && h > opts.maxHeight) { h = opts.maxHeight; shrunk = true; }
+    const availW = Math.max(0, VW - margin * 2), availH = Math.max(0, VH - margin * 2);
+    if (w > availW) { w = availW; shrunk = true; }
+    if (h > availH) { h = availH; shrunk = true; }
+    let x, y;
+    if (opts.rawLeft != null && opts.rawTop != null) {
+        x = opts.rawLeft; y = opts.rawTop;
+    } else if (side === 'point') {
+        const p = opts.point || (anchorRect ? { x: anchorRect.left, y: anchorRect.top } : { x: 0, y: 0 });
+        x = p.x + gap; y = p.y + gap;
+    } else if (side === 'right') {
+        x = anchorRect.right + gap;
+        y = anchorRect.top + anchorRect.height / 2 - h / 2;
+    } else { // 'below'
+        x = (align === 'end') ? (anchorRect.right - w) : anchorRect.left;
+        y = anchorRect.bottom + gap;
+    }
+    let flippedH = false, flippedV = false;
+    if (side === 'right' && opts.rawLeft == null) {
+        if (x + w > VW - margin) { x = anchorRect.left - w - gap; flippedH = true; }
+    } else {
+        if (x + w > VW - margin) { x = VW - w - margin; flippedH = true; }
+    }
+    if (preferFlipV && anchorRect && y + h > VH - margin) {
+        const flippedY = anchorRect.top - h - gap;
+        if (flippedY >= margin) { y = flippedY; flippedV = true; }
+    }
+    x = Math.max(margin, Math.min(x, VW - w - margin));
+    y = Math.max(margin, Math.min(y, VH - h - margin));
+    if (shrunk) {
+        el.style.maxWidth = w + 'px';
+        el.style.maxHeight = h + 'px';
+        el.style.overflowY = 'auto';
+    }
+    return { left: x, top: y, flippedV: flippedV, flippedH: flippedH, shrunk: shrunk };
 }
 
 // 统一避让布局器（规格 §2）。
@@ -44627,9 +44747,13 @@ function ovlShowQuickActionsAt(x, y, source) {
         })
         : null;
     if (!qaPlaced) {
-        qa.style.left = Math.max(4, x - 40) + 'px';
-        qa.style.top = Math.max(4, y - 36) + 'px';
         qa.classList.add('ovl-open');
+        // v2 Pass P117：这条兜底路径（理论上不会走到，见上方注释）原来只 clamp 了左/上限，
+        // 落点贴视口右/下边缘（比如在屏幕右下角选中文字）时工具条会越出视口——统一钳制助手
+        // 补上右/下限，不改"贴选区附近"这个落点语义，只保证真的落在视口内。
+        const cl = ovlClampPopupToViewport(qa, null, { rawLeft: Math.max(4, x - 40), rawTop: Math.max(4, y - 36), preferFlipV: false });
+        qa.style.left = cl.left + 'px';
+        qa.style.top = cl.top + 'px';
     }
 }
 function ovlBindQuickActions() {
@@ -45997,9 +46121,14 @@ function ovlUpdateEqPreview(clientX, clientY) {
     try {
         box.innerHTML = window.katex.renderToString(found, { throwOnError: false });
     } catch (e) { ovlHideEqPreview(); return; }
-    box.style.left = Math.max(4, clientX + 12) + 'px';
-    box.style.top = Math.max(4, clientY + 16) + 'px';
+    // v2 Pass P117：原来只 clamp 了左/上限——光标在编辑器右侧或屏幕下方时公式预览框必出界。
+    // 先加类使其参与布局才能量出真实尺寸（.ovl-open 才 display:block），再交给统一钳制助手；
+    // 这两步在同一段同步代码里完成，浏览器不会插入一次多余的重绘，不会看到"先出现在错误位置
+    // 再跳一下"的闪烁。跟点击点类弹层一样不做上下翻转（保持"跟随光标"的直觉）。
     box.classList.add('ovl-open');
+    const cl = ovlClampPopupToViewport(box, null, { rawLeft: clientX + 12, rawTop: clientY + 16, preferFlipV: false });
+    box.style.left = cl.left + 'px';
+    box.style.top = cl.top + 'px';
 }
 function ovlOnCaretActivity() {
     ovlUpdateBreadcrumb();
@@ -46210,9 +46339,14 @@ function ovlToggleMbMenu(key, btnEl) {
     cfg.render();
     if (btnEl) btnEl.classList.add('ovl-mb-open');
     const r = (btnEl || menu).getBoundingClientRect();
-    menu.style.top = (r.bottom + 4) + 'px';
-    menu.style.left = Math.max(4, r.left) + 'px';
+    // v2 Pass P117：原来只 clamp 了左下限，工具栏按钮越靠右这套菜单（File/Edit/Insert/...）
+    // 越容易在窄视口下右侧或底部出界——统一钳制助手补齐。
+    menu.style.visibility = 'hidden';
     menu.hidden = false;
+    const cl = ovlClampPopupToViewport(menu, r, { rawLeft: r.left, rawTop: r.bottom + 4 });
+    menu.style.left = cl.left + 'px';
+    menu.style.top = cl.top + 'px';
+    menu.style.visibility = '';
 }
 
 // 菜单项点击的统一分发：cmd:xxx 走 OvlCmds；其余是既有函数的第二个入口（决策 D）。
