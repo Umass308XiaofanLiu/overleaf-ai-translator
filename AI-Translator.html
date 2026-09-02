@@ -4275,7 +4275,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.09.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.09.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -31660,6 +31660,16 @@ async function ovlVisualLangRunQueue() {
                     el.setAttribute('data-ovl-trans-failed', '1');
                     el.setAttribute('data-ovl-trans-fail-reason', 'source-missing');
                     if (typeof ovlVisualEnsureRetryBadge === 'function') ovlVisualEnsureRetryBadge(el, { reason: 'source-missing', attempts: 0 });
+                    // v2 Pass P122 合并返修（终核 P123 交叉回归，核验 .claude/tmp/p122_p123_merge_diag.md）：
+                    // 失败角标本身是 position:absolute 通常零高度footprint，但 gutter 在"大量块走
+                    // 缓存同步应用、只有少数失败块走这条异步路径"的场景下（比如重开同一份语料，
+                    // 499/550 缓存命中同步落地、只有 51 个真失败块走 worker() 异步分支）会失去
+                    // "靠成功路径高频回调顺带兜住任何残留高度漂移"这道安全网——之前只有成功路径
+                    // 会调 ovlScheduleVisualGutterAfterImage()，失败路径完全不调，实测复现整列
+                    // 行号相对块永久错位（最大 280px，见诊断）。补一次调度跟成功路径同一条纪律。
+                    if (typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') {
+                        ovlScheduleVisualGutterAfterImage();
+                    }
                 }
                 ovlVisualLangProgressUpdate();
                 continue;
@@ -31732,6 +31742,11 @@ async function ovlVisualLangRunQueue() {
                         // v2 Pass P113：被拒时不静默，块上给可见"重试"角标；v2 Pass P122（C3/C5）：
                         // 角标同时带上分类原因 + 尝试次数，供 title/data-tip 展示。
                         ovlVisualEnsureRetryBadge(el, { reason: reason, attempts: totalAttempts, echoCandidate: meta.echoCandidate });
+                    }
+                    // v2 Pass P122 合并返修（终核 P123 交叉回归）：同上——失败路径也要跟成功路径
+                    // 一样调度一次 gutter 重排，不能只靠 ResizeObserver/成功路径的高频副作用兜底。
+                    if (typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') {
+                        ovlScheduleVisualGutterAfterImage();
                     }
                 }
             }
