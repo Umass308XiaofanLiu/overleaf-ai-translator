@@ -4243,7 +4243,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.07.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.07.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -12190,11 +12190,103 @@ async function handleAiRefine(index, field, type) {
 }
 
 // 显示 Toast 提示
+// v2 Pass P125（C4 根治，诊断见 .claude/tmp/p122_diag.md §3.2/§4 C4）：外壳模式下（LaTeX
+// 工作台，v1 翻译器悬浮窗关着，这是打开页面后的默认状态）CSS 第 1195 行
+// `body.ovl-shell-active:not(.ovl-translator-open) #root { display:none }` 让下面
+// setState({toast}) 写进 #root.innerHTML 的提示框整体不可见（实测 rect=0x0、
+// offsetParent===null）——全部约 160 处 showToast 调用点因此隐形。
+// 分流只加在函数最前面：命中外壳模式时转给 ovlToastShow（挂在 #ovlPortal 下，定义见下方
+// 「外壳原生 toast」一节）并 return；不命中（v1 翻译器悬浮窗开着、#root 可见）时原样落到
+// 下面两条语句——这两条语句本身一个字节没有改动，铁律见 CLAUDE.md/任务书。
 function showToast(message, type = 'info') {
+    try {
+        if (document.body.classList.contains('ovl-shell-active') && !document.body.classList.contains('ovl-translator-open')) {
+            ovlToastShow(message, type);
+            return;
+        }
+    } catch (e) { /* 探测分流条件本身出错时静默落回 v1 路径，不让提示功能整体失效 */ }
     setState({ toast: { message, type } });
     setTimeout(() => {
         setState({ toast: null });
     }, 3000);
+}
+
+// ==================== 外壳原生 toast（v2 Pass P125，C4）====================
+// showToast 在外壳模式下的替身通道：不碰 #root/setState/renderApp 任何一步，直接挂在
+// #ovlPortal（外壳浮层唯一挂载根，CSS 约 2123 行 `#ovlPortal { position:fixed; inset:0;
+// z-index:1080 }`，`#ovlPortal > * { pointer-events:auto }`）下面，自建一个纵向堆叠容器，
+// 支持同时显示多条、每条独立计时、3000ms 后自动移除（跟 v1 renderToast 的
+// setTimeout(…,3000) 时长保持一致，见上面 OVL_TOAST_DURATION_MS）、点击可立即关闭。
+// z-index 取 1099——高于 #ovlPortal 内目前已知最高的 .ovl-modal-overlay（1095，P110c 改成
+// "全场最高"，见该处注释），保证反馈提示不会被任何弹窗/菜单挡住。
+const OVL_TOAST_DURATION_MS = 3000;
+const OVL_TOAST_KIND_STYLE = {
+    success: 'background:#ecfdf5;border-color:#a7f3d0;color:#047857;',
+    warning: 'background:#fffbeb;border-color:#fde68a;color:#b45309;',
+    error: 'background:#fef2f2;border-color:#fecaca;color:#b91c1c;',
+    info: 'background:#eff6ff;border-color:#bfdbfe;color:#1d4ed8;'
+};
+const OVL_TOAST_KIND_STYLE_DEFAULT = 'background:#f8fafc;border-color:#e2e8f0;color:#334155;';
+
+// 取（必要时懒创建）门户里的 toast 堆叠容器。绝不缓存 DOM 引用给调用方——每次现取，
+// 跟仓库里其它挂 #ovlPortal 的浮层同一条纪律（容器本身极少被销毁重建，这里主要是防御
+// #ovlPortal 尚未就绪的极端时序）。
+function ovlToastStack() {
+    let stack = document.getElementById('ovlToastStack');
+    if (stack) return stack;
+    const portal = document.getElementById('ovlPortal') || document.body;
+    stack = document.createElement('div');
+    stack.id = 'ovlToastStack';
+    stack.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);'
+        + 'z-index:1099;display:flex;flex-direction:column;align-items:center;gap:8px;'
+        + 'pointer-events:none;';
+    portal.appendChild(stack);
+    return stack;
+}
+
+function ovlToastRemoveEl(el) {
+    try {
+        if (!el) return;
+        if (el.__ovlToastTimer) { clearTimeout(el.__ovlToastTimer); el.__ovlToastTimer = null; }
+        if (el.parentNode) el.parentNode.removeChild(el);
+    } catch (e) {}
+}
+
+// 外壳模式下的可见 toast：样式贴近 v1 renderToast（同一套 success/warning/info 配色 + 圆角
+// 卡片观感），额外给 error 配了红色（v1 的 bgColor 映射表本来就没有 'error' 这个 key，会落
+// 到默认灰色——这里不是要复刻这个既有细节，只要求"贴近"，79 处调用点传的都是 'error'，
+// 给它一个更贴切的颜色对用户是纯增益，不影响 v1 路径本身）。
+function ovlToastShow(message, kind) {
+    try {
+        const stack = ovlToastStack();
+        const kindStyle = OVL_TOAST_KIND_STYLE[kind] || OVL_TOAST_KIND_STYLE_DEFAULT;
+        const el = document.createElement('div');
+        el.setAttribute('data-ovl-shell-toast', '1');
+        el.style.cssText = kindStyle
+            + 'pointer-events:auto;border:1px solid;padding:10px 20px;border-radius:12px;'
+            + 'box-shadow:0 10px 30px -8px rgba(0,0,0,0.25);font-size:13px;font-weight:500;'
+            + 'max-width:70vw;word-break:break-word;cursor:pointer;';
+        el.textContent = (message === null || message === undefined) ? '' : String(message);
+        el.addEventListener('click', function () { ovlToastRemoveEl(el); });
+        stack.appendChild(el);
+        el.__ovlToastTimer = setTimeout(function () { ovlToastRemoveEl(el); }, OVL_TOAST_DURATION_MS);
+        return el;
+    } catch (e) {
+        console.error('[ovl] ovlToastShow failed', e);
+        return null;
+    }
+}
+
+// 需求：外壳模式切回 v1（打开翻译器悬浮窗）时，把还没自然过期的门户 toast 全部清掉，
+// 不残留（v1 打开后 #root 可见，两套反馈通道同屏叠加会让人困惑；且门户 toast 的存在
+// 意义就是"v1 不可见时的替身"，v1 一旦可见就没有继续占屏的理由）。调用点见
+// ovlOpenTranslator（约 27860 行附近，加了 class 'ovl-translator-open' 之后）。
+function ovlToastClearAll() {
+    try {
+        const stack = document.getElementById('ovlToastStack');
+        if (!stack) return;
+        Array.prototype.slice.call(stack.children).forEach(ovlToastRemoveEl);
+    } catch (e) {}
 }
 
 // 处理文本选择（同义词）
@@ -27858,6 +27950,9 @@ function ovlOpenTranslator() {
         const win = ovlTransEnsureWin();
         if (!win) throw new Error('ovlTransEnsureWin returned null');
         document.body.classList.add('ovl-translator-open');
+        // v2 Pass P125（C4）：切回 v1 之后 #root 可见，不能让外壳模式下还没自然过期的门户
+        // toast（挂在 #ovlPortal）继续叠在屏幕上——见 ovlToastClearAll 定义处注释。
+        try { if (typeof ovlToastClearAll === 'function') ovlToastClearAll(); } catch (e0) {}
         ovlTransSyncSimpleUI();   // P2：按存的值恢复一次简化模式态（§2.2.3）
         // 用户没碰过窗口（mode 'auto'）时，每次打开都按当前视口重新居中一次；
         // 碰过了（mode 'free'）就尊重存下来的几何，只把它拉回视口内。
