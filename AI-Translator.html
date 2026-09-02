@@ -4358,7 +4358,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.11.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.11.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -32720,6 +32720,37 @@ function ovlVisualLangIdleAudit() {
         if (typeof ovlVisualLangRunQueue === 'function') ovlVisualLangRunQueue();
     } catch (e) {}
 }
+// ==================== v2 Pass P128g（B5-1 阻断收口，核验 .claude/tmp/p128_verify5.md）====================
+// 角标属性的唯一登记表。根因：ovlVisualCollectBlockVisibleText（"取块可见文本"的唯一入口——
+// AI 工具块预览 chatAgentExecListBlockStatus/翻译 QA 扫描 chatAgentQaVisibleText/自检
+// ovlVisualAuditUnmarkedEnglish/P68 查找 ovlVisualFindTextRangeInBlock+ovlFindCollectZhMatches/
+// P130 中文句 span 与锚点提取 ovlVisualZhSentenceSpans/反向 Range 计算
+// ovlVisualMapEnRangeToZhSentence，全部经它拿"用户看得见的文字"）的排除选择器以前是手写死的
+// 字符串字面量，P128e 新增 data-ovl-noprose-badge/data-ovl-short-badge 两种角标时没有同步跟上
+// ——角标文案（"无可译文本 · 强制翻译"/"可能漏译 · 重试"）因此混进了上面列的全部下游文本/
+// 锚点/Range。这张表登记了现存全部角标属性（真实语料 grep `data-ovl-.*-badge` 逐条核对过，
+// 无遗漏），`ovlVisualCollectBlockVisibleText` 的排除选择器与 `ovlVisualRestoreAllBadges`
+// 挂载链路（下面的 ensure/remove 系列）用到的属性名字面量，全部从这张表取，不再各处手抄一份
+// ——以后新增一种角标，只需要在下面数组里加一行。
+const OVL_VISUAL_BADGE_ATTRS = [
+    'data-ovl-retry-badge',
+    'data-ovl-faildetail-badge',
+    'data-ovl-force-accept-badge',
+    'data-ovl-noprose-badge',
+    'data-ovl-short-badge'
+];
+// 按语义命名的下标常量，取代散落在挂载/摘除/点击路由各处的字符串字面量。
+const OVL_VISUAL_BADGE_ATTR_RETRY = OVL_VISUAL_BADGE_ATTRS[0];
+const OVL_VISUAL_BADGE_ATTR_FAILDETAIL = OVL_VISUAL_BADGE_ATTRS[1];
+const OVL_VISUAL_BADGE_ATTR_FORCE_ACCEPT = OVL_VISUAL_BADGE_ATTRS[2];
+const OVL_VISUAL_BADGE_ATTR_NOPROSE = OVL_VISUAL_BADGE_ATTRS[3];
+const OVL_VISUAL_BADGE_ATTR_SHORT = OVL_VISUAL_BADGE_ATTRS[4];
+// 由登记表生成"取块可见文本"排除选择器——.katex-mathml（KaTeX 隐藏副本，不是角标）单独拼在
+// 前面，角标部分逐一取自登记表；新增角标不用再改这个函数（唯一调用点见
+// ovlVisualCollectBlockVisibleText）。
+function ovlVisualBadgeExcludeSelector() {
+    return ['.katex-mathml'].concat(OVL_VISUAL_BADGE_ATTRS.map(function (attr) { return '[' + attr + ']'; })).join(', ');
+}
 // v2 Pass P128（C1，M1 根治）：failLog 回填的 data-ovl-trans-failed 块只是数据属性——角标
 // 本身（.ovl-visual-retry-badge/详情/仍然采用）是运行时插入的真实 DOM 节点，字符串拼接阶段
 // （ovlVisualFailAttrHtml）不产出它们。整篇重渲染落地后统一挂一遍，跟 worker/手动重试落地
@@ -32756,8 +32787,8 @@ function ovlVisualRestoreNoProseBadges(pane) {
     try {
         const els = pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-noprose="1"]');
         els.forEach(function (el) {
-            if (el.querySelector('[data-ovl-noprose-badge]')) return;
-            el.insertAdjacentHTML('afterbegin', '<span class="ovl-visual-noprose-badge" data-ovl-noprose-badge="1" contenteditable="false" '
+            if (el.querySelector('[' + OVL_VISUAL_BADGE_ATTR_NOPROSE + ']')) return;
+            el.insertAdjacentHTML('afterbegin', '<span class="ovl-visual-noprose-badge" ' + OVL_VISUAL_BADGE_ATTR_NOPROSE + '="1" contenteditable="false" '
                 + 'title="没有检测到需要翻译的自然语言，点击强制走一遍真正的翻译">无可译文本 · 强制翻译</span>');
         });
     } catch (e) {}
@@ -32898,15 +32929,15 @@ const OVL_VISUAL_PARTIAL_TIP = {
 function ovlVisualEnsureShortBadge(el) {
     try {
         if (!el) return;
-        if (el.querySelector('[data-ovl-short-badge]')) return;
-        el.insertAdjacentHTML('afterbegin', '<span class="ovl-visual-short-badge" data-ovl-short-badge="1" contenteditable="false" '
+        if (el.querySelector('[' + OVL_VISUAL_BADGE_ATTR_SHORT + ']')) return;
+        el.insertAdjacentHTML('afterbegin', '<span class="ovl-visual-short-badge" ' + OVL_VISUAL_BADGE_ATTR_SHORT + '="1" contenteditable="false" '
             + 'title="' + escapeAttr(OVL_VISUAL_PARTIAL_TIP.short) + '">可能漏译 · 重试</span>');
     } catch (e) {}
 }
 function ovlVisualRemoveShortBadge(el) {
     try {
         if (!el) return;
-        const b = el.querySelector('[data-ovl-short-badge]');
+        const b = el.querySelector('[' + OVL_VISUAL_BADGE_ATTR_SHORT + ']');
         if (b) b.remove();
     } catch (e) {}
 }
@@ -33500,12 +33531,12 @@ function ovlVisualEnsureRetryBadge(el, info) {
         const attempts = opt.attempts || 0;
         const tip = ovlVisualFailTipText(reason) + (attempts > 0 ? ('（已尝试 ' + attempts + ' 次）') : '');
         if (opt.detail) el.setAttribute('data-ovl-trans-fail-detail', String(opt.detail).slice(0, 300));
-        let badge = el.querySelector('[data-ovl-retry-badge]');
+        let badge = el.querySelector('[' + OVL_VISUAL_BADGE_ATTR_RETRY + ']');
         if (!badge) {
-            el.insertAdjacentHTML('afterbegin', '<span class="ovl-visual-retry-badge" data-ovl-retry-badge="1" contenteditable="false">重试</span>'
-                + '<span class="ovl-visual-faildetail-badge" data-ovl-faildetail-badge="1" contenteditable="false" '
+            el.insertAdjacentHTML('afterbegin', '<span class="ovl-visual-retry-badge" ' + OVL_VISUAL_BADGE_ATTR_RETRY + '="1" contenteditable="false">重试</span>'
+                + '<span class="ovl-visual-faildetail-badge" ' + OVL_VISUAL_BADGE_ATTR_FAILDETAIL + '="1" contenteditable="false" '
                 + 'title="点开查看失败原因原文">详情</span>');
-            badge = el.querySelector('[data-ovl-retry-badge]');
+            badge = el.querySelector('[' + OVL_VISUAL_BADGE_ATTR_RETRY + ']');
         }
         if (badge) {
             badge.textContent = '重试';
@@ -33528,9 +33559,9 @@ function ovlVisualEnsureRetryBadge(el, info) {
 function ovlVisualRemoveRetryBadge(el) {
     try {
         if (!el) return;
-        const b = el.querySelector('[data-ovl-retry-badge]');
+        const b = el.querySelector('[' + OVL_VISUAL_BADGE_ATTR_RETRY + ']');
         if (b) b.remove();
-        const d = el.querySelector('[data-ovl-faildetail-badge]');
+        const d = el.querySelector('[' + OVL_VISUAL_BADGE_ATTR_FAILDETAIL + ']');
         if (d) d.remove();
         ovlVisualRemoveForceAcceptBadge(el);
         el.removeAttribute('data-ovl-trans-fail-detail');
@@ -33548,9 +33579,9 @@ function ovlVisualEnsureForceAcceptBadge(el, candidateText) {
     try {
         if (!el) return;
         OvlVisualForceAcceptCandidates.set(el, candidateText);
-        if (el.querySelector('[data-ovl-force-accept-badge]')) return;
-        const badge = el.querySelector('[data-ovl-retry-badge]');
-        const html = '<span class="ovl-visual-force-accept-badge" data-ovl-force-accept-badge="1" contenteditable="false" '
+        if (el.querySelector('[' + OVL_VISUAL_BADGE_ATTR_FORCE_ACCEPT + ']')) return;
+        const badge = el.querySelector('[' + OVL_VISUAL_BADGE_ATTR_RETRY + ']');
+        const html = '<span class="ovl-visual-force-accept-badge" ' + OVL_VISUAL_BADGE_ATTR_FORCE_ACCEPT + '="1" contenteditable="false" '
             + 'title="模型这次的输出被回显防毒守卫拦截，但你可以确认后仍然采用它" '
             + 'data-tip="需要再点一次才会真正写入——这是独立于&quot;重试&quot;的第二次显式确认" data-tip-pos="left">仍然采用这次结果</span>';
         if (badge && badge.insertAdjacentHTML) badge.insertAdjacentHTML('afterend', html);
@@ -33561,7 +33592,7 @@ function ovlVisualRemoveForceAcceptBadge(el) {
     try {
         if (!el) return;
         OvlVisualForceAcceptCandidates.delete(el);
-        const b = el.querySelector('[data-ovl-force-accept-badge]');
+        const b = el.querySelector('[' + OVL_VISUAL_BADGE_ATTR_FORCE_ACCEPT + ']');
         if (b) b.remove();
     } catch (e) {}
 }
@@ -33668,7 +33699,7 @@ async function ovlVisualBlockRetryClick(el) {
     // v2 Pass P122（C3.2，进行中态）：以前这里点击后 0 像素变化。角标文案/class 真的变，
     // 配 aria-busy；CSS 里 .ovl-visual-retry-badge--busy 有 pointer-events:none，防止飞行中
     // 重复点出第二个并发请求（跟 data-ovl-trans-retrying 守卫是两道独立防线）。
-    const badgeEl = el.querySelector('[data-ovl-retry-badge]');
+    const badgeEl = el.querySelector('[' + OVL_VISUAL_BADGE_ATTR_RETRY + ']');
     if (badgeEl) {
         badgeEl.textContent = '重试中…';
         badgeEl.classList.add('ovl-visual-retry-badge--busy');
@@ -33773,7 +33804,7 @@ async function ovlVisualBlockForceTranslateClick(el) {
     const controller = new AbortController();
     OvlVisualLangState.adhocControllers.push(controller);
     el.setAttribute('data-ovl-trans-force-translating', '1');
-    const badge = el.querySelector('[data-ovl-noprose-badge]');
+    const badge = el.querySelector('[' + OVL_VISUAL_BADGE_ATTR_NOPROSE + ']');
     if (badge) { badge.textContent = '翻译中…'; badge.classList.add('ovl-visual-noprose-badge--busy'); }
     let meta = {};
     try {
@@ -33839,7 +33870,7 @@ function ovlBindVisualPane() {
         if (e.target.closest('#ovlVisualTailBar')) { OvlVisualState.tailOpen = !OvlVisualState.tailOpen; ovlVisualRender(); return; }
         // v2 Pass P113：失败块角标点击 -> 单块强制重译。角标是运行时插入的动态内容，同样走
         // 委托绑定，不逐个 addEventListener。
-        const retryBadge = e.target.closest('[data-ovl-retry-badge]');
+        const retryBadge = e.target.closest('[' + OVL_VISUAL_BADGE_ATTR_RETRY + ']');
         if (retryBadge) {
             e.stopPropagation();
             const blk = retryBadge.closest('.ovl-visual-block');
@@ -33847,7 +33878,7 @@ function ovlBindVisualPane() {
             return;
         }
         // v2 Pass P122（C3.3）："详情"标签点击 -> 弹出失败原因原文（ovlConfirmDialog，不用 alert）。
-        const detailBadge = e.target.closest('[data-ovl-faildetail-badge]');
+        const detailBadge = e.target.closest('[' + OVL_VISUAL_BADGE_ATTR_FAILDETAIL + ']');
         if (detailBadge) {
             e.stopPropagation();
             const blk = detailBadge.closest('.ovl-visual-block');
@@ -33855,7 +33886,7 @@ function ovlBindVisualPane() {
             return;
         }
         // v2 Pass P122（C3b）："仍然采用这次结果"逃生门点击 -> 第二次显式点击，强制落地。
-        const forceBadge = e.target.closest('[data-ovl-force-accept-badge]');
+        const forceBadge = e.target.closest('[' + OVL_VISUAL_BADGE_ATTR_FORCE_ACCEPT + ']');
         if (forceBadge) {
             e.stopPropagation();
             const blk = forceBadge.closest('.ovl-visual-block');
@@ -33863,7 +33894,7 @@ function ovlBindVisualPane() {
             return;
         }
         // v2 Pass P128e（B3-1 阻断收口）："无可译文本"角标点击 -> 强制走一遍真正的翻译流程。
-        const noproseBadge = e.target.closest('[data-ovl-noprose-badge]');
+        const noproseBadge = e.target.closest('[' + OVL_VISUAL_BADGE_ATTR_NOPROSE + ']');
         if (noproseBadge) {
             e.stopPropagation();
             const blk = noproseBadge.closest('.ovl-visual-block');
@@ -33872,7 +33903,7 @@ function ovlBindVisualPane() {
         }
         // v2 Pass P128e（漏译侧，non-blocking）："可能漏译"角标点击 -> 跟失败角标同一套重译
         // 逻辑（ovlVisualBlockRetryClick 不要求块当前是 data-ovl-trans-failed，直接复用）。
-        const shortBadge = e.target.closest('[data-ovl-short-badge]');
+        const shortBadge = e.target.closest('[' + OVL_VISUAL_BADGE_ATTR_SHORT + ']');
         if (shortBadge) {
             e.stopPropagation();
             const blk = shortBadge.closest('.ovl-visual-block');
@@ -34343,14 +34374,18 @@ function ovlPaintVisualMarkOverlay() {
 // 一个调用点，P68 新增的中文可见文字查找（ovlFindCollectZhMatches）需要同一份"用户看得见的
 // 文字"，不重新写一遍这套坑（katex-mathml 隐藏副本会污染文字拼接，上面那段注释详细解释）。
 function ovlVisualCollectBlockVisibleText(blockEl) {
-    // v2 Pass P122（C7）：失败角标（重试/详情/仍然采用这次结果）是运行时用
-    // insertAdjacentHTML('afterbegin', …) 插进块内部的真实子节点（不是伪元素），以前会被这个
-    // TreeWalker 当成块正文的一部分收进去——查找/复制/就地编辑读块文本时"重试"两个字会污染
-    // 结果。跟 .katex-mathml 用同一条 closest 排除规则，一并跳过。
+    // v2 Pass P122（C7，P128g 收口）：全部角标（重试/详情/仍然采用这次结果/无可译文本·强制
+    // 翻译/可能漏译·重试）都是运行时用 insertAdjacentHTML('afterbegin', …) 插进块内部的真实
+    // 子节点（不是伪元素），以前会被这个 TreeWalker 当成块正文的一部分收进去——查找/复制/
+    // 就地编辑/P130 句切分与锚点/反向 Range 读块文本时角标文案会污染结果。跟 .katex-mathml
+    // 用同一条 closest 排除规则一并跳过；排除选择器不再手写死，改由 P128g 新增的
+    // OVL_VISUAL_BADGE_ATTRS 登记表统一生成（见 ovlVisualBadgeExcludeSelector，
+    // ovlVisualRestoreFailBadges 上方）——B5-1 的根因就是这份选择器手抄之后没跟上 P128e 新增
+    // 的两种角标，登记表统一之后，新增角标只需要在那张表里加一行，这里不用再改。
+    const excludeSelector = ovlVisualBadgeExcludeSelector();
     const walker = document.createTreeWalker(blockEl, NodeFilter.SHOW_TEXT, {
         acceptNode: function (n) {
-            return (n.parentElement && n.parentElement.closest(
-                '.katex-mathml, [data-ovl-retry-badge], [data-ovl-faildetail-badge], [data-ovl-force-accept-badge]'))
+            return (n.parentElement && n.parentElement.closest(excludeSelector))
                 ? NodeFilter.FILTER_REJECT : NodeFilter.FILTER_ACCEPT;
         }
     });
@@ -48278,8 +48313,9 @@ function ovlP130BuildKatexProtectedMask(collected) {
     return mask;
 }
 // 块的中文句列表：直接切"当前渲染出来、用户看得见"的文字（ovlVisualCollectBlockVisibleText，
-// P68 已经在用的同一个 helper，天然跳过 katex-mathml 隐藏副本与失败角标），叠加 KaTeX 保护
-// 掩码后再切句。
+// P68 已经在用的同一个 helper，排除选择器由 P128g 起的 OVL_VISUAL_BADGE_ATTRS 登记表统一
+// 生成，天然跳过 katex-mathml 隐藏副本与全部登记在案的角标——失败/详情/仍然采用/无可译文本/
+// 可能漏译，不再是"只跳过失败角标"），叠加 KaTeX 保护掩码后再切句。
 // v2 Pass P130c（B-2 根治，见下方 ovlP130StripNonRenderedForAnchors 头部大注释）：每个 span
 // 额外附一份 anchorText——把落在 KaTeX 渲染节点内部的字符换成空格，专供锚点抽取使用（公式
 // 渲染出来是 Unicode 字形，字符集跟英文源码完全不同，两侧都不该参与锚点比较）。只影响锚点
