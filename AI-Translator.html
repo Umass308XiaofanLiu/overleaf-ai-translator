@@ -4292,7 +4292,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.10.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.10.03';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -29409,6 +29409,21 @@ const OVL_BIB_SPECIAL_LETTER = {
     L: '\u0141', l: '\u0142', O: '\u00d8', o: '\u00f8', AA: '\u00c5', aa: '\u00e5',
     AE: '\u00c6', ae: '\u00e6', OE: '\u0152', oe: '\u0153', ss: '\u00df', i: '\u0131', j: '\u0237'
 };
+// v2 Pass P129c（NB-4 收口，.claude/tmp/p129_verify2.md）：P129b 引入的"无参数未知命令静默
+// 丢弃命令名"这条兜底规则的前提假设（"这类命令幸存到这里几乎全是纯排版残留，不携带可读内容"）
+// 被终核实测证伪——\TeX/\LaTeX/\copyright/\pounds/\S/\P/\ldots 等常见排版符号命令本身就是
+// 唯一携带语义的载体，整条丢弃会让 "The \TeX book" 变成 "The book"。跟上面的
+// OVL_BIB_SPECIAL_LETTER 同一种"命令名整体匹配"手法，收录进这张表的命令改成查表替换成对应
+// 文字/符号，而不是落进下面的静默丢弃兜底；表外命令（真正的纯排版残留）行为不变，仍然丢弃，
+// 但会在开发者控制台记一次 debug 日志（命令名去重后只记一次）方便以后扩表。
+const OVL_BIB_TEXT_SYMBOL = {
+    TeX: 'TeX', LaTeX: 'LaTeX', ldots: '\u2026', dots: '\u2026', S: '\u00a7', P: '\u00b6',
+    copyright: '\u00a9', textdegree: '\u00b0', textregistered: '\u00ae', texttrademark: '\u2122',
+    pounds: '\u00a3', euro: '\u20ac'
+};
+// v2 Pass P129c（NB-4 收口）：静默丢弃兜底触发时，每个不同的命令名只往控制台记一次 debug
+// 日志（避免同一篇文档反复出现同一命令刷屏），供以后扩 OVL_BIB_TEXT_SYMBOL 表时定位。
+const OVL_BIB_UNKNOWN_CMD_LOGGED = new Set();
 function ovlBibAccentLookup(cmdChar, letter) {
     const noArg = OVL_BIB_ACCENT_NOARG[cmdChar];
     if (noArg && noArg[letter] != null) return noArg[letter];
@@ -29518,13 +29533,33 @@ function ovlBibCleanText(raw) {
                 }
             }
         }
+        // v2 Pass P129c（NB-5 收口，.claude/tmp/p129_verify2.md）：\bibinfo{role}{value} ->
+        // value，跟上面 \BIBforeignlanguage 同一个根因（IEEEtran.bst 常见的"两参数宏，第一参数
+        // 只是语义标签不是可读文字"）——第一参数 role（比如 "year"/"pages"）原来被下面的通用
+        // 兜底当成命令的花括号参数原样吐出，拼出 "year2020"/"pages10–20" 这类文字。跟 \href 同
+        // 一种"跳过第一参数、只留第二参数"手法。
+        mm = /^\\bibinfo\b\s*/.exec(s.slice(i));
+        if (mm && s[i + mm[0].length] === '{') {
+            const p1 = i + mm[0].length;
+            const close1 = ovlFindMatchingBrace(s, p1);
+            if (close1 !== -1) {
+                let p2 = close1 + 1;
+                while (s[p2] === ' ') p2++;
+                if (s[p2] === '{') {
+                    const close2 = ovlFindMatchingBrace(s, p2);
+                    if (close2 !== -1) { out += ovlBibCleanText(s.slice(p2 + 1, close2)); i = close2 + 1; continue; }
+                }
+            }
+        }
         // v2 Pass P129b（blocking-2 收口）：bib 条目正文专用的纯排版宏——静默删除，不落地任何
         // 文本（源文本里它们前后本来就带着自己的空格，删掉命令本身不会让相邻单词粘连）。
         // \BIBentryALTinterwordspacing/\BIBentrySTDinterwordspacing 是 IEEEtran.bst 对带 URL/note
         // 的条目成对吐出的 interword-spacing 开关；\relax 是 TeX 空操作；\BIBdecl 万一没被
         // ovlRenderVisualBibliography 的"从第一个 \bibitem 开始"那刀挡在条目正文外（理论上不该
         // 发生，防御性收），一并处理。用户原始抱怨"似乎没编译"就是这几个裸宏名直接漏在屏幕上。
-        mm = /^\\(BIBentryALTinterwordspacing|BIBentrySTDinterwordspacing|BIBdecl|relax)\b/.exec(s.slice(i));
+        // v2 Pass P129c（NB-5 顺手项）：补上同族的 interword-stretch-factor 开关变体
+        // （IEEEtran.bst 另一种拼写/版本会吐出这两个，跟上面两个 interwordspacing 同源）。
+        mm = /^\\(BIBentryALTinterwordspacing|BIBentrySTDinterwordspacing|BIBentryALTinterwordstretchfactor|BIBentrySTDinterwordstretchfactor|BIBdecl|relax)\b/.exec(s.slice(i));
         if (mm) { i += mm[0].length; continue; }
         // \hskip/\vskip <glue>（可选跟着 \relax）-> 一个空格。IEEEtran.bst 常见形如
         // "2nd ed.\hskip 1em plus 0.5em minus 0.4em\relax Springer, 2012."——用来在书籍类条目里
@@ -29536,16 +29571,27 @@ function ovlBibCleanText(raw) {
             if (afterGlue > i + mm[0].length) { out += ' '; i = afterGlue; continue; }
         }
         // \hspace{…}/\hspace*{…} -> 空格，丢弃花括号里的尺寸参数（同样不是可读文字）。
-        mm = /^\\hspace\*?\b\s*/.exec(s.slice(i));
+        // v2 Pass P129c（NB-3 收口，.claude/tmp/p129_verify2.md）：原来的 \*?\b 里 \b 只在
+        // *和{ 之间(两侧都是非单词字符)判定失败，导致 \hspace*{…} 从未匹配到星号，回退成只匹配
+        // "\hspace" 七个字符——紧邻字符是 * 不是 {，下面 s[...]==='{' 的检查直接判负，整条折叠
+        // 分支形同虚设，尺寸参数原样漏出（"a\hspace*{1em}b" -> "a1emb"）。改成"星号只在紧跟 {
+        // 时才消费，否则退回单词边界"——星号变体和无星号变体都能吃到，且对 \hspacefoo{…} 这种
+        // 命令名更长的情况仍然安全（两个分支都不匹配，mm 为 null，原样落回下面的通用兜底）。
+        mm = /^\\hspace(?:\*(?=\{)|\b)\s*/.exec(s.slice(i));
         if (mm && s[i + mm[0].length] === '{') {
             const p = i + mm[0].length;
             const close = ovlFindMatchingBrace(s, p);
             if (close !== -1) { out += ' '; i = close + 1; continue; }
         }
-        // \& \% \_ \# \$ -> 字面标点（& 走 HTML 转义，其余四个本身对 HTML 无害）
+        // \& \% \_ \# \$ \{ \} -> 字面标点（& 走 HTML 转义，其余六个本身对 HTML 无害）。
+        // v2 Pass P129c（NB-4 顺手项）：\{/\} 原来没有专属分支——反斜杠被单独原样吐出（走本
+        // 函数最末尾"反斜杠后面既不是已知转义符也不是合法命令名字符"那条兜底），紧跟着的裸
+        // "{"/"}"字符在下一轮循环里会被当成花括号分组/孤立右花括号处理，语义不对（转义花括号
+        // 本来就该是字面字符，不是分组定界符）。
         const nextCh = s[i + 1];
         if (nextCh === '&') { out += '&amp;'; i += 2; continue; }
         if (nextCh === '%' || nextCh === '_' || nextCh === '#' || nextCh === '$') { out += nextCh; i += 2; continue; }
+        if (nextCh === '{' || nextCh === '}') { out += nextCh; i += 2; continue; }
         // 重音命令：符号型（' ` " ^ ~ = .，可以裸跟一个字母，也可以花括号包一个字母）或
         // 字母型（c v u H k r，只认花括号单字母形式——裸跟字母会跟 \url/\vec/\ref 这类更长
         // 的真实命令名撞在一起，必须靠"紧跟着就是 {"这个边界排除掉那些情况）。
@@ -29588,14 +29634,24 @@ function ovlBibCleanText(raw) {
             i += mm[0].length;
             continue;
         }
+        // v2 Pass P129c（NB-4 收口）：常见携带可读语义的纯符号命令——查表替换成对应文字/符号，
+        // 不落进下面的静默丢弃兜底。跟上面 OVL_BIB_SPECIAL_LETTER 同一次正则匹配结果（mm），
+        // 只是换一张表，不用再跑一次正则。
+        if (mm && Object.prototype.hasOwnProperty.call(OVL_BIB_TEXT_SYMBOL, mm[1])) {
+            out += OVL_BIB_TEXT_SYMBOL[mm[1]];
+            i += mm[0].length;
+            continue;
+        }
         // 通用兜底：未知 \cmd{arg} -> 只留 arg（递归清洗，逐字保留内容，只丢命令名）。
         // v2 Pass P129b（blocking-2 收口）：未知的、不带花括号参数的命令 -> 静默丢弃命令名本身，
         // 不再原样保留。这条跟 Visual 正文渲染器"宁可难看不吞字"的一般纪律刻意不同——bib 条目
         // 正文里的无参数命令幸存到这里，说明它不是重音、不是 \newblock/\textit/\url/\href 这些
-        // 已知语义命令、也不在上面新增的纯排版宏白名单里，几乎全部是纯排版/兼容性残留（比如
-        // IEEEtran.bst 因宏包版本差异吐出的其它无参数命令），本身不携带可读内容；原样打印命令名
-        // 才是用户原始抱怨"似乎没编译"的那种裸宏漏出观感。实测遇到的具体命令清单见
-        // .claude/tmp/p129_impl.md「P129b 收口」节。
+        // 已知语义命令、也不在上面新增的纯排版宏白名单里、也不在 OVL_BIB_TEXT_SYMBOL 表里——
+        // v2 Pass P129c（NB-4 收口，.claude/tmp/p129_verify2.md）：终核实测证伪了"几乎全是纯
+        // 排版残留、不携带可读内容"这条前提假设，常见反例已收进 OVL_BIB_TEXT_SYMBOL；这里仍然
+        // 静默丢弃（不原样打印命令名——避免用户原始抱怨"似乎没编译"那种裸宏漏出观感），但改成
+        // 给每个不同的命令名往控制台记一次 debug 日志，方便以后按需扩表。实测遇到的具体命令
+        // 清单见 .claude/tmp/p129_impl.md「P129b 收口」节 + p129_verify2.md「NB-4」。
         mm = /^\\[a-zA-Z@]+\*?/.exec(s.slice(i));
         if (mm) {
             let p = i + mm[0].length;
@@ -29603,6 +29659,11 @@ function ovlBibCleanText(raw) {
             if (s[p] === '{') {
                 const close = ovlFindMatchingBrace(s, p);
                 if (close !== -1) { out += ovlBibCleanText(s.slice(p + 1, close)); i = close + 1; continue; }
+            }
+            const droppedName = mm[0].slice(1).replace(/\*$/, '');
+            if (droppedName && !OVL_BIB_UNKNOWN_CMD_LOGGED.has(droppedName)) {
+                OVL_BIB_UNKNOWN_CMD_LOGGED.add(droppedName);
+                try { console.debug('[ovlBibCleanText] 表外无参命令被丢弃：\\' + droppedName); } catch (e) {}
             }
             i = p;
             continue;
@@ -31389,6 +31450,20 @@ function ovlBibPreambleLineIsNoise(line, depth) {
     if (OVL_VISUAL_BIB_PREAMBLE_PUNCT_RE.test(t)) return true;
     return false;
 }
+// v2 Pass P129c（NB-1 收口，.claude/tmp/p129_verify2.md）：注释里落单的 { 会把花括号深度
+// 前向污染到它下面的真实正文——原因是深度扫描把整行（含 % 后面的注释文本）都数了一遍。真正的
+// TeX 语义是 "未转义的 % 到行尾都是字面注释，不是代码"，注释里的花括号根本不存在于代码结构
+// 里，不该参与深度计数。这里剥掉每一行里"生效的"（未被 \% 转义）% 之后的部分，只用剥完注释的
+// "代码部分" 参与深度计数；`\%` 是转义的字面百分号，不算注释起点，继续往后找下一个 %。
+function ovlBibStripLineComment(line) {
+    for (let i = 0; i < line.length; i++) {
+        if (line[i] !== '%') continue;
+        let bs = 0, j = i - 1;
+        while (j >= 0 && line[j] === '\\') { bs++; j--; }
+        if (bs % 2 === 0) return line.slice(0, i); // 偶数个反斜杠（含 0 个）=> 真注释起点
+    }
+    return line;
+}
 // 返回 cur 里"真实正文"结束、"可吸收进 bib 原子块的前导噪声"开始的下标（0 基）。
 // 返回值 === cur.length：整段都不是噪声，不吸收任何东西（对应 V3：正文直接贴 \begin，无前导）。
 // 返回值 === 0：整段都是噪声，维持原状全部吸收（对应现有 baseline 行为，不需要切）。
@@ -31400,8 +31475,9 @@ function ovlBibFindPreambleCut(cur) {
         const isNoise = ovlBibPreambleLineIsNoise(line, depth);
         noise[idx] = isNoise;
         if (isNoise) {
+            const codePart = ovlBibStripLineComment(line); // 注释部分不参与深度计数（NB-1）
             let opens = 0, closes = 0;
-            for (let c = 0; c < line.length; c++) { if (line[c] === '{') opens++; else if (line[c] === '}') closes++; }
+            for (let c = 0; c < codePart.length; c++) { if (codePart[c] === '{') opens++; else if (codePart[c] === '}') closes++; }
             depth = Math.max(0, depth + opens - closes);
         } else {
             depth = 0; // 真实正文行不参与花括号深度追踪，避免误伤后续内容
