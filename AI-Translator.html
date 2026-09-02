@@ -4292,7 +4292,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.10.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.10.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -29576,6 +29576,17 @@ function ovlBibCleanText(raw) {
                 out += letter;
                 i = after; continue;
             }
+        }
+        // v2 Pass P129b（NB-1 顺手收口）：波兰语/丹麦语/德语人名常见的特殊字母命令——命令名
+        // 本身就是那个字母（跟上面"符号+字母"两段式的重音表结构不同，需要整段匹配命令名，
+        // 不是逐字符判定）。用跟下面通用兜底同一种"贪婪匹配尽量多字母"的命令名正则，但只有
+        // 命令名整体命中 OVL_BIB_SPECIAL_LETTER 才消费；命中不了（比如 \int 不在表里）原样
+        // 落进下面的通用兜底，交给它按已有规则处理，不误伤真实命令。
+        mm = /^\\([a-zA-Z]+)\*?/.exec(s.slice(i));
+        if (mm && Object.prototype.hasOwnProperty.call(OVL_BIB_SPECIAL_LETTER, mm[1])) {
+            out += OVL_BIB_SPECIAL_LETTER[mm[1]];
+            i += mm[0].length;
+            continue;
         }
         // 通用兜底：未知 \cmd{arg} -> 只留 arg（递归清洗，逐字保留内容，只丢命令名）。
         // v2 Pass P129b（blocking-2 收口）：未知的、不带花括号参数的命令 -> 静默丢弃命令名本身，
