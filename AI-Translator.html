@@ -4243,7 +4243,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.07.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.07.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -12228,10 +12228,18 @@ function showToast(message, type = 'info') {
 // 和 `#aiChatRoot`（AI 对话窗，body 直挂，CSS 约 410 行 `z-index: 2147482000`）；900x600 窗口
 // 下真实点击左侧栏打开 AI 对话窗后，toast 有一半被 `#aiChatRoot` 盖住（详见 p125_verify.md）。
 // 修法：容器改为 `document.body` 直挂（不再是 #ovlPortal 的子节点，不再共享它的层叠上下文），
-// z-index 取 2147483000——高于目前已知的 `#aiChatRoot`（2147482000）和 `#synonymPopup`
-// （1087）。诚实标注：这仍然是"目前已知最高"，不是数学上的封顶——出现比这更高的新组件时
-// 需要重新核对。切到 v1（`ovlOpenTranslator()`）时清空这些 toast 的逻辑（`ovlToastClearAll`）
-// 与计时/堆叠逻辑本身不受这次挂载点变化影响，一并保留。
+// z-index 取 2147483000——高于 `#aiChatRoot`（2147482000）、`#synonymPopup`（1087）、
+// `#xport-thinking-banner`（99999），与 `[data-tip]::after` 同值 2147483000（同值时平手，
+// 实测 93 个 `[data-tip]` 里仅 1 个祖先链上没有别的层叠上下文，且它在 `#root` 内、外壳模式下
+// `display:none`，实际不可达，非问题）。【P125c 更正，原"这仍然是目前已知最高"作废】不成立：
+// 同一份文件里 `#renderBoundaryPanel`（约 15505/15512 行，`document.body` 直挂、
+// `zIndex:'2147483600'`）比这里高 600，且可由真实生产路径（`window` 的
+// `error`/`unhandledrejection` → `rbHandleAsync` → `rbShow`）弹出，实测把 toast 全部遮住——
+// 这不是回归，是应用既有设计（v1 的 `#root` 老通道被这个面板遮得一模一样；该面板是渲染出错
+// 时的崩溃告知面板，设计上就要盖住一切）。准确说法：本容器高于 `#aiChatRoot`/`#synonymPopup`/
+// `#xport-thinking-banner`，与 `[data-tip]::after` 同值，低于故意设计成全场最高的
+// `#renderBoundaryPanel`。切到 v1（`ovlOpenTranslator()`）时清空这些 toast 的逻辑
+// （`ovlToastClearAll`）与计时/堆叠逻辑本身不受这次挂载点变化影响，一并保留。
 const OVL_TOAST_DURATION_MS = 3000;
 const OVL_TOAST_KIND_STYLE = {
     success: 'background:#ecfdf5;border-color:#a7f3d0;color:#047857;',
@@ -12245,10 +12253,14 @@ const OVL_TOAST_KIND_STYLE_DEFAULT = 'background:#f8fafc;border-color:#e2e8f0;co
 // 理由见上方 P125b 注释——挂在 #ovlPortal 下会被它自己 1080 的层叠上下文吃掉内部
 // z-index）。绝不缓存 DOM 引用给调用方——每次现取（容器本身极少被销毁重建，这里主要是
 // 防御极端时序）。
-// max-height:40vh;overflow-y:auto（P125b issue-3，低危健壮性）：防的是拼接了异常长错误
-// 信息（比如把 e.message 拼进提示文案的那些调用点）时纵向撑出视口——真实文案里最长的一条
-// 84 字实测四档窗口都不会触发这条兜底（400x300 下占屏高 53%，仍在 40vh 内），只有明显超出
-// 常规长度的文本才会触发滚动，不影响正常提示的观感。
+// max-height:60vh;overflow-y:auto（P125b issue-3 引入 40vh；P125c 放宽到 60vh，issue-5
+// 修正）：防的是拼接了异常长错误信息（比如把 e.message 拼进提示文案的那些调用点）时纵向
+// 撑出视口——实测口径：仓库里最长的一条真实 showToast 字面量（84 字，"本地桥接服务版本过
+// 旧……"）在四档窗口里最窄的 400x300 下高度是 159px；60vh = 300*0.6 = 180px > 159px，不
+// 触发这条兜底，最长真实文案完整可见不被裁（【P125c 更正，原话作废】旧注释说"84 字实测四档
+// 窗口都不会触发"不成立且自相矛盾：40vh=120px 时该文案在 400x300 下会被钳到 120px，末尾约
+// 39px 被裁掉，已被 p125_verify.md 第2轮 issue-5 实测证伪）。只有明显超出常规长度、比这条
+// 真实文案更长的合成/拼接文本才会触发这条兜底，此时 overflow-y:auto 让用户可以滚动查看。
 function ovlToastStack() {
     let stack = document.getElementById('ovlToastStack');
     if (stack) return stack;
@@ -12256,7 +12268,7 @@ function ovlToastStack() {
     stack.id = 'ovlToastStack';
     stack.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);'
         + 'z-index:2147483000;display:flex;flex-direction:column;align-items:center;gap:8px;'
-        + 'max-height:40vh;overflow-y:auto;'
+        + 'max-height:60vh;overflow-y:auto;'
         + 'pointer-events:none;';
     document.body.appendChild(stack);
     return stack;
@@ -15505,8 +15517,10 @@ function rbEnsurePanel() {
         box.id = 'renderBoundaryPanel';
         // 「用户不可能错过」也要对读屏用户成立：assertive 的 live region 会在面板出现时直接朗读。
         try { box.setAttribute('role', 'alert'); box.setAttribute('aria-live', 'assertive'); } catch (e) {}
-        // z 预算：对话窗是 2147483000、它的拖动遮罩是 2147482000。这个面板必须盖在最上面，
-        // 否则「页面炸了」的告知会被一个还在正常工作的浮窗挡住。
+        // z 预算（P125c 订正：原文两个数字弄反）：对话窗 #aiChatRoot 是 2147482000，
+        // 2147483000 是 data-tip 气泡 [data-tip]::after 的值，不是对话窗；此处也没有独立的
+        // "拖动遮罩"元素。这个面板必须盖在最上面，否则「页面炸了」的告知会被一个还在正常
+        // 工作的浮窗挡住。
         rbStyle(box, {
             position: 'fixed', top: '12px', left: '50%', transform: 'translateX(-50%)',
             zIndex: '2147483600', width: 'min(760px, calc(100vw - 24px))',
