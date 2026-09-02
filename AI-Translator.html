@@ -4243,7 +4243,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.08.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.08.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -32691,6 +32691,22 @@ function ovlScheduleLineOffsetRecompute(delay) {
 // 重画的情况——调用方是 ovlScheduleLineOffsetRecompute 的防抖回调，不是敲键盘的热路径。
 function ovlRenderGutter(force) {
     try {
+        // v2 Pass P123b（终核 issue-2）：这个函数只画 Code 模式的行号槽，但在本文件里被
+        // 至少 20 个调用点直接调用，其中 ovlResetProjectScopedState()（切项目文件夹）和
+        // ovlPerformDelete()（删掉当前文件所在父目录）这两处，在 Visual 模式下可达，且
+        // 调用之后都不跟一次 ovlVisualRender()/ovlRenderVisualGutter() 补救——旧行为是
+        // 直接把 gutter 换成一堆 Code 形态的 .ovl-ln 空壳格子，跟 Visual 面板的绝对定位
+        // 块彻底错位；本轮改的增量重排（P123 D3）又让这种错位从"闪一下、下次块落地自愈"
+        // 变成"持久，直到用户打开新文件触发整篇重渲染才会恢复"（块集合没变→增量分支→
+        // changedIdx 为空→不补建 cell，WeakMap 里存的 cell 也已经脱离文档）。与其在每个
+        // 调用点各自补判断，不如把模式分流收口到这一个函数的入口——Visual 模式下这个函数
+        // 本来就不该管 gutter，一律转派给 ovlRenderVisualGutter()（它自己已经有
+        // editorMode!=='visual' 的早退守卫，互相调用不会死循环），一次性堵死这一整类
+        // 缺陷的所有现有和未来调用点，不只是这两个已知实例。
+        if (OvlState.editorMode === 'visual') {
+            if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
+            return;
+        }
         const ta = document.getElementById('ovlCodeArea');
         const gutter = document.getElementById('ovlGutter');
         if (!ta || !gutter) return;
