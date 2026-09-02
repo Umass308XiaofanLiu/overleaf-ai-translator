@@ -4336,7 +4336,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.10.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.10.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -30396,13 +30396,53 @@ function ovlVisualTransCacheKey(text, config) {
 // 保持原有签名（只回传字符串，两个既有调用点 ovlVisualRenderBlockContent/inlineZhSave 的
 // enText 读取都不需要这层信息，不动它们），新增 ovlVisualTransCacheGetMeta 内部实现，
 // Get 委托给它取 .tgt，避免两份查找逻辑分叉。
+// v2 Pass P128d（R-3 收口，核验 .claude/tmp/p128_verify2.md §7 R-3）：hit 未盖章（没有
+// gateVersion 字段，或版本号跟当前不一致）时先过一次 ovlVisualCjkGateEval——旧缓存条目（本
+// Pass 之前、乃至 P128/P128b 那道闸更早期版本写入的）从来没被今天这套源相对判据检查过，
+// "读到即成功"是 N-3/B2-1 系列问题在读侧留的最后一条静默通道：旧版本翻译出来的英文（哪怕
+// 混进 1 个汉字，`ovlVisualAuditUnmarkedEnglish` 的 `!hasCjk` 判据比这道闸弱一个量级，抓
+// 不到）原样显示成"成功"，用户重开文档还是看见同一段英文。
+//   skipped/forced 两种豁免：skipped 语义上等价于"源文本来就没有可译散文"（srcWords===0，
+//     这道闸本来就不判），forced 是用户在 C3b 逃生门里显式点过一次"仍然采用这次结果"——两者
+//     都不该被这道闸事后翻案，直接盖章放行。
+//   其余情形真的跑一次 ovlVisualCjkGateEval(text, hit.tgt)：过闸就盖章（避免下次再重复算），
+//     不过闸——整条从缓存里删掉，函数返回视为未命中（调用方 ovlVisualRenderBlockContent 落到
+//     它自己的 pending 兜底分支，块带着"翻译中…"标记重新排进队列，不会再显示成"成功"）。
+// 返回值：null=需要按未命中处理（调用方据此不返回这条 hit）；否则返回同一个（可能被原地
+// 盖了章的）hit 对象。
+function ovlVisualTransCacheGateCheck(text, hit, map, key, projectId) {
+    if (hit.gateVersion === OVL_VISUAL_CJK_GATE_VERSION) return hit;
+    let passed = !!(hit.skipped || hit.forced);
+    if (!passed) {
+        const gate = (typeof ovlVisualCjkGateEval === 'function') ? ovlVisualCjkGateEval(text, hit.tgt) : { ok: true };
+        passed = !!gate.ok;
+    }
+    if (passed) {
+        hit.gateVersion = OVL_VISUAL_CJK_GATE_VERSION;
+        if (map && key) {
+            map[key] = hit;
+            if (ovlVisualTransCacheSaveBucket(projectId, map)) ovlVisualTransCacheIndexTouch(projectId);
+        }
+        return hit;
+    }
+    if (map && key && (key in map)) {
+        delete map[key];
+        ovlVisualTransCacheSaveBucket(projectId, map);
+    }
+    return null;
+}
 function ovlVisualTransCacheGetMeta(text, config, projectIdOverride) {
     try {
         const projectId = projectIdOverride || ovlVisualTransCacheProjectId();
         const key = ovlVisualTransCacheKey(text, config);
         const map = ovlVisualTransCacheBucketLoad(projectId);
-        const hit = map[key];
+        let hit = map[key];
         if (hit && typeof hit.tgt === 'string') {
+            hit = ovlVisualTransCacheGateCheck(text, hit, map, key, projectId);
+        } else {
+            hit = null;
+        }
+        if (hit) {
             const now = Date.now();
             if (!hit.ts || now - hit.ts > 60000) {
                 hit.ts = now;
@@ -30421,14 +30461,21 @@ function ovlVisualTransCacheGetMeta(text, config, projectIdOverride) {
             // null，不报错、不需要迁移。
             return { tgt: hit.tgt, skipped: !!hit.skipped, forced: !!hit.forced, partial: !!hit.partial, partialReason: hit.partialReason || null, ladderLevel: hit.ladderLevel || null };
         }
-        // 新桶未命中——查一次旧版全局缓存兜底，命中就提升进新桶（不删旧的、旧的不再增长）。
-        // 旧版缓存条目本来就没有 skipped/forced/partial/ladderLevel 字段（早于 P113/P122/
-        // P122c/P128b），提升时用 !!undefined = false / undefined || null = null，逐字节
-        // 兼容旧数据。
+        // 新桶未命中（含"闸没过被当场删掉"这种情形）——查一次旧版全局缓存兜底，命中就先过闸
+        // 再决定要不要提升进新桶（不删旧的、旧的不再增长；不过闸就不提升，直接当未命中）。
+        // 旧版缓存条目本来就没有 skipped/forced/partial/ladderLevel/gateVersion 字段（早于
+        // P113/P122/P122c/P128b/P128d），提升时用 !!undefined = false / undefined || null =
+        // null，逐字节兼容旧数据。
         const legacy = ovlVisualTransCacheLegacyLoad();
         const legacyHit = legacy[key];
         if (legacyHit && typeof legacyHit.tgt === 'string') {
-            ovlVisualTransCachePut(text, config, legacyHit.tgt, projectId, legacyHit.skipped, legacyHit.forced, legacyHit.partial, legacyHit.partialReason, legacyHit.ladderLevel);
+            let passed = !!(legacyHit.skipped || legacyHit.forced);
+            if (!passed) {
+                const gate = (typeof ovlVisualCjkGateEval === 'function') ? ovlVisualCjkGateEval(text, legacyHit.tgt) : { ok: true };
+                passed = !!gate.ok;
+            }
+            if (!passed) return null; // 旧版兜底同样不豁免——不达标不提升、直接当未命中
+            ovlVisualTransCachePut(text, config, legacyHit.tgt, projectId, legacyHit.skipped, legacyHit.forced, legacyHit.partial, legacyHit.partialReason, legacyHit.ladderLevel, OVL_VISUAL_CJK_GATE_VERSION);
             return { tgt: legacyHit.tgt, skipped: !!legacyHit.skipped, forced: !!legacyHit.forced, partial: !!legacyHit.partial, partialReason: legacyHit.partialReason || null, ladderLevel: legacyHit.ladderLevel || null };
         }
     } catch (e) {}
@@ -30456,12 +30503,21 @@ function ovlVisualTransCacheGet(text, config, projectIdOverride) {
 // 命中缓存直接吐译文，"这条译文是不是走了不校验公式/命令的 raw 兜底路径译出的"这条信息就
 // 静默消失了——跟 forced/partial 当年漏读是同一类、同一处、同一个修法。不传（其余全部调用
 // 点）落 null，逐字节不影响既有行为；旧缓存条目读出来同样是 null（见上方 GetMeta）。
-function ovlVisualTransCachePut(text, config, tgt, projectIdOverride, skipped, forced, partial, partialReason, ladderLevel) {
+// v2 Pass P128d（R-3 收口）：再新增第 10 个可选形参 gateVersion——不传（现有全部调用点）时
+// 默认落当前的 OVL_VISUAL_CJK_GATE_VERSION，不是像前面几个形参那样落 falsy 默认值。理由：
+// 这个函数在生产代码里只会在"内容已经过闸"（正常翻译成功/skipped 豁免/forced 显式覆盖/
+// 用户手动就地编辑）之后才被调用——写入侧本来就已经保证了内容合格，没有必要强迫每一处调用
+// 点都手工传一遍"我合格了"；真正需要"未盖章"这个状态的两处（旧版 localStorage 里本来就没有
+// 这个字段的历史数据、以及上面 GetMeta 里"过闸失败就删掉"的分支）都不经过这条默认路径——
+// 前者是 JSON.parse 出来的对象天生没有这个键，后者根本不调用 Put。只有上面 GetMeta 显式确认
+// "刚刚过了闸"之后才会显式传 OVL_VISUAL_CJK_GATE_VERSION 走"提升旧版兜底缓存"这条分支，
+// 跟不传时的默认值相同，是同一个值、不是两套逻辑。
+function ovlVisualTransCachePut(text, config, tgt, projectIdOverride, skipped, forced, partial, partialReason, ladderLevel, gateVersion) {
     try {
         const projectId = projectIdOverride || ovlVisualTransCacheProjectId();
         const key = ovlVisualTransCacheKey(text, config);
         const map = ovlVisualTransCacheBucketLoad(projectId);
-        map[key] = { tgt: tgt, ts: Date.now(), skipped: !!skipped, forced: !!forced, partial: !!partial, partialReason: partial ? (partialReason || 'unknown') : null, ladderLevel: ladderLevel || null };
+        map[key] = { tgt: tgt, ts: Date.now(), skipped: !!skipped, forced: !!forced, partial: !!partial, partialReason: partial ? (partialReason || 'unknown') : null, ladderLevel: ladderLevel || null, gateVersion: (typeof gateVersion === 'number') ? gateVersion : OVL_VISUAL_CJK_GATE_VERSION };
         ovlVisualTransCacheEvictToBudget(map, OVL_VISUAL_TRANS_CACHE_PROJECT_BUDGET_CHARS);
         if (ovlVisualTransCacheSaveBucket(projectId, map)) {
             ovlVisualTransCacheIndexTouch(projectId);
@@ -30890,45 +30946,75 @@ function ovlVisualExtractProse(s) {
     t = t.replace(/[{}\[\]]/g, ' ');
     return t;
 }
-// ==================== v2 Pass P128b（N-3 收口，核验 .claude/tmp/p128_verify.md N-3/§12）====================
-// 零中文硬闸（本文件下方 ovlVisualTranslateBlockText/ovlVisualTranslateBlockRaw 里原来的
-// `ovlVisualCountCjk(...) === 0`）只堵"整句一个中文字都没有"这一种情形——模型只要在一大段
-// 没翻的英文里混进哪怕一个汉字就能绕过去（实测复现：1 个汉字 + 19 个英文词，threw:false，
-// 跟用户反馈的"英文且无标记"症状肉眼一样）。改成比例闸：先用上面的 ovlVisualExtractProse
-// 剥掉已经受保护的公式/代码/引用哨兵，这里再排除 URL 与"专有名词大写缩写"（学术译文合法
-// 保留缩写/型号名，不该被当"没翻译的英文"计入分母）——剩下的散文里数 CJK 字符与拉丁字母
-// 各自的数量，比例低于阈值才判失败。
-// 阈值 0.15 的取数依据（完整分布见 .claude/tmp/p128_impl.md「P128b 收口」节）：
-//   · 3 条真实模型译文（qwen3.6-35b-a3b，.claude/tmp/p128_verify.md §4，逐字未改）比例全部
-//     =1.000（纯 CJK，无残留拉丁字符——真实语料这几句本来就不含专有名词，覆盖不到下界）；
-//   · 6 条按同一批真实语料风格补写、专门压测"译文合法保留多个大小写混合专有名词/型号名"
-//     （大写缩写规则排不掉的那一类，比如 Starlink/GATv2/PyTorch）下界的样本，比例
-//     0.439～1.000；
-//   · 3 条更极端的"几乎整句都是专有名词列表"样本（逐个列出星座运营商/框架名字），比例低到
-//     0.268～0.400——这是本次能构造出的最刁钻但仍然"该被判成功"的真实分布下界；
-//   · 反例：N-3 阻断报告原始复现输入（1 个汉字+19 个英文词）比例 0.0063；另外两条"大段未译
-//     英文里零星插入几个汉字"的对抗样本比例 0.0298/0.0629。
-//   合法下界 0.268 与对抗上界 0.0629 之间留了 4 倍以上的安全窗口，0.15 取在窗口中段偏向
-//   "宁可放过、不许误杀"（任务原话"不误伤任何真实成功译文的下界"）。
-const OVL_VISUAL_CJK_RATIO_MIN = 0.15;
+// ==================== v2 Pass P128d（B2-1/B2-2 收口，核验 .claude/tmp/p128_verify2.md）====================
+// P128b 的"译文自身比例闸"（ovlVisualCjkRatio，denom===0 视为满分）被 Opus 第 2 轮终核判
+// fail，两处阻断：
+//   B2-1：分母为 0 的豁免把"只剩引用哨兵/纯标点数字/空串/1 汉字+全大写缩写"四种脏译文
+//     重新变成无标记静默落地（且写进缓存、重渲染后永久生效）——分母只看译文自己，模型只要
+//     把可译内容全部丢掉、只留受保护片段/标点，分母天然归零，闸门形同虚设。
+//   B2-2：URL 排除正则 `[^\s，。；、,.;]+` 把 '.' 排除在字符类外，任何真实域名都在第一个点
+//     被截断，这条豁免从未真正生效过；专有名词列表（Starlink/OneWeb/Kuiper 这类首字母大写、
+//     不是全大写缩写的词）同样排不掉，两者共同导致合法译文（含 URL 的、专有名词密集的）被
+//     误杀成 low-cjk。
+// 根治不是再调阈值，是换整个判据的立足点：不再看"译文自己剥完之后中文占剩余字符的比例"，
+// 改成**源相对**——先看源文本身有多少"确实需要翻译"的拉丁散文（srcWords），再看译文里译出
+// 了多少中文字符（zhChars），要求两者之间有一个下限比例。源文本身没有可译散文（纯公式/纯
+// 缩写/纯 URL，srcWords===0）时这道闸不判定——是否放行交给上下文已有的多重集/占位符完整性
+// 校验（这才是"分母为 0"这类块真正该被谁把关的地方，不该由一个"比例"函数兼职判）。
 function ovlVisualCjkRatioProse(s) {
     let t = String(s == null ? '' : s);
-    // URL：合法出现在学术译文里（比如代码仓库/数据集链接），不算"没翻译的英文"。
-    t = t.replace(/(?:https?:\/\/|www\.)[^\s，。；、,.;]+/g, ' ');
+    // URL：合法出现在学术译文里（比如代码仓库/数据集链接）。v2 Pass P128d 修正（B2-2 根因①）：
+    // 旧正则把 '.' 排除在字符类外，任何真实域名都在第一个点被截断，等于这条豁免从未生效过
+    // （实测 https://github.com/a/b → " .com/a/b"）。改用 `\S+`——一路吃到下一个空白为止，
+    // 可能连带吃掉紧跟其后没有空格分隔的中文句末标点（比如"...data。"里的句号）；这里只是
+    // 把 URL 从"要不要数进拉丁单词/CJK 字符"这个统计里剔除，多吃一个标点不影响判定，比
+    // "漏吃 URL 本体"这个原来的阻断安全得多。
+    t = t.replace(/(?:https?:\/\/|www\.)\S+/gi, ' ');
     // 专有名词大写缩写：连续 2+ 个大写字母开头（可带数字/连字符/一个复数小写 s），比如
     // MIMO-OFDM、GNN、IEEE、LISLs——学术译文里合法保留、不该被当"没翻译的英文"计入分母。
+    // 注：首字母大写但非全大写的专有名词（Starlink/OneWeb/CelesTrak）这条正则排不掉——
+    // B2-2 根因②，源相对判据不靠这条正则去豁免它们，靠"这本来就是源文里的专有名词、不计入
+    // srcWords 之外的"（下面 ovlVisualGateSrcWords 只数从源文剥出来的词，源文里的专有名词
+    // 词形跟译文里原样保留的词形一致，天然不会被两头重复计较）。
     t = t.replace(/\b[A-Z]{2,}[A-Z0-9-]*'?s?\b/g, ' ');
     return t;
 }
-// 排除受保护片段（数学/命令/引用/代码，ovlVisualExtractProse 已经做）+ URL/大写缩写之后，
-// CJK 字符数 / (CJK + 拉丁字母数)；分母为 0（剥完什么可数字符都不剩）视为满分、不算失败——
-// 跟下面 mainNothing 豁免同一个精神，不能因为一块本来就没什么可数散文就误判成低比例。
-function ovlVisualCjkRatio(s) {
-    const prose = ovlVisualCjkRatioProse(ovlVisualExtractProse(s));
-    const cjk = ovlVisualCountCjk(prose);
-    const latin = (prose.match(/[A-Za-z]/g) || []).length;
-    const denom = cjk + latin;
-    return denom === 0 ? 1 : cjk / denom;
+// 剥掉受保护片段（[[N]]/OVLCODE/OVLCITE 哨兵、反斜杠命令名、花括号/方括号——见
+// ovlVisualExtractProse）与 URL/大写缩写之后剩下的纯散文，供下面两个计数函数共用。
+function ovlVisualGateProse(s) {
+    return ovlVisualCjkRatioProse(ovlVisualExtractProse(s));
+}
+// 源侧：≥2 个字母的拉丁"单词"数（大写缩写已经被上面剥掉，不需要再单独排除一次）。
+function ovlVisualGateSrcWords(s) {
+    const prose = ovlVisualGateProse(s);
+    return (prose.match(/[A-Za-z]{2,}/g) || []).length;
+}
+// 译文侧：CJK 字符数。
+function ovlVisualGateZhChars(s) {
+    return ovlVisualCountCjk(ovlVisualGateProse(s));
+}
+// K 的取数依据、真实/拟真译文 zhChars/srcWords 分布最低 10 条（含两条曾经被 B2-2 误杀的
+// 合法样本重算后的真实值）见 .claude/tmp/p128_impl.md「P128d 收口」节。
+const OVL_VISUAL_CJK_GATE_K = 0.25;
+// 缓存条目"是否已经过当前版本这道闸校验"的版本号——每收紧/放松一次判据就 +1；旧缓存条目
+// （字段缺失，或版本号对不上）在下次读取时会被 ovlVisualTransCacheGetMeta 重新过一遍闸
+// （v2 Pass P128d，R-3 收口，见该函数头部注释）。
+const OVL_VISUAL_CJK_GATE_VERSION = 1;
+// 统一判据入口——src/rawTgt 都传"裸文本"（不带本模块占位符的最终形态，可以含原始 LaTeX）：
+//   · 主路径写入侧：src 是原始未掩码源文，rawTgt 是完整解遮罩之后的最终译文；
+//   · L-raw 写入侧：src/body 本来就是裸 LaTeX，原样传；
+//   · 缓存读侧（R-3）：src 是查询用的原始源文，rawTgt 是缓存里存的最终译文——
+//   三处口径统一成同一份实现，不写三份判据、不因为“这条译文是哪条路径译出的”而分叉逻辑。
+function ovlVisualCjkGateEval(src, rawTgt) {
+    const srcMasked = xportMask(ovlVisualCodeMask(String(src == null ? '' : src)).text).text;
+    const tgtMasked = xportMask(ovlVisualCodeMask(String(rawTgt == null ? '' : rawTgt)).text).text;
+    const srcWords = ovlVisualGateSrcWords(srcMasked);
+    const zhChars = ovlVisualGateZhChars(tgtMasked);
+    if (srcWords === 0) return { ok: true, reason: null, srcWords: srcWords, zhChars: zhChars, need: 0 };
+    const need = Math.max(1, Math.ceil(OVL_VISUAL_CJK_GATE_K * srcWords));
+    if (zhChars === 0) return { ok: false, reason: 'no-cjk', srcWords: srcWords, zhChars: zhChars, need: need };
+    if (zhChars < need) return { ok: false, reason: 'low-cjk', srcWords: srcWords, zhChars: zhChars, need: need };
+    return { ok: true, reason: null, srcWords: srcWords, zhChars: zhChars, need: need };
 }
 // 规范化：去空白 + 去掉所有标点/符号装饰，只保留跨语言都有意义的"字"（字母/数字）。
 function ovlVisualNormalizeProse(s) {
@@ -30996,11 +31082,17 @@ function ovlVisualTransFailReason(err, meta) {
     // v2 Pass P122b（B2）：ovlVisualCiteCheck 抛出的错误固定含"引用编号哨兵"，判定依据仍然
     // 只用已经存在的信号（throw 出来的 message 固定文案），跟上面 code-sentinel 同一条纪律。
     if (/引用编号哨兵/.test(msg)) return 'cite-sentinel';
-    // v2 Pass P128（C2，硬闸）→ P128b（N-3 收口，改比例闸）："成功但基本没有中文"——占位符/
-    // 哨兵完整性校验全部通过，但正文中文占比低于阈值，说明模型压根没做翻译这件事本身（改写/
-    // 续写/答非所问，或者只在大段英文里意思意思插了几个汉字）。判据算法见 ovlVisualCjkRatio
-    // 头部注释；分类名从 no-cjk 改成 low-cjk（ratio===0 是 low-cjk 的一个特例，不再单列）。
+    // v2 Pass P128（C2，硬闸）→ P128b（N-3 收口，改比例闸）→ P128d（B2-1/B2-2 收口，改源相对
+    // 闸）："成功但基本没有中文"——占位符/哨兵完整性校验全部通过，但译出的中文字符数相对
+    // 源文可译散文量不够，说明模型压根没做翻译这件事本身（改写/续写/答非所问，或者只在大段
+    // 英文里意思意思插了几个汉字）。判据算法见 ovlVisualCjkGateEval 头部注释。
     if (/中文占比过低/.test(msg)) return 'low-cjk';
+    // v2 Pass P128d（B2-1 收口）：源文确实有可译散文（srcWords>0），但译文剥完受保护片段后
+    // 一个汉字都没有——重新拆出独立分类（P128b 曾把这种情形并进 low-cjk，"零"和"不够"共用
+    // 一个判据/一条消息，导致"只剩引用哨兵"这类译文只要凑巧分母为 0 就整体逃逸出这道闸，是
+    // B2-1 阻断的直接根因；拆开之后两条分类各自对应一条独立的 throw 消息，不再靠同一个正则
+    // 兜底）。
+    if (/零中文/.test(msg)) return 'no-cjk';
     // v2 Pass P128（L-raw 阶梯末级）：不带哨兵的兜底路径没有 OVLCITE 哨兵可供"越界/缺失/
     // 重复"这类哨兵专属判据，改用多重集直接比较译文/原文的裸引用编号，不一致时用这条独立
     // 消息区分于哨兵路径的 cite-sentinel。
@@ -31254,25 +31346,22 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
             }
             throw new Error('翻译结果与原文几乎相同，判定为未翻译成功（回显防毒守卫拦截）');
         }
-        // v2 Pass P128（C2，任务书点名）："成功但没有中文"必须判失败——以前的校验只管占位符/
+        // v2 Pass P128（C2，任务书点名）→ P128b（N-3）→ P128d（B2-1/B2-2，核验
+        // .claude/tmp/p128_verify2.md）："成功但没有中文"必须判失败——以前的校验只管占位符/
         // 代码/引用哨兵有没有被改动（"完整性"意义上的合格），完全没人管"正文那部分到底有没有
         // 被翻译成中文"这件事本身。回显守卫（上面刚过）只抓"几乎原样照抄"这一种情形；模型还
         // 可能返回一段跟原文不那么像、但同样一个中文字都没有的英文（改写/续写/答非所问）——
-        // 这类输出会全须全尾通过占位符/代码/引用校验，被当"翻译成功"落地，正是用户反馈"大量
-        // 句子仍是英文"的另一条独立成因（诊断 .claude/tmp/p128_diag.md 未直接点名这条，但
-        // "成功但没有中文"这类输出天然不会在 §1 的 failed 计数里现身，是比 M1/M2/M3 更隐蔽的
-        // 第四种"英文但零标记"来源）。判据前提是这块原文确实有自然语言（进了这个 else 分支
-        // 本身就意味着 mainNothing===false，纯缩写/纯引用/纯公式块已经在上面 mainNothing
-        // 分支或回显守卫豁免，不会走到这里，v2 Pass P128 测试 T5 六个探针逐条钉死"不许矫枉
-        // 过正"）。刻意放在回显守卫之后而不是之前：回显（几乎原样照抄）本身也是 0 中文，但
-        // 已经有更具体的分类（echo）和专属的用户逃生门（C3b"仍然采用这次结果"，靠
-        // meta.echoCandidate 驱动）——这条新闸只兜"回显守卫没抓到、但确实一个中文字都没翻"
-        // 的剩余情形，不抢先吞掉 echo 分类，否则真实回显会被误标成通用的 no-cjk，C3b 逃生门
-        // （依赖 reason==='echo'）会因此对真实回显失效，是比原问题更糟的回归。
-        // v2 Pass P128b（N-3 收口）：改用比例闸，判据与算法见上方 ovlVisualCjkRatio 头部注释。
-        if (ovlVisualCjkRatio(body) < OVL_VISUAL_CJK_RATIO_MIN) {
-            throw new Error('翻译结果里中文占比过低（模型基本未翻译）');
-        }
+        // 这类输出会全须全尾通过占位符/代码/引用校验，被当"翻译成功"落地。判据前提是这块
+        // 原文确实有自然语言（进了这个 else 分支本身就意味着 mainNothing===false，纯缩写/
+        // 纯引用/纯公式块已经在上面 mainNothing 分支或回显守卫豁免，不会走到这里）。
+        // v2 Pass P128d：判据本身（源相对的 ovlVisualCjkGateEval）挪到本函数末尾统一执行——
+        // mainNothing 分支（无正常翻译，只有可能的 \text{} 散文回填）与本分支（正常翻译）
+        // 最终都汇合到同一份完整解遮罩文本 afterCodeUnmask，用同一次调用判两条分支，不用
+        // 在这里对 body（还是掩码形态、且只覆盖本分支）单独判一次——原来这里的判据只看
+        // "译文自身"的中文占比，源文本来就有多少可译内容完全不影响判据，这正是 B2-1/B2-2
+        // 两处阻断的根本设计问题；换成源相对的口径后，判据必须同时看到"最终解遮罩之后的
+        // 源文/译文"，只有在本函数末尾（citeUnmask/codeUnmask/text-prose 回填都做完之后）
+        // 才凑得齐，因此从这里挪走。
         // v2 Pass P122b（B2）：C1 免费修复命中时，body 里的引用编号已经被直接改回最终的
         // 字面 [k] 形态（不是哨兵形态）——那条路本来就是"模型把 OVLCITE 哨兵写成了 [[k]]
         // 双层括号"这个特定误用的专属急救，急救产物天然不含 〘〘OVLCITEk〙〙 哨兵，下面的
@@ -31384,6 +31473,20 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
         if (meta) meta.textProseHandled = textProseMasked.items.length;
         if (meta && anyTextProseFailed) { meta.partial = true; meta.partialReason = 'text-prose'; }
     }
+    // v2 Pass P128d（B2-1/B2-2 收口）：源相对中文覆盖闸——两条主体分支（mainNothing 与正常
+    // 翻译）、以及是否含 \text{} 散文回填，到这里都已经统一汇合成同一份最终解遮罩文本
+    // afterCodeUnmask，用同一个函数、同一套"裸文本进裸文本出"口径统一判——跟
+    // ovlVisualTranslateBlockRaw、ovlVisualTransCacheGetMeta（R-3 读侧过闸）共用同一个
+    // ovlVisualCjkGateEval，不写三份判据。mainNothing 分支（纯公式/代码/引用，没有可译散文）
+    // 天然 srcWords===0，这里不会误杀；块内有 \text{} 散文时，散文本身的翻译失败已经被上面
+    // 的逐片段回落（fragMeta.failed → meta.partial，CSS 虚线左边框标记）单独保护，这道闸只
+    // 管块级整体，两层保护互不重叠、互不冲突。
+    const gate = ovlVisualCjkGateEval(src, afterCodeUnmask);
+    if (!gate.ok) {
+        throw new Error(gate.reason === 'no-cjk'
+            ? '翻译结果零中文（源文有可译散文，但译文剥完受保护片段后一个汉字都没有）'
+            : '翻译结果里中文占比过低（模型基本未翻译）');
+    }
     return afterCodeUnmask;
 }
 
@@ -31466,10 +31569,6 @@ async function ovlVisualTranslateBlockRaw(text, cfg, signal, meta) {
         if (meta) meta.echoCandidate = body; // 跟 L0 同一条纪律：抓住候选，供 C3b 逃生门使用
         throw new Error('翻译结果与原文几乎相同，判定为未翻译成功（回显防毒守卫拦截）');
     }
-    // v2 Pass P128b（N-3 收口）：改用比例闸，判据与算法见上方 ovlVisualCjkRatio 头部注释。
-    if (ovlVisualCjkRatio(body) < OVL_VISUAL_CJK_RATIO_MIN) {
-        throw new Error('翻译结果里中文占比过低（模型基本未翻译）');
-    }
     body = body.replace(/\[\[\s*(\d{1,3})\s*\]\]/g, '[$1]');
     const srcCites = ovlVisualCiteMask(ovlVisualCodeMask(src).text).map;
     const tgtCites = ovlVisualCiteMask(ovlVisualCodeMask(body).text).map;
@@ -31498,6 +31597,17 @@ async function ovlVisualTranslateBlockRaw(text, cfg, signal, meta) {
     const tgtMathCmd = xportMask(tgtCodeMasked.text);
     if (!ovlVisualMultisetEqual(srcCodeMasked.map, tgtCodeMasked.map) || !ovlVisualMultisetEqual(srcMathCmd.map, tgtMathCmd.map)) {
         throw new Error('翻译结果未通过完整性校验（数学公式、\\ref/\\cite/\\label 等命令或代码片段被改动或吞掉，raw 路径多重集比对未通过）');
+    }
+    // v2 Pass P128d（B2-1/B2-2 收口）：源相对中文覆盖闸——src/body 在 raw 路径本来就是裸
+    // LaTeX（从未掩码），跟 ovlVisualCjkGateEval 的入参口径天然一致，直接传，不用额外转换；
+    // 跟主路径（ovlVisualTranslateBlockText 末尾）、读侧（R-3，ovlVisualTransCacheGetMeta）
+    // 共用同一个函数。放在完整性/引用多重集校验之后：先确认受保护片段没被吞/改，再判"剩下
+    // 该翻译的那部分到底翻没翻"，两类失败分类互不吸收。
+    const gate = ovlVisualCjkGateEval(src, body);
+    if (!gate.ok) {
+        throw new Error(gate.reason === 'no-cjk'
+            ? '翻译结果零中文（源文有可译散文，但译文剥完受保护片段后一个汉字都没有）'
+            : '翻译结果里中文占比过低（模型基本未翻译）');
     }
     return body;
 }
@@ -32569,7 +32679,7 @@ function ovlVisualLangProgressUpdate() {
         });
         const reasonLabel = { echo: '回显', placeholder: '占位符', 'cite-bracket': '引用括号', 'cite-sentinel': '引用哨兵',
             'code-sentinel': '代码哨兵', truncated: '截断', timeout: '超时', network: '网络',
-            config: '配置', 'low-cjk': '中文占比过低', 'cite-mismatch': '引用不符',
+            config: '配置', 'low-cjk': '中文占比过低', 'no-cjk': '零中文', 'cite-mismatch': '引用不符',
             'raw-integrity': '兜底路径公式/命令被吞', unknown: '未知' };
         const breakdown = Object.keys(byReason).map(function (r) {
             const label = reasonLabel[r] || (String(r).indexOf('http-') === 0 ? 'HTTP ' + r.slice(5) : r);
@@ -32947,10 +33057,11 @@ const OVL_VISUAL_FAIL_TIP = {
     network: '网络请求失败（连接被重置/DNS 解析失败等）。点击重试。',
     config: '翻译服务配置有问题（provider/模型/密钥），请检查设置后重试。',
     'source-missing': '取不到这一块对应的源码（编辑器内容可能已变化）。点击重试。',
-    // v2 Pass P128（C2/L-raw）→ P128b（N-3 改比例闸、B-1 新增 raw-integrity）：判定依据分别见
-    // ovlVisualTranslateBlockText 里的 zh 覆盖比例闸（ovlVisualCjkRatio）、
-    // ovlVisualTranslateBlockRaw 里的引用编号多重集校验 / 数学命令代码多重集校验。
-    'low-cjk': '模型返回的内容里中文占比过低（可能是复述改写、答非所问，或只翻了一小部分），判定为未翻译成功。点击重试（会换一套指令重问）。',
+    // v2 Pass P128（C2/L-raw）→ P128b（N-3 改比例闸、B-1 新增 raw-integrity）→ P128d（B2-1/
+    // B2-2 收口，改源相对闸）：判定依据见 ovlVisualCjkGateEval——主路径/L-raw/缓存读侧
+    // （R-3）共用同一个函数。
+    'low-cjk': '模型返回的内容里中文字符相对原文可译内容的比例过低（可能是复述改写、答非所问，或只翻了一小部分），判定为未翻译成功。点击重试（会换一套指令重问）。',
+    'no-cjk': '模型返回的内容里一个中文字都没有（可能只剩下引用/占位符残留、或者是纯标点数字），判定为未翻译成功。点击重试（会换一套指令重问）。',
     'cite-mismatch': '兜底翻译（不使用哨兵）里模型把引用编号翻错、漏掉或多写了。点击重试。',
     // v2 Pass P128b（B-1 阻断收口）：raw 兜底路径没有哨兵可校验占位符，改事后比对数学公式/
     // \ref\cite\label 等命令/代码片段是否被模型吞掉或改动——命中就判失败，不静默落地。
