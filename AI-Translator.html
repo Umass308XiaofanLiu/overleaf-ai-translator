@@ -2057,6 +2057,28 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
     font-size: 10px; line-height: 1.3; padding: 1px 5px; border-radius: 3px;
     background: #eef2ff; color: #6366f1; border: 1px solid #e0e7ff; pointer-events: none;
 }
+/* v2 Pass P128e（B3-1 阻断收口）：分块阶段判定"无可译文本"——跟 skipped 视觉上同一档
+   （低调、不刺眼），但这条状态额外带一个可点的"强制翻译"角标（.ovl-visual-noprose-badge，
+   跟失败角标同一套交互手法：委托绑定在 #ovlVisualPane 上，点击触发真正的翻译尝试）。 */
+.ovl-visual-block[data-ovl-trans-noprose="1"] { position: relative; }
+.ovl-visual-noprose-badge {
+    position: absolute; top: 2px; right: 2px; z-index: 3;
+    font-size: 10px; line-height: 1.3; padding: 1px 6px; border-radius: 3px;
+    background: #f3f4f6; color: #6b7280; border: 1px solid #e5e7eb;
+    cursor: pointer; user-select: none;
+}
+.ovl-visual-noprose-badge:hover { background: #e5e7eb; }
+.ovl-visual-noprose-badge--busy { opacity: 0.65; pointer-events: none; }
+/* v2 Pass P128e（漏译侧，non-blocking）：'short' partial 专属角标——独立于失败角标
+   （.ovl-visual-retry-badge），语义是"块已经成功落地，只是可能漏译，用户自己判断"，配一个
+   中性/提示色（蓝灰），不用失败角标的警示黄，避免和真失败混淆。 */
+.ovl-visual-short-badge {
+    position: absolute; top: 2px; right: 2px; z-index: 3;
+    font-size: 10px; line-height: 1.3; padding: 1px 6px; border-radius: 3px;
+    background: #eef2ff; color: #4338ca; border: 1px solid #c7d2fe;
+    cursor: pointer; user-select: none;
+}
+.ovl-visual-short-badge:hover { background: #e0e7ff; }
 /* v2 Pass P128b（N-1 收口）：正在飞行中的块（worker 已发出请求、还没落地）以前跟 pending/
    skipped 一样零覆盖——像素级看不出区别于"漏标记的英文"。跟上面两条同一套坐标系/零占位
    手法，只是文案换成"翻译中…"。这个属性是运行时态（worker 发请求前打、落地或 abort 后摘），
@@ -4336,7 +4358,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.10.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.10.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -30175,7 +30197,13 @@ function ovlVisualLoadFigureThumbnails(root) {
 // pending，角标/fail-reason/attempts 全部消失。P122 方案书 C6 白纸黑字写了这个字段，实现时
 // 漏掉了——见 ovlVisualFailLogSet/Get/Delete（约 30005 行附近）与 ovlVisualRenderBlockContent
 // 的回填分支。
-const OvlVisualLangState = { lang: 'original', seq: 0, controller: null, running: false, total: 0, done: 0, adhocControllers: [], failLog: new Map() };
+// v2 Pass P128e（结构性防活锁护栏，任务书第 2 条）：auditRequeueCount——每块（同一个
+// ovlVisualTransCacheKey）被 ovlVisualLangIdleAudit 打回 pending 重入队的次数，跟 failLog
+// 同一条纪律：只在内存里计数、不落 localStorage、刷新页面即清零（这本来就是"这次会话里
+// 已经被自检重入队过几次"，不是需要跨会话持久化的用户数据）。auditRateWindow——全局速率
+// 窗口（{start, count}），用来限制"一次 idle 触发最多把多少块打回 pending"，防止一次性
+// 打开一篇病态文档时把成百上千个块同时踢回队列、瞬间打满并发。见 ovlVisualLangIdleAudit。
+const OvlVisualLangState = { lang: 'original', seq: 0, controller: null, running: false, total: 0, done: 0, adhocControllers: [], failLog: new Map(), auditRequeueCount: new Map(), auditRateWindow: null };
 
 // ---- 缓存：源码块哈希 + 语言 + provider/model -> 译文 ----
 // 32 位 FNV-1a 起手 + 一个简单的第二哈希叠加，纯粹是为了在字符串很短时也不至于经常撞
@@ -30972,10 +31000,16 @@ function ovlVisualCjkRatioProse(s) {
     t = t.replace(/(?:https?:\/\/|www\.)\S+/gi, ' ');
     // 专有名词大写缩写：连续 2+ 个大写字母开头（可带数字/连字符/一个复数小写 s），比如
     // MIMO-OFDM、GNN、IEEE、LISLs——学术译文里合法保留、不该被当"没翻译的英文"计入分母。
-    // 注：首字母大写但非全大写的专有名词（Starlink/OneWeb/CelesTrak）这条正则排不掉——
-    // B2-2 根因②，源相对判据不靠这条正则去豁免它们，靠"这本来就是源文里的专有名词、不计入
-    // srcWords 之外的"（下面 ovlVisualGateSrcWords 只数从源文剥出来的词，源文里的专有名词
-    // 词形跟译文里原样保留的词形一致，天然不会被两头重复计较）。
+    // 注（v2 Pass P128e 更正，核验 .claude/tmp/p128_verify3.md N3-1）：首字母大写但非全大写
+    // 的专有名词（Starlink/OneWeb/CelesTrak）这条正则排不掉，实测 ovlVisualGateSrcWords 会
+    // 把它们**照样计入 srcWords**（抬高分母、让闸更严）——上一版这里写的"源文里的专有名词
+    // 词形跟译文里原样保留的词形一致，天然不会被两头重复计较"这句话描述的"对称抵消"机制
+    // 并不存在：这里只算源侧一次，压根没有"两头"可言。B2-2（专有名词密集的合法译文不再被
+    // 误杀）真正成立的原因是**译文侧**的统计口径从"数剩余拉丁字符占比"整个换成了"数中文
+    // 字符"——专有名词在译文里原样保留只是不再被当"没翻译"从译文侧扣分，跟它算不算进源侧
+    // 分母无关；K=0.25 的取值本身已经把"专有名词计入分母"这件事算进了校准样本（见
+    // .claude/tmp/p128_impl.md「P128d 收口」§13.1 表格，legit 样本 srcWords 均含专有名词），
+    // 不需要也不应该改判据本身，这里只改注释，把描述订正成跟实测一致。
     t = t.replace(/\b[A-Z]{2,}[A-Z0-9-]*'?s?\b/g, ' ');
     return t;
 }
@@ -30996,25 +31030,74 @@ function ovlVisualGateZhChars(s) {
 // K 的取数依据、真实/拟真译文 zhChars/srcWords 分布最低 10 条（含两条曾经被 B2-2 误杀的
 // 合法样本重算后的真实值）见 .claude/tmp/p128_impl.md「P128d 收口」节。
 const OVL_VISUAL_CJK_GATE_K = 0.25;
+// v2 Pass P128e（漏译侧，non-blocking，任务书第 4 条）：K 只抓"完全没翻/基本没翻"（施工报告
+// 与 .claude/tmp/p128_verify3.md §4 都确认合法样本下界 0.500~0.556 vs K=0.25 有约 2 倍安全
+// 边际，不建议再调），但抓不住"翻了大半、漏了小半"——真实/拟真成功译文 zhChars/srcWords 实测
+// 集中在 1.2~2.1（见 .claude/tmp/p128_impl.md「P128e 收口」节最低 10 条分布），比 K 大数倍。
+// 另立一条**漏译侧**判据，不跟 K 共用同一个阈值、也不判失败（只标 partial，见
+// ovlVisualTranslateBlockText 里的用法）：源词数达到一定规模才判（太短的块统计噪声太大，
+// 短句/短语正常也会出现 ratio 明显低于 1 的合法译文），且下限比 K 松得多（0.6 远低于真实
+// 分布的下界 1.2），只用来抓"漏了一大截"这种量级的失误。
+const OVL_VISUAL_UNDERTRANS_K = 0.6;
+const OVL_VISUAL_UNDERTRANS_MIN_SRC_WORDS = 15;
 // 缓存条目"是否已经过当前版本这道闸校验"的版本号——每收紧/放松一次判据就 +1；旧缓存条目
 // （字段缺失，或版本号对不上）在下次读取时会被 ovlVisualTransCacheGetMeta 重新过一遍闸
-// （v2 Pass P128d，R-3 收口，见该函数头部注释）。
-const OVL_VISUAL_CJK_GATE_VERSION = 1;
+// （v2 Pass P128d，R-3 收口，见该函数头部注释）。v2 Pass P128e：2→本 Pass 收紧了
+// srcWords===0 分支的判据（见下），版本号必须跟着涨，否则旧版本"srcWords===0 即无条件放行"
+// 时代盖章过的缓存条目（可能正是 B3-1 那类占位符抄回+英文正文）会被读侧当"已验证过"永久
+// 免检，B3-1 在读侧留下同一个洞。
+const OVL_VISUAL_CJK_GATE_VERSION = 2;
 // 统一判据入口——src/rawTgt 都传"裸文本"（不带本模块占位符的最终形态，可以含原始 LaTeX）：
 //   · 主路径写入侧：src 是原始未掩码源文，rawTgt 是完整解遮罩之后的最终译文；
 //   · L-raw 写入侧：src/body 本来就是裸 LaTeX，原样传；
 //   · 缓存读侧（R-3）：src 是查询用的原始源文，rawTgt 是缓存里存的最终译文——
 //   三处口径统一成同一份实现，不写三份判据、不因为“这条译文是哪条路径译出的”而分叉逻辑。
+// v2 Pass P128e（B3-1 阻断收口，核验 .claude/tmp/p128_verify3.md §1）：srcWords===0 这条
+// 豁免以前是"不判定，交给上下文已有的多重集/占位符完整性校验"——实测证伪：那些校验只管
+// "受保护片段有没有被改动"，对"占位符一个不少、正文全是英文"这种回复全部平凡通过，源文本
+// 身没有可译散文的块（\hfill $\square$ 这类，真实语料 3/550）在写入侧彻底不设防，模型只要
+// 把占位符原样抄回、正文写一段英文，就零标记落地，紧接着被 ovlVisualLangIdleAudit 打回
+// pending 重新排队，形成无上限的重译活锁（详见 verify3.md §1，230 次/2.5s）。根治：不再是
+// "不判定"，而是要求译文剥完受保护片段后**同样**没有拉丁散文——源文没有可译内容，译文也不
+// 该凭空长出一段英文正文（跟源侧用的是完全同一把尺子 ovlVisualGateSrcWords，对称、不需要
+// 新写一套判据）；模型如果往这类块里翻出了合理的中文说明（比如源文本来就是纯符号但模型
+// 顺手加了个中文括注）不受影响——这道闸只挡"英文"，不挡"多余的中文"。
 function ovlVisualCjkGateEval(src, rawTgt) {
     const srcMasked = xportMask(ovlVisualCodeMask(String(src == null ? '' : src)).text).text;
     const tgtMasked = xportMask(ovlVisualCodeMask(String(rawTgt == null ? '' : rawTgt)).text).text;
     const srcWords = ovlVisualGateSrcWords(srcMasked);
     const zhChars = ovlVisualGateZhChars(tgtMasked);
-    if (srcWords === 0) return { ok: true, reason: null, srcWords: srcWords, zhChars: zhChars, need: 0 };
+    if (srcWords === 0) {
+        const tgtWords = ovlVisualGateSrcWords(tgtMasked);
+        if (tgtWords > 0) {
+            return { ok: false, reason: 'english-body', srcWords: 0, zhChars: zhChars, need: 0, tgtWords: tgtWords };
+        }
+        return { ok: true, reason: null, srcWords: 0, zhChars: zhChars, need: 0 };
+    }
     const need = Math.max(1, Math.ceil(OVL_VISUAL_CJK_GATE_K * srcWords));
     if (zhChars === 0) return { ok: false, reason: 'no-cjk', srcWords: srcWords, zhChars: zhChars, need: need };
     if (zhChars < need) return { ok: false, reason: 'low-cjk', srcWords: srcWords, zhChars: zhChars, need: need };
     return { ok: true, reason: null, srcWords: srcWords, zhChars: zhChars, need: need };
+}
+// v2 Pass P128e（B3-1，任务书第 1 条"分块/入队阶段判定"无可译散文""）：判定"这一块从源头
+// 就没有任何可译散文"——用跟写入侧闸完全同一把尺子（上面 ovlVisualCjkGateEval 的
+// srcWords===0 分支），额外排除掉块里有 \text{}/\textrm{}/\mbox{} 散文的情形：这类散文虽然
+// 在源相对闸眼里因为整个 $...$ 被 xportMask 当一个不透明 token 一次性收走而"看不见"（gate
+// 的 srcMasked 直接对裸源文过 codeMask+xportMask，不会先跑 ovlVisualTextProseExtract），
+// 但确实存在、确实要走 ovlVisualTranslateTextProseFragment 单独翻译，不能被这条早退跳过
+// 而根本不入队——不然这块内容永远不会被翻译。纯函数、零网络调用，可以放心在渲染/分块阶段
+// 同步调用。
+function ovlVisualBlockNoProse(text) {
+    const src = String(text == null ? '' : text);
+    if (!src.trim()) return true;
+    try {
+        const codeMasked = ovlVisualCodeMask(src);
+        const textProseMasked = (typeof ovlVisualTextProseExtract === 'function') ? ovlVisualTextProseExtract(codeMasked.text) : { items: [] };
+        if (textProseMasked.items && textProseMasked.items.length) return false;
+    } catch (e) { return false; } // 抽取失败：保守当"有散文"处理，走正常队列，不要误跳过
+    try {
+        return ovlVisualCjkGateEval(src, '').srcWords === 0;
+    } catch (e) { return false; }
 }
 // 规范化：去空白 + 去掉所有标点/符号装饰，只保留跨语言都有意义的"字"（字母/数字）。
 function ovlVisualNormalizeProse(s) {
@@ -31082,6 +31165,10 @@ function ovlVisualTransFailReason(err, meta) {
     // v2 Pass P122b（B2）：ovlVisualCiteCheck 抛出的错误固定含"引用编号哨兵"，判定依据仍然
     // 只用已经存在的信号（throw 出来的 message 固定文案），跟上面 code-sentinel 同一条纪律。
     if (/引用编号哨兵/.test(msg)) return 'cite-sentinel';
+    // v2 Pass P128e（B3-1 阻断收口）：源文本身没有可译散文（srcWords===0，纯公式/代码/引用/
+    // \hfill 这类），但译文剥完受保护片段后仍残留英文正文——独立分类，跟下面只在
+    // srcWords>0 时才成立的 no-cjk/low-cjk 区分开（这两条消息互斥不重叠）。
+    if (/不该有的英文正文/.test(msg)) return 'english-body';
     // v2 Pass P128（C2，硬闸）→ P128b（N-3 收口，改比例闸）→ P128d（B2-1/B2-2 收口，改源相对
     // 闸）："成功但基本没有中文"——占位符/哨兵完整性校验全部通过，但译出的中文字符数相对
     // 源文可译散文量不够，说明模型压根没做翻译这件事本身（改写/续写/答非所问，或者只在大段
@@ -31206,7 +31293,24 @@ async function ovlVisualTranslateTextProseFragment(prose, config, signal, outMet
     if (!body) { if (outMeta) outMeta.failed = true; return src; }
     if (ovlVisualIsEchoFailure(masked.text, body)) { if (outMeta) outMeta.failed = true; return src; }
     if (!xportBlockOk(body, masked.map)) { if (outMeta) outMeta.failed = true; return src; }
-    return xportUnmask(body, masked.map);
+    const result = xportUnmask(body, masked.map);
+    // v2 Pass P128e（R-5 阻断收口，任务书第 3 条）：占位符/回显守卫全过了，不代表模型真的
+    // 翻译成了中文——回显守卫比的是"跟原文像不像"，模型把英文原文换成**另一段不同的英文**
+    // （复述/改写/续写）时两者明显不同，回显守卫认不出来；占位符完整性校验管的是"哨兵有没有
+    // 被动过"，跟正文是不是中文毫无关系。以前这里没有任何语言判据，片段译成英文会被当"翻译
+    // 成功"直接返回，块整体因此看起来"成功"、零标记，被 ovlVisualLangIdleAudit 打回 pending
+    // 无限重译（.claude/tmp/p128_verify3.md §12 R-5，224 次调用实测活锁，跟主路径 B3-1 是
+    // 同一类问题的另一扇门）。补上跟主路径/L-raw 完全同一把尺子（ovlVisualCjkGateEval，片段
+    // 自己的源文本 src 天然支持"该有多少中文"这条判据——片段通常很短，源相对闸的
+    // srcWords===0 豁免对"纯符号短语"同样成立，不会误杀）：不过闸就当失败处理，跟上面四条
+    // 真失败路径完全同一条纪律——outMeta.failed=true、返回原文，调用方据此把整块标
+    // partial（partial-reason=text-prose，P122b 已有机制），不重试、不无上限——这个片段这次
+    // 就到此为止，下一次真正触发翻译（比如整篇重渲染后重新入队/用户手动重试）才会再问一次，
+    // 不会被自检的"无标记"误判卷入循环（partial 块本来就在 ovlVisualAuditUnmarkedEnglish 的
+    // 排除名单里）。
+    const gate = (typeof ovlVisualCjkGateEval === 'function') ? ovlVisualCjkGateEval(src, result) : { ok: true };
+    if (!gate.ok) { if (outMeta) outMeta.failed = true; return src; }
+    return result;
 }
 
 // ---- 单块翻译：代码层掩码 -> 公式/引用层掩码 -> 调模型 -> 两层各自校验 -> 两层各自还原 ----
@@ -31483,9 +31587,23 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
     // 管块级整体，两层保护互不重叠、互不冲突。
     const gate = ovlVisualCjkGateEval(src, afterCodeUnmask);
     if (!gate.ok) {
-        throw new Error(gate.reason === 'no-cjk'
-            ? '翻译结果零中文（源文有可译散文，但译文剥完受保护片段后一个汉字都没有）'
-            : '翻译结果里中文占比过低（模型基本未翻译）');
+        // v2 Pass P128e（B3-1 阻断收口）：新增 english-body——源文本身没有可译散文
+        // （srcWords===0），但译文剥完受保护片段后仍残留英文正文（模型把占位符原样抄回、
+        // 正文自己写了一段英文），三层完整性校验管不到这种情形，专门独立分类，不落进
+        // no-cjk/low-cjk 那两条只在 srcWords>0 时才成立的消息里。
+        throw new Error(gate.reason === 'english-body'
+            ? '翻译结果里残留了不该有的英文正文（源文本身没有可译散文，但译文剥完受保护片段后仍有英文单词）'
+            : gate.reason === 'no-cjk'
+                ? '翻译结果零中文（源文有可译散文，但译文剥完受保护片段后一个汉字都没有）'
+                : '翻译结果里中文占比过低（模型基本未翻译）');
+    }
+    // v2 Pass P128e（漏译侧，non-blocking，任务书第 4 条）：闸只抓"基本没翻"，这里补一条
+    // 不阻断的"可能漏了一部分"提示——已经存在的 meta.partial 优先级更高（text-prose 片段
+    // 失败已经明确指出"哪部分没翻"，比这条统计性的粗略信号更准确），不覆盖。
+    if (meta && !meta.partial && gate.srcWords >= OVL_VISUAL_UNDERTRANS_MIN_SRC_WORDS
+        && gate.zhChars < OVL_VISUAL_UNDERTRANS_K * gate.srcWords) {
+        meta.partial = true;
+        meta.partialReason = 'short';
     }
     return afterCodeUnmask;
 }
@@ -31535,6 +31653,21 @@ function ovlVisualLadderCorrectionText(reason) {
             + '别的数字、漏掉了原文里本来存在的某一个、或者把同一个哨兵重复写了两遍。这次必须让原文里出现'
             + '过的每一个 〘〘OVLCITE数字〙〙 哨兵原样一字不改地在译文里出现恰好一次：不得改动方括号里的'
             + '数字、不得凭空新增一个原文没有的编号、不得删除、不得重复。';
+    }
+    // v2 Pass P128e（N3-2 收口，核验 .claude/tmp/p128_verify3.md non-blocking N3-2）：
+    // no-cjk/low-cjk/english-body 以前没有专属纠正段，落到最后一句通用兜底——"上一次一个
+    // 中文字都没翻/基本没翻/凭空多出一段英文"是这条闸专门要抓的头号失败模式，换 prompt 重问
+    // 却拿不到对症提示，成功率因此打折。三条原因共用同一条核心诉求（必须输出中文译文、
+    // 保留占位符），各自再补一句说明具体差在哪，帮模型定位问题。
+    if (reason === 'no-cjk' || reason === 'low-cjk' || reason === 'english-body') {
+        const detail = reason === 'no-cjk'
+            ? '上一次你的回复里一个中文字都没有（可能只留下了占位符或标点数字）。'
+            : reason === 'low-cjk'
+                ? '上一次你的回复里中文字符相对原文可译内容的比例过低（可能是复述改写、答非所问，或者只翻了一小部分）。'
+                : '上一次你的回复本来不该有正文——原文这部分没有需要翻译的自然语言，但你的回复里却凭空多出了一段英文正文。';
+        return detail + '这次必须输出中文译文，保留占位符：把原文里所有的自然语言部分都翻译成通顺准确的简体中文，'
+            + '同时让 [[数字]]、〔〔OVLCODE数字〕〕、〘〘OVLCITE数字〙〙 这几类占位符原样一字不改地保留在译文里，'
+            + '不要额外添加任何原文没有要求你写的英文正文。';
     }
     return '上一次的回复没有通过校验，请重新按照上面的规则认真翻译一遍，不要改动任何占位符，也不要照抄原文。';
 }
@@ -31605,9 +31738,18 @@ async function ovlVisualTranslateBlockRaw(text, cfg, signal, meta) {
     // 该翻译的那部分到底翻没翻"，两类失败分类互不吸收。
     const gate = ovlVisualCjkGateEval(src, body);
     if (!gate.ok) {
-        throw new Error(gate.reason === 'no-cjk'
-            ? '翻译结果零中文（源文有可译散文，但译文剥完受保护片段后一个汉字都没有）'
-            : '翻译结果里中文占比过低（模型基本未翻译）');
+        // v2 Pass P128e（B3-1 阻断收口）：跟主路径同一条纪律，新增 english-body 分类。
+        throw new Error(gate.reason === 'english-body'
+            ? '翻译结果里残留了不该有的英文正文（源文本身没有可译散文，但译文剥完受保护片段后仍有英文单词）'
+            : gate.reason === 'no-cjk'
+                ? '翻译结果零中文（源文有可译散文，但译文剥完受保护片段后一个汉字都没有）'
+                : '翻译结果里中文占比过低（模型基本未翻译）');
+    }
+    // v2 Pass P128e（漏译侧，non-blocking）：跟主路径同一条纪律，见该函数末尾同名注释。
+    if (meta && !meta.partial && gate.srcWords >= OVL_VISUAL_UNDERTRANS_MIN_SRC_WORDS
+        && gate.zhChars < OVL_VISUAL_UNDERTRANS_K * gate.srcWords) {
+        meta.partial = true;
+        meta.partialReason = 'short';
     }
     return body;
 }
@@ -32146,9 +32288,9 @@ function ovlVisualRenderBlockContent(text) {
     // ovlVisualLangSyncAfterRender 从翻译分母里扣掉。跟 P128 的 failed/ladderLevel 字段
     // 合流（P128c）：这条短路路径永远不失败、永远不经阶梯，两个字段固定给中性值。
     if (OvlVisualLangState.lang === 'zh' && OVL_VISUAL_BIB_BLOCK_RE.test(text)) {
-        return { html: ovlVisualRenderChunk(text), pending: false, skipped: false, forced: false, partial: false, partialReason: null, failed: false, ladderLevel: null, notrans: true };
+        return { html: ovlVisualRenderChunk(text), pending: false, skipped: false, forced: false, partial: false, partialReason: null, failed: false, ladderLevel: null, notrans: true, noprose: false };
     }
-    if (OvlVisualLangState.lang !== 'zh') return { html: ovlVisualRenderChunk(text), pending: false, skipped: false, forced: false, partial: false, partialReason: null, failed: false, ladderLevel: null, notrans: false };
+    if (OvlVisualLangState.lang !== 'zh') return { html: ovlVisualRenderChunk(text), pending: false, skipped: false, forced: false, partial: false, partialReason: null, failed: false, ladderLevel: null, notrans: false, noprose: false };
     try {
         const cfg = (typeof getApiConfig === 'function') ? getApiConfig() : null;
         const meta = cfg ? ovlVisualTransCacheGetMeta(text, cfg) : null;
@@ -32160,7 +32302,7 @@ function ovlVisualRenderBlockContent(text) {
         // （见下方 ovlVisualLadderAttrHtml），不再是重渲染一次就看不出这条译文是不是走 raw。
         // v2 Pass P128c（合流）：notrans:false——非 bib 缓存命中路径，字段跟上面短路分支同一
         // 形状，供 ovlVisualRenderBodyWithLines 无条件读取而不用先判 undefined。
-        if (meta != null) return { html: ovlVisualRenderChunk(meta.tgt), pending: false, skipped: !!meta.skipped, forced: !!meta.forced, partial: !!meta.partial, partialReason: meta.partialReason || null, failed: false, ladderLevel: meta.ladderLevel || null, notrans: false };
+        if (meta != null) return { html: ovlVisualRenderChunk(meta.tgt), pending: false, skipped: !!meta.skipped, forced: !!meta.forced, partial: !!meta.partial, partialReason: meta.partialReason || null, failed: false, ladderLevel: meta.ladderLevel || null, notrans: false, noprose: false };
     } catch (e) {}
     // v2 Pass P128（C1，M1 根治）：缓存未命中不再直接判定成"毫无标记的待翻译"——失败块按
     // 纪律不入缓存（P122 C6），以前这里无条件回退成 pending，任何一次整篇重渲染都会把此前
@@ -32184,11 +32326,30 @@ function ovlVisualRenderBlockContent(text) {
                 // 已用真实测试逮到（P128 state-visible T3 根治断言曾经稳定失败在这一点）。
                 failed: true, reason: info.reason, attempts: info.attempts,
                 detail: info.detail, echoCandidate: info.echoCandidate, ladderLevel: null,
-                notrans: false // v2 Pass P128c（合流）：failLog 回放路径同样不是 bib 块
+                notrans: false, // v2 Pass P128c（合流）：failLog 回放路径同样不是 bib 块
+                noprose: false
             };
         }
     } catch (e) {}
-    return { html: ovlVisualRenderChunk(text), pending: true, skipped: false, forced: false, partial: false, partialReason: null, failed: false, ladderLevel: null, notrans: false };
+    // v2 Pass P128e（B3-1 阻断收口，任务书第 1 条）：缓存未命中、failLog 也未命中——以前
+    // 无条件退化成 pending，排进翻译队列；对"源文本身根本没有可译散文"的块（纯公式/代码/
+    // 引用/\hfill 这类，真实语料 550 块里有 79 块，其中 14 块因为结构上不是彻底的
+    // ovlVisualNothingToTranslate 而会真的被送去模型面前，见 ovlVisualBlockNoProse 头部
+    // 注释）这样做既浪费一次模型调用，又是 B3-1 活锁的入口——模型只要把占位符原样抄回、
+    // 正文自己写一段英文，旧版三层完整性校验全部平凡通过，零标记落地。改成分块阶段直接
+    // 判定"无可译文本"：不排队、不发请求、不计翻译分母（ovlVisualLangSyncAfterRender 的
+    // total 选择器需要一并排除，见该函数）、自检（ovlVisualAuditUnmarkedEnglish）也直接
+    // 排除（块内容就是原文，天然没有中文，不能被当"无标记英文块"抓）。用户如果不认同这个
+    // 判断（比如块里其实藏着需要翻译的内容，判据毕竟是启发式的），可以点块上的"无可译文本"
+    // 标签强制走一遍真正的翻译流程（ovlVisualBlockForceTranslateClick）——那条路复用跟
+    // 队列 worker 完全相同的 ovlVisualTranslateBlockWithLadder，如果模型真的吐出不该有的
+    // 英文正文，会被上面新增的 english-body 判据挡下、给出可见失败角标，不会静默循环。
+    try {
+        if (typeof ovlVisualBlockNoProse === 'function' && ovlVisualBlockNoProse(text)) {
+            return { html: ovlVisualRenderChunk(text), pending: false, skipped: false, forced: false, partial: false, partialReason: null, failed: false, ladderLevel: null, notrans: false, noprose: true };
+        }
+    } catch (e) {}
+    return { html: ovlVisualRenderChunk(text), pending: true, skipped: false, forced: false, partial: false, partialReason: null, failed: false, ladderLevel: null, notrans: false, noprose: false };
 }
 
 // ==================== v2 Pass P116：Visual 章节 IEEE 编号 ====================
@@ -32300,6 +32461,7 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
             html += '<div class="ovl-visual-block" data-src-line="' + b.line + '" data-src-line-end="' + blockLineEnd
                 + '" data-para-start="1"' + numAttrHtml + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
                 + (rc.skipped ? ' data-ovl-trans-skipped="1" title="' + escapeAttr(OVL_VISUAL_SKIPPED_TITLE) + '"' : '') + (rc.forced ? ' data-ovl-trans-forced="1"' : '')
+                + (rc.noprose ? ' data-ovl-trans-noprose="1" title="' + escapeAttr(OVL_VISUAL_NOPROSE_TITLE) + '"' : '') // v2 Pass P128e（B3-1）：分块阶段判定"无可译文本"，不入队、不计分母
                 + (rc.partial ? ovlVisualPartialAttrHtml(rc.partialReason) : '') // v2 Pass P122c（BV2-2）：缓存命中回填 partial
                 + (rc.failed ? ovlVisualFailAttrHtml(rc) : '') // v2 Pass P128（C1）：failLog 回填的失败状态
                 + ovlVisualLadderAttrHtml(rc.ladderLevel) // v2 Pass P128b（N-4）：缓存命中回填"经兜底档译出"标记
@@ -32313,6 +32475,7 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
             html += '<div class="ovl-visual-block" data-src-line="' + sb.line + '" data-src-line-end="' + sb.lineEnd
                 + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '"' + (j === 0 ? numAttrHtml : '') + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
                 + (rc.skipped ? ' data-ovl-trans-skipped="1" title="' + escapeAttr(OVL_VISUAL_SKIPPED_TITLE) + '"' : '') + (rc.forced ? ' data-ovl-trans-forced="1"' : '')
+                + (rc.noprose ? ' data-ovl-trans-noprose="1" title="' + escapeAttr(OVL_VISUAL_NOPROSE_TITLE) + '"' : '') // v2 Pass P128e（B3-1）：分块阶段判定"无可译文本"，不入队、不计分母
                 + (rc.partial ? ovlVisualPartialAttrHtml(rc.partialReason) : '') // v2 Pass P122c（BV2-2）：缓存命中回填 partial
                 + (rc.failed ? ovlVisualFailAttrHtml(rc) : '') // v2 Pass P128（C1）：failLog 回填的失败状态
                 + ovlVisualLadderAttrHtml(rc.ladderLevel) // v2 Pass P128b（N-4）：缓存命中回填"经兜底档译出"标记
@@ -32355,6 +32518,11 @@ function ovlVisualAuditUnmarkedEnglish(pane) {
             // 排除缺失导致，不是环境抖动。
             if (el.hasAttribute('data-ovl-trans-partial')) return;
             if (el.hasAttribute('data-ovl-trans-notrans')) return; // v2 Pass P129 预留
+            // v2 Pass P128e（B3-1）：分块阶段判定"无可译文本"的块内容就是原始英文源码，
+            // 天然会命中下面的 hasEnglishRun&&!hasCjk——这不是"漏标记的英文"，是本来就没有
+            // 被送去翻译过、明确标了 noprose 的原文，排除掉，不然一渲染就会被自检误判成
+            // "无标记英文块"、打回 pending 重新排队，等于绕开了这条早退本身要防的活锁。
+            if (el.getAttribute('data-ovl-trans-noprose') === '1') return;
             // v2 Pass P128b（N-1 收口，核验 .claude/tmp/p128_verify.md N-1）：漏了这一条排除——
             // worker 发请求前先摘掉 data-ovl-trans-pending 再打 data-ovl-trans-inflight（下面
             // ovlVisualLangRunQueue 里），正在飞行中的块因此"既不是 pending 也没有任何可见
@@ -32391,10 +32559,44 @@ function ovlVisualAuditUnmarkedEnglish(pane) {
     } catch (e) {}
     return out;
 }
+// v2 Pass P128e（结构性防活锁护栏，任务书第 2 条）：每块每会话最多允许被自检重入队
+// OVL_VISUAL_AUDIT_REQUEUE_LIMIT 次——第 1/2 次命中正常打回 pending 重译，第 3 次命中（前
+// 两次重译回来仍然是"无标记英文"）判定这是一个真正的循环，不再继续喂给队列，改标 failed
+// （audit-loop）给出可见角标，交给用户手动判断/重试。计数存在 OvlVisualLangState 内存里，
+// key 跟 failLog 同一套算法（ovlVisualTransCacheKey），刷新页面清零——这是"这次会话见过
+// 几次"，不需要跨会话持久化。
+const OVL_VISUAL_AUDIT_REQUEUE_LIMIT = 2;
+function ovlVisualAuditRequeueCount(text, config) {
+    try {
+        const key = ovlVisualTransCacheKey(text, config);
+        return OvlVisualLangState.auditRequeueCount.get(key) || 0;
+    } catch (e) { return 0; }
+}
+function ovlVisualAuditRequeueBump(text, config) {
+    try {
+        const key = ovlVisualTransCacheKey(text, config);
+        const n = (OvlVisualLangState.auditRequeueCount.get(key) || 0) + 1;
+        OvlVisualLangState.auditRequeueCount.set(key, n);
+        // 跟 failLog 同一条淘汰纪律（防病态文档吃内存），复用同一个上限常量，不新开一个。
+        if (OvlVisualLangState.auditRequeueCount.size > OVL_VISUAL_FAILLOG_MAX) {
+            const firstKey = OvlVisualLangState.auditRequeueCount.keys().next().value;
+            if (firstKey !== undefined) OvlVisualLangState.auditRequeueCount.delete(firstKey);
+        }
+        return n;
+    } catch (e) { return 0; }
+}
+// v2 Pass P128e（结构性防活锁护栏）：全局自检重入队速率上限——一次 idle 触发最多把
+// OVL_VISUAL_AUDIT_RATE_LIMIT 个块打回 pending（不是"每分钟"这个窗口内的全局请求数，是
+// "被自检本身重新踢回队列"这个动作的速率，翻译过程中正常产生的 pending 不受影响）。命中
+// 上限的那些块这一轮先不动（既不打 pending 也不判 failed），留到下一次 idle 触发（队列跑完
+// 一批/pending 清零）时按当时的窗口重新评估——天然节流，不需要额外的定时器/去抖。
+const OVL_VISUAL_AUDIT_RATE_LIMIT = 10;
+const OVL_VISUAL_AUDIT_RATE_WINDOW_MS = 60000;
 // 运行时自愈：队列空闲（不再有 worker 在跑）之后跑一次自检——理论上不应该有命中（failLog/
-// pending/skipped/forced 四条纪律叠加之后不应再有漏网的块），但"理论上不应该"不等于"永远
-// 不会"（比如未来新增的渲染路径忘了打标记）。命中就地补救：打回 pending 让队列重新翻一遍，
-// 并 console.warn 留痕，不静默吞掉。
+// pending/skipped/forced/noprose 五条纪律叠加之后不应再有漏网的块），但"理论上不应该"不等
+// 于"永远不会"（比如未来新增的渲染路径忘了打标记）。命中就地补救：打回 pending 让队列重新
+// 翻一遍，并 console.warn 留痕，不静默吞掉——但补救本身也要设上限，否则"补救"两个字就是
+// P128 verify3.md §1 那种无上限重译活锁的另一个名字。
 function ovlVisualLangIdleAudit() {
     try {
         if (OvlVisualLangState.lang !== 'zh' || OvlVisualLangState.running) return;
@@ -32402,9 +32604,51 @@ function ovlVisualLangIdleAudit() {
         if (!pane) return;
         const hits = ovlVisualAuditUnmarkedEnglish(pane);
         if (!hits.length) return;
-        console.warn('[ovl] ovlVisualLangIdleAudit：发现 ' + hits.length + ' 个无标记英文块（不应出现，已自动补回待翻队列）',
-            hits.map(function (h) { return { line: h.line, snippet: h.snippet }; }));
-        hits.forEach(function (h) { try { h.el.setAttribute('data-ovl-trans-pending', '1'); } catch (e) {} });
+        const now = Date.now();
+        const state = OvlVisualLangState;
+        if (!state.auditRateWindow || now - state.auditRateWindow.start >= OVL_VISUAL_AUDIT_RATE_WINDOW_MS) {
+            state.auditRateWindow = { start: now, count: 0 };
+        }
+        let cfg = null;
+        try { cfg = getApiConfig(); } catch (e) { cfg = null; }
+        const toRequeue = [], toFail = [];
+        hits.forEach(function (h) {
+            let srcText = null;
+            try { srcText = ovlVisualBlockSrcText(h.el); } catch (e) { srcText = null; }
+            const n = (srcText && cfg) ? ovlVisualAuditRequeueCount(srcText, cfg) : 0;
+            if (n >= OVL_VISUAL_AUDIT_REQUEUE_LIMIT) { toFail.push(h); return; }
+            if (state.auditRateWindow.count >= OVL_VISUAL_AUDIT_RATE_LIMIT) return; // 这一轮先不动，下次再评估
+            state.auditRateWindow.count++;
+            if (srcText && cfg) ovlVisualAuditRequeueBump(srcText, cfg);
+            toRequeue.push(h);
+        });
+        if (toFail.length) {
+            console.warn('[ovl] ovlVisualLangIdleAudit：' + toFail.length + ' 个块自检重入队已达上限（'
+                + OVL_VISUAL_AUDIT_REQUEUE_LIMIT + ' 次），停止自动重译、改标失败',
+                toFail.map(function (h) { return { line: h.line, snippet: h.snippet }; }));
+            toFail.forEach(function (h) {
+                try {
+                    const el = h.el;
+                    el.setAttribute('data-ovl-trans-failed', '1');
+                    el.setAttribute('data-ovl-trans-fail-reason', 'audit-loop');
+                    let srcText = null;
+                    try { srcText = ovlVisualBlockSrcText(el); } catch (e) {}
+                    if (srcText && cfg && typeof ovlVisualFailLogSet === 'function') {
+                        ovlVisualFailLogSet(srcText, cfg, {
+                            reason: 'audit-loop', attempts: OVL_VISUAL_AUDIT_REQUEUE_LIMIT,
+                            detail: '自检（ovlVisualLangIdleAudit）反复判定这一块是无标记英文块，重入队已达每会话上限，已停止自动重译'
+                        });
+                    }
+                    if (typeof ovlVisualEnsureRetryBadge === 'function') {
+                        ovlVisualEnsureRetryBadge(el, { reason: 'audit-loop', attempts: OVL_VISUAL_AUDIT_REQUEUE_LIMIT });
+                    }
+                } catch (e) {}
+            });
+        }
+        if (!toRequeue.length) return;
+        console.warn('[ovl] ovlVisualLangIdleAudit：发现 ' + toRequeue.length + ' 个无标记英文块（不应出现，已自动补回待翻队列）',
+            toRequeue.map(function (h) { return { line: h.line, snippet: h.snippet }; }));
+        toRequeue.forEach(function (h) { try { h.el.setAttribute('data-ovl-trans-pending', '1'); } catch (e) {} });
         if (typeof ovlVisualLangRunQueue === 'function') ovlVisualLangRunQueue();
     } catch (e) {}
 }
@@ -32433,6 +32677,31 @@ function ovlVisualRestoreFailBadges(pane) {
             } catch (e) {}
             ovlVisualEnsureRetryBadge(el, { reason: reason, attempts: attempts, detail: detail, echoCandidate: echoCandidate });
         });
+    } catch (e) {}
+}
+// v2 Pass P128e（B3-1 阻断收口）："无可译文本"角标（.ovl-visual-noprose-badge）是运行时插入
+// 的真实 DOM 节点——跟失败角标同一条纪律（ovlVisualRestoreFailBadges 头部注释），字符串
+// 拼接阶段（ovlVisualRenderBodyWithLines）只产出 data-ovl-trans-noprose 属性，整篇重渲染
+// 落地后统一挂一遍。
+function ovlVisualRestoreNoProseBadges(pane) {
+    if (!pane) return;
+    try {
+        const els = pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-noprose="1"]');
+        els.forEach(function (el) {
+            if (el.querySelector('[data-ovl-noprose-badge]')) return;
+            el.insertAdjacentHTML('afterbegin', '<span class="ovl-visual-noprose-badge" data-ovl-noprose-badge="1" contenteditable="false" '
+                + 'title="没有检测到需要翻译的自然语言，点击强制走一遍真正的翻译">无可译文本 · 强制翻译</span>');
+        });
+    } catch (e) {}
+}
+// v2 Pass P128e（漏译侧，non-blocking）：partial-reason="short" 的"重试"角标同样是运行时
+// 插入的真实 DOM 节点（跟失败角标共用同一个 ovlVisualEnsureRetryBadge），缓存命中回填只落了
+// data-ovl-trans-partial(-reason) 属性（ovlVisualPartialAttrHtml），这里补一遍。
+function ovlVisualRestoreShortPartialBadges(pane) {
+    if (!pane || typeof ovlVisualEnsureShortBadge !== 'function') return;
+    try {
+        const els = pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-partial-reason="short"]');
+        els.forEach(function (el) { ovlVisualEnsureShortBadge(el); });
     } catch (e) {}
 }
 function ovlVisualRender() {
@@ -32496,6 +32765,8 @@ function ovlVisualRender() {
         }
         pane.innerHTML = html;
         ovlVisualRestoreFailBadges(pane); // v2 Pass P128（C1）：重渲染落地后回挂失败角标，紧跟在 innerHTML 之后
+        ovlVisualRestoreNoProseBadges(pane); // v2 Pass P128e（B3-1）：回挂"无可译文本·强制翻译"角标
+        ovlVisualRestoreShortPartialBadges(pane); // v2 Pass P128e（漏译侧）：回挂"可能漏译"重试角标
         ovlVisualSelOverlayReset(pane); // Pass Sel-Outline：innerHTML 冲掉了旧叠加层，重挂一个空的
         const preEl = pane.querySelector('.ovl-visual-preamble');
         if (preEl) preEl.textContent = preamble;
@@ -32528,8 +32799,36 @@ function ovlVisualRender() {
 // 块本身的原生 title 上——鼠标悬停即可看到，跟 CSS 2040 行那条虚线左边框视觉提示配套。
 const OVL_VISUAL_PARTIAL_TIP = {
     'text-prose': '本块内 \\text{}/\\textrm{}/\\mbox{} 命令里有部分英文片段翻译失败，已保留原文（块内其余内容已正常翻译）。',
-    sentence: '本块按句切分重试后仍有部分句子未翻译成功，已保留原文（块内其余内容已正常翻译）。'
+    sentence: '本块按句切分重试后仍有部分句子未翻译成功，已保留原文（块内其余内容已正常翻译）。',
+    // v2 Pass P128e（漏译侧，non-blocking，任务书第 4 条）：块整体判定成功、已经落地入缓存，
+    // 只是译出的中文字符量明显低于源文可译内容的规模，标一个"可能漏译"的提示，不阻断、
+    // 可以点击角标重试。
+    short: '本块译文的中文字符量明显低于源文可译内容的规模，可能有部分内容漏译（块本身已正常落地，不影响使用）。'
 };
+// v2 Pass P128e（漏译侧，non-blocking）：'short' partial 专属的可点角标——**必须**跟失败块
+// 的 [data-ovl-retry-badge] 是两个不同的属性/选择器，不能复用同一个：现有多处代码/测试
+// （比如 test_p128_state_visible.js Suite 1 的 badges===failed 判据）把
+// "pane.querySelectorAll('[data-ovl-retry-badge]').length" 当成"当前失败块数"的可靠代理，
+// 这条不变量早于本 Pass 就存在。'short' 块整体是成功落地的（data-ovl-trans-partial，不是
+// data-ovl-trans-failed），如果借用同一个角标属性，会让"角标数"与"失败数"脱钩，实测复现
+// （550 块真实语料：failed=51 但 badges=91，多出的 40 正是本该只是"可能漏译"提示的
+// partial-short 块）。改成独立的 data-ovl-short-badge，点击效果一样（复用
+// ovlVisualBlockRetryClick 同一套重译逻辑），只是不占用"失败角标"这个语义槽位。
+function ovlVisualEnsureShortBadge(el) {
+    try {
+        if (!el) return;
+        if (el.querySelector('[data-ovl-short-badge]')) return;
+        el.insertAdjacentHTML('afterbegin', '<span class="ovl-visual-short-badge" data-ovl-short-badge="1" contenteditable="false" '
+            + 'title="' + escapeAttr(OVL_VISUAL_PARTIAL_TIP.short) + '">可能漏译 · 重试</span>');
+    } catch (e) {}
+}
+function ovlVisualRemoveShortBadge(el) {
+    try {
+        if (!el) return;
+        const b = el.querySelector('[data-ovl-short-badge]');
+        if (b) b.remove();
+    } catch (e) {}
+}
 function ovlVisualApplyPartialMark(el, meta) {
     if (!el) return;
     if (meta && meta.partial) {
@@ -32537,10 +32836,15 @@ function ovlVisualApplyPartialMark(el, meta) {
         const reason = meta.partialReason || 'unknown';
         el.setAttribute('data-ovl-trans-partial-reason', reason);
         el.title = OVL_VISUAL_PARTIAL_TIP[reason] || '本块只有部分内容翻译成功，已保留部分英文原文。';
+        // v2 Pass P128e：'short' 是唯一一种"块整体成功、但译文量疑似不够"的 partial 原因——
+        // 跟 text-prose/sentence（已经明确标出"哪部分没翻"）不同，用户没有别的信号能判断
+        // 要不要信任这次结果，额外给一个可点的入口（见上方 ovlVisualEnsureShortBadge）。
+        if (reason === 'short') ovlVisualEnsureShortBadge(el); else ovlVisualRemoveShortBadge(el);
     } else {
         el.removeAttribute('data-ovl-trans-partial');
         el.removeAttribute('data-ovl-trans-partial-reason');
         if (el.getAttribute('title')) el.removeAttribute('title');
+        ovlVisualRemoveShortBadge(el);
     }
 }
 // v2 Pass P122c（BV2-2 修复，核验 .claude/tmp/p122_verify2.md 阻断2）：ovlVisualApplyPartialMark
@@ -32571,6 +32875,11 @@ function ovlVisualFailAttrHtml(info) {
 // title/data-tip 是同一档"人话说明"，字符串拼接与 DOM 两条路径共用同一份文案，避免各写一份
 // 容易改漏一处。
 const OVL_VISUAL_SKIPPED_TITLE = '纯公式/代码/注释，无可译内容，本块不需要翻译。';
+// v2 Pass P128e（B3-1 阻断收口）：分块阶段判定"无可译文本"（ovlVisualBlockNoProse）的悬停
+// 说明——跟 skipped 同一档"人话说明"手法，区别是这条状态还带一个可点的"强制翻译"角标（见
+// ovlVisualRestoreNoProseBadges/ovlVisualBlockForceTranslateClick），所以 title 里额外提示
+// 一句"如何强制翻译"。
+const OVL_VISUAL_NOPROSE_TITLE = '这一块没有检测到需要翻译的自然语言（纯公式/代码/引用/排版命令），已跳过、不计入翻译进度。如果其实需要翻译，可以点击右上角"强制翻译"。';
 // v2 Pass P128b（N-4 收口）：raw 兜底档译出的可见标记——跟 skipped/pending 同一套"低调
 // ::after 小标"手法（CSS 见 [data-ovl-trans-ladder="raw"]），只标"经兜底档译出"这一种档位
 // （L0/L2/L4/L3 是常规成功路径，不需要额外标出）。ovlVisualApplyLadderMark 操作已挂载的
@@ -32664,11 +32973,19 @@ function ovlVisualLangProgressUpdate() {
             const r = pe.getAttribute('data-ovl-trans-partial-reason') || 'unknown';
             byPartialReason[r] = (byPartialReason[r] || 0) + 1;
         });
+        // v2 Pass P128e：'short' 不一定"保留了部分英文原文"（闸只看中文字符量相对源文规模
+        // 够不够，块本身可能是一段偏短但纯中文的译文），跟 text-prose/sentence 那两种"确实
+        // 有英文原文混在里面"的情形描述不一样，单独拆一句、不套用统一的"保留了部分英文原文"。
+        const shortN = byPartialReason['short'] || 0;
+        const otherPartialN = partialN - shortN;
         const partialReasonLabel = { 'text-prose': '公式内散文片段', sentence: '按句切分后仍有句子未译' };
-        const partialBreakdown = Object.keys(byPartialReason).map(function (r) {
-            return byPartialReason[r] + (partialReasonLabel[r] || r);
-        }).join('/');
-        parts.push(partialN + ' 个块部分翻译（' + partialBreakdown + '，保留了部分英文原文）');
+        if (otherPartialN > 0) {
+            const otherBreakdown = Object.keys(byPartialReason).filter(function (r) { return r !== 'short'; }).map(function (r) {
+                return byPartialReason[r] + (partialReasonLabel[r] || r);
+            }).join('/');
+            parts.push(otherPartialN + ' 个块部分翻译（' + otherBreakdown + '，保留了部分英文原文）');
+        }
+        if (shortN > 0) parts.push(shortN + ' 个块可能漏译（中文字符量低于源文可译内容的预期，块右上角点"重试"）');
     }
     if (failN > 0) {
         // 按失败分类分解——已经落在 DOM 上的 data-ovl-trans-fail-reason，不新增判定逻辑。
@@ -32680,7 +32997,8 @@ function ovlVisualLangProgressUpdate() {
         const reasonLabel = { echo: '回显', placeholder: '占位符', 'cite-bracket': '引用括号', 'cite-sentinel': '引用哨兵',
             'code-sentinel': '代码哨兵', truncated: '截断', timeout: '超时', network: '网络',
             config: '配置', 'low-cjk': '中文占比过低', 'no-cjk': '零中文', 'cite-mismatch': '引用不符',
-            'raw-integrity': '兜底路径公式/命令被吞', unknown: '未知' };
+            'raw-integrity': '兜底路径公式/命令被吞', 'english-body': '不该有的英文正文',
+            'audit-loop': '自检重入队已达上限', unknown: '未知' };
         const breakdown = Object.keys(byReason).map(function (r) {
             const label = reasonLabel[r] || (String(r).indexOf('http-') === 0 ? 'HTTP ' + r.slice(5) : r);
             return byReason[r] + label;
@@ -32956,7 +33274,10 @@ function ovlVisualLangSyncAfterRender() {
     // pending/inflight 标记（ovlVisualRenderBlockContent 对它们短路，从不查缓存/不进队列），
     // 分子（pending/inflight 减法）天然已经不含它们；分母这里必须显式排除，否则永远多算
     // 出几个"应译但从没被尝试过"的块，done 追不上 total，进度条卡死在 N/M（N<M）永不隐藏。
-    const total = pane.querySelectorAll('.ovl-visual-block:not([data-ovl-trans-notrans])').length;
+    // v2 Pass P128e（B3-1）：分块阶段判定"无可译文本"（data-ovl-trans-noprose）同样从不会有
+    // pending/inflight——同一条纪律，一并排除；用户点"强制翻译"成功后这个属性会被摘掉，
+    // 下一次 sync 自然把它计回分母，不需要在这里特殊处理"强制过的 noprose 块"。
+    const total = pane.querySelectorAll('.ovl-visual-block:not([data-ovl-trans-notrans]):not([data-ovl-trans-noprose])').length;
     const pending = pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-pending="1"]').length;
     // v2 Pass P113c（核验 .claude/tmp/p113_verify.md 次要2，done>total 计数窗口）：worker
     // 摘掉 pending 到真正 done++ 之间有一次 await，那段窗口里的块既不是 pending 也还不是
@@ -33062,10 +33383,20 @@ const OVL_VISUAL_FAIL_TIP = {
     // （R-3）共用同一个函数。
     'low-cjk': '模型返回的内容里中文字符相对原文可译内容的比例过低（可能是复述改写、答非所问，或只翻了一小部分），判定为未翻译成功。点击重试（会换一套指令重问）。',
     'no-cjk': '模型返回的内容里一个中文字都没有（可能只剩下引用/占位符残留、或者是纯标点数字），判定为未翻译成功。点击重试（会换一套指令重问）。',
+    // v2 Pass P128e（B3-1 阻断收口）：源文本身没有可译散文（纯公式/代码/引用/\hfill 这类），
+    // 但译文里凭空多出了一段英文正文——判定依据同样见 ovlVisualCjkGateEval。
+    'english-body': '源文本身没有需要翻译的自然语言（纯公式/代码/引用），但模型返回的内容里却残留了不该有的英文正文。点击重试（会换一套指令重问）。',
     'cite-mismatch': '兜底翻译（不使用哨兵）里模型把引用编号翻错、漏掉或多写了。点击重试。',
     // v2 Pass P128b（B-1 阻断收口）：raw 兜底路径没有哨兵可校验占位符，改事后比对数学公式/
     // \ref\cite\label 等命令/代码片段是否被模型吞掉或改动——命中就判失败，不静默落地。
     'raw-integrity': '兜底翻译（不带哨兵）里模型把数学公式、\\ref/\\cite/\\label 等命令或代码片段吞掉或改动了。点击重试。',
+    // v2 Pass P128e（结构性防活锁护栏，任务书第 2 条）：这一块被空闲自检
+    // （ovlVisualLangIdleAudit）反复判定成"无标记英文块"、重入队已经达到每会话上限——
+    // 停止自动重译，改成可见失败态，避免陷入无上限重译活锁。
+    'audit-loop': '这一块被后台自检反复判定为"看起来还是英文"，自动重译已达到本次会话的上限，已停止自动重试（避免无限循环）。可以手动点击重试，或检查这一块的翻译结果是否本来就正确。',
+    // 注：漏译侧 non-blocking 提示（partial-reason=short）不是"翻译失败"，走的是独立的
+    // OVL_VISUAL_PARTIAL_TIP.short + ovlVisualEnsureShortBadge（data-ovl-short-badge），
+    // 不占用这张失败原因文案表，见该函数头部注释。
     unknown: '翻译判定失败，点击重新翻译这一块。'
 };
 function ovlVisualFailTipText(reason) {
@@ -33339,6 +33670,84 @@ async function ovlVisualBlockRetryClick(el) {
     }
 }
 
+// v2 Pass P128e（B3-1 阻断收口，任务书第 1 条"强制翻译"）：点击"无可译文本"角标——用户不
+// 认同分块阶段的判断（判据是启发式的 ovlVisualBlockNoProse，真的可能漏判需要翻译的内容），
+// 强制走一遍真正的翻译流程。跟 ovlVisualBlockRetryClick 是同一套手法（mySeq/fixedProjectId
+// 固定住、AbortController 挂进 adhocControllers、复用同一个 ovlVisualTranslateBlockWithLadder
+// 阶梯），差别只是这块本来就没有失败态可清（noprose 块从未真正入队翻译过，也没有旧缓存
+// 条目要删）。模型如果真的吐出"占位符原样抄回+正文英文"这种 B3-1 形状的回复，会被写入侧
+// 新增的 english-body 判据挡下，走跟其它失败原因完全一样的"标 failed+可见角标+不循环"路径，
+// 不会静默循环、也不会无限重试——阶梯本身有限（L0/L2/L4/条件性 L-raw），跑完就 throw，不
+// 会有 ovlVisualLangIdleAudit 那种自检重入队参与进来（这块从来没打过 pending，队列本来就
+// 不认识它）。
+async function ovlVisualBlockForceTranslateClick(el) {
+    if (!el || el.getAttribute('data-ovl-trans-force-translating') === '1') return;
+    const srcLatex = (typeof ovlVisualBlockSrcText === 'function') ? ovlVisualBlockSrcText(el) : null;
+    if (srcLatex == null || !srcLatex.trim()) return;
+    let cfg = null;
+    try { cfg = getApiConfig(); } catch (e) { cfg = null; }
+    const mySeq = OvlVisualLangState.seq;
+    let fixedProjectId;
+    try { fixedProjectId = ovlVisualTransCacheProjectId(); } catch (e) { fixedProjectId = null; }
+    const controller = new AbortController();
+    OvlVisualLangState.adhocControllers.push(controller);
+    el.setAttribute('data-ovl-trans-force-translating', '1');
+    const badge = el.querySelector('[data-ovl-noprose-badge]');
+    if (badge) { badge.textContent = '翻译中…'; badge.classList.add('ovl-visual-noprose-badge--busy'); }
+    let meta = {};
+    try {
+        const tgt = await ovlVisualTranslateBlockWithLadder(srcLatex, cfg, controller.signal, meta, { userForced: true });
+        if (mySeq !== OvlVisualLangState.seq) return; // 陈旧响应（语言已切走/已取消），丢弃不落地
+        try { ovlVisualTransCachePut(srcLatex, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel); } catch (e) {}
+        if (document.body.contains(el)) {
+            el.removeAttribute('data-ovl-trans-noprose');
+            if (el.getAttribute('title')) el.removeAttribute('title');
+            if (badge) badge.remove();
+            el.innerHTML = ovlVisualRenderChunk(tgt);
+            if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; }
+            if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta);
+            if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta);
+            if (typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(el);
+            if (typeof ovlRenderVisualGutter === 'function' && OvlState.editorMode === 'visual') ovlRenderVisualGutter();
+        }
+        if (typeof showToast === 'function') showToast('翻译完成', 'success');
+    } catch (err) {
+        if (err && err.name === 'AbortError') return; // 用户切走了/取消了，不报失败
+        if (mySeq !== OvlVisualLangState.seq) return;
+        if (document.body.contains(el)) {
+            el.removeAttribute('data-ovl-trans-noprose');
+            if (el.getAttribute('title')) el.removeAttribute('title');
+            if (badge) badge.remove();
+            el.setAttribute('data-ovl-trans-failed', '1');
+            const reason = meta.failReason || ovlVisualTransFailReason(err, meta);
+            el.setAttribute('data-ovl-trans-fail-reason', reason);
+            const totalAttempts = meta.attempts || 1;
+            el.setAttribute('data-ovl-trans-attempts', String(totalAttempts));
+            if (typeof ovlVisualFailLogSet === 'function') {
+                ovlVisualFailLogSet(srcLatex, cfg, { reason: reason, attempts: totalAttempts, detail: (err && err.message) || String(err), echoCandidate: meta.echoCandidate, ladderLevel: meta.ladderLevel });
+            }
+            if (typeof ovlVisualEnsureRetryBadge === 'function') {
+                ovlVisualEnsureRetryBadge(el, { reason: reason, attempts: totalAttempts, detail: (err && err.message) || String(err), echoCandidate: meta.echoCandidate });
+            }
+            if (typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') {
+                ovlScheduleVisualGutterAfterImage();
+            }
+        }
+        if (typeof showToast === 'function') {
+            showToast('强制翻译失败：' + ((err && err.message) || String(err)), 'error');
+        }
+    } finally {
+        const idx = OvlVisualLangState.adhocControllers.indexOf(controller);
+        if (idx !== -1) OvlVisualLangState.adhocControllers.splice(idx, 1);
+        el.removeAttribute('data-ovl-trans-force-translating');
+        // v2 Pass P128e：这块从"不计分母"变成"计分母"（或反过来，块被删/编辑过等极端情形），
+        // 用完整的 SyncAfterRender 重新从 DOM 现算 total/done，而不是只刷新文案——跟
+        // ovlVisualBlockRetryClick 只调 ProgressUpdate 不同：那条路径里块本来就已经计入
+        // total（failed 块也计分母），这里块的分母归属本身就变了，必须重算。
+        try { if (typeof ovlVisualLangSyncAfterRender === 'function') ovlVisualLangSyncAfterRender(); } catch (e) {}
+    }
+}
+
 // 折叠横条点击 / 失败块重试角标点击：委托绑定在 #ovlVisualPane 上（面板整个是动态内容，
 // 不用逐条重新 addEventListener）。
 function ovlBindVisualPane() {
@@ -33370,6 +33779,23 @@ function ovlBindVisualPane() {
             e.stopPropagation();
             const blk = forceBadge.closest('.ovl-visual-block');
             if (blk) ovlVisualBlockForceAcceptClick(blk);
+            return;
+        }
+        // v2 Pass P128e（B3-1 阻断收口）："无可译文本"角标点击 -> 强制走一遍真正的翻译流程。
+        const noproseBadge = e.target.closest('[data-ovl-noprose-badge]');
+        if (noproseBadge) {
+            e.stopPropagation();
+            const blk = noproseBadge.closest('.ovl-visual-block');
+            if (blk) ovlVisualBlockForceTranslateClick(blk);
+            return;
+        }
+        // v2 Pass P128e（漏译侧，non-blocking）："可能漏译"角标点击 -> 跟失败角标同一套重译
+        // 逻辑（ovlVisualBlockRetryClick 不要求块当前是 data-ovl-trans-failed，直接复用）。
+        const shortBadge = e.target.closest('[data-ovl-short-badge]');
+        if (shortBadge) {
+            e.stopPropagation();
+            const blk = shortBadge.closest('.ovl-visual-block');
+            if (blk) ovlVisualBlockRetryClick(blk);
             return;
         }
     });
