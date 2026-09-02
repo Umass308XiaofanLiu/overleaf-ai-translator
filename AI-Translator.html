@@ -2038,6 +2038,23 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    的虚线提示条，跟"翻译失败"（data-ovl-trans-failed，无此标记）区分开：这个块整体算成功
    落地了，只是里面混了没翻成的原文。 */
 .ovl-visual-block[data-ovl-trans-partial] { border-left: 2px dashed #f59e0b; padding-left: 6px; }
+/* v2 Pass P129：参考文献编号列表——悬挂缩进 + 小一号字，跟 Overleaf 编译出来的 references
+   观感一致。手写标号（不用 <ol> 自动编号）：PDF→LaTeX 转换产物的编号常是 [17]...[55] 这种
+   不连续序列，浏览器原生 <ol> 计数器会跟手写编号打架。 */
+.ovl-visual-bib { font-size: 0.92em; }
+.ovl-visual-bib-item { display: flex; align-items: baseline; gap: 0.5em; padding: 0.2em 0; }
+.ovl-visual-bib-num { flex: 0 0 auto; min-width: 2.6em; color: #374151; font-variant-numeric: tabular-nums; }
+.ovl-visual-bib-text { flex: 1 1 auto; color: #1f2937; }
+/* v2 Pass P129：中文模式下参考文献块不送翻译——用户原话"这部分信息可以在visual chinese
+   模式下跳过"。跟 P122（C3.2 等）那组重试角标同一套"::after + position:absolute"零占位
+   手法：不进 el.textContent（伪元素天然不进）、不改变块高度（避免打穿 P123 的 gutter 对齐）。
+   悬停显示的完整说明走块本身的 title 属性（ovlVisualRenderBodyWithLines 落地时一并写）。 */
+.ovl-visual-block[data-ovl-trans-notrans] { position: relative; }
+.ovl-visual-block[data-ovl-trans-notrans]::after {
+    content: '参考文献·不翻译'; position: absolute; top: 2px; right: 2px; z-index: 2;
+    font-size: 11px; line-height: 1.4; padding: 1px 6px; border-radius: 3px;
+    background: #f3f4f6; color: #6b7280; border: 1px solid #e5e7eb; pointer-events: none;
+}
 /* 整个 Visual 正文的第一块永远紧贴顶部，不管它是不是"段落起点"——旧版靠子元素顶 margin
    清零天然免费拿到这条，现在改由 margin-top 驱动间距了，要显式补一条覆盖掉上面
    [data-para-start="1"] 给的 0.6em（选择器优先级 0,3,0 > 0,2,0，天然赢，不用 !important）。 */
@@ -28730,6 +28747,14 @@ function ovlUnwrapSingleParagraph(html) {
 // P64：longtable 单独列一项（不接 \*? ，这个环境没有星号变体），复用 table 的渲染路径。
 const OVL_VISUAL_FLOAT_DISPATCH_RE = /^\s*\\begin\{(table|algorithm|figure)\*?\}|^\s*\\begin\{(longtable)\}/;
 function ovlVisualRenderChunk(tex) {
+    // v2 Pass P129：thebibliography 整段命中就分派给编号引用列表渲染器，跟下面 float 分派
+    // 同一条"try/catch 退回原有散文渲染路径"纪律。两种 Visual 模式（Original/中文）都走
+    // 这条路径——中文模式下这块从不送翻译（见 ovlVisualRenderBlockContent 的 notrans 短路
+    // 分支），但 innerHTML 仍然要由这里渲染成编号列表，不是裸源码，这正是用户要的"按编译
+    // 正确显示"。
+    if (/\\begin\{thebibliography\}/.test(tex)) {
+        try { return ovlRenderVisualBibliography(tex); } catch (e) { console.error('[ovl-visual] 参考文献渲染失败，退回原有的散文渲染路径', e); }
+    }
     const floatMatch = OVL_VISUAL_FLOAT_DISPATCH_RE.exec(tex);
     if (floatMatch) {
         try {
@@ -29341,6 +29366,393 @@ function ovlRenderVisualFigure(tex) {
     html += '<div class="ovl-visual-fig-row">' + boxes.join('') + '</div>';
     if (capExtract.found && capExtract.arg.trim()) {
         html += '<div class="ovl-visual-caption ovl-visual-caption-below">' + ovlUnwrapSingleParagraph(ovlVisualRenderChunk(capExtract.arg)) + '</div>';
+    }
+    html += '</div>';
+    return html;
+}
+
+// ---- 4) 参考文献列表 ----
+// v2 Pass P129。用户原话："visual模式下的references信息是没必要翻译的...这部分在原版visual
+// 下显示的也不太对，似乎没编译。我觉得要没不显示，要么就按照编译正确显示。"——本渲染器只求
+// "看得出跟 Overleaf 编译出来的参考文献列表一样"：\bibitem 逐条编号，忽略 BibTeX/IEEEtran.bst
+// 产物常见的 \providecommand/\csname.../\BIBdecl 等前导宏残片。做法：从第一个 \bibitem 开始
+// 才算正文，之前的一律丢弃——最稳、也最贴合转换产物的实际形状（诊断
+// .claude/tmp/p128_diag.md §7.2）。手写标号（不用 <ol> 自动编号）：PDF→LaTeX 转换产物的编号
+// 常常是 [17]...[55] 这种不连续序列，浏览器原生 <ol> 计数器会跟手写编号打架。
+
+// 重音命令 -> Unicode 直接替换表，覆盖 IEEEtran/BibTeX 产物常见的十来个：
+//   无花括号符号型（\'e \`a \"o \^i \~n \=a \.z）+ 花括号字母型（\c{c} \v{s} \u{a} \H{o}
+//   \k{a} \r{a}）。表里没有的组合原样保留命令文本、不吞字（D2 纪律：宁可难看不吞字）。
+const OVL_BIB_ACCENT_SYMBOLS = ["'", '`', '"', '^', '~', '=', '.'];
+const OVL_BIB_ACCENT_LETTERS = ['c', 'v', 'u', 'H', 'k', 'r'];
+const OVL_BIB_ACCENT_NOARG = {
+    "'": { a: '\u00e1', e: '\u00e9', i: '\u00ed', o: '\u00f3', u: '\u00fa', y: '\u00fd',
+        A: '\u00c1', E: '\u00c9', I: '\u00cd', O: '\u00d3', U: '\u00da', Y: '\u00dd',
+        c: '\u0107', n: '\u0144', s: '\u015b', z: '\u017a', C: '\u0106', N: '\u0143', S: '\u015a', Z: '\u0179' },
+    '`': { a: '\u00e0', e: '\u00e8', i: '\u00ec', o: '\u00f2', u: '\u00f9',
+        A: '\u00c0', E: '\u00c8', I: '\u00cc', O: '\u00d2', U: '\u00d9' },
+    '"': { a: '\u00e4', e: '\u00eb', i: '\u00ef', o: '\u00f6', u: '\u00fc', y: '\u00ff',
+        A: '\u00c4', E: '\u00cb', I: '\u00cf', O: '\u00d6', U: '\u00dc' },
+    '^': { a: '\u00e2', e: '\u00ea', i: '\u00ee', o: '\u00f4', u: '\u00fb',
+        A: '\u00c2', E: '\u00ca', I: '\u00ce', O: '\u00d4', U: '\u00db' },
+    '~': { a: '\u00e3', n: '\u00f1', o: '\u00f5', A: '\u00c3', N: '\u00d1', O: '\u00d5' },
+    '=': { a: '\u0101', e: '\u0113', i: '\u012b', o: '\u014d', u: '\u016b',
+        A: '\u0100', E: '\u0112', I: '\u012a', O: '\u014c', U: '\u016a' },
+    '.': { z: '\u017c', Z: '\u017b', c: '\u010b', e: '\u0117' }
+};
+const OVL_BIB_ACCENT_BRACEARG = {
+    c: { c: '\u00e7', C: '\u00c7', s: '\u015f', S: '\u015e' },
+    v: { s: '\u0161', S: '\u0160', c: '\u010d', C: '\u010c', z: '\u017e', Z: '\u017d',
+        e: '\u011b', E: '\u011a', r: '\u0159', R: '\u0158', n: '\u0148', N: '\u0147',
+        d: '\u010f', D: '\u010e', t: '\u0165', T: '\u0164' },
+    u: { a: '\u0103', A: '\u0102', g: '\u011f', G: '\u011e' },
+    H: { o: '\u0151', O: '\u0150', u: '\u0171', U: '\u0170' },
+    k: { a: '\u0105', A: '\u0104', e: '\u0119', E: '\u0118' },
+    r: { a: '\u00e5', A: '\u00c5', u: '\u016f', U: '\u016e' }
+};
+// NOTE(P129b/NB-1, non-blocking, see .claude/tmp/p129_verify.md): common special-letter
+// commands in Polish/Danish/German names (the command name itself IS the letter, not an
+// accent-symbol-plus-base-letter pair like the tables above), kept in a separate table since
+// they need whole-command-name matching instead of per-character classification. Anything
+// not in this table still falls through to the generic fallback below and is silently
+// dropped per the P129b blocking-2 rule (command name deleted, no raw leak).
+const OVL_BIB_SPECIAL_LETTER = {
+    L: '\u0141', l: '\u0142', O: '\u00d8', o: '\u00f8', AA: '\u00c5', aa: '\u00e5',
+    AE: '\u00c6', ae: '\u00e6', OE: '\u0152', oe: '\u0153', ss: '\u00df', i: '\u0131', j: '\u0237'
+};
+// v2 Pass P129c（NB-4 收口，.claude/tmp/p129_verify2.md）：P129b 引入的"无参数未知命令静默
+// 丢弃命令名"这条兜底规则的前提假设（"这类命令幸存到这里几乎全是纯排版残留，不携带可读内容"）
+// 被终核实测证伪——\TeX/\LaTeX/\copyright/\pounds/\S/\P/\ldots 等常见排版符号命令本身就是
+// 唯一携带语义的载体，整条丢弃会让 "The \TeX book" 变成 "The book"。跟上面的
+// OVL_BIB_SPECIAL_LETTER 同一种"命令名整体匹配"手法，收录进这张表的命令改成查表替换成对应
+// 文字/符号，而不是落进下面的静默丢弃兜底；表外命令（真正的纯排版残留）行为不变，仍然丢弃，
+// 但会在开发者控制台记一次 debug 日志（命令名去重后只记一次）方便以后扩表。
+const OVL_BIB_TEXT_SYMBOL = {
+    TeX: 'TeX', LaTeX: 'LaTeX', ldots: '\u2026', dots: '\u2026', S: '\u00a7', P: '\u00b6',
+    copyright: '\u00a9', textdegree: '\u00b0', textregistered: '\u00ae', texttrademark: '\u2122',
+    pounds: '\u00a3', euro: '\u20ac'
+};
+// v2 Pass P129c（NB-4 收口）：静默丢弃兜底触发时，每个不同的命令名只往控制台记一次 debug
+// 日志（避免同一篇文档反复出现同一命令刷屏），供以后扩 OVL_BIB_TEXT_SYMBOL 表时定位。
+const OVL_BIB_UNKNOWN_CMD_LOGGED = new Set();
+function ovlBibAccentLookup(cmdChar, letter) {
+    const noArg = OVL_BIB_ACCENT_NOARG[cmdChar];
+    if (noArg && noArg[letter] != null) return noArg[letter];
+    const brace = OVL_BIB_ACCENT_BRACEARG[cmdChar];
+    if (brace && brace[letter] != null) return brace[letter];
+    return null;
+}
+// v2 Pass P129b（blocking-2 收口）：消费一段 TeX <glue>（\hskip/\vskip 后面跟的量纲，形如
+// "1em plus 0.5em minus 0.4em"，可选再跟一个 \relax）。只消费尺寸数字本身，不解读它们、不
+// 落地成任何文字——调用方看到返回值 > 起始位置就知道确实吃到了一段合法 glue，用一个空格
+// 代表它；吃不到（不是真的 glue 语法）就原样返回起始位置，交给上一层的兜底逻辑处理，不误吞。
+function ovlBibConsumeGlueDimen(s, i) {
+    const m = /^\s*[+-]?(?:\d+\.?\d*|\.\d+)\s*(?:pt|em|ex|in|cm|mm|bp|pc|dd|cc|sp|fil+)?/.exec(s.slice(i));
+    if (!m || !m[0].trim()) return i;
+    return i + m[0].length;
+}
+function ovlBibConsumeGlue(s, i) {
+    let p = ovlBibConsumeGlueDimen(s, i);
+    if (p === i) return i;
+    let m = /^\s*plus\s*/.exec(s.slice(p));
+    if (m) { const p2 = ovlBibConsumeGlueDimen(s, p + m[0].length); if (p2 > p + m[0].length) p = p2; }
+    m = /^\s*minus\s*/.exec(s.slice(p));
+    if (m) { const p2 = ovlBibConsumeGlueDimen(s, p + m[0].length); if (p2 > p + m[0].length) p = p2; }
+    m = /^\s*\\relax\b/.exec(s.slice(p));
+    if (m) p += m[0].length;
+    return p;
+}
+// 递归下降式清洗，跟 ovlRenderTextColor（8003 行附近）/ovlExtractBraceCommand（28768 行）
+// 同一种"花括号配平扫描"手法。把参考文献条目正文里的 LaTeX 命令转成纯文本/极小一撮
+// 行内标签（<em>/<strong>），同时对 <、>、& 三个 HTML 敏感字符做保护性转义——命令解析出的
+// 标签是这里自己拼的，唯一有风险的是原文里字面出现这三个字符（\& 转义后落地成的 & 也在
+// 这里一并转义成 &amp;，不走"裸字符串塞进 innerHTML"这条路）。
+function ovlBibCleanText(raw) {
+    const s = String(raw == null ? '' : raw);
+    const n = s.length;
+    let out = '';
+    let i = 0;
+    while (i < n) {
+        const ch = s[i];
+        if (ch !== '\\') {
+            if (ch === '{') {
+                // 纯花括号分组（比如 BibTeX 常见的 "{Foreman}" 保护大小写写法）——去掉花括号，
+                // 内容原样递归处理，不是命令，不加任何标签。
+                const close = ovlFindMatchingBrace(s, i);
+                if (close !== -1) { out += ovlBibCleanText(s.slice(i + 1, close)); i = close + 1; continue; }
+            }
+            if (ch === '}') { i++; continue; } // 孤立右花括号（不应出现，防御性丢弃，不崩）
+            if (ch === '<') { out += '&lt;'; i++; continue; }
+            if (ch === '>') { out += '&gt;'; i++; continue; }
+            if (ch === '&') { out += '&amp;'; i++; continue; }
+            if (ch === '-' && s[i + 1] === '-' && s[i + 2] === '-') { out += '\u2014'; i += 3; continue; } // ---
+            if (ch === '-' && s[i + 1] === '-') { out += '\u2013'; i += 2; continue; } // --
+            if (ch === '`' && s[i + 1] === '`') { out += '\u201c'; i += 2; continue; } // ``
+            if (ch === "'" && s[i + 1] === "'") { out += '\u201d'; i += 2; continue; } // ''
+            if (ch === '~') { out += ' '; i++; continue; }
+            out += ch; i++; continue;
+        }
+        // ch === '\\'：\newblock（无参数宏，换行/空格语义）——后面不跟字母才是它本身，
+        // 不是别的更长命令名的前缀。
+        if (s.slice(i, i + 9) === '\\newblock' && !/[a-zA-Z]/.test(s[i + 9] || '')) { out += ' '; i += 9; continue; }
+        // \textit{…}/\emph{…} -> <em>…</em>；\textbf{…} -> <strong>…</strong>
+        let mm = /^\\(textit|emph|textbf)\b\s*/.exec(s.slice(i));
+        if (mm && s[i + mm[0].length] === '{') {
+            const p = i + mm[0].length;
+            const close = ovlFindMatchingBrace(s, p);
+            if (close !== -1) {
+                const inner = ovlBibCleanText(s.slice(p + 1, close));
+                out += (mm[1] === 'textbf') ? ('<strong>' + inner + '</strong>') : ('<em>' + inner + '</em>');
+                i = close + 1; continue;
+            }
+        }
+        // \url{…} -> 纯文本（Visual 是只读预览，不生成可点链接，避免 file:// 下的导航风险）
+        mm = /^\\url\b\s*/.exec(s.slice(i));
+        if (mm && s[i + mm[0].length] === '{') {
+            const p = i + mm[0].length;
+            const close = ovlFindMatchingBrace(s, p);
+            if (close !== -1) { out += ovlBibCleanText(s.slice(p + 1, close)); i = close + 1; continue; }
+        }
+        // \href{url}{text} -> 纯文本(text)，同样不生成链接
+        mm = /^\\href\b\s*/.exec(s.slice(i));
+        if (mm && s[i + mm[0].length] === '{') {
+            const p1 = i + mm[0].length;
+            const close1 = ovlFindMatchingBrace(s, p1);
+            if (close1 !== -1) {
+                let p2 = close1 + 1;
+                if (s[p2] === '{') {
+                    const close2 = ovlFindMatchingBrace(s, p2);
+                    if (close2 !== -1) { out += ovlBibCleanText(s.slice(p2 + 1, close2)); i = close2 + 1; continue; }
+                }
+            }
+        }
+        // v2 Pass P129b（blocking-2 收口，.claude/tmp/p129_verify.md）：\BIBforeignlanguage{lang}{text}
+        // 只取第二参数（译文正文），丢弃第一参数（语言代码）——旧行为落进下面的通用兜底，只认
+        // 命令名后第一个花括号组，把 "german" 和 "Ein Titel" 两段都原样输出拼在一起变成
+        // "germanEin Titel"（用户贴出的第一块 IEEEtran 条目原文正含这个宏）。跟 \href 同一种
+        // "跳过第一参数、只留第二参数"手法。
+        mm = /^\\BIBforeignlanguage\b\s*/.exec(s.slice(i));
+        if (mm && s[i + mm[0].length] === '{') {
+            const p1 = i + mm[0].length;
+            const close1 = ovlFindMatchingBrace(s, p1);
+            if (close1 !== -1) {
+                let p2 = close1 + 1;
+                while (s[p2] === ' ') p2++;
+                if (s[p2] === '{') {
+                    const close2 = ovlFindMatchingBrace(s, p2);
+                    if (close2 !== -1) { out += ovlBibCleanText(s.slice(p2 + 1, close2)); i = close2 + 1; continue; }
+                }
+            }
+        }
+        // v2 Pass P129c（NB-5 收口，.claude/tmp/p129_verify2.md）：\bibinfo{role}{value} ->
+        // value，跟上面 \BIBforeignlanguage 同一个根因（IEEEtran.bst 常见的"两参数宏，第一参数
+        // 只是语义标签不是可读文字"）——第一参数 role（比如 "year"/"pages"）原来被下面的通用
+        // 兜底当成命令的花括号参数原样吐出，拼出 "year2020"/"pages10–20" 这类文字。跟 \href 同
+        // 一种"跳过第一参数、只留第二参数"手法。
+        mm = /^\\bibinfo\b\s*/.exec(s.slice(i));
+        if (mm && s[i + mm[0].length] === '{') {
+            const p1 = i + mm[0].length;
+            const close1 = ovlFindMatchingBrace(s, p1);
+            if (close1 !== -1) {
+                let p2 = close1 + 1;
+                while (s[p2] === ' ') p2++;
+                if (s[p2] === '{') {
+                    const close2 = ovlFindMatchingBrace(s, p2);
+                    if (close2 !== -1) { out += ovlBibCleanText(s.slice(p2 + 1, close2)); i = close2 + 1; continue; }
+                }
+            }
+        }
+        // v2 Pass P129b（blocking-2 收口）：bib 条目正文专用的纯排版宏——静默删除，不落地任何
+        // 文本（源文本里它们前后本来就带着自己的空格，删掉命令本身不会让相邻单词粘连）。
+        // \BIBentryALTinterwordspacing/\BIBentrySTDinterwordspacing 是 IEEEtran.bst 对带 URL/note
+        // 的条目成对吐出的 interword-spacing 开关；\relax 是 TeX 空操作；\BIBdecl 万一没被
+        // ovlRenderVisualBibliography 的"从第一个 \bibitem 开始"那刀挡在条目正文外（理论上不该
+        // 发生，防御性收），一并处理。用户原始抱怨"似乎没编译"就是这几个裸宏名直接漏在屏幕上。
+        // v2 Pass P129c（NB-5 顺手项）：补上同族的 interword-stretch-factor 开关变体
+        // （IEEEtran.bst 另一种拼写/版本会吐出这两个，跟上面两个 interwordspacing 同源）。
+        mm = /^\\(BIBentryALTinterwordspacing|BIBentrySTDinterwordspacing|BIBentryALTinterwordstretchfactor|BIBentrySTDinterwordstretchfactor|BIBdecl|relax)\b/.exec(s.slice(i));
+        if (mm) { i += mm[0].length; continue; }
+        // \hskip/\vskip <glue>（可选跟着 \relax）-> 一个空格。IEEEtran.bst 常见形如
+        // "2nd ed.\hskip 1em plus 0.5em minus 0.4em\relax Springer, 2012."——用来在书籍类条目里
+        // 插入出版社前的空白，整段 TeX 量纲语法折成一个空格，不落地任何尺寸数字（那是排版参数，
+        // 不是可读文字），否则不折成空格会让 "ed." 和 "Springer" 直接粘连成 "ed.Springer"。
+        mm = /^\\[hv]skip\b/.exec(s.slice(i));
+        if (mm) {
+            const afterGlue = ovlBibConsumeGlue(s, i + mm[0].length);
+            if (afterGlue > i + mm[0].length) { out += ' '; i = afterGlue; continue; }
+        }
+        // \hspace{…}/\hspace*{…} -> 空格，丢弃花括号里的尺寸参数（同样不是可读文字）。
+        // v2 Pass P129c（NB-3 收口，.claude/tmp/p129_verify2.md）：原来的 \*?\b 里 \b 只在
+        // *和{ 之间(两侧都是非单词字符)判定失败，导致 \hspace*{…} 从未匹配到星号，回退成只匹配
+        // "\hspace" 七个字符——紧邻字符是 * 不是 {，下面 s[...]==='{' 的检查直接判负，整条折叠
+        // 分支形同虚设，尺寸参数原样漏出（"a\hspace*{1em}b" -> "a1emb"）。改成"星号只在紧跟 {
+        // 时才消费，否则退回单词边界"——星号变体和无星号变体都能吃到，且对 \hspacefoo{…} 这种
+        // 命令名更长的情况仍然安全（两个分支都不匹配，mm 为 null，原样落回下面的通用兜底）。
+        mm = /^\\hspace(?:\*(?=\{)|\b)\s*/.exec(s.slice(i));
+        if (mm && s[i + mm[0].length] === '{') {
+            const p = i + mm[0].length;
+            const close = ovlFindMatchingBrace(s, p);
+            if (close !== -1) { out += ' '; i = close + 1; continue; }
+        }
+        // \& \% \_ \# \$ \{ \} -> 字面标点（& 走 HTML 转义，其余六个本身对 HTML 无害）。
+        // v2 Pass P129c（NB-4 顺手项）：\{/\} 原来没有专属分支——反斜杠被单独原样吐出（走本
+        // 函数最末尾"反斜杠后面既不是已知转义符也不是合法命令名字符"那条兜底），紧跟着的裸
+        // "{"/"}"字符在下一轮循环里会被当成花括号分组/孤立右花括号处理，语义不对（转义花括号
+        // 本来就该是字面字符，不是分组定界符）。
+        const nextCh = s[i + 1];
+        if (nextCh === '&') { out += '&amp;'; i += 2; continue; }
+        if (nextCh === '%' || nextCh === '_' || nextCh === '#' || nextCh === '$') { out += nextCh; i += 2; continue; }
+        if (nextCh === '{' || nextCh === '}') { out += nextCh; i += 2; continue; }
+        // 重音命令：符号型（' ` " ^ ~ = .，可以裸跟一个字母，也可以花括号包一个字母）或
+        // 字母型（c v u H k r，只认花括号单字母形式——裸跟字母会跟 \url/\vec/\ref 这类更长
+        // 的真实命令名撞在一起，必须靠"紧跟着就是 {"这个边界排除掉那些情况）。
+        const cmdChar = nextCh;
+        const isSymbolAccent = cmdChar && OVL_BIB_ACCENT_SYMBOLS.indexOf(cmdChar) !== -1;
+        const isLetterAccent = cmdChar && OVL_BIB_ACCENT_LETTERS.indexOf(cmdChar) !== -1 && s[i + 2] === '{';
+        if (isSymbolAccent || isLetterAccent) {
+            const p = i + 2;
+            let letter = null, after = p, braced = false;
+            if (s[p] === '{') {
+                const close = ovlFindMatchingBrace(s, p);
+                if (close !== -1 && close - p === 2) { letter = s[p + 1]; after = close + 1; braced = true; }
+            } else if (isSymbolAccent && /[a-zA-Z]/.test(s[p] || '')) {
+                letter = s[p]; after = p + 1;
+            }
+            if (letter != null) {
+                const rep = ovlBibAccentLookup(cmdChar, letter);
+                if (rep != null) { out += rep; i = after; continue; }
+                if (isSymbolAccent) {
+                    // 符号型重音 + 未收录字母组合：原样保留命令文本本身（不落进下面的通用
+                    // 兜底——那条兜底只认字母开头的命令名，符号命令会被跳过导致反斜杠单独
+                    // 裸露），不吞字。
+                    out += '\\' + cmdChar + (braced ? ('{' + letter + '}') : letter);
+                    i = after; continue;
+                }
+                // 字母型（\v \c \u \H \k \r）花括号单字母形式但组合未收录：保留花括号内的
+                // 字母本身（丢重音、不丢字），跟下面通用兜底剥花括号参数是同一种效果。
+                out += letter;
+                i = after; continue;
+            }
+        }
+        // v2 Pass P129b（NB-1 顺手收口）：波兰语/丹麦语/德语人名常见的特殊字母命令——命令名
+        // 本身就是那个字母（跟上面"符号+字母"两段式的重音表结构不同，需要整段匹配命令名，
+        // 不是逐字符判定）。用跟下面通用兜底同一种"贪婪匹配尽量多字母"的命令名正则，但只有
+        // 命令名整体命中 OVL_BIB_SPECIAL_LETTER 才消费；命中不了（比如 \int 不在表里）原样
+        // 落进下面的通用兜底，交给它按已有规则处理，不误伤真实命令。
+        mm = /^\\([a-zA-Z]+)\*?/.exec(s.slice(i));
+        if (mm && Object.prototype.hasOwnProperty.call(OVL_BIB_SPECIAL_LETTER, mm[1])) {
+            out += OVL_BIB_SPECIAL_LETTER[mm[1]];
+            i += mm[0].length;
+            continue;
+        }
+        // v2 Pass P129c（NB-4 收口）：常见携带可读语义的纯符号命令——查表替换成对应文字/符号，
+        // 不落进下面的静默丢弃兜底。跟上面 OVL_BIB_SPECIAL_LETTER 同一次正则匹配结果（mm），
+        // 只是换一张表，不用再跑一次正则。
+        if (mm && Object.prototype.hasOwnProperty.call(OVL_BIB_TEXT_SYMBOL, mm[1])) {
+            out += OVL_BIB_TEXT_SYMBOL[mm[1]];
+            i += mm[0].length;
+            continue;
+        }
+        // 通用兜底：未知 \cmd{arg} -> 只留 arg（递归清洗，逐字保留内容，只丢命令名）。
+        // v2 Pass P129b（blocking-2 收口）：未知的、不带花括号参数的命令 -> 静默丢弃命令名本身，
+        // 不再原样保留。这条跟 Visual 正文渲染器"宁可难看不吞字"的一般纪律刻意不同——bib 条目
+        // 正文里的无参数命令幸存到这里，说明它不是重音、不是 \newblock/\textit/\url/\href 这些
+        // 已知语义命令、也不在上面新增的纯排版宏白名单里、也不在 OVL_BIB_TEXT_SYMBOL 表里——
+        // v2 Pass P129c（NB-4 收口，.claude/tmp/p129_verify2.md）：终核实测证伪了"几乎全是纯
+        // 排版残留、不携带可读内容"这条前提假设，常见反例已收进 OVL_BIB_TEXT_SYMBOL；这里仍然
+        // 静默丢弃（不原样打印命令名——避免用户原始抱怨"似乎没编译"那种裸宏漏出观感），但改成
+        // 给每个不同的命令名往控制台记一次 debug 日志，方便以后按需扩表。实测遇到的具体命令
+        // 清单见 .claude/tmp/p129_impl.md「P129b 收口」节 + p129_verify2.md「NB-4」。
+        mm = /^\\[a-zA-Z@]+\*?/.exec(s.slice(i));
+        if (mm) {
+            let p = i + mm[0].length;
+            while (s[p] === ' ') p++; // 容忍命令名和 { 之间的空格
+            if (s[p] === '{') {
+                const close = ovlFindMatchingBrace(s, p);
+                if (close !== -1) { out += ovlBibCleanText(s.slice(p + 1, close)); i = close + 1; continue; }
+            }
+            const droppedName = mm[0].slice(1).replace(/\*$/, '');
+            if (droppedName && !OVL_BIB_UNKNOWN_CMD_LOGGED.has(droppedName)) {
+                OVL_BIB_UNKNOWN_CMD_LOGGED.add(droppedName);
+                try { console.debug('[ovlBibCleanText] 表外无参命令被丢弃：\\' + droppedName); } catch (e) {}
+            }
+            i = p;
+            continue;
+        }
+        // 反斜杠后面既不是已知转义符也不是合法命令名字符：原样保留这一个反斜杠字符。
+        out += ch; i++;
+    }
+    return out;
+}
+// 从 \begin{thebibliography}...\end{thebibliography} 之间已经摘出来的 inner 文本里（调用方
+// 保证从第一个 \bibitem 开始）切出逐条 { label, key, body }。\bibitem[label]{key} 或
+// \bibitem{key} 都认；花括号不配平的单条（畸形源码）直接跳过、不崩、继续扫下一条。
+function ovlBibParseItems(inner) {
+    const marks = [];
+    const itemRe = /\\bibitem\s*(?:\[((?:[^\[\]]|\[[^\]]*\])*)\])?\s*\{/g;
+    let m, guard = 0;
+    while ((m = itemRe.exec(inner)) && ++guard < 5000) {
+        const braceOpen = m.index + m[0].length - 1;
+        const braceClose = ovlFindMatchingBrace(inner, braceOpen);
+        if (braceClose === -1) { itemRe.lastIndex = m.index + m[0].length; continue; }
+        marks.push({ index: m.index, label: m[1] || null, key: inner.slice(braceOpen + 1, braceClose), bodyStart: braceClose + 1 });
+        itemRe.lastIndex = braceClose + 1;
+    }
+    const items = [];
+    for (let k = 0; k < marks.length; k++) {
+        const bodyEnd = (k + 1 < marks.length) ? marks[k + 1].index : inner.length;
+        items.push({ label: marks[k].label, key: marks[k].key, body: inner.slice(marks[k].bodyStart, bodyEnd) });
+    }
+    return items;
+}
+// v2 Pass P129b（NB-2 顺手收口，non-blocking，.claude/tmp/p129_verify.md）：\bibitem[label]{key}
+// 的可选 label 原来直接 escapeHtml 后当编号输出，重音命令一个字都不清洗——\bibitem[X\"o12]{a2}
+// 显示成字面 "[X\"o12]" 而不是 "[Xö12]"。这里复用 ovlBibCleanText 的重音替换逻辑，再把它
+// 产生的 HTML 转义/标签剥回纯文本（label 场景不需要 <em>/<strong>，且调用方 escapeHtml 还会
+// 再转义一次，不能留着 ovlBibCleanText 自己转义过的实体，否则变成二次转义）。
+function ovlBibCleanLabelPlain(raw) {
+    return ovlBibCleanText(raw)
+        .replace(/<\/?(?:em|strong)>/g, '')
+        .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+}
+// 编号规则（D2/边界纪律，三级优先）：
+//   1) 正文本身已经以 [数字/字母组合] 开头（PDF→LaTeX 转换产物 \bibitem{ref1} [17] … 这种
+//      形态）——原样保留、当作这一条的编号，不再自己重新编号（不能变成 "[1] [17] …" 双写）。
+//   2) 否则 \bibitem[label]{key} 的可选 label 优先用作编号（v2 Pass P129b 起先过
+//      ovlBibCleanLabelPlain 清洗重音，不再原样漏出 \"o 这类裸命令）。
+//   3) 否则按出现顺序 [1] [2] …
+function ovlBibItemNumberAndBody(item, seqIndex) {
+    const trimmed = item.body.replace(/^\s+/, '');
+    const leadNumM = /^\[([^\[\]]{1,24})\]\s*/.exec(trimmed);
+    if (leadNumM) return { num: '[' + leadNumM[1] + ']', body: trimmed.slice(leadNumM[0].length) };
+    if (item.label) return { num: '[' + ovlBibCleanLabelPlain(item.label) + ']', body: trimmed };
+    return { num: '[' + seqIndex + ']', body: trimmed };
+}
+function ovlRenderVisualBibliography(tex) {
+    const cleanedTex = ovlStripLatexCommentsForRender(tex);
+    const beginM = /\\begin\{thebibliography\}\s*\{[^{}]*\}/.exec(cleanedTex);
+    const endIdx = cleanedTex.indexOf('\\end{thebibliography}');
+    // 起止标签本身找不到 / \end 在 \begin 之前（畸形源码）就不装懂——诚实退化成散文渲染，
+    // 不硬凑，也不吞掉后面的内容（D2/边界纪律）。
+    if (!beginM || endIdx === -1 || endIdx < beginM.index) {
+        return '<div class="ovl-visual-float-fallback">' + ovlUnwrapSingleParagraph(renderFormattedText(cleanedTex)) + '</div>';
+    }
+    const bodyStart = beginM.index + beginM[0].length;
+    const inner = cleanedTex.slice(bodyStart, endIdx);
+    // 从第一个 \bibitem 开始才算正文——之前的一切（\providecommand/\csname...\endcsname/
+    // \BIBdecl/\typeout 等 BibTeX/IEEEtran.bst 产物前导宏）一律丢弃，不显示、不报错。
+    const firstItemM = /\\bibitem\b/.exec(inner);
+    const items = firstItemM ? ovlBibParseItems(inner.slice(firstItemM.index)) : [];
+    if (!items.length) {
+        return '<div class="ovl-visual-float-fallback">' + ovlUnwrapSingleParagraph(renderFormattedText(cleanedTex)) + '</div>';
+    }
+    let html = '<div class="ovl-visual-bib">';
+    for (let k = 0; k < items.length; k++) {
+        const nb = ovlBibItemNumberAndBody(items[k], k + 1);
+        const cleaned = ovlBibCleanText(nb.body).replace(/[ \t]*\n[ \t]*/g, ' ').replace(/[ \t]{2,}/g, ' ').trim();
+        html += '<div class="ovl-visual-bib-item" data-bib-key="' + escapeAttr(items[k].key || '') + '">'
+            + '<span class="ovl-visual-bib-num">' + escapeHtml(nb.num) + '</span>'
+            + '<span class="ovl-visual-bib-text">' + cleaned + '</span></div>';
     }
     html += '</div>';
     return html;
@@ -30998,6 +31410,12 @@ const OVL_VISUAL_MATH_ATOMIC_ENV_RE = /^(equation|align|gather|multline|eqnarray
 // 套进 table 反而不合法），必须跟 table/algorithm/figure 一样单独记一档深度，否则
 // ovlSplitVisualBlocks 会把它当普通正文按源码行切散，& / \\ 全部打碎。
 const OVL_VISUAL_FLOAT_ATOMIC_ENV_RE = /^(table|algorithm|figure|longtable)\*?$/;
+// v2 Pass P129：thebibliography 也要"整段自成一块"——用户原话："这部分在原版 visual 下显示
+// 的也不太对，似乎没编译。我觉得要没不显示，要么就按照编译正确显示。"诊断
+// .claude/tmp/p128_diag.md §7.2 实测：现状被 ovlSplitVisualBlocks 按空行切成 40+ 散块，
+// \bibitem/\newblock/\providecommand 全部漏成裸源码。跟 floatDepth 同一套"深度计数器 + 强制
+// 成块"手法，见下面 ovlSplitVisualBlocks 里的 bibDepth。
+const OVL_VISUAL_BIB_ATOMIC_ENV_RE = /^thebibliography$/;
 // v2 Pass P105：转义感知地数一行里真正生效的裸定界符（\[ \] \( \)）出现次数。判定用的是
 // 跟下面 ovlLatexEscapedAt 同一套"数紧邻前面连续反斜杠的奇偶"算法，但这里奇偶的含义反过来
 // 读：花括号那边"奇数个反斜杠=被转义成字面量"，这里"奇数个反斜杠=真正合并成一个 TeX 控制
@@ -31015,17 +31433,92 @@ function ovlLatexCountBareDelim(text, ch) {
     }
     return n;
 }
+// v2 Pass P129b（BL1 收口，.claude/tmp/p129_verify.md blocking-1）：紧贴在 \begin{thebibliography}
+// 正上方、中间没有空行的内容曾经被无差别整段吸进 bib 原子块——如果那段内容其实是真实正文
+// （或者只是"没有专门给它留一处判定入口"的普通段落），会被 ovlRenderVisualBibliography
+// 「从第一个 \bibitem 开始才算正文」那刀连同前导宏一起丢弃，正文静默消失（对抗触发矩阵
+// V1-V6，V2/V3/V4/V6 复现）。修法：entersBibHere 触发时，往回扫 cur 找出"贴着结尾、确实是
+// 已知 BibTeX/IEEEtran 前导宏（含其未在同一行闭合的花括号体）"的那一段噪声，只把这一段
+// 留给即将开始的 bib 原子块（交给 ovlRenderVisualBibliography 继续按老规则清理），噪声段前面
+// 的内容（不管是普通正文段落还是 \begin{center}…\end{center} 这类完整结构）强制单独 flush
+// 成一块，绝不再被捎带丢弃。
+//
+// 单纯按"这一行是不是以已知命令名开头"逐行判定不够：真实 IEEEtran 前导常见形如
+//   \providecommand{\BIBentryALTinterwordspacing}{\spaceskip=\fontdimen2\font plus
+//   \fontdimen3\font minus \fontdimen4\font\relax}
+// 第二行本身不以任何已知命令名开头，但它是第一行未闭合花括号体的延续——所以这里维护一个
+// "净花括号深度"：一旦某行被判定为噪声且这一行结尾花括号没配平，后续行只要仍处于这个未闭合
+// 深度里，不管长什么样都继续算噪声，直到深度归零。真实正文行永远不参与、也不重置这个深度
+// 追踪（避免正文里偶然出现的孤立花括号把后面的内容误判成噪声）。
+const OVL_VISUAL_BIB_PREAMBLE_LEAD_RE = /^\\(providecommand|renewcommand|newcommand|BIBdecl|expandafter|ifx|else\b|fi\b|typeout|language|csname|endcsname|def|let|global|long|makeatletter|makeatother|ifCLASSOPTION\w*)\b/;
+const OVL_VISUAL_BIB_PREAMBLE_PUNCT_RE = /^[{}%#@=0-9\s]*$/;
+function ovlBibPreambleLineIsNoise(line, depth) {
+    if (depth > 0) return true;
+    const t = line.trim();
+    if (t === '') return true;
+    if (t[0] === '%') return true;
+    if (OVL_VISUAL_BIB_PREAMBLE_LEAD_RE.test(t)) return true;
+    if (OVL_VISUAL_BIB_PREAMBLE_PUNCT_RE.test(t)) return true;
+    return false;
+}
+// v2 Pass P129c（NB-1 收口，.claude/tmp/p129_verify2.md）：注释里落单的 { 会把花括号深度
+// 前向污染到它下面的真实正文——原因是深度扫描把整行（含 % 后面的注释文本）都数了一遍。真正的
+// TeX 语义是 "未转义的 % 到行尾都是字面注释，不是代码"，注释里的花括号根本不存在于代码结构
+// 里，不该参与深度计数。这里剥掉每一行里"生效的"（未被 \% 转义）% 之后的部分，只用剥完注释的
+// "代码部分" 参与深度计数；`\%` 是转义的字面百分号，不算注释起点，继续往后找下一个 %。
+function ovlBibStripLineComment(line) {
+    for (let i = 0; i < line.length; i++) {
+        if (line[i] !== '%') continue;
+        let bs = 0, j = i - 1;
+        while (j >= 0 && line[j] === '\\') { bs++; j--; }
+        if (bs % 2 === 0) return line.slice(0, i); // 偶数个反斜杠（含 0 个）=> 真注释起点
+    }
+    return line;
+}
+// 返回 cur 里"真实正文"结束、"可吸收进 bib 原子块的前导噪声"开始的下标（0 基）。
+// 返回值 === cur.length：整段都不是噪声，不吸收任何东西（对应 V3：正文直接贴 \begin，无前导）。
+// 返回值 === 0：整段都是噪声，维持原状全部吸收（对应现有 baseline 行为，不需要切）。
+function ovlBibFindPreambleCut(cur) {
+    let depth = 0;
+    const noise = new Array(cur.length);
+    for (let idx = 0; idx < cur.length; idx++) {
+        const line = cur[idx];
+        const isNoise = ovlBibPreambleLineIsNoise(line, depth);
+        noise[idx] = isNoise;
+        if (isNoise) {
+            const codePart = ovlBibStripLineComment(line); // 注释部分不参与深度计数（NB-1）
+            let opens = 0, closes = 0;
+            for (let c = 0; c < codePart.length; c++) { if (codePart[c] === '{') opens++; else if (codePart[c] === '}') closes++; }
+            depth = Math.max(0, depth + opens - closes);
+        } else {
+            depth = 0; // 真实正文行不参与花括号深度追踪，避免误伤后续内容
+        }
+    }
+    let cut = cur.length;
+    for (let idx = cur.length - 1; idx >= 0 && noise[idx]; idx--) cut = idx;
+    return cut;
+}
 function ovlSplitVisualBlocks(body, baseLine) {
     const lines = body.split('\n');
     const blocks = [];
     let mathDepth = 0;
     let floatDepth = 0;
+    // v2 Pass P129：只有 \begin{thebibliography}/\end{thebibliography} 在整个 body 里数量
+    // 配平才把它当原子块处理——畸形源码（缺 \end）绝不吞掉后面整篇正文，回退成旧的按空行
+    // 切分行为（照抄 xportEnvRanges，9955 行附近，"没配对就当普通正文放过"的纪律）。这是
+    // 一次性预扫描（跟下面逐行扫描相互独立），不是逐行现判——单一 \begin{thebibliography}
+    // 没有 \end 配对时，beginsBib/endsBib 下面恒为 0，bibDepth 永远不推进，isHeading/flush
+    // 的判定条件里加的 bibDepth===0 天然总是成立，等价于这次改动完全不存在。
+    const bibBeginCount = (body.match(/\\begin\{thebibliography\}/g) || []).length;
+    const bibEndCount = (body.match(/\\end\{thebibliography\}/g) || []).length;
+    const bibWellFormed = bibBeginCount > 0 && bibBeginCount === bibEndCount;
+    let bibDepth = 0;
     let cur = [];
     let curStart = 0;
     // v2 Pass（Visual 按源码行断行）：这一组攒的内容有没有碰过数学/float 原子环境——决定它
-    // 是不是"原子块"。原子块（公式/表格/算法/图片）下游 ovlVisualRenderBodyWithLines 永远
-    // 整块渲染、不会再交给 ovlSplitVisualLines 按行细分；普通正文块才会被细分。见下面
-    // 那一行"这一行涉不涉及原子环境"的判定紧跟在 begins/endsMath/Float 算出来之后。
+    // 是不是"原子块"。原子块（公式/表格/算法/图片/参考文献）下游 ovlVisualRenderBodyWithLines
+    // 永远整块渲染、不会再交给 ovlSplitVisualLines 按行细分；普通正文块才会被细分。见下面
+    // 那一行"这一行涉不涉及原子环境"的判定紧跟在 begins/endsMath/Float/Bib 算出来之后。
     let curAtomic = false;
     const beginRe = /\\begin\{([^}]*)\}/g;
     const endRe = /\\end\{([^}]*)\}/g;
@@ -31039,23 +31532,25 @@ function ovlSplitVisualBlocks(body, baseLine) {
     for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         const isBlank = line.trim() === '';
-        const isHeading = mathDepth === 0 && floatDepth === 0 && !isBlank && headingRe.test(line);
+        const isHeading = mathDepth === 0 && floatDepth === 0 && bibDepth === 0 && !isBlank && headingRe.test(line);
         // v2 Pass P14：光靠空行还不够——用户实测的那个 47 行 proposition 内部压根没有一个
         // 空行（学术写作里常见：一个环境内部段落之间只用普通换行，不留空行），单靠"放开
         // 空行拦截"这一刀切不动它。真正稳定存在、且天然是"这一段到此为止"的边界，是数学
         // 专用环境自己的起止——公式前的正文和公式本身、公式和公式后的正文，本来就是三种
         // 不同性质的内容，理应各自成块。这里探一下这一行会不会让 mathDepth 从 0 迈进 1，
         // 是的话在推进这一行之前先把之前攒的内容切走，让公式自己起一块新的。
-        let beginsMath = 0, endsMath = 0, beginsFloat = 0, endsFloat = 0, m;
+        let beginsMath = 0, endsMath = 0, beginsFloat = 0, endsFloat = 0, beginsBib = 0, endsBib = 0, m;
         beginRe.lastIndex = 0;
         while ((m = beginRe.exec(line))) {
             if (OVL_VISUAL_MATH_ATOMIC_ENV_RE.test(m[1])) beginsMath++;
             if (OVL_VISUAL_FLOAT_ATOMIC_ENV_RE.test(m[1])) beginsFloat++;
+            if (bibWellFormed && OVL_VISUAL_BIB_ATOMIC_ENV_RE.test(m[1])) beginsBib++;
         }
         endRe.lastIndex = 0;
         while ((m = endRe.exec(line))) {
             if (OVL_VISUAL_MATH_ATOMIC_ENV_RE.test(m[1])) endsMath++;
             if (OVL_VISUAL_FLOAT_ATOMIC_ENV_RE.test(m[1])) endsFloat++;
+            if (bibWellFormed && OVL_VISUAL_BIB_ATOMIC_ENV_RE.test(m[1])) endsBib++;
         }
         // v2 Pass P105：\[...\]（行间数学的裸写法，不走 \begin{}/\end{} 环境名，上面两个
         // 正则天生逮不到它）并入同一个 beginsMath/endsMath 计数——让它享有跟 equation/align
@@ -31070,9 +31565,44 @@ function ovlSplitVisualBlocks(body, baseLine) {
         endsMath += ovlLatexCountBareDelim(line, ']');
         const entersMathHere = mathDepth === 0 && beginsMath > 0;
         const entersFloatHere = floatDepth === 0 && beginsFloat > 0;
-        if (mathDepth === 0 && floatDepth === 0 && (isBlank || isHeading || entersMathHere || entersFloatHere) && cur.length) flush();
+        // v2 Pass P129：不把"进入 bib 环境"塞进下面这一刀通用 flush 触发条件（跟 math/float
+        // 不同——那两个的 entersMathHere/entersFloatHere 仍然强制切）。诊断
+        // .claude/tmp/p128_diag.md §7.2 实测真实文档里 \providecommand/\BIBdecl 等
+        // BibTeX/IEEEtran.bst 前导宏经常跟 \begin{thebibliography} 之间没有空行——如果这里
+        // 无差别强制切块，这段前导噪声会独立成一个"普通正文"块，走不到
+        // ovlRenderVisualBibliography，D2 那条"从第一个 \bibitem 开始才算正文，之前的一律
+        // 丢弃"的纪律就失效了。真正的段落边界（有空行分隔）不受影响，仍然照常在空行处切开。
+        //
+        // v2 Pass P129b（BL1 收口）：上面这条设计只考虑了"不能强制切"，没考虑"不切就会把紧贴
+        // 在前导宏之前、同样没有空行分隔的真实正文一起捎带丢弃"（对抗触发矩阵 V2/V3/V4/V6）。
+        // entersBibHere 触发时用 ovlBibFindPreambleCut 往回找真实前导宏噪声与真实正文的边界，
+        // 把噪声之前的内容单独 flush 成一块（绝不吞正文），噪声本身继续留给即将开始的 bib
+        // 原子块（行为与之前一致，交给 ovlRenderVisualBibliography 清理）。
+        const entersBibHere = bibDepth === 0 && beginsBib > 0;
+        if (entersBibHere && cur.length) {
+            const cut = ovlBibFindPreambleCut(cur);
+            if (cut > 0) {
+                const preambleNoise = cur.slice(cut);
+                cur.length = cut;
+                flush();
+                cur = preambleNoise;
+                curStart = i - preambleNoise.length;
+            }
+        }
+        if (mathDepth === 0 && floatDepth === 0 && bibDepth === 0 && (isBlank || isHeading || entersMathHere || entersFloatHere) && cur.length) flush();
         if (isBlank) {
-            curStart = i + 1;
+            // v2 Pass P129：参考文献条目之间的空行是合法内容间隔（BibTeX/.bbl 产物的正常
+            // 写法，诊断 .claude/tmp/p128_diag.md §7.2 实测确有此形态），不能像 math/float
+            // 环境内部空行那样直接丢弃——丢了会让下面 flush() 里 cur.join('\n') 拼出来的
+            // 行数比真实源码行区间短，级联算错这个块之后所有块的绝对行号，打穿 P123 的
+            // gutter 对齐。math/float 内部空行本来就是编译错误，丢弃无副作用，这里只在
+            // bibDepth>0 时改走"保留"分支，其余场景（bibDepth===0）逐字节维持旧行为。
+            if (bibDepth > 0) {
+                if (cur.length === 0) curStart = i;
+                cur.push(line);
+            } else {
+                curStart = i + 1;
+            }
         } else {
             if (cur.length === 0) curStart = i;
             cur.push(line);
@@ -31081,13 +31611,16 @@ function ovlSplitVisualBlocks(body, baseLine) {
         // 这一行只要沾了原子环境的边——不管是刚进入、正呆在里面、还是刚离开（同一行开
         // 又同一行闭，比如 "\begin{equation}x=1\end{equation}"，闭合那一刻 mathDepth 已经
         // 归零，只看 mathDepth>0 会漏判）——这一组就是原子块，标记下来。
-        if (beginsMath > 0 || endsMath > 0 || beginsFloat > 0 || endsFloat > 0 || mathDepth > 0 || floatDepth > 0) curAtomic = true;
+        if (beginsMath > 0 || endsMath > 0 || beginsFloat > 0 || endsFloat > 0 || beginsBib > 0 || endsBib > 0 || mathDepth > 0 || floatDepth > 0 || bibDepth > 0) curAtomic = true;
         mathDepth = Math.max(0, mathDepth + beginsMath - endsMath);
         floatDepth = Math.max(0, floatDepth + beginsFloat - endsFloat);
-        // 公式/float 刚闭合（对应深度归零）：让它自己收尾成一块，别把后面紧跟着的正文焊
-        // 进同一块——否则"公式/表格/算法/图片 + 后面一大段话"又会重新长成下一个超长块。
+        bibDepth = Math.max(0, bibDepth + beginsBib - endsBib);
+        // 公式/float/bib 刚闭合（对应深度归零）：让它自己收尾成一块，别把后面紧跟着的正文
+        // 焊进同一块——否则"公式/表格/算法/图片/参考文献 + 后面一大段话"又会重新长成下一个
+        // 超长块。
         if (mathDepth === 0 && endsMath > 0 && cur.length) { flush(); curStart = i + 1; }
         if (floatDepth === 0 && endsFloat > 0 && cur.length) { flush(); curStart = i + 1; }
+        if (bibDepth === 0 && endsBib > 0 && cur.length) { flush(); curStart = i + 1; }
     }
     flush();
     return blocks;
@@ -31221,8 +31754,17 @@ function ovlSplitVisualLines(blockText, blockStartLine) {
 // "两层掩码后无可翻内容"的豁免路径产出的，调用方（下面 ovlVisualRenderBodyWithLines）据此
 // 重新打上 data-ovl-trans-skipped，跟首次翻译落地时打的是同一个属性、同一个语义，只是
 // 换了个信息来源（首次是 worker 的 meta.skipped，重渲染是缓存里存的 skipped 标记）。
+// v2 Pass P129：参考文献块整段命中就短路——不查缓存、不进队列、不算失败，直接渲染成编号
+// 引用列表（ovlVisualRenderChunk 已经会分派给 ovlRenderVisualBibliography），标 notrans:true
+// 供 ovlVisualRenderBodyWithLines 打 data-ovl-trans-notrans、供 ovlVisualLangSyncAfterRender
+// 从翻译分母里扣掉。只在 lang==='zh' 时才需要这条短路——Original 模式本来就直接返回
+// ovlVisualRenderChunk(text)，thebibliography 分派本身已经对两种模式都生效，不用重复判断。
+const OVL_VISUAL_BIB_BLOCK_RE = /\\begin\{thebibliography\}/;
 function ovlVisualRenderBlockContent(text) {
-    if (OvlVisualLangState.lang !== 'zh') return { html: ovlVisualRenderChunk(text), pending: false, skipped: false, forced: false, partial: false, partialReason: null };
+    if (OvlVisualLangState.lang === 'zh' && OVL_VISUAL_BIB_BLOCK_RE.test(text)) {
+        return { html: ovlVisualRenderChunk(text), pending: false, skipped: false, forced: false, partial: false, partialReason: null, notrans: true };
+    }
+    if (OvlVisualLangState.lang !== 'zh') return { html: ovlVisualRenderChunk(text), pending: false, skipped: false, forced: false, partial: false, partialReason: null, notrans: false };
     try {
         const cfg = (typeof getApiConfig === 'function') ? getApiConfig() : null;
         const meta = cfg ? ovlVisualTransCacheGetMeta(text, cfg) : null;
@@ -31230,9 +31772,9 @@ function ovlVisualRenderBlockContent(text) {
         // 同一条纪律，只是信息来源换成缓存字段），供进度行统计"J 个块由用户强制采用"。
         // v2 Pass P122c（BV2-2 修复）：partial/partialReason 同一条纪律，供 ovlVisualRenderBodyWithLines
         // 重新打回 data-ovl-trans-partial / -reason，避免重渲染后"部分翻译"标记与进度行静默归零。
-        if (meta != null) return { html: ovlVisualRenderChunk(meta.tgt), pending: false, skipped: !!meta.skipped, forced: !!meta.forced, partial: !!meta.partial, partialReason: meta.partialReason || null };
+        if (meta != null) return { html: ovlVisualRenderChunk(meta.tgt), pending: false, skipped: !!meta.skipped, forced: !!meta.forced, partial: !!meta.partial, partialReason: meta.partialReason || null, notrans: false };
     } catch (e) {}
-    return { html: ovlVisualRenderChunk(text), pending: true, skipped: false, forced: false, partial: false, partialReason: null };
+    return { html: ovlVisualRenderChunk(text), pending: true, skipped: false, forced: false, partial: false, partialReason: null, notrans: false };
 }
 
 // ==================== v2 Pass P116：Visual 章节 IEEE 编号 ====================
@@ -31345,6 +31887,7 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
                 + '" data-para-start="1"' + numAttrHtml + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
                 + (rc.skipped ? ' data-ovl-trans-skipped="1"' : '') + (rc.forced ? ' data-ovl-trans-forced="1"' : '')
                 + (rc.partial ? ovlVisualPartialAttrHtml(rc.partialReason) : '') // v2 Pass P122c（BV2-2）：缓存命中回填 partial
+                + (rc.notrans ? ' data-ovl-trans-notrans="1" title="参考文献列表按原文显示，不做翻译"' : '') // v2 Pass P129
                 + '>' + rc.html + '</div>'; // v2 Pass P113 返修（问题2）；forced 见 v2 Pass P122（C6）
             continue;
         }
@@ -31355,6 +31898,7 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
                 + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '"' + (j === 0 ? numAttrHtml : '') + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
                 + (rc.skipped ? ' data-ovl-trans-skipped="1"' : '') + (rc.forced ? ' data-ovl-trans-forced="1"' : '')
                 + (rc.partial ? ovlVisualPartialAttrHtml(rc.partialReason) : '') // v2 Pass P122c（BV2-2）：缓存命中回填 partial
+                + (rc.notrans ? ' data-ovl-trans-notrans="1" title="参考文献列表按原文显示，不做翻译"' : '') // v2 Pass P129
                 + '>' + rc.html + '</div>'; // v2 Pass P113 返修（问题2）；forced 见 v2 Pass P122（C6）
         }
     }
@@ -31779,7 +32323,11 @@ function ovlVisualLangSyncAfterRender() {
     if (OvlVisualLangState.lang !== 'zh') { ovlVisualLangProgressUpdate(); return; }
     const pane = document.getElementById('ovlVisualPane');
     if (!pane) return;
-    const total = pane.querySelectorAll('.ovl-visual-block').length;
+    // v2 Pass P129：参考文献块（data-ovl-trans-notrans）不入翻译分母——它们从不会有
+    // pending/inflight 标记（ovlVisualRenderBlockContent 对它们短路，从不查缓存/不进队列），
+    // 分子（pending/inflight 减法）天然已经不含它们；分母这里必须显式排除，否则永远多算
+    // 出几个"应译但从没被尝试过"的块，done 追不上 total，进度条卡死在 N/M（N<M）永不隐藏。
+    const total = pane.querySelectorAll('.ovl-visual-block:not([data-ovl-trans-notrans])').length;
     const pending = pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-pending="1"]').length;
     // v2 Pass P113c（核验 .claude/tmp/p113_verify.md 次要2，done>total 计数窗口）：worker
     // 摘掉 pending 到真正 done++ 之间有一次 await，那段窗口里的块既不是 pending 也还不是
