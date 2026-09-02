@@ -4279,7 +4279,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.09.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.09.03';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -22134,6 +22134,7 @@ async function chatAgentP2TEnsureJobForReconvert(readiness) {
         concurrency: Math.max(1, Math.min(4, Number(OvlSettings.pdf2texConcurrency) || 3)),
         model: (OvlSettings.pdf2texVisionModel || '').trim(), endpoint: (OvlSettings.pdf2texVisionEndpoint || '').trim().replace(/\/+$/, ''),
         pages: pages, startedAt: Date.now(), finishedAt: null, cancelled: false, pipelineError: null,
+        pausedAt: null, pausedMs: 0, // v2 Pass P127b（N2）：ovlP2TCancel/ovlP2TContinue 配对读写，见两函数定义处注释
         aborts: new Set(), doc: doc
     };
     OvlP2TState.job = job;
@@ -39398,8 +39399,9 @@ function ovlP2TAskOutputDir(entry) {
 //   把整页算子表同步跑完，会连续占满主线程；后台标签页本身事件循环调度权重更低，长时间占满
 //   主线程会让页面对用户输入/其它任务的响应变差。
 // MessageChannel 的 postMessage 是宏任务，不属于 timer API，不受 Chrome 后台节流影响，且
-// 每次都真正让出一次事件循环——可见/不可见两种状态下调度行为完全一致，不需要看 document.hidden
-// 分支特殊处理。
+// 每次都真正让出一次事件循环——调度原语本身可见/不可见两种状态下行为一致；但下面
+// ovlP2TBeginRafBypass 装的替身函数会额外看 document.hidden 来决定要不要真的改道到它
+// （v2 Pass P127b 收口，见下方大段注释），不是这一段调度原语自身的属性。
 let _ovlP2TYieldChannel = null;
 let _ovlP2TYieldQueue = [];
 function ovlP2TYield() {
@@ -39420,14 +39422,66 @@ function ovlP2TYield() {
 // 引用计数，允许并发（pdf2texConcurrency）多个 page.render() 同时在飞：只在第一次进入时
 // 接管 window.requestAnimationFrame，只在最后一个退出时还原，避免 A 还没渲染完、B 先结束
 // 就把全局 rAF 提前换回原生实现。
+//
+// v2 Pass P127b 收口（对抗终核 N1，.claude/tmp/p127_verify.md §2①②/§8 N1）：P127 最初的
+// 替身接管是"全局且无条件"的——恒返回句柄 0、且从不接管 cancelAnimationFrame。这两点对
+// pdf.js 本身无害（pdf.js 从不调用 cancelAnimationFrame，已核实），但接管期间会波及本文件
+// 其它 10 处 rAF 调用点：① `if (!rafId) rafId = raf(...)` 这类 truthy 合并守卫因为 0 是假值，
+// 每次 schedule 都会重新判定成"还没排"，实测 20 次连续 schedule → 20 次 flush（原生只 1 次，
+// 19186/27554/27811/45147 四处拖拽/滚动合帧守卫都是这个模式）；② `cancelAnimationFrame(0)`
+// 传给原生实现必然是 no-op，取消完全失效，P123 的 ovlFlushPendingVisualGutter（48475）因此
+// 取消不掉已排队的重绘回调，实测 gutter 被多画一次。根子都是"替身句柄不是真句柄、且没接管
+// cancelAnimationFrame"，跟"要不要绕开 rAF 节流"这件事本身无关。
+//
+// 收口两处改动，把副作用面收缩到只剩"确实需要绕开节流"的场景：
+// (a) 替身函数每次被调用时先看 document.hidden——可见（前台）就原样委托原生 rAF，返回原生
+//     句柄、取消语义跟 P127 之前完全一致；只有真正不可见（后台标签页）时才改道 MessageChannel。
+//     pdf.js 的分片循环每帧都会重新调一次 window.requestAnimationFrame（不是只读一次缓存），
+//     所以同一次 page.render() 跨越"后台→前台"切换时，这个判断会自动逐帧跟着切，不需要额外
+//     处理（P127 终核 probe4 已验证这类跨切换场景）。
+// (b) 改道分支返回自增的唯一正整数句柄（从 1e9 起跳，跟浏览器原生句柄的号段——从 1 起的小
+//     整数——错开，避免万一被前台/后台混用的代码拿混淆），并且同期接管
+//     window.cancelAnimationFrame：收到的 handle 在待执行表（Map）里就删表（真正取消，
+//     排队的回调不会再跑），不在表里就落到原生 cancelAnimationFrame（覆盖"这次 rAF 是前台
+//     原生委托来的、句柄也是原生的"那条路径）。待执行表随 Begin/End 建立/清空，不跨接管
+//     会话泄漏。
+//
+// 潜在风险（已知、非本次修复目标，见终核 N1 第4点）：接管期间任何自递归 rAF 循环仍然会以
+// MessageChannel 的宏任务吞吐速率运行（远快于原生 60fps 节流）。实测（本文件
+// test_p127_bg_render.js「N1-bg」用例，2026-09-02，真实后台标签页，headless Chrome，同机
+// 连续两次运行测得 32786 次/秒、35795 次/秒）：1 秒内自递归 rAF 循环触发次数量级在 3~4 万
+// 次/秒（原生 60 次/秒）。当前代码库里全部 10 处 rAF 调用点逐个核对过，没有任何一处是自
+// 递归动画循环（都是"一次性合并重绘"模式），不会
+// 触发这条路径；日后如果新增 rAF 驱动的动画循环，会在接管期间以此速率空转，留作已知限制。
 let _ovlP2TRafBypassDepth = 0;
 let _ovlP2TRealRAF = null;
+let _ovlP2TRealCAF = null;
+let _ovlP2TBypassHandleSeq = 1e9; // 高位起跳，跟原生句柄号段（从 1 起的小整数）错开
+let _ovlP2TBypassPending = null; // Map<handle, true>：改道分支排进去、还没执行/没被取消的回调
 function ovlP2TBeginRafBypass() {
     if (_ovlP2TRafBypassDepth === 0 && typeof window !== 'undefined' && window.requestAnimationFrame) {
         _ovlP2TRealRAF = window.requestAnimationFrame;
+        _ovlP2TRealCAF = (typeof window.cancelAnimationFrame === 'function') ? window.cancelAnimationFrame : function () {};
+        _ovlP2TBypassPending = new Map();
         window.requestAnimationFrame = function (cb) {
-            ovlP2TYield().then(function () { cb(typeof performance !== 'undefined' ? performance.now() : Date.now()); });
-            return 0; // pdf.js 从不调用 cancelAnimationFrame（已核实），返回值不会被用到
+            if (typeof document === 'undefined' || document.hidden !== true) {
+                return _ovlP2TRealRAF(cb); // 前台：原样委托原生，句柄/取消语义都不变
+            }
+            const handle = ++_ovlP2TBypassHandleSeq;
+            _ovlP2TBypassPending.set(handle, true);
+            ovlP2TYield().then(function () {
+                if (!_ovlP2TBypassPending || !_ovlP2TBypassPending.has(handle)) return; // 已被 cancelAnimationFrame 取消
+                _ovlP2TBypassPending.delete(handle);
+                cb(typeof performance !== 'undefined' ? performance.now() : Date.now());
+            });
+            return handle; // 唯一非零正整数，跟原生句柄号段错开
+        };
+        window.cancelAnimationFrame = function (handle) {
+            if (_ovlP2TBypassPending && _ovlP2TBypassPending.has(handle)) {
+                _ovlP2TBypassPending.delete(handle);
+                return;
+            }
+            return _ovlP2TRealCAF(handle); // 原生句柄（前台委托来的）落到真正的原生取消
         };
     }
     _ovlP2TRafBypassDepth++;
@@ -39436,7 +39490,10 @@ function ovlP2TEndRafBypass() {
     _ovlP2TRafBypassDepth = Math.max(0, _ovlP2TRafBypassDepth - 1);
     if (_ovlP2TRafBypassDepth === 0 && _ovlP2TRealRAF) {
         window.requestAnimationFrame = _ovlP2TRealRAF;
+        window.cancelAnimationFrame = _ovlP2TRealCAF;
         _ovlP2TRealRAF = null;
+        _ovlP2TRealCAF = null;
+        _ovlP2TBypassPending = null;
     }
 }
 async function ovlP2TRenderPageToCanvas(page, maxPx) {
@@ -41760,11 +41817,27 @@ function ovlP2TCancel() {
     job.cancelled = true;
     job.aborts.forEach(function (a) { try { a.abort(); } catch (e) {} });
     job.pages.forEach(function (p) { if (p.state === 'running') p.state = 'pending'; });
+    // v2 Pass P127b（终核 N2，.claude/tmp/p127_verify.md §4/§8）：记下"这次取消发生的时刻"，
+    // 配合 ovlP2TContinue() 里的平移——不这样做的话，用户「取消 → 隔很久 → 继续转换」这段
+    // 纯等待的墙钟会被 ovlP2TPanelRender() 的 elapsedS（= Date.now() - job.startedAt）当成
+    // "转换真的在跑"算进吞吐，实测隔 2 小时continue 会把 ETA 从几百秒放大到 22500 秒量级。
+    // 只在还没记过的时候写（job.pausedAt 为 null）——避免用户反复点"取消"按钮把起点越推越晚。
+    if (job.pausedAt == null) job.pausedAt = Date.now();
     ovlP2TPanelRender();
 }
 function ovlP2TContinue() {
     const job = OvlP2TState.job;
     if (!job || OvlP2TState.running) return;
+    // v2 Pass P127b（终核 N2）：把 job.pausedAt 到现在这段纯等待时长整体平移进 job.startedAt——
+    // ovlP2TPanelRender() 算 elapsedS 时用的就是 Date.now() - job.startedAt，startedAt 往后
+    // 平移相同时长，暂停期间的墙钟就不会再被算作"转换耗时"，ETA 分母（真实吞吐）也就不会被
+    // 一次历史停顿永久污染。job.pausedMs 只做累计诊断用，不参与任何计算。
+    if (job.pausedAt != null) {
+        const pausedForMs = Math.max(0, Date.now() - job.pausedAt);
+        job.startedAt += pausedForMs;
+        job.pausedMs = (job.pausedMs || 0) + pausedForMs;
+        job.pausedAt = null;
+    }
     ovlP2TRunPipeline(job);
 }
 
@@ -41901,6 +41974,8 @@ async function ovlP2TBeginJob(entry, outRel) {
         finishedAt: null,
         cancelled: false,
         pipelineError: null,
+        pausedAt: null, // v2 Pass P127b（N2）：ovlP2TCancel() 写、ovlP2TContinue() 读并清空，见两函数定义处注释
+        pausedMs: 0, // 累计暂停时长，仅供诊断参考——真正生效的是 ovlP2TContinue() 里对 startedAt 的平移
         aborts: new Set(),
         doc: doc
     };
