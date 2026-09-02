@@ -1933,7 +1933,7 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    编辑器主体（含 gutter，"整个可视宽度"），画的是整行色带，位置靠 JS 用 ta.scrollTop 现算，
    scroll 时重算（Code 模式下 textarea 自己滚，不是父容器滚，没法靠"挂在滚动内容内部"
    免费获得跟随滚动的效果）。 */
-#ovlVisualMarkOverlay { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 6; opacity: 1; transition: opacity 0.6s ease; }
+#ovlVisualMarkOverlay { position: absolute; top: 0; left: 0; pointer-events: none; z-index: 6; opacity: 1; transition: opacity 0.3s ease; }
 .ovl-mark-box {
     position: absolute;
     border: 1px solid var(--ovl-mark-outline, rgba(202, 138, 4, 0.85));
@@ -1949,17 +1949,17 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
     overflow: hidden;
     z-index: 1;
     opacity: 1;
-    transition: opacity 0.6s ease;
+    transition: opacity 0.3s ease;
 }
-/* v2 Pass P45：约 60 秒后自动淡出（见 ovlMarkScheduleFadeOut）——只切 opacity，不切
-   display/visibility，靠上面两条 transition 平滑过渡，不是突然消失。淡出动画播完之后
-   ovlClearMarkOverlay() 才真的清空 DOM，见该函数调用点。 */
+/* v2 Pass P45：可设置时长（默认 60 秒，v2 Pass P124 改为可调，见 OvlHighlightExpiry）后自动
+   淡出——只切 opacity，不切 display/visibility，靠上面两条 transition 平滑过渡，不是突然消失。
+   淡出动画播完之后 ovlClearMarkOverlay() 才真的清空 DOM，见该函数调用点。 */
 #ovlVisualMarkOverlay.ovl-mark-fadeout, #ovlCodeMarkOverlay.ovl-mark-fadeout { opacity: 0; }
 /* v2 Pass P73：正向 SyncTeX 近似高亮框容器，挂在单页 .ovl-pdf-page（position:relative）内部，
    跟 #ovlVisualMarkOverlay 同一套颜色变量/class（.ovl-mark-box）、同一套淡出约定，独立开一个
    容器只是因为它挂在"某一页"上而不是整个 PDF 面板。 */
 .ovl-pdf-sync-overlay { position: absolute; inset: 0; pointer-events: none; z-index: 5;
-    opacity: 1; transition: opacity 0.6s ease; }
+    opacity: 1; transition: opacity 0.3s ease; }
 .ovl-pdf-sync-overlay.ovl-mark-fadeout { opacity: 0; }
 .ovl-visual-raw { white-space: pre-wrap; word-break: break-word; font: 12px/1.5 "SFMono-Regular", Consolas, monospace; color: #374151; }
 .ovl-visual-bar {
@@ -4275,7 +4275,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.08.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.08.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -12227,11 +12227,133 @@ async function handleAiRefine(index, field, type) {
 }
 
 // 显示 Toast 提示
+// v2 Pass P125（C4 根治，诊断见 .claude/tmp/p122_diag.md §3.2/§4 C4）：外壳模式下（LaTeX
+// 工作台，v1 翻译器悬浮窗关着，这是打开页面后的默认状态）CSS 第 1195 行
+// `body.ovl-shell-active:not(.ovl-translator-open) #root { display:none }` 让下面
+// setState({toast}) 写进 #root.innerHTML 的提示框整体不可见（实测 rect=0x0、
+// offsetParent===null）——全部约 160 处 showToast 调用点因此隐形。
+// 分流只加在函数最前面：命中外壳模式时转给 ovlToastShow（挂在 document.body 下，P125b 起
+// 不再挂 #ovlPortal，定义见下方「外壳原生 toast」一节）并 return；不命中（v1 翻译器悬浮窗
+// 开着、#root 可见）时原样落到
+// 下面两条语句——这两条语句本身一个字节没有改动，铁律见 CLAUDE.md/任务书。
 function showToast(message, type = 'info') {
+    try {
+        if (document.body.classList.contains('ovl-shell-active') && !document.body.classList.contains('ovl-translator-open')) {
+            ovlToastShow(message, type);
+            return;
+        }
+    } catch (e) { /* 探测分流条件本身出错时静默落回 v1 路径，不让提示功能整体失效 */ }
     setState({ toast: { message, type } });
     setTimeout(() => {
         setState({ toast: null });
     }, 3000);
+}
+
+// ==================== 外壳原生 toast（v2 Pass P125，C4；P125b 修正层叠承诺）====================
+// showToast 在外壳模式下的替身通道：不碰 #root/setState/renderApp 任何一步，自建一个纵向
+// 堆叠容器，支持同时显示多条、每条独立计时、3000ms 后自动移除（跟 v1 renderToast 的
+// setTimeout(…,3000) 时长保持一致，见上面 OVL_TOAST_DURATION_MS）、点击可立即关闭。
+//
+// P125b（对抗性终核 .claude/tmp/p125_verify.md §3 issue-1，实测判定）：P125 原实现把这个
+// 容器挂在 #ovlPortal 下面、z-index 取 1099——但 #ovlPortal 本身是 `position:fixed` + 非
+// auto 的 `z-index:1080`（CSS 约 2123 行），这就建立了一个新的层叠上下文：容器内的
+// z-index:1099 只在 #ovlPortal 这个子层叠上下文里排序，相对 #ovlPortal 外面的一切，整坨
+// toast 的实际名次就是 #ovlPortal 自己的 1080。核验代理用真实组件、真实操作实测复现出遮挡：
+// 外壳模式下 <body> 直挂、名次高于 1080 的真实组件至少有两个——`#synonymPopup`（选词/替换/
+// 简化/语法弹窗，`document.body.insertAdjacentHTML` 直挂 body，CSS 约 1381 行
+// `body.ovl-shell-active:not(.ovl-translator-open) #synonymPopup { z-index:1087 !important }`）
+// 和 `#aiChatRoot`（AI 对话窗，body 直挂，CSS 约 410 行 `z-index: 2147482000`）；900x600 窗口
+// 下真实点击左侧栏打开 AI 对话窗后，toast 有一半被 `#aiChatRoot` 盖住（详见 p125_verify.md）。
+// 修法：容器改为 `document.body` 直挂（不再是 #ovlPortal 的子节点，不再共享它的层叠上下文），
+// z-index 取 2147483000——高于 `#aiChatRoot`（2147482000）、`#synonymPopup`（1087）、
+// `#xport-thinking-banner`（99999），与 `[data-tip]::after` 同值 2147483000（同值时平手，
+// 实测 93 个 `[data-tip]` 里仅 1 个祖先链上没有别的层叠上下文，且它在 `#root` 内、外壳模式下
+// `display:none`，实际不可达，非问题）。【P125c 更正，原"这仍然是目前已知最高"作废】不成立：
+// 同一份文件里 `#renderBoundaryPanel`（约 15505/15512 行，`document.body` 直挂、
+// `zIndex:'2147483600'`）比这里高 600，且可由真实生产路径（`window` 的
+// `error`/`unhandledrejection` → `rbHandleAsync` → `rbShow`）弹出，实测把 toast 全部遮住——
+// 这不是回归，是应用既有设计（v1 的 `#root` 老通道被这个面板遮得一模一样；该面板是渲染出错
+// 时的崩溃告知面板，设计上就要盖住一切）。准确说法：本容器高于 `#aiChatRoot`/`#synonymPopup`/
+// `#xport-thinking-banner`，与 `[data-tip]::after` 同值，低于故意设计成全场最高的
+// `#renderBoundaryPanel`。切到 v1（`ovlOpenTranslator()`）时清空这些 toast 的逻辑
+// （`ovlToastClearAll`）与计时/堆叠逻辑本身不受这次挂载点变化影响，一并保留。
+const OVL_TOAST_DURATION_MS = 3000;
+const OVL_TOAST_KIND_STYLE = {
+    success: 'background:#ecfdf5;border-color:#a7f3d0;color:#047857;',
+    warning: 'background:#fffbeb;border-color:#fde68a;color:#b45309;',
+    error: 'background:#fef2f2;border-color:#fecaca;color:#b91c1c;',
+    info: 'background:#eff6ff;border-color:#bfdbfe;color:#1d4ed8;'
+};
+const OVL_TOAST_KIND_STYLE_DEFAULT = 'background:#f8fafc;border-color:#e2e8f0;color:#334155;';
+
+// 取（必要时懒创建）toast 堆叠容器。P125b 起直接挂 document.body（不再挂 #ovlPortal，
+// 理由见上方 P125b 注释——挂在 #ovlPortal 下会被它自己 1080 的层叠上下文吃掉内部
+// z-index）。绝不缓存 DOM 引用给调用方——每次现取（容器本身极少被销毁重建，这里主要是
+// 防御极端时序）。
+// max-height:60vh;overflow-y:auto（P125b issue-3 引入 40vh；P125c 放宽到 60vh，issue-5
+// 修正）：防的是拼接了异常长错误信息（比如把 e.message 拼进提示文案的那些调用点）时纵向
+// 撑出视口——实测口径：仓库里最长的一条真实 showToast 字面量（84 字，"本地桥接服务版本过
+// 旧……"）在四档窗口里最窄的 400x300 下高度是 159px；60vh = 300*0.6 = 180px > 159px，不
+// 触发这条兜底，最长真实文案完整可见不被裁（【P125c 更正，原话作废】旧注释说"84 字实测四档
+// 窗口都不会触发"不成立且自相矛盾：40vh=120px 时该文案在 400x300 下会被钳到 120px，末尾约
+// 39px 被裁掉，已被 p125_verify.md 第2轮 issue-5 实测证伪）。只有明显超出常规长度、比这条
+// 真实文案更长的合成/拼接文本才会触发这条兜底，此时 overflow-y:auto 让用户可以滚动查看。
+function ovlToastStack() {
+    let stack = document.getElementById('ovlToastStack');
+    if (stack) return stack;
+    stack = document.createElement('div');
+    stack.id = 'ovlToastStack';
+    stack.style.cssText = 'position:fixed;top:16px;left:50%;transform:translateX(-50%);'
+        + 'z-index:2147483000;display:flex;flex-direction:column;align-items:center;gap:8px;'
+        + 'max-height:60vh;overflow-y:auto;'
+        + 'pointer-events:none;';
+    document.body.appendChild(stack);
+    return stack;
+}
+
+function ovlToastRemoveEl(el) {
+    try {
+        if (!el) return;
+        if (el.__ovlToastTimer) { clearTimeout(el.__ovlToastTimer); el.__ovlToastTimer = null; }
+        if (el.parentNode) el.parentNode.removeChild(el);
+    } catch (e) {}
+}
+
+// 外壳模式下的可见 toast：样式贴近 v1 renderToast（同一套 success/warning/info 配色 + 圆角
+// 卡片观感），额外给 error 配了红色（v1 的 bgColor 映射表本来就没有 'error' 这个 key，会落
+// 到默认灰色——这里不是要复刻这个既有细节，只要求"贴近"，79 处调用点传的都是 'error'，
+// 给它一个更贴切的颜色对用户是纯增益，不影响 v1 路径本身）。
+function ovlToastShow(message, kind) {
+    try {
+        const stack = ovlToastStack();
+        const kindStyle = OVL_TOAST_KIND_STYLE[kind] || OVL_TOAST_KIND_STYLE_DEFAULT;
+        const el = document.createElement('div');
+        el.setAttribute('data-ovl-shell-toast', '1');
+        el.style.cssText = kindStyle
+            + 'pointer-events:auto;border:1px solid;padding:10px 20px;border-radius:12px;'
+            + 'box-shadow:0 10px 30px -8px rgba(0,0,0,0.25);font-size:13px;font-weight:500;'
+            + 'max-width:70vw;word-break:break-word;cursor:pointer;';
+        el.textContent = (message === null || message === undefined) ? '' : String(message);
+        el.addEventListener('click', function () { ovlToastRemoveEl(el); });
+        stack.appendChild(el);
+        el.__ovlToastTimer = setTimeout(function () { ovlToastRemoveEl(el); }, OVL_TOAST_DURATION_MS);
+        return el;
+    } catch (e) {
+        console.error('[ovl] ovlToastShow failed', e);
+        return null;
+    }
+}
+
+// 需求：外壳模式切回 v1（打开翻译器悬浮窗）时，把还没自然过期的门户 toast 全部清掉，
+// 不残留（v1 打开后 #root 可见，两套反馈通道同屏叠加会让人困惑；且门户 toast 的存在
+// 意义就是"v1 不可见时的替身"，v1 一旦可见就没有继续占屏的理由）。调用点见
+// ovlOpenTranslator（约 27860 行附近，加了 class 'ovl-translator-open' 之后）。
+function ovlToastClearAll() {
+    try {
+        const stack = document.getElementById('ovlToastStack');
+        if (!stack) return;
+        Array.prototype.slice.call(stack.children).forEach(ovlToastRemoveEl);
+    } catch (e) {}
 }
 
 // 处理文本选择（同义词）
@@ -15432,8 +15554,10 @@ function rbEnsurePanel() {
         box.id = 'renderBoundaryPanel';
         // 「用户不可能错过」也要对读屏用户成立：assertive 的 live region 会在面板出现时直接朗读。
         try { box.setAttribute('role', 'alert'); box.setAttribute('aria-live', 'assertive'); } catch (e) {}
-        // z 预算：对话窗是 2147483000、它的拖动遮罩是 2147482000。这个面板必须盖在最上面，
-        // 否则「页面炸了」的告知会被一个还在正常工作的浮窗挡住。
+        // z 预算（P125c 订正：原文两个数字弄反）：对话窗 #aiChatRoot 是 2147482000，
+        // 2147483000 是 data-tip 气泡 [data-tip]::after 的值，不是对话窗；此处也没有独立的
+        // "拖动遮罩"元素。这个面板必须盖在最上面，否则「页面炸了」的告知会被一个还在正常
+        // 工作的浮窗挡住。
         rbStyle(box, {
             position: 'fixed', top: '12px', left: '50%', transform: 'translateX(-50%)',
             zIndex: '2147483600', width: 'min(760px, calc(100vw - 24px))',
@@ -27908,6 +28032,10 @@ function ovlOpenTranslator() {
         const win = ovlTransEnsureWin();
         if (!win) throw new Error('ovlTransEnsureWin returned null');
         document.body.classList.add('ovl-translator-open');
+        // v2 Pass P125（C4）：切回 v1 之后 #root 可见，不能让外壳模式下还没自然过期的门户
+        // toast（P125b 起挂 document.body，不再是 #ovlPortal）继续叠在屏幕上——见
+        // ovlToastClearAll 定义处注释。
+        try { if (typeof ovlToastClearAll === 'function') ovlToastClearAll(); } catch (e0) {}
         ovlTransSyncSimpleUI();   // P2：按存的值恢复一次简化模式态（§2.2.3）
         // 用户没碰过窗口（mode 'auto'）时，每次打开都按当前视口重新居中一次；
         // 碰过了（mode 'free'）就尊重存下来的几何，只把它拉回视口内。
@@ -32064,47 +32192,131 @@ function ovlBindVisualSelOverlay() {
 // 跟 rangeChars 那套字符级重画平行独立，互不冲突（同一时刻只有一个非 null）。
 const OvlMarkState = { lineFrom: -1, lineTo: -1, rangeChars: null, zhVisualRec: null };
 
-// v2 Pass P45：用户反馈黄色高亮"1 分钟后自动消失"——约 60 秒后开始淡出（CSS transition，
+// v2 Pass P45：用户反馈黄色高亮"1 分钟后自动消失"——默认约 60 秒后开始淡出（CSS transition，
 // 见 #ovlVisualMarkOverlay/#ovlCodeMarkOverlay 的 .ovl-mark-fadeout 规则，约 1664 行附近），
 // 淡出动画播完再真的清空 DOM，复用既有的 ovlClearMarkOverlay，不另起一套清空逻辑。
-// window.__ovlMarkFadeMsOverride 是测试专用的可控时钟入口，不影响生产默认值 60000ms
-// （硬性要求："不要为了好测就把生产默认值改掉"）。
-const OVL_MARK_FADE_MS = 60000;
-const OVL_MARK_FADE_TRANSITION_MS = 650; // 跟 CSS transition: opacity 0.6s 对齐，留一点余量
-let OvlMarkFadeTimer = null;
-let OvlMarkFadeOutTimer = null;
-function ovlMarkFadeDurationMs() {
-    const override = (typeof window !== 'undefined') ? window.__ovlMarkFadeMsOverride : null;
-    return (typeof override === 'number' && override >= 0) ? override : OVL_MARK_FADE_MS;
+// v2 Pass P124：改造成按 kind 分槽位的中央过期机制 OvlHighlightExpiry——时长可在设置里调
+// （OvlSettings.ovlHighlightExpirySec，默认 60 秒，0 = 永不消失，见 OVL_SETTINGS_DEFAULTS）。
+// 编辑器侧（Code/Visual 共用同一份 OvlMarkState，只服务一处命中）只有一个槽位，kind 固定为
+// 'editorMark'；PDF 侧每页各自一个 kind（'pdfSync:'+pageNum，见 44172 附近），顺手根治了
+// "两个 painter 共用一个全局计时器、跨页互相 clearTimeout 掉对方的表"的既有缺陷。
+// window.__ovlMarkFadeMsOverride 是测试专用的可控时钟入口，语义不变（这么多毫秒后淡出，单位
+// 毫秒），且优先级高于设置——不影响生产默认值（硬性要求："不要为了好测就把生产默认值改掉"）。
+// 两套 0 的语义刻意不同：钩子的 0 = 立刻淡出（P45 既有语义，不许改）；只有**设置**里的 0 秒
+// 才是"永不消失"，两者别合并。
+const OVL_HL_EXPIRY_DEFAULT_SEC = 60;   // 用户指定的默认值（秒）
+const OVL_HL_FADE_MS = 300;             // 淡出动画时长，跟上面 CSS transition: opacity 0.3s 对齐
+const OVL_HL_CLEAR_DELAY_MS = 350;      // 淡出播完再真清 DOM，留 50ms 余量
+
+// 解析"从现在起多久后开始淡出"。返回 -1 = 永不过期。优先级：测试时钟 > 设置 > 默认 60 秒。
+function ovlHighlightExpiryMs() {
+    const ov = (typeof window !== 'undefined') ? window.__ovlMarkFadeMsOverride : null;
+    if (typeof ov === 'number' && ov >= 0) return ov;
+    const raw = typeof OvlSettings !== 'undefined' ? OvlSettings.ovlHighlightExpirySec : undefined;
+    // v2 Pass P124b：null/""/非有限数必须落回默认 60 秒——不能被下面的 Number() 隐式转换成 0
+    // 从而被 sec===0 那条分支误判成用户选的"永不消失"（Number(null)===0、Number("")===0，
+    // 只有 localStorage 被外部损坏才会碰到，正常五个 <option> 都有确定 value）。真正的
+    // "永不消失"只认字面数字/数字字符串 0（P124 终核报告 Issue-2②）。
+    if (raw === null || raw === undefined || raw === '') return OVL_HL_EXPIRY_DEFAULT_SEC * 1000;
+    const sec = Number(raw);
+    if (!isFinite(sec) || sec < 0) return OVL_HL_EXPIRY_DEFAULT_SEC * 1000;
+    if (sec === 0) return -1; // 永不消失
+    return sec * 1000;
 }
-function ovlMarkClearFadeTimers() {
-    if (OvlMarkFadeTimer) { clearTimeout(OvlMarkFadeTimer); OvlMarkFadeTimer = null; }
-    if (OvlMarkFadeOutTimer) { clearTimeout(OvlMarkFadeOutTimer); OvlMarkFadeOutTimer = null; }
-}
+
+// 中央过期机制：kind -> { fade, clear, reset } 处理器 + kind -> { fadeTimer, clearTimer } 计时器。
+// touch(kind) 在"真的画出了新高亮"时调用一次：先取消同 kind 旧表、复位视觉（撤掉可能还没来得
+// 及真清的 .ovl-mark-fadeout），再按当前设置重排；ms<0（永不消失）时只做前两步，不排表。
+const OvlHighlightExpiry = {
+    handlers: new Map(),
+    timers: new Map(),
+    lastExpirySec: undefined, // v2 Pass P124b：ovlApplySettings() 用它判断这一项是否真的变了
+    register(kind, fadeFn, clearFn, resetFn) {
+        this.handlers.set(kind, { fade: fadeFn, clear: clearFn, reset: resetFn || null });
+    },
+    cancel(kind) {
+        const t = this.timers.get(kind);
+        if (!t) return;
+        if (t.fadeTimer) clearTimeout(t.fadeTimer);
+        if (t.clearTimer) clearTimeout(t.clearTimer);
+        this.timers.delete(kind);
+    },
+    touch(kind) {
+        this.cancel(kind);
+        const h = this.handlers.get(kind);
+        if (!h) return;
+        try { if (h.reset) h.reset(); } catch (e) {}
+        const ms = ovlHighlightExpiryMs();
+        if (ms < 0) return; // 永不消失：不排表
+        const self = this;
+        const rec = { fadeTimer: null, clearTimer: null };
+        rec.fadeTimer = setTimeout(function () {
+            rec.fadeTimer = null;
+            try { h.fade(); } catch (e) {}
+            rec.clearTimer = setTimeout(function () {
+                self.timers.delete(kind);
+                try { h.clear(); } catch (e) {}
+            }, OVL_HL_CLEAR_DELAY_MS);
+        }, ms);
+        this.timers.set(kind, rec);
+    },
+    rearmAll() {
+        const self = this;
+        // v2 Pass P124b（终核报告 Issue-1，唯一 fail 项）：只遍历 timers 找不到"永不消失"状态
+        // 下画出来、但压根没排表的高亮——touch() 在 ms<0 时提前 return，从来没进过 timers。
+        // 这里额外纳入"当前可见但未排表"的 kind：编辑器侧看 OvlMarkState.lineFrom>=0（行级/
+        // 字符级/中文可见文字级三种画法都会置这个字段，见 ovlMarkLines/ovlMarkRange/
+        // ovlMarkRangeZhVisual），兜底再看叠加层里是否还留着 .ovl-mark-box；PDF 侧看每一页
+        // 容器里是否还有 .ovl-pdf-sync-overlay。只有"确实注册过 handler"的 kind 才会被
+        // touch()，不会凭空造出从没画过的高亮。
+        const kinds = new Set(this.timers.keys());
+        if (this.handlers.has('editorMark')) {
+            let editorVisible = (typeof OvlMarkState !== 'undefined' && OvlMarkState.lineFrom >= 0);
+            if (!editorVisible) {
+                const co = document.getElementById('ovlCodeMarkOverlay');
+                const vo = document.getElementById('ovlVisualMarkOverlay');
+                editorVisible = !!((co && co.querySelector('.ovl-mark-box')) || (vo && vo.querySelector('.ovl-mark-box')));
+            }
+            if (editorVisible) kinds.add('editorMark');
+        }
+        if (typeof OvlState !== 'undefined' && OvlState.pdfPageMap) {
+            OvlState.pdfPageMap.forEach(function (entry, num) {
+                const kind = 'pdfSync:' + num;
+                if (self.handlers.has(kind) && entry && entry.container && entry.container.querySelector('.ovl-pdf-sync-overlay')) {
+                    kinds.add(kind);
+                }
+            });
+        }
+        kinds.forEach(function (kind) { self.touch(kind); });
+    },
+    activeKinds() { return Array.from(this.timers.keys()); },
+    // v2 Pass P124b（终核报告 Issue-2③）：批量清掉某前缀的全部 handler+timer 条目。目前只有
+    // 'pdfSync:' 用得到——PDF 整份页列表重建（换文档/换编译结果）时旧页号的 kind 不会再被
+    // 用到，不清掉的话 handlers 会随见过的页号单调增长、永不回收（见 ovlPdfTeardown）。
+    purgePrefix(prefix) {
+        const self = this;
+        Array.from(this.handlers.keys()).forEach(function (kind) {
+            if (kind.indexOf(prefix) === 0) {
+                self.cancel(kind);
+                self.handlers.delete(kind);
+            }
+        });
+    }
+};
+
+// —— 以下四个函数名保留（P45 遗留调用点：31759/32034/32085 三处 ovlMarkScheduleFadeOut()、
+// ovlClearMarkOverlay 内部两处引用），改成转调上面中枢的薄壳，调用点一字不动。——
+function ovlMarkFadeDurationMs() { return ovlHighlightExpiryMs(); }
+function ovlMarkClearFadeTimers() { OvlHighlightExpiry.cancel('editorMark'); }
 function ovlMarkResetFadeVisual() {
     const vo = document.getElementById('ovlVisualMarkOverlay');
     const co = document.getElementById('ovlCodeMarkOverlay');
     if (vo) vo.classList.remove('ovl-mark-fadeout');
     if (co) co.classList.remove('ovl-mark-fadeout');
 }
-// 每次新的 ovlMarkLines 调用都要重置这个计时器（硬性要求）；用户滚动/交互不重置——这个
-// 函数只从 ovlMarkLines 里调用一次，滚动触发的 ovlRepaintMarkOverlay 完全不碰它，纯计时。
-function ovlMarkScheduleFadeOut() {
-    ovlMarkClearFadeTimers();
-    ovlMarkResetFadeVisual();
-    const ms = ovlMarkFadeDurationMs();
-    OvlMarkFadeTimer = setTimeout(function () {
-        OvlMarkFadeTimer = null;
-        const vo = document.getElementById('ovlVisualMarkOverlay');
-        const co = document.getElementById('ovlCodeMarkOverlay');
-        if (vo) vo.classList.add('ovl-mark-fadeout');
-        if (co) co.classList.add('ovl-mark-fadeout');
-        OvlMarkFadeOutTimer = setTimeout(function () {
-            OvlMarkFadeOutTimer = null;
-            ovlClearMarkOverlay();
-        }, OVL_MARK_FADE_TRANSITION_MS);
-    }, ms);
-}
+// 每次新的 ovlMarkLines/ovlMarkRange/ovlMarkRangeZhVisual 调用都要重置这个计时器（硬性要
+// 求）；用户滚动/交互不重置——滚动触发的 ovlRepaintMarkOverlay 完全不碰它，纯计时。
+function ovlMarkScheduleFadeOut() { OvlHighlightExpiry.touch('editorMark'); }
 
 function ovlClearCodeMarkOverlay() {
     const overlay = document.getElementById('ovlCodeMarkOverlay');
@@ -32127,6 +32339,20 @@ function ovlClearMarkOverlay() {
     ovlClearCodeMarkOverlay();
     ovlClearVisualMarkOverlay();
 }
+// v2 Pass P124：编辑器侧唯一的 kind 注册（Code/Visual 共用同一份 OvlMarkState，故共用同一
+// 个 kind 'editorMark'）。fade 只切 opacity（.ovl-mark-fadeout），clear 复用既有的唯一清空
+// 收口 ovlClearMarkOverlay，reset 撤掉可能还没来得及真清的淡出 class——三个回调都现查
+// DOM（getElementById），不缓存引用。
+OvlHighlightExpiry.register('editorMark',
+    function () {
+        const vo = document.getElementById('ovlVisualMarkOverlay');
+        const co = document.getElementById('ovlCodeMarkOverlay');
+        if (vo) vo.classList.add('ovl-mark-fadeout');
+        if (co) co.classList.add('ovl-mark-fadeout');
+    },
+    function () { ovlClearMarkOverlay(); },
+    function () { ovlMarkResetFadeVisual(); }
+);
 
 // pane.innerHTML 整篇重写时（跟 ovlVisualSelOverlayReset 同一批时机）重新挂一个空节点，
 // 真正的内容由 ovlRenderVisualGutter() 结尾调用 ovlScheduleMarkOverlay() 补画。
@@ -43660,7 +43886,10 @@ const OVL_SETTINGS_DEFAULTS = {
     // main.tex 拼装完成后自动用桥编译一次；失败则截取错误日志 + 出错页片段发给修复模型
     // （复用视觉模型同一 endpoint/模型名，关闭思考），应用修正后再编译一次——最多一轮，不循环。
     // 默认开；关闭则跳过整段核验，行为等同于 P85 之前（见 ovlP2TRunPipeline/ovlP2TRunVerify）。
-    pdf2texAutoVerify: true
+    pdf2texAutoVerify: true,
+    // ---- v2 Pass P124：定位高亮自动过期（PDF + LaTeX 通用，见 OvlHighlightExpiry）----
+    // 单位秒；0 = 永不消失（见 ovlHighlightExpiryMs 的特判）。默认 60 秒是用户明确指定的值。
+    ovlHighlightExpirySec: 60
 };
 const OVL_FONT_FAMILIES = {
     'ovl-mono-default': '"SFMono-Regular", Consolas, "Courier New", monospace',
@@ -43813,6 +44042,19 @@ function ovlApplySettings() {
                 });
             }
             OvlState.ovlBridgeLastOrigin = nowOrigin;
+        }
+        // v2 Pass P124：定位高亮过期时长可能刚变——把所有当前活跃/可见的过期计时按新设置重新
+        // 排一遍（从现在开始重新计时，不是立刻按新值截断）。
+        // v2 Pass P124b（终核报告 Issue-2①）：改成只在 ovlHighlightExpirySec 这一项真的变了
+        // 才 rearmAll()——原版无条件重排，改字体大小/主题这类无关设置也会顺带把正亮高亮的
+        // 计时清零重排，跟设置面板帮助文案「改这一项会让…重新开始计时」的措辞（只承诺这一项）
+        // 不符。
+        if (typeof OvlHighlightExpiry !== 'undefined') {
+            const curExpirySec = OvlSettings.ovlHighlightExpirySec;
+            if (OvlHighlightExpiry.lastExpirySec !== curExpirySec) {
+                OvlHighlightExpiry.lastExpirySec = curExpirySec;
+                OvlHighlightExpiry.rearmAll();
+            }
         }
     } catch (e) { console.error('[ovl] applySettings failed', e); }
 }
@@ -44064,6 +44306,21 @@ function ovlSettingsAppearanceHtml() {
         + '</select>', '编辑器用哪种等宽字体。三个选项都是系统里通常已经装了的字体，不会额外下载。');
     html += ovlSetRow('编辑器行高', '<select data-setpath="settings.lineHeight">' + ovlOptTag('compact', '紧凑', s.lineHeight) + ovlOptTag('normal', '正常', s.lineHeight) + ovlOptTag('wide', '宽松', s.lineHeight) + '</select>',
         '编辑器里每行文字之间的疏密程度。');
+    // ---- v2 Pass P124：定位高亮自动过期（用户要求：PDF 和 LaTeX 里的定位高亮都要能设置多久
+    // 后自动消失，默认 1 分钟）。放「外观」而不是「编辑器」——它同时管着 PDF 栏，是视觉呈现
+    // 行为，不只是编辑器的事。----
+    html += ovlSetRow('定位高亮保留时长',
+        '<select data-setpath="settings.ovlHighlightExpirySec">'
+        + ovlOptTag(15, '15 秒', s.ovlHighlightExpirySec)
+        + ovlOptTag(30, '30 秒', s.ovlHighlightExpirySec)
+        + ovlOptTag(60, '1 分钟（默认）', s.ovlHighlightExpirySec)
+        + ovlOptTag(120, '2 分钟', s.ovlHighlightExpirySec)
+        + ovlOptTag(0, '永不消失', s.ovlHighlightExpirySec)
+        + '</select>',
+        'PDF 和 LaTeX 里因为跳转、查找、AI 定位画出来的黄色高亮框，多久之后自动淡出消失。'
+      + '选「永不消失」就一直留着，直到你按 Esc、重新选中文字，或者跳到别的位置。'
+      + '改这一项会让当前正亮着的高亮从现在重新开始计时。'
+      + '你自己拖选的文字、gutter 上的关注标记不受这一项影响。');
     return html;
 }
 
@@ -44491,7 +44748,8 @@ function ovlBindSettingsModal() {
         const store = parts[0] === 'compile' ? OvlCompileSettings : OvlSettings;
         let val = el.type === 'checkbox' ? el.checked : el.value;
         if (path === 'settings.fontSize' || path === 'settings.tabSize' || path === 'settings.overleafAutoPullMinutes'
-            || path === 'settings.pdf2texConcurrency' || path === 'settings.pdf2texMaxPx') val = Number(val);
+            || path === 'settings.pdf2texConcurrency' || path === 'settings.pdf2texMaxPx'
+            || path === 'settings.ovlHighlightExpirySec') val = Number(val);
         store[parts[1]] = val;
         if (parts[0] === 'compile') { ovlSaveCompileSettings(); ovlUpdatePdfToolbarUI(); }
         else { ovlSaveSettings(); ovlApplySettings(); }
@@ -44736,6 +44994,11 @@ function ovlPdfTeardown() {
             if (entry.renderTask) { try { entry.renderTask.cancel(); } catch (e) {} entry.renderTask = null; }
         });
     }
+    // v2 Pass P124b（终核报告 Issue-2③）：连同这份 pdfPageMap 绑定的过期计时 kind 一起清掉——
+    // DOM 容器马上会被 wrap.innerHTML='' 整体拆掉（ovlPdfBuildPageList 紧接着调用这个函数），
+    // 旧 kind 的 handlers/timers 条目不清的话会随见过的页号单调增长、永不回收。relayout
+    // （缩放，ovlPdfRelayout）不走这个函数，页容器原地保留，不受影响。
+    if (typeof OvlHighlightExpiry !== 'undefined') OvlHighlightExpiry.purgePrefix('pdfSync:');
     OvlState.pdfPageMap = null;
     OvlState.pdfPageMapUrl = null;
 }
@@ -44942,7 +45205,30 @@ function ovlPdfApplyView() {
 // h/v 直接当宽高用（诚实声明：h/v 的真实含义——是包围盒宽高还是别的量，比如 TeX 内部 node 的
 // depth/height——没有实测确认过，稳妥起见不采用）。跟反向双击的 convertToPdfPoint 互为逆运算：
 // convertToViewportPoint 把 PDF 原生坐标换回渲染视口 CSS 像素。
-let ovlPdfSyncHighlightFadeTimer = null;
+// v2 Pass P124：PDF 侧过期——每页一个 kind（'pdfSync:'+pageNum），根治"两个 painter（本函数 +
+// 下面 ovlP106PaintHighlightForItems）共用同一个全局计时器、跨页互相 clearTimeout 掉对方的表"
+// 的既有缺陷（新页 paint 只会重排自己那个 kind，不再动别页）。fade/clear/reset 三个回调每次都
+// 现查 OvlState.pdfPageMap.get(pageNum).container，绝不缓存 DOM 引用——缩放/relayout 会重建
+// 整页容器，缓存的引用必成野指针；取不到就静默 return，不是错误。clear() 比旧版本更进一步：
+// 淡出播完真的 innerHTML='' + remove() 整个容器，不留 opacity:0 的残影 DOM。
+function ovlPdfSyncHlKind(pageNum) { return 'pdfSync:' + pageNum; }
+function ovlPdfSyncHlOverlay(pageNum) {
+    const entry = OvlState.pdfPageMap && OvlState.pdfPageMap.get(pageNum);
+    if (!entry || !entry.container) return null;
+    return entry.container.querySelector('.ovl-pdf-sync-overlay');
+}
+function ovlPdfSyncHlArm(pageNum) {
+    const kind = ovlPdfSyncHlKind(pageNum);
+    OvlHighlightExpiry.register(kind,
+        function () { const ov = ovlPdfSyncHlOverlay(pageNum); if (ov) ov.classList.add('ovl-mark-fadeout'); },
+        function () {
+            const ov = ovlPdfSyncHlOverlay(pageNum);
+            if (ov) { ov.innerHTML = ''; ov.classList.remove('ovl-mark-fadeout'); ov.remove(); }
+        },
+        function () { const ov = ovlPdfSyncHlOverlay(pageNum); if (ov) ov.classList.remove('ovl-mark-fadeout'); }
+    );
+    OvlHighlightExpiry.touch(kind);
+}
 function ovlPdfPaintSyncHighlight(pageNum, xPt, yPt) {
     try {
         const entry = OvlState.pdfPageMap && OvlState.pdfPageMap.get(pageNum);
@@ -44962,10 +45248,7 @@ function ovlPdfPaintSyncHighlight(pageNum, xPt, yPt) {
             + (pt[1] - boxHPt * scale) + 'px;width:' + (boxWPt * scale) + 'px;height:'
             + (boxHPt * scale) + 'px;"></div>';
         overlay.classList.remove('ovl-mark-fadeout');
-        clearTimeout(ovlPdfSyncHighlightFadeTimer);
-        ovlPdfSyncHighlightFadeTimer = window.setTimeout(function () {
-            overlay.classList.add('ovl-mark-fadeout');
-        }, 60000); // 跟 ovlMarkScheduleFadeOut 同一约定：约 60 秒自动淡出
+        ovlPdfSyncHlArm(pageNum);
     } catch (e) { console.error('[ovl] pdf sync highlight failed', e); }
 }
 
@@ -45363,8 +45646,8 @@ function ovlP106BuildColumnLines(items) {
 }
 // 精确包围盒画高亮（跟 ovlPdfPaintSyncHighlight 的固定近似框不同——这里有 pdf.js 真实 item
 // 坐标，能画出贴合文字的精确框，可能跨 1~3 行各画一个）。复用同一个 .ovl-pdf-sync-overlay
-// 容器 + 淡出计时器（ovlPdfSyncHighlightFadeTimer，在上面 ovlPdfPaintSyncHighlight 附近已经
-// 声明过，这里不重复声明）。
+// 容器 + 同一个过期机制（ovlPdfSyncHlArm，在上面 ovlPdfPaintSyncHighlight 附近已经定义过，
+// 同一页两个 painter 共用同一个 kind——互相重置计时是正确语义，不重复声明）。
 function ovlP106PaintHighlightForItems(pageNum, items) {
     try {
         const entry = OvlState.pdfPageMap && OvlState.pdfPageMap.get(pageNum);
@@ -45408,8 +45691,7 @@ function ovlP106PaintHighlightForItems(pageNum, items) {
         });
         overlay.innerHTML = html;
         overlay.classList.remove('ovl-mark-fadeout');
-        clearTimeout(ovlPdfSyncHighlightFadeTimer);
-        ovlPdfSyncHighlightFadeTimer = window.setTimeout(function () { overlay.classList.add('ovl-mark-fadeout'); }, 60000);
+        ovlPdfSyncHlArm(pageNum);
         const firstBox = overlay.querySelector('.ovl-mark-box');
         if (firstBox && firstBox.scrollIntoView) firstBox.scrollIntoView({ block: 'center', behavior: 'smooth' });
         return true;
