@@ -2537,6 +2537,10 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-p2t-headbtn:hover { background: #2F3A4C; color: #F4F5F6; }
 .ovl-p2t-body { padding: 10px 12px; overflow-y: auto; }
 .ovl-p2t-meta { font-size: 11px; color: #9AA4B2; margin-bottom: 8px; word-break: break-all; line-height: 1.6; }
+/* v2 Pass P127：窗口不可见兜底提示——pdf.js 整页渲染分片调度已改用不受节流的宏任务
+   （见 ovlP2TYield/ovlP2TBeginRafBypass），这条横幅是万一之外的兜底可见性提示，不是
+   主修复本身。 */
+.ovl-p2t-hidden-hint { font-size: 11px; color: #eab308; background: rgba(234,179,8,0.12); border: 1px solid rgba(234,179,8,0.35); border-radius: 4px; padding: 6px 8px; margin-bottom: 8px; line-height: 1.5; }
 .ovl-p2t-bar-track { height: 6px; border-radius: 3px; background: #2F3A4C; overflow: hidden; margin-bottom: 6px; }
 .ovl-p2t-bar-fill { height: 100%; background: #098842; border-radius: 3px; transition: width .25s ease; }
 .ovl-p2t-progtext { font-size: 11px; color: #9AA4B2; margin-bottom: 10px; display: flex; justify-content: space-between; gap: 8px; }
@@ -4275,7 +4279,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.09.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.09.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -39361,6 +39365,80 @@ function ovlP2TAskOutputDir(entry) {
 // 变化，scale 公式跟原来逐字节一致），供 ovlP2TRenderPageToPng 自己调用、也供 §1.2 的
 // ovlP2TApplyFigureCrops 复用同一份渲染结果做裁剪——两者必须用同一套 scale 计算，否则裁剪
 // 坐标系跟发给模型看的图不是同一张，bbox 会对不上。
+// ==================== v2 Pass P127：绕开 pdf.js RenderTask 的 window.requestAnimationFrame
+// 分片调度（诊断报告 pdf2latex_slow_diag.md，置信度 97%：窗口不可见/被完全遮挡时 Chrome
+// 暂停 rAF，pdf.js 3.11.174 的整页 canvas 渲染逐片全靠 rAF 推进，于是原地挂死，实测 64
+// 分 38 秒零进展） ====================
+//
+// 为什么不是给 RenderTask 挂 onContinue（诊断报告 §⑥ P0 建议的写法）：逐行核对本 App 实际
+// 加载的 pdfjs-dist@3.11.174/build/pdf.min.js 源码后发现，`_continue(){this.running=!0;
+// this.cancelled||(this.task.onContinue?this.task.onContinue(this._scheduleNextBound):
+// this._scheduleNext())}` —— onContinue 收到的续跑回调 `cont` 就是 `_scheduleNext.bind(this)`
+// 本身。调用 cont()（不管是同步调用还是像诊断报告建议那样包一层 Promise.resolve() 再调用）
+// 最终还是会执行 `_scheduleNext(){this._useRequestAnimationFrame?window.requestAnimationFrame(...)
+// :Promise.resolve().then(...)}` 这条分支，而 `_useRequestAnimationFrame` 在 InternalRenderTask
+// 构造时已经按 `intent:'display'` 定死为 true（display intent ⇒ `useRequestAnimationFrame:!u`
+// 里的 u=false）。也就是说单挂 onContinue、回调里再调 cont()，跟完全不挂 onContinue 是同一
+// 件事——页面不可见时一样会走到 window.requestAnimationFrame 原地挂死，onContinue 只是在
+// "要不要现在调 cont()"这一步插了个钩子，并不能改写 cont() 内部还会不会走 rAF（本仓库把
+// 这条源码级证据独立记在 .claude/tmp/p127_impl.md，供复核）。
+//
+// 真正能生效的入口是 pdf.js 只在 `_scheduleNext` 里读 `window.requestAnimationFrame` 这一个
+// 属性，而且是每次现读（不是模块加载时缓存的引用）——所以只需要在 page.render() 期间临时
+// 把 window.requestAnimationFrame 本身换掉，pdf.js 自己的分片循环、算子表执行顺序、canvas
+// 像素结果完全不变，只是"谁来触发下一片"从浏览器合成器换成我们自己的调度原语。pdf.js 这份
+// 源码从不调用 cancelAnimationFrame（已核实，零命中），所以我们的替身 rAF 不需要真的实现
+// 取消语义。
+//
+// 调度原语选 MessageChannel 的 postMessage（一次性宏任务），排除了两个选项：
+// - 不用 setTimeout(0)：Chrome 对后台标签页的 timer 钳到 ≥1s，链式 timer 嵌套 ≥5 层后进入
+//   intensive throttling 降到 1/min（33460 行同一仓库更早的注释也踩过这条、并写明"可见但
+//   未聚焦时成立，后台不成立"）——完全解决不了"64 分钟挂死"这种量级的问题。
+// - 不用纯 Promise.resolve() 微任务链：微任务队列会在当前宏任务清空之前一次性掏空，等价于
+//   把整页算子表同步跑完，会连续占满主线程；后台标签页本身事件循环调度权重更低，长时间占满
+//   主线程会让页面对用户输入/其它任务的响应变差。
+// MessageChannel 的 postMessage 是宏任务，不属于 timer API，不受 Chrome 后台节流影响，且
+// 每次都真正让出一次事件循环——可见/不可见两种状态下调度行为完全一致，不需要看 document.hidden
+// 分支特殊处理。
+let _ovlP2TYieldChannel = null;
+let _ovlP2TYieldQueue = [];
+function ovlP2TYield() {
+    return new Promise(function (resolve) {
+        if (!_ovlP2TYieldChannel) {
+            _ovlP2TYieldChannel = new MessageChannel();
+            // 共用一个 channel，用队列保证 postMessage 的到达顺序 == resolve 的调用顺序，
+            // 三个并发 worker 同时调用 ovlP2TYield() 也不会互相覆盖对方的 onmessage 回调。
+            _ovlP2TYieldChannel.port1.onmessage = function () {
+                const cb = _ovlP2TYieldQueue.shift();
+                if (cb) cb();
+            };
+        }
+        _ovlP2TYieldQueue.push(resolve);
+        _ovlP2TYieldChannel.port2.postMessage(null);
+    });
+}
+// 引用计数，允许并发（pdf2texConcurrency）多个 page.render() 同时在飞：只在第一次进入时
+// 接管 window.requestAnimationFrame，只在最后一个退出时还原，避免 A 还没渲染完、B 先结束
+// 就把全局 rAF 提前换回原生实现。
+let _ovlP2TRafBypassDepth = 0;
+let _ovlP2TRealRAF = null;
+function ovlP2TBeginRafBypass() {
+    if (_ovlP2TRafBypassDepth === 0 && typeof window !== 'undefined' && window.requestAnimationFrame) {
+        _ovlP2TRealRAF = window.requestAnimationFrame;
+        window.requestAnimationFrame = function (cb) {
+            ovlP2TYield().then(function () { cb(typeof performance !== 'undefined' ? performance.now() : Date.now()); });
+            return 0; // pdf.js 从不调用 cancelAnimationFrame（已核实），返回值不会被用到
+        };
+    }
+    _ovlP2TRafBypassDepth++;
+}
+function ovlP2TEndRafBypass() {
+    _ovlP2TRafBypassDepth = Math.max(0, _ovlP2TRafBypassDepth - 1);
+    if (_ovlP2TRafBypassDepth === 0 && _ovlP2TRealRAF) {
+        window.requestAnimationFrame = _ovlP2TRealRAF;
+        _ovlP2TRealRAF = null;
+    }
+}
 async function ovlP2TRenderPageToCanvas(page, maxPx) {
     const unitViewport = page.getViewport({ scale: 1 });
     const longest = Math.max(unitViewport.width, unitViewport.height);
@@ -39371,8 +39449,13 @@ async function ovlP2TRenderPageToCanvas(page, maxPx) {
     canvas.width = Math.max(1, Math.ceil(viewport.width));
     canvas.height = Math.max(1, Math.ceil(viewport.height));
     const ctx = canvas.getContext('2d');
-    const task = page.render({ canvasContext: ctx, viewport: viewport });
-    await task.promise;
+    ovlP2TBeginRafBypass();
+    try {
+        const task = page.render({ canvasContext: ctx, viewport: viewport });
+        await task.promise;
+    } finally {
+        ovlP2TEndRafBypass();
+    }
     return { canvas: canvas, viewport: viewport };
 }
 async function ovlP2TRenderPageToPng(page, maxPx) {
@@ -39420,6 +39503,9 @@ function ovlP2TCropCanvasRegion(canvas, x0, y0, x1, y1) {
 // 更高的分辨率单独重渲一次整页（不是同一张 canvas），换更清晰的裁剪产物——不影响发给模型的
 // 那张图（继续用 OvlSettings.pdf2texMaxPx 原值，两处渲染互不干扰）。
 const OVL_P2T_CROP_RENDER_MULT = 2;
+// v2 Pass P127 §P4：单页"运行中"超过这个分钟数，面板 chip 的 title 上加一句诊断文案（只
+// 展示，不自动取消）——见 ovlP2TPanelRender 里对 p.startedAt 的判断。
+const OVL_P2T_STAGE_WATCHDOG_MIN = 10;
 const OVL_P2T_BBOX_RE = /% BBOX:\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)\s*\r?\n\s*\\begin\{figure\}[\s\S]*?\\includegraphics\[[^\]]*\]\{([^}]+)\}/g;
 
 // ==================== v2 Pass P109 §A：按 bbox 真实占比 emit \includegraphics 宽度 ====================
@@ -40723,6 +40809,7 @@ async function ovlP2TConvertOnePage(job, num) {
     pageState.flags = pageState.flags || {};
     ovlP2TPanelRender();
     const startedAt = Date.now();
+    pageState.startedAt = startedAt; // v2 Pass P127 §P4：面板看门狗读这个算"跑了多久"，不细分子阶段（成本/收益考量见该 Pass 报告）
     let page = null;
     try {
         page = await job.doc.getPage(num);
@@ -40781,11 +40868,14 @@ async function ovlP2TConvertOnePage(job, num) {
             job.aborts.delete(controller);
         }
         if (!stillCurrent()) return;
-        const ms = Date.now() - startedAt;
+        // v2 Pass P127（诊断报告 pdf2latex_slow_diag.md §③/⑥ P2）：这两条失败分支在这一刻
+        // 就直接 return，后面不再有 bbox 裁剪重渲/写盘等耗时步骤，"此刻的 ms" 就是这页真实
+        // 花掉的全部时间，原地打点没问题——只有下面成功路径的 ms 曾经打早了（见下方注释）。
+        const failMs = Date.now() - startedAt;
         if (!visionResult.ok) {
             pageState.state = 'failed';
             pageState.reason = visionResult.error;
-            pageState.ms = ms;
+            pageState.ms = failMs;
             pageState.fragment = ovlP2TFailurePlaceholder(num, visionResult.error);
             await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment);
             return;
@@ -40793,14 +40883,19 @@ async function ovlP2TConvertOnePage(job, num) {
         if (!extracted.ok) {
             pageState.state = 'failed';
             pageState.reason = extracted.reason;
-            pageState.ms = ms;
+            pageState.ms = failMs;
             pageState.fragment = ovlP2TFailurePlaceholder(num, extracted.reason);
             await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment);
             return;
         }
         pageState.state = extracted.flags.suspect ? 'suspect' : 'ok';
         pageState.reason = null;
-        pageState.ms = ms;
+        // v2 Pass P127：pageState.ms 的打点从这里（视觉阶梯刚返回、bbox 裁剪重渲/三级兜底
+        // 重渲还没跑）挪到下面 §1.2 裁剪 + 写盘全部完成之后再算——诊断报告实测：这里打点会
+        // 系统性漏算裁剪重渲阶段被浏览器后台节流挂起的时间（page.render() 走 rAF 分片调度，
+        // 窗口不可见时会挂起，P127 的 P0 已经用 ovlP2TBeginRafBypass 绕开了这条节流路径，
+        // 但 ETA 口径本身也要跟着改——即使以后又出现别的挂起原因，ms 也应该覆盖这一页
+        // 真正花掉的全部墙钟时间，不只是视觉请求那一段）。
         pageState.chars = extracted.text.length;
         pageState.flags = Object.assign(pageState.flags || {}, extracted.flags);
         // v2 Pass P86 §1 / P104：bbox 区域裁剪——只在真的命中 "% BBOX:" 标记时才会重新渲染一次
@@ -40822,6 +40917,7 @@ async function ovlP2TConvertOnePage(job, num) {
         try { finalText = ovlP2TEnsureAtomicEnvOwnLine(finalText); } catch (e) { console.error('[ovl] p2t ensure atomic env own line failed', num, e); }
         pageState.fragment = finalText;
         await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment);
+        pageState.ms = Date.now() - startedAt; // v2 Pass P127：真墙钟——含 bbox 裁剪重渲 + 写盘
     } catch (e) {
         console.error('[ovl] p2t convert page failed', num, e);
         pageState.state = 'failed';
@@ -41516,12 +41612,24 @@ async function ovlP2TRunVerify(job) {
     job.verify.lowConfidencePages = ovlP2TVerifyLowConfidencePages(job);
 }
 
+// v2 Pass P127 §P1：转换进行中时把面板重绘挂到 visibilitychange 上，好让"窗口不可见"
+// 提示条能在切后台/切回前台的瞬间就更新，不用等下一次页面完成事件才刷新（P0 修好之后
+// 页面完成事件本身已经不会再挂 64 分钟，但用户切窗口那一刻的即时反馈仍然值得要）。
+function ovlP2TOnVisibilityChange() { if (OvlP2TState.running) ovlP2TPanelRender(); }
+// v2 Pass P127 §P4：单job 面板本来只在每页完成等离散事件上重绘，"已用 T 秒"和阶段看门狗
+// 诊断文案会因此显得卡住不动（即使转换本身在正常推进）。批量面板（ovlP2TBatchStartProgressTimer）
+// 早就是这个 setInterval 定时重绘的模式，这里原样照抄同一节奏量级（用 20s 而不是批量面板
+// 的 500ms——单 job 面板没有那种"多个 job 排队跑"的高频状态变化，不需要那么密）。
+let _ovlP2TWatchdogTimer = null;
 async function ovlP2TRunPipeline(job) {
     OvlP2TState.job = job;
     OvlP2TState.running = true;
     job.cancelled = false;
     job.pages.forEach(function (p) { if (p.state === 'running') p.state = 'pending'; });
     ovlP2TPanelShow();
+    document.addEventListener('visibilitychange', ovlP2TOnVisibilityChange);
+    if (_ovlP2TWatchdogTimer) { clearInterval(_ovlP2TWatchdogTimer); }
+    _ovlP2TWatchdogTimer = setInterval(function () { if (OvlP2TState.running) ovlP2TPanelRender(); }, 20000);
     try {
         await ovlP2TMkdirp(job.outRel);
         await ovlP2TWriteText(job.outRel + '/.gitignore', '*'); // 写入顺序硬性：mkdir 后立刻写 .gitignore
@@ -41624,6 +41732,8 @@ async function ovlP2TRunPipeline(job) {
         if (typeof showToast === 'function') showToast('PDF→LaTeX 转换失败：' + job.pipelineError, 'error');
     } finally {
         OvlP2TState.running = false;
+        document.removeEventListener('visibilitychange', ovlP2TOnVisibilityChange); // v2 Pass P127 §P1：转换结束（成功/失败/取消都会走到这里）就摘掉监听，不残留
+        if (_ovlP2TWatchdogTimer) { clearInterval(_ovlP2TWatchdogTimer); _ovlP2TWatchdogTimer = null; } // v2 Pass P127 §P4：同上，不残留定时器
         // v2 Pass P75 实测修复：这里原来无条件 job.doc.destroy()——但一次"取消"之后的
         // "继续转换"、以及完成之后的"重试失败页"都要复用同一个 job.doc 重新 getPage()，
         // 在这里销毁会让续跑/重试第二次直接内部报错（job.doc 变 null）、一次视觉请求都不发
@@ -41971,17 +42081,29 @@ function ovlP2TPanelRender() {
     const elapsedS = Math.round((Date.now() - job.startedAt) / 1000);
     const conc = Math.max(1, job.concurrency || 1);
     let etaText = '';
+    // v2 Pass P127（诊断报告 pdf2latex_slow_diag.md §③/⑥ P2）：改用"目前真实流逝的墙钟
+    // 时间 ÷ 已完成页数"当单页实际吞吐，不再是"单页耗时均值 ÷ 并发度"。旧公式有两个各自
+    // 独立的问题——① pageState.ms 曾在 bbox 裁剪重渲之前打点，窗口不可见导致 pdf.js 渲染
+    // 挂起时，挂起时长系统性漏算，出现过"已用 4003 秒 · 预估剩 266 秒"这种自相矛盾的数字
+    // （P127 已把打点挪到 ovlP2TConvertOnePage 整页真正写盘之后，见该函数）；② "/ 并发度"
+    // 假设并发是线性加速，但诊断报告证据 1 实测：单发 30s，并发 3 时每条反而要 69-79s，
+    // LM Studio 侧基本串行，并发 3 只买到约 15% 吞吐，除以 conc 系统性把 ETA 往乐观方向
+    // 偏约 2.5 倍。"elapsedS / 已完成页数" 是已经真实发生过的墙钟速度，天然把并发实际
+    // 效果、以及任何挂起都吃了进去，不需要再额外除以并发度这个理论假设。
     if (running && !finished && !cancelled) {
-        // v2 Pass P83（任务书公式）：已完成页均值（算术平均，不是中位数）滚动更新，
-        // 并发下 ETA = 剩余页数 × 单页均值 / 并发度。
         const doneTimes = job.pages.map(function (p) { return p.ms; }).filter(function (ms) { return typeof ms === 'number'; });
         if (doneTimes.length > 0) {
-            const avgMs = doneTimes.reduce(function (a, b) { return a + b; }, 0) / doneTimes.length;
             const remaining = Math.max(0, total - done);
-            const etaS = Math.round(remaining * avgMs / conc / 1000);
+            const perPageWallS = elapsedS / doneTimes.length;
+            const etaS = Math.round(remaining * perPageWallS);
             etaText = '预估剩余 ' + etaS + ' 秒（并发 ' + conc + '）';
         }
     }
+    // v2 Pass P127 §P1：rAF 绕开之后（ovlP2TYield/ovlP2TBeginRafBypass）转换本身不再需要
+    // 窗口可见也能推进；这条只是兜底可见性提示——万一浏览器还有别的、我们没覆盖到的节流
+    // 路径（比如未来 pdf.js 升级又加了新的 rAF 依赖），至少让用户知道"窗口在后台会更慢"，
+    // 不是本 Pass 的主修复。
+    const showHiddenHint = running && !finished && !cancelled && typeof document !== 'undefined' && document.hidden === true;
 
     let html = '';
     html += '<div class="ovl-p2t-head">';
@@ -41991,6 +42113,9 @@ function ovlP2TPanelRender() {
     html += '</div>';
     html += '<div class="ovl-p2t-body">';
     html += '<div class="ovl-p2t-meta">' + escapeHtml(job.pdfName) + ' &rarr; ' + escapeHtml(job.outRel) + '</div>';
+    if (showHiddenHint) {
+        html += '<div class="ovl-p2t-hidden-hint">窗口在后台时浏览器会限速，建议保持窗口在前台</div>';
+    }
     html += '<div class="ovl-p2t-bar-track"><div class="ovl-p2t-bar-fill" style="width:' + Math.round(total ? (done / total * 100) : 0) + '%"></div></div>';
     // v2 Pass P83：右侧格式改成「第 X/N 页 · 已用 T 秒 · 预估剩余 R 秒（并发 C）」——转换未
     // 结束时才有 etaText，结束/取消/失败时只到「已用 T 秒」为止（没有剩余可估）。
@@ -42001,6 +42126,16 @@ function ovlP2TPanelRender() {
         let title = '第 ' + p.num + ' 页';
         if (p.reason) title += '：' + p.reason;
         if (p.ms) title += '（' + Math.round(p.ms / 1000) + 's）';
+        // v2 Pass P127 §P4：阶段看门狗——不细分"渲染/视觉请求/裁剪重渲"具体在哪个子阶段
+        // （要精确到子阶段得在每个子阶段入口都记一次时间戳，改动面明显更大；P0 已经把
+        // rAF 挂起这个已知根因绕开了，这里只是给"以后又出现别的原因、某页真的卡住不动"
+        // 留一个兜底诊断信号），用整页 startedAt 到现在的墙钟时间判断，只展示不自动取消。
+        if (p.state === 'running' && p.startedAt) {
+            const stuckMin = (Date.now() - p.startedAt) / 60000;
+            if (stuckMin >= OVL_P2T_STAGE_WATCHDOG_MIN) {
+                title += '（诊断：第 ' + p.num + ' 页转换已 ' + Math.round(stuckMin) + ' 分钟未完成，可能被浏览器限速或卡在某一步，不会自动取消）';
+            }
+        }
         html += '<div class="ovl-p2t-chip" data-state="' + p.state + '" data-page="' + p.num + '" title="' + escapeAttr(title) + '">' + p.num + '</div>';
     });
     html += '</div>';
