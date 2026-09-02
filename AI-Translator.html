@@ -4243,7 +4243,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.08.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.08.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -27395,6 +27395,14 @@ function ovlSetViewMode(mode, opts) {
         OvlState.viewMode = mode;
         const body = document.getElementById('ovlBody');
         if (body) body.setAttribute('data-view', mode);
+        // v2 Pass P123（D4）：pane 隐藏期间（比如切到 PDF-only）ovlRenderVisualGutter() 会被
+        // offsetParent 守卫短路掉，中文后台翻译落地的坐标全部没画进去——切回 editor/split、
+        // pane 重新可见时补一次真实重排，不能指望等下一次块落地才顺带修正。data-view 属性
+        // 刚改完就读布局，浏览器会同步补一次样式/布局重算，offsetParent 已经反映新状态。
+        if ((mode === 'editor' || mode === 'split') && OvlState.editorMode === 'visual'
+            && typeof ovlRenderVisualGutter === 'function') {
+            ovlRenderVisualGutter();
+        }
         const menu = document.getElementById('ovlLayoutMenu');
         if (menu) {
             const items = menu.querySelectorAll('.ovl-layout-menu-item');
@@ -31027,8 +31035,14 @@ async function ovlVisualLangRunQueue() {
                     // （ovlVisualRender 末尾）保持一致；editorMode 仍是 visual 时才有意义做——
                     // 离开 Visual 模式时 ovlVisualLangCancelInFlight 已经让上面的 mySeq 守卫先
                     // 短路，这里的判断只是双保险。
-                    if (typeof ovlRenderVisualGutter === 'function' && OvlState.editorMode === 'visual') {
-                        ovlRenderVisualGutter();
+                    // v2 Pass P123（D3）：改走 ovlScheduleVisualGutterAfterImage() 的 rAF 合并
+                    // 入口，不再每块落地都同步跑一次全量重排——诊断实测中文翻译 30s 内这条直接
+                    // 调用被打了 348 次、单次 41ms、把主线程钉到 longtask 峰值 4432ms（见
+                    // .claude/tmp/p123_diag.md §B.4 D3）。同一帧内多块落地会被合并成一次重排；
+                    // ovlVisualScrollToLine/ovlMarkCenterVisual 这类同步读缓存的入口已经补了
+                    // ovlFlushPendingVisualGutter() 兜底，不会读到还没跑完这次重排的旧坐标。
+                    if (typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') {
+                        ovlScheduleVisualGutterAfterImage();
                     }
                 }
                 OvlVisualLangState.done = Math.min(OvlVisualLangState.total, OvlVisualLangState.done + 1); // 钳制：双保险，见下方 inflight 才是根治
@@ -32212,15 +32226,20 @@ function ovlMarkCenterVisual(lineFrom, lineTo) {
         if (OvlState.editorMode !== 'visual') return;
         const pane = document.getElementById('ovlVisualPane');
         const gutter = document.getElementById('ovlGutter');
-        if (!pane || !gutter || !OvlVisualBlockRects.length) return;
+        if (!pane || !gutter) return;
+        // v2 Pass P123（D3 风险2）：同 ovlVisualScrollToLine，先 flush 掉待处理的 rAF 重排。
+        if (typeof ovlFlushPendingVisualGutter === 'function') ovlFlushPendingVisualGutter();
+        if (!OvlVisualBlockRects.length) return;
         let idxFrom = 0, idxTo = 0;
         for (let i = 0; i < OvlVisualBlockRects.length; i++) { if (OvlVisualBlockRects[i].line <= lineFrom) idxFrom = i; else break; }
         for (let i = 0; i < OvlVisualBlockRects.length; i++) { if (OvlVisualBlockRects[i].line <= lineTo) idxTo = i; else break; }
-        const cellFrom = gutter.children[idxFrom];
-        const cellTo = gutter.children[idxTo] || cellFrom;
-        if (!cellFrom) return;
-        const topFrom = parseFloat(cellFrom.style.top) || 0;
-        const topTo = (parseFloat(cellTo.style.top) || 0) + (parseFloat(cellTo.style.height) || 0);
+        // v2 Pass P123（D2）：同 ovlVisualScrollToLine，直接读 OvlVisualBlockRects 缓存的
+        // top/h，不再假设 gutter.children[idx] 就是块 idx 的格子。
+        const rectFrom = OvlVisualBlockRects[idxFrom];
+        const rectTo = OvlVisualBlockRects[idxTo] || rectFrom;
+        if (!rectFrom) return;
+        const topFrom = rectFrom.top || 0;
+        const topTo = (rectTo.top || 0) + (rectTo.h || 0);
         const mid = (topFrom + topTo) / 2;
         let target = mid - pane.clientHeight / 2;
         const maxScroll = Math.max(0, pane.scrollHeight - pane.clientHeight);
@@ -32640,7 +32659,23 @@ function ovlScheduleLineOffsetRecompute(delay) {
         // 这里是真正会跟用户"继续打字/继续拖"撞车的时机，必须不阻塞；见分片版本头部注释里
         // 记录的实测数据（1129ms 卡顿）。
         ovlRecomputeLineOffsetsChunked(function (ok) {
-            if (ok) ovlRenderGutter(true);
+            // v2 Pass P123（诊断第8条隐式依赖，.claude/tmp/p123_diag.md）：这个回调可能在
+            // 防抖延迟/分片计算跨越的这段时间里发生了 Code<->Visual 模式切换——
+            // ovlRecomputeLineOffsetsChunked 入口处 `ta.clientWidth<=0` 的守卫只在函数刚
+            // 开始那一刻检查一次，长文档的分片计算要跨好几个 setTimeout(0) 事件循环 tick
+            // 才收尾，真正跑到这个回调时模式完全可能已经变了。改前无脑调 Code 模式的
+            // ovlRenderGutter(true) 会把 Visual 模式的绝对定位格子换成 Code 模式的正常流
+            // 格子——实测在真实 CDP 时序下能稳定复现（ovlSetViewMode 之后紧跟着切一次
+            // ovlSetEditorMode('visual')，Visual gutter 会被换成一堆 class="ovl-ln" 的
+            // 空壳格子），不是本轮引入的新问题，但本轮改了 Visual gutter 的重排时机，必须
+            // 顺手把这条隐式依赖钉死，不能让它成为新缺陷的放大器。这里改成按调用这一刻的
+            // 真实模式分流：Visual 模式画 Visual 的格子，Code 模式才画 Code 的格子，跟
+            // ovlSetEditorMode 切模式时的既有分流是同一条纪律。
+            if (OvlState.editorMode === 'visual') {
+                if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
+            } else if (ok) {
+                ovlRenderGutter(true);
+            }
             // v2 Pass P37：拖分栏/敲字导致重新换行会让 Code 模式的黄色标记高亮画在旧行号
             // 对应的旧像素位置上——行偏移表一重算完就补一次repaint，不管 ok 与否都试一次
             // （即使行数没变化、表没重算，宽度变化也可能只影响 rows，ovlScheduleMarkOverlay
@@ -32656,6 +32691,22 @@ function ovlScheduleLineOffsetRecompute(delay) {
 // 重画的情况——调用方是 ovlScheduleLineOffsetRecompute 的防抖回调，不是敲键盘的热路径。
 function ovlRenderGutter(force) {
     try {
+        // v2 Pass P123b（终核 issue-2）：这个函数只画 Code 模式的行号槽，但在本文件里被
+        // 至少 20 个调用点直接调用，其中 ovlResetProjectScopedState()（切项目文件夹）和
+        // ovlPerformDelete()（删掉当前文件所在父目录）这两处，在 Visual 模式下可达，且
+        // 调用之后都不跟一次 ovlVisualRender()/ovlRenderVisualGutter() 补救——旧行为是
+        // 直接把 gutter 换成一堆 Code 形态的 .ovl-ln 空壳格子，跟 Visual 面板的绝对定位
+        // 块彻底错位；本轮改的增量重排（P123 D3）又让这种错位从"闪一下、下次块落地自愈"
+        // 变成"持久，直到用户打开新文件触发整篇重渲染才会恢复"（块集合没变→增量分支→
+        // changedIdx 为空→不补建 cell，WeakMap 里存的 cell 也已经脱离文档）。与其在每个
+        // 调用点各自补判断，不如把模式分流收口到这一个函数的入口——Visual 模式下这个函数
+        // 本来就不该管 gutter，一律转派给 ovlRenderVisualGutter()（它自己已经有
+        // editorMode!=='visual' 的早退守卫，互相调用不会死循环），一次性堵死这一整类
+        // 缺陷的所有现有和未来调用点，不只是这两个已知实例。
+        if (OvlState.editorMode === 'visual') {
+            if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
+            return;
+        }
         const ta = document.getElementById('ovlCodeArea');
         const gutter = document.getElementById('ovlGutter');
         if (!ta || !gutter) return;
@@ -47201,17 +47252,101 @@ function ovlEnsureVisualBlockResizeObserver() {
     return OvlVisualBlockRO;
 }
 
+// v2 Pass P123（D1/D2/D3/D4，诊断见 .claude/tmp/p123_diag.md）：Visual gutter 从"每次全量
+// innerHTML='' 重建 N 个绝对定位 div"改成增量——中文懒翻译每块落地都会调一次这个函数，诊断
+// 实测中文翻译 30s 内被调 348 次、单次 41ms、把主线程钉到 longtask 峰值 4432ms（65% 墙钟
+// 时间在重建 gutter，原始模式一次都不会走到这条重排路径，是唯一"中文模式独有"的缺陷）。
+// 增量的关键：块落地翻译/单块重译这两条路径都是原地 blk.innerHTML= 替换（同一个 DOM 元素，
+// 只是内容变了），不是整篇重新 pane.innerHTML=html 换掉所有元素——所以只要块的元素集合/
+// 顺序没变，就不需要清空重建，只需要重新量一遍每块的高度、只写真的变了的那些 cell。块集合
+// 真的变了（整篇重渲染/换文件/折叠导言区/首次渲染）才退回全量重建，那条路径本来就不在
+// 348 次/30s 这条热路径里，一次性成本无所谓。
+let OvlVisualGutterCellMap = (typeof WeakMap !== 'undefined') ? new WeakMap() : null; // 块元素 -> 它的 gutter cell（只有渲染高度 >= 阈值的块才有 cell）
+let OvlVisualGutterBlockOrder = []; // 上一次渲染时的块元素顺序快照，元素引用逐个比对，判断这次调用块集合有没有变
+let OvlVisualGutterSpacerEl = null; // v2 Pass P123（D1）：撑高 gutter 滚动高度用的隐形哨兵，见 ovlVisualGutterSyncSpacer
+let OvlVisualGutterLastSpacerTop = -1;
+const OVL_VISUAL_GUTTER_MIN_H = 1; // v2 Pass P123（D2）：渲染高度小于这个值（绝大多数是 \label 等被过滤掉的命令行，量出来是 0）不产生行号格子——统一套 16px 下限会让上千个零高块的行号互相压成一坨
+
+function ovlVisualGutterSameBlockOrder(blocks) {
+    if (blocks.length !== OvlVisualGutterBlockOrder.length) return false;
+    for (let i = 0; i < blocks.length; i++) {
+        if (blocks[i] !== OvlVisualGutterBlockOrder[i]) return false;
+    }
+    return true;
+}
+
+// v2 Pass P105/P109 挂 ResizeObserver 那段逻辑抽出来单独一个函数，全量重建/增量更新两条
+// 路径共用，不重复写一遍——行为跟原来完全一样：只对没观察过的块调用一次 observe()，挂之前
+// 先把 WeakMap 里的"上次高度/宽度"同步成这次刚测出来的值（h 用带 16px 下限的那个值，
+// 跟原实现一致，不在这里顺手"修"RO 首次回调用原始高度比对可能误判的那个小瑕疵——不在
+// D1-D4 四条缺陷范围内，不在本轮改）。
+function ovlVisualGutterObserveBlock(blk, h, w) {
+    if (!OvlVisualObservedBlocks || OvlVisualObservedBlocks.has(blk)) return;
+    const ro = ovlEnsureVisualBlockResizeObserver();
+    if (!ro) return;
+    OvlVisualObservedBlocks.add(blk);
+    if (OvlVisualBlockLastH) OvlVisualBlockLastH.set(blk, h);
+    if (OvlVisualBlockLastW) OvlVisualBlockLastW.set(blk, w);
+    try { ro.observe(blk); } catch (e3) {}
+}
+
+function ovlVisualGutterEnsureSpacer(gutter) {
+    if (OvlVisualGutterSpacerEl && OvlVisualGutterSpacerEl.parentNode === gutter) return OvlVisualGutterSpacerEl;
+    const sp = document.createElement('div');
+    sp.className = 'ovl-ln-spacer';
+    sp.setAttribute('aria-hidden', 'true');
+    sp.style.position = 'absolute';
+    sp.style.left = '0';
+    sp.style.width = '1px';
+    sp.style.height = '1px';
+    sp.style.visibility = 'hidden';
+    sp.style.pointerEvents = 'none';
+    gutter.appendChild(sp);
+    OvlVisualGutterSpacerEl = sp;
+    OvlVisualGutterLastSpacerTop = -1; // 新建的 spacer（首次/gutter.innerHTML='' 之后重挂）强制下面重写一次 top
+    return sp;
+}
+
+// v2 Pass P123（D1）：gutter 的滚动高度天生比 pane 少 27~28px——gutter 的 scrollHeight 由
+// "最后一个绝对定位 cell 的底边 + 8px padding"撑出来，pane 还多出自己的 padding-bottom
+// （20px）和 .ovl-visual-body 的 .6em，滚到底时 `gutter.scrollTop = pane.scrollTop` 会被
+// gutter 自己更小的 scrollHeight 钳死，整列行号跟着偏了 27~28px（\end{document} 之后的尾段
+// 越长，钳死量越大）。补一个不可见的 1px 哨兵撑到跟 pane 同样高，不改变任何看得见的格子。
+function ovlVisualGutterSyncSpacer(gutter, pane) {
+    const sp = ovlVisualGutterEnsureSpacer(gutter);
+    const targetTop = Math.max(0, pane.scrollHeight - 1);
+    if (Math.abs(targetTop - OvlVisualGutterLastSpacerTop) > 0.5) {
+        sp.style.top = targetTop + 'px';
+        OvlVisualGutterLastSpacerTop = targetTop;
+        return true;
+    }
+    return false;
+}
+
 function ovlRenderVisualGutter() {
     try {
         const gutter = document.getElementById('ovlGutter');
         const pane = document.getElementById('ovlVisualPane');
         if (!gutter || !pane) return;
         if (OvlState.editorMode !== 'visual') return; // Code 模式下这根 gutter 不归这个函数管
-        const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+        // v2 Pass P123（D4）：pane 不可见时（比如切到 PDF-only 视图，#ovlEditorPanel 走
+        // display:none）getBoundingClientRect 会全部塌成 0——中文翻译在后台继续落地会把
+        // 每一块 cell 的坐标全写成 top:0，切回来之前整列行号会闪一下全部堆在顶部。
+        // offsetParent 为 null 就是"我或者我的祖先现在不可见"的标准判据，直接不画，保留
+        // 上一次的真实坐标，等 pane 真的可见时再重新量——ovlSetViewMode 切回 editor/split
+        // 会补一次强制重排，不用等下一次块落地才顺带修正。
+        if (!pane.offsetParent) return;
+        const blocks = Array.prototype.slice.call(pane.querySelectorAll('.ovl-visual-block[data-src-line]'));
         gutter.style.paddingTop = '0px';
-        OvlVisualBlockRects = [];
-        if (!blocks.length) { gutter.innerHTML = ''; return; }
-        const paneRect = pane.getBoundingClientRect();
+        if (!blocks.length) {
+            gutter.innerHTML = '';
+            OvlVisualBlockRects = [];
+            OvlVisualGutterCellMap = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+            OvlVisualGutterBlockOrder = [];
+            OvlVisualGutterSpacerEl = null;
+            OvlVisualGutterLastSpacerTop = -1;
+            return;
+        }
         // gutter 和 pane 是同一个 flex 行里的两个兄弟节点，边框盒的顶边天然对齐（同一个 Y）。
         // gutter 自己的 padding-top 已经清零，所以"cell.style.top = X"就是 X 像素落在
         // gutter 边框顶边下方——要跟 pane 里的块对齐，X 就该是"块边框盒顶边相对 pane 边框盒
@@ -47219,40 +47354,98 @@ function ovlRenderVisualGutter() {
         // padding 里面，r.top 相对 paneRect.top 的差值天然已经含着这段 padding，再减一次
         // 就是把整列行号硬拔高了 20px——上一版实测的那个恒定 20px 偏差，根就在这里多减了
         // 一次，不是字体加载的问题（那个是另一个真问题，也一并修了，见下面 fonts.ready）。
-        const frag = document.createDocumentFragment();
-        blocks.forEach(function (blk, i) {
-            const r = blk.getBoundingClientRect();
-            const top = (r.top - paneRect.top) + pane.scrollTop;
-            const h = Math.max(r.height, 16);
-            const ln = parseInt(blk.getAttribute('data-src-line'), 10);
-            const cell = document.createElement('div');
-            cell.className = 'ovl-ln ovl-ln-visual';
-            cell.setAttribute('data-ln', String(ln));
-            cell.setAttribute('data-block', String(i));
-            cell.style.top = Math.max(0, top) + 'px';
-            cell.style.height = h + 'px';
-            cell.textContent = String(ln + 1);
-            frag.appendChild(cell);
-            OvlVisualBlockRects.push({ line: ln, el: blk });
-            // v2 Pass P105：只对没观察过的块调用一次 observe()——WeakSet 保证每个 DOM 节点
-            // 生命周期内只挂一次，避免"每次 gutter 重算都重新 observe 导致规范里那个初次
-            // 投递又触发一轮 gutter 重算"的死循环。挂之前先把 WeakMap 里的"上次高度"同步
-            // 成这次刚测出来的 h——这样 ResizeObserver 那个必然会来的初次回调量出来的高度
-            // 会跟这里记的一致，被判定成"没变"，不会白触发一轮。
-            // v2 Pass P109 返修：宽度也同样预置（用 r.width，跟观察回调里读到的是同一套
-            // getBoundingClientRect 口径），避免首次投递被误判成"面板宽度变了"白重算一次图片。
-            if (OvlVisualObservedBlocks && !OvlVisualObservedBlocks.has(blk)) {
-                const ro = ovlEnsureVisualBlockResizeObserver();
-                if (ro) {
-                    OvlVisualObservedBlocks.add(blk);
-                    if (OvlVisualBlockLastH) OvlVisualBlockLastH.set(blk, h);
-                    if (OvlVisualBlockLastW) OvlVisualBlockLastW.set(blk, r.width);
-                    try { ro.observe(blk); } catch (e3) {}
+        const paneRect = pane.getBoundingClientRect();
+        const sameOrder = ovlVisualGutterSameBlockOrder(blocks);
+        let anyChanged = false;
+
+        if (!sameOrder) {
+            // 块集合变了（整篇重渲染/换文件/折叠导言区/首次渲染）——退回全量重建，写的目标
+            // 是一份还没挂到文档上的 DocumentFragment，读（getBoundingClientRect）写
+            // （frag.appendChild）交替也不会互相触发布局抖动，跟原实现同一条纪律。
+            gutter.innerHTML = '';
+            OvlVisualBlockRects = new Array(blocks.length);
+            OvlVisualGutterCellMap = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+            const frag = document.createDocumentFragment();
+            for (let i = 0; i < blocks.length; i++) {
+                const blk = blocks[i];
+                const r = blk.getBoundingClientRect();
+                const top = Math.max(0, (r.top - paneRect.top) + pane.scrollTop);
+                const rawH = r.height;
+                const visible = rawH >= OVL_VISUAL_GUTTER_MIN_H;
+                const h = Math.max(rawH, 16);
+                const ln = parseInt(blk.getAttribute('data-src-line'), 10);
+                OvlVisualBlockRects[i] = { line: ln, el: blk, top: top, h: h, visible: visible };
+                if (visible) {
+                    const cell = document.createElement('div');
+                    cell.className = 'ovl-ln ovl-ln-visual';
+                    cell.setAttribute('data-ln', String(ln));
+                    cell.setAttribute('data-block', String(i));
+                    cell.style.top = top + 'px';
+                    cell.style.height = h + 'px';
+                    cell.textContent = String(ln + 1);
+                    frag.appendChild(cell);
+                    if (OvlVisualGutterCellMap) OvlVisualGutterCellMap.set(blk, cell);
+                }
+                ovlVisualGutterObserveBlock(blk, h, r.width);
+            }
+            gutter.appendChild(frag);
+            anyChanged = true;
+        } else {
+            // 块集合没变——先做一遍纯读（getBoundingClientRect），跟原实现同一条"量完再写"
+            // 纪律：这次不是写进detached的 fragment，而是直接写已经挂在文档上的 live cell，
+            // 读写交替会互相触发布局抖动，所以先把全部块量完、算出真正变了哪些，再统一写。
+            const newRects = new Array(blocks.length);
+            const changedIdx = [];
+            for (let i = 0; i < blocks.length; i++) {
+                const blk = blocks[i];
+                const prev = OvlVisualBlockRects[i];
+                const r = blk.getBoundingClientRect();
+                const top = Math.max(0, (r.top - paneRect.top) + pane.scrollTop);
+                const rawH = r.height;
+                const visible = rawH >= OVL_VISUAL_GUTTER_MIN_H;
+                const h = Math.max(rawH, 16);
+                const ln = prev ? prev.line : parseInt(blk.getAttribute('data-src-line'), 10);
+                newRects[i] = { line: ln, el: blk, top: top, h: h, visible: visible, rawW: r.width };
+                const prevVisible = !!(prev && prev.visible);
+                if (!prev || visible !== prevVisible || Math.abs((prev.top || 0) - top) > 0.5 || Math.abs((prev.h || 0) - h) > 0.5) {
+                    changedIdx.push(i);
                 }
             }
-        });
-        gutter.innerHTML = '';
-        gutter.appendChild(frag);
+            if (changedIdx.length) {
+                anyChanged = true;
+                for (let k = 0; k < changedIdx.length; k++) {
+                    const i = changedIdx[k];
+                    const rc = newRects[i];
+                    let cell = OvlVisualGutterCellMap ? OvlVisualGutterCellMap.get(rc.el) : null;
+                    if (rc.visible) {
+                        if (!cell) {
+                            cell = document.createElement('div');
+                            cell.className = 'ovl-ln ovl-ln-visual';
+                            cell.setAttribute('data-ln', String(rc.line));
+                            cell.setAttribute('data-block', String(i));
+                            cell.textContent = String(rc.line + 1);
+                            gutter.appendChild(cell);
+                            if (OvlVisualGutterCellMap) OvlVisualGutterCellMap.set(rc.el, cell);
+                        }
+                        cell.style.top = rc.top + 'px';
+                        cell.style.height = rc.h + 'px';
+                    } else if (cell) {
+                        cell.remove();
+                        if (OvlVisualGutterCellMap) OvlVisualGutterCellMap.delete(rc.el);
+                    }
+                }
+            }
+            // v2 Pass P105：只对没观察过的块调用一次 observe()，宽度复用上面读阶段量出来的
+            // rawW（不重新调 getBoundingClientRect）——写阶段已经改过部分 cell 的 style，这里
+            // 再读一次会强制走一趟全量布局重算，白白抵消掉"只写变了的" cell 省下来的成本。
+            for (let i = 0; i < blocks.length; i++) ovlVisualGutterObserveBlock(blocks[i], newRects[i].h, newRects[i].rawW);
+            OvlVisualBlockRects = newRects;
+        }
+        OvlVisualGutterBlockOrder = blocks;
+
+        const spacerChanged = ovlVisualGutterSyncSpacer(gutter, pane);
+        if (!anyChanged && !spacerChanged) return; // v2 Pass P123（D3）：这一轮测下来高度真没变——整趟到此为止，不碰 scrollTop/选区标记/字体重排
+
         gutter.scrollTop = pane.scrollTop;
         ovlPaintGutterMarks();
         ovlScheduleVisualGutterAfterFonts(0);
@@ -47262,6 +47455,19 @@ function ovlRenderVisualGutter() {
         // Visual 模式、有没有激活的标记，没有就是空操作。
         if (typeof ovlScheduleMarkOverlay === 'function') ovlScheduleMarkOverlay();
     } catch (e) { console.error('[ovl] renderVisualGutter failed', e); }
+}
+
+// v2 Pass P123（D3 风险2）：ovlVisualScrollToLine / ovlMarkCenterVisual 直接读
+// OvlVisualBlockRects 缓存的像素位置——如果块刚落地/图片刚到位，触发的是
+// ovlScheduleVisualGutterAfterImage() 那条 rAF 合并入口（下一帧才真的跑），这两个入口如果
+// 恰好在"块已经变了、gutter 还没重排"这个窗口里被调用，读到的就是旧坐标。这里在读之前先把
+// 还没跑的那次重排同步跑掉，不真的等下一帧。
+function ovlFlushPendingVisualGutter() {
+    if (OvlVisualGutterImageRaf !== null) {
+        try { cancelAnimationFrame(OvlVisualGutterImageRaf); } catch (e) {}
+        OvlVisualGutterImageRaf = null;
+        if (OvlState.editorMode === 'visual' && typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
+    }
 }
 
 // v2 Pass P13：切模式前读"Visual 现在卷到源码第几行了"——找最后一个顶边仍在 pane 视口
@@ -47294,14 +47500,20 @@ function ovlVisualScrollToLine(line) {
     try {
         const pane = document.getElementById('ovlVisualPane');
         const gutter = document.getElementById('ovlGutter');
-        if (!pane || !gutter || !OvlVisualBlockRects.length) return;
+        if (!pane || !gutter) return;
+        // v2 Pass P123（D3 风险2）：先把还没跑的那次 rAF 合并重排同步跑掉，避免读到旧坐标。
+        if (typeof ovlFlushPendingVisualGutter === 'function') ovlFlushPendingVisualGutter();
+        if (!OvlVisualBlockRects.length) return;
         let idx = 0;
         for (let i = 0; i < OvlVisualBlockRects.length; i++) {
             if (OvlVisualBlockRects[i].line <= line) idx = i; else break;
         }
-        const cell = gutter.children[idx];
-        if (!cell) return;
-        pane.scrollTop = Math.max(0, parseFloat(cell.style.top) || 0);
+        // v2 Pass P123（D2）：改读 OvlVisualBlockRects[idx] 自己缓存的 top，不再假设
+        // gutter.children[idx] 就是块 idx 的格子——渲染高度 <1px 的块现在不产生 cell，
+        // gutter 的子节点数量跟块数量不再一一对应，见 ovlRenderVisualGutter() 头部大注释。
+        const rect = OvlVisualBlockRects[idx];
+        if (!rect) return;
+        pane.scrollTop = Math.max(0, rect.top || 0);
         gutter.scrollTop = pane.scrollTop;
     } catch (e) { console.error('[ovl] visualScrollToLine failed', e); }
 }
