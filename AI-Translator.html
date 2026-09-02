@@ -4358,7 +4358,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.11.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.11.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -31024,6 +31024,23 @@ function ovlVisualExtractProse(s) {
 // 了多少中文字符（zhChars），要求两者之间有一个下限比例。源文本身没有可译散文（纯公式/纯
 // 缩写/纯 URL，srcWords===0）时这道闸不判定——是否放行交给上下文已有的多重集/占位符完整性
 // 校验（这才是"分母为 0"这类块真正该被谁把关的地方，不该由一个"比例"函数兼职判）。
+// v2 Pass P128f（B4-1 阻断收口，核验 .claude/tmp/p128_verify4.md §2）：判定"这一段文本整体
+// 是不是以大写为主"——真实标题/表头/ALGORITHM 块（`PROOF OF THEOREM 1`、`REFERENCES`、
+// `\section{RELATED WORK}`、整句全大写正文等）不是"缩写"，是被全大写排版的正常散文，不该被
+// 下面的缩写豁免正则一并吞掉。孤立的单个短缩写（比如只有一个词的块 `LEO`）不算"以大写为主的
+// 一段文本"——要求候选词数 ≥2 才判定，避免把 verify4.md §2.2 A10 这类合法的单缩写块也误判成
+// "标题"从而反过来把它错当成正文（那样 `LEO` 会被计入 srcWords，反而不再是 no-prose，但真实
+// 语料/任务书都要求它保持 no-prose）。
+function ovlVisualCapsHeavyBlock(s) {
+    const words = String(s == null ? '' : s).match(/[A-Za-z]{2,}/g) || [];
+    if (words.length < 2) return false;
+    let capsN = 0, run = 0;
+    for (let i = 0; i < words.length; i++) {
+        const isCaps = words[i] === words[i].toUpperCase();
+        if (isCaps) { capsN++; run++; if (run >= 3) return true; } else { run = 0; }
+    }
+    return (capsN / words.length) >= 0.5;
+}
 function ovlVisualCjkRatioProse(s) {
     let t = String(s == null ? '' : s);
     // URL：合法出现在学术译文里（比如代码仓库/数据集链接）。v2 Pass P128d 修正（B2-2 根因①）：
@@ -31045,7 +31062,23 @@ function ovlVisualCjkRatioProse(s) {
     // 分母无关；K=0.25 的取值本身已经把"专有名词计入分母"这件事算进了校准样本（见
     // .claude/tmp/p128_impl.md「P128d 收口」§13.1 表格，legit 样本 srcWords 均含专有名词），
     // 不需要也不应该改判据本身，这里只改注释，把描述订正成跟实测一致。
-    t = t.replace(/\b[A-Z]{2,}[A-Z0-9-]*'?s?\b/g, ' ');
+    // v2 Pass P128f（B4-1 阻断收口）：旧正则把"任意长度的全大写词串"一律当缩写剥掉——
+    // `PROOF OF THEOREM 1`/`REFERENCES`/`\section{RELATED WORK}`/整句全大写正文这类真实
+    // 标题/正文因此被剥成空字符串，`srcWords` 归零，被 ovlVisualCjkGateEval/ovlVisualBlockNoProse
+    // 误判成"无可译文本"（真实语料 1-2/550，13 类构造边界 6 类全中，见 verify4.md §2）。
+    // 根治：只有"短 token（字母部分 ≤5，或本身含数字/连字符，比如 5G/Wi-Fi/NTNs/MIMO-OFDM）
+    // 且所在这段文本不是整体以大写为主"才当缩写剥掉；块整体以大写为主时（ovlVisualCapsHeavyBlock
+    // 判定，占比 ≥50% 或存在 ≥3 个连续全大写词）——无论长短，一律按普通单词折算进 srcWords，
+    // 不再剥离。孤立的短缩写（`LEO` 这类块内只有一个词）永远达不到"以大写为主"的判定门槛
+    // （候选词数 <2），继续被当缩写剥掉、继续判 no-prose，跟任务书要求的边界一致。
+    const capsHeavy = ovlVisualCapsHeavyBlock(t);
+    t = t.replace(/\b[A-Z]{2,}[A-Z0-9-]*'?s?\b/g, function (m) {
+        if (capsHeavy) return m;
+        const hasDigitOrHyphen = /[0-9-]/.test(m);
+        const letterLen = (m.match(/[A-Za-z]/g) || []).length;
+        if (hasDigitOrHyphen || letterLen <= 5) return ' ';
+        return m;
+    });
     return t;
 }
 // 剥掉受保护片段（[[N]]/OVLCODE/OVLCITE 哨兵、反斜杠命令名、花括号/方括号——见
@@ -32739,6 +32772,21 @@ function ovlVisualRestoreShortPartialBadges(pane) {
         els.forEach(function (el) { ovlVisualEnsureShortBadge(el); });
     } catch (e) {}
 }
+// v2 Pass P128f（R-6 收口，核验 .claude/tmp/p128_verify4.md §7）：以前每条会用字符串模板
+// （ovlVisualRenderBodyWithLines）重建一批块 DOM 的路径，都要自己记得把上面三个"回挂角标"
+// 函数逐个调一遍——整篇 ovlVisualRender() 三个都调了，但局部 patch 路径
+// （ovlInlineSrcRerenderLocal）只调了 ovlVisualRestoreFailBadges 一个，漏挂 noprose/short
+// 两种角标：`[data-ovl-trans-noprose]` 本身没有 CSS `::after`兜底（不像 skipped 那样"就算
+// JS 没回挂，CSS 也还看得出状态"），角标一旦漏挂，块就是像素级零标记的英文——用户在 zh 模式
+// 下就地编辑、选区跨到 noprose/short 块时复现（整篇重渲染后自愈，但那之前是真的看不出来）。
+// 收敛成一个函数、只维护一处调用列表，以后任何新的"重建一批块 DOM"路径只要记得调这一个
+// 函数就不会再漏。
+function ovlVisualRestoreAllBadges(pane) {
+    if (!pane) return;
+    ovlVisualRestoreFailBadges(pane);
+    ovlVisualRestoreNoProseBadges(pane);
+    ovlVisualRestoreShortPartialBadges(pane);
+}
 function ovlVisualRender() {
     try {
         const pane = document.getElementById('ovlVisualPane');
@@ -32799,9 +32847,7 @@ function ovlVisualRender() {
             if (OvlVisualState.tailOpen) html += '<pre class="ovl-visual-tail"></pre>';
         }
         pane.innerHTML = html;
-        ovlVisualRestoreFailBadges(pane); // v2 Pass P128（C1）：重渲染落地后回挂失败角标，紧跟在 innerHTML 之后
-        ovlVisualRestoreNoProseBadges(pane); // v2 Pass P128e（B3-1）：回挂"无可译文本·强制翻译"角标
-        ovlVisualRestoreShortPartialBadges(pane); // v2 Pass P128e（漏译侧）：回挂"可能漏译"重试角标
+        ovlVisualRestoreAllBadges(pane); // v2 Pass P128f（R-6）：重渲染落地后回挂失败/无可译文本/可能漏译三种角标，紧跟在 innerHTML 之后，收敛成单一函数（见该函数头部注释）
         ovlVisualSelOverlayReset(pane); // Pass Sel-Outline：innerHTML 冲掉了旧叠加层，重挂一个空的
         const preEl = pane.querySelector('.ovl-visual-preamble');
         if (preEl) preEl.textContent = preamble;
@@ -32898,7 +32944,7 @@ function ovlVisualPartialAttrHtml(reason) {
 // 已挂载的 DOM 元素上插入角标是同一份文案表（OVL_VISUAL_FAIL_TIP），只是产出属性字符串。
 // 角标本身（.ovl-visual-retry-badge 等 <span>）不在这里拼——那是真实可点击的交互元素，必须
 // 是已经在 DOM 里的节点，由 ovlVisualRender()/ovlInlineSrcRerenderLocal 在内容落地之后统一
-// 调用 ovlVisualRestoreFailBadges() 挂上。
+// 调用 ovlVisualRestoreAllBadges() 挂上（v2 Pass P128f 起收敛成单一函数，见该函数头部注释）。
 function ovlVisualFailAttrHtml(info) {
     const reason = (info && info.reason) || 'unknown';
     const attempts = (info && info.attempts) || 0;
@@ -49809,9 +49855,12 @@ function ovlInlineSrcRerenderLocal(st, newText) {
         if (pane && typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(pane);
         if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
         // v2 Pass P128（C1）：局部 patch 是整篇 ovlVisualRender() 之外第二条会重建块的路径——
-        // 同样要回挂失败角标，否则只在这条路径下（比如编辑相邻段落触发局部重渲染）复现"角标
-        // 被冲掉但没有整篇重渲染"的漏网场景。
-        if (pane && typeof ovlVisualRestoreFailBadges === 'function') ovlVisualRestoreFailBadges(pane);
+        // 同样要回挂角标，否则只在这条路径下（比如编辑相邻段落触发局部重渲染）复现"角标
+        // 被冲掉但没有整篇重渲染"的漏网场景。v2 Pass P128f（R-6 收口）：以前这里只调了
+        // ovlVisualRestoreFailBadges 一个，漏挂 noprose/short 两种角标（见
+        // ovlVisualRestoreAllBadges 头部注释）——改调收敛后的单一函数，跟整篇渲染路径共用
+        // 同一份"这批新块要回挂哪些角标"的清单，以后不会再漏。
+        if (pane && typeof ovlVisualRestoreAllBadges === 'function') ovlVisualRestoreAllBadges(pane);
         // v2 Pass P38：就地编辑保存后，被改过的这一块源码哈希变了——ovlVisualRenderBodyWithLines
         // 重新渲染出来的新块如果落在中文模式下会自动带 data-ovl-trans-pending（缓存按内容哈希，
         // 编辑过的文本天然 miss），这里补一次同步把调度器踢起来翻这一块；没改过的块不受影响。
