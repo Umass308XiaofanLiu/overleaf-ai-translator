@@ -4243,7 +4243,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.08.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.08.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-01';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -31316,7 +31316,13 @@ const OVL_HL_CLEAR_DELAY_MS = 350;      // 淡出播完再真清 DOM，留 50ms 
 function ovlHighlightExpiryMs() {
     const ov = (typeof window !== 'undefined') ? window.__ovlMarkFadeMsOverride : null;
     if (typeof ov === 'number' && ov >= 0) return ov;
-    const sec = Number(typeof OvlSettings !== 'undefined' ? OvlSettings.ovlHighlightExpirySec : NaN);
+    const raw = typeof OvlSettings !== 'undefined' ? OvlSettings.ovlHighlightExpirySec : undefined;
+    // v2 Pass P124b：null/""/非有限数必须落回默认 60 秒——不能被下面的 Number() 隐式转换成 0
+    // 从而被 sec===0 那条分支误判成用户选的"永不消失"（Number(null)===0、Number("")===0，
+    // 只有 localStorage 被外部损坏才会碰到，正常五个 <option> 都有确定 value）。真正的
+    // "永不消失"只认字面数字/数字字符串 0（P124 终核报告 Issue-2②）。
+    if (raw === null || raw === undefined || raw === '') return OVL_HL_EXPIRY_DEFAULT_SEC * 1000;
+    const sec = Number(raw);
     if (!isFinite(sec) || sec < 0) return OVL_HL_EXPIRY_DEFAULT_SEC * 1000;
     if (sec === 0) return -1; // 永不消失
     return sec * 1000;
@@ -31328,6 +31334,7 @@ function ovlHighlightExpiryMs() {
 const OvlHighlightExpiry = {
     handlers: new Map(),
     timers: new Map(),
+    lastExpirySec: undefined, // v2 Pass P124b：ovlApplySettings() 用它判断这一项是否真的变了
     register(kind, fadeFn, clearFn, resetFn) {
         this.handlers.set(kind, { fade: fadeFn, clear: clearFn, reset: resetFn || null });
     },
@@ -31358,9 +31365,47 @@ const OvlHighlightExpiry = {
         this.timers.set(kind, rec);
     },
     rearmAll() {
-        Array.from(this.timers.keys()).forEach(function (kind) { OvlHighlightExpiry.touch(kind); });
+        const self = this;
+        // v2 Pass P124b（终核报告 Issue-1，唯一 fail 项）：只遍历 timers 找不到"永不消失"状态
+        // 下画出来、但压根没排表的高亮——touch() 在 ms<0 时提前 return，从来没进过 timers。
+        // 这里额外纳入"当前可见但未排表"的 kind：编辑器侧看 OvlMarkState.lineFrom>=0（行级/
+        // 字符级/中文可见文字级三种画法都会置这个字段，见 ovlMarkLines/ovlMarkRange/
+        // ovlMarkRangeZhVisual），兜底再看叠加层里是否还留着 .ovl-mark-box；PDF 侧看每一页
+        // 容器里是否还有 .ovl-pdf-sync-overlay。只有"确实注册过 handler"的 kind 才会被
+        // touch()，不会凭空造出从没画过的高亮。
+        const kinds = new Set(this.timers.keys());
+        if (this.handlers.has('editorMark')) {
+            let editorVisible = (typeof OvlMarkState !== 'undefined' && OvlMarkState.lineFrom >= 0);
+            if (!editorVisible) {
+                const co = document.getElementById('ovlCodeMarkOverlay');
+                const vo = document.getElementById('ovlVisualMarkOverlay');
+                editorVisible = !!((co && co.querySelector('.ovl-mark-box')) || (vo && vo.querySelector('.ovl-mark-box')));
+            }
+            if (editorVisible) kinds.add('editorMark');
+        }
+        if (typeof OvlState !== 'undefined' && OvlState.pdfPageMap) {
+            OvlState.pdfPageMap.forEach(function (entry, num) {
+                const kind = 'pdfSync:' + num;
+                if (self.handlers.has(kind) && entry && entry.container && entry.container.querySelector('.ovl-pdf-sync-overlay')) {
+                    kinds.add(kind);
+                }
+            });
+        }
+        kinds.forEach(function (kind) { self.touch(kind); });
     },
-    activeKinds() { return Array.from(this.timers.keys()); }
+    activeKinds() { return Array.from(this.timers.keys()); },
+    // v2 Pass P124b（终核报告 Issue-2③）：批量清掉某前缀的全部 handler+timer 条目。目前只有
+    // 'pdfSync:' 用得到——PDF 整份页列表重建（换文档/换编译结果）时旧页号的 kind 不会再被
+    // 用到，不清掉的话 handlers 会随见过的页号单调增长、永不回收（见 ovlPdfTeardown）。
+    purgePrefix(prefix) {
+        const self = this;
+        Array.from(this.handlers.keys()).forEach(function (kind) {
+            if (kind.indexOf(prefix) === 0) {
+                self.cancel(kind);
+                self.handlers.delete(kind);
+            }
+        });
+    }
 };
 
 // —— 以下四个函数名保留（P45 遗留调用点：31759/32034/32085 三处 ovlMarkScheduleFadeOut()、
@@ -43097,9 +43142,19 @@ function ovlApplySettings() {
             }
             OvlState.ovlBridgeLastOrigin = nowOrigin;
         }
-        // v2 Pass P124：定位高亮过期时长可能刚变——把所有当前活跃的过期计时按新设置重新排一遍
-        // （从现在开始重新计时，不是立刻按新值截断）。没有活跃计时时是空操作。
-        if (typeof OvlHighlightExpiry !== 'undefined') OvlHighlightExpiry.rearmAll();
+        // v2 Pass P124：定位高亮过期时长可能刚变——把所有当前活跃/可见的过期计时按新设置重新
+        // 排一遍（从现在开始重新计时，不是立刻按新值截断）。
+        // v2 Pass P124b（终核报告 Issue-2①）：改成只在 ovlHighlightExpirySec 这一项真的变了
+        // 才 rearmAll()——原版无条件重排，改字体大小/主题这类无关设置也会顺带把正亮高亮的
+        // 计时清零重排，跟设置面板帮助文案「改这一项会让…重新开始计时」的措辞（只承诺这一项）
+        // 不符。
+        if (typeof OvlHighlightExpiry !== 'undefined') {
+            const curExpirySec = OvlSettings.ovlHighlightExpirySec;
+            if (OvlHighlightExpiry.lastExpirySec !== curExpirySec) {
+                OvlHighlightExpiry.lastExpirySec = curExpirySec;
+                OvlHighlightExpiry.rearmAll();
+            }
+        }
     } catch (e) { console.error('[ovl] applySettings failed', e); }
 }
 
@@ -44038,6 +44093,11 @@ function ovlPdfTeardown() {
             if (entry.renderTask) { try { entry.renderTask.cancel(); } catch (e) {} entry.renderTask = null; }
         });
     }
+    // v2 Pass P124b（终核报告 Issue-2③）：连同这份 pdfPageMap 绑定的过期计时 kind 一起清掉——
+    // DOM 容器马上会被 wrap.innerHTML='' 整体拆掉（ovlPdfBuildPageList 紧接着调用这个函数），
+    // 旧 kind 的 handlers/timers 条目不清的话会随见过的页号单调增长、永不回收。relayout
+    // （缩放，ovlPdfRelayout）不走这个函数，页容器原地保留，不受影响。
+    if (typeof OvlHighlightExpiry !== 'undefined') OvlHighlightExpiry.purgePrefix('pdfSync:');
     OvlState.pdfPageMap = null;
     OvlState.pdfPageMapUrl = null;
 }
