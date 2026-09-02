@@ -4279,7 +4279,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.09.03';        // APP_VERSION_STAMP
+const APP_VERSION = '03.10.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -7756,12 +7756,18 @@ function commitCrossHighlight(mySeq, idx, fromSide, toSide, fragments, via) {
 // 因此这里的唯一原则是 —— 没把握就不给。返回 null，调用方老老实实退回选区范围。
 
 // 后面跟着 '.' 也不算句末的缩写（全小写，不含最后那个点）
+// v2 Pass P130b（核验 .claude/tmp/p130_verify.md blocking#1 附带发现）：新增 'i.i.d'、's.t'——
+// 之前两个都不在表里，英文原文里靠"句末标点后紧跟小写字母"这条独立安全网兜住（"i.i.d. across
+// users"里 "across" 是小写，天然不会被误判句末），但中文译文里这类缩写后面紧跟的是中文字符
+// （不是拉丁小写字母），那条安全网够不到——中文侧现在复用的就是这同一张表（见下方
+// ovlZhSplitSentences），所以这里补全的两条对中英文切句是同时生效的，不是只为中文开小灶。
 const SENTENCE_ABBREVIATIONS = [
     'e.g', 'i.e', 'et al', 'al', 'etc', 'cf', 'vs', 'viz', 'resp', 'approx', 'ca', 'ibid',
     'fig', 'figs', 'eq', 'eqs', 'sec', 'secs', 'ref', 'refs', 'tab', 'tabs', 'alg', 'thm',
     'ch', 'chap', 'app', 'no', 'nos', 'vol', 'vols', 'pp', 'p', 'ed', 'eds', 'est',
     'dr', 'prof', 'mr', 'mrs', 'ms', 'st', 'jr', 'sr', 'inc', 'ltd', 'dept', 'univ',
-    'w.r.t', 'a.k.a', 'ph.d', 'm.s', 'b.s', 'u.s', 'u.k', 'min', 'max', 'std', 'avg', 'var'
+    'w.r.t', 'a.k.a', 'ph.d', 'm.s', 'b.s', 'u.s', 'u.k', 'min', 'max', 'std', 'avg', 'var',
+    'i.i.d', 's.t'
 ];
 
 // LaTeX 数学与宏参数区：这些区域里的 '.' 不是句号（$x_i \cdot y$、\cite{smith2020} 等）。
@@ -32721,6 +32727,25 @@ function ovlVisualPosInNonRenderedSpan(spans, pos) {
     for (let i = 0; i < spans.length; i++) { if (pos >= spans[i][0] && pos < spans[i][1]) return true; }
     return false;
 }
+// v2 Pass P130b（N-1 收口，抽出来的词/子句级精确路径，逻辑跟改动前逐字节相同）：数出命中在
+// 块源码里是第几次出现（0-based）——次序作为源码→渲染的消歧依据。P68 修复 2：跳过不会渲染成
+// 可见文字的区间（注释 + \label/\ref/\eqref/\autoref 参数，实测确认 \cite 系列不在此列——见
+// ovlVisualNonRenderedSpans 头顶的大注释），让这里的计数基准跟 ovlVisualFindTextRangeInBlock
+// 在渲染 DOM 里数次序的基准对齐。对着已经翻译成别的语言的块，matchedText（英文子串）在渲染
+// DOM 里天然找不到，ovlVisualFindTextRangeInBlock 老实返回 null——这是安全失败，不是误判。
+function ovlVisualFindWordLevelRangeInBlock(target, blockText, localStart, localEnd) {
+    try {
+        const matchedText = blockText.slice(localStart, localEnd);
+        if (!matchedText) return null;
+        const nonRendered = ovlVisualNonRenderedSpans(blockText);
+        let occurrenceIndex = 0, from = 0, idx;
+        while ((idx = blockText.indexOf(matchedText, from)) !== -1 && idx < localStart) {
+            if (!ovlVisualPosInNonRenderedSpan(nonRendered, idx)) occurrenceIndex++;
+            from = idx + 1;
+        }
+        return ovlVisualFindTextRangeInBlock(target, matchedText, occurrenceIndex);
+    } catch (e) { return null; }
+}
 
 // startChar/endChar：#ovlCodeArea 坐标系；lineFrom/lineTo 是它俩换算出的 0-based 行区间
 // （调用方已经算好，避免这里重复算一遍 split('\n')）。
@@ -32748,26 +32773,27 @@ function ovlVisualRangeForChars(pane, lineFrom, lineTo, startChar, endChar) {
         if (localStart < 0 || localEnd > blockText.length || localStart >= localEnd) return null;
         const matchedText = blockText.slice(localStart, localEnd);
         if (!matchedText) return null;
-        // v2 Pass P130：中文模式下块的渲染 DOM 是中文，下面这套"在渲染文字里 indexOf 英文子串"
-        // 逻辑必然 0 命中——这正是反向（PDF 双击 -> 编辑器高亮）在中文 Visual 模式下退化成
-        // 整块高亮的根因。这里先试一次句级对齐反查（只在这个块的中文句数/英文句数严格 1:1
-        // 时才做，跟正向 ovlVisualMapZhSentenceToEn 同一条"对不齐就老实退化"纪律，绝不猜测）；
-        // 命中就直接返回中文句的 Range，未命中原样 return null（调用方 ovlPaintVisualMarkOverlayFromChars
-        // /ovlMarkRange 早就会把 null 退回块级高亮，逐字节沿用既有降级路径，不是新增行为）。
+        // v2 Pass P130：中文模式下块的渲染 DOM 是中文，"在渲染文字里 indexOf 英文子串"这套逻辑
+        // 对着已经翻成中文的块必然 0 命中——这正是反向（PDF 双击 -> 编辑器高亮）在中文 Visual
+        // 模式下退化成整块高亮的根因。
+        // v2 Pass P130b（核验 .claude/tmp/p130_verify.md non-blocking N-1 收口）：P130 最初的
+        // 写法在 OvlVisualLangState.lang==='zh' 时无条件跳过下面这段"词/子句级精确"路径，直接
+        // 改走句级映射——这对已经翻译成中文的块是对的（英文子串搜不到中文渲染文字里，老实
+        // 返回 null 才是唯一正确结果），但对**仍显示英文**的块（pending/failed/skipped，P128
+        // 合并进主线后会长期存在）是无谓的精度倒退：明明词级路径本来就能精确命中（渲染 DOM
+        // 里就是原样的英文），却被语言开关直接跳过、强行放宽成整句。
+        // 改法：先老老实实试一次词/子句级精确路径（ovlVisualFindWordLevelRangeInBlock，逻辑
+        // 跟改动前逐字节相同，只是抽成了函数）——只有它明确返回 null（说明这个块真的已经翻成
+        // 别的文字，渲染 DOM 里找不到这段英文子串）才退化到句级映射；lang!=='zh' 时压根不会走
+        // 到句级映射这一步（下面这行 if 保证）。断言：句级映射只在"词级确凿失败"之后才可能被
+        // 调用，不存在"词级能命中却被跳过去猜句子"的路径——test_p130_zh_locate.js 组L5 的
+        // pending 英文块用例（词级命中单词 "calibration"）直接断言这一点。
+        const wordLevel = ovlVisualFindWordLevelRangeInBlock(target, blockText, localStart, localEnd);
+        if (wordLevel) return wordLevel;
         if (OvlVisualLangState.lang === 'zh') {
             return ovlVisualMapEnRangeToZhSentence(target, localStart, localEnd);
         }
-        // 数出命中在块源码里是第几次出现（0-based）——次序作为源码→渲染的消歧依据。P68 修复 2：
-        // 跳过不会渲染成可见文字的区间（注释 + \label/\ref/\eqref/\autoref 参数，实测确认
-        // \cite 系列不在此列——见 ovlVisualNonRenderedSpans 头顶的大注释），让这里的计数基准
-        // 跟 ovlVisualFindTextRangeInBlock 在渲染 DOM 里数次序的基准对齐。
-        const nonRendered = ovlVisualNonRenderedSpans(blockText);
-        let occurrenceIndex = 0, from = 0, idx;
-        while ((idx = blockText.indexOf(matchedText, from)) !== -1 && idx < localStart) {
-            if (!ovlVisualPosInNonRenderedSpan(nonRendered, idx)) occurrenceIndex++;
-            from = idx + 1;
-        }
-        return ovlVisualFindTextRangeInBlock(target, matchedText, occurrenceIndex);
+        return null;
     } catch (e) { return null; }
 }
 
@@ -43557,11 +43583,20 @@ function ovlSyncTexForwardDirect() {
         // v2 Pass P130：中文 Visual 模式下 ovlSyncTexCurrentSentenceText 已经把选中的中文句换成
         // 按序对齐的英文源句；对不齐（句数不等/拿不到源码）时会退化到块首句或整行，这里如实
         // 提示用户退化到了哪一档，不假装每次都是精确句级（CLAUDE.md §9 诚实优先于完成度）。
+        // v2 Pass P130b：新增 reason:'anchor'——句数刚好相等但锚点/DP 安全闸判定对齐不可信
+        // （blocking#1 的场景），跟"句数本来就不等"是两种不同的不放心程度，文案分开，不要把
+        // "算出来但不敢信"说成"压根没法算"。
         const p130Degrade = OvlP130LastLocateInfo;
         if (p130Degrade && p130Degrade.level && p130Degrade.level !== 'sentence' && typeof showToast === 'function') {
-            showToast(p130Degrade.level === 'block'
-                ? '中文模式下这一句无法精确对齐，已按该段落定位（段落级）'
-                : '中文模式下这一句无法精确对齐，仅定位到该页（页级）', 'info');
+            let p130Msg;
+            if (p130Degrade.level === 'block') {
+                p130Msg = (p130Degrade.reason === 'anchor')
+                    ? '段落级定位（句子对齐不可靠）'
+                    : '中文模式下这一句无法精确对齐，已按该段落定位（段落级）';
+            } else {
+                p130Msg = '中文模式下这一句无法精确对齐，仅定位到该页（页级）';
+            }
+            showToast(p130Msg, 'info');
         }
         setTimeout(function () {
             if (typeof ovlP106TryReverseSentenceHighlight !== 'function') return;
@@ -46373,50 +46408,110 @@ function ovlPdfSyncTexTrySentenceLevel(items, clickX, clickY, lineIdx) {
 //
 // 方案（不新增持久化 schema，运行时现算）：把"中文句 i"按序对齐到"英文源句 i"，取到对应
 // 英文句后原样交给已有的 ovlP106*/ovlPdfSyncTexTrySentenceLevel 两条腿——它们一个字都不用
-// 改，因为它们拿到的又是英文文本了。对齐失败时有明确的三级退化链（句级 -> 块首句 -> 整行/
+// 改，因为它们拿到的又是英文文本了。对齐失败时有明确的多级退化链（句级 -> 块首句 -> 整行/
 // 页级），并在 UI 上如实提示，不冒充精确。
 //
-// 退化链（ovlVisualMapZhSentenceToEn 返回 { enText, level }）：
-//   L1  中文句数 === 英文句数（且 >0）      -> en[zhIdx]         level:'sentence'
-//   L2  句数不等，但块只有 1 个英文句        -> en[0]（唯一选择）  level:'sentence'
-//   L3  句数不等且英文句数 >1               -> en[0]（段落首句）  level:'block'
+// v2 Pass P130b（核验 .claude/tmp/p130_verify.md blocking#1）：原版唯一的安全闸是"中文句数
+// === 英文句数"——但两套切句器口径不同，句数完全可能偶然相等却整体错位（比如中文这边在
+// "Tab. 2"处多切一刀、又在别处把两句合成一句，句数刚好抵消相等），此时原版直接判 level:
+// 'sentence' 全部通过，不出任何提示，用户点第 i 句译文却被带到 PDF 上第 j≠i 句——比"只能
+// 页级"更误导。本 Pass 在"句数相等"之外，再对每一对候选 (en[i], zh[i]) 做锚点安全闸校验
+// （ovlP130AlignZhToEnAnchored，见下文），句数相等只是长度层面的必要条件，锚点/长度证据都
+// 站得住才真正采信为句级；不满足时尝试锚点驱动的单调 DP 合并/拆分（允许 1↔2、2↔1），DP 也
+// 拼不出一条锚点不冲突的完整路径时，老实退化到块级 + toast 提示"段落级定位（句子对齐不可
+// 靠）"——绝不允许"句数刚好相等"这一条弱证据单独放行。
+//
+// 退化链（ovlVisualMapZhSentenceToEn 返回 { enText, level, reason? }）：
+//   L1  锚点安全闸通过（含句数相等的直通 1:1，以及 DP 合并/拆分出的 1↔2/2↔1）
+//                                            -> 对应英文句（可能是拼接的多句）  level:'sentence'
+//   L2  块内只有 1 个英文句，别无选择         -> en[0]（唯一选择）  level:'sentence'
+//   L3a 中文侧切不出句子/锚点安全闸判定不可信 -> en[0]（段落首句）  level:'block', reason:'anchor'
 //   L4  拿不到英文源码（block 没有可用的 data-src-line 区间）      level:'line'（enText:null）
 
-// 中文句切分：按中英文句末标点 。！？!?. 切，收尾吞掉紧跟的闭合引号/括号与空白；跟
-// ovlP114SplitLineIntoSentenceSpans（英文专用、P114 反向定位在用）平行独立、互不影响——那个
-// 函数不改，这里单开一个中文/中英混排专用的。ASCII 句点复用 P114 已有的缩写表
-// （ovlP114MaskAbbrevPeriods，"Fig."/"et al." 这类不误切）+ 前后皆数字的小数点守卫；中文全角
-// 句末标点（。！？）语义上没有小数点式的歧义，一律视为真边界。硬不变量（跟 P114 组I 同一条
-// 纪律）：spans.map(s=>text.slice(s.startChar,s.endChar)).join('') === text 恒成立，不丢字。
-const OVL_ZH_SENT_TRAILING_RE = /["'”’」』】)\]〉》]/;
-function ovlZhSplitSentences(text) {
+// v2 Pass P130b（核验 .claude/tmp/p130_verify.md blocking#1，根治）：中文切句口径统一到英文
+// 那一套，不再维护两份规则。原版每次单独抓一张 16 条的缩写表（ovlP114MaskAbbrevPeriods），跟
+// 英文真正在用的分句器 xportSegmentsEx/findSentenceBoundaries（9990/7839 行，全文档切段/切句
+// 唯一权威实现，SENTENCE_ABBREVIATIONS 有 50+ 条）根本不是同一张表——"Tab."/"etc."/"w.r.t."/
+// "Ph.D."/"U.S." 都不在旧的 16 条表里，中文译文一出现这些常见学术缩写就会被多切一刀。
+// 对应关系（中文句末标点集合 vs 英文）：CJK_END='。！？' 对应英文 ASCII_END='.!?'；中文里的
+// ；/： 跟英文的 ;/: 一样都**不**算句末（枚举/并列关系，不是完整句子边界），两边故意保持
+// 不对称少切、宁可句子偏长。
+//
+// 中文句切分：按中英文句末标点 。！？!?. 切，收尾吞掉紧跟的闭合引号/括号与空白。ASCII 句点
+// 保护规则（跟英文 findSentenceBoundaries 完全同源，不是"照着抄一份"而是直接调用同一个
+// isAbbreviationDot + 同一张 SENTENCE_ABBREVIATIONS 表）：
+//   ① 小数点：前后皆数字（"98.5"）不切；
+//   ② 缩写：isAbbreviationDot 判定命中（"Fig."/"et al."/"w.r.t."/"Ph.D."/"U.S." 等）不切；
+//   ③ ASCII 省略号：连续 2 个以上 '.'（"..."）整段跳过，不当边界（中文场景下英文那条"省略号
+//      后紧跟小写字母=不是新句子"安全网够不到——省略号后面接的通常是中文字，不是拉丁小写词，
+//      所以中文这边单独加"连续多点一律不算边界"这条更直接的规则，语义上更宽松但绝不会真的
+//      切错——省略号本来就不该独立成句）；
+//   ④ 编号列表：紧邻句点前的数字串（"1."/"12."）如果出现在当前正在累积的句子片段最开头、或者
+//      前面（跳过空白后）紧跟着枚举引导标点（：:；;，,、换行）——判定为列表序号，不切
+//      （"主要有三点：1. 提高精度；2. 降低时延。"不应该在 "1." "2." 处断开）；
+//   ⑤ 剩下的 ASCII 句点：后面必须紧跟空白/结尾/中文字符/闭合引号才算真边界，否则当普通字符
+//      （网址/未收录缩写残留）继续扫——沿用原有"标点后紧跟非空白=假边界"这条判据。
+// 公式/`\text{}` 内标点的保护用第二个参数 protectedMask 实现（见下方 ovlVisualZhSentenceSpans/
+// ovlP130BuildKatexProtectedMask）——中文侧拿到的是**渲染后的可见文字**，不是 LaTeX 源码，没
+// 有 `$...$`/`\text{}` 这种源码级语法可判，只能反过来从 DOM：字符落在某个 .katex 渲染节点内部
+// 就标记为受保护，跳过句末判定（原理跟英文侧"源码里 $...$ 内的句点不算句末"完全对应，只是
+// 判据从"源码文本模式"换成了"DOM 祖先节点"，因为两边看到的是不同层的表示）。
+// 硬不变量（跟英文 P114 组I 同一条纪律，纯函数测试 join 不变量覆盖）：
+//   spans.map(s=>text.slice(s.startChar,s.endChar)).join('') === text 恒成立，一个字符不丢。
+const OVL_ZH_SENT_TRAILING_RE = /["'”’」』】)\]〉》）］]/; // v2 Pass P130b（N-2 收口）：补全角 ）］
+// 编号列表项判定：dotIndex 是句点下标，spanStart 是"当前正在累积的中文句"起点。
+function ovlP130IsListMarkerDot(raw, dotIndex, spanStart) {
+    let j = dotIndex - 1;
+    while (j >= 0 && /[0-9]/.test(raw[j])) j--;
+    if (j === dotIndex - 1) return false; // 句点前一个字符不是数字，不是列表序号
+    const digitStart = j + 1;
+    if (digitStart <= spanStart) return true; // 数字串就在当前句子片段最开头
+    let k = j;
+    while (k >= 0 && /\s/.test(raw[k])) k--;
+    if (k < 0) return true; // 数字串前只有空白，等于在文本开头
+    return '：:；;，,、\n'.indexOf(raw[k]) !== -1; // 紧邻枚举引导标点
+}
+// protectedMask：可选的同长度布尔数组，true 表示该字符位置不参与句末判定（当普通字符跳过）；
+// 不传时行为等价于"整段都不受保护"，纯文本单测（没有 DOM）走这条路径。
+function ovlZhSplitSentences(text, protectedMask) {
     const raw = String(text == null ? '' : text);
-    const masked = (typeof ovlP114MaskAbbrevPeriods === 'function') ? ovlP114MaskAbbrevPeriods(raw) : raw;
-    const n = masked.length;
+    const n = raw.length;
     const spans = [];
     let start = 0, i = 0;
     while (i < n) {
-        const ch = masked[i];
+        if (protectedMask && protectedMask[i]) { i++; continue; }
+        const ch = raw[i];
         const isCjkEnd = (ch === '。' || ch === '！' || ch === '？'); // 。！？
-        const isAsciiEnd = (ch === '.' || ch === '!' || ch === '?');
-        if (isCjkEnd || isAsciiEnd) {
-            if (ch === '.') {
-                const prevCh = i > 0 ? masked[i - 1] : '';
-                const nextCh = (i + 1) < n ? masked[i + 1] : '';
-                if (/[0-9]/.test(prevCh) && /[0-9]/.test(nextCh)) { i++; continue; } // 小数点，不切
+        const isAsciiDot = (ch === '.');
+        const isAsciiBang = (ch === '!' || ch === '?');
+        if (isCjkEnd || isAsciiDot || isAsciiBang) {
+            if (isAsciiDot) {
+                if (raw[i + 1] === '.') { // ③ ASCII 省略号：整段连续的点都不是边界
+                    let j = i;
+                    while (j < n && raw[j] === '.') j++;
+                    i = j; continue;
+                }
+                const prevCh = i > 0 ? raw[i - 1] : '';
+                const nextCh = (i + 1) < n ? raw[i + 1] : '';
+                if (/[0-9]/.test(prevCh) && /[0-9]/.test(nextCh)) { i++; continue; } // ① 小数点
+                if (ovlP130IsListMarkerDot(raw, i, start)) { i++; continue; }        // ④ 编号列表
+                if (typeof isAbbreviationDot === 'function' && isAbbreviationDot(raw, i)) { i++; continue; } // ② 缩写
             }
             let j = i + 1;
-            while (j < n && (masked[j] === '。' || masked[j] === '！' || masked[j] === '？'
-                || masked[j] === '.' || masked[j] === '!' || masked[j] === '?')) j++;
+            while (j < n && !(protectedMask && protectedMask[j]) &&
+                (raw[j] === '。' || raw[j] === '！' || raw[j] === '？'
+                    || raw[j] === '.' || raw[j] === '!' || raw[j] === '?')) j++;
+            const isAsciiEnd = (isAsciiDot || isAsciiBang);
             if (isAsciiEnd) {
-                // ASCII 句末：后面必须是空白/结尾/中文字符/闭合引号才算真边界，否则当普通字符
-                // （网址/未收录缩写残留）继续扫——跟 P114 的"标点后紧跟非空白=假边界"同一条纪律。
-                const after = j < n ? masked[j] : '';
+                // ⑤ ASCII 句末：后面必须是空白/结尾/中文字符/闭合引号才算真边界，否则当普通
+                // 字符（网址/未收录缩写残留）继续扫——跟 P114 的"标点后紧跟非空白=假边界"同一
+                // 条纪律。
+                const after = j < n ? raw[j] : '';
                 const boundaryOk = (j >= n) || /\s/.test(after) || /[一-鿿]/.test(after) || OVL_ZH_SENT_TRAILING_RE.test(after);
-                if (!boundaryOk) { i++; continue; }
+                if (!boundaryOk) { i = j; continue; }
             }
-            while (j < n && OVL_ZH_SENT_TRAILING_RE.test(masked[j])) j++; // 收尾闭合引号/括号
-            while (j < n && /\s/.test(masked[j])) j++;                    // 收尾空白
+            while (j < n && OVL_ZH_SENT_TRAILING_RE.test(raw[j])) j++; // 收尾闭合引号/括号
+            while (j < n && /\s/.test(raw[j])) j++;                    // 收尾空白
             spans.push([start, j]);
             start = j; i = j;
             continue;
@@ -46430,12 +46525,30 @@ function ovlZhSplitSentences(text) {
     }
     return out;
 }
+// 从 ovlVisualCollectBlockVisibleText 的 {nodes,text} 里构建"这段字符落在某个 KaTeX 渲染节点
+// 内部"的保护掩码——公式渲染出来的文字（比如 \alpha+\beta\gamma 渲染成的 α+βγ，或者
+// \text{...} 渲染出的字面文字）天然会含 ASCII 句点/叹号问号这类字符，不能被误判成中文句末。
+function ovlP130BuildKatexProtectedMask(collected) {
+    const n = collected.text.length;
+    const mask = new Array(n);
+    for (let i = 0; i < collected.nodes.length; i++) {
+        const entry = collected.nodes[i];
+        const el = entry.node.parentElement;
+        if (el && el.closest && el.closest('.katex')) {
+            const s = entry.start, e = s + entry.node.nodeValue.length;
+            for (let k = s; k < e && k < n; k++) mask[k] = true;
+        }
+    }
+    return mask;
+}
 // 块的中文句列表：直接切"当前渲染出来、用户看得见"的文字（ovlVisualCollectBlockVisibleText，
-// P68 已经在用的同一个 helper，天然跳过 katex-mathml 隐藏副本与失败角标）。
+// P68 已经在用的同一个 helper，天然跳过 katex-mathml 隐藏副本与失败角标），叠加 KaTeX 保护
+// 掩码后再切句。
 function ovlVisualZhSentenceSpans(blockEl) {
     try {
-        const text = ovlVisualCollectBlockVisibleText(blockEl).text;
-        return ovlZhSplitSentences(text);
+        const collected = ovlVisualCollectBlockVisibleText(blockEl);
+        const mask = ovlP130BuildKatexProtectedMask(collected);
+        return ovlZhSplitSentences(collected.text, mask);
     } catch (e) { return []; }
 }
 // 块的英文源句列表：ovlVisualBlockSrcText（块的源码区间现切）+ xportSegmentsEx（既有英文分句
@@ -46460,19 +46573,174 @@ function ovlVisualEnSentencesForBlock(blockEl) {
         return out;
     } catch (e) { return null; }
 }
-// 核心：中文句索引 -> 对齐的英文源句 + 退化档位（四级链，见本节头部注释）。
+// ==================== v2 Pass P130b：锚点安全闸 + 单调 DP 对齐（核心）====================
+// 只看"句数相等"不是安全的对齐证明（见本节头部注释的 blocking#1 复现）。这里对每一对候选
+// (en 句群, zh 句群) 提取"锚点多重集"——引用编号 [n]（含 P122 OVLCITE 哨兵解开后落地的同一种
+// 字面 [n] 记法，正向/反向都已经统一走这个记法，见 ovlVisualCiteMask/Unmask 30145 行起）、
+// 阿拉伯数字串、全大写缩写（LEO/GNN/MWM/FSO…）、URL——这些内容翻译时必须逐字保留，天然是
+// "这一句到底是谁"的强证据：任一类别在英文句里非空，就要求中文句群里同一类别的多重集完全
+// 相等（不管数量还是值），一个不落地/多出来/挪了位置都判不兼容。英文句里该类别为空则不做该
+// 类别校验（宽松放行，比如某句根本没有引用，不能拿"中文句里出现了个不相关的数字"来卡它）。
+// 公式片段本身不比较字面文本（源码是 LaTeX、渲染后是 KaTeX 输出的 Unicode 字形，两边字符集
+// 完全不同、逐字比较没有意义），但 SENTENCE_ABBREVIATIONS/全大写缩写/数字串这三类天然会覆盖
+// 公式里最容易被弄混的部分（编号、变量名缩写）；纯公式无锚点的句子交给下面的长度比弱校验。
+//
+// 两边都没有任何锚点时，退而求其次用"中文字符数 / 英文词数"跟本块整体均值比：globalRatio 是
+// 这个块里"全部中文字符数 / 全部英文词数"的总体均值，单句的比值允许在 [0.35×, 3.0×] 全局均值
+// 内浮动——这个区间是经验值：收紧到 [0.5,2] 在真实学术译文里会把插入语/从句造成的正常长度
+// 波动（比如一句很短的过渡句 vs 一句带长定语的主句）也判成"可疑"，反而经常触发不必要的降级；
+// 放宽到 [0.35,3.0] 仍然能抓住"整句被错位挪到另一句"这种典型偏差（实测错位后长度比偏离
+// 5~10 倍是常态，远超这个区间），是"抓真错位、不误伤正常波动"之间的平衡点，不是拍脑袋常数。
+//
+// DP 只允许 (1en,1zh)/(2en,1zh)/(1en,2zh) 三种转移（对应"直接对应"/"两句英文合并成一句中文"/
+// "一句英文拆成两句中文"），更深的合并/拆分不做——真实学术翻译里三句合一/一句拆三这类更深层
+// 的重排极罕见，越往深走锚点/长度这两类证据就越稀释，为了覆盖这种尾部场景反而会拉低主路径
+// 的可信度，不值得。DP 图里只允许"hard 兼容"（锚点没有冲突）的边存在，1:1 转移给更高的基础
+// 分（更常见、更该被优先选中），锚点确凿吻合或长度比落在区间内再加分——如果从 (0,0) 到
+// (n,m) 找不到一条完全由"hard 兼容"边组成的路径，说明这个块无论怎么合并/拆分都拼不出一个
+// 站得住脚的对齐，直接判不可信；找到路径后，只要其中有一步是"没有锚点、纯靠长度比又没通过"
+// 的弱证据步骤，整个对齐仍然判不可信（confident=false）——宁可退化，不允许"大部分对、一步
+// 蒙对"混过去。
+const OVL_P130_ANCHOR_CITE_RE = /\[(\d{1,3})\](?!\])/g;
+const OVL_P130_ANCHOR_CAPS_RE = /\b[A-Z]{2,}[A-Z0-9]*\b/g;
+const OVL_P130_ANCHOR_URL_RE = /https?:\/\/[^\s，。！？"'）】》]+/g;
+const OVL_P130_ANCHOR_DIGIT_RE = /\d+(?:\.\d+)?/g;
+function ovlP130ExtractTextAnchors(text) {
+    const s = String(text == null ? '' : text);
+    const cites = [], urls = [];
+    let m;
+    const citeRe = new RegExp(OVL_P130_ANCHOR_CITE_RE.source, 'g');
+    while ((m = citeRe.exec(s))) cites.push(m[1]);
+    const urlRe = new RegExp(OVL_P130_ANCHOR_URL_RE.source, 'g');
+    while ((m = urlRe.exec(s))) urls.push(m[0]);
+    // 数字串/全大写缩写排除已经算进引用编号、URL 的那部分，避免同一段字符被算进两个锚点类别。
+    const withoutCiteUrl = s.replace(new RegExp(OVL_P130_ANCHOR_CITE_RE.source, 'g'), ' ')
+        .replace(new RegExp(OVL_P130_ANCHOR_URL_RE.source, 'g'), ' ');
+    const caps = [];
+    const capsRe = new RegExp(OVL_P130_ANCHOR_CAPS_RE.source, 'g');
+    while ((m = capsRe.exec(withoutCiteUrl))) caps.push(m[0]);
+    const digits = [];
+    const digitRe = new RegExp(OVL_P130_ANCHOR_DIGIT_RE.source, 'g');
+    while ((m = digitRe.exec(withoutCiteUrl))) digits.push(m[0]);
+    return { cites: cites, caps: caps, urls: urls, digits: digits };
+}
+// 一个锚点类别的多重集校验：英文侧为空 -> 不校验（放行）；非空 -> 两边必须完全相等（复用
+// P122 已有的 ovlVisualMultisetEqual，不重写一份比较逻辑）。
+function ovlP130AnchorCategoryOk(enList, zhList) {
+    if (!enList.length) return true;
+    return ovlVisualMultisetEqual(enList, zhList);
+}
+function ovlP130EnWordCount(text) {
+    const m = String(text == null ? '' : text).match(/[A-Za-z]+/g);
+    return m ? m.length : 0;
+}
+function ovlP130ZhCharCount(text) {
+    const m = String(text == null ? '' : text).match(/[一-鿿]/g);
+    return m ? m.length : 0;
+}
+// 一对候选句群的兼容性：hard=false 表示锚点确凿冲突，这条转移在 DP 图里直接不存在；
+// hard=true 时看 soft——有锚点且已经通过校验 -> soft=true；没有锚点 -> 退到长度比弱校验。
+function ovlP130GroupCompat(enText, zhText, globalRatio) {
+    const enA = ovlP130ExtractTextAnchors(enText);
+    const zhA = ovlP130ExtractTextAnchors(zhText);
+    if (!ovlP130AnchorCategoryOk(enA.cites, zhA.cites)) return { hard: false, soft: false };
+    if (!ovlP130AnchorCategoryOk(enA.caps, zhA.caps)) return { hard: false, soft: false };
+    if (!ovlP130AnchorCategoryOk(enA.urls, zhA.urls)) return { hard: false, soft: false };
+    if (!ovlP130AnchorCategoryOk(enA.digits, zhA.digits)) return { hard: false, soft: false };
+    const hasAnyAnchor = enA.cites.length || enA.caps.length || enA.urls.length || enA.digits.length;
+    if (hasAnyAnchor) return { hard: true, soft: true }; // 锚点已经比对通过，不需要再看长度比
+    const enWords = ovlP130EnWordCount(enText);
+    const zhChars = ovlP130ZhCharCount(zhText);
+    if (enWords === 0 || zhChars === 0) return { hard: true, soft: true }; // 没有可比内容（纯符号/纯公式句），不做长度判定
+    const ratio = zhChars / enWords;
+    const lo = globalRatio * 0.35, hi = globalRatio * 3.0;
+    return { hard: true, soft: (ratio >= lo && ratio <= hi) };
+}
+// 单调 DP：只用 3 种转移（1:1/2:1/1:2），只走 hard 兼容的边，1:1 给更高基础分（优先选中）。
+// 找不到一条完整路径返回 null；找到就把每一步的 (en 范围, zh 范围, soft) 带回去。
+function ovlP130DpAlign(enSpans, zhSpans) {
+    const n = enSpans.length, m = zhSpans.length;
+    if (!n || !m) return null;
+    let totalEnWords = 0, totalZhChars = 0;
+    for (let i = 0; i < n; i++) totalEnWords += ovlP130EnWordCount(enSpans[i].text);
+    for (let j = 0; j < m; j++) totalZhChars += ovlP130ZhCharCount(zhSpans[j].text);
+    const globalRatio = (totalEnWords > 0) ? (totalZhChars / totalEnWords) : 1;
+    const NEG = -1e9;
+    const score = [], back = [];
+    for (let i = 0; i <= n; i++) { score.push(new Array(m + 1).fill(NEG)); back.push(new Array(m + 1).fill(null)); }
+    score[0][0] = 0;
+    for (let i = 0; i <= n; i++) {
+        for (let j = 0; j <= m; j++) {
+            if (score[i][j] === NEG) continue;
+            const moves = [];
+            if (i < n && j < m) moves.push([1, 1, 1.0]);
+            if (i + 1 < n && j < m) moves.push([2, 1, 0.4]);
+            if (i < n && j + 1 < m) moves.push([1, 2, 0.4]);
+            for (let k = 0; k < moves.length; k++) {
+                const di = moves[k][0], dj = moves[k][1], bonus = moves[k][2];
+                const enText = enSpans.slice(i, i + di).map(function (s) { return s.text; }).join(' ');
+                const zhText = zhSpans.slice(j, j + dj).map(function (s) { return s.text; }).join('');
+                const compat = ovlP130GroupCompat(enText, zhText, globalRatio);
+                if (!compat.hard) continue;
+                const stepScore = bonus + (compat.soft ? 0.2 : -0.6);
+                const cand = score[i][j] + stepScore;
+                if (cand > score[i + di][j + dj]) {
+                    score[i + di][j + dj] = cand;
+                    back[i + di][j + dj] = { di: di, dj: dj, soft: compat.soft };
+                }
+            }
+        }
+    }
+    if (score[n][m] === NEG) return null;
+    const steps = [];
+    let i = n, j = m;
+    while (i > 0 || j > 0) {
+        const b = back[i][j];
+        if (!b) return null; // 防御性：score 非 NEG 理应总有 back，异常时老实退出不猜
+        steps.push({ enFrom: i - b.di, enTo: i, zhFrom: j - b.dj, zhTo: j, soft: b.soft });
+        i -= b.di; j -= b.dj;
+    }
+    steps.reverse();
+    return { steps: steps };
+}
+// 对外入口：整块跑一次 DP，返回 { steps:[{zhFrom,zhTo,enFrom,enTo,enText}], confident } ——
+// confident=false 时调用方一律退化到块级，不使用 steps 里任何一步的结果（哪怕其中某几步单独
+// 看是可信的）；"要么整体可信、要么整体不用"是故意的，避免"大部分对、一步蒙对"混过去。
+function ovlP130AlignZhToEnAnchored(enSpans, zhSpans) {
+    const dp = ovlP130DpAlign(enSpans, zhSpans);
+    if (!dp) return null;
+    let confident = true;
+    for (let i = 0; i < dp.steps.length; i++) { if (!dp.steps[i].soft) { confident = false; break; } }
+    const steps = dp.steps.map(function (s) {
+        return {
+            zhFrom: s.zhFrom, zhTo: s.zhTo, enFrom: s.enFrom, enTo: s.enTo,
+            enText: enSpans.slice(s.enFrom, s.enTo).map(function (e) { return e.text; }).join(' ')
+        };
+    });
+    return { steps: steps, confident: confident };
+}
+function ovlP130StepForZhIdx(aligned, zhIdx) {
+    for (let i = 0; i < aligned.steps.length; i++) {
+        const s = aligned.steps[i];
+        if (zhIdx >= s.zhFrom && zhIdx < s.zhTo) return s;
+    }
+    return null;
+}
+// 核心：中文句索引 -> 对齐的英文源句 + 退化档位（见本节头部注释的退化链说明）。
 function ovlVisualMapZhSentenceToEn(blockEl, zhIdx) {
     try {
         const enSpans = ovlVisualEnSentencesForBlock(blockEl);
         if (!enSpans || !enSpans.length) return { enText: null, level: 'line' }; // L4
+        if (enSpans.length === 1) return { enText: enSpans[0].text, level: 'sentence' }; // L2：别无选择
         const zhSpans = ovlVisualZhSentenceSpans(blockEl);
-        const zhCount = (zhSpans && zhSpans.length) || 0;
-        if (zhCount > 0 && zhCount === enSpans.length) {
-            const idx = Math.max(0, Math.min(enSpans.length - 1, zhIdx | 0));
-            return { enText: enSpans[idx].text, level: 'sentence' }; // L1
+        if (!zhSpans || !zhSpans.length) return { enText: enSpans[0].text, level: 'block', reason: 'anchor' };
+        const idx = Math.max(0, Math.min(zhSpans.length - 1, zhIdx | 0));
+        const aligned = ovlP130AlignZhToEnAnchored(enSpans, zhSpans);
+        if (aligned && aligned.confident) {
+            const step = ovlP130StepForZhIdx(aligned, idx);
+            if (step) return { enText: step.enText, level: 'sentence' }; // L1：锚点安全闸通过
         }
-        if (enSpans.length === 1) return { enText: enSpans[0].text, level: 'sentence' }; // L2
-        return { enText: enSpans[0].text, level: 'block' }; // L3：段落首句
+        return { enText: enSpans[0].text, level: 'block', reason: 'anchor' }; // L3a：对齐不可信，老实退化
     } catch (e) { return { enText: null, level: 'line' }; }
 }
 // 选区起点落在中文句列表里的第几句（0-based）；落在句间空白/结尾时夹到最近的、起点<=pos 的
@@ -46513,39 +46781,52 @@ function ovlP130ResolveZhVisualSelectionToEn(pane, range, selectedText) {
         if (zhIdx === -1) return null;
         const mapped = ovlVisualMapZhSentenceToEn(block, zhIdx);
         mapped.zhIdx = zhIdx;
-        mapped.block = block;
+        // v2 Pass P130b（核验 .claude/tmp/p130_verify.md observation O-1 顺手修）：原来这里还
+        // 挂了一行 mapped.block = block，把已脱离文档的 DOM 节点长期挂在模块级全局
+        // OvlP130LastLocateInfo 上（下一次 ovlVisualRender() 之后就是野引用），且没有任何调用
+        // 方读取这个字段——直接不挂，字段消失，JSON.stringify(OvlP130LastLocateInfo) 也不会再
+        // 带出 "block":{} 这种噪音。
         return mapped;
     } catch (e) { return null; }
 }
 // 对外入口（反向，P114 编译模式句级细化 -> Visual 中文块）：ovlPdfSyncTexTrySentenceLevel
 // 拿到的是英文源码字符区间（PDF 双击命中句在 #ovlCodeArea 坐标系里的 [start,end)），中文
-// 渲染 DOM 里没有对应字节可以 indexOf——这里只在这个块的中文句数/英文句数严格 1:1（跟正向
-// 同一条"对不齐就不猜"纪律）时，找英文区间重叠面积最大的那一句，换算成同一序号的中文句，
-// 用既有的 ovlVisualFindTextRangeInBlock（P52/P68 同一套按"渲染文字第几次出现"定位）拿
-// Range。对不齐/找不到 occurrence 都返回 null，调用方（ovlVisualRangeForChars）原样退回
-// 已有的整块高亮兜底，不是新增的失败模式。
+// 渲染 DOM 里没有对应字节可以 indexOf——这里跟正向共用同一套锚点 DP 对齐（ovlP130AlignZhTo
+// EnAnchored，不要维护两份对齐规则），找英文区间重叠面积最大的那一步，取它对应的中文句群
+// （可能是 DP 合并出的多句拼接）算 occurrence，用既有的 ovlVisualFindTextRangeInBlock
+// （P52/P68 同一套按"渲染文字第几次出现"定位）拿 Range。对齐不可信/找不到 occurrence 都返回
+// null，调用方（ovlVisualRangeForChars）原样退回已有的整块高亮兜底，不是新增的失败模式。
 function ovlVisualMapEnRangeToZhSentence(blockEl, localStart, localEnd) {
     try {
         const enSpans = ovlVisualEnSentencesForBlock(blockEl);
         if (!enSpans || !enSpans.length) return null;
         const zhSpans = ovlVisualZhSentenceSpans(blockEl);
-        if (!zhSpans || zhSpans.length !== enSpans.length) return null; // 句数不对齐：老实退回块级
-        let bestIdx = -1, bestOverlap = 0;
-        for (let i = 0; i < enSpans.length; i++) {
-            const s = enSpans[i];
-            if (s.start < 0) continue;
-            const ov = Math.min(localEnd, s.end) - Math.max(localStart, s.start);
-            if (ov > bestOverlap) { bestOverlap = ov; bestIdx = i; }
+        if (!zhSpans || !zhSpans.length) return null;
+        const aligned = ovlP130AlignZhToEnAnchored(enSpans, zhSpans);
+        if (!aligned || !aligned.confident) return null; // 对齐不可信：老实退回块级
+        let bestStep = null, bestOverlap = 0;
+        for (let i = 0; i < aligned.steps.length; i++) {
+            const s = aligned.steps[i];
+            const enFromChar = enSpans[s.enFrom].start;
+            const enToSpan = enSpans[s.enTo - 1];
+            if (enFromChar < 0 || enToSpan.end < 0) continue;
+            const ov = Math.min(localEnd, enToSpan.end) - Math.max(localStart, enFromChar);
+            if (ov > bestOverlap) { bestOverlap = ov; bestStep = s; }
         }
-        if (bestIdx === -1) return null;
-        const zh = zhSpans[bestIdx];
+        if (!bestStep) return null;
+        // 中文句区间可能横跨多句（1 英文 -> 2 中文的拆分步骤）——拼成一段连续文字当查找目标，
+        // ovlVisualFindTextRangeInBlock 按"渲染文字第几次出现"定位，天然支持这种长字符串（它们
+        // 本来就是紧挨着渲染出来的相邻句子）。
+        const zhFrom = zhSpans[bestStep.zhFrom], zhTo = zhSpans[bestStep.zhTo - 1];
         const collected = ovlVisualCollectBlockVisibleText(blockEl).text;
+        const targetText = collected.slice(zhFrom.startChar, zhTo.endChar);
+        if (!targetText) return null;
         let occurrenceIndex = 0, from = 0, idx;
-        while ((idx = collected.indexOf(zh.text, from)) !== -1 && idx < zh.startChar) {
+        while ((idx = collected.indexOf(targetText, from)) !== -1 && idx < zhFrom.startChar) {
             occurrenceIndex++;
             from = idx + 1;
         }
-        return ovlVisualFindTextRangeInBlock(blockEl, zh.text, occurrenceIndex);
+        return ovlVisualFindTextRangeInBlock(blockEl, targetText, occurrenceIndex);
     } catch (e) { return null; }
 }
 
