@@ -4375,7 +4375,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.12.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.12.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-03';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -35826,6 +35826,14 @@ async function ovlRenderTree(dirHandle) {
 }
 
 async function ovlOpenFile(fileHandle, name, parentHandle, relPath, opts) {
+    // v2 Pass P131c（BLK-2 修复，硬约束 3）：当前文件有未解决的外部冲突 + 编辑器仍是脏的，
+    // 切到别的文件之前必须先弹确认，绝不能像之前那样静默丢弃（131→115 字符那种）。
+    // ovlExternalConflictGuardBeforeLeave 内部会先判断"根本没有未决冲突"就直接放行，不额外
+    // 弹窗，不影响绝大多数正常切文件路径。
+    if (typeof ovlExternalConflictGuardBeforeLeave === 'function') {
+        const proceed = await ovlExternalConflictGuardBeforeLeave();
+        if (!proceed) return;
+    }
     try {
         const file = await fileHandle.getFile();
         const text = await file.text();
@@ -35986,14 +35994,17 @@ function ovlUpdateTabUI() {
 }
 
 let ovlSaveStatusTimer = null;
-function ovlFlashSaveStatus(msg, isError) {
+// v2 Pass P131c（BLK-2 修复）：新增可选第三参 persist——冲突未解决期间自动落盘/Ctrl+S 被挡住
+// 这件事不能只闪 2.6s 就消失（silent 档下用户本来就看不到别的反馈），要一直挂在状态条上
+// 直到冲突被解决。不传就是旧行为，逐字节不变。
+function ovlFlashSaveStatus(msg, isError, persist) {
     const el = document.getElementById('ovlSaveStatus');
     if (!el) return;
     el.textContent = msg;
     el.classList.toggle('ovl-save-status-error', !!isError);
     el.classList.add('ovl-save-status-show');
-    if (ovlSaveStatusTimer) clearTimeout(ovlSaveStatusTimer);
-    ovlSaveStatusTimer = setTimeout(function () { el.classList.remove('ovl-save-status-show'); }, 2600);
+    if (ovlSaveStatusTimer) { clearTimeout(ovlSaveStatusTimer); ovlSaveStatusTimer = null; }
+    if (!persist) ovlSaveStatusTimer = setTimeout(function () { el.classList.remove('ovl-save-status-show'); }, 2600);
 }
 
 // ---- webkitdirectory 降级路径（FSA 不可用时）----
@@ -36145,8 +36156,10 @@ function ovlRemoteProjectRoot() {
     } catch (e) { return ''; }
 }
 
-async function ovlRemoteFsJson(url, body) {
-    const resp = await ovlBridgeFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+async function ovlRemoteFsJson(url, body, signal) {
+    // v2 Pass P131c（NB-3 部分修复）：signal 可选——外部改动探测超时时用它 abort 掉底层
+    // fetch，避免每 20s 一次的挂起探测在同一 origin 上无限堆积，把 6 连接上限占满。
+    const resp = await ovlBridgeFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: signal });
     let data = null;
     try { data = await resp.json(); } catch (e) { data = null; }
     return data;
@@ -37714,6 +37727,10 @@ function ovlProjectHistoryMaybeAutoRestore() {
 // OvlSaveInFlight 防的是：自动保存的防抖计时器和用户手动 Ctrl+S 前后脚一起触发，两次
 // 同时对同一个 handle 调 createWritable() 会互相踩（FSA 同一个 handle 不支持并发写流）。
 let OvlSaveInFlight = false;
+// v2 Pass P131c（BLK-2 修复）：冲突未解决期间被拒绝的落盘次数——silent 档自动落盘撞冲突时
+// 状态条以前完全不闪（见 ovlSaveCurrentFile catch 分支），用户毫无感知；现在无论 silent 与否
+// 都要可见，这个计数就是"已阻止落盘 N 次"里的 N。解决冲突（重新加载/覆盖磁盘成功）后清零。
+let OvlConflictBlockedWrites = 0;
 async function ovlSaveCurrentFile(opts) {
     opts = opts || {};
     if (OvlSaveInFlight) return;
@@ -37734,6 +37751,13 @@ async function ovlSaveCurrentFile(opts) {
         await writable.close();
         OvlState.dirty = false;
         OvlState.lastSavedAt = Date.now();
+        // v2 Pass P131c（BLK-2 修复）：这次写成功了——如果之前处在冲突态、被拒过若干次，
+        // 到这里就是真正解决了，把持久状态条（persist:true 那次挂上去的）清掉，不留残留。
+        if (OvlConflictBlockedWrites > 0) {
+            OvlConflictBlockedWrites = 0;
+            const stEl0 = document.getElementById('ovlSaveStatus');
+            if (stEl0) stEl0.classList.remove('ovl-save-status-show');
+        }
         // v2 Pass P115：这份文件此刻确实刚落盘——它自己在 OvlFileTextCache 里大概率没有
         // 缓存项（它是当前文件，重锚定走 ta.value 不走缓存），这里失效是防御性的：万一之前
         // 曾经作为"别的文件的跨文件关注目标"被读进过缓存、之后又被打开编辑到现在，缓存里
@@ -37767,7 +37791,12 @@ async function ovlSaveCurrentFile(opts) {
             // 重新跑一次 ovlExternalCheckNow，会读到最新磁盘内容，因为跟编辑器不一致且编辑器
             // 仍是脏的，会走 'conflict' 分支弹出"重新加载 / 保留我的修改"——跟自动探测到的
             // 外部改动走同一套 UI，语义一致，不再需要一个单独的 confirm 弹窗。
-            if (!opts.silent) ovlFlashSaveStatus('保存失败：磁盘上有外部改动，本次保存已取消，请在下方提示中处理', true);
+            // v2 Pass P131c（BLK-2 修复）：这条不能只在 !opts.silent 时才闪——冲突期间的自动
+            // 落盘全部是 silent:true，之前的写法导致用户在冲突态里打字、以为自动保存正常工作，
+            // 实际一个字都没进磁盘却毫无提示（终核报告 V1-c5）。这里无条件可见 + persist:true
+            // 常驻，直到冲突被解决（reload/overwrite 成功）才清掉。
+            OvlConflictBlockedWrites++;
+            ovlFlashSaveStatus('未保存·有外部改动（已阻止落盘 ' + OvlConflictBlockedWrites + ' 次，请在下方横幅中选择处理方式）', true, true);
             try { if (typeof ovlExternalCheckNow === 'function') ovlExternalCheckNow('save-conflict', { force: true }); } catch (e2) {}
         } else if (!opts.silent) {
             ovlFlashSaveStatus('保存失败：' + (e && e.message ? e.message : String(e)), true);
@@ -45564,7 +45593,7 @@ const OVL_SELF_WRITE_TOLERANCE_MS = 1500;
 //    本地 FSA -> handle.getFile().lastModified（元数据读取，不等于读字节）
 //    远程句柄 -> POST /fs/list 父目录，找 entry.mtimeMs（几 KB 响应，顺带知道文件在不在）
 //    任何一步失败/字段缺失 -> {ok:false}，调用方降级成直接做完整比对。
-async function ovlExternalProbeMtime(cf) {
+async function ovlExternalProbeMtime(cf, signal) {
     try {
         if (!cf || !cf.handle || OvlState.usingWebkitFallback) return { ok: false };
         // v2 Pass P131b（N1 修复）：这里原来用 ovlIsRemoteBridge() 挑分支——但那个函数的语义是
@@ -45582,7 +45611,7 @@ async function ovlExternalProbeMtime(cf) {
         const idx = relPath.lastIndexOf('/');
         const dir = idx === -1 ? '.' : relPath.slice(0, idx);
         const base = idx === -1 ? relPath : relPath.slice(idx + 1);
-        const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: ovlRemoteProjectRoot(), path: dir });
+        const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: ovlRemoteProjectRoot(), path: dir }, signal);
         if (!data || data.ok !== true || !Array.isArray(data.entries)) return { ok: false };
         let entry = null;
         for (let i = 0; i < data.entries.length; i++) { if (data.entries[i] && data.entries[i].name === base) { entry = data.entries[i]; break; } }
@@ -45607,12 +45636,16 @@ const OVL_EXTERNAL_CHECK_MIN_INTERVAL_MS = 800;
 // 15–30s 量级内放弃并把控制权交还——finally() 照样触发，OvlExternalCheckInFlight 照样清空，
 // 下一次触发（哪怕只是 8s 轮询）就能重新开始正常工作。
 const OVL_EXTERNAL_CHECK_TIMEOUT_MS = 20000;
-function ovlWithTimeout(promise, ms, label) {
+function ovlWithTimeout(promise, ms, label, abortFn) {
     return new Promise(function (resolve, reject) {
         let settled = false;
         const timer = setTimeout(function () {
             if (settled) return;
             settled = true;
+            // v2 Pass P131c（NB-3 部分修复）：仅"我们自己不再等"不够——底层 fetch 还挂着，
+            // 每次超时都会在同一 origin 攒一个永不 settle 的连接，攒够 6 个（Chrome HTTP/1.1
+            // 每 origin 上限）会把 /health 等所有后续请求一起饿死。有 abortFn 就真的 abort 掉。
+            if (typeof abortFn === 'function') { try { abortFn(); } catch (e) {} }
             reject(new Error((label || '操作') + '超时（' + ms + 'ms 未响应）'));
         }, ms);
         Promise.resolve(promise).then(function (v) {
@@ -45660,16 +45693,25 @@ async function ovlExternalCheckNowImpl(reason, opts) {
         if (!cf || !cf.handle || OvlState.usingWebkitFallback) return 'skipped';
         if (OvlInlineSrcEdit) return 'skipped'; // 就地编辑源码中，等编辑结束后下一次触发再说（不吞事件，见 4.6 的"编辑器变干净"触发点）
         let mtimeMs = null;
-        if (!opts.force) {
+        {
+            // v2 Pass P131c（NB-1 部分修复）：force（WS 推送触发）此前整个跳过便宜探测，
+            // 直接进完整读盘——文件被外部删除时完整读盘会失败，外层 catch 只能返回 'error'，
+            // ovlExternalHandleMissing() 永远走不到，WS 健康档下"文件已删除"横幅因此永不出现。
+            // 改成只跳过"mtime 相同就早退"这一段，存在性判断（missing 分支）照做——force 的
+            // 本意是"不要因为 mtime 没变就偷懒不读"，不是"连文件在不在都不用查"。
+            const probeAc = (typeof AbortController === 'function') ? new AbortController() : null;
             let probe;
             try {
-                probe = await ovlWithTimeout(ovlExternalProbeMtime(cf), OVL_EXTERNAL_CHECK_TIMEOUT_MS, '外部改动探测');
+                probe = await ovlWithTimeout(
+                    ovlExternalProbeMtime(cf, probeAc ? probeAc.signal : undefined),
+                    OVL_EXTERNAL_CHECK_TIMEOUT_MS, '外部改动探测',
+                    probeAc ? function () { probeAc.abort(); } : null);
             } catch (eTimeout) {
                 probe = { ok: false }; // 超时——降级走下面的完整读比对（同样带超时保护）
             }
             if (probe.ok) {
                 if (!probe.exists) return ovlExternalHandleMissing();
-                if (typeof OvlState.lastLoadedMtimeMs === 'number' && probe.mtimeMs === OvlState.lastLoadedMtimeMs) {
+                if (!opts.force && typeof OvlState.lastLoadedMtimeMs === 'number' && probe.mtimeMs === OvlState.lastLoadedMtimeMs) {
                     return 'unchanged'; // mtime 没变——不读内容，这是"零额外读盘"档位的关键
                 }
                 mtimeMs = probe.mtimeMs;
@@ -45798,13 +45840,21 @@ function ovlExtChangeBannerShow(info) {
         + '<span class="ovl-extbanner-icon">⚠</span>'
         + '<div class="ovl-extbanner-text">'
         + '<div class="ovl-extbanner-main">' + (isMissing ? '这个文件在磁盘上已经不存在了' : '这个文件已在外部被修改（磁盘上的内容和编辑器里的不一致）') + '</div>'
-        + '<div class="ovl-extbanner-sub">' + (isMissing ? '编辑器里的内容会保留，不会被清空。' : '你在编辑器里有未保存的改动，已经帮你挡住了这次覆盖。') + '</div>'
+        // v2 Pass P131c（BLK-2 修复）：这句原来写"已经帮你挡住了这次覆盖"——那是错的，挡住的是
+        // 磁盘上对方的改动，用户自己的编辑其实进入了"再也存不进磁盘"的状态，文案必须说真话。
+        + '<div class="ovl-extbanner-sub">' + (isMissing ? '编辑器里的内容会保留，不会被清空。' : '磁盘上有外部改动；你在编辑器里的改动目前还没有写入磁盘（自动保存/Ctrl+S 会持续被挡住），请选择下面的处理方式。') + '</div>'
         + '</div>'
         + '<div class="ovl-extbanner-actions">'
         + (isMissing
             ? '<button type="button" class="ovl-extbanner-btn" id="ovlExtBannerKeep">保留编辑器内容</button>'
+            // v2 Pass P131c（BLK-2 修复）：原来只有「重新加载」/「保留我的修改」两个出口，点了
+            // 「保留我的修改」之后没有任何合法途径能把编辑器内容存回磁盘（P50 乐观锁持续拒绝）。
+            // 新增「用我的版本覆盖磁盘」——以当前编辑器内容为准，把已知 mtime 前进到这次看到的
+            // 磁盘 mtime 再存一次；「保留我的修改」改名「稍后决定」，语义不变（id 不变，不破坏
+            // 既有测试/调用点），只是这句话现在准确描述"暂不处理，横幅常驻"这个真实状态。
             : '<button type="button" class="ovl-extbanner-btn ovl-extbanner-btn-primary" id="ovlExtBannerReload">重新加载（丢弃我的改动）</button>'
-              + '<button type="button" class="ovl-extbanner-btn" id="ovlExtBannerKeep">保留我的修改</button>')
+              + '<button type="button" class="ovl-extbanner-btn ovl-extbanner-btn-overwrite" id="ovlExtBannerOverwrite">用我的版本覆盖磁盘</button>'
+              + '<button type="button" class="ovl-extbanner-btn" id="ovlExtBannerKeep">稍后决定</button>')
         + '</div>'
         + '</div>';
     el.hidden = false;
@@ -45813,6 +45863,25 @@ function ovlExtChangeBannerShow(info) {
         reloadBtn.addEventListener('click', function () {
             ovlExtChangeBannerHide();
             ovlExternalCheckNow('banner-reload', { force: true, overwriteDirty: true }); // 点击时重新读盘，可能又变了；用户已明确要丢弃本地改动
+        });
+    }
+    const overwriteBtn = document.getElementById('ovlExtBannerOverwrite');
+    if (overwriteBtn) {
+        overwriteBtn.addEventListener('click', function () {
+            // v2 Pass P131c（BLK-2 修复）：「用我的版本覆盖磁盘」——用户已经明确表态要用当前
+            // 编辑器内容覆盖磁盘。不改 server.js，只用桥既有 /fs/write 的 expectedMtimeMs 语义：
+            // 把乐观锁的"已知 mtime"前进到这次冲突里看到的磁盘 mtime，让接下来这一次保存不再
+            // 被 P50 拒绝；如果点击这一刻磁盘又被第三方改了一次（info.mtimeMs 已经过期），
+            // /fs/write 会用这个过期值再次撞上真实当前 mtime，桥端仍会拒绝——ovlSaveCurrentFile
+            // 的 catch(e.conflict) 分支会重新弹出这个横幅，不会静默覆盖对方最新的改动，也不会
+            // 陷入自我循环覆盖。
+            const cf3 = OvlState.currentFile;
+            if (!isMissing && cf3 && cf3.handle && ('__lastKnownMtimeMs' in cf3.handle) && info.mtimeMs != null) {
+                cf3.handle.__lastKnownMtimeMs = info.mtimeMs;
+            }
+            if (!isMissing && info.mtimeMs != null) OvlState.lastLoadedMtimeMs = info.mtimeMs;
+            ovlExtChangeBannerHide();
+            ovlSaveCurrentFile();
         });
     }
     const keepBtn = document.getElementById('ovlExtBannerKeep');
@@ -45840,6 +45909,74 @@ function ovlExtChangeBannerHide() {
     OvlExtChangeBannerPending = null;
     const el = document.getElementById('ovlExtChangeBanner');
     if (el) { el.hidden = true; el.innerHTML = ''; }
+}
+
+// v2 Pass P131c（BLK-2 修复，硬约束 3）：真正的"内容冲突"未解决（不含 missing 分支——文件
+// 被删除跟"我的草稿存不进去"是两回事，不拦切换）。
+function ovlExternalConflictActive() {
+    return !!(OvlExtChangeBannerPending && !OvlExtChangeBannerPending.missing);
+}
+
+// 未决冲突期间切换文件/关闭标签/切项目前必须弹的确认框——绝不 window.confirm，复用
+// #ovlModalOverlay 现成的 .ovl-modal 样式体系，跟 ovlConfirmDialog/ovlPromptDialog 同构。
+// cb(choice) 里 choice ∈ {'reload','overwrite','cancel'}。
+function ovlExtConflictLeaveConfirm(cb) {
+    const overlay = document.getElementById('ovlModalOverlay');
+    if (!overlay) { cb('cancel'); return; }
+    ovlDismissActiveModal();
+    overlay.innerHTML = '';
+    overlay.hidden = false;
+    const box = document.createElement('div');
+    box.className = 'ovl-modal';
+    const h = document.createElement('div'); h.className = 'ovl-modal-title'; h.textContent = '当前草稿有未解决的外部冲突';
+    box.appendChild(h);
+    const msg = document.createElement('div'); msg.className = 'ovl-modal-message';
+    msg.textContent = '离开将丢失这份编辑器里还没存进磁盘的改动，请先选择处理方式：';
+    box.appendChild(msg);
+    const btnRow = document.createElement('div'); btnRow.className = 'ovl-modal-btns';
+    const cancelBtn = document.createElement('button'); cancelBtn.type = 'button'; cancelBtn.className = 'ovl-modal-btn'; cancelBtn.textContent = '取消（留在这个文件）';
+    const reloadBtn = document.createElement('button'); reloadBtn.type = 'button'; reloadBtn.className = 'ovl-modal-btn'; reloadBtn.textContent = '重新加载（丢弃我的改动）';
+    const overwriteBtn = document.createElement('button'); overwriteBtn.type = 'button'; overwriteBtn.className = 'ovl-modal-btn ovl-modal-btn-primary'; overwriteBtn.textContent = '用我的版本覆盖磁盘';
+    btnRow.appendChild(cancelBtn); btnRow.appendChild(reloadBtn); btnRow.appendChild(overwriteBtn);
+    box.appendChild(btnRow);
+    overlay.appendChild(box);
+    let settled = false;
+    function close() { overlay.hidden = true; overlay.innerHTML = ''; document.removeEventListener('keydown', onKey); if (__ovlActiveModalDismiss === dismissSelf) __ovlActiveModalDismiss = null; }
+    function dismissSelf() { close(); if (!settled) { settled = true; cb('cancel'); } }
+    function pick(choice) { if (settled) return; settled = true; close(); cb(choice); }
+    function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); dismissSelf(); } }
+    cancelBtn.addEventListener('click', function () { pick('cancel'); });
+    reloadBtn.addEventListener('click', function () { pick('reload'); });
+    overwriteBtn.addEventListener('click', function () { pick('overwrite'); });
+    overlay.addEventListener('click', function (e) { if (e.target === overlay) dismissSelf(); });
+    document.addEventListener('keydown', onKey);
+    __ovlActiveModalDismiss = dismissSelf;
+}
+
+// 冲突态离开前置检查的共用执行体：reload/overwrite 选定后真正去做，resolve(true) 才允许
+// 调用方继续原本要做的切换动作；resolve(false) = 用户取消，调用方必须原样中止。
+function ovlExternalConflictGuardBeforeLeave() {
+    if (!ovlExternalConflictActive() || !OvlState.dirty) return Promise.resolve(true);
+    return new Promise(function (resolve) {
+        ovlExtConflictLeaveConfirm(function (choice) {
+            if (choice === 'cancel') { resolve(false); return; }
+            const pending = OvlExtChangeBannerPending;
+            const cfX = OvlState.currentFile;
+            if (choice === 'overwrite') {
+                if (cfX && cfX.handle && ('__lastKnownMtimeMs' in cfX.handle) && pending && pending.mtimeMs != null) {
+                    cfX.handle.__lastKnownMtimeMs = pending.mtimeMs;
+                }
+                if (pending && pending.mtimeMs != null) OvlState.lastLoadedMtimeMs = pending.mtimeMs;
+                ovlExtChangeBannerHide();
+                ovlSaveCurrentFile().then(function () { resolve(true); }, function () { resolve(true); });
+                return;
+            }
+            // choice === 'reload'
+            ovlExtChangeBannerHide();
+            ovlExternalCheckNow('leave-conflict-reload', { force: true, overwriteDirty: true })
+                .then(function () { resolve(true); }, function () { resolve(true); });
+        });
+    });
 }
 
 // ---- 轮询兜底（4.7）：WS OPEN 且当天收到过 changed = 不轮询；WS OPEN 但从未收到过 = 60s；
