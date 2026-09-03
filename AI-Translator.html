@@ -2491,6 +2491,23 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-save-status.ovl-save-status-show { opacity: 1; }
 .ovl-save-status.ovl-save-status-error { color: #f87171; }
 
+/* v2 Pass P131：外部改动冲突横幅——只用既有配色变量/风格，不引外部依赖。hidden 属性控制
+   显隐（跟 [hidden]{display:none!important} 的既有约定一致，不用额外 class）。 */
+.ovl-extbanner { background: #7c2d12; border-bottom: 1px solid #9a3412; }
+.ovl-extbanner-row { display: flex; align-items: center; gap: 10px; padding: 8px 12px; }
+.ovl-extbanner-icon { font-size: 15px; flex: none; color: #fbbf24; }
+.ovl-extbanner-text { flex: 1 1 auto; min-width: 0; }
+.ovl-extbanner-main { font-size: 12px; color: #fef3c7; font-weight: 600; }
+.ovl-extbanner-sub { font-size: 11px; color: #fde68a; margin-top: 2px; }
+.ovl-extbanner-actions { flex: none; display: flex; gap: 6px; }
+.ovl-extbanner-btn {
+    font-size: 11px; padding: 4px 10px; border-radius: 4px; border: 1px solid #9a3412;
+    background: #2F3A4C; color: #E4E8EE; cursor: pointer; white-space: nowrap;
+}
+.ovl-extbanner-btn:hover { background: #3a4759; }
+.ovl-extbanner-btn-primary { background: #b45309; border-color: #b45309; color: #fff; }
+.ovl-extbanner-btn-primary:hover { background: #d97706; }
+
 .ovl-tree-reopen { padding: 10px 8px; }
 .ovl-tree-reopen-text { font-size: 12px; color: #E7E9EE; line-height: 1.5; margin-bottom: 8px; }
 .ovl-tree-reopen-btns { display: flex; gap: 6px; }
@@ -4358,8 +4375,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.11.05';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-02';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.12.00';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-03';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -20796,7 +20813,7 @@ function chatAgentSameAsCurrentFile(projectDir, relPath) {
         const cf = OvlState.currentFile;
         if (!cf || !cf.name || typeof ovlBridgeAbsPathFor !== 'function') return false;
         const absTouched = chatAgentAbsPath(projectDir, relPath);
-        const absCurrent = ovlBridgeAbsPathFor(cf.name);
+        const absCurrent = ovlBridgeAbsPathFor(cf.relPath || cf.name);
         if (!absTouched || !absCurrent) return false;
         return String(absTouched).toLowerCase() === String(absCurrent).toLowerCase();
     } catch (e) { return false; }
@@ -21211,6 +21228,7 @@ async function chatAgentDoRollback(projectDir, checkpoint, opLabel) {
         try {
             if (OvlState.dirHandle && !OvlState.usingWebkitFallback && typeof ovlRenderTree === 'function') ovlRenderTree(OvlState.dirHandle);
         } catch (e) {}
+        try { if (typeof ovlExternalCheckNow === 'function') ovlExternalCheckNow('agent-revert', { force: true }); } catch (e) {}
     } catch (e) {
         chatAppendRow('error', '回退失败：连不上桥接服务（' + ((e && e.message) || e) + '）');
     }
@@ -21300,6 +21318,10 @@ async function chatAgentExecWriteTool(toolName, args, projectDir, signal, pendin
             ovlRenderTree(OvlState.dirHandle);
         }
     } catch (e) { console.warn('[chat-agent] file tree refresh failed', e); }
+
+    // v2 Pass P131：外部（chat agent，语义上跟 Claude Code 这类外部 agent 是同一类"应用内但
+    // 不经过编辑器"的写入）写工具执行成功——立即检查当前打开文件是否受影响，不等轮询。
+    try { if (typeof ovlExternalCheckNow === 'function') ovlExternalCheckNow('agent-write', { force: true }); } catch (e) {}
 
     try {
         if (toolName === 'write_file') {
@@ -22281,9 +22303,15 @@ async function chatAgentP2TReloadEditorIfCurrent(outRel, newMainText) {
             if (typeof ovlRecomputeLineOffsets === 'function') ovlRecomputeLineOffsets();
             if (typeof ovlRenderGutter === 'function') ovlRenderGutter(true);
             if (typeof ovlBuildOutline === 'function') ovlBuildOutline();
+            // v2 Pass P131（B-2）：这里绕过了 ovlOpenFile/ovlExternalCheckNow 的正常重载路径直接
+            // 改 ta.value——必须同步更新快照，否则下一次外部改动探测会拿"重转前的旧内容"当
+            // 基准误判冲突。mtime 不精确已知（拿不到这次落盘的真实值），交给下一次 mtime 探测
+            // 自然收敛（探测到不一致时会走完整内容比对，不会误覆盖）。
+            OvlState.lastLoadedText = newMainText;
         }
         if (OvlState.editorMode === 'visual' && typeof ovlVisualRender === 'function') ovlVisualRender();
         if (OvlState.dirHandle && !OvlState.usingWebkitFallback && typeof ovlRenderTree === 'function') ovlRenderTree(OvlState.dirHandle);
+        if (typeof ovlExternalCheckNow === 'function') { try { ovlExternalCheckNow('agent-p2t-reconvert', { force: true }); } catch (e) {} }
     } catch (e) { console.error('[chat-agent] reload editor after reconvert failed', e); }
 }
 
@@ -27085,6 +27113,10 @@ const OvlState = {
     // ---- v2 Pass P17：桥 WebSocket 磁盘改动推送的自触发回声过滤，见 ovlBridgeHandleExternalChange ----
     lastSelfWriteMtimeMs: null, // 自己上一次真的写盘成功后，FSA File.lastModified 读回来的值
     lastSelfWritePath: null,    // 上面那次写盘对应的绝对路径（ovlBridgeAbsPathFor 算出来的）
+    // ---- v2 Pass P131（B-2）：判断"编辑器是否干净/磁盘内容是否真的变了"的权威快照 ----
+    lastLoadedText: null,     // 上一次真正装进 #ovlCodeArea 的磁盘内容快照
+    lastLoadedMtimeMs: null,  // 与之对应的磁盘 mtime
+    lastLoadedRelPath: null,  // 快照属于哪个 relPath（换文件立即作废）
     compiling: false,
     // v2 Pass P33：拉取/推送/克隆 Overleaf 期间置 true（ovlOverleafPullRun/
     // ovlOverleafCloneSetBusy 里设），单纯给「编辑」的互斥判定用——那几个操作本来就已经
@@ -27203,6 +27235,8 @@ function ovlShellHtml() {
         // M2：脏点/保存状态由 ovlUpdateTabUI() / ovlFlashSaveStatus() 驱动，都是 CSS class + textContent
         // 的纯 DOM 写，不走 renderApp（工具条区域从来不进 renderAppCore）。
         +     '<div class="ovl-editor-tabbar"><span class="ovl-editor-tab" id="ovlEditorTabName">未打开文件</span><span class="ovl-save-status" id="ovlSaveStatus"></span></div>'
+        // v2 Pass P131：外部改动冲突横幅——脏时的唯一出口，绝不静默覆盖编辑器内容。
+        +     '<div class="ovl-extbanner" id="ovlExtChangeBanner" hidden></div>'
         // M7 Editor 分类「Breadcrumbs」：光标所在的 \section/\subsection 路径，默认关（Overleaf 默认也关）。
         +     '<div class="ovl-breadcrumb" id="ovlBreadcrumb"></div>'
         +     '<div class="ovl-editor-toolbar">'
@@ -35442,6 +35476,193 @@ function ovlShowTreeError(msg) {
     body.appendChild(d);
 }
 
+// v2 Pass P131：文件树展开态持久化（A）。展开态过去 100% 只存在于 DOM（class + 已经建出来
+// 的懒加载子 <ul>），ovlRenderTree 每次 body.textContent='' 全量重建就把它清空——20 个调用点
+// （拉取/转换/新建/删除/AI 写盘……）全部会清零，诊断见 .claude/tmp/p131_diag_plan.md §1。
+// 数据模型照抄上面 fileWatch* 那一套（同一套 try/catch、同一套 loadedKey 懒加载语义），只多一条
+// loadedEpoch 重读条件（对应换项目时内存态必须清空，即使 key 字符串意外相同）。
+const OVL_TREE_EXPAND_MAX_DIRS = 400;  // 单项目最多记这么多展开目录，超了按插入序淘汰最老的
+const OVL_TREE_EXPAND_MAX_PROJ = 20;   // localStorage 里最多留这么多个项目
+const OVL_TREE_EXPAND_MAX_DEPTH = 12;  // 恢复时的递归深度硬上限（防病态目录树把主线程吃了）
+
+const OvlTreeExpandState = {
+    open: [],            // [relPath, ...]，插入序；'/' 分隔、相对项目根，跟 li.__ovlEntry.relPath 同一套
+    scrollTop: 0,
+    loadedKey: null,      // 上次从 localStorage 读时的项目 key
+    loadedEpoch: -1        // 上次读取时的 __ovlProjectEpoch，换项目必重读（双保险）
+};
+function ovlTreeExpandLsKey() { return ovlIsRemoteBridge() ? 'ovl.treeExpandedDirsRemote' : 'ovl.treeExpandedDirs'; }
+function ovlTreeExpandProjectKey() { try { return ovlNormalizeProjectPath(ovlRemoteProjectRoot()); } catch (e) { return ''; } }
+function ovlTreeExpandMapLoad() {
+    try {
+        const raw = localStorage.getItem(ovlTreeExpandLsKey());
+        if (!raw) return {};
+        const obj = JSON.parse(raw);
+        return (obj && typeof obj === 'object' && !Array.isArray(obj)) ? obj : {};
+    } catch (e) { return {}; }
+}
+function ovlTreeExpandMapSave(map) {
+    try { localStorage.setItem(ovlTreeExpandLsKey(), JSON.stringify(map)); } catch (e) {}
+}
+function ovlTreeExpandEnsureLoaded() {
+    const key = ovlTreeExpandProjectKey();
+    const epoch = (typeof __ovlProjectEpoch !== 'undefined') ? __ovlProjectEpoch : 0;
+    if (OvlTreeExpandState.loadedKey === key && OvlTreeExpandState.loadedEpoch === epoch) return;
+    OvlTreeExpandState.loadedKey = key;
+    OvlTreeExpandState.loadedEpoch = epoch;
+    OvlTreeExpandState.open = [];
+    OvlTreeExpandState.scrollTop = 0;
+    if (!key) return;
+    try {
+        const map = ovlTreeExpandMapLoad();
+        const rec = map[key];
+        const arr = Array.isArray(rec) ? rec : (rec && Array.isArray(rec.open) ? rec.open : []);
+        const seen = {};
+        const out = [];
+        for (let i = 0; i < arr.length && out.length < OVL_TREE_EXPAND_MAX_DIRS; i++) {
+            const rp = String(arr[i] == null ? '' : arr[i]);
+            if (!rp || seen[rp]) continue;
+            seen[rp] = true;
+            out.push(rp);
+        }
+        OvlTreeExpandState.open = out;
+        OvlTreeExpandState.scrollTop = (rec && typeof rec.scrollTop === 'number') ? rec.scrollTop : 0;
+    } catch (e) {}
+}
+function ovlTreeExpandGetSet() {
+    ovlTreeExpandEnsureLoaded();
+    return new Set(OvlTreeExpandState.open);
+}
+function ovlTreeExpandPersist() {
+    try {
+        const key = ovlTreeExpandProjectKey();
+        if (!key) return; // 没打开项目就没有persist的地方——内存态照旧生效，只是不落盘
+        const map = ovlTreeExpandMapLoad();
+        const keys = Object.keys(map);
+        if (keys.indexOf(key) === -1 && keys.length >= OVL_TREE_EXPAND_MAX_PROJ) {
+            // 超过项目上限——淘汰最老的一个（对象键的插入序在现代引擎里等价于插入顺序）
+            delete map[keys[0]];
+        }
+        map[key] = { open: OvlTreeExpandState.open.slice(0, OVL_TREE_EXPAND_MAX_DIRS), scrollTop: OvlTreeExpandState.scrollTop || 0 };
+        ovlTreeExpandMapSave(map);
+    } catch (e) {}
+}
+function ovlTreeExpandAdd(relPath) {
+    if (!relPath) return;
+    ovlTreeExpandEnsureLoaded();
+    if (OvlTreeExpandState.open.indexOf(relPath) === -1) {
+        OvlTreeExpandState.open.push(relPath);
+        if (OvlTreeExpandState.open.length > OVL_TREE_EXPAND_MAX_DIRS) OvlTreeExpandState.open.shift();
+    }
+}
+function ovlTreeExpandRemove(relPath) {
+    if (!relPath) return;
+    ovlTreeExpandEnsureLoaded();
+    const prefix = relPath + '/';
+    OvlTreeExpandState.open = OvlTreeExpandState.open.filter(function (p) { return p !== relPath && p.indexOf(prefix) !== 0; });
+}
+// 只摘掉这一个 relPath 自己，不动后代——用户手动折叠一个目录（不是删除/重命名）时用这个：
+// 折叠 sections 不该忘记 sections/deep 曾经是展开的，下次重新展开 sections 时它应该记得
+// 连 sections/deep 也一起展开回来（跟 Overleaf/VS Code 的折叠语义一致）。真正的"这个路径
+// 在磁盘上没了"（删除/被剪枝）才用上面那个会连后代一起摘的 ovlTreeExpandRemove。
+function ovlTreeExpandRemoveExact(relPath) {
+    if (!relPath) return;
+    ovlTreeExpandEnsureLoaded();
+    const idx = OvlTreeExpandState.open.indexOf(relPath);
+    if (idx !== -1) OvlTreeExpandState.open.splice(idx, 1);
+}
+function ovlTreeExpandAddAncestors(relPath) {
+    if (!relPath) return;
+    ovlTreeExpandEnsureLoaded();
+    const parts = String(relPath).split('/');
+    parts.pop(); // 去掉文件本身
+    let acc = '';
+    for (let i = 0; i < parts.length; i++) {
+        acc = acc ? (acc + '/' + parts[i]) : parts[i];
+        ovlTreeExpandAdd(acc);
+    }
+}
+// 重命名/删除时把展开集合里指向旧路径（含以它为前缀的所有后代）的条目迁移/清理——
+// 跟 ovlOverleafRenameMigrateState（28498）的前缀替换思路一致。
+function ovlTreeExpandRenamePrefix(oldRel, newRel) {
+    if (!oldRel || !newRel) return;
+    ovlTreeExpandEnsureLoaded();
+    const prefix = oldRel + '/';
+    OvlTreeExpandState.open = OvlTreeExpandState.open.map(function (p) {
+        if (p === oldRel) return newRel;
+        if (p.indexOf(prefix) === 0) return newRel + p.slice(oldRel.length);
+        return p;
+    });
+}
+// 剪枝：对 open 里的每个 p，只有当"这次渲染真的遍历过它的父层"（ctx.seenDirs.has(parent)）
+// 且这一层里已经看不到 p 了，才判定"磁盘上真被删掉了"从而清理；因祖先被折叠而这次没走到的
+// 深层 key 不受影响（seenDirs 里压根没有那个 parent 的记录）。
+function ovlTreeExpandPrune(ctx) {
+    if (!ctx || !ctx.seenDirs) return;
+    ovlTreeExpandEnsureLoaded();
+    OvlTreeExpandState.open = OvlTreeExpandState.open.filter(function (p) {
+        const idx = p.lastIndexOf('/');
+        const parent = idx === -1 ? '' : p.slice(0, idx);
+        if (!ctx.seenDirs.has(parent)) return true; // 这一层这次没遍历到——保留，不误删
+        return ctx.seenDirs.get(parent).has(p);
+    });
+}
+// 生产 = 测试共用的唯一不变量自检实现。rendered = DOM 里带 .ovl-tree-open 的 relPath 集合。
+function ovlTreeExpandSelfCheck() {
+    const body = document.getElementById('ovlTreeBody');
+    const rendered = [];
+    if (body) {
+        const nodes = body.querySelectorAll('.ovl-tree-node.ovl-tree-open');
+        for (let i = 0; i < nodes.length; i++) {
+            const e = nodes[i].__ovlEntry;
+            if (e && e.isDir) rendered.push(e.relPath);
+        }
+    }
+    const requested = OvlTreeExpandState.open.slice();
+    const renderedSet = {}; rendered.forEach(function (p) { renderedSet[p] = true; });
+    const requestedSet = {}; requested.forEach(function (p) { requestedSet[p] = true; });
+    // extra：DOM 里展开了但不在请求集合里的（不应该出现）
+    const extra = rendered.filter(function (p) { return !requestedSet[p]; });
+    // missing：请求了但 DOM 里没展开的（可能是被 budget/depth 截断，或目录已不存在——调用方自行判断）
+    const missing = requested.filter(function (p) { return !renderedSet[p]; });
+    return { ok: extra.length === 0, requested: requested, rendered: rendered, missing: missing, extra: extra, scrollTop: body ? body.scrollTop : 0 };
+}
+// 就地把已渲染 DOM 里的祖先链逐级展开（不重建整棵树）——用于"打开文件时保证祖先链可见"，
+// 例如 P2T 渲染树 → 打开产物（43591→43594）的顺序，新出现的 <out>/ 目录能被展开出来。
+async function ovlTreeExpandRevealInDom(relPath) {
+    const body = document.getElementById('ovlTreeBody');
+    if (!body || !relPath) return;
+    const parts = String(relPath).split('/');
+    parts.pop();
+    let acc = '';
+    // container 起点是 body（其下第一个 ul 是 ovlBuildTreeDom 建出来的根列表）；进一层之后
+    // 换成那一层目录节点自己的 childUl（ovl-tree-children），两种情况下"直接子 li"都是找法一致。
+    let listEl = body.querySelector(':scope > ul.ovl-tree-ul');
+    if (!listEl) return;
+    for (let i = 0; i < parts.length; i++) {
+        acc = acc ? (acc + '/' + parts[i]) : parts[i];
+        let li = null;
+        for (let j = 0; j < listEl.children.length; j++) {
+            const cand = listEl.children[j];
+            const e = cand.__ovlEntry;
+            if (e && e.isDir && e.relPath === acc) { li = cand; break; }
+        }
+        if (!li) return; // 这一层还没渲染出来（比如更深层还没懒加载）——放弃，不是错误
+        const row = li.querySelector(':scope > .ovl-tree-row');
+        const childUl = li.querySelector(':scope > ul.ovl-tree-children');
+        if (!row || !childUl) return;
+        if (!li.classList.contains('ovl-tree-open')) {
+            const h = li.__ovlEntry.handle, name = li.__ovlEntry.name;
+            try {
+                await ovlTreeEnsureNodeOpen(li, row, h, acc, name, childUl, true);
+                ovlTreeExpandAdd(acc);
+            } catch (e) { return; }
+        }
+        listEl = childUl;
+    }
+    try { ovlTreeExpandPersist(); } catch (e) {}
+}
+
 // ---- File System Access API 路径 ----
 
 // 递归建目录树的 DOM（懒加载子目录：点开才递归读下一层）。
@@ -35450,8 +35671,29 @@ function ovlShowTreeError(msg) {
 // 用 '/' 拼接累加，得到"相对项目根的完整路径"（含所有子目录层级），挂在 __ovlEntry.relPath
 // 上。此前这里只记 name（当前这一层的 basename），子目录里的文件/"设为主文档"/打开文件都
 // 因此丢了自己所在的子目录信息——是 main file not found 的真根因。
-async function ovlBuildTreeDom(dirHandle, relPrefix) {
+// v2 Pass P131：展开/折叠一个目录节点的唯一实现——点击与"恢复展开态"(ovlTreeExpandRevealInDom)
+// 共用同一份逻辑，绝不写两份。箭头文本与 class 的写法跟改之前逐字节相同（chatBuildTreeOverview
+// 按这套 class/文本读树给模型当上下文，不能变）。
+async function ovlTreeEnsureNodeOpen(li, row, h, relPath, name, childUl, opening) {
+    li.classList.toggle('ovl-tree-open', opening);
+    row.textContent = (opening ? '▾ ' : '▸ ') + name;
+    if (opening && childUl.childElementCount === 0) {
+        try {
+            const built = await ovlBuildTreeDom(h, relPath);
+            while (built.firstChild) childUl.appendChild(built.firstChild);
+        } catch (e) {
+            console.error('[ovl] list dir failed', e);
+            const errLi = document.createElement('li');
+            errLi.className = 'ovl-tree-error';
+            errLi.textContent = '（读取失败）';
+            childUl.appendChild(errLi);
+        }
+    }
+}
+
+async function ovlBuildTreeDom(dirHandle, relPrefix, ctx, depth) {
     relPrefix = relPrefix || '';
+    depth = depth | 0;
     const ul = document.createElement('ul');
     ul.className = 'ovl-tree-ul';
     const entries = [];
@@ -35490,22 +35732,36 @@ async function ovlBuildTreeDom(dirHandle, relPrefix) {
             const childUl = document.createElement('ul');
             childUl.className = 'ovl-tree-ul ovl-tree-children';
             li.appendChild(childUl);
+            // v2 Pass P131：记录"这一层看见了哪些目录"，供 ovlTreeExpandPrune 剪枝用——只有
+            // 这次渲染真的遍历到了某一层，才敢据此判断"磁盘上不见了 = 真的被删了"。
+            if (ctx) {
+                const seenAtLevel = ctx.seenDirs.get(relPrefix) || new Set();
+                seenAtLevel.add(relPath);
+                ctx.seenDirs.set(relPrefix, seenAtLevel);
+            }
             row.addEventListener('click', function () {
                 const opening = !li.classList.contains('ovl-tree-open');
-                li.classList.toggle('ovl-tree-open', opening);
-                row.textContent = (opening ? '▾ ' : '▸ ') + name;
-                if (opening && childUl.childElementCount === 0) {
-                    ovlBuildTreeDom(h, relPath).then(function (built) {
-                        while (built.firstChild) childUl.appendChild(built.firstChild);
-                    }).catch(function (e) {
-                        console.error('[ovl] list dir failed', e);
-                        const errLi = document.createElement('li');
-                        errLi.className = 'ovl-tree-error';
-                        errLi.textContent = '（读取失败）';
-                        childUl.appendChild(errLi);
-                    });
-                }
+                ovlTreeEnsureNodeOpen(li, row, h, relPath, name, childUl, opening).catch(function () {});
+                try {
+                    if (opening) ovlTreeExpandAdd(relPath); else ovlTreeExpandRemoveExact(relPath);
+                    ovlTreeExpandPersist();
+                } catch (e) {}
             });
+            // v2 Pass P131：构建期预展开——ctx 只在 ovlRenderTree 发起的整树重建时传入（点击
+            // 懒加载那次调用不传 ctx，语义不变：不会把整棵子树按持久集合展开）。
+            if (ctx && ctx.want.has(relPath) && depth < OVL_TREE_EXPAND_MAX_DEPTH && ctx.budget.n > 0) {
+                ctx.budget.n--;
+                li.classList.add('ovl-tree-open');
+                row.textContent = '▾ ' + name;
+                try {
+                    const built = await ovlBuildTreeDom(h, relPath, ctx, depth + 1);
+                    while (built.firstChild) childUl.appendChild(built.firstChild);
+                } catch (e) {
+                    console.warn('[ovl] restore expand failed for ' + relPath, e);
+                    li.classList.remove('ovl-tree-open'); // 单个目录列不出来就保持折叠，绝不整棵树失败
+                    row.textContent = '▸ ' + name;
+                }
+            }
         } else {
             // v2 Pass P72：.pdf 分流到直显（不编译，直接喂给 pdf.js 查看器），其余扩展名走
             // 原来的文本编辑器打开路径。改之前这里对 .pdf 也无脑走 ovlOpenFile()，会把 PDF
@@ -35526,15 +35782,27 @@ async function ovlBuildTreeDom(dirHandle, relPrefix) {
 async function ovlRenderTree(dirHandle) {
     const body = document.getElementById('ovlTreeBody');
     if (!body) return;
+    // v2 Pass P131：拆之前先记滚动位置——body.textContent='' 之后这个数字就没了。
+    const prevScroll = body.scrollTop;
+    ovlTreeExpandEnsureLoaded();
+    const want = ovlTreeExpandGetSet();
+    const ctx = { want: want, seenDirs: new Map(), budget: { n: OVL_TREE_EXPAND_MAX_DIRS } };
     body.textContent = '';
     const loading = document.createElement('div');
     loading.className = 'ovl-tree-loading';
     loading.textContent = '正在读取…';
     body.appendChild(loading);
     try {
-        const ul = await ovlBuildTreeDom(dirHandle);
+        const ul = await ovlBuildTreeDom(dirHandle, '', ctx, 0);
         body.textContent = '';
         body.appendChild(ul);
+        try { ovlTreeExpandPrune(ctx); } catch (e) {}
+        // 还原滚动位置：优先用"拆之前"的值（同一次会话内连续重渲）；没有就用持久层记的那个
+        // （整页刷新/换回这个项目）。
+        const target = (prevScroll > 0 ? prevScroll : (OvlTreeExpandState.scrollTop || 0));
+        body.scrollTop = Math.min(target, Math.max(0, body.scrollHeight - body.clientHeight));
+        OvlTreeExpandState.scrollTop = body.scrollTop;
+        try { ovlTreeExpandPersist(); } catch (e) {}
     } catch (e) {
         console.error('[ovl] render tree failed', e);
         ovlShowTreeError('读取文件夹失败：' + (e && e.message ? e.message : String(e)));
@@ -35568,6 +35836,20 @@ async function ovlOpenFile(fileHandle, name, parentHandle, relPath, opts) {
         // 不会比修之前更差，只是恢复不了"记不住子目录"这个已知缺陷。
         OvlState.currentFile = { name: name, relPath: relPath || name, handle: fileHandle, parentHandle: parentHandle || OvlState.dirHandle || null };
         OvlState.dirty = false;
+        // v2 Pass P131：打开文件时保证祖先链在展开集合里（即使这次树还没重渲/DOM 还没建到这
+        // 一支），下一次 ovlRenderTree 会天然把它们展开出来。
+        try { ovlTreeExpandAddAncestors(relPath || name); ovlTreeExpandPersist(); } catch (e) {}
+        // v2 Pass P131（B-2）：记这份文件"真正装进编辑器"那一刻的内容/元数据快照——是判断
+        // "编辑器是否干净"、"外部改动 mtime 有没有真的变化"的权威依据（比 OvlState.dirty 更
+        // 可靠，dirty 只由 textarea input 事件置位，Visual 就地编辑/程序化改 ta.value 都可能
+        // 让它跟真实情况脱节）。
+        OvlState.lastLoadedText = text;
+        OvlState.lastLoadedMtimeMs = (typeof file.lastModified === 'number') ? file.lastModified : null;
+        OvlState.lastLoadedRelPath = relPath || name;
+        // v2 Pass P131：换文件=旧文件的"WS 今天证明活着过"不能跨文件复用（新订阅是另一条
+        // watch，桥是否真的挂上了 watcher 未知），轮询兜底重新评估；并确保轮询定时器已经在跑。
+        if (typeof OvlExternalEverReceivedChanged !== 'undefined') OvlExternalEverReceivedChanged = false;
+        if (typeof ovlExternalPollEnsureStarted === 'function') { try { ovlExternalPollEnsureStarted(); } catch (e) {} }
         // v2 Pass P128（C1，卫生清理）：换文件——failLog 的 key 本身已经含内容哈希，跨文档
         // 天然不会误命中；这里额外清空纯粹是内存卫生（长会话反复换文件不让 Map 无限堆积陈旧
         // 记录），不是正确性所需。
@@ -35598,6 +35880,11 @@ async function ovlOpenFile(fileHandle, name, parentHandle, relPath, opts) {
         OvlVisualState.preambleOpen = false; OvlVisualState.tailOpen = false;
         if (typeof ovlVisTransHide === 'function') ovlVisTransHide(); // P4：换文件=旧选区作废
         if (OvlState.editorMode === 'visual') ovlVisualRender();
+        // v2 Pass P131：打开的文件可能在展开集合里但树还没渲染到这一支的 DOM（比如 P2T 收尾
+        // 先 ovlRenderTree 再 ovlOpenFile，产物目录那次是新出现的）——就地把已渲染 DOM 里的
+        // 祖先链逐级展开，不重建整棵树、不闪烁。fire-and-forget：这不是打开文件流程必须等待的
+        // 一步，失败也不影响编辑器可用。
+        if (typeof ovlTreeExpandRevealInDom === 'function') { ovlTreeExpandRevealInDom(relPath || name).catch(function () {}); }
         // v2 Pass P17：换文件=之前订阅的那个文件的 watch 不再有意义，改订阅这一个（路径缺失/桥
         // 离线时 ovlBridgeUpdateWatch 自己会静默跳过，不影响这里的打开流程）。
         if (typeof ovlBridgeUpdateWatch === 'function') { try { ovlBridgeUpdateWatch(); } catch (e) {} }
@@ -37437,10 +37724,18 @@ async function ovlSaveCurrentFile(opts) {
         try {
             const savedFile = await cf.handle.getFile();
             OvlState.lastSelfWriteMtimeMs = savedFile.lastModified;
-            OvlState.lastSelfWritePath = (typeof ovlBridgeAbsPathFor === 'function') ? ovlBridgeAbsPathFor(cf.name) : null;
+            OvlState.lastSelfWritePath = (typeof ovlBridgeAbsPathFor === 'function') ? ovlBridgeAbsPathFor(cf.relPath || cf.name) : null;
+            // v2 Pass P131（B-2）：保存成功=编辑器内容此刻就是磁盘内容，快照跟着更新——否则
+            // 保存后立即来一次外部改动探测会误判"跟 lastLoadedText 不一致"。
+            OvlState.lastLoadedText = ta.value;
+            OvlState.lastLoadedMtimeMs = savedFile.lastModified;
         } catch (e) {}
         ovlUpdateTabUI();
         if (!opts.silent) ovlFlashSaveStatus('已保存 ' + new Date(OvlState.lastSavedAt).toLocaleTimeString(), false);
+        // v2 Pass P131（B-3 补洞）：保存=编辑器变回"干净"的时刻之一——立刻补一次外部改动检查，
+        // 找回"脏时被丢弃、之后再也没人补的那次外部改动通知"（横幅"保留我的修改"场景下，用户
+        // 保存自己的版本后，如果磁盘上其实还有更晚的另一次外部改动，这里能追上）。
+        try { if (typeof ovlExternalCheckNow === 'function') ovlExternalCheckNow('clean-after-save'); } catch (e) {}
     } catch (e) {
         console.error('[ovl] save failed', e);
         if (!opts.silent) ovlFlashSaveStatus('保存失败：' + (e && e.message ? e.message : String(e)), true);
@@ -37914,7 +38209,19 @@ function ovlHandleCtxAction(id, entry) {
                 validate: function (v) { return (v && v.trim()) ? null : '名字不能为空'; },
                 onConfirm: function (v) {
                     ovlPerformRename(entry.parentHandle, entry.name, entry.isDir, v, entry.relPath)
-                        .then(function () { return ovlRenderTree(OvlState.dirHandle); })
+                        .then(function () {
+                            // v2 Pass P131：展开集合里指向旧路径（含后代）的 key 迁移成新路径，
+                            // 否则重命名之后这个目录（及其已展开的子目录）会看起来"折叠了"。
+                            try {
+                                const oldRel = entry.relPath || entry.name;
+                                const parentIdx = oldRel.lastIndexOf('/');
+                                const parent = parentIdx === -1 ? '' : oldRel.slice(0, parentIdx);
+                                const newRel = parent ? (parent + '/' + v) : v;
+                                if (typeof ovlTreeExpandRenamePrefix === 'function') ovlTreeExpandRenamePrefix(oldRel, newRel);
+                                if (typeof ovlTreeExpandPersist === 'function') ovlTreeExpandPersist();
+                            } catch (e) {}
+                            return ovlRenderTree(OvlState.dirHandle);
+                        })
                         .then(function () { ovlFlashSaveStatus('已重命名', false); })
                         .catch(function (e) { ovlFlashSaveStatus('重命名失败：' + (e && e.message ? e.message : String(e)), true); });
                 }
@@ -37940,7 +38247,10 @@ function ovlHandleCtxAction(id, entry) {
                 confirmLabel: '删除',
                 onConfirm: function () {
                     ovlPerformDelete(entry.parentHandle, entry.name, entry.isDir, entry.relPath)
-                        .then(function () { return ovlRenderTree(OvlState.dirHandle); })
+                        .then(function () {
+                            try { if (typeof ovlTreeExpandRemove === 'function') ovlTreeExpandRemove(entry.relPath || entry.name); } catch (e) {}
+                            return ovlRenderTree(OvlState.dirHandle);
+                        })
                         .then(function () { ovlFlashSaveStatus('已删除', false); })
                         .catch(function (e) { ovlFlashSaveStatus('删除失败：' + (e && e.message ? e.message : String(e)), true); });
                 }
@@ -39651,6 +39961,7 @@ async function ovlOverleafDiscardRollback(projectDir, checkpoint) {
         }
         showToast('已回退到丢弃之前的状态（恢复 ' + data.filesRestored + ' 个文件）', 'success');
         if (OvlState.dirHandle && !OvlState.usingWebkitFallback) { try { ovlRenderTree(OvlState.dirHandle); } catch (e) {} }
+        if (typeof ovlExternalCheckNow === 'function') { try { ovlExternalCheckNow('overleaf-discard-rollback', { force: true }); } catch (e) {} }
     } catch (e) {
         showToast('回退失败：连不上桥接服务', 'error');
     }
@@ -39803,6 +40114,9 @@ function ovlOverleafHandlePullResult(data, ctx) {
         // OvlState.dirty===false 时自动重新加载（ovlBridgeHandleExternalChange）——这里
         // 只补一次订阅刷新，确保 watch 是最新的（万一 pull 之前压根还没建立过订阅）。
         if (typeof ovlBridgeUpdateWatch === 'function') { try { ovlBridgeUpdateWatch(); } catch (e) {} }
+        // v2 Pass P131：不等 WS/轮询——拉取成功这一刻立即做一次权威检查（干净则静默重载、
+        // 脏则弹横幅），把"拉取完成后当前文件没跟着刷新"的用户抱怨堵死在源头。
+        if (typeof ovlExternalCheckNow === 'function') { try { ovlExternalCheckNow('pull', { force: true }); } catch (e) {} }
     }
 }
 
@@ -39944,6 +40258,10 @@ async function ovlOverleafPush() {
         if (data.action === 'pushed') {
             ovlOverleafSetSyncStatus('已推送到 Overleaf', false);
             showToast('已推送到 Overleaf' + untrackedSuffix, 'success');
+            // v2 Pass P131（5.6/4.6）：推送本身不改工作区文件内容/mtime（诊断已核对过
+            // ovlOverleafPush 里没有任何 ovlRenderTree 调用），这里只是便宜、无害地补一次
+            // 检查——不会有任何实际变化，纯粹是任务描述明确要求的触发点。
+            if (typeof ovlExternalCheckNow === 'function') { try { ovlExternalCheckNow('push'); } catch (e) {} }
         } else if (data.action === 'nothing-to-push') {
             ovlOverleafSetSyncStatus('没有改动，无需推送', false);
             showToast('没有改动，无需推送' + untrackedSuffix, 'info');
@@ -43593,6 +43911,10 @@ async function ovlP2TRunPipeline(job) {
             const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, job.outRel + '/main.tex');
             await ovlOpenFile(resolved.handle, resolved.name, resolved.parentHandle, job.outRel + '/main.tex');
         } catch (e) { console.error('[ovl] p2t open result after run failed', e); }
+        // v2 Pass P131：ovlOpenFile 本身已经从磁盘重读一次（内容天然是新的），这里补一次
+        // ovlExternalCheckNow 只是为了把 watch 订阅立刻校准到正确路径（B-2 根因修复之前，
+        // 这一步曾经订到项目根 main.tex 而不是产物目录，见 p131_diag_plan.md §2.3）。
+        try { if (typeof ovlExternalCheckNow === 'function') ovlExternalCheckNow('p2t', { force: true }); } catch (e) {}
         job.finishedAt = Date.now();
     } catch (e) {
         console.error('[ovl] p2t pipeline failed', e);
@@ -44135,6 +44457,7 @@ function ovlP2TBindPanel() {
                 danger: true, requireTyped: job.outRel.split('/').pop(), confirmLabel: '删除',
                 onConfirm: function () {
                     ovlP2TDeleteOutDir(job).then(function () {
+                        try { if (typeof ovlTreeExpandRemove === 'function') ovlTreeExpandRemove(job.outRel); } catch (e) {}
                         return ovlP2TDestroyJobDoc(job);
                     }).then(function () {
                         OvlP2TState.job = null;
@@ -45077,13 +45400,22 @@ async function ovlOverleafCloneFinishNamed(projectId, data, name) {
 // 限制，见 §3.2）。/compile 请求把这两块分开发给桥、让桥自己 path.join——这里前端要自己拼一份
 // 字符串塞进 WebSocket 订阅消息，逻辑镜像桥端 doCompile 里的
 // `path.isAbsolute(mainFile) ? mainFile : path.join(projectDir, mainFile)` 那一句。
-function ovlBridgeAbsPathFor(name) {
+// v2 Pass P131（B-1，根因修复）：这里的形参改名叫 relPath 只是文档意图——调用方必须传
+// cf.relPath || cf.name（相对项目根、含子目录），不能只传 basename。此前三处调用点全部传
+// cf.name，子目录文件（含 pdf→latex 产物 <out>/main.tex）算出来的绝对路径不存在，桥端
+// attachWatcher 的 fs.existsSync 静默为假、静默不挂 watcher——是"打开的子目录文件不自动
+// 刷新"的根因，见 .claude/tmp/p131_diag_plan.md §2.2/§2.3。
+function ovlBridgeAbsPathFor(relPath) {
     const pathInput = document.getElementById('ovlProjectPathInput');
     const projectDir = pathInput ? pathInput.value.trim() : '';
-    if (!projectDir || !name) return null;
-    if (/^[a-zA-Z]:[\\/]|^\\\\/.test(name)) return name; // name 本身已经是绝对路径（跟 Node path.isAbsolute 同一条件的 Windows 简化版）
+    if (!projectDir || !relPath) return null;
+    if (/^[a-zA-Z]:[\\/]|^\\\\/.test(relPath)) return relPath; // relPath 本身已经是绝对路径（跟 Node path.isAbsolute 同一条件的 Windows 简化版）
     const sep = (projectDir.indexOf('\\') === -1 && projectDir.indexOf('/') !== -1) ? '/' : '\\';
-    return projectDir.replace(/[\\/]+$/, '') + sep + name;
+    // relPath 内部一律 '/' 分隔（跟 li.__ovlEntry.relPath 同一套约定）；这里统一换成本次算出
+    // 的 sep，保证跟桥端 attachWatcher 原样回显（msg.path）的那个字符串逐字相等（Windows 下
+    // 桥用 path.join 拼绝对路径，天然是 '\\' 分隔）。
+    const normRel = String(relPath).replace(/[\\/]+/g, sep).replace(/^[\\/]+/, '');
+    return projectDir.replace(/[\\/]+$/, '') + sep + normRel;
 }
 
 let OvlBridgeWs = null;
@@ -45168,9 +45500,16 @@ function ovlBridgeOpenWs(absPath, ticket) {
 function ovlBridgeUpdateWatch() {
     const cf = OvlState.currentFile;
     if (!cf || !cf.name || !cf.handle || OvlState.usingWebkitFallback) { ovlBridgeCloseWatch(); return; }
-    const absPath = ovlBridgeAbsPathFor(cf.name);
+    const absPath = ovlBridgeAbsPathFor(cf.relPath || cf.name);
     if (!absPath) { ovlBridgeCloseWatch(); return; } // 项目路径还没填/还没用过浏览按钮——安静跳过，等填了再订阅
-    if (OvlBridgeWsPath === absPath && OvlBridgeWs && OvlBridgeWs.readyState === WebSocket.OPEN) return; // 已经订阅着同一个文件
+    if (OvlBridgeWsPath === absPath && OvlBridgeWs && OvlBridgeWs.readyState === WebSocket.OPEN) {
+        // v2 Pass P131（B-1 第 4 处）：路径没变、socket 也还开着——但不能因此彻底跳过。旧场景
+        // 里"订阅时文件还不存在→桥端 attachWatcher 静默不挂→前端永不重试"是条死路（见
+        // p131_diag_plan.md §2.5）。桥端 attachWatcher 会先 detachWatcher 再挂，天然幂等，
+        // 这里重发一次 watch 消息成本很低，换来"文件后来才出现"这种情况能自愈。
+        try { OvlBridgeWs.send(JSON.stringify({ type: 'watch', path: absPath })); } catch (e) {}
+        return;
+    }
     ovlBridgeCloseWatch();
     OvlBridgeWsPath = absPath;
     ovlBridgeConnectWs(absPath);
@@ -45182,31 +45521,245 @@ function ovlBridgeUpdateWatch() {
 // 完全精确，见任务描述原话。
 const OVL_SELF_WRITE_TOLERANCE_MS = 1500;
 
-async function ovlBridgeHandleExternalChange(msg) {
-    const cf = OvlState.currentFile;
-    if (!cf || !cf.handle || OvlState.usingWebkitFallback) return; // 没有可重读的 FSA 句柄，安静忽略
-    const absPath = ovlBridgeAbsPathFor(cf.name);
-    if (!absPath || absPath !== msg.path) return; // 推送对应的不是当前打开的这个文件（比如刚切换文件，旧订阅还没关掉就来了一条）
-    if (typeof OvlState.lastSelfWriteMtimeMs === 'number' && OvlState.lastSelfWritePath === absPath
-        && Math.abs((msg.mtimeMs || 0) - OvlState.lastSelfWriteMtimeMs) < OVL_SELF_WRITE_TOLERANCE_MS) {
-        return; // 自己刚落盘触发的回声，不是外部改动
+// v2 Pass P131（B）：外部改动自动刷新。根因是 B-1（上面 ovlBridgeAbsPathFor 用 basename 而不是
+// relPath，子目录文件/pdf→latex 产物永远订不上正确的 watch）；这里补 B-2~B-4：统一入口
+// ovlExternalCheckNow + 便宜 mtime 探测 + 脏时冲突横幅（绝不静默覆盖）+ WS 不可用时的分档轮询
+// 兜底。全部只用桥已有端点（/fs/read、/fs/list、/project-asset）和既有 WS 协议，零改 server.js。
+// 见 .claude/tmp/p131_diag_plan.md §4。
+
+// ① 便宜探测：只要 mtime/存在性，不读内容。
+//    本地 FSA -> handle.getFile().lastModified（元数据读取，不等于读字节）
+//    远程句柄 -> POST /fs/list 父目录，找 entry.mtimeMs（几 KB 响应，顺带知道文件在不在）
+//    任何一步失败/字段缺失 -> {ok:false}，调用方降级成直接做完整比对。
+async function ovlExternalProbeMtime(cf) {
+    try {
+        if (!cf || !cf.handle || OvlState.usingWebkitFallback) return { ok: false };
+        if (!ovlIsRemoteBridge()) {
+            const file = await cf.handle.getFile();
+            return { ok: true, exists: true, mtimeMs: file.lastModified };
+        }
+        const relPath = cf.relPath || cf.name;
+        const idx = relPath.lastIndexOf('/');
+        const dir = idx === -1 ? '.' : relPath.slice(0, idx);
+        const base = idx === -1 ? relPath : relPath.slice(idx + 1);
+        const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: ovlRemoteProjectRoot(), path: dir });
+        if (!data || data.ok !== true || !Array.isArray(data.entries)) return { ok: false };
+        let entry = null;
+        for (let i = 0; i < data.entries.length; i++) { if (data.entries[i] && data.entries[i].name === base) { entry = data.entries[i]; break; } }
+        if (!entry) return { ok: true, exists: false };
+        if (typeof entry.mtimeMs !== 'number') return { ok: false }; // 字段缺失（旧桥）——降级成完整比对
+        return { ok: true, exists: true, mtimeMs: entry.mtimeMs };
+    } catch (e) { return { ok: false }; }
+}
+
+// 单飞 + 尾随重跑：pull/WS/轮询/可见性等触发点可能在极短时间内并发调用 ovlExternalCheckNow，
+// 这里压成"最多一个在飞，飞完了如果又被别的触发点排了队，再补跑一次"，不让并发请求打到桥。
+let OvlExternalCheckInFlight = null;
+let OvlExternalCheckPending = false;
+let OvlExternalCheckLastRunAt = 0;
+const OVL_EXTERNAL_CHECK_MIN_INTERVAL_MS = 800;
+
+// ② 权威新鲜度检查（唯一入口，所有触发点都调它）。
+// 返回：'unchanged' | 'same-content' | 'reloaded' | 'conflict' | 'missing' | 'skipped' | 'error'
+function ovlExternalCheckNow(reason, opts) {
+    if (OvlExternalCheckInFlight) {
+        OvlExternalCheckPending = true;
+        return OvlExternalCheckInFlight;
     }
-    if (OvlState.dirty) return; // 有未保存的本地改动，不许覆盖（§ 任务描述明文要求）——等本地改动落盘/撤销后下一条 changed 事件再说
-    // v2 Pass P33：就地编辑源码正在进行时同一条顾虑——这一刻可能还没触发 dirty（真正的
-    // 落地要等保存那一步），这一轮外部改动推送先跳过，等编辑结束（保存/取消）后重新触发
-    // 的下一条 changed 事件再接手，不吞事件、只是错开这一轮。
-    if (OvlInlineSrcEdit) return;
-    const file = await cf.handle.getFile();
-    const text = await file.text();
-    const ta = document.getElementById('ovlCodeArea');
-    if (!ta) return;
+    OvlExternalCheckInFlight = ovlExternalCheckNowImpl(reason, opts || {}).finally(function () {
+        OvlExternalCheckInFlight = null;
+        OvlExternalCheckLastRunAt = Date.now();
+        if (OvlExternalCheckPending) {
+            OvlExternalCheckPending = false;
+            setTimeout(function () { ovlExternalCheckNow('trailing-' + reason, opts); }, 0);
+        }
+    });
+    return OvlExternalCheckInFlight;
+}
+
+async function ovlExternalCheckNowImpl(reason, opts) {
+    try {
+        const cf = OvlState.currentFile;
+        if (!cf || !cf.handle || OvlState.usingWebkitFallback) return 'skipped';
+        if (OvlInlineSrcEdit) return 'skipped'; // 就地编辑源码中，等编辑结束后下一次触发再说（不吞事件，见 4.6 的"编辑器变干净"触发点）
+        let mtimeMs = null;
+        if (!opts.force) {
+            const probe = await ovlExternalProbeMtime(cf);
+            if (probe.ok) {
+                if (!probe.exists) return ovlExternalHandleMissing();
+                if (typeof OvlState.lastLoadedMtimeMs === 'number' && probe.mtimeMs === OvlState.lastLoadedMtimeMs) {
+                    return 'unchanged'; // mtime 没变——不读内容，这是"零额外读盘"档位的关键
+                }
+                mtimeMs = probe.mtimeMs;
+            }
+            // probe 失败（旧桥缺字段/网络问题）——不放弃，降级走下面的完整读比对
+        }
+        const file = await cf.handle.getFile();
+        const text = await file.text();
+        if (typeof mtimeMs !== 'number') mtimeMs = (typeof file.lastModified === 'number') ? file.lastModified : Date.now();
+        if (text === OvlState.lastLoadedText) {
+            // 内容没变（mtime 心跳/touch），只更新快照——绝不动编辑器、绝不弹提示。
+            OvlState.lastLoadedMtimeMs = mtimeMs;
+            return 'same-content';
+        }
+        const ta = document.getElementById('ovlCodeArea');
+        const isClean = !!ta && ta.value === OvlState.lastLoadedText && !OvlState.dirty;
+        // opts.overwriteDirty：横幅「重新加载（丢弃我的改动）」按钮的唯一合法用法——用户已经
+        // 明确表态要丢弃本地改动，这里才允许绕过"脏就不覆盖"这条铁律；没有这个显式意图时
+        // （包括普通的 force:true，那只表示"跳过便宜探测直接完整比对"）绝不越过这道闸。
+        if (isClean || opts.overwriteDirty) {
+            if (ta) OvlState.dirty = false;
+            ovlExternalSilentReload(ta, text, mtimeMs);
+            return 'reloaded';
+        }
+        ovlExtChangeBannerShow({ text: text, mtimeMs: mtimeMs, missing: false });
+        return 'conflict';
+    } catch (e) {
+        console.warn('[ovl] external check failed (' + reason + ')', e);
+        return 'error';
+    }
+}
+
+function ovlExternalHandleMissing() {
+    ovlExtChangeBannerShow({ text: null, mtimeMs: null, missing: true });
+    return 'missing';
+}
+
+// 静默重载要保住的连带（4.4）：光标/滚动位置（按 line,col 语义还原）、Visual 面板滚动、
+// gutter/outline 重建、Visual 重渲、跨文件文本缓存失效（P115，此前 ovlBridgeHandleExternalChange
+// 漏调，是真缺陷，顺手补）。撤销栈会被 ta.value= 清空——这是今天已有的行为，本方案不改善也不
+// 恶化，如实记在报告里，不写成"已保留"。
+function ovlExternalSilentReload(ta, text, mtimeMs) {
+    const oldText = ta.value;
+    const selStart = ta.selectionStart, selEnd = ta.selectionEnd;
+    const beforeCaret = oldText.slice(0, selStart);
+    const lineIdx = (beforeCaret.match(/\n/g) || []).length; // 0-based 逻辑行
+    const lastNl = beforeCaret.lastIndexOf('\n');
+    const col = selStart - (lastNl === -1 ? 0 : lastNl + 1);
+    const scrollTop = ta.scrollTop;
+    const visualPane = document.getElementById('ovlVisualPane');
+    const visualScrollTop = visualPane ? visualPane.scrollTop : 0;
+
+    // v2 Pass P131（5.4/R5）：中文 Visual 在途翻译与重载的竞态——重载前先取消在途的那一批
+    // （++seq + abort 飞在半路的请求），再按新内容重渲。不这样做的话，旧内容那一批请求可能
+    // 在重渲之后才回来，凭旧的 mySeq 判断仍然"当前"，把属于旧文本的译文写进新 DOM。
+    // ovlVisualLangCancelInFlight 内部只在有东西可取消时才有实际动作，非 zh/非在途时安全空跑。
+    if (typeof ovlVisualLangCancelInFlight === 'function') { try { ovlVisualLangCancelInFlight(); } catch (e) {} }
     ta.value = text;
+    OvlState.lastLoadedText = text;
+    OvlState.lastLoadedMtimeMs = mtimeMs;
     OvlState.lineOffsets = null;
     ovlRecomputeLineOffsets();
     ovlRenderGutter(true);
     ovlBuildOutline();
     if (OvlState.editorMode === 'visual') ovlVisualRender();
+    try {
+        const cf = OvlState.currentFile;
+        if (cf && typeof ovlFileTextCacheInvalidate === 'function') ovlFileTextCacheInvalidate(cf.relPath || cf.name);
+    } catch (e) {}
+
+    // 还原 (line, col)——新文本行数变少就 clamp 到最后一行末尾。
+    try {
+        const newLines = text.split('\n');
+        const targetLine = Math.min(lineIdx, newLines.length - 1);
+        let offset = 0;
+        for (let i = 0; i < targetLine; i++) offset += newLines[i].length + 1;
+        offset += Math.min(col, newLines[targetLine].length);
+        ta.selectionStart = ta.selectionEnd = offset;
+        ta.scrollTop = scrollTop;
+        if (visualPane) visualPane.scrollTop = visualScrollTop;
+    } catch (e) {}
+
     ovlFlashSaveStatus('已从磁盘同步外部改动', false);
+}
+
+// ③ 冲突横幅（脏时唯一出口，绝不静默覆盖）。
+let OvlExtChangeBannerPending = null; // { text, mtimeMs, missing }
+function ovlExtChangeBannerShow(info) {
+    OvlExtChangeBannerPending = info;
+    const el = document.getElementById('ovlExtChangeBanner');
+    if (!el) return;
+    const isMissing = !!info.missing;
+    el.innerHTML =
+        '<div class="ovl-extbanner-row">'
+        + '<span class="ovl-extbanner-icon">⚠</span>'
+        + '<div class="ovl-extbanner-text">'
+        + '<div class="ovl-extbanner-main">' + (isMissing ? '这个文件在磁盘上已经不存在了' : '这个文件已在外部被修改（磁盘上的内容和编辑器里的不一致）') + '</div>'
+        + '<div class="ovl-extbanner-sub">' + (isMissing ? '编辑器里的内容会保留，不会被清空。' : '你在编辑器里有未保存的改动，已经帮你挡住了这次覆盖。') + '</div>'
+        + '</div>'
+        + '<div class="ovl-extbanner-actions">'
+        + (isMissing
+            ? '<button type="button" class="ovl-extbanner-btn" id="ovlExtBannerKeep">保留编辑器内容</button>'
+            : '<button type="button" class="ovl-extbanner-btn ovl-extbanner-btn-primary" id="ovlExtBannerReload">重新加载（丢弃我的改动）</button>'
+              + '<button type="button" class="ovl-extbanner-btn" id="ovlExtBannerKeep">保留我的修改</button>')
+        + '</div>'
+        + '</div>';
+    el.hidden = false;
+    const reloadBtn = document.getElementById('ovlExtBannerReload');
+    if (reloadBtn) {
+        reloadBtn.addEventListener('click', function () {
+            ovlExtChangeBannerHide();
+            ovlExternalCheckNow('banner-reload', { force: true, overwriteDirty: true }); // 点击时重新读盘，可能又变了；用户已明确要丢弃本地改动
+        });
+    }
+    const keepBtn = document.getElementById('ovlExtBannerKeep');
+    if (keepBtn) {
+        keepBtn.addEventListener('click', function () {
+            // "保留我的修改"：只收横幅，把 lastLoadedMtimeMs 更新成这次看到的 mtime（否则下一轮
+            // 探测会反复弹），但不动 lastLoadedText——保留"内容层面仍有分歧"的事实，让保存时
+            // 桥的 expectedMtimeMs 冲突检测照常生效。
+            if (!isMissing && info.mtimeMs != null) OvlState.lastLoadedMtimeMs = info.mtimeMs;
+            ovlExtChangeBannerHide();
+        });
+    }
+}
+function ovlExtChangeBannerHide() {
+    OvlExtChangeBannerPending = null;
+    const el = document.getElementById('ovlExtChangeBanner');
+    if (el) { el.hidden = true; el.innerHTML = ''; }
+}
+
+// ---- 轮询兜底（4.7）：WS OPEN 且当天收到过 changed = 不轮询；WS OPEN 但从未收到过 = 60s；
+// WS 非 OPEN = 8s；document.hidden = 一律不轮询（隐藏标签定时器被节流，轮它没意义，改在
+// visibilitychange→visible 时立刻查一次）。----
+let OvlExternalEverReceivedChanged = false;
+let OvlExternalPollTimer = null;
+let ovlExternalCleanCheckDebounce = null; // textarea input 里"是否已改回跟磁盘一致"的防抖计时器
+function ovlExternalPollTick() {
+    OvlExternalPollTimer = null;
+    if (document.hidden) return; // 隐藏时不排下一轮，等 visibilitychange→visible 重新拉起（P127 教训：隐藏标签定时器被节流，轮它没意义）
+    const wsOpen = !!(OvlBridgeWs && OvlBridgeWs.readyState === WebSocket.OPEN);
+    if (wsOpen && OvlExternalEverReceivedChanged) {
+        // WS 健康且已证明活着——这一轮不产生任何请求，只是重新排一次"复查"定时器，防止
+        // WS 之后掉线时没有任何定时器在跑（空窗期只能靠 close/onerror 事件唤醒，不够保险）。
+        OvlExternalPollTimer = setTimeout(ovlExternalPollTick, 60000);
+        return;
+    }
+    ovlExternalCheckNow('poll');
+    OvlExternalPollTimer = setTimeout(ovlExternalPollTick, wsOpen ? 60000 : 8000);
+}
+function ovlExternalPollEnsureStarted() {
+    if (OvlExternalPollTimer) return;
+    OvlExternalPollTimer = setTimeout(ovlExternalPollTick, 100);
+}
+function ovlExternalPollStop() {
+    if (OvlExternalPollTimer) { clearTimeout(OvlExternalPollTimer); OvlExternalPollTimer = null; }
+}
+
+async function ovlBridgeHandleExternalChange(msg) {
+    const cf = OvlState.currentFile;
+    if (!cf || !cf.handle || OvlState.usingWebkitFallback) return; // 没有可重读的 FSA 句柄，安静忽略
+    const absPath = ovlBridgeAbsPathFor(cf.relPath || cf.name);
+    if (!absPath || absPath !== msg.path) return; // 推送对应的不是当前打开的这个文件（比如刚切换文件，旧订阅还没关掉就来了一条）
+    if (typeof OvlState.lastSelfWriteMtimeMs === 'number' && OvlState.lastSelfWritePath === absPath
+        && Math.abs((msg.mtimeMs || 0) - OvlState.lastSelfWriteMtimeMs) < OVL_SELF_WRITE_TOLERANCE_MS) {
+        return; // 自己刚落盘触发的回声，不是外部改动
+    }
+    OvlExternalEverReceivedChanged = true;
+    // v2 Pass P131：脏/就地编辑时不再直接 return 吞掉——ovlExternalCheckNow 内部会判断脏态
+    // 弹横幅而不是覆盖，且"脏→干净"之后（ovlSaveCurrentFile 成功 / textarea 变回干净）会
+    // 重新触发一次检查，补上"事件只推一次、丢了就永久丢失"的洞（B-3）。
+    await ovlExternalCheckNow('ws', { force: true });
 }
 
 // v2 Pass P48：正向 SyncTeX"总是跳到固定页"的根因——#ovlCodeArea 在 Visual 模式下是
@@ -45605,6 +46158,19 @@ function ovlClearCachedFiles() {
 
 function ovlBindShell() {
     try {
+        // v2 Pass P131（4.6）：标签页重新可见/重新获得焦点——立即查一次，不等轮询。隐藏期间
+        // 轮询定时器自己不排下一轮（见 ovlExternalPollTick），这里是隐藏→可见之后唯一的唤醒点。
+        document.addEventListener('visibilitychange', function () {
+            if (!document.hidden) {
+                try { ovlExternalCheckNow('visible'); } catch (e) {}
+                try { ovlExternalPollEnsureStarted(); } catch (e) {}
+            }
+        });
+        window.addEventListener('focus', function () {
+            try { ovlExternalCheckNow('focus'); } catch (e) {}
+        });
+    } catch (e) {}
+    try {
         const treeBtn = document.getElementById('ovlTreeToggleBtn');
         if (treeBtn) treeBtn.addEventListener('click', ovlToggleTree);
 
@@ -45703,6 +46269,18 @@ function ovlBindShell() {
                 if (OvlState.currentFile) { OvlState.dirty = true; ovlUpdateTabUI(); }
                 // v2 Pass P14：改完自动同步回磁盘文件，不用记得按 Ctrl+S。
                 ovlScheduleAutoSaveToDisk();
+                // v2 Pass P131（B-3 补洞）：用户撤销/手改回跟磁盘一致的内容——防抖判定，避免每次
+                // 敲字都做一次整串比较；变回干净就立刻补一次外部改动检查（脏期间被丢弃的那次
+                // 外部改动事件，在这里被追回来）。
+                if (ovlExternalCleanCheckDebounce) clearTimeout(ovlExternalCleanCheckDebounce);
+                ovlExternalCleanCheckDebounce = setTimeout(function () {
+                    ovlExternalCleanCheckDebounce = null;
+                    if (OvlState.currentFile && ta.value === OvlState.lastLoadedText) {
+                        OvlState.dirty = false;
+                        ovlUpdateTabUI();
+                        try { ovlExternalCheckNow('clean-undo'); } catch (e) {}
+                    }
+                }, 400);
                 // v2 Pass P108：敲字＝一次"实质操作"，标记当前项目为最近（见
                 // ovlProjectHistoryTouchCurrent 头部注释，内部已去抖，这里不用担心高频调用）。
                 if (typeof ovlProjectHistoryTouchCurrent === 'function') ovlProjectHistoryTouchCurrent();
@@ -45793,6 +46371,22 @@ function ovlBindShell() {
                     .then(function () { return ovlRenderTree(OvlState.dirHandle); })
                     .then(function () { ovlFlashSaveStatus('已上传 ' + files.length + ' 个文件', false); })
                     .catch(function (e2) { ovlFlashSaveStatus('上传失败：' + (e2 && e2.message ? e2.message : String(e2)), true); });
+            });
+        }
+
+        // v2 Pass P131：滚动位置持久化——防抖 250ms，避免拖动滚动条时打爆 localStorage 写入。
+        const treeBodyForScroll = document.getElementById('ovlTreeBody');
+        if (treeBodyForScroll) {
+            let ovlTreeScrollDebounce = null;
+            treeBodyForScroll.addEventListener('scroll', function () {
+                if (ovlTreeScrollDebounce) clearTimeout(ovlTreeScrollDebounce);
+                ovlTreeScrollDebounce = setTimeout(function () {
+                    ovlTreeScrollDebounce = null;
+                    try {
+                        OvlTreeExpandState.scrollTop = treeBodyForScroll.scrollTop;
+                        ovlTreeExpandPersist();
+                    } catch (e) {}
+                }, 250);
             });
         }
 
