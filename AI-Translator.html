@@ -4358,7 +4358,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.11.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.11.04';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -48320,16 +48320,36 @@ function ovlP130BuildKatexProtectedMask(collected) {
 // 额外附一份 anchorText——把落在 KaTeX 渲染节点内部的字符换成空格，专供锚点抽取使用（公式
 // 渲染出来是 Unicode 字形，字符集跟英文源码完全不同，两侧都不该参与锚点比较）。只影响锚点
 // 抽取这一条路径，不影响 span.text 本身（下游高亮/occurrence 定位仍然用原始渲染文字）。
+// v2 Pass P130e（核验 .claude/tmp/p130_verify4.md N-1/N-2：注释与实测不符——原实现把 KaTeX
+// 节点内**全部**字符换成空格，含阿拉伯数字，跟英文侧 ovlP130StripNonRenderedForAnchors ④
+// "行内数学只剥变量名/符号、保留数字"的做法不对称，导致 `$N=64$`/`$45^\circ$` 这类两侧本该
+// 渲染出同样数字字形的强锚点单向失灵——英侧有数字锚点、中侧被整段抹空，真实语料实测 550 块里
+// 10.4%（67/642）的英文句因此新获得中侧配不上的"幽灵"数字锚点，必然退化）：改用
+// ovlP130KatexAnchorText——落在 KaTeX 保护区间内的字符，数字（含被数字紧夹的小数点）原样
+// 保留，其余字符换成空格，跟英文侧同一套 ovlP130DigitsWithDecimalsSpaced 规则对称。传给
+// ovlZhSplitSentences 做句子边界保护的 mask 本身不变（边界判定管"是不是句末标点"，跟"这段
+// 文字是不是数字"无关，不该因为公式里含数字就改变切句结果）。
+function ovlP130KatexAnchorText(text, mask) {
+    const n = text.length;
+    let out = '';
+    let i = 0;
+    while (i < n) {
+        if (!mask || !mask[i]) { out += text[i]; i++; continue; }
+        let j = i;
+        while (j < n && mask[j]) j++; // 这一段连续被 KaTeX 掩码保护的区间整体喂给 helper，
+        out += ovlP130DigitsWithDecimalsSpaced(text.slice(i, j)); // 好让"数字紧夹小数点"判据看得到完整上下文
+        i = j;
+    }
+    return out;
+}
 function ovlVisualZhSentenceSpans(blockEl) {
     try {
         const collected = ovlVisualCollectBlockVisibleText(blockEl);
         const mask = ovlP130BuildKatexProtectedMask(collected);
         const spans = ovlZhSplitSentences(collected.text, mask);
+        const anchorFull = ovlP130KatexAnchorText(collected.text, mask); // P130e：数字保留版全文，一次算好
         for (let k = 0; k < spans.length; k++) {
-            const sp = spans[k];
-            let out = '';
-            for (let p = sp.startChar; p < sp.endChar; p++) out += (mask && mask[p]) ? ' ' : collected.text[p];
-            sp.anchorText = out;
+            spans[k].anchorText = anchorFull.slice(spans[k].startChar, spans[k].endChar);
         }
         return spans;
     } catch (e) { return []; }
@@ -48367,6 +48387,11 @@ function ovlVisualZhSentenceSpans(blockEl) {
 //      符号两侧字符集本来就不同，不该参与锚点比较；数字则两侧字符集相同（KaTeX 渲染出的就是
 //      同样的阿拉伯数字字形），是真正可比的强证据。`$P_{TX}$` 这类不含数字的公式仍然是空
 //      锚点，跟中文侧的渲染字形（"PTX" 连排）继续保持"两边都不参与锚点比较"，不受影响。
+//      **如实订正（v2 Pass P130e，核验 .claude/tmp/p130_verify4.md N-1）**：这段注释写下时
+//      中文侧（ovlVisualZhSentenceSpans）其实还在把 KaTeX 渲染节点内的字符**全部**换成空格、
+//      含数字，"两侧字符集相同"当时只是英文侧单方面的行为，并不成立——`$N=64$` 这类公式英侧能
+//      提出数字锚点、中侧却被抹空，制造单侧幻影必然退化。P130e 起中文侧改用
+//      ovlP130KatexAnchorText 同步保留数字，这里描述的对称性现在两侧都是真的。
 // 剥离/保留后统一按" "分隔拼接，不做逐字符长度对齐——这份文本只用于锚点提取，不用于字符位置
 // 映射，避免两侧本不相邻的锚点因为中间内容被剥掉而被错误地拼接成一个 token 即可。
 function ovlP130DigitsWithDecimalsSpaced(seg) {
@@ -48563,8 +48588,19 @@ function ovlP130ZhCharCount(text) {
 // （四位小数）。取 [P5, P95] 而不是 [min, max]，是为了把两端各 5% 的极端样本（很短的过渡句/
 // 术语堆叠的长复合句）排除在"典型"窗口之外——这部分句子本来就该更依赖锚点或直接退化，不该被
 // 一个过宽的长度窗口"顺便放过"。
-const OVL_P130_LEN_RATIO_LO = 1.2886;
-const OVL_P130_LEN_RATIO_HI = 2.3166;
+// v2 Pass P130e（核验 .claude/tmp/p130_verify4.md §2：47 句单人手译校准的方法论局限——单篇
+// 论文、单人翻译风格，样本量也不大）：用本机能拿到的 17 条**真实模型调用**译文（非手译，
+// qwen/qwen3.6-35b-a3b，来源见 tools/e2e/test_p130_zh_locate.js「P130e 长度窗真实译文核验」
+// 一节：3 条来自已入仓夹具 tools/e2e/fixtures/p122_real_model_replay.json、3 条来自 P128 车道
+// 已落盘的真实调用记录、其余 11 条为 verify4 报告 §2.2 独立审计过的同一批真实调用聚合数据）
+// 复核：min=1.4000、max=2.2857，**全部 17 条落在原窗 [1.2886,2.3166] 内**，但上沿余量只有
+// 2.2857/2.3166=1.3%，稍长的忠实译文就会被误判出窗、把本可句级的块打成退化。改为 [1.15,2.6]：
+// 下沿 1.4000/1.15=21.7%、上沿 2.6/2.2857=13.8%，两端都留出更实在的余量；同时窗越宽，
+// §9 R-1 残余风险（两句被调换、真值对的长度比恰好双双落窗外才会被误判 identity）里"双双落窗
+// 外"这个必要条件越难自然成立——本 Pass 额外新增的互补越界护栏（见下方
+// ovlP130CrossIsAmbiguous）专门兜住这一类，两处改动配合，不单靠放宽窗口本身指望"更难碰到"。
+const OVL_P130_LEN_RATIO_LO = 1.15;
+const OVL_P130_LEN_RATIO_HI = 2.6;
 // 一对候选句子是否兼容（布尔，不再有 DP 需要的连续质量分/软硬两级）：四类锚点逐一双向多重集
 // 相等（含空对空，ovlP130AnchorCategoryOk 已删除单向捷径）；只要有一类锚点在任一侧非空，通过
 // 后即视为强证据，不再看长度比；四类锚点在两侧都是空集时，才退到长度比弱校验（窗口见上）。
@@ -48584,28 +48620,137 @@ function ovlP130PairCompat(enText, zhText) {
     const ratio = zhChars / enWords;
     return ratio >= OVL_P130_LEN_RATIO_LO && ratio <= OVL_P130_LEN_RATIO_HI;
 }
+// v2 Pass P130e（判别性检查放宽 + 互补越界护栏，核验 .claude/tmp/p130_verify4.md §3.3/§9
+// R-1）：原判别性检查"任一交叉对 (zh_i,en_j) i≠j 也通过 ovlP130PairCompat 就判定整块歧义"比
+// 真正需要的必要条件更强——交叉对哪怕技术上落在长度窗内，只要它不能配上一整套同样自洽的
+// **完整替代读法**，就不构成真正的歧义（真实语料复核见 §3.2：FN 的 45.5% 大头正是这条判别性
+// 检查本身，比长度窗口更常见）。两层防线，只在双侧完全无锚点（纯长度比证据）时生效——有锚点
+// 的比较是精确多重集相等，不存在"是否存在替代读法"这种模糊性，严格判据原样保留：
+//   ①放宽（完整替代排列，可证明不增加错句风险）：把"交叉对是否单独通过"换成"是否存在一个
+//     完整的 1:1 替代排列 π≠identity，其**每一对** (zh_i,en_π(i)) 都通过 ovlP130PairCompat"——
+//     这是比"任一交叉对通过"更弱、但仍然安全的必要条件：若不存在这样的完整排列，identity 就是
+//     唯一能让全部证据自洽的读法，接受它不会跟某个"同样自洽"的错误读法混淆。
+//     **本 Pass 曾经用"对角线相对交叉对贴合 30% 更优即不算歧义"这条更激进的放宽，红队自测发现
+//     可构造反例**（两句都无锚点、对角线两对都落窗、交叉两对**也**都落窗但相对对角线偏离
+//     >30%——这种情况下旧放宽会误判"不算歧义"，但如果真值恰好是调换的，就是一处新的静默
+//     错句；实测复现见车道报告）。改用"完整替代排列是否存在"后，这个反例里两条交叉对都落窗
+//     `→` 替代排列（交换）本身也完全自洽 `→` 正确判定为歧义、退化，反例不再成立。用
+//     ovlP130HasAlternatePermutation 做通用（不限 n=2）的排列存在性搜索。
+//   ②护栏（互补越界，V2 类的独立补丁）：①收窄后不会再对"两条交叉对都落窗"的情况误放行，但
+//     窗放宽后，纯长度比证据仍可构造"对角线两对都恰好落窗、交叉两对都恰好落窗**外**"的反例
+//     （真实调换 + 两条真值对的长度比同时落在窗外——见 §9 R-1 的 V2 复现：诊断关系
+//     r_00·r_11=r_01·r_10 恒成立，两句被调换时交叉比值天然会向窗口两侧互补地偏离）；这种情况
+//     下①的排列存在性搜索也会判定"不存在完整替代排列"（因为交叉对本身就没通过），跟①处理的
+//     场景不冲突，需要单独一条护栏：交叉对 (zh_i,en_j) 与其互补对 (zh_j,en_i) 若分别远低于/
+//     远高于窗口两端（"远"取 OVL_P130_RECIP_FAR_MULT 倍窗口边界，比窗口本身更极端，减少对
+//     "两句自然长度差异较大但确实无调换"的正常内容误伤），判定为疑似调换，同样整块退化——按
+//     项目一贯"宁可退化不错句"的取舍，这条护栏用更高的 FN 换硬闸不失守。
+const OVL_P130_RECIP_FAR_MULT = 1.3;
+function ovlP130RatioOrNull(zhText, enText) {
+    const enWords = ovlP130EnWordCount(enText), zhChars = ovlP130ZhCharCount(zhText);
+    if (enWords === 0 || zhChars === 0) return null;
+    return zhChars / enWords;
+}
+// 通用排列存在性搜索（不限 n=2）：compat[i][j] = zh_i 是否兼容 en_j（ovlP130PairCompat 语义）。
+// v2 Pass P130f（终核 .claude/tmp/p130_verify5.md §7 P0-1 必修，收口报告见
+// .claude/tmp/p130_impl.md「P130f 收口」节）：本函数原先是无预算的阶乘级回溯（标准回溯法枚举
+// 完整 1:1 指派），喂一个上三角 compat 矩阵（对角线全真、非对角只在 j>i 为真——即不存在替代
+// 排列，回溯必须穷举整个搜索空间）时会指数级爆炸——终核实测 n=14 需 1.41s、n=15 需 11.9s、
+// n=16 CDP `Runtime.evaluate` 60s 超时（主线程被冻住至少 60 秒），且能通过产品自己的
+// ovlP130AlignZhToEnAnchored（构造一个纯散文、无任何锚点的多句块即可触发，n=13 实测
+// 239.5ms）走到——每次点「定位」/每次 PDF 双击都是同步调用。改为 O(n^2) 有向环检测，语义可
+// 证明等价（调用点 ovlP130AlignZhToEnAnchored 在调用本函数之前已经逐一校验过 compat[i][i]
+// 全部为真，即对角线全真是这个等价性成立的前提）：
+//   =>：任意 π!==identity 的完整替代排列都可以分解为若干非平凡轮换；每个轮换的每条边
+//       (i, π(i)) 都满足 i!==π(i)，因此是"非对角兼容边"——沿轮换走一圈，就是下面这张有向图
+//       （节点=句索引，边 i->j 当 i!==j 且 compat[i][j] 为真）里的一个环。
+//   <=：反过来，图里任意一个长度>=2 的环 i1->i2->...->ik->i1（各节点互不相同）都能还原成一个
+//       完整替代排列：环上按环指派（π(i1)=i2, π(i2)=i3, …, π(ik)=i1），环外全部保持恒等
+//       （对角线已保证兼容，compat[x][x] 恒真，不需要额外检查）。这个 π!==identity（k>=2 时
+//       i1!==i2）且每一对 (x, π(x)) 都兼容，正是一个完整替代排列。
+// 因此"存在完整替代排列" <=> "非对角有向图存在环"，标准三色（白/灰/黑）DFS 找环即可，
+// O(n^2)（每对 (i,j) 至多考察一次）。终核已在 216 个真实语料多句块（含 n=25/40/48 的参考
+// 文献块）+ 72 组对抗电池（车道 .claude/tmp/p130_verify5.md 附带的 rules.py 离线复刻）与页面
+// 实测判定 100% 一致；本 Pass 收口时又用逐字复制的新旧两份实现在同一批数据上直接互相比对
+// （不经过页面/DOM，纯函数级），251 个"对角线全真"（即真正会走到本函数）的可达用例 0 处不
+// 一致，另加合成的上三角最坏情形逐 n（8/10/12/13/14/15）比对同样全部一致——细节见
+// .claude/tmp/p130_impl.md「P130f 收口」节。
+// 对角线全真是上面等价性论证的前提——调用点已经在调用本函数之前逐一校验过，这里仍加一道
+// 防御：万一将来出现别的调用点漏掉这一步，对角线不全真时上面的等价性论证不再成立，保守地
+// 视为"存在替代排列"（返回 true，交由调用方整块判歧义退化），不放行、不冒充有把握。
+function ovlP130HasAlternatePermutation(compat, n) {
+    for (let i = 0; i < n; i++) {
+        if (!compat[i][i]) return true; // 防御：对角线非全真，等价性前提不成立，保守方向
+    }
+    const OVL_P130_PERM_WHITE = 0, OVL_P130_PERM_GRAY = 1, OVL_P130_PERM_BLACK = 2;
+    const color = new Array(n).fill(OVL_P130_PERM_WHITE);
+    function dfs(u) {
+        color[u] = OVL_P130_PERM_GRAY;
+        for (let v = 0; v < n; v++) {
+            if (v === u || !compat[u][v]) continue;
+            if (color[v] === OVL_P130_PERM_GRAY) return true; // 命中递归栈里的节点：找到一个环
+            if (color[v] === OVL_P130_PERM_WHITE && dfs(v)) return true;
+        }
+        color[u] = OVL_P130_PERM_BLACK;
+        return false;
+    }
+    for (let i = 0; i < n; i++) {
+        if (color[i] === OVL_P130_PERM_WHITE && dfs(i)) return true;
+    }
+    return false;
+}
+function ovlP130CrossIsAmbiguous(enSpans, zhSpans, i, j, compat) {
+    const enJText = enSpans[j].anchorText, zhIText = zhSpans[i].anchorText;
+    const passesCross = compat[i][j];
+    const enAJ = ovlP130ExtractTextAnchors(enJText), zhAI = ovlP130ExtractTextAnchors(zhIText);
+    const crossHasAnchor = enAJ.cites.length || enAJ.caps.length || enAJ.urls.length || enAJ.digits.length
+        || zhAI.cites.length || zhAI.caps.length || zhAI.urls.length || zhAI.digits.length;
+    if (crossHasAnchor || passesCross) return false; // 有锚点交叉对/落窗交叉对交给①的完整排列搜索统一处理，这里不重复判
+    // ②护栏：交叉对本身没通过（纯长度比场景），检查是否"互补越界"（疑似调换，见头部注释）
+    const crossRatio = ovlP130RatioOrNull(zhIText, enJText);
+    const reciprocalRatio = ovlP130RatioOrNull(zhSpans[j].anchorText, enSpans[i].anchorText);
+    if (crossRatio != null && reciprocalRatio != null) {
+        const farLo = OVL_P130_LEN_RATIO_LO / OVL_P130_RECIP_FAR_MULT;
+        const farHi = OVL_P130_LEN_RATIO_HI * OVL_P130_RECIP_FAR_MULT;
+        const crossFarLow = crossRatio < farLo, crossFarHigh = crossRatio > farHi;
+        const recipFarLow = reciprocalRatio < farLo, recipFarHigh = reciprocalRatio > farHi;
+        if ((crossFarLow && recipFarHigh) || (crossFarHigh && recipFarLow)) return true;
+    }
+    return false;
+}
 // 对外入口：只有中英文句数严格相等（且 > 0）才可能给出句级结果——句数不等一律返回 null，
-// 调用方老实退化到块级（v2 Pass P130d 停用 DP，不再尝试 1↔2/2↔1 合并/拆分）。句数相等时，
-// 每一对 (en[i], zh[i]) 必须先各自通过 ovlP130PairCompat；全部通过后再做判别性检查——对任意
-// i≠j，如果 zh[i] 换配 en[j] 同样能通过 ovlP130PairCompat，说明这条 1:1 配对不是唯一说得通的
-// 解读（存在锚点/长度证据都撑不住"谁是谁"的歧义），整块判不可信。两关都过，才认为这份 1:1
-// 逐句映射可信。n===1 时天然没有第二个候选可以歧义（块里就这一句英文、一句中文，不存在"配
-// 到别的句子"这种可能性），跟正向 ovlVisualMapZhSentenceToEn 的 L2"别无选择"同一条纪律，
-// 直接跳过锚点/长度证据检查——这不是放宽标准，是这种情况下证据检查本身没有意义（唯一解读
-// 天然成立，不需要证据来"确认"）。这条也修复了反向入口 ovlVisualMapEnRangeToZhSentence 原来
-// 没有这条捷径、直接吃绝对长度窗口检查的不对称（单句块的中文译文长度比经常在真实短句上落
-// 出窗口，反向会被无谓地判不可信）。
+// 调用方老实退化到块级（v2 Pass P130d 停用 DP，不再尝试 1↔2/2↔1 合并/拆分）。句数相等时，先
+// 建立 n×n 兼容矩阵 compat[i][j]=ovlP130PairCompat(en_j,zh_i)；对角线（identity）必须全部
+// 兼容，否则直接不可信；对角线全过后做判别性检查（P130e 起两层，见 ovlP130CrossIsAmbiguous /
+// ovlP130HasAlternatePermutation 头部大注释）——①是否存在完整的替代排列（比"任一交叉对通过"
+// 更弱但可证明安全）；②纯长度比场景下交叉对是否"互补越界"（V2 类调换的独立护栏）。任一层判定
+// 歧义，整块判不可信。n===1 时天然没有第二个候选可以歧义（块里就这一句英文、一句中文，不存在
+// "配到别的句子"这种可能性），跟正向 ovlVisualMapZhSentenceToEn 的 L2"别无选择"同一条纪律，
+// 直接跳过锚点/长度证据检查——这不是放宽标准，是这种情况下证据检查本身没有意义（唯一解读天然
+// 成立，不需要证据来"确认"）。这条也修复了反向入口 ovlVisualMapEnRangeToZhSentence 原来没有
+// 这条捷径、直接吃绝对长度窗口检查的不对称（单句块的中文译文长度比经常在真实短句上落出窗口，
+// 反向会被无谓地判不可信）。
 function ovlP130AlignZhToEnAnchored(enSpans, zhSpans) {
     const n = enSpans.length, m = zhSpans.length;
     if (!n || !m || n !== m) return null; // 句数不等：只有句数相等才可能句级，见本节头部注释
     if (n === 1) return { steps: [{ zhFrom: 0, zhTo: 1, enFrom: 0, enTo: 1, enText: enSpans[0].text }], confident: true };
+    // compat[i][j]：zh_i 是否兼容 en_j（对角线 i===j 就是原来的逐对校验，非对角线复用同一份
+    // 结果供①的完整排列搜索使用，避免 ovlP130PairCompat 被重复调用两次）。
+    const compat = [];
     for (let i = 0; i < n; i++) {
-        if (!ovlP130PairCompat(enSpans[i].anchorText, zhSpans[i].anchorText)) return null;
+        compat.push([]);
+        for (let j = 0; j < n; j++) {
+            compat[i][j] = ovlP130PairCompat(enSpans[j].anchorText, zhSpans[i].anchorText);
+        }
     }
+    for (let i = 0; i < n; i++) {
+        if (!compat[i][i]) return null;
+    }
+    if (ovlP130HasAlternatePermutation(compat, n)) return null; // ①存在完整的替代排列，判定歧义
     for (let i = 0; i < n; i++) {
         for (let j = 0; j < n; j++) {
             if (j === i) continue;
-            if (ovlP130PairCompat(enSpans[j].anchorText, zhSpans[i].anchorText)) return null; // 判别性检查：存在歧义配对
+            if (ovlP130CrossIsAmbiguous(enSpans, zhSpans, i, j, compat)) return null; // ②互补越界护栏（见上方头部注释）
         }
     }
     const steps = [];
