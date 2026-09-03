@@ -2716,6 +2716,22 @@ body.ovl-translator-open #ovlTransWin { display: block; }
     flex: none; font-size: 10px; padding: 1px 6px; border-radius: 999px;
     background: #2F3A4C; color: #eab308; border: 1px solid #495365;
 }
+/* v2 Pass P132：批量 PDF 选择对话框——目录树折叠展示 + 全选/全不选工具条。
+   独立 class 前缀 ovl-p2tb-tree-* / ovl-p2tb-pickbar，不复用 .ovl-tree-*（那套挂了 document
+   级 contextmenu 兜底，见诊断 §1.7，复用会导致模态框内右键菜单关不掉）。 */
+.ovl-p2tb-tree-ul { list-style: none; margin: 0; padding-left: 16px; }
+.ovl-p2tb-tree-ul.ovl-p2tb-tree-root { padding-left: 0; }
+.ovl-p2tb-tree-children { display: none; }
+.ovl-p2tb-tree-node.ovl-p2tb-tree-open > .ovl-p2tb-tree-children { display: block; }
+.ovl-p2tb-tree-row { display: flex; align-items: center; gap: 6px; padding: 3px 4px; border-radius: 4px; cursor: pointer; min-width: 0; }
+.ovl-p2tb-tree-row:hover { background: #2F3A4C; }
+.ovl-p2tb-tree-caret { flex: none; width: 12px; text-align: center; color: #9AA4B2; }
+.ovl-p2tb-tree-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ovl-p2tb-tree-count { flex: none; font-size: 10px; color: #9AA4B2; }
+.ovl-p2tb-pickbar { display: flex; align-items: center; gap: 8px; margin: 0 0 6px; }
+.ovl-p2tb-pickbar-spacer { flex: 1 1 auto; }
+.ovl-p2tb-selbtn { height: 24px; padding: 0 10px; font-size: 11px; }
+.ovl-p2tb-pickcount { font-size: 11px; color: #9AA4B2; }
 
 .ovl-modal-overlay {
     position: fixed;
@@ -4375,7 +4391,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.12.03';        // APP_VERSION_STAMP
+const APP_VERSION = '03.13.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-03';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -44638,6 +44654,224 @@ let OvlP2TBatchState = {
 };
 const OVL_P2TB_STATUS_LABEL = { queued: '排队中', running: '转换中', done: '完成', failed: '失败', cancelled: '已取消' };
 
+// v2 Pass P132：批量选择对话框的「树展开态」——只活在本次页面会话内存里，刻意不落
+// localStorage（不与主文件树 P131 的 ovl.treeExpandedDirs 共用/污染，见诊断 §2.7）。
+const OvlP2TBatchPickUi = { expandedByProject: Object.create(null), current: null };
+
+function ovlP2TBatchPickExpandKey() {
+    try { return ovlTreeExpandProjectKey() || ''; } catch (e) { return ''; }
+}
+function ovlP2TBatchPickGetExpanded(key) {
+    const arr = OvlP2TBatchPickUi.expandedByProject[key];
+    return arr ? new Set(arr) : null;
+}
+function ovlP2TBatchPickSetExpanded(key, set) {
+    try {
+        const keys = Object.keys(OvlP2TBatchPickUi.expandedByProject);
+        if (keys.indexOf(key) === -1 && keys.length >= OVL_TREE_EXPAND_MAX_PROJ) {
+            delete OvlP2TBatchPickUi.expandedByProject[keys[0]]; // 淘汰最老插入的项目（复用 P131 常量）
+        }
+        OvlP2TBatchPickUi.expandedByProject[key] = Array.from(set).slice(0, OVL_TREE_EXPAND_MAX_DIRS);
+    } catch (e) {}
+}
+
+// ---- 纯数据层：从既有扁平 relPath 列表在内存里推导一棵目录树，零新增请求、零改
+//      ovlP2TBatchCollectPdfsRecursive/桥。不含 PDF 的目录天然不会出现（只有作为某个 relPath
+//      前缀才会被建出来），"不含 PDF 的目录隐藏"由构造成立，无需过滤代码（诊断 §2.3）。----
+function ovlP2TBatchBuildPickTree(rows) {
+    const root = { rel: '', name: '', isDir: true, children: [], childMap: Object.create(null), row: null };
+    rows.forEach(function (r, idx) {
+        const norm = String(r.relPath || '').replace(/\\/g, '/').replace(/^\.\//, '');
+        let parts = norm.split('/').filter(function (p) { return p.length > 0; });
+        if (!parts.length) parts = [norm || ('item' + idx)];
+        let cur = root, relSoFar = '';
+        for (let i = 0; i < parts.length - 1; i++) {
+            relSoFar = relSoFar ? (relSoFar + '/' + parts[i]) : parts[i];
+            let dir = cur.childMap[parts[i]];
+            if (!dir) {
+                dir = { rel: relSoFar, name: parts[i], isDir: true, children: [], childMap: Object.create(null), row: null };
+                cur.childMap[parts[i]] = dir;
+                cur.children.push(dir);
+            }
+            cur = dir;
+        }
+        const leafName = parts[parts.length - 1];
+        // 叶子不进 childMap（只有目录进 childMap）——同名文件/目录因此不冲突（诊断 §2.9 R5）。
+        cur.children.push({ rel: norm, name: leafName, isDir: false, children: null, childMap: null, row: r, idx: idx });
+    });
+    (function sortNode(node) {
+        if (!node.isDir) return;
+        node.children.sort(function (a, b) { // 目录在前，再按 localeCompare（与主树 35711-35716 同规则）
+            const ak = a.isDir ? 0 : 1, bk = b.isDir ? 0 : 1;
+            if (ak !== bk) return ak - bk;
+            return a.name.localeCompare(b.name);
+        });
+        node.children.forEach(sortNode);
+    })(root);
+    return root;
+}
+
+// ---- 默认展开策略（诊断 §2.2）：镜像主文件树 P131 持久展开集合 ∩ 本次候选目录；为空则只展开
+//      第一层。只读 ovlTreeExpandGetSet()，绝不写回主树。----
+function ovlP2TBatchPickDefaultExpand(root) {
+    let seed = null;
+    try { seed = ovlTreeExpandGetSet(); } catch (e) { seed = null; }
+    const init = new Set();
+    if (seed) {
+        (function collect(node) {
+            if (node.isDir && node.rel && seed.has(node.rel)) init.add(node.rel);
+            node.children && node.children.forEach(collect);
+        })(root);
+    }
+    if (init.size === 0) {
+        root.children.forEach(function (c) { if (c.isDir) init.add(c.rel); });
+    }
+    return init;
+}
+
+// ---- 渲染层：一次建完整棵 DOM，之后只切 class；折叠/展开不重建、不碰任何 checkbox，
+//      于是"折叠/展开不改变选择集"由构造成立（诊断 §2.6）。全程 createElement+textContent，
+//      绝不 innerHTML（文件名可含 <、引号）。----
+function ovlP2TBatchRenderPickTree(root, listWrap, ui) {
+    listWrap.textContent = '';
+    const rootUl = document.createElement('ul');
+    rootUl.className = 'ovl-p2tb-tree-ul ovl-p2tb-tree-root';
+    function buildNode(node) {
+        const li = document.createElement('li');
+        li.className = 'ovl-p2tb-tree-node';
+        node.liEl = li;
+        if (node.isDir) {
+            const row = document.createElement('div');
+            row.className = 'ovl-p2tb-tree-row ovl-p2tb-tree-row-dir';
+            const caret = document.createElement('span');
+            caret.className = 'ovl-p2tb-tree-caret';
+            const isOpen = ui.expanded.has(node.rel);
+            if (isOpen) li.classList.add('ovl-p2tb-tree-open');
+            caret.textContent = isOpen ? '▾' : '▸';
+            node.caretEl = caret;
+            row.appendChild(caret);
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.setAttribute('data-p2tb-dircb', node.rel);
+            node.cbEl = cb;
+            row.appendChild(cb);
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'ovl-p2tb-tree-name';
+            nameSpan.textContent = node.name;
+            nameSpan.title = node.rel;
+            row.appendChild(nameSpan);
+            const countSpan = document.createElement('span');
+            countSpan.className = 'ovl-p2tb-tree-count';
+            node.countEl = countSpan;
+            row.appendChild(countSpan);
+            node.rowEl = row;
+            li.appendChild(row);
+            const childUl = document.createElement('ul');
+            childUl.className = 'ovl-p2tb-tree-ul ovl-p2tb-tree-children';
+            node.children.forEach(function (ch) { childUl.appendChild(buildNode(ch)); });
+            li.appendChild(childUl);
+            // 目录复选框：点击切整棵子树（含折叠部分，元素仍在 DOM 里只是 display:none）。
+            cb.addEventListener('change', function () {
+                ovlP2TBatchPickSetAllLeaves(node, cb.checked);
+                ovlP2TBatchPickRefreshAggregates(root, ui);
+            });
+            // 折叠/展开：事件源头与勾选分开，不靠 stopPropagation 兜（诊断 §2.6）。
+            row.addEventListener('click', function (e) {
+                if (e.target === cb) return;
+                const nowOpen = li.classList.toggle('ovl-p2tb-tree-open');
+                caret.textContent = nowOpen ? '▾' : '▸';
+                if (nowOpen) ui.expanded.add(node.rel); else ui.expanded.delete(node.rel);
+                ovlP2TBatchPickSetExpanded(ui.expandKey, ui.expanded);
+            });
+        } else {
+            const label = document.createElement('label');
+            label.className = 'ovl-p2tb-pickrow ovl-p2tb-tree-row';
+            const caretPad = document.createElement('span');
+            caretPad.className = 'ovl-p2tb-tree-caret'; // 空占位，保证与目录行缩进对齐
+            label.appendChild(caretPad);
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = !(node.row && node.row.already); // 已转换过的默认不勾选（既有规则不变）
+            cb.setAttribute('data-p2tb-cb', node.rel);
+            node.cbEl = cb;
+            label.appendChild(cb);
+            const nameSpan = document.createElement('span');
+            nameSpan.className = 'ovl-p2tb-tree-name';
+            nameSpan.textContent = node.name; // 只显示 basename，完整 relPath 放 title
+            nameSpan.title = node.rel;
+            label.appendChild(nameSpan);
+            if (node.row && node.row.already) {
+                const tag = document.createElement('span');
+                tag.className = 'ovl-p2tb-tag';
+                tag.textContent = '已转换';
+                label.appendChild(tag);
+            }
+            node.rowEl = label;
+            li.appendChild(label);
+            cb.addEventListener('change', function () { ovlP2TBatchPickRefreshAggregates(root, ui); });
+        }
+        return li;
+    }
+    root.children.forEach(function (ch) { rootUl.appendChild(buildNode(ch)); });
+    listWrap.appendChild(rootUl);
+}
+
+function ovlP2TBatchPickSetAllLeaves(node, val) {
+    if (!node.isDir) { if (node.cbEl) node.cbEl.checked = val; return; }
+    node.children.forEach(function (ch) { ovlP2TBatchPickSetAllLeaves(ch, val); });
+}
+
+// ---- 聚合重算：唯一实现，生产用于刷新目录三态/已选计数/「下一步」禁用态，测试直接拿它断言
+//      （诊断 §2.4/§3.1，同 P131 §3.6 ovlTreeExpandSelfCheck 的做法：不是死代码）。一次 O(N)
+//      后序遍历。----
+function ovlP2TBatchPickRefreshAggregates(root, ui) {
+    const dirInfos = [];
+    function walk(node) {
+        if (!node.isDir) return { total: 1, checked: (node.cbEl && node.cbEl.checked) ? 1 : 0 };
+        let t = 0, c = 0;
+        node.children.forEach(function (ch) { const r = walk(ch); t += r.total; c += r.checked; });
+        if (node.cbEl) {
+            node.cbEl.checked = (t > 0 && c === t);
+            node.cbEl.indeterminate = (c > 0 && c < t);
+        }
+        if (node.countEl) node.countEl.textContent = '(' + t + ')';
+        if (node.rel) {
+            dirInfos.push({
+                rel: node.rel, total: t, checked: c,
+                cbChecked: node.cbEl ? node.cbEl.checked : null,
+                cbIndeterminate: node.cbEl ? node.cbEl.indeterminate : null
+            });
+        }
+        return { total: t, checked: c };
+    }
+    const agg = walk(root);
+    if (ui.countEl) ui.countEl.textContent = '已选 ' + agg.checked + ' / 共 ' + agg.total;
+    if (ui.okBtn) ui.okBtn.disabled = (agg.checked === 0);
+    ui.lastAgg = { total: agg.total, checked: agg.checked, dirs: dirInfos };
+    return ui.lastAgg;
+}
+
+// ---- 自检：生产诊断与测试断言共用同一实现，不缓存，从当前对话框 DOM 现算（诊断 §3.1）。----
+function ovlP2TBatchPickSelfCheck() {
+    const ui = OvlP2TBatchPickUi.current;
+    if (!ui || !ui.root) return { ok: false, reason: 'no-active-dialog' };
+    const agg = ovlP2TBatchPickRefreshAggregates(ui.root, ui);
+    let ok = true;
+    agg.dirs.forEach(function (d) {
+        const expectChecked = (d.total > 0 && d.checked === d.total);
+        const expectIndeterminate = (d.checked > 0 && d.checked < d.total);
+        if (d.total < 1) ok = false; // I5：每个目录子树叶子数 >= 1
+        if (d.cbChecked !== expectChecked || d.cbIndeterminate !== expectIndeterminate) ok = false; // I4
+    });
+    const expanded = [];
+    (function collect(node) {
+        if (node.isDir && node.rel && node.liEl && node.liEl.classList.contains('ovl-p2tb-tree-open')) expanded.push(node.rel);
+        node.children && node.children.forEach(collect);
+    })(ui.root);
+    const submitOrder = ui.rows.map(function (r) { return r.relPath; });
+    return { ok: ok, total: agg.total, checked: agg.checked, dirs: agg.dirs, expanded: expanded, submitOrder: submitOrder };
+}
+
 // ---- §1 选择对话框：桥模式=递归扫项目下所有 .pdf（目录浏览的简化形态：不用逐层点开子目录，
 //      直接给一份带完整相对路径的扁平列表，跟 ovlP2TCollectDirs §4.8b 保存位置对话框同一套
 //      "目录感知的扁平列表"范式，不是真的做一个逐层点进去的文件管理器）；本地 FSA 模式=浏览器
@@ -44718,39 +44952,39 @@ function ovlP2TBatchPickListDialog(items) {
         const msg = document.createElement('div');
         msg.className = 'ovl-modal-message';
         msg.textContent = rows.length
-            ? ('找到 ' + rows.length + ' 个 PDF。已转换过的文件默认不勾选，需要强制重新转换可手动勾上。')
+            ? ('找到 ' + rows.length + ' 个 PDF。已转换过的文件默认不勾选，需要强制重新转换可手动勾上。'
+                + '「全选」会连已转换过的一起选上（等于强制重新转换）。')
             : '没有找到任何 .pdf 文件。';
         box.appendChild(msg);
+
+        // v2 Pass P132：全选/全不选工具条 + 已选计数。候选为 0 时整条隐藏（列表已经显示空态提示）。
+        const pickbar = document.createElement('div');
+        pickbar.className = 'ovl-p2tb-pickbar';
+        const selectAllBtn = document.createElement('button');
+        selectAllBtn.type = 'button'; selectAllBtn.className = 'ovl-modal-btn ovl-p2tb-selbtn';
+        selectAllBtn.id = 'ovlP2TBatchSelectAllBtn'; selectAllBtn.textContent = '全选';
+        const selectNoneBtn = document.createElement('button');
+        selectNoneBtn.type = 'button'; selectNoneBtn.className = 'ovl-modal-btn ovl-p2tb-selbtn';
+        selectNoneBtn.id = 'ovlP2TBatchSelectNoneBtn'; selectNoneBtn.textContent = '全不选';
+        const pickbarSpacer = document.createElement('div');
+        pickbarSpacer.className = 'ovl-p2tb-pickbar-spacer';
+        const countEl = document.createElement('span');
+        countEl.className = 'ovl-p2tb-pickcount';
+        countEl.id = 'ovlP2TBatchPickCount';
+        pickbar.appendChild(selectAllBtn);
+        pickbar.appendChild(selectNoneBtn);
+        pickbar.appendChild(pickbarSpacer);
+        pickbar.appendChild(countEl);
+        pickbar.hidden = rows.length === 0;
+        box.appendChild(pickbar);
 
         const listWrap = document.createElement('div');
         listWrap.className = 'ovl-history-list';
         listWrap.id = 'ovlP2TBatchPickList';
-        listWrap.style.maxHeight = '260px';
+        listWrap.style.maxHeight = '300px';
         listWrap.style.overflowY = 'auto';
+        listWrap.style.overflowX = 'auto';
         box.appendChild(listWrap);
-
-        rows.forEach(function (r) {
-            const row = document.createElement('label');
-            row.className = 'ovl-history-row ovl-p2tb-pickrow';
-            row.style.cssText = 'display:flex;align-items:center;gap:8px;cursor:pointer;';
-            const cb = document.createElement('input');
-            cb.type = 'checkbox';
-            cb.checked = !r.already; // 已转换过的默认不勾选，见函数头注释 §1 决策 3
-            cb.setAttribute('data-p2tb-cb', r.relPath);
-            row.appendChild(cb);
-            const span = document.createElement('span');
-            span.style.cssText = 'flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
-            span.textContent = r.relPath;
-            span.title = r.relPath;
-            row.appendChild(span);
-            if (r.already) {
-                const tag = document.createElement('span');
-                tag.className = 'ovl-p2tb-tag';
-                tag.textContent = '已转换';
-                row.appendChild(tag);
-            }
-            listWrap.appendChild(row);
-        });
 
         const errEl = document.createElement('div');
         errEl.className = 'ovl-modal-error';
@@ -44766,8 +45000,31 @@ function ovlP2TBatchPickListDialog(items) {
         box.appendChild(btnRow);
         overlay.appendChild(box);
 
+        // 树只由候选 PDF 的路径推导，不含 PDF 的目录天然不出现（诊断 §2.1/§2.3）。
+        const treeRoot = ovlP2TBatchBuildPickTree(rows);
+        const expandKey = ovlP2TBatchPickExpandKey();
+        let initExpanded = ovlP2TBatchPickGetExpanded(expandKey); // 会话内记忆：非首次打开则恢复
+        if (!initExpanded) initExpanded = ovlP2TBatchPickDefaultExpand(treeRoot); // 首次打开：镜像主树/展开第一层
+        const ui = { root: treeRoot, rows: rows, expanded: initExpanded, expandKey: expandKey, countEl: countEl, okBtn: okBtn, listWrap: listWrap, lastAgg: null };
+        OvlP2TBatchPickUi.current = ui;
+        ovlP2TBatchRenderPickTree(treeRoot, listWrap, ui);
+        ovlP2TBatchPickRefreshAggregates(treeRoot, ui);
+
+        selectAllBtn.addEventListener('click', function () {
+            ovlP2TBatchPickSetAllLeaves(treeRoot, true);
+            ovlP2TBatchPickRefreshAggregates(treeRoot, ui);
+        });
+        selectNoneBtn.addEventListener('click', function () {
+            ovlP2TBatchPickSetAllLeaves(treeRoot, false);
+            ovlP2TBatchPickRefreshAggregates(treeRoot, ui);
+        });
+
         let settled = false;
-        function close() { overlay.hidden = true; overlay.innerHTML = ''; document.removeEventListener('keydown', onKey); }
+        function close() {
+            overlay.hidden = true; overlay.innerHTML = ''; document.removeEventListener('keydown', onKey);
+            ovlP2TBatchPickSetExpanded(expandKey, ui.expanded); // 关闭前再落一次会话内存（幂等，兜底）
+            if (OvlP2TBatchPickUi.current === ui) OvlP2TBatchPickUi.current = null;
+        }
         function finish(v) { if (settled) return; settled = true; close(); resolve(v); }
         function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); finish(null); } }
         cancelBtn.addEventListener('click', function () { finish(null); });
@@ -44775,10 +45032,14 @@ function ovlP2TBatchPickListDialog(items) {
         document.addEventListener('keydown', onKey);
 
         okBtn.addEventListener('click', function () {
-            const checkedPaths = Array.prototype.slice.call(listWrap.querySelectorAll('input[type=checkbox]:checked'))
-                .map(function (cb) { return cb.getAttribute('data-p2tb-cb'); });
-            if (!checkedPaths.length) { errEl.textContent = '请至少选择一个 PDF 文件'; return; }
-            const picked = rows.filter(function (r) { return checkedPaths.indexOf(r.relPath) !== -1; });
+            // 头号改动风险（诊断 §1.2/§4.6）：必须用 data-p2tb-cb，裸 input[type=checkbox]:checked
+            // 会把目录复选框（data-p2tb-dircb）也捞进来。
+            const checkedSet = {};
+            Array.prototype.slice.call(listWrap.querySelectorAll('input[data-p2tb-cb]:checked'))
+                .forEach(function (cb) { checkedSet[cb.getAttribute('data-p2tb-cb')] = true; });
+            if (!Object.keys(checkedSet).length) { errEl.textContent = '请至少选择一个 PDF 文件'; return; }
+            // 提交顺序 = rows 的原始发现顺序，与树的展示顺序/展开折叠状态无关（诊断 §1.3/I6）。
+            const picked = rows.filter(function (r) { return !!checkedSet[r.relPath]; });
             finish(picked);
         });
 
