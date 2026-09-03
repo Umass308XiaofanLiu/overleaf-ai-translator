@@ -4358,7 +4358,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.11.03';        // APP_VERSION_STAMP
+const APP_VERSION = '03.11.04';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -48652,26 +48652,52 @@ function ovlP130RatioOrNull(zhText, enText) {
     return zhChars / enWords;
 }
 // 通用排列存在性搜索（不限 n=2）：compat[i][j] = zh_i 是否兼容 en_j（ovlP130PairCompat 语义）。
-// 标准回溯法枚举完整 1:1 指派，找到第一个"至少一处 assign[k]!==k"（即非 identity）的完整合法
-// 指派就立即返回 true；找完整个搜索空间都只有 identity 自己合法就返回 false。n 恒为块内句数
-// （实践中个位数，阶乘级搜索开销可忽略）。
+// v2 Pass P130f（终核 .claude/tmp/p130_verify5.md §7 P0-1 必修，收口报告见
+// .claude/tmp/p130_impl.md「P130f 收口」节）：本函数原先是无预算的阶乘级回溯（标准回溯法枚举
+// 完整 1:1 指派），喂一个上三角 compat 矩阵（对角线全真、非对角只在 j>i 为真——即不存在替代
+// 排列，回溯必须穷举整个搜索空间）时会指数级爆炸——终核实测 n=14 需 1.41s、n=15 需 11.9s、
+// n=16 CDP `Runtime.evaluate` 60s 超时（主线程被冻住至少 60 秒），且能通过产品自己的
+// ovlP130AlignZhToEnAnchored（构造一个纯散文、无任何锚点的多句块即可触发，n=13 实测
+// 239.5ms）走到——每次点「定位」/每次 PDF 双击都是同步调用。改为 O(n^2) 有向环检测，语义可
+// 证明等价（调用点 ovlP130AlignZhToEnAnchored 在调用本函数之前已经逐一校验过 compat[i][i]
+// 全部为真，即对角线全真是这个等价性成立的前提）：
+//   =>：任意 π!==identity 的完整替代排列都可以分解为若干非平凡轮换；每个轮换的每条边
+//       (i, π(i)) 都满足 i!==π(i)，因此是"非对角兼容边"——沿轮换走一圈，就是下面这张有向图
+//       （节点=句索引，边 i->j 当 i!==j 且 compat[i][j] 为真）里的一个环。
+//   <=：反过来，图里任意一个长度>=2 的环 i1->i2->...->ik->i1（各节点互不相同）都能还原成一个
+//       完整替代排列：环上按环指派（π(i1)=i2, π(i2)=i3, …, π(ik)=i1），环外全部保持恒等
+//       （对角线已保证兼容，compat[x][x] 恒真，不需要额外检查）。这个 π!==identity（k>=2 时
+//       i1!==i2）且每一对 (x, π(x)) 都兼容，正是一个完整替代排列。
+// 因此"存在完整替代排列" <=> "非对角有向图存在环"，标准三色（白/灰/黑）DFS 找环即可，
+// O(n^2)（每对 (i,j) 至多考察一次）。终核已在 216 个真实语料多句块（含 n=25/40/48 的参考
+// 文献块）+ 72 组对抗电池（车道 .claude/tmp/p130_verify5.md 附带的 rules.py 离线复刻）与页面
+// 实测判定 100% 一致；本 Pass 收口时又用逐字复制的新旧两份实现在同一批数据上直接互相比对
+// （不经过页面/DOM，纯函数级），251 个"对角线全真"（即真正会走到本函数）的可达用例 0 处不
+// 一致，另加合成的上三角最坏情形逐 n（8/10/12/13/14/15）比对同样全部一致——细节见
+// .claude/tmp/p130_impl.md「P130f 收口」节。
+// 对角线全真是上面等价性论证的前提——调用点已经在调用本函数之前逐一校验过，这里仍加一道
+// 防御：万一将来出现别的调用点漏掉这一步，对角线不全真时上面的等价性论证不再成立，保守地
+// 视为"存在替代排列"（返回 true，交由调用方整块判歧义退化），不放行、不冒充有把握。
 function ovlP130HasAlternatePermutation(compat, n) {
-    const usedCol = new Array(n).fill(false);
-    const assign = new Array(n).fill(-1);
-    function backtrack(i) {
-        if (i === n) {
-            for (let k = 0; k < n; k++) { if (assign[k] !== k) return true; }
-            return false; // 这一支正好是 identity 本身，不算"替代"排列，继续回溯找别的
+    for (let i = 0; i < n; i++) {
+        if (!compat[i][i]) return true; // 防御：对角线非全真，等价性前提不成立，保守方向
+    }
+    const OVL_P130_PERM_WHITE = 0, OVL_P130_PERM_GRAY = 1, OVL_P130_PERM_BLACK = 2;
+    const color = new Array(n).fill(OVL_P130_PERM_WHITE);
+    function dfs(u) {
+        color[u] = OVL_P130_PERM_GRAY;
+        for (let v = 0; v < n; v++) {
+            if (v === u || !compat[u][v]) continue;
+            if (color[v] === OVL_P130_PERM_GRAY) return true; // 命中递归栈里的节点：找到一个环
+            if (color[v] === OVL_P130_PERM_WHITE && dfs(v)) return true;
         }
-        for (let j = 0; j < n; j++) {
-            if (usedCol[j] || !compat[i][j]) continue;
-            usedCol[j] = true; assign[i] = j;
-            if (backtrack(i + 1)) { usedCol[j] = false; assign[i] = -1; return true; }
-            usedCol[j] = false; assign[i] = -1;
-        }
+        color[u] = OVL_P130_PERM_BLACK;
         return false;
     }
-    return backtrack(0);
+    for (let i = 0; i < n; i++) {
+        if (color[i] === OVL_P130_PERM_WHITE && dfs(i)) return true;
+    }
+    return false;
 }
 function ovlP130CrossIsAmbiguous(enSpans, zhSpans, i, j, compat) {
     const enJText = enSpans[j].anchorText, zhIText = zhSpans[i].anchorText;
