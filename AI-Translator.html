@@ -4375,7 +4375,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.12.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.12.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-03';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -35654,7 +35654,10 @@ async function ovlTreeExpandRevealInDom(relPath) {
         if (!li.classList.contains('ovl-tree-open')) {
             const h = li.__ovlEntry.handle, name = li.__ovlEntry.name;
             try {
-                await ovlTreeEnsureNodeOpen(li, row, h, acc, name, childUl, true);
+                // v2 Pass P131b（N5 同源一致性）：跟点击展开一样带上当次持久集合快照，避免
+                // 打开文件顺带展开的祖先链跟点击/整树重渲三条路径出现不一致的展开语义。
+                const revealCtx = { want: ovlTreeExpandGetSet(), seenDirs: new Map(), budget: { n: OVL_TREE_EXPAND_MAX_DIRS } };
+                await ovlTreeEnsureNodeOpen(li, row, h, acc, name, childUl, true, revealCtx, i + 1);
                 ovlTreeExpandAdd(acc);
             } catch (e) { return; }
         }
@@ -35674,12 +35677,15 @@ async function ovlTreeExpandRevealInDom(relPath) {
 // v2 Pass P131：展开/折叠一个目录节点的唯一实现——点击与"恢复展开态"(ovlTreeExpandRevealInDom)
 // 共用同一份逻辑，绝不写两份。箭头文本与 class 的写法跟改之前逐字节相同（chatBuildTreeOverview
 // 按这套 class/文本读树给模型当上下文，不能变）。
-async function ovlTreeEnsureNodeOpen(li, row, h, relPath, name, childUl, opening) {
+// v2 Pass P131b（N5 修复）：新增可选 ctx/depth——不传时行为与之前逐字节相同（不会把整棵子树
+// 按持久集合预展开）；传了就跟 ovlBuildTreeDom 内部构建期预展开走同一条判定逻辑（35 行下方
+// `ctx.want.has(relPath)`），让"点击展开一个目录"与"整树重渲"对同一份持久集合的解释一致。
+async function ovlTreeEnsureNodeOpen(li, row, h, relPath, name, childUl, opening, ctx, depth) {
     li.classList.toggle('ovl-tree-open', opening);
     row.textContent = (opening ? '▾ ' : '▸ ') + name;
     if (opening && childUl.childElementCount === 0) {
         try {
-            const built = await ovlBuildTreeDom(h, relPath);
+            const built = await ovlBuildTreeDom(h, relPath, ctx, depth || 0);
             while (built.firstChild) childUl.appendChild(built.firstChild);
         } catch (e) {
             console.error('[ovl] list dir failed', e);
@@ -35741,14 +35747,24 @@ async function ovlBuildTreeDom(dirHandle, relPrefix, ctx, depth) {
             }
             row.addEventListener('click', function () {
                 const opening = !li.classList.contains('ovl-tree-open');
-                ovlTreeEnsureNodeOpen(li, row, h, relPath, name, childUl, opening).catch(function () {});
+                // v2 Pass P131b（N5 修复，幽灵展开）：折叠一个目录只摘它自己
+                // （ovlTreeExpandRemoveExact，见 35568 注释），后代的 key 仍留在持久集合里——
+                // 这本身是对的（跟 VS Code 语义一致，同一渲染周期内折叠再展开要保留后代展开
+                // 态）。但此前点击懒加载调用 ovlBuildTreeDom 时不传 ctx，于是"折叠 sections→
+                // 手动再展开 sections"这一步骤看不到 sections/deep 恢复展开，要等下一次任意
+                // ovlRenderTree 它才会自己冒出来——这条"幽灵展开"正是终核 N5 指出的问题。
+                // 修法：点击展开时也带上跟整树重渲同一份 ctx（当次持久集合的快照），两条路径
+                // 对同一份集合的解释从此一致，不再有"只有下次重渲才兑现"的滞后。
+                const clickCtx = opening ? { want: ovlTreeExpandGetSet(), seenDirs: new Map(), budget: { n: OVL_TREE_EXPAND_MAX_DIRS } } : null;
+                ovlTreeEnsureNodeOpen(li, row, h, relPath, name, childUl, opening, clickCtx, depth + 1).catch(function () {});
                 try {
                     if (opening) ovlTreeExpandAdd(relPath); else ovlTreeExpandRemoveExact(relPath);
                     ovlTreeExpandPersist();
                 } catch (e) {}
             });
-            // v2 Pass P131：构建期预展开——ctx 只在 ovlRenderTree 发起的整树重建时传入（点击
-            // 懒加载那次调用不传 ctx，语义不变：不会把整棵子树按持久集合展开）。
+            // v2 Pass P131：构建期预展开——ctx 在 ovlRenderTree 发起的整树重建时传入；点击
+            // 懒加载那次调用（上面 clickCtx）从 P131b 起也会传入一份当次快照，语义已统一，
+            // 详见上方注释。
             if (ctx && ctx.want.has(relPath) && depth < OVL_TREE_EXPAND_MAX_DEPTH && ctx.budget.n > 0) {
                 ctx.budget.n--;
                 li.classList.add('ovl-tree-open');
@@ -36265,7 +36281,13 @@ class OvlRemoteFileHandle {
                     // v2 Pass P50 保存冲突检测：磁盘内容在上次读取之后被别人（或另一个标签页）
                     // 改过——绝不静默覆盖，直接抛出去，走 ovlSaveCurrentFile 现成的 catch 分支
                     // 弹"保存失败：……"，用户能看见、能决定重新加载还是别的处理方式。
-                    throw new Error((data && data.error) || '保存远程文件失败');
+                    // v2 Pass P131b（BLK-1 补充）：把桥端 conflict:true 这个判定原样带到抛出的
+                    // Error 上（.conflict / .currentMtimeMs），ovlSaveCurrentFile 据此区分"真的
+                    // 是外部改动冲突"还是别的失败原因，前者要弹出可操作的冲突横幅而不是只闪一行
+                    // 文案就算数。
+                    const err = new Error((data && data.error) || '保存远程文件失败');
+                    if (data && data.conflict) { err.conflict = true; err.currentMtimeMs = data.currentMtimeMs; }
+                    throw err;
                 }
                 self.__lastKnownMtimeMs = (typeof data.mtimeMs === 'number') ? data.mtimeMs : self.__lastKnownMtimeMs;
             }
@@ -37738,7 +37760,18 @@ async function ovlSaveCurrentFile(opts) {
         try { if (typeof ovlExternalCheckNow === 'function') ovlExternalCheckNow('clean-after-save'); } catch (e) {}
     } catch (e) {
         console.error('[ovl] save failed', e);
-        if (!opts.silent) ovlFlashSaveStatus('保存失败：' + (e && e.message ? e.message : String(e)), true);
+        if (e && e.conflict) {
+            // v2 Pass P131b（BLK-1 补充）：手动保存/自动落盘撞上桥端 P50 乐观锁——写入已经被
+            // 桥拒绝，磁盘上的外部改动没有被覆盖，但绝不能就这样悄悄结束（用户/自动落盘本来
+            // 就没打算跟外部改动"打一架"，得让用户明确看到、能决定）。复用现成的冲突横幅：
+            // 重新跑一次 ovlExternalCheckNow，会读到最新磁盘内容，因为跟编辑器不一致且编辑器
+            // 仍是脏的，会走 'conflict' 分支弹出"重新加载 / 保留我的修改"——跟自动探测到的
+            // 外部改动走同一套 UI，语义一致，不再需要一个单独的 confirm 弹窗。
+            if (!opts.silent) ovlFlashSaveStatus('保存失败：磁盘上有外部改动，本次保存已取消，请在下方提示中处理', true);
+            try { if (typeof ovlExternalCheckNow === 'function') ovlExternalCheckNow('save-conflict', { force: true }); } catch (e2) {}
+        } else if (!opts.silent) {
+            ovlFlashSaveStatus('保存失败：' + (e && e.message ? e.message : String(e)), true);
+        }
     } finally {
         OvlSaveInFlight = false;
     }
@@ -45534,7 +45567,14 @@ const OVL_SELF_WRITE_TOLERANCE_MS = 1500;
 async function ovlExternalProbeMtime(cf) {
     try {
         if (!cf || !cf.handle || OvlState.usingWebkitFallback) return { ok: false };
-        if (!ovlIsRemoteBridge()) {
+        // v2 Pass P131b（N1 修复）：这里原来用 ovlIsRemoteBridge() 挑分支——但那个函数的语义是
+        // "桥是不是在别的主机上"（127.0.0.1/localhost/::1 一律返回 false），不是"是不是桥模式"。
+        // 用户真实配置是 http://127.0.0.1:8181，此前会一路走进"本地 FSA"分支，对
+        // OvlRemoteFileHandle 调 getFile()——这不是真正的"元数据探测"，是完整的 /fs/read 整篇
+        // 读盘（连带把 __lastKnownMtimeMs 悄悄推进，见 BLK-1）。判据改成看 handle 本身是不是
+        // OvlRemoteFileHandle/OvlRemoteDirHandle（构造时都设了 __ovlRemote = true），跟主机
+        // 是本地还是远程无关，本地桥也会走下面便宜的 /fs/list 探测。
+        if (!(cf.handle && cf.handle.__ovlRemote)) {
             const file = await cf.handle.getFile();
             return { ok: true, exists: true, mtimeMs: file.lastModified };
         }
@@ -45556,14 +45596,45 @@ async function ovlExternalProbeMtime(cf) {
 // 这里压成"最多一个在飞，飞完了如果又被别的触发点排了队，再补跑一次"，不让并发请求打到桥。
 let OvlExternalCheckInFlight = null;
 let OvlExternalCheckPending = false;
+let OvlExternalCheckPendingArgs = null; // v2 Pass P131b（N3 修复）：{reason, opts}——被压掉的调用里最后一个的意图
 let OvlExternalCheckLastRunAt = 0;
 const OVL_EXTERNAL_CHECK_MIN_INTERVAL_MS = 800;
+// v2 Pass P131b（N4 修复）：探测/完整读盘不带超时，一次不 settle（桥挂起/网络卡死）就会让
+// OvlExternalCheckInFlight 永远非 null，此后所有触发点（WS 推送、拉取、横幅按钮、轮询、
+// 可见性）都只会排队等一个再也不会完成的 Promise——整个自动刷新机制对本会话永久失效，用户
+// 又回到"外部改了不刷新"的旧症状且毫无感知。这里不追求真正取消底层请求（那需要给
+// OvlRemoteFileHandle 全面接入 AbortController，风险面更大），只保证"我们自己这次等待"会在
+// 15–30s 量级内放弃并把控制权交还——finally() 照样触发，OvlExternalCheckInFlight 照样清空，
+// 下一次触发（哪怕只是 8s 轮询）就能重新开始正常工作。
+const OVL_EXTERNAL_CHECK_TIMEOUT_MS = 20000;
+function ovlWithTimeout(promise, ms, label) {
+    return new Promise(function (resolve, reject) {
+        let settled = false;
+        const timer = setTimeout(function () {
+            if (settled) return;
+            settled = true;
+            reject(new Error((label || '操作') + '超时（' + ms + 'ms 未响应）'));
+        }, ms);
+        Promise.resolve(promise).then(function (v) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve(v);
+        }, function (e) {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            reject(e);
+        });
+    });
+}
 
 // ② 权威新鲜度检查（唯一入口，所有触发点都调它）。
 // 返回：'unchanged' | 'same-content' | 'reloaded' | 'conflict' | 'missing' | 'skipped' | 'error'
 function ovlExternalCheckNow(reason, opts) {
     if (OvlExternalCheckInFlight) {
         OvlExternalCheckPending = true;
+        OvlExternalCheckPendingArgs = { reason: reason, opts: opts || {} };
         return OvlExternalCheckInFlight;
     }
     OvlExternalCheckInFlight = ovlExternalCheckNowImpl(reason, opts || {}).finally(function () {
@@ -45571,7 +45642,13 @@ function ovlExternalCheckNow(reason, opts) {
         OvlExternalCheckLastRunAt = Date.now();
         if (OvlExternalCheckPending) {
             OvlExternalCheckPending = false;
-            setTimeout(function () { ovlExternalCheckNow('trailing-' + reason, opts); }, 0);
+            // v2 Pass P131b（N3 修复）：尾随重跑必须用"最后一次被压掉的调用"的 reason/opts，
+            // 不能沿用这次已经跑完的那个闭包变量——否则横幅「重新加载」在检查还在飞的时候点
+            // 下去，overwriteDirty:true 这个意图会被原样丢掉，尾随重跑变成拿旧 reason/opts
+            // 再查一次，结果还是脏就还是弹横幅，点击变成毫无反应的哑弹。
+            const pendingArgs = OvlExternalCheckPendingArgs || { reason: reason, opts: opts };
+            OvlExternalCheckPendingArgs = null;
+            setTimeout(function () { ovlExternalCheckNow('trailing-' + pendingArgs.reason, pendingArgs.opts); }, 0);
         }
     });
     return OvlExternalCheckInFlight;
@@ -45584,7 +45661,12 @@ async function ovlExternalCheckNowImpl(reason, opts) {
         if (OvlInlineSrcEdit) return 'skipped'; // 就地编辑源码中，等编辑结束后下一次触发再说（不吞事件，见 4.6 的"编辑器变干净"触发点）
         let mtimeMs = null;
         if (!opts.force) {
-            const probe = await ovlExternalProbeMtime(cf);
+            let probe;
+            try {
+                probe = await ovlWithTimeout(ovlExternalProbeMtime(cf), OVL_EXTERNAL_CHECK_TIMEOUT_MS, '外部改动探测');
+            } catch (eTimeout) {
+                probe = { ok: false }; // 超时——降级走下面的完整读比对（同样带超时保护）
+            }
             if (probe.ok) {
                 if (!probe.exists) return ovlExternalHandleMissing();
                 if (typeof OvlState.lastLoadedMtimeMs === 'number' && probe.mtimeMs === OvlState.lastLoadedMtimeMs) {
@@ -45592,14 +45674,44 @@ async function ovlExternalCheckNowImpl(reason, opts) {
                 }
                 mtimeMs = probe.mtimeMs;
             }
-            // probe 失败（旧桥缺字段/网络问题）——不放弃，降级走下面的完整读比对
+            // probe 失败（旧桥缺字段/网络问题/超时）——不放弃，降级走下面的完整读比对
         }
-        const file = await cf.handle.getFile();
-        const text = await file.text();
-        if (typeof mtimeMs !== 'number') mtimeMs = (typeof file.lastModified === 'number') ? file.lastModified : Date.now();
+        // v2 Pass P131b（BLK-1 修复）：cf.handle.getFile() 对 OvlRemoteFileHandle 有副作用——
+        // 会把 __lastKnownMtimeMs 刷成刚读到的磁盘 mtime；这个字段是 P50 乐观锁 Ctrl+S/自动
+        // 落盘时发给桥的 expectedMtimeMs。此前这里"读一下比对内容"这个纯读操作会顺手把它
+        // 推进，等于替用户悄悄认领了外部改动——脏态冲突分支明明还没让用户做决定，锁却已经
+        // 解除，随后 1.5s 自动落盘（或"保留我的修改"后手动 Ctrl+S）就会在用户不知情的情况下
+        // 静默覆盖磁盘上的外部改动，而横幅同一时刻却在说"已经帮你挡住了"。
+        // 修法：读之前先记一份，读完（含超时/异常路径，用 finally 兜底）立刻还原；只有真正
+        // 判定为 'reloaded'（用户/横幅明确决定采纳外部内容）或 'same-content'（内容其实跟
+        // 我们一致，只是被 touch 了一下，采纳是安全的）时才显式让它前进到新 mtime；'conflict'
+        // 分支保持还原后的旧值不变，'error' 分支同样保持还原，让 P50 冲突检测继续对后续的
+        // 写入生效——跟 baseline「脏就早退、压根不读盘」达到同样的保护效果。
+        const savedKnownMtime = (cf.handle && ('__lastKnownMtimeMs' in cf.handle)) ? cf.handle.__lastKnownMtimeMs : undefined;
+        let file, text, freshKnownMtime;
+        try {
+            file = await ovlWithTimeout(cf.handle.getFile(), OVL_EXTERNAL_CHECK_TIMEOUT_MS, '外部改动检查读盘');
+            // v2 Pass P131b（配套修复）：getFile() 成功后、restore 之前，先把它顺手写进
+            // __lastKnownMtimeMs 的原始值（服务端 fs.statSync().mtimeMs 的浮点数，未经 File
+            // 构造函数的 WebIDL long long 取整）记下来——File.lastModified 是整数毫秒，跟
+            // /fs/list 的 entry.mtimeMs（同样是未取整的浮点数）在 Windows 上可能差个零点几
+            // 毫秒的小数部分。如果这里改用被取整过的 file.lastModified 当 OvlState.lastLoadedMtimeMs
+            // 的新基准，下一次走便宜探测（/fs/list）比对时就会因为这点浮点误差判定"变了"，
+            // 明明磁盘没再动过也会误判、重新弹出冲突横幅（"保留我的修改"之后不该再弹）。
+            freshKnownMtime = (cf.handle && ('__lastKnownMtimeMs' in cf.handle)) ? cf.handle.__lastKnownMtimeMs : undefined;
+            text = await ovlWithTimeout(file.text(), OVL_EXTERNAL_CHECK_TIMEOUT_MS, '外部改动检查读盘');
+        } finally {
+            if (savedKnownMtime !== undefined) cf.handle.__lastKnownMtimeMs = savedKnownMtime;
+        }
+        if (typeof mtimeMs !== 'number') {
+            mtimeMs = (typeof freshKnownMtime === 'number') ? freshKnownMtime
+                : ((typeof file.lastModified === 'number') ? file.lastModified : Date.now());
+        }
         if (text === OvlState.lastLoadedText) {
-            // 内容没变（mtime 心跳/touch），只更新快照——绝不动编辑器、绝不弹提示。
+            // 内容没变（mtime 心跳/touch），只更新快照——绝不动编辑器、绝不弹提示。内容确实
+            // 跟我们手上这份一致，安全前进到新 mtime。
             OvlState.lastLoadedMtimeMs = mtimeMs;
+            if (savedKnownMtime !== undefined) cf.handle.__lastKnownMtimeMs = mtimeMs;
             return 'same-content';
         }
         const ta = document.getElementById('ovlCodeArea');
@@ -45609,10 +45721,11 @@ async function ovlExternalCheckNowImpl(reason, opts) {
         // （包括普通的 force:true，那只表示"跳过便宜探测直接完整比对"）绝不越过这道闸。
         if (isClean || opts.overwriteDirty) {
             if (ta) OvlState.dirty = false;
+            if (savedKnownMtime !== undefined) cf.handle.__lastKnownMtimeMs = mtimeMs; // 真正采纳外部内容——前进到新 mtime
             ovlExternalSilentReload(ta, text, mtimeMs);
             return 'reloaded';
         }
-        ovlExtChangeBannerShow({ text: text, mtimeMs: mtimeMs, missing: false });
+        ovlExtChangeBannerShow({ text: text, mtimeMs: mtimeMs, missing: false, knownMtimeMs: savedKnownMtime });
         return 'conflict';
     } catch (e) {
         console.warn('[ovl] external check failed (' + reason + ')', e);
@@ -45709,6 +45822,16 @@ function ovlExtChangeBannerShow(info) {
             // 探测会反复弹），但不动 lastLoadedText——保留"内容层面仍有分歧"的事实，让保存时
             // 桥的 expectedMtimeMs 冲突检测照常生效。
             if (!isMissing && info.mtimeMs != null) OvlState.lastLoadedMtimeMs = info.mtimeMs;
+            // v2 Pass P131b（BLK-1 补充，防御性）：ovlExternalCheckNowImpl 现在已经保证走到
+            // 'conflict' 分支之前会把 cf.handle.__lastKnownMtimeMs 还原成检查开始前的旧值，
+            // 所以这里理论上不需要再动它；但显式钉一次成本几乎为零，能防住"以后有别的代码
+            // 路径在横幅弹出之后、用户点按钮之前的这段时间里意外推进了它"这种未来回归——
+            // 明确表达"保留我的修改"这个决定必须让下一次保存继续撞上桥端的乐观锁冲突检测。
+            const cf2 = OvlState.currentFile;
+            if (!isMissing && cf2 && cf2.handle && ('__lastKnownMtimeMs' in cf2.handle)
+                && typeof info.knownMtimeMs === 'number') {
+                cf2.handle.__lastKnownMtimeMs = info.knownMtimeMs;
+            }
             ovlExtChangeBannerHide();
         });
     }
@@ -46278,7 +46401,13 @@ function ovlBindShell() {
                     if (OvlState.currentFile && ta.value === OvlState.lastLoadedText) {
                         OvlState.dirty = false;
                         ovlUpdateTabUI();
-                        try { ovlExternalCheckNow('clean-undo'); } catch (e) {}
+                        // v2 Pass P131b：标签页隐藏时不发起这次检查——本地脏态清理（上面两行）
+                        // 照做不误，只是探测请求本身跟轮询遵守同一条纪律（4.7：隐藏期间不产生
+                        // 额外网络请求），等既有的 visibilitychange→visible 触发点
+                        // （ovlExternalCheckNow('visible')）恢复可见时自己补上，不会漏掉。
+                        if (typeof document === 'undefined' || !document.hidden) {
+                            try { ovlExternalCheckNow('clean-undo'); } catch (e) {}
+                        }
                     }
                 }, 400);
                 // v2 Pass P108：敲字＝一次"实质操作"，标记当前项目为最近（见
