@@ -156,16 +156,58 @@ const APP_HTML_PATH = path.join(__dirname, '..', '..', 'AI-Translator.html');
 // 缓存成 Buffer + 算好 ETag，后续每个请求直接吐缓存，不再逐请求碰磁盘。缓存在 server.listen()
 // 之前发起（见文件末尾），但不阻塞监听——万一还没读完就有请求先进来，serveAppHtml 会退回原来的
 // 同步 readFileSync 兜底，正确性不受影响，只是那一次请求没吃到缓存的加速。
-let APP_HTML_CACHE = null; // { body: Buffer, etag: string } | null
+//
+// v2 Pass P133（B1）：缓存按 mtime+size 失效。P110b 的缓存只在启动时读一次、之后永不重读磁盘，
+// 实测后果（.claude/tmp/p133_recon_jump.md §2）：jump 上 scp 覆盖了新版 AI-Translator.html 之后
+// 桥仍旧把启动那一刻缓存的旧页面（03.07.00）发给所有设备，直到有人重启桥进程——而 jump 桥是
+// SYSTEM 计划任务托管、ssh 用户无权重启，"只更新前端"这种最常见的部署于是被卡死在"必须重启"。
+// 现在缓存对象多记两个字段 { mtimeMs, size }，serveAppHtml 每次请求先 fs.statSync 一次（一次 stat
+// 的成本相对 3MB 响应体可忽略），mtime 或 size 任一跟缓存记录不一致就同步重读并重算 ETag；stat
+// 不到/读不到时保留旧缓存继续服务（scp 覆盖中途的短暂窗口不该让页面 500）。BRIDGE_API_VERSION
+// 保持 58：这不是 API 变化，只是同一条路由的新鲜度语义修正。回归见 tools/e2e/test_p133_bridge_serve.js
+// 组 A（对 aba52fd 的旧 server.js 做 FAIL-first：改文件后 ETag 不变，即"红"）。
+let APP_HTML_CACHE = null; // { body: Buffer, etag: string, mtimeMs: number, size: number } | null
+function buildAppHtmlCache(buf, st) {
+    return {
+        body: buf,
+        etag: '"' + crypto.createHash('sha1').update(buf).digest('hex') + '"',
+        mtimeMs: st.mtimeMs,
+        size: st.size
+    };
+}
 function loadAppHtmlCache() {
-    fs.readFile(APP_HTML_PATH, (err, buf) => {
-        if (err) {
-            console.warn('[latex-bridge] 预读 AI-Translator.html 到缓存失败（不影响服务，每次请求会退回同步读取）：' + (err && err.message));
+    // 先 stat 后 read：两步之间文件若被替换，记下的是"旧"stat + "新"内容，下一次请求 stat 不一致
+    // 会再重读一次自愈；反过来（先 read 后 stat）会记下"新"stat + "旧"内容，永远不会再重读——
+    // 顺序不能反。
+    fs.stat(APP_HTML_PATH, (statErr, st) => {
+        if (statErr) {
+            console.warn('[latex-bridge] 预读 AI-Translator.html 到缓存失败（不影响服务，每次请求会退回同步读取）：' + (statErr && statErr.message));
             return;
         }
-        const etag = '"' + crypto.createHash('sha1').update(buf).digest('hex') + '"';
-        APP_HTML_CACHE = { body: buf, etag: etag };
+        fs.readFile(APP_HTML_PATH, (err, buf) => {
+            if (err) {
+                console.warn('[latex-bridge] 预读 AI-Translator.html 到缓存失败（不影响服务，每次请求会退回同步读取）：' + (err && err.message));
+                return;
+            }
+            APP_HTML_CACHE = buildAppHtmlCache(buf, st);
+        });
     });
+}
+// 返回当前应当发出去的缓存对象；缓存不存在/已过期时同步重读。返回 null 表示磁盘上读不到文件且
+// 也没有任何旧缓存可用（调用方回 500）。
+function freshAppHtmlCache() {
+    let st = null;
+    try { st = fs.statSync(APP_HTML_PATH); } catch (e) { st = null; }
+    if (!st) return APP_HTML_CACHE; // 文件此刻不可见（scp 中途/被删）：有旧缓存就继续用旧缓存
+    if (APP_HTML_CACHE && APP_HTML_CACHE.mtimeMs === st.mtimeMs && APP_HTML_CACHE.size === st.size) {
+        return APP_HTML_CACHE;
+    }
+    let buf = null;
+    try { buf = fs.readFileSync(APP_HTML_PATH); } catch (e) { buf = null; }
+    if (!buf) return APP_HTML_CACHE; // 读失败同上：保留旧缓存
+    if (buf.length === 0 && APP_HTML_CACHE) return APP_HTML_CACHE; // 覆盖写入把文件截成 0 字节的瞬间：不缓存半截、不发空页
+    APP_HTML_CACHE = buildAppHtmlCache(buf, st);
+    return APP_HTML_CACHE;
 }
 
 // 令牌来自环境变量还是 .bridge-token 文件——只用于启动横幅播报"来源"，不含令牌值本身。
@@ -301,20 +343,16 @@ function sendText(res, code, text, contentType) {
 // v2 Pass P110b（N-1 非阻塞项）：优先用启动时预读好的 APP_HTML_CACHE（含 ETag），命中
 // If-None-Match 直接 304 空体；缓存还没就绪（启动瞬间的极小窗口，或预读失败）才退回逐请求同步
 // readFileSync 兜底，保证正确性不依赖缓存是否命中。
+// v2 Pass P133（B1）：缓存新鲜度改由 freshAppHtmlCache() 统一判定（每请求 stat 一次，mtime/size
+// 变了就重读并重算 ETag）——见上面 APP_HTML_CACHE 处的说明。
 function serveAppHtml(req, res) {
-    let body, etag;
-    if (APP_HTML_CACHE) {
-        body = APP_HTML_CACHE.body;
-        etag = APP_HTML_CACHE.etag;
-    } else {
-        try {
-            body = fs.readFileSync(APP_HTML_PATH);
-        } catch (e) {
-            sendJson(res, 500, { ok: false, error: '读取 AI-Translator.html 失败：' + (e && e.message ? e.message : String(e)) });
-            return;
-        }
-        etag = '"' + crypto.createHash('sha1').update(body).digest('hex') + '"';
+    const cache = freshAppHtmlCache();
+    if (!cache) {
+        sendJson(res, 500, { ok: false, error: '读取 AI-Translator.html 失败：磁盘上找不到或读不到 ' + APP_HTML_PATH });
+        return;
     }
+    const body = cache.body;
+    const etag = cache.etag;
     const inm = req && req.headers && req.headers['if-none-match'];
     if (inm && inm === etag) {
         res.writeHead(304, { 'ETag': etag, 'Cache-Control': 'no-cache' });
