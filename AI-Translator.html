@@ -4392,7 +4392,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.14.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.14.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-05';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -36390,10 +36390,14 @@ class OvlRemoteDirHandle {
         if (!data || data.ok !== true) throw new Error((data && data.error) || '列出远程目录失败');
         return Array.isArray(data.entries) ? data.entries : [];
     }
+    // v2 Pass P133a 收口1：wantDir 传 null/undefined 表示"不分文件/目录，只看名字"——removeEntry 的
+    // 删后复核用它（删的是文件还是目录，调用方不一定知道也不需要知道）。原有 true/false 调用形状
+    // 与语义一字不变；/fs/list 自身失败仍按既有语义视为"不存在"。
     async __childExists(name, wantDir) {
         let entries;
         try { entries = await this.__listRaw(); } catch (e) { return false; }
-        return entries.some(function (e) { return e.name === name && !!e.isDir === !!wantDir; });
+        const anyKind = (wantDir === null || wantDir === undefined);
+        return entries.some(function (e) { return e.name === name && (anyKind || !!e.isDir === !!wantDir); });
     }
     async *entries() {
         const raw = await this.__listRaw();
@@ -36431,6 +36435,15 @@ class OvlRemoteDirHandle {
         const childRel = this.__childRel(name);
         const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/delete'), { projectDir: ovlRemoteProjectRoot(), path: childRel });
         if (!data || data.ok !== true) throw new Error((data && data.error) || '删除远程文件/目录失败');
+        // v2 Pass P133a 收口1（终核 B-1）：桥端 doFsDelete 用 fs.rmSync，Node 24.12/Windows 对含非 ASCII
+        // （如中文）成分的路径会静默不删、不抛错，桥照样回 ok:true——前端若盲信就变成"界面说已删除/
+        // 已重命名、文件还在"的静默失效（中文名改名 = 新旧两个文件并存）。删完用既有 __childExists
+        // （一次 /fs/list，不分文件/目录）复核一遍，仍在就明确抛错，让调用点（ovlPerformRename /
+        // ovlPerformDelete → ovlHandleCtxAction）走"失败"分支显示真实状态、不假报成功。根治（桥端改
+        // fs.promises.rm）在 server.js 一侧。
+        if (await this.__childExists(name, null)) {
+            throw new Error('桥端报告删除成功，但「' + name + '」仍在远程目录中（删除未生效）');
+        }
     }
 }
 
@@ -50861,15 +50874,22 @@ function ovlProjectMakeCopyRemote() {
             ovlRemoteFsJson(ovlBridgeUrl('/fs/copy'), { projectDir: parent, from: base, to: name }).then(function (data) {
                 if (!data || data.ok !== true) throw new Error((data && data.error) || '复制失败');
                 const newRoot = parent.replace(/[\\/]+$/, '') + sep + name;
-                ovlSetProjectPath(newRoot, { skipWatch: true });
-                OvlState.usingWebkitFallback = false;
-                OvlState.dirHandle = new OvlRemoteDirHandle('.', ovlProjectHistoryBasename(newRoot) || newRoot);
-                __ovlProjectEpoch++;
-                ovlResetProjectScopedState();
-                ovlUpdateTreeToolbtnsVisibility();
-                return Promise.resolve(ovlRenderTree(OvlState.dirHandle)).then(function () {
-                    try { ovlBridgeUpdateWatch(); } catch (e3) {}
-                    ovlFlashSaveStatus('已复制到「' + name + '」并切换到该副本', false);
+                // v2 Pass P133a 收口1（终核 B-2）：桥端 doFsCopy 用 fs.cpSync，Node 24.12/Windows 对非 ASCII
+                // （如中文）目标名会静默不复制却回 ok:true；切换之前先用既有 /fs/list 复核副本目录真的
+                // 存在，不存在就报错且**不切换**——否则会切到一个不存在的目录、状态条却说"已复制并切换"、
+                // 树报「projectDir 不存在」。根治（桥端改 fs.promises.cp）在 server.js 一侧。
+                return ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: newRoot, path: '.' }).then(function (lst) {
+                    if (!lst || lst.ok !== true) throw new Error('桥端报告复制成功，但副本目录「' + name + '」不存在（复制未生效）' + (lst && lst.error ? '：' + lst.error : ''));
+                    ovlSetProjectPath(newRoot, { skipWatch: true });
+                    OvlState.usingWebkitFallback = false;
+                    OvlState.dirHandle = new OvlRemoteDirHandle('.', ovlProjectHistoryBasename(newRoot) || newRoot);
+                    __ovlProjectEpoch++;
+                    ovlResetProjectScopedState();
+                    ovlUpdateTreeToolbtnsVisibility();
+                    return Promise.resolve(ovlRenderTree(OvlState.dirHandle)).then(function () {
+                        try { ovlBridgeUpdateWatch(); } catch (e3) {}
+                        ovlFlashSaveStatus('已复制到「' + name + '」并切换到该副本', false);
+                    });
                 });
             }).catch(function (e2) {
                 console.error('[ovl] make a copy (remote) failed', e2);
