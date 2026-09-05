@@ -1314,6 +1314,61 @@ function redactToken(text, token) {
 const OVERLEAF_GIT_TIMEOUT_MS = 30000;
 const GIT_ASKPASS_HELPER = path.join(__dirname, 'git-askpass-helper.bat');
 
+// v2 Pass P121 —— safe.directory 所有权兼容。
+//
+// 背景：jump 上的桥以计划任务 SYSTEM 身份跑，但 Overleaf 项目克隆目录（本机形如
+// C:/Users/xiaofanl/ai-translator-projects/VR、/CG）属主是交互式用户（CAMPUS/xiaofanl）。
+// git >= 2.35.2 的 ownership 检查会让 SYSTEM 身份对这些目录的任何 git 操作报 "detected
+// dubious ownership"，且 jump 侧没有管理员 ssh、icacls 改属主不可行——必须代码修。
+// runGitCommand() 是本仓库全部 git 子进程唯一的 spawn 点（42 处调用全部经过这里：clone/
+// pull/push/fetch/status/checkout/log/rev-parse/checkpoint 引用操作等），在这里注入
+// 一处即覆盖全部，不需要逐个调用点打补丁。
+//
+// 取值为什么是通配符 "*" 而不是精确路径——这是实测结果，不是拍脑袋：本地建测试仓库，用
+// git 官方测试开关 GIT_TEST_ASSUME_DIFFERENT_OWNER=1 模拟"外来属主"触发同一报错（先 sanity
+// check 过它在本机 git 2.45.1.windows.1 上确实让裸 git status 报 dubious ownership），
+// 逐一实测 safe.directory 精确路径的几种常见形态：
+//   · 正斜杠形式（跟 git 报错里自己建议的那行一致，如 C:/Users/.../p121_safedir_probe）
+//     —— 通过；
+//   · 原生反斜杠形式（Windows 路径最自然的写法，也是 Node path.join() 在本仓库实际调用点
+//     里对 projectDir/targetDir/cloneRoot 产出的形式）—— 不通过，"detected dubious
+//     ownership" 原样复现；
+//   · 盘符大小写不一致（c: vs C:）——不通过；
+//   · 结尾多一个反斜杠/斜杠——不通过。
+// 也就是说 safe.directory 精确路径匹配是逐字节字符串比较，git 内部不会先把分隔符/大小写/
+// 尾斜杠规整了再比。本函数的 cwd 参数在实际调用点里来源不一（path.join() 拼出的、用户选的
+// 文件夹路径、历史存档的项目路径……），Windows 上默认就是反斜杠形式，不能保证每一条都恰好是
+// 唯一能匹配的"正斜杠+大小写与磁盘一致+无尾斜杠"形态——任何一处偏差就会让整条 git 链路重新
+// 炸回 dubious ownership。逐一保证精确路径可靠，比直接用通配符引入的复杂度/脆弱面更大，
+// 因此选 "*"。
+// 安全影响：桥进程本就以完整文件系统权限直接读写这些目录（fs.readFile/writeFile 等，不经过
+// git 的任何权限中介），ownership 检查挡的是"当前用户对这个目录有没有控制权"这类风险，对
+// 已经手握文件系统完整权限的桥自身不构成额外的安全边界，跳过它不新增风险面。
+// 注入方式：仅作为这一次 spawn 的 `-c` 参数（args 数组里，不进 shell 字符串），绝不写
+// `git config --global`、绝不碰任何仓库的 .git/config——桥进程退出后这条豁免连同子进程一起
+// 消失，不留任何持久化痕迹。本机桥（用户自己账号跑，属主本就一致，从不会撞见这个报错）
+// 同样吃这一行 -c，因为它只是在这一次子进程的调用范围内放宽了一个不适用于本机场景的检查，
+// 不改变任何实际行为、不产生任何副作用。
+// 已知边界（实测过，生产无影响，详细复现方法与推理见 tools/e2e/test_p121_safedir.js 文件头
+// 注释）：这个 `-c` 只作用于本函数直接 spawn 的这一个 git 进程本身，不会传给 git 自己另外
+// fork 出的子 git——当"远程"是本地文件系统路径（或 file:// URL）时，git clone/fetch/push
+// 会为了读写那个远程再 fork 一个独立的 git-upload-pack/git-receive-pack 子进程，这个子进程
+// 既不继承外层 `-c`，也不继承其对应的 GIT_CONFIG_COUNT/KEY_n/VALUE_n 环境变量。生产环境里
+// Overleaf 的远程恒为 https://git.overleaf.com/<projectId>（HTTPS 智能协议，不会为读远程
+// fork 一个"打开本地仓库检查属主"的子进程），这条边界因此不成立；只有测试夹具用本地裸仓库
+// 冒充远程时才会显形，测试文件里已用独立机制（GIT_CONFIG_GLOBAL 指向临时全局配置）中和。
+const GIT_SAFE_DIRECTORY_ARGS = ['-c', 'safe.directory=*'];
+
+// 仅供 e2e 测试使用（tools/e2e/test_p121_safedir.js）：设置环境变量 OVL_TEST_GIT_ARGV_LOG
+// 为一个文件路径时，每次 spawn 前把最终 argv（含上面注入的 safe.directory）追加写一行 JSON
+// 到该文件——用于断言"确实注入了"，而不是仅凭链路跑通就推测注入生效。不设置该环境变量时
+// （生产/常规使用）这段代码完全不执行，对真实桥零影响、零开销。
+function logGitArgvForTest(finalArgs) {
+    const logPath = process.env.OVL_TEST_GIT_ARGV_LOG;
+    if (!logPath) return;
+    try { fs.appendFileSync(logPath, JSON.stringify(finalArgs) + '\n'); } catch (e) { /* 测试探针写失败不该影响真实 git 调用 */ }
+}
+
 // 跑一条 git 命令，token 只走环境变量（GIT_ASKPASS），绝不拼进 args/URL——见文件头注释。
 // 不抛异常：spawn 失败、超时、非零退出码统统汇总成 {ok, code, stdout, stderr, timedOut} 返回。
 // timeoutMs 可选：不传时保持原来的 OVERLEAF_GIT_TIMEOUT_MS（pull/push 现有行为完全不变），
@@ -1323,9 +1378,11 @@ const GIT_ASKPASS_HELPER = path.join(__dirname, 'git-askpass-helper.bat');
 // 变量把 git 操作限制在一个临时索引/工作树上，绝不触碰真实的 .git/index。
 function runGitCommand(args, cwd, token, timeoutMs, extraEnv) {
     return new Promise((resolve) => {
+        const finalArgs = GIT_SAFE_DIRECTORY_ARGS.concat(args);
+        logGitArgvForTest(finalArgs);
         let child;
         try {
-            child = spawn('git', args, {
+            child = spawn('git', finalArgs, {
                 cwd: cwd,
                 windowsHide: true,
                 env: Object.assign({}, process.env, {
