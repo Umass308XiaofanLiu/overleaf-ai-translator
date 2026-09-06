@@ -2111,7 +2111,9 @@ async function doOverleafClone(projectId, token, parentDir, folderName) {
             if (!cloneResult.ok) {
                 if (createdByUs) {
                     // 只删自己刚建的半成品目录，绝不删本来就存在的目录（哪怕它当初是空的）。
-                    try { fs.rmSync(targetDir, { recursive: true, force: true }); } catch (e2) {}
+                    // v2 Pass P133b 收口2：改走 fsRemoveTree——targetDir 是用户自选路径，含中文时
+                    // 旧的 fs.rmSync 不但删不掉半成品，还可能删掉那条乱码路径上碰巧存在的别的目录。
+                    await fsRemoveTree(targetDir, { force: true });
                 }
                 return { ok: false, error: redactToken(cloneResult.stderr || cloneResult.stdout || 'git clone 失败', token) };
             }
@@ -2231,6 +2233,88 @@ const FS_GIT_TIMEOUT_MS = 30000;
 function fsRealpath(p) {
     try { return fs.realpathSync.native ? fs.realpathSync.native(p) : fs.realpathSync(p); }
     catch (e) { return null; }
+}
+
+// ---------------------------------------------------------------------------
+// v2 Pass P133b 收口2：Windows 上 fs.rmSync / fs.cpSync 会静默破坏含非 ASCII 字符的路径
+// ---------------------------------------------------------------------------
+// 根因（本机 Node v24.12.0 / win32-x64，ANSI 代码页 ACP=936，已用最小脚本逐条坐实）：
+// Node ≥22 把 fs.rmSync / fs.cpSync 的实现挪进了 C++ 的 std::filesystem
+// （`fs.rmSync.toString()` 就是 `binding.rmSync(getValidatedPath(path), …)`），而 MSVC 的
+// `std::filesystem::path` 从**窄字符串**构造时按 Windows ANSI 代码页把字节转成 UTF-16——
+// Node 递下去的却是 UTF-8 字节。于是路径里只要有一个非 ASCII 字符，C++ 那边看到的就是另一条
+// 「乱码路径」：
+//   · rmSync('…/图片-测试.txt') 实际操作的是 '…/鍥剧墖-娴嬭瘯.txt'（UTF-8 字节按 CP936 重解释）。
+//     该路径通常不存在 → std::filesystem::status() 报 not_found → 实现直接 return，**不抛异常**
+//     → doFsDelete 只看"没抛异常"就回 ok:true。这就是 /fs/delete 说删了、文件还在的全部原因。
+//   · 更危险的是它并非"什么都不做"：那条乱码路径**万一真的存在**，被删掉的就是它。实测
+//     （同时建「删除目标目录」与其乱码同名目录，rmSync 传入前者）：中文目录原封不动，乱码目录
+//     连同里面的文件被整棵删光——这是会删错用户文件的数据损坏面，不只是"没生效"。
+//   · cpSync 同理把目标建到乱码路径上：cpSync(src, '…/副本目录') 之后磁盘上出现的是 '鍓湰鐩綍'，
+//     调用方看到的 '副本目录' 根本不存在。
+//   · 某些字节序列（实测日文片假名 'テスト'、以及中文目录名做 cpSync 来源）在转换时让整个进程
+//     以 0xC0000409 STATUS_STACK_BUFFER_OVERRUN 硬退出——桥进程当场死掉，页面报"桥接服务未启动"。
+// 不是根因的几处（都已逐条排除）：请求体解码（readBody 是 Buffer.concat(...).toString('utf8')，
+// JSON.parse 后拿到的 JS 字符串正确）、URL/查询串的 decodeURIComponent（/fs/* 全走 POST JSON 体）、
+// 路径拼接/normalize/realpath 与越界校验（resolveInProject 用的 path.resolve / fs.existsSync /
+// fs.statSync / fs.realpathSync 在中文路径上全部正常）。走 libuv 的那批 API——unlink / rmdir /
+// rename / mkdir / stat / lstat / readdir / copyFile / realpath / writeFile / readFile / glob——
+// 一律正确（它们把 UTF-8 正确转成 UTF-16）；fs.promises.rm / fs.promises.cp 是 JS 实现、底下只用
+// 这批 API，实测 ascii/中文/日文/emoji/西里尔/空格/深层嵌套/只读文件全部正常。
+//
+// 因此本文件**一律不再使用 fs.rmSync / fs.cpSync**，改走下面两个包装；并且每个写操作之后都
+// **回头校验磁盘上的真实结果**——即便将来 Node 把 promises 版也挪进 C++、或者换一台 ACP 不同的
+// 机器，最坏也只是得到一条明确的错误，不会再出现"回 ok:true 却什么都没干"。
+function fsPathStillThere(p) {
+    // 用 lstat 而不是 existsSync：断链的符号链接本身也算"还在"，不能被当成已删除。
+    try { fs.lstatSync(p); return true; } catch (e) { return false; }
+}
+
+// 递归删除；语义对齐原来的 fs.rmSync(p, {recursive:true, force}) 调用形状。
+// 永不抛异常，一律返回 {ok:true} 或 {ok:false, code, error}。
+async function fsRemoveTree(absPath, opts) {
+    opts = opts || {};
+    const force = !!opts.force;
+    try {
+        await fs.promises.rm(absPath, { recursive: true, force: force, maxRetries: 3, retryDelay: 60 });
+    } catch (e) {
+        if (force && e && e.code === 'ENOENT') return { ok: true };
+        return { ok: false, code: 'RM_FAILED', error: (e && e.message) ? e.message : String(e) };
+    }
+    if (fsPathStillThere(absPath)) {
+        return { ok: false, code: 'RM_NOT_EFFECTIVE', error: '删除未生效：调用没有报错，但目标在磁盘上仍然存在' };
+    }
+    return { ok: true };
+}
+
+// 递归复制；语义对齐原来的 fs.cpSync(src, dest, {recursive:true, errorOnExist:true})。
+// 复制完必须真的落在 dest 上：类型要跟来源一致，单文件比字节数，目录比递归展开的文件条数。
+async function fsCopyTree(src, dest) {
+    try {
+        await fs.promises.cp(src, dest, { recursive: true, errorOnExist: true });
+    } catch (e) {
+        return { ok: false, code: 'CP_FAILED', error: (e && e.message) ? e.message : String(e) };
+    }
+    let ss = null, ds = null;
+    try { ss = fs.lstatSync(src); } catch (e) {}
+    try { ds = fs.lstatSync(dest); } catch (e) {}
+    if (!ds) {
+        return { ok: false, code: 'CP_NOT_EFFECTIVE', error: '复制未生效：调用没有报错，但目标路径在磁盘上不存在' };
+    }
+    if (ss && ss.isDirectory() !== ds.isDirectory()) {
+        return { ok: false, code: 'CP_NOT_EFFECTIVE', error: '复制未生效：目标的类型（' + (ds.isDirectory() ? '目录' : '文件') + '）与来源（' + (ss.isDirectory() ? '目录' : '文件') + '）不一致' };
+    }
+    if (ss && ss.isFile() && ds.isFile() && ss.size !== ds.size) {
+        return { ok: false, code: 'CP_NOT_EFFECTIVE', error: '复制未生效：目标字节数 ' + ds.size + ' 与来源 ' + ss.size + ' 不一致' };
+    }
+    if (ss && ss.isDirectory() && ds.isDirectory()) {
+        const nSrc = collectAffectedRelPaths(path.dirname(src), src).length;
+        const nDst = collectAffectedRelPaths(path.dirname(dest), dest).length;
+        if (nSrc !== nDst) {
+            return { ok: false, code: 'CP_NOT_EFFECTIVE', error: '复制未生效：目标下有 ' + nDst + ' 个文件，来源有 ' + nSrc + ' 个，复制不完整' };
+        }
+    }
+    return { ok: true };
 }
 
 // 把 relPath 解析到 projectDir 内部的绝对路径，做双重防越界校验（字符串前缀 + realpath
@@ -2537,9 +2621,19 @@ async function doFsWrite(projectDir, relPath, content, expectedMtimeMs) {
     catch (e) { return Object.assign({ ok: false, error: '创建父目录失败: ' + e.message }, checkpointFields(cp)); }
     try { fs.writeFileSync(r.resolved, content, 'utf8'); }
     catch (e) { return Object.assign({ ok: false, error: '写入失败: ' + e.message }, checkpointFields(cp)); }
-    let newMtimeMs = null;
-    try { newMtimeMs = fs.statSync(r.resolved).mtimeMs; } catch (e) {}
-    return Object.assign({ ok: true, path: relPath, bytesWritten: Buffer.byteLength(content, 'utf8'), mtimeMs: newMtimeMs }, checkpointFields(cp));
+    // v2 Pass P133b 收口2：落盘自检——写完必须真的是一个文件、字节数跟内容对得上，
+    // 对不上就明确报错，绝不因为"调用没抛异常"就回 ok:true（同一类"静默写坏"在
+    // fs.rmSync/fs.cpSync 上已经踩过，见 fsRemoveTree 头部注释）。
+    const wantBytes = Buffer.byteLength(content, 'utf8');
+    let st2 = null;
+    try { st2 = fs.statSync(r.resolved); } catch (e) { st2 = null; }
+    if (!st2 || !st2.isFile()) {
+        return Object.assign({ ok: false, code: 'WRITE_NOT_EFFECTIVE', error: '写入未生效：调用没有报错，但磁盘上没有出现这个文件: ' + relPath }, checkpointFields(cp));
+    }
+    if (st2.size !== wantBytes) {
+        return Object.assign({ ok: false, code: 'WRITE_NOT_EFFECTIVE', error: '写入未生效：磁盘上的字节数 ' + st2.size + ' 与待写内容的 ' + wantBytes + ' 不一致' }, checkpointFields(cp));
+    }
+    return Object.assign({ ok: true, path: relPath, bytesWritten: wantBytes, mtimeMs: st2.mtimeMs }, checkpointFields(cp));
 }
 
 // v2 Pass P75 §7.1：doFsWrite 只能写 UTF-8 字符串（fs.writeFileSync(..., 'utf8')），PDF→LaTeX
@@ -2574,6 +2668,16 @@ async function doFsWriteBinary(projectDir, relPath, contentBase64, opts) {
     catch (e) { return Object.assign({ ok: false, error: '创建父目录失败: ' + e.message }, checkpointFields(cp)); }
     try { fs.writeFileSync(r.resolved, buf); }
     catch (e) { return Object.assign({ ok: false, error: '写入失败: ' + e.message }, checkpointFields(cp)); }
+    // v2 Pass P133b 收口2：落盘自检——本端点的全部意义就是"原样字节落盘"，所以直接读回来
+    // 逐字节比一遍（上面的 4,000,000 字符 base64 上限保证读回量 ≲3 MB）。对不上一律 ok:false。
+    let back = null;
+    try { back = fs.readFileSync(r.resolved); } catch (e) { back = null; }
+    if (!back) {
+        return Object.assign({ ok: false, code: 'WRITE_BINARY_NOT_EFFECTIVE', error: '写入未生效：调用没有报错，但磁盘上读不到这个文件: ' + relPath }, checkpointFields(cp));
+    }
+    if (back.length !== buf.length || !back.equals(buf)) {
+        return Object.assign({ ok: false, code: 'WRITE_BINARY_NOT_EFFECTIVE', error: '写入未生效：读回的 ' + back.length + ' 字节与待写的 ' + buf.length + ' 字节不一致（拒绝谎报成功）' }, checkpointFields(cp));
+    }
     let newMtimeMs = null;
     try { newMtimeMs = fs.statSync(r.resolved).mtimeMs; } catch (e) {}
     return Object.assign({ ok: true, path: relPath, bytesWritten: buf.length, mtimeMs: newMtimeMs }, checkpointFields(cp));
@@ -2585,6 +2689,12 @@ async function doFsMkdir(projectDir, relPath) {
     const cp = await fsGitCheckpoint(projectDir, 'mkdir ' + relPath);
     try { fs.mkdirSync(r.resolved, { recursive: true }); }
     catch (e) { return Object.assign({ ok: false, error: '建目录失败: ' + e.message }, checkpointFields(cp)); }
+    // v2 Pass P133b 收口2：落盘自检——建完必须真的是一个目录。
+    let stMk = null;
+    try { stMk = fs.statSync(r.resolved); } catch (e) { stMk = null; }
+    if (!stMk || !stMk.isDirectory()) {
+        return Object.assign({ ok: false, code: 'MKDIR_NOT_EFFECTIVE', error: '建目录未生效：调用没有报错，但磁盘上没有出现这个目录: ' + relPath }, checkpointFields(cp));
+    }
     return Object.assign({ ok: true, path: relPath }, checkpointFields(cp));
 }
 
@@ -2600,6 +2710,17 @@ async function doFsMove(projectDir, fromRel, toRel) {
     try { fs.mkdirSync(path.dirname(rt.resolved), { recursive: true }); } catch (e) { /* 后面 rename 会自己报错 */ }
     try { fs.renameSync(rf.resolved, rt.resolved); }
     catch (e) { return Object.assign({ ok: false, error: '移动失败: ' + e.message }, checkpointFields(cp)); }
+    // v2 Pass P133b 收口2：落盘自检——移动/改名完成后来源必须消失、目标必须出现。
+    // （fs.renameSync 走 libuv、对非 ASCII 路径本来就正常，这里是统一的"不成功不报成功"兜底。）
+    if (fsPathStillThere(rf.resolved) || !fsPathStillThere(rt.resolved)) {
+        return Object.assign({
+            ok: false, code: 'MOVE_NOT_EFFECTIVE',
+            error: '移动/改名未生效：调用没有报错，但磁盘上' +
+                (fsPathStillThere(rf.resolved) ? '来源「' + fromRel + '」仍然存在' : '') +
+                (fsPathStillThere(rf.resolved) && !fsPathStillThere(rt.resolved) ? '、且' : '') +
+                (!fsPathStillThere(rt.resolved) ? '目标「' + toRel + '」没有出现' : '')
+        }, checkpointFields(cp));
+    }
     return Object.assign({ ok: true, from: fromRel, to: toRel, affected: affected }, checkpointFields(cp));
 }
 
@@ -2613,8 +2734,13 @@ async function doFsCopy(projectDir, fromRel, toRel) {
     const cp = await fsGitCheckpoint(projectDir, 'copy ' + fromRel + ' -> ' + toRel);
     try { fs.mkdirSync(path.dirname(rt.resolved), { recursive: true }); }
     catch (e) { return Object.assign({ ok: false, error: '创建目标父目录失败: ' + e.message }, checkpointFields(cp)); }
-    try { fs.cpSync(rf.resolved, rt.resolved, { recursive: true, errorOnExist: true }); }
-    catch (e) { return Object.assign({ ok: false, error: '复制失败: ' + e.message }, checkpointFields(cp)); }
+    // v2 Pass P133b 收口2：原来这里是 fs.cpSync——它在 Windows 上对含非 ASCII 字符的路径会把
+    // 目标建到"乱码路径"上（回 ok 却什么都没复制），中文来源目录甚至直接让进程 0xC0000409 崩掉。
+    // 见 fsRemoveTree 头部的根因注释；fsCopyTree 走 fs.promises.cp 并自带落盘校验。
+    const cpRes = await fsCopyTree(rf.resolved, rt.resolved);
+    if (!cpRes.ok) {
+        return Object.assign({ ok: false, code: cpRes.code, error: '复制失败: ' + cpRes.error }, checkpointFields(cp));
+    }
     const affected = collectAffectedRelPaths(rt.base, rt.resolved);
     return Object.assign({ ok: true, from: fromRel, to: toRel, affected: affected }, checkpointFields(cp));
 }
@@ -2626,8 +2752,13 @@ async function doFsDelete(projectDir, relPath) {
     if (r.resolved === r.base) return { ok: false, error: '拒绝删除项目根目录本身' };
     const affected = collectAffectedRelPaths(r.base, r.resolved);
     const cp = await fsGitCheckpoint(projectDir, 'delete ' + relPath);
-    try { fs.rmSync(r.resolved, { recursive: true, force: false }); }
-    catch (e) { return Object.assign({ ok: false, error: '删除失败: ' + e.message }, checkpointFields(cp)); }
+    // v2 Pass P133b 收口2：原来这里是 fs.rmSync——它在 Windows 上对含非 ASCII 字符的路径
+    // 既可能"静默什么都不删还不抛异常"（于是这里回 ok:true 谎报删除成功），也可能删掉那条
+    // 乱码路径上碰巧存在的**别的**文件/目录。见 fsRemoveTree 头部的根因注释。
+    const rmRes = await fsRemoveTree(r.resolved, { force: false });
+    if (!rmRes.ok) {
+        return Object.assign({ ok: false, code: rmRes.code, error: '删除失败: ' + rmRes.error }, checkpointFields(cp));
+    }
     return Object.assign({ ok: true, path: relPath, affected: affected }, checkpointFields(cp));
 }
 
@@ -2791,10 +2922,18 @@ async function doFsRestore(projectDir, checkpointRef, opts) {
     // 恢复前先给当前状态打一个检查点，保证这次恢复本身也可回退。
     const preCp = await fsGitCheckpoint(projectDir, 'before restore to ' + checkpointRef);
 
+    // v2 Pass P133b 收口2：原来这里是 fs.rmSync + "只要没抛异常就 push 进 removedExtraFiles"。
+    // 在 Windows 上含非 ASCII 字符的路径根本没被删掉（rmSync 静默返回），于是 removedExtraFiles
+    // 会把一堆其实还躺在磁盘上的文件报成"已删除"；更糟的是那条乱码路径上碰巧存在别的文件时会
+    // 删错东西。见 fsRemoveTree 头部的根因注释。现在只有**确认真的没了**才记进 removedExtraFiles，
+    // 删不掉的单独进 failedToRemove 并在响应里给出警告，不再谎报。
     const removedExtraFiles = [];
-    willDelete.forEach((rel) => {
-        try { fs.rmSync(path.join(projectDir, rel.split('/').join(path.sep)), { force: true }); removedExtraFiles.push(rel); } catch (e) {}
-    });
+    const failedToRemove = [];
+    for (const rel of willDelete) {
+        const res = await fsRemoveTree(path.join(projectDir, rel.split('/').join(path.sep)), { force: true });
+        if (res.ok) removedExtraFiles.push(rel);
+        else failedToRemove.push({ path: rel, error: res.error });
+    }
     try { pruneEmptyDirs(projectDir); } catch (e) {}
 
     const tmpIndex = fsTempIndexPath();
@@ -2817,6 +2956,13 @@ async function doFsRestore(projectDir, checkpointRef, opts) {
         restoredTo: checkpointRef,
         filesRestored: targetFiles.size,
         removedExtraFiles: removedExtraFiles,
+        // v2 Pass P133b 收口2：删不掉的多余文件如实单列，绝不混进 removedExtraFiles 冒充已删除。
+        failedToRemove: failedToRemove,
+        removeWarning: failedToRemove.length
+            ? ('有 ' + failedToRemove.length + ' 个检查点之后新建的多余文件没能删掉（例如: ' +
+                failedToRemove.slice(0, 5).map((x) => x.path).join(', ') + (failedToRemove.length > 5 ? ' 等' : '') +
+                '），它们仍然留在工作区里；检查点里的文件已按快照恢复。')
+            : null,
         skippedIgnored: skippedIgnored,
         ignoreWarning: ignoreWarning,
         note: '已恢复到检查点当时的文件内容。已知差异：不保证复原文件权限位；恢复后残留空目录的清理是尽力而为。'
@@ -3207,16 +3353,18 @@ const server = http.createServer(async (req, res) => {
             if (body.id) {
                 const outdir = safeOutdirForId(body.id);
                 if (!outdir) { sendJson(res, 400, { ok: false, error: 'invalid id' }); return; }
-                try { fs.rmSync(outdir, { recursive: true, force: true }); } catch (e) {}
+                // v2 Pass P133b 收口2：统一走 fsRemoveTree（禁用 fs.rmSync，见其头部根因注释）。
+                // WORK_ROOT 在 os.tmpdir() 下，Windows 用户名含非 ASCII 时整条路径就带非 ASCII。
+                await fsRemoveTree(outdir, { force: true });
                 sendJson(res, 200, { ok: true, cleared: body.id });
                 return;
             }
             // 不带 id：清空全部缓存的编译产物（对应 Overleaf 的 "Clear cached files"）。
             try {
                 const entries = fs.readdirSync(WORK_ROOT);
-                entries.forEach((e) => {
-                    try { fs.rmSync(path.join(WORK_ROOT, e), { recursive: true, force: true }); } catch (e2) {}
-                });
+                for (const e of entries) {
+                    await fsRemoveTree(path.join(WORK_ROOT, e), { force: true });
+                }
             } catch (e) {}
             sendJson(res, 200, { ok: true, clearedAll: true });
             return;
