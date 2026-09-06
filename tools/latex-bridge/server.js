@@ -1455,6 +1455,8 @@ function runGitCommand(args, cwd, token, timeoutMs, extraEnv) {
                 env: Object.assign({}, process.env, {
                     GIT_ASKPASS: GIT_ASKPASS_HELPER,
                     OVL_GIT_TOKEN: token || '',
+                    OVL_GIT_USERNAME: 'git', // v2 Pass P133f：Overleaf 要求 Basic 认证用户名固定为字面量 'git'（密码=token）；
+                                              // 常量注入，不开新配置项——见 git-askpass-helper.js 头部注释的完整背景
                     GIT_TERMINAL_PROMPT: '0' // askpass 出问题时不许卡在交互式输入等待上
                 }, extraEnv || {})
             });
