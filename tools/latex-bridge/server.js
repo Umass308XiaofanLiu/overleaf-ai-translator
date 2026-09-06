@@ -1397,6 +1397,35 @@ const GIT_ASKPASS_HELPER = path.join(__dirname, 'git-askpass-helper.bat');
 // 冒充远程时才会显形，测试文件里已用独立机制（GIT_CONFIG_GLOBAL 指向临时全局配置）中和。
 const GIT_SAFE_DIRECTORY_ARGS = ['-c', 'safe.directory=*'];
 
+// v2 Pass P133e —— 禁用宿主机凭据助手，把凭据来源锁定到桥自己的 GIT_ASKPASS。
+//
+// 背景：jump 上 Git for Windows 的系统级 gitconfig 设了 `credential.helper=manager`
+// （Git Credential Manager，GCM）。桥以非交互会话身份（用户级计划任务/ssh）跑网络类 git
+// 操作（clone/fetch/pull/push/ls-remote 等）时，git 的凭据子系统会先尝试调 GCM 去存取
+// Windows 凭据管理器（wincredman）——这一步在非交互会话里直接致命失败：
+// `fatal: Unable to persist credentials with the 'wincredman' credential store`，整条
+// git 命令因此非零退出，即使实际的网络请求本身是通的（DNS/443 都正常）。GCM 这一步排在
+// askpass 之前，一旦它自己先崩，本文件头部注释里说的"token 只走 GIT_ASKPASS 环境变量"这
+// 条路径根本没有机会被触发——前端看到的"拉取失败：git fetch 失败"就是这个致命失败的表现，
+// 不是网络问题也不是 token 本身有问题。
+// 修法：在同一处（本函数 spawn 的 `-c` 参数列表）追加 `-c credential.helper=`。git 对
+// credential.helper 这个多值 key 的"空字符串"有特殊语义——不是新增一条空助手，而是清空
+// 在它之前所有来源（system/global/local）已经累积的助手列表；命令行 `-c` 在“遇到顺序”上
+// 排在配置文件之后，因此这一条空值会把 GCM 从这次子进程的助手链里整个摘掉，凭据流程直接
+// 落到 askpass（GIT_ASKPASS_HELPER + OVL_GIT_TOKEN，见 runGitCommand 里的 env），GCM
+// 及其 wincredman 交互从头到尾不会被调用，也就不会再有致命崩溃挡路。
+// 注入方式与上面的 safe.directory 完全同构：只作为这一次 spawn 的 `-c` 参数（args 数组
+// 里，不进 shell 字符串），绝不写 `git config --global/--system`、绝不碰任何仓库的
+// .git/config——桥进程退出后这条豁免连同子进程一起消失，不留任何持久化痕迹，不影响宿主机
+// 上其他 git 使用者（比如用户交互式终端里的 git）继续用 GCM。
+// 安全影响：清空助手列表只是让 git 不再尝试"读取/写入宿主机已保存的凭据"，桥本来就不依赖
+// 宿主机保存的凭据——它自己通过 GIT_ASKPASS 精确控制每次用哪个 token（见文件头注释的整段
+// token 处理原则），这里只是移除了一个会致命崩溃、且桥根本用不到的中间环节，不新增攻击面、
+// 不弱化 token 本身的保密性（token 仍然只走环境变量，不落盘、不进 argv）。
+// GIT_TERMINAL_PROMPT=0 已经在下面 spawn 的 env 里设置（P41 起就有，askpass 出问题时不
+// 会卡在交互式终端输入等待），这里不重复设置。
+const GIT_NO_CREDENTIAL_HELPER_ARGS = ['-c', 'credential.helper='];
+
 // 仅供 e2e 测试使用（tools/e2e/test_p121_safedir.js）：设置环境变量 OVL_TEST_GIT_ARGV_LOG
 // 为一个文件路径时，每次 spawn 前把最终 argv（含上面注入的 safe.directory）追加写一行 JSON
 // 到该文件——用于断言"确实注入了"，而不是仅凭链路跑通就推测注入生效。不设置该环境变量时
@@ -1416,7 +1445,7 @@ function logGitArgvForTest(finalArgs) {
 // 变量把 git 操作限制在一个临时索引/工作树上，绝不触碰真实的 .git/index。
 function runGitCommand(args, cwd, token, timeoutMs, extraEnv) {
     return new Promise((resolve) => {
-        const finalArgs = GIT_SAFE_DIRECTORY_ARGS.concat(args);
+        const finalArgs = GIT_SAFE_DIRECTORY_ARGS.concat(GIT_NO_CREDENTIAL_HELPER_ARGS, args);
         logGitArgvForTest(finalArgs);
         let child;
         try {
