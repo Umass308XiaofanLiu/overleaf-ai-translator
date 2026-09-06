@@ -4392,8 +4392,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.13.01';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-03';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.14.02';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-05';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -26922,8 +26922,21 @@ function loadSavedSettings() {
         const savedLocalUrl = localStorage.getItem('localBaseUrl');
         if (savedLocalUrl) {
             AppState.localBaseUrl = savedLocalUrl;
+        } else {
+            // v2 Pass P133（m3，R1 E-5）：页面从桥托管的 http(s) 地址加载（同网远程用法，比如
+            // http://<jump 的 Tailscale IP>:8181/）时，默认值里的 "localhost" 指的是浏览器所在的
+            // 那台设备、不是跑 LM Studio 的桥主机，且非安全上下文下对 loopback 的请求还可能被
+            // Chrome 本地网络访问策略拦下。只在**从未存过**该设置时把默认主机换成页面自己的
+            // 主机名（端口不变，仍是 LM Studio 默认的 1234）；判据跟 ovlBridgeOrigin 的同源分支
+            // 同一条（location.protocol 为 http:/https: 且 origin 非 'null'），file:// 打开时一字不变。
+            // 已经存过的 localStorage.localBaseUrl 走上面的分支，绝不被覆盖。
+            try {
+                if (location && (location.protocol === 'http:' || location.protocol === 'https:') && location.origin && location.origin !== 'null' && location.hostname) {
+                    AppState.localBaseUrl = 'http://' + location.hostname + ':1234';
+                }
+            } catch (e) { /* location 读取异常：保持硬编码默认值 */ }
         }
-        
+
         // 加载 History Limit
         const savedHistoryLimit = localStorage.getItem('historyLimit');
         if (savedHistoryLimit) {
@@ -27460,7 +27473,7 @@ function ovlPortalHtml() {
         // 直接用 http://Tailscale-IP/ 打开页面）下不存在——远程模式已经有自己的短路提示
         // （ovlIsRemoteBridge() 分支），这里补上"本地模式但页面本身不安全"这条边界情况，
         // 静态渲染时算一次 window.isSecureContext 就够（运行期不会变）。
-        +   '<div class="ovl-layout-menu-item" data-proj="makeCopy"' + (window.isSecureContext ? '' : ' data-disabled="1" data-tip="本地文件夹模式需要 HTTPS 或本机环境" data-tip-pos="left"') + '>Make a copy</div>'
+        +   '<div class="ovl-layout-menu-item" data-proj="makeCopy"' + ((window.isSecureContext || ovlIsRemoteBridge()) ? '' : ' data-disabled="1" data-tip="本地文件夹模式需要 HTTPS 或本机环境" data-tip-pos="left"') + '>Make a copy</div>'
         +   '<div class="ovl-layout-menu-item" data-proj="rename" data-disabled="1" data-tip="点这里改不了；双击顶栏正中间的项目名可以真的重命名磁盘上的项目文件夹" data-tip-pos="left">Rename</div>'
         +   '<div class="ovl-menu-sep"></div>'
         +   '<div class="ovl-layout-menu-item" data-proj="wordCount">Word count</div>'
@@ -36270,34 +36283,45 @@ class OvlRemoteFileHandle {
     async createWritable() {
         const self = this;
         let pending = '';
+        // v2 Pass P133（M1）：字节写入不再解码——pendingBytes 非空时 close() 走 /fs/write-binary。
+        let pendingBytes = null;
         return {
             // v2 Pass P51：write() 之前对"既不是字符串、也不是 ArrayBuffer/TypedArray"的输入
             // 一律 String(content) 硬转——Blob/File（FSA 规范允许直接传）会被转成字面量字符串
             // "[object Blob]"，不报错、静默把文件写坏，跟这个项目今天已经栽过的"检查点静默漏
             // 文件/回退静默删文件"是同一种"看起来正常、实际有损"的地雷。改成：
             //   - string：原样。
-            //   - ArrayBuffer/ArrayBufferView（TypedArray/DataView）：按 UTF-8 解码成字符串——
-            //     /fs/write 走 JSON body，只能带文本，桥那边落盘用的是 fs.writeFileSync(path,
-            //     content, 'utf8')，跟本地 FSA 路径二进制安全写盘不是同一件事：这里只承诺"文本
-            //     内容原样落盘"，不承诺任意二进制字节流原样落盘（现有 ~90 处调用点里，二进制
-            //     写入只发生在图片/PDF 这类"整份替换"场景，见 ovlPerformUpload/ovlPerformRename，
-            //     这些走的是 arrayBuffer→write 但内容本身通常不含需要保真的非文本字节；真正的
-            //     任意二进制字节流保真写入不在这版本范围内，但绝不允许静默产出错误内容）。
-            //   - Blob（含 File，它是 Blob 的子类）：await blob.arrayBuffer() 取字节，走同一条
-            //     ArrayBuffer 分支。
+            //   - ArrayBuffer/ArrayBufferView（TypedArray/DataView）/Blob（含 File）：
+            //     v2 Pass P133（M1，远程对等）以前一律 TextDecoder('utf-8') 解码成字符串再走
+            //     /fs/write 文本落盘——非 UTF-8 字节（PNG 首字节 0x89、PDF 里的压缩流……）全部
+            //     被替换成 U+FFFD，上传/重命名/复制目录里的图片和 PDF 静默损坏，而
+            //     ovlPerformRename 又是"写新名成功即删旧名"，原件跟着丢。现在改成：字节原样存成
+            //     Uint8Array（pendingBytes），close() 时 base64 经既有的 POST /fs/write-binary
+            //     （桥端 doFsWriteBinary 原样 Buffer 落盘，P75 起就在、ovlP2TWriteBinary 已在用）
+            //     写盘，不解码、不再走 /fs/write。文本（string）路径一字不动，仍走 /fs/write +
+            //     expectedMtimeMs 乐观锁。/fs/write-binary 没有 expectedMtimeMs（桥端签名只有
+            //     skipCheckpoint）——二进制整份替换（上传/改名/复制）本来就不经过编辑器的
+            //     Ctrl+S 乐观锁流程，属既有语义；这里刻意不传 skipCheckpoint，保留桥端 git
+            //     检查点保护。单次上限约 3 MB（桥端 base64 4,000,000 字符门槛），超限桥端会
+            //     明确报错，绝不静默截断。
             //   - 其它任何类型：明确抛出中文错误，绝不 String(content) 硬转、绝不静默写坏内容——
             //     宁可炸出来让人看见。
             write: async function (content) {
                 if (typeof content === 'string') {
                     pending = content;
+                    pendingBytes = null;
                 } else if (content instanceof Blob) {
                     const buf = await content.arrayBuffer();
-                    pending = new TextDecoder('utf-8').decode(buf);
+                    pendingBytes = new Uint8Array(buf);
+                    pending = '';
                 } else if (content instanceof ArrayBuffer) {
-                    pending = new TextDecoder('utf-8').decode(content);
+                    pendingBytes = new Uint8Array(content);
+                    pending = '';
                 } else if (content && content.buffer instanceof ArrayBuffer && typeof content.byteLength === 'number') {
                     // ArrayBufferView：TypedArray（Uint8Array 等）/DataView，FSA 规范允许的写入类型之一。
-                    pending = new TextDecoder('utf-8').decode(content);
+                    // 按 byteOffset/byteLength 取视图覆盖的那一段，不多不少（子数组视图的 .buffer 是整块底层缓冲）。
+                    pendingBytes = new Uint8Array(content.buffer, content.byteOffset || 0, content.byteLength);
+                    pending = '';
                 } else {
                     throw new Error('远程文件写入不支持这种数据类型（' + (content && content.constructor && content.constructor.name || typeof content) + '），只支持 string/ArrayBuffer/TypedArray/Blob（含 File）——拒绝写入，避免把内容写坏。');
                 }
@@ -36314,6 +36338,18 @@ class OvlRemoteFileHandle {
             truncate: async function () { throw new Error('远程文件写入不支持 truncate()，这个能力还没实现。'); },
             close: async function () {
                 const projectDir = ovlRemoteProjectRoot();
+                if (pendingBytes) {
+                    // v2 Pass P133（M1）：字节路径——见上方 write() 注释。失败原样抛出（不静默），
+                    // 调用点 ovlPerformRename 只在 close() 成功之后才 removeEntry(旧名)，原件得以保留。
+                    const dataBin = await ovlRemoteFsJson(ovlBridgeUrl('/fs/write-binary'), {
+                        projectDir: projectDir, path: self.__relPath, contentBase64: ovlP2TUint8ToBase64(pendingBytes)
+                    });
+                    if (!dataBin || dataBin.ok !== true) {
+                        throw new Error((dataBin && dataBin.error) || '写入远程二进制文件失败');
+                    }
+                    self.__lastKnownMtimeMs = (typeof dataBin.mtimeMs === 'number') ? dataBin.mtimeMs : self.__lastKnownMtimeMs;
+                    return;
+                }
                 const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/write'), {
                     projectDir: projectDir, path: self.__relPath, content: pending,
                     expectedMtimeMs: (typeof self.__lastKnownMtimeMs === 'number') ? self.__lastKnownMtimeMs : undefined
@@ -36354,6 +36390,8 @@ class OvlRemoteDirHandle {
         if (!data || data.ok !== true) throw new Error((data && data.error) || '列出远程目录失败');
         return Array.isArray(data.entries) ? data.entries : [];
     }
+    // __childExists 的语义是"列不出来 = 不存在"（getFileHandle/getDirectoryHandle 靠它决定要不要
+    // create），删后复核不能复用这条语义——见 removeEntry 的注释。
     async __childExists(name, wantDir) {
         let entries;
         try { entries = await this.__listRaw(); } catch (e) { return false; }
@@ -36395,6 +36433,26 @@ class OvlRemoteDirHandle {
         const childRel = this.__childRel(name);
         const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/delete'), { projectDir: ovlRemoteProjectRoot(), path: childRel });
         if (!data || data.ok !== true) throw new Error((data && data.error) || '删除远程文件/目录失败');
+        // v2 Pass P133a 收口1（终核 B-1）：桥端 doFsDelete 用 fs.rmSync，Node 24.12/Windows 对含非 ASCII
+        // （如中文）成分的路径会静默不删、不抛错，桥照样回 ok:true——前端若盲信就变成"界面说已删除/
+        // 已重命名、文件还在"的静默失效（中文名改名 = 新旧两个文件并存）。删完再列一次父目录复核，
+        // 让调用点（ovlPerformRename / ovlPerformDelete → ovlHandleCtxAction）显示真实状态、不假报成功。
+        // 根治（桥端改 fs.promises.rm）在 server.js 一侧。
+        // v2 Pass P133a 收口3（终核 B-4）：这里**不能**复用 __childExists——它的既有语义是"列不出来 =
+        // 不存在"（getFileHandle/getDirectoryHandle 靠这条去 create，不能动），拿来当删后复核就是
+        // fail-open：复核那一次 /fs/list 只要失败（桥重启窗口、链路抖动、令牌刚被轮换回 401、桥被
+        // 别的操作打崩），"没能确认"会被当成"确认删掉了"，上面那条静默失效原样回来。改成直接
+        // 列一次做三态判定：列到同名 = 确认没删掉；列不到 = 通过；**列表本身失败 = 结果无法确认**，
+        // 同样抛错，让状态条说"不确定、去刷新看看"而不是说"已删除"。请求次数不变（仍是一次 /fs/list）。
+        let after;
+        try {
+            after = await this.__listRaw();
+        } catch (e) {
+            throw new Error('无法列出远程目录复核，「' + name + '」的删除结果无法确认（' + (e && e.message ? e.message : String(e)) + '）；请刷新文件树确认');
+        }
+        if (after.some(function (e) { return e.name === name; })) {
+            throw new Error('桥端报告删除成功，但「' + name + '」仍在远程目录中（删除未生效）');
+        }
     }
 }
 
@@ -36539,12 +36597,15 @@ function ovlRemoteFolderDialogClose() {
     if (OvlRemoteFolderDialogOnKey) { document.removeEventListener('keydown', OvlRemoteFolderDialogOnKey); OvlRemoteFolderDialogOnKey = null; }
 }
 
-function ovlRemotePickFolder() {
+// v2 Pass P133（m1）：opts.initialPath 可选——"被令牌弹窗冲掉后自动重开"时把用户刚填的路径带回来
+// 预填（见下方 handleDismissed）。不传时行为跟以前一字不变（预填当前项目路径 / 上次存的路径）。
+function ovlRemotePickFolder(opts) {
+    opts = opts || {};
     // v2 Pass P131d（NB-b）：守卫必须排在选择器弹窗**之前**——两者共用 #ovlModalOverlay，
     // 套在里面会互相清空。守卫解决冲突后状态清空，递归这一次不会再弹第二遍。
     if (typeof ovlExternalConflictActive === 'function' && ovlExternalConflictActive()) {
         return ovlExternalConflictGuardBeforeLeave().then(function (proceed) {
-            return proceed ? ovlRemotePickFolder() : undefined;
+            return proceed ? ovlRemotePickFolder(opts) : undefined;
         });
     }
     return new Promise(function (resolve) {
@@ -36579,7 +36640,7 @@ function ovlRemotePickFolder() {
         input.type = 'text';
         input.id = 'ovlRemotePickInput';
         input.className = 'ovl-modal-input';
-        let initial = ovlRemoteProjectRoot();
+        let initial = (typeof opts.initialPath === 'string' && opts.initialPath.trim()) ? opts.initialPath.trim() : ovlRemoteProjectRoot();
         if (!initial) { try { initial = localStorage.getItem(ovlProjectPathLsKey()) || ''; } catch (e) { initial = ''; } }
         input.value = initial;
         input.placeholder = '例如 /home/xiaofanl/projects/AI-Translator';
@@ -36608,7 +36669,10 @@ function ovlRemotePickFolder() {
             loading.className = 'ovl-tree-loading';
             loading.textContent = '正在列出…';
             listWrap.appendChild(loading);
+            inFlight++;
             ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: p, path: '.' }).then(function (data) {
+                inFlight--;
+                if (handleDismissed(p)) return;
                 listWrap.textContent = '';
                 if (!data || data.ok !== true) {
                     renderError((data && data.error) || '列出目录失败——检查路径是否存在、桥是否在线、令牌是否正确');
@@ -36643,6 +36707,8 @@ function ovlRemotePickFolder() {
                     listWrap.appendChild(row);
                 });
             }).catch(function (e) {
+                inFlight--;
+                if (handleDismissed(p)) return;
                 listWrap.textContent = '';
                 renderError('列出目录失败：' + (e && e.message ? e.message : String(e)));
             });
@@ -36661,20 +36727,83 @@ function ovlRemotePickFolder() {
         box.appendChild(btnRow);
         overlay.appendChild(box);
 
-        function close() { ovlRemoteFolderDialogClose(); resolve(); }
+        // v2 Pass P133（m1，R1 E-1）：首次远程使用的真实路径——在这个弹窗里点「列出/刷新」→
+        // /fs/list 401 → ovlBridgeFetch 弹令牌弹窗（ovlPromptDialog）→ 它进场先
+        // ovlDismissActiveModal() + overlay.innerHTML=''，本弹窗 DOM 被整个抹掉；以前本弹窗
+        // 不登记 __ovlActiveModalDismiss，于是 keydown 监听器残留在 document 上、Promise 永不
+        // settle、令牌存好后的重试结果渲染进一个已脱离文档的 listWrap——用户看到的是"弹窗消失，
+        // 什么都没发生"。修法复用既有的活跃弹窗登记表（跟 ovlPromptDialog/ovlConfirmDialog/
+        // P131 三选一同一套不变量）：
+        //   - dismissSelf：被别的弹窗冲掉时只摘监听、标记 dismissedByOther，不碰 overlay（对方
+        //     紧接着就会清空并接管）。没有在途的 /fs/list 请求时立刻 resolve；有在途请求时把
+        //     "何时 settle"交给该请求的回调（handleDismissed）决定——因为那次请求正是触发令牌
+        //     弹窗的那一次，它的结果决定要不要重开本弹窗。
+        //   - handleDismissed：/fs/list 的回调回来时若本弹窗已被冲掉——令牌已存好（用户在令牌
+        //     弹窗里点了「保存并重试」）→ 自动重开本弹窗并预填同一路径，让用户回到刚才的地方，
+        //     且**原 Promise 等重开的那个弹窗关闭后才 resolve**（对调用方 ovlPickFolderAndRecordHistory
+        //     而言，重开的弹窗就是同一次"打开项目文件夹"动作的延续，历史记录照常登记）；
+        //     令牌为空（用户取消了令牌弹窗）→ 不重开、直接 resolve，避免"取消→再弹→再取消"的死循环。
+        //   - close() / settle() 幂等：残留在 overlay 上的 click 监听器（每个弹窗都会往 overlay 上
+        //     挂一个，既有行为）在本弹窗关闭之后再被触发时什么都不做，不会误伤后来打开的别的弹窗。
+        let closed = false;
+        let settled = false;
+        let dismissedByOther = false;
+        let reopened = false;
+        let inFlight = 0;
+        function settle() { if (settled) return; settled = true; resolve(); }
+        function teardown() {
+            if (closed) return;
+            closed = true;
+            if (__ovlActiveModalDismiss === dismissSelf) __ovlActiveModalDismiss = null;
+            document.removeEventListener('keydown', onKey);
+            if (OvlRemoteFolderDialogOnKey === onKey) OvlRemoteFolderDialogOnKey = null;
+        }
+        function dismissSelf() {
+            if (closed) return;
+            dismissedByOther = true;
+            teardown();
+            if (inFlight === 0) settle();
+        }
+        function handleDismissed(p) {
+            if (!dismissedByOther) return false;
+            let tokenNow = '';
+            try { tokenNow = (OvlSettings && OvlSettings.ovlBridgeToken || '').trim(); } catch (e) { tokenNow = ''; }
+            if (tokenNow && !reopened) {
+                reopened = true;
+                try { Promise.resolve(ovlRemotePickFolder({ initialPath: p })).then(settle, settle); }
+                catch (e) { console.warn('[ovl] reopen remote folder dialog failed', e); settle(); }
+            } else if (!reopened && inFlight === 0) {
+                settle();
+            }
+            return true;
+        }
+        function close() {
+            if (!closed) {
+                teardown();
+                ovlRemoteFolderDialogClose();
+            }
+            settle();
+        }
         function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); close(); } }
         cancelBtn.addEventListener('click', close);
         overlay.addEventListener('click', function (e) { if (e.target === overlay) close(); });
         document.addEventListener('keydown', onKey);
         OvlRemoteFolderDialogOnKey = onKey;
+        __ovlActiveModalDismiss = dismissSelf;
 
         okBtn.addEventListener('click', function () {
             const p = input.value.trim();
             if (!p) { renderError('请先填写远程绝对路径'); return; }
             okBtn.disabled = true;
+            inFlight++;
             ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: p, path: '.' }).then(function (data) {
+                inFlight--;
                 okBtn.disabled = false;
-                if (!data || data.ok !== true) { renderError((data && data.error) || '这个路径打不开——检查是否存在/是否是目录'); return; }
+                if (!data || data.ok !== true) {
+                    if (handleDismissed(p)) return;
+                    renderError((data && data.error) || '这个路径打不开——检查是否存在/是否是目录');
+                    return;
+                }
                 // v2 Pass P66：改走统一收口函数，顺带反向同步 Overleaf 项目 ID。watch 沿用
                 // 原有时序，在下面 renderTree 之后另调，这里跳过。
                 ovlSetProjectPath(p, { skipWatch: true });
@@ -36691,7 +36820,7 @@ function ovlRemotePickFolder() {
                     try { ovlBridgeUpdateWatch(); } catch (e3) {}
                 }).catch(function () {});
                 close();
-            }).catch(function (e2) { okBtn.disabled = false; renderError('连接失败：' + (e2 && e2.message ? e2.message : String(e2))); });
+            }).catch(function (e2) { inFlight--; okBtn.disabled = false; if (handleDismissed(p)) return; renderError('连接失败：' + (e2 && e2.message ? e2.message : String(e2))); });
         });
 
         if (input.value) listCurrent();
@@ -39114,6 +39243,16 @@ function ovlBridgeTokenPromptOnce() {
     __ovlBridgeTokenPromptPending = p.then(function (token) { __ovlBridgeTokenPromptPending = null; return token; });
     return __ovlBridgeTokenPromptPending;
 }
+// v2 Pass P133（m5，R1 E-9）：已填令牌但桥仍回 401（令牌填错/桥端已轮换）时，以前各调用点只显示
+// 通用错误（"列出目录失败"之类），用户不知道该去哪儿修。这里补一条可见 toast 指到设置面板的
+// 既有排查入口；同一个令牌值只提示一次（用户换了令牌再错才再提示），不弹窗、不重试、绝不形成
+// 无限弹窗——令牌弹窗的既有语义（只在"从没填过"时弹一次）一字不动。
+let __ovlBridgeBadTokenNotifiedFor = null;
+function ovlBridgeBadTokenNotifyOnce(token) {
+    if (__ovlBridgeBadTokenNotifiedFor === token) return;
+    __ovlBridgeBadTokenNotifiedFor = token;
+    try { showToast('访问令牌无效或已轮换：设置 → 远程桥接 → 重新粘贴令牌并「测试连接」', 'error'); } catch (e) {}
+}
 function ovlBridgeFetch(p, opts) {
     const o = Object.assign({}, opts || {});
     o.headers = ovlBridgeAuthHeaders(o.headers);
@@ -39121,10 +39260,11 @@ function ovlBridgeFetch(p, opts) {
     return fetch(url, o).then(function (resp) {
         if (resp.status !== 401) return resp;
         let hasToken = false;
-        try { hasToken = !!(OvlSettings && OvlSettings.ovlBridgeToken && OvlSettings.ovlBridgeToken.trim()); } catch (e) {}
+        let tokenNow = '';
+        try { tokenNow = (OvlSettings && OvlSettings.ovlBridgeToken || '').trim(); hasToken = !!tokenNow; } catch (e) {}
         // 本地已经填了令牌但还是 401 = 令牌本身不对，不是"从没填过"——不自动弹窗打扰，
         // 照旧走设置面板「测试连接」那条既有的排查路径，原样把这次 401 交回调用点。
-        if (hasToken) return resp;
+        if (hasToken) { ovlBridgeBadTokenNotifyOnce(tokenNow); return resp; }
         return ovlBridgeTokenPromptOnce().then(function (token) {
             if (!token) return resp; // 用户取消：原样把这次 401 交回调用点，不重试
             const o2 = Object.assign({}, opts || {});
@@ -47093,7 +47233,12 @@ function ovlBindShell() {
         const uploadInput = document.getElementById('ovlUploadInput');
         if (uploadInput) {
             uploadInput.addEventListener('change', function (e) {
-                const files = e.target.files;
+                // v2 Pass P133（M1 上传路径，真实 CDP 事件实测）：e.target.files 是 [SameObject] 的
+                // 活 FileList——下面那句 uploadInput.value = '' 会把这同一个对象清空（Chrome 实测
+                // same=true、length 1→0），随后 files.length 为 0 直接 return，上传从未发生、也没有
+                // 任何提示。先把 FileList 快照成普通数组再清空 value（ovlPerformUpload 只用
+                // .length/[i]，数组同形）。
+                const files = Array.prototype.slice.call(e.target.files || []);
                 const target = OvlState.uploadTargetHandle || OvlState.dirHandle;
                 uploadInput.value = ''; // 清空，允许连续上传同名文件也能重新触发 change
                 if (!files || !files.length || !target) return;
@@ -50707,13 +50852,68 @@ async function ovlProjectDownloadZip() {
 }
 
 // ---- Make a copy：复用 M9 的 ovlCopyDirRecursive，目标文件夹另外选（另一次 showDirectoryPicker）----
+// v2 Pass P133（m2，矩阵 #29）：远程模式的 Make a copy 等价替代——以前这里直接 toast「暂不支持」
+// （目标文件夹选择器只能选本机目录）。远程下"复制到同级目录"用桥既有的 POST /fs/copy 即可做到：
+// projectDir = 项目目录的上一级，from = 项目目录名，to = 新名（桥端 doFsCopy 是 fs.cpSync
+// recursive，目标已存在直接拒绝、不半拷；项目里若有 .git 会随目录一起复制，跟本地
+// ovlCopyDirRecursive 的语义一致）。复制成功后按 ovlRemotePickFolder「选择此文件夹」同一套收口
+// 切换到副本（ovlSetProjectPath + OvlRemoteDirHandle + epoch + reset + renderTree）。不新增桥路由。
+function ovlProjectMakeCopyRemote() {
+    const root = ovlRemoteProjectRoot();
+    if (!root) { ovlFlashSaveStatus('请先在 PDF 面板里填写项目绝对路径', true); return; }
+    const parent = ovlRemoteParentPath(root);
+    const base = ovlProjectHistoryBasename(root);
+    if (!parent || parent === root || !base) { ovlFlashSaveStatus('无法确定项目目录的上一级目录（根目录不能整体复制）', true); return; }
+    const sep = (root.indexOf('\\') !== -1 && root.indexOf('/') === -1) ? '\\' : '/';
+    ovlPromptDialog({
+        title: 'Make a copy',
+        label: '新文件夹名称（会建在远程项目目录的同级目录 ' + parent + ' 下）',
+        value: base + '-copy',
+        confirmLabel: '复制',
+        validate: function (v) {
+            v = String(v || '').trim();
+            if (!v) return '名字不能为空';
+            if (/[\\/]/.test(v) || v === '.' || v === '..') return '名字不能包含路径分隔符，也不能是 . 或 ..';
+            return null;
+        },
+        onConfirm: function (name) {
+            name = String(name || '').trim();
+            if (!name) { ovlFlashSaveStatus('名字不能为空', true); return; }
+            ovlFlashSaveStatus('正在复制项目…', false, true);
+            ovlRemoteFsJson(ovlBridgeUrl('/fs/copy'), { projectDir: parent, from: base, to: name }).then(function (data) {
+                if (!data || data.ok !== true) throw new Error((data && data.error) || '复制失败');
+                const newRoot = parent.replace(/[\\/]+$/, '') + sep + name;
+                // v2 Pass P133a 收口1（终核 B-2）：桥端 doFsCopy 用 fs.cpSync，Node 24.12/Windows 对非 ASCII
+                // （如中文）目标名会静默不复制却回 ok:true；切换之前先用既有 /fs/list 复核副本目录真的
+                // 存在，不存在就报错且**不切换**——否则会切到一个不存在的目录、状态条却说"已复制并切换"、
+                // 树报「projectDir 不存在」。根治（桥端改 fs.promises.cp）在 server.js 一侧。
+                return ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: newRoot, path: '.' }).then(function (lst) {
+                    if (!lst || lst.ok !== true) throw new Error('桥端报告复制成功，但副本目录「' + name + '」不存在（复制未生效）' + (lst && lst.error ? '：' + lst.error : ''));
+                    ovlSetProjectPath(newRoot, { skipWatch: true });
+                    OvlState.usingWebkitFallback = false;
+                    OvlState.dirHandle = new OvlRemoteDirHandle('.', ovlProjectHistoryBasename(newRoot) || newRoot);
+                    __ovlProjectEpoch++;
+                    ovlResetProjectScopedState();
+                    ovlUpdateTreeToolbtnsVisibility();
+                    return Promise.resolve(ovlRenderTree(OvlState.dirHandle)).then(function () {
+                        try { ovlBridgeUpdateWatch(); } catch (e3) {}
+                        ovlFlashSaveStatus('已复制到「' + name + '」并切换到该副本', false);
+                    });
+                });
+            }).catch(function (e2) {
+                console.error('[ovl] make a copy (remote) failed', e2);
+                ovlFlashSaveStatus('复制失败：' + (e2 && e2.message ? e2.message : String(e2)), true);
+            });
+        }
+    });
+}
 async function ovlProjectMakeCopy() {
     if (!OvlState.dirHandle) { ovlFlashSaveStatus('请先打开项目文件夹', true); return; }
     if (OvlState.usingWebkitFallback) { ovlFlashSaveStatus('降级只读模式（webkitdirectory）下无法复制项目', true); return; }
     // v2 Pass P50：目标文件夹靠 showDirectoryPicker() 选，这是浏览器本机原生对话框，只能选本机
     // 目录——远程模式下源项目在桥所在的远程机器上，"选一个本机目录当远程项目的复制目标"这件事
-    // 本身不成立，明确禁用并说明原因，不让用户点了没反应。
-    if (ovlIsRemoteBridge()) { ovlFlashSaveStatus('远程模式下暂不支持「Make a copy」（目标文件夹选择器只能选本机目录，选不了远程机器上的路径）。请改用 Overleaf 同步，或直接在远程机器上手动复制。', true); return; }
+    // 本身不成立。v2 Pass P133（m2）：改走桥端 /fs/copy 的远程等价实现（见 ovlProjectMakeCopyRemote）。
+    if (ovlIsRemoteBridge()) { ovlProjectMakeCopyRemote(); return; }
     if (!window.showDirectoryPicker) { ovlFlashSaveStatus('这个浏览器不支持选择目标文件夹', true); return; }
     let destParent;
     try {
@@ -53334,8 +53534,22 @@ function ovlBindVisualTranslate() {
         if (e.target.closest('#ovlVisTransCopyBtn')) {
             const body = document.getElementById('ovlVisTransBody');
             const text = body ? body.textContent : '';
-            if (text && navigator.clipboard && navigator.clipboard.writeText) {
-                navigator.clipboard.writeText(text).then(function () { showToast('已复制译文', 'success'); }).catch(function () {});
+            // v2 Pass P133（m4，R1 E-6）：非安全上下文（同网 http://IP:8181/ 打开）下
+            // navigator.clipboard 整个是 undefined，以前这里条件不满足就什么都不做——无 toast、
+            // 无兜底，用户点了没反应。改成跟 copyToClipboard（P110）同一套降级：原生 API 可用
+            // 就用，不可用/被拒绝就退到既有的 ovlClipboardWriteFallback（execCommand('copy')），
+            // 两条路都给可见提示；兜底也失败时明确说"复制失败"而不是假报成功。
+            if (text) {
+                const fallbackCopy = function () {
+                    let ok = false;
+                    try { ok = ovlClipboardWriteFallback(text); } catch (e2) { ok = false; }
+                    showToast(ok ? '已复制译文' : '复制失败：浏览器拒绝了剪贴板写入（非安全上下文且 execCommand 兜底也不可用）', ok ? 'success' : 'error');
+                };
+                if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+                    navigator.clipboard.writeText(text).then(function () { showToast('已复制译文', 'success'); }).catch(fallbackCopy);
+                } else {
+                    fallbackCopy();
+                }
             }
         }
     });
@@ -53477,7 +53691,9 @@ function ovlRenderMbFileMenu() {
     html += ovlMbItem({ sep: 1 });
     // v2 Pass P110：同上（桌面版项目菜单 data-proj="makeCopy" 那处注释）——非安全上下文下
     // showDirectoryPicker() 不存在，这里跟移动端菜单既有的 disabled/tip 机制走同一套。
-    html += ovlMbItem({ id: 'makeCopy', label: 'Make a copy', disabled: !OvlState.dirHandle || !window.isSecureContext, tip: window.isSecureContext ? '' : '本地文件夹模式需要 HTTPS 或本机环境' });
+    // v2 Pass P133（m2）：远程模式走 /fs/copy 等价实现，不再依赖 showDirectoryPicker——远程下即使非安全上下文也可用。
+    const mbMakeCopyOk = !!(window.isSecureContext || ovlIsRemoteBridge());
+    html += ovlMbItem({ id: 'makeCopy', label: 'Make a copy', disabled: !OvlState.dirHandle || !mbMakeCopyOk, tip: mbMakeCopyOk ? '' : '本地文件夹模式需要 HTTPS 或本机环境' });
     // 本地版本历史是 M11（⚪最低优先级，见 §4 里程碑表），这一轮没做——禁用且写清楚，不隐藏。
     html += ovlMbItem({ id: 'history', label: 'Show version history', disabled: true, tip: '未实现：本地版本历史是 M11（最低优先级），见交付说明的遗留清单' });
     html += ovlMbItem({ id: 'wordCount', label: 'Word count' });
