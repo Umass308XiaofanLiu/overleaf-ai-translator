@@ -4392,8 +4392,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.14.02';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-05';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.14.03';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-06';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -39202,9 +39202,29 @@ function ovlIsRemoteBridge(originArg) {
 // server.js 的 tokenAuthorized）——统一在这一层加，调用点不用逐个改。本地默认地址下
 // OvlSettings.ovlBridgeToken 多半是空字符串，加不加这个头对本地桥（不校验令牌）无影响。
 const OVL_BRIDGE_TOKEN_HEADER = 'X-Latex-Bridge-Token';
+// ---- v2 Pass P133d：访问令牌的统一归一化（用户实测：把 .bridge-token 的内容粘进弹框被判"无效"）----
+// 现场事实：jump 上那份 .bridge-token 是 64 字节、**结尾没有换行**，`type` 出来之后终端的下一个
+// 提示符会紧贴在令牌后面（`<令牌>C:\Users\xiaofanl>`）；用同一份文件在 jump 侧带令牌 POST /fs/list
+// 拿到的是 400（鉴权已通过、只是缺参数），无令牌是 401 —— 即令牌文件本身有效，是**粘贴值带了多余
+// 字符**。所以所有"令牌入口"统一走这里：去掉换行/制表符 + 首尾空白，再按令牌字符集校验。
+// 字符集：桥自己生成的是 crypto.randomBytes(32).toString('hex')（纯十六进制）；LATEX_BRIDGE_TOKEN
+// 允许自定义，所以放宽到「URL 非保留字符 + base64 字符」。`C:\Users\xiaofanl>` 里的 `:`/`\`/`>`
+// 都不在其中 → 命中 charset，直接判无效并提示，**不写盘**（写进去只会换来一次 401 和更难查的现象）。
+// 只作用于桥令牌这一个字段，不扩到 overleafToken 等其它字段。
+const OVL_BRIDGE_TOKEN_CHAR_RE = /^[A-Za-z0-9._~+/=-]+$/;
+const OVL_BRIDGE_TOKEN_BAD_CHARS_MSG = '访问令牌里混进了不该有的字符（多半把终端提示符/路径一起复制进来了）。没有保存——请只复制 .bridge-token 文件里的那一串。';
+function ovlBridgeTokenNormalize(raw) {
+    let s = '';
+    try { s = String(raw == null ? '' : raw).replace(/[\r\n\t]+/g, '').trim(); } catch (e) { s = ''; }
+    if (!s) return { value: '', ok: false, reason: 'empty' };
+    if (!OVL_BRIDGE_TOKEN_CHAR_RE.test(s)) return { value: s, ok: false, reason: 'charset' };
+    return { value: s, ok: true, reason: '' };
+}
 function ovlBridgeAuthHeaders(existing) {
     let token = '';
-    try { token = (OvlSettings && OvlSettings.ovlBridgeToken || '').trim(); } catch (e) {}
+    // P133d：读侧也走同一条归一化——历史存档里可能已经存着带空白/换行的脏值，带换行的头会让
+    // fetch 直接抛 TypeError（非法头值），归一化之后至少能正常发出去、拿到诚实的 401。
+    try { token = ovlBridgeTokenNormalize(OvlSettings && OvlSettings.ovlBridgeToken).value; } catch (e) {}
     if (!token) return existing || {};
     const h = Object.assign({}, existing || {});
     h[OVL_BRIDGE_TOKEN_HEADER] = token;
@@ -39230,11 +39250,17 @@ function ovlBridgeTokenPromptOnce() {
                 placeholder: '粘贴访问令牌',
                 confirmLabel: '保存并重试',
                 onConfirm: function (v) {
-                    const token = String(v || '').trim();
-                    if (token) {
-                        try { OvlSettings.ovlBridgeToken = token; ovlSaveSettings(); } catch (e) { console.warn('[ovl] save bridge token failed', e); }
+                    // v2 Pass P133d：首用弹窗也走统一归一化（去换行/制表符 + trim + 字符集校验）。
+                    // 粘进来的串带了终端提示符之类的杂质时**不写盘**、出一条中文提示，并按"用户取消"
+                    // 处理（resolve('')）——原样把这次 401 交回调用点，绝不拿脏值去重试。
+                    const norm = ovlBridgeTokenNormalize(v);
+                    if (!norm.ok) {
+                        if (norm.reason === 'charset') { try { showToast(OVL_BRIDGE_TOKEN_BAD_CHARS_MSG, 'error'); } catch (e) {} }
+                        resolve('');
+                        return;
                     }
-                    resolve(token);
+                    try { OvlSettings.ovlBridgeToken = norm.value; ovlSaveSettings(); } catch (e) { console.warn('[ovl] save bridge token failed', e); }
+                    resolve(norm.value);
                 },
                 onCancel: function () { resolve(''); }
             });
@@ -47570,6 +47596,19 @@ const OVL_SETTINGS_DEFAULTS = {
     // 单位秒；0 = 永不消失（见 ovlHighlightExpiryMs 的特判）。默认 60 秒是用户明确指定的值。
     ovlHighlightExpirySec: 60
 };
+// ---- v2 Pass P133d：凭证类设置项白名单（诊断 .claude/tmp/p133_token_prompt_diag.md §1.2）----
+// 这两个字段是「同一个 data-setpath 通用 change 处理」下仅有的两个凭证（都是 type="password"）：
+//   settings.ovlBridgeToken  远程桥访问令牌（清空 → /fs/* 401 → 弹「需要访问令牌」，本次事故）
+//   settings.overleafToken   Overleaf Git Token（清空 → 要去 Overleaf 网站重新生成，代价更大）
+// 同机制下其余 token/key 形状的字段经逐个核对**没有**：settings.overleafProjectAddr（项目地址）、
+// settings.ovlAiMergeEndpoint / settings.ovlAiMergeModel、settings.pdf2texVisionEndpoint /
+// settings.pdf2texVisionModel / settings.pdf2texDefaultOutDir、settings.ovlBridgeAddr 都是
+// 地址/模型名/目录名，清空 = 回落到默认值，是合法且可逆的操作，不能纳入守卫。
+// 翻译器那三个 API Key（#geminiApiKeyInput / #openaiApiKeyInput / #claudeApiKeyInput）存在
+// AppState 而不是 OvlSettings，也不走 data-setpath 这套委托，不在本白名单的作用域内。
+const OVL_CREDENTIAL_SETPATHS = ['settings.ovlBridgeToken', 'settings.overleafToken'];
+// 「恢复默认」要保留的键（= 上面白名单去掉 "settings." 前缀）。
+const OVL_RESET_PRESERVE_KEYS = OVL_CREDENTIAL_SETPATHS.map(function (p) { return p.split('.')[1]; });
 const OVL_FONT_FAMILIES = {
     'ovl-mono-default': '"SFMono-Regular", Consolas, "Courier New", monospace',
     'ovl-mono-menlo': 'Menlo, Monaco, "Courier New", monospace',
@@ -47738,11 +47777,33 @@ function ovlApplySettings() {
     } catch (e) { console.error('[ovl] applySettings failed', e); }
 }
 
+// v2 Pass P133d：「恢复默认」原来是**一键静默**把 OvlSettings 整个拍回默认值——连远程桥访问令牌
+// 和 Overleaf Git Token 一起清成空串，没有二次确认、没有撤销（诊断 §1.2-B，实测复现 §3.1[6]）。
+// 现在改成两条：① 先过既有的 ovlConfirmDialog（项目现成组件，符合「禁 window.confirm」纪律）；
+// ② 确认后保留 OVL_RESET_PRESERVE_KEYS 里的凭证，其余设置项照旧回默认值。
+// 保留范围刻意只含凭证：ovlBridgeAddr 这类地址仍然回默认（"恢复默认"就该把可逆的配置恢复掉）。
 function ovlResetSettings() {
-    OvlSettings = Object.assign({}, OVL_SETTINGS_DEFAULTS);
+    ovlConfirmDialog({
+        title: '恢复默认设置',
+        message: '所有设置将恢复为默认值。已填写的「远程桥接 → 访问令牌」和「Overleaf 同步 → Overleaf Git Token」会被保留（这两项清掉之后没法自动找回）。确定继续吗？',
+        confirmLabel: '恢复默认',
+        danger: true,
+        onConfirm: ovlResetSettingsApply
+    });
+}
+function ovlResetSettingsApply() {
+    const preserved = {};
+    try {
+        OVL_RESET_PRESERVE_KEYS.forEach(function (k) {
+            const v = OvlSettings ? OvlSettings[k] : '';
+            if (typeof v === 'string' && v.trim() !== '') preserved[k] = v;
+        });
+    } catch (e) { console.warn('[ovl] P133d 保留凭证失败', e); }
+    OvlSettings = Object.assign({}, OVL_SETTINGS_DEFAULTS, preserved);
     ovlSaveSettings();
     ovlApplySettings();
     ovlRenderSettingsCategory(OvlSettingsState.cat);
+    try { showToast(Object.keys(preserved).length ? '设置已恢复默认（已保留访问令牌 / Overleaf Git Token）' : '设置已恢复默认', 'info'); } catch (e) {}
 }
 
 // ---- M7 Compiler（真的驱动桥）+ M4 编译选项菜单：同一份状态，两个入口（决策 D 同一条纪律） ----
@@ -48237,7 +48298,15 @@ async function ovlBridgeTestConnection() {
     const addrInput = document.getElementById('ovlBridgeAddrInput');
     const tokenInput = document.getElementById('ovlBridgeTokenInput');
     const addr = ((addrInput && addrInput.value) || '').trim().replace(/\/+$/, '') || ovlBridgeOrigin();
-    const token = ((tokenInput && tokenInput.value) || '').trim();
+    // v2 Pass P133d：「测试连接」读的是输入框当前值（用户可能还没失焦），同样走统一归一化；
+    // 字符集不合法时直接把"是粘贴脏了"这件事说清楚，不拿脏值去打桥（那只会回一个 401，把
+    // "令牌文件有效但粘错了"误报成"令牌不对"——正是用户这次踩到的那条弯路）。
+    const tokenNorm = ovlBridgeTokenNormalize(tokenInput && tokenInput.value);
+    if (tokenNorm.reason === 'charset') {
+        if (resultEl) { resultEl.textContent = '✗ 访问令牌里含有不该出现的字符（像是把终端提示符一起复制进来了），请只粘贴令牌本身'; resultEl.style.color = '#f87171'; }
+        return;
+    }
+    const token = tokenNorm.value;
     if (resultEl) { resultEl.textContent = '测试中…'; resultEl.style.color = '#9AA4B2'; }
     try {
         const ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
@@ -48429,6 +48498,37 @@ function ovlBindSettingsModal() {
         if (path === 'settings.fontSize' || path === 'settings.tabSize' || path === 'settings.overleafAutoPullMinutes'
             || path === 'settings.pdf2texConcurrency' || path === 'settings.pdf2texMaxPx'
             || path === 'settings.ovlHighlightExpirySec') val = Number(val);
+        // v2 Pass P133d（T0 追加）：桥令牌走统一归一化（见 ovlBridgeTokenNormalize 上方注释）——
+        // 去掉换行/制表符 + 首尾空白后再落盘；字符集不合法（把终端提示符/路径一起粘进来了）时
+        // **不写盘**、把输入框恢复成已存值、出一条中文提示。只作用于 settings.ovlBridgeToken。
+        if (path === 'settings.ovlBridgeToken') {
+            const tnorm = ovlBridgeTokenNormalize(val);
+            if (tnorm.reason === 'charset') {
+                try { el.value = String(store[parts[1]] == null ? '' : store[parts[1]]); } catch (e2) {}
+                try { showToast(OVL_BRIDGE_TOKEN_BAD_CHARS_MSG, 'error'); } catch (e2) {}
+                return;
+            }
+            val = tnorm.value;
+            // 归一化把首尾空白吃掉之后，输入框里还留着那份"脏"的显示值——同步回干净值，
+            // 免得下一次失焦又拿旧的脏值触发一次 change。
+            try { if (el.value !== val) el.value = val; } catch (e2) {}
+        }
+        // v2 Pass P133d：凭证字段「清空不算修改」守卫（诊断 .claude/tmp/p133_token_prompt_diag.md §1.2-A）。
+        // 事故根因：这个 change 委托原来对所有字段一视同仁地 `store[k] = el.value; ovlSaveSettings()`，
+        // 于是「把访问令牌框清空 → 一失焦」就把空串静默覆盖存进 localStorage['ovl.settings']，
+        // 下一次 /fs/* 收 401 且本地令牌为空 → 弹「需要访问令牌」（实测复现见诊断 §3.1[3][4]；
+        // 旧版 03.07.00 同样中招，见 §3.2，所以这不是 P133 引入的，是既有设计缺陷）。
+        // 守卫只覆盖 OVL_CREDENTIAL_SETPATHS：新值 trim 后为空、而已存值非空 → 不写、不存盘，
+        // 把输入框恢复成已存值（type=password 本来就是掩码显示，不会因此泄露明文），只出一条
+        // toast，不弹任何新对话框。换令牌照旧：粘贴任何非空值都会正常写盘。
+        if (OVL_CREDENTIAL_SETPATHS.indexOf(path) !== -1) {
+            const prevCred = String(store[parts[1]] == null ? '' : store[parts[1]]);
+            if (String(val).trim() === '' && prevCred.trim() !== '') {
+                try { el.value = prevCred; } catch (e2) {}
+                try { showToast('凭证不会被清空——已恢复为原来的值。要更换请直接粘贴新的值。', 'info'); } catch (e2) {}
+                return;
+            }
+        }
         store[parts[1]] = val;
         if (parts[0] === 'compile') { ovlSaveCompileSettings(); ovlUpdatePdfToolbarUI(); }
         else { ovlSaveSettings(); ovlApplySettings(); }
