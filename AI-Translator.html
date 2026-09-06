@@ -4392,7 +4392,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.14.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.14.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-05';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -36390,14 +36390,12 @@ class OvlRemoteDirHandle {
         if (!data || data.ok !== true) throw new Error((data && data.error) || '列出远程目录失败');
         return Array.isArray(data.entries) ? data.entries : [];
     }
-    // v2 Pass P133a 收口1：wantDir 传 null/undefined 表示"不分文件/目录，只看名字"——removeEntry 的
-    // 删后复核用它（删的是文件还是目录，调用方不一定知道也不需要知道）。原有 true/false 调用形状
-    // 与语义一字不变；/fs/list 自身失败仍按既有语义视为"不存在"。
+    // __childExists 的语义是"列不出来 = 不存在"（getFileHandle/getDirectoryHandle 靠它决定要不要
+    // create），删后复核不能复用这条语义——见 removeEntry 的注释。
     async __childExists(name, wantDir) {
         let entries;
         try { entries = await this.__listRaw(); } catch (e) { return false; }
-        const anyKind = (wantDir === null || wantDir === undefined);
-        return entries.some(function (e) { return e.name === name && (anyKind || !!e.isDir === !!wantDir); });
+        return entries.some(function (e) { return e.name === name && !!e.isDir === !!wantDir; });
     }
     async *entries() {
         const raw = await this.__listRaw();
@@ -36437,11 +36435,22 @@ class OvlRemoteDirHandle {
         if (!data || data.ok !== true) throw new Error((data && data.error) || '删除远程文件/目录失败');
         // v2 Pass P133a 收口1（终核 B-1）：桥端 doFsDelete 用 fs.rmSync，Node 24.12/Windows 对含非 ASCII
         // （如中文）成分的路径会静默不删、不抛错，桥照样回 ok:true——前端若盲信就变成"界面说已删除/
-        // 已重命名、文件还在"的静默失效（中文名改名 = 新旧两个文件并存）。删完用既有 __childExists
-        // （一次 /fs/list，不分文件/目录）复核一遍，仍在就明确抛错，让调用点（ovlPerformRename /
-        // ovlPerformDelete → ovlHandleCtxAction）走"失败"分支显示真实状态、不假报成功。根治（桥端改
-        // fs.promises.rm）在 server.js 一侧。
-        if (await this.__childExists(name, null)) {
+        // 已重命名、文件还在"的静默失效（中文名改名 = 新旧两个文件并存）。删完再列一次父目录复核，
+        // 让调用点（ovlPerformRename / ovlPerformDelete → ovlHandleCtxAction）显示真实状态、不假报成功。
+        // 根治（桥端改 fs.promises.rm）在 server.js 一侧。
+        // v2 Pass P133a 收口3（终核 B-4）：这里**不能**复用 __childExists——它的既有语义是"列不出来 =
+        // 不存在"（getFileHandle/getDirectoryHandle 靠这条去 create，不能动），拿来当删后复核就是
+        // fail-open：复核那一次 /fs/list 只要失败（桥重启窗口、链路抖动、令牌刚被轮换回 401、桥被
+        // 别的操作打崩），"没能确认"会被当成"确认删掉了"，上面那条静默失效原样回来。改成直接
+        // 列一次做三态判定：列到同名 = 确认没删掉；列不到 = 通过；**列表本身失败 = 结果无法确认**，
+        // 同样抛错，让状态条说"不确定、去刷新看看"而不是说"已删除"。请求次数不变（仍是一次 /fs/list）。
+        let after;
+        try {
+            after = await this.__listRaw();
+        } catch (e) {
+            throw new Error('无法列出远程目录复核，「' + name + '」的删除结果无法确认（' + (e && e.message ? e.message : String(e)) + '）；请刷新文件树确认');
+        }
+        if (after.some(function (e) { return e.name === name; })) {
             throw new Error('桥端报告删除成功，但「' + name + '」仍在远程目录中（删除未生效）');
         }
     }
