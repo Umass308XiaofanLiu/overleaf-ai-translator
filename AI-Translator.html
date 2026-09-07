@@ -4392,8 +4392,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.14.03';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-06';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.15.00';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-07';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -4414,11 +4414,17 @@ const DEFAULT_MODEL_CATALOG = [
     { id: 'gpt-5.2',                    name: 'GPT-5.2',               sub: 'Best Quality',         short: 'GPT-5.2',    provider: 'openai', tier: 'pro'  },
     { id: 'claude-haiku-4-5-20251001',  name: 'Claude Haiku 4.5',      sub: 'Fast & Efficient',     short: 'Haiku',      provider: 'claude', tier: 'lite' },
     { id: 'claude-sonnet-4-5-20250929', name: 'Claude Sonnet 4.5',     sub: 'Balanced Performance', short: 'Sonnet 4.5', provider: 'claude', tier: 'fast' },
-    { id: 'claude-opus-4-5-20251101',   name: 'Claude Opus 4.5',       sub: 'Best Quality',         short: 'Opus 4.5',   provider: 'claude', tier: 'pro'  }
+    { id: 'claude-opus-4-5-20251101',   name: 'Claude Opus 4.5',       sub: 'Best Quality',         short: 'Opus 4.5',   provider: 'claude', tier: 'pro'  },
+    // v2 Pass P134：阿里云百炼 Qwen(DashScope OpenAI 兼容模式)。id 未经真实 /v1/models 拉取校验
+    // （用户需求文本点名的型号名），走种子目录同一套"离线兜底，刷新按钮可覆盖"规则。
+    { id: 'qwen-turbo',                 name: 'Qwen Turbo',            sub: 'Fast & Cheap',         short: 'Turbo',      provider: 'qwen',   tier: 'lite' },
+    { id: 'qwen-plus',                  name: 'Qwen Plus',             sub: 'Balanced Performance', short: 'Plus',       provider: 'qwen',   tier: 'fast' },
+    { id: 'qwen-max',                   name: 'Qwen Max',              sub: 'Best Quality',         short: 'Max',        provider: 'qwen',   tier: 'pro'  },
+    { id: 'qwen-vl-max',                name: 'Qwen VL Max',           sub: 'Vision',               short: 'VL Max',     provider: 'qwen',   tier: 'pro'  }
 ];
 
-const MODEL_PROVIDERS = ['gemini', 'openai', 'claude'];
-const MODEL_PROVIDER_LABEL = { gemini: 'Google Gemini', openai: 'OpenAI', claude: 'Anthropic Claude' };
+const MODEL_PROVIDERS = ['gemini', 'openai', 'claude', 'qwen'];
+const MODEL_PROVIDER_LABEL = { gemini: 'Google Gemini', openai: 'OpenAI', claude: 'Anthropic Claude', qwen: '阿里云百炼 Qwen' };
 
 // 缓存超过 7 天只改文案（提示「已过期」），绝不清空数据
 const MODEL_CATALOG_TTL = 7 * 24 * 60 * 60 * 1000;
@@ -4485,7 +4491,8 @@ const MODEL_PRICING = {
         'gemini-2.5-flash-lite':  { in: 0.10, out: 0.40,  note: '音频输入另计 $0.30 / 1M（文本翻译不受影响）' }
     },
     openai: {},   // 预留：结构与 gemini 桶一致，届时直接加 { 'gpt-5.2': { in, out } } 即可
-    claude: {}    // 预留：同上
+    claude: {},   // 预留：同上
+    qwen: {}      // 预留：同上，UI 已有"价格未知"兜底文案
 };
 
 // 前缀继承的**尾巴白名单**。规则：宁可少显示一个价，也绝不能显示一个错价。
@@ -4646,7 +4653,7 @@ const AppState = {
     error: null,
 
     // API配置
-    apiProvider: 'gemini', // 'gemini' | 'openai' | 'claude' | 'local'
+    apiProvider: 'gemini', // 'gemini' | 'openai' | 'claude' | 'local' | 'qwen'
     selectedModel: DEFAULT_MODEL_CATALOG[0].id,
     geminiApiKey: "", // Gemini API Key
     openaiApiKey: "", // OpenAI API Key
@@ -4654,9 +4661,14 @@ const AppState = {
     claudeProxyUrl: "", // Claude Proxy URL (Cloudflare Worker)
     localBaseUrl: "http://localhost:1234",
     localModels: [],
+    // v2 Pass P134：阿里云百炼 Qwen(DashScope OpenAI 兼容模式)。qwenBaseUrl 默认国际站
+    // （用户拍板：两个端点 CORS 均已实测放行，见 p134_qwen_plan.md §4，用户没有指定倾向时
+    // 默认选国际站，Settings 下拉可切到国内站，或直接手改这个字段覆盖成任意地址）。
+    qwenApiKey: "", // Qwen (DashScope) API Key
+    qwenBaseUrl: "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
     // 在线模型目录的 API 拉取结果，按 provider 分桶。
     // 空数组 = 从未成功拉取过，getModelCatalog() 自动落回 DEFAULT_MODEL_CATALOG。
-    fetchedModels: { gemini: [], openai: [], claude: [] },
+    fetchedModels: { gemini: [], openai: [], claude: [], qwen: [] },
 
     // 编辑状态
     activeIndex: null,
@@ -4741,13 +4753,14 @@ const AppState = {
     modelRefresh: {
         gemini: { status: 'idle', at: 0, count: 0, errCode: null, errMsg: '', source: 'builtin' },
         openai: { status: 'idle', at: 0, count: 0, errCode: null, errMsg: '', source: 'builtin' },
-        claude: { status: 'idle', at: 0, count: 0, errCode: null, errMsg: '', source: 'builtin' }
+        claude: { status: 'idle', at: 0, count: 0, errCode: null, errMsg: '', source: 'builtin' },
+        qwen: { status: 'idle', at: 0, count: 0, errCode: null, errMsg: '', source: 'builtin' }
     },
     settingsModelQuery: '',   // 设置弹窗里的模型搜索关键词
     showDatedSnapshots: false, // 是否保留 OpenAI 的 -YYYY-MM-DD 固定快照（下次更新生效）
     newlyFoundIds: [],         // 本次刷新新发现的 id，用于 NEW 徽标和「全部显示」
     settingsModalWidth: SETTINGS_MODAL_DEFAULT_WIDTH, // Settings 弹窗宽度（px），拖拽手柄调整后持久化
-    modelGroupExpanded: { gemini: false, openai: false, claude: false }, // Settings 弹窗里「展开了哪几家」；刻意不落 localStorage，每次开弹窗都回到折叠
+    modelGroupExpanded: { gemini: false, openai: false, claude: false, qwen: false }, // Settings 弹窗里「展开了哪几家」；刻意不落 localStorage，每次开弹窗都回到折叠
     settingsTab: SETTINGS_TABS[0].id, // Settings 弹窗当前页签（持久化到 localStorage['settingsTab']，关弹窗/刷新都记得）
     rowGap: ROW_GAP_DEFAULT,          // 句对行距（px），左右两栏共用；持久化到 localStorage['rowGap']
 
@@ -4821,7 +4834,9 @@ function getApiConfig() {
         geminiApiKey: AppState.geminiApiKey,
         openaiApiKey: AppState.openaiApiKey,
         claudeApiKey: AppState.claudeApiKey,
-        claudeProxyUrl: AppState.claudeProxyUrl
+        claudeProxyUrl: AppState.claudeProxyUrl,
+        qwenApiKey: AppState.qwenApiKey,
+        qwenBaseUrl: AppState.qwenBaseUrl
     };
 }
 
@@ -7746,6 +7761,11 @@ async function callModelPlainText(prompt, config, signal, meta, opts) {
     if (config.provider === 'local') {
         return await callLocalLLM(config.localBaseUrl, config.model, [{ role: 'user', content: prompt }], false, signal, meta || null, opts || null);
     }
+    // v2 Pass P134：Qwen(DashScope) 复用 callLocalLLM 传输层，只是换 baseUrl 并带上 apiKey。
+    if (config.provider === 'qwen') {
+        const qwenOpts = Object.assign({}, opts || null, { apiKey: config.qwenApiKey });
+        return await callLocalLLM(config.qwenBaseUrl, config.model, [{ role: 'user', content: prompt }], false, signal, meta || null, qwenOpts);
+    }
     if (config.provider === 'openai') {
         return await callOpenAIAPI(config.model, [{ role: 'user', content: prompt }], {}, config.openaiApiKey, signal) || '';
     }
@@ -8421,6 +8441,12 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
     const oTemp = (o && typeof o.temperature === 'number' && isFinite(o.temperature)) ? o.temperature : null;
     const oMax = (o && typeof o.maxTokens === 'number' && isFinite(o.maxTokens) && o.maxTokens > 0)
         ? Math.round(o.maxTokens) : null;
+    // v2 Pass P134：可选鉴权头。不传 opts.apiKey（即现状所有 'local' 调用点）时 headers
+    // 逐字节维持原来的 { "Content-Type": "application/json" } 字面量，不发 Authorization——
+    // 只有像 Qwen(DashScope) 这类需要 Bearer 鉴权的 OpenAI 兼容云端点才会传这个字段。
+    const oApiKey = (o && typeof o.apiKey === 'string' && o.apiKey) ? o.apiKey : null;
+    const headers = { "Content-Type": "application/json" };
+    if (oApiKey) headers.Authorization = 'Bearer ' + oApiKey;
     const body = {
         model: model || "local-model",
         messages: messages,
@@ -8473,7 +8499,7 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
     try {
         let response = await fetch(endpoint, {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: headers,
             body: JSON.stringify(body),
             signal
         });
@@ -8496,7 +8522,7 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
             delete body.tool_choice;
             response = await fetch(endpoint, {
                 method: "POST",
-                headers: { "Content-Type": "application/json" },
+                headers: headers,
                 body: JSON.stringify(body),
                 signal
             });
@@ -8512,7 +8538,7 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
                 delete body.reasoning_effort;
                 response = await fetch(endpoint, {
                     method: "POST",
-                    headers: { "Content-Type": "application/json" },
+                    headers: headers,
                     body: JSON.stringify(body),
                     signal
                 });
@@ -8749,6 +8775,43 @@ async function fetchOpenaiModelList(apiKey, hideSnapshots) {
                 // 这是抗陈旧的逃生口 —— 纯白名单对每个新发布家族都是零日盲区。
                 group: OPENAI_ALLOW.test(id) ? 'chat' : 'other'
             };
+        })
+        .filter(Boolean)
+        .sort((a, b) => (b.created || 0) - (a.created || 0));
+}
+
+// —— 阿里云百炼 Qwen(DashScope OpenAI 兼容模式) ——
+// GET ${origin}/v1/models，与 fetchLocalModels 用的同一条 xportCapsOrigin 归一约定
+// （baseUrl 允许写成 ".../compatible-mode/v1"，归一后去掉末尾 /v1 再统一拼回 /v1/models，
+// 逐字节复用 fetchLocalModels 8575 行那条注释里讲的口子——写不写尾部 /v1 都能命中）。
+// 响应形状是标准 OpenAI /v1/models（{object:"list", data:[{id, created, owned_by}, ...]}），
+// v2 Pass P134 实测（curl，不带密钥）确认该端点存在、需要 Bearer 鉴权、CORS 对 file://
+// 与局域网同源页面均放行（见 .claude/tmp/p134_qwen_plan.md §4）。
+async function fetchQwenModelList(apiKey, baseUrl) {
+    if (!apiKey) throw modelFetchError('NO_KEY', '未填写 Qwen API Key');
+    if (!baseUrl) throw modelFetchError('HTTP', '未填写 Qwen 服务地址（Base URL）');
+
+    const endpoint = `${xportCapsOrigin(baseUrl)}/v1/models`;
+    const response = await fetchWithTimeout(endpoint, {
+        method: "GET",
+        headers: { "Authorization": `Bearer ${apiKey}` }
+        // 不要加 credentials:'include'，同上方三条铁律注释
+    });
+    if (!response.ok) {
+        const errJson = await response.json().catch(() => null);
+        const info = classifyModelHttpError(response.status, errJson);
+        throw modelFetchError(info.errCode, info.errMsg);
+    }
+
+    const json = await response.json();
+    const all = Array.isArray(json.data) ? json.data : [];
+
+    return all
+        .filter(m => m && typeof m.id === 'string')
+        .map(m => {
+            const id = sanitizeModelId(m.id);
+            if (!id) return null;
+            return { id, name: id, provider: 'qwen', created: m.created || 0, group: 'chat' };
         })
         .filter(Boolean)
         .sort((a, b) => (b.created || 0) - (a.created || 0));
@@ -10776,6 +10839,10 @@ async function xportRequest(items, srcName, tgtName, config, signal, outMeta) {
     if (config.provider === 'local') {
         raw = await callLocalLLM(config.localBaseUrl, config.model,
             [{ role: 'system', content: sys }, { role: 'user', content: user }], false, signal, meta);
+    } else if (config.provider === 'qwen') {
+        // v2 Pass P134：复用同一条 callLocalLLM 传输，只是换 baseUrl 并带 apiKey。
+        raw = await callLocalLLM(config.qwenBaseUrl, config.model,
+            [{ role: 'system', content: sys }, { role: 'user', content: user }], false, signal, meta, { apiKey: config.qwenApiKey });
     } else {
         raw = await callGeminiAPI(config.model, user,
             { systemInstruction: sys, temperature: 0.3 }, config.geminiApiKey, signal, meta);
@@ -10799,6 +10866,12 @@ async function xportLegacyOne(seg, srcName, tgtName, config, signal) {
         const meta = {};
         const r = await callLocalLLM(config.localBaseUrl, config.model,
             [{ role: 'system', content: systemPrompt }, { role: 'user', content: seg }], false, signal, meta);
+        data = parseLocalJson(r, meta);
+    } else if (config.provider === 'qwen') {
+        // v2 Pass P134：同上一级，复用 callLocalLLM，换 baseUrl + 带 apiKey。
+        const meta = {};
+        const r = await callLocalLLM(config.qwenBaseUrl, config.model,
+            [{ role: 'system', content: systemPrompt }, { role: 'user', content: seg }], false, signal, meta, { apiKey: config.qwenApiKey });
         data = parseLocalJson(r, meta);
     } else {
         const r = await callGeminiAPI(config.model, seg, {
@@ -10928,7 +11001,9 @@ async function xportRecoverSegment(mm, rawSeg, wasBatched, srcName, tgtName, con
 function xportActive(config) {
     try {
         if (!AppState.sentinelTransport) return false;
-        return config.provider === 'local' || config.provider === 'gemini';
+        // v2 Pass P134：Qwen 复用与 local 相同的 OpenAI 兼容传输，同样纳入哨兵协议（更稳），
+        // 而不是退回旧版 JSON 协议。
+        return config.provider === 'local' || config.provider === 'gemini' || config.provider === 'qwen';
     } catch (e) { return false; }
 }
 
@@ -11135,6 +11210,25 @@ async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
         return parseLocalJson(response, meta);
     }
 
+    // v2 Pass P134：Qwen 复用同一条 callLocalLLM 传输（旧版 JSON 协议兜底路径，
+    // 正常情况下 xportActive 已把 qwen 纳入哨兵协议，这里不会被走到，但保持与 local 对称）。
+    if (config.provider === 'qwen') {
+        const meta = {};
+        const response = await callLocalLLM(
+            config.qwenBaseUrl,
+            config.model,
+            [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: text }
+            ],
+            false,
+            signal,
+            meta,
+            { apiKey: config.qwenApiKey }
+        );
+        return parseLocalJson(response, meta);
+    }
+
     // OpenAI Path
     if (config.provider === 'openai') {
         const response = await callOpenAIAPI(
@@ -11233,6 +11327,19 @@ CRITICAL RULES:
         );
     }
 
+    // v2 Pass P134：Qwen(DashScope) 复用同一条 callLocalLLM 传输。
+    if (config.provider === 'qwen') {
+        return await callLocalLLM(
+            config.qwenBaseUrl,
+            config.model,
+            [{ role: "user", content: prompt }],
+            false,
+            signal,
+            null,
+            { apiKey: config.qwenApiKey }
+        );
+    }
+
     // OpenAI Path
     if (config.provider === 'openai') {
         const response = await callOpenAIAPI(
@@ -11287,6 +11394,27 @@ async function getSmartUpdate(prompt, config, signal = null) {
         );
         // 这条链路按既有行为**吞掉**失败（返回空串 = 不改动用户的译文），所以 A4 的分类
         // 只落到 console：把「推理吃光预算」和「真的没输出」在排查时分开，UI 行为一字不变。
+        try {
+            const data = parseLocalJson(response, meta);
+            return data.text || "";
+        } catch (e) { console.warn('getSmartUpdate: ' + (e && e.code ? e.code : '') + ' ' + (e && e.message)); return ""; }
+    }
+
+    // v2 Pass P134：Qwen(DashScope) 复用同一条 callLocalLLM 传输。
+    if (config.provider === 'qwen') {
+        const meta = {};
+        const response = await callLocalLLM(
+            config.qwenBaseUrl,
+            config.model,
+            [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: prompt + "\n\nRETURN JSON: {\"text\": \"...\"}" }
+            ],
+            false,
+            signal,
+            meta,
+            { apiKey: config.qwenApiKey }
+        );
         try {
             const data = parseLocalJson(response, meta);
             return data.text || "";
@@ -11396,6 +11524,24 @@ Return JSON: { "alternatives": ["option1", "option2", "option3", "option4"] }`;
         );
         // 同 getSmartUpdate：吞掉失败是既有行为（弹窗显示「没有候选」），
         // A4 的分类只进 console —— 这条链路上 UI 一字不变。
+        try {
+            const data = parseLocalJson(response, meta, { arrayKey: 'alternatives' });
+            return data.alternatives || [];
+        } catch (e) { console.warn('getSynonyms: ' + (e && e.code ? e.code : '') + ' ' + (e && e.message)); return []; }
+    }
+
+    // v2 Pass P134：Qwen(DashScope) 复用同一条 callLocalLLM 传输。
+    if (config.provider === 'qwen') {
+        const meta = {};
+        const response = await callLocalLLM(
+            config.qwenBaseUrl,
+            config.model,
+            [{ role: "user", content: prompt }],
+            false,
+            signal,
+            meta,
+            { apiKey: config.qwenApiKey }
+        );
         try {
             const data = parseLocalJson(response, meta, { arrayKey: 'alternatives' });
             return data.alternatives || [];
@@ -11768,6 +11914,25 @@ async function getGrammarSuggestions(sentence, selectedText, lang, config, avoid
             meta
         );
         // A4 分出来的码现在跟着返回值一起走到弹窗（grammarParseFailure），不再只进 console。
+        try {
+            return normalizeGrammarPayload(parseLocalJson(response, meta, { arrayKey: 'alternatives' }), baseline);
+        } catch (e) {
+            return grammarParseFailure(e);
+        }
+    }
+
+    // v2 Pass P134：Qwen(DashScope) 复用同一条 callLocalLLM 传输。
+    if (config.provider === 'qwen') {
+        const meta = {};
+        const response = await callLocalLLM(
+            config.qwenBaseUrl,
+            config.model,
+            [{ role: "user", content: prompt }],
+            false,
+            signal,
+            meta,
+            { apiKey: config.qwenApiKey }
+        );
         try {
             return normalizeGrammarPayload(parseLocalJson(response, meta, { arrayKey: 'alternatives' }), baseline);
         } catch (e) {
@@ -12994,7 +13159,9 @@ function syncSettingsInputsToState() {
         ['geminiApiKeyInput', 'geminiApiKey'],
         ['openaiApiKeyInput', 'openaiApiKey'],
         ['claudeApiKeyInput', 'claudeApiKey'],
-        ['claudeProxyUrlInput', 'claudeProxyUrl']
+        ['claudeProxyUrlInput', 'claudeProxyUrl'],
+        ['qwenApiKeyInput', 'qwenApiKey'],
+        ['qwenBaseUrlInput', 'qwenBaseUrl']
     ].forEach(function (pair) {
         const input = document.getElementById(pair[0]);
         if (input) {
@@ -13117,7 +13284,8 @@ async function refreshOnlineModels(providers) {
     const keyOf = {
         gemini: AppState.geminiApiKey,
         openai: AppState.openaiApiKey,
-        claude: AppState.claudeApiKey
+        claude: AppState.claudeApiKey,
+        qwen: AppState.qwenApiKey
     };
     if (targets.every(p => !keyOf[p])) {
         showToast('请先在下方填写至少一个 API Key', 'warning');
@@ -13137,6 +13305,7 @@ async function refreshOnlineModels(providers) {
     const tasks = targets.map(function (p) {
         if (p === 'gemini') return fetchGeminiModelList(AppState.geminiApiKey);
         if (p === 'openai') return fetchOpenaiModelList(AppState.openaiApiKey, !AppState.showDatedSnapshots);
+        if (p === 'qwen') return fetchQwenModelList(AppState.qwenApiKey, AppState.qwenBaseUrl);
         return fetchClaudeModelList(AppState.claudeApiKey, AppState.claudeProxyUrl);
     });
 
@@ -14902,7 +15071,8 @@ function escapeAttr(value) {
 const MODEL_ICON_CLASS = {
     gemini: { lite: 'text-emerald-500', fast: 'text-orange-500', pro: 'text-indigo-600' },
     openai: { lite: 'text-teal-500',    fast: 'text-green-500',  pro: 'text-sky-600'   },
-    claude: { lite: 'text-amber-500',   fast: 'text-orange-600', pro: 'text-rose-600'  }
+    claude: { lite: 'text-amber-500',   fast: 'text-orange-600', pro: 'text-rose-600'  },
+    qwen:   { lite: 'text-purple-400',  fast: 'text-violet-500', pro: 'text-fuchsia-600' }
 };
 
 // 给 API 拉回来的陌生模型猜一个档位（只影响图标和配色）
@@ -17437,6 +17607,44 @@ ${renderSettingsEditingExtraSections()}
                         </button>
                     </div>
 
+                    <!-- v2 Pass P134：Qwen (DashScope) API Key Section -->
+                    <div class="pb-5 border-b border-slate-100">
+                        <div class="flex items-center gap-2 mb-3" data-tip="阿里云百炼 Qwen(DashScope OpenAI 兼容模式)。浏览器可直连（file:// 与局域网同源均已实测放行 CORS），不需要 Proxy URL。" data-tip-pos="bottom-start">
+                            <div class="w-6 h-6 bg-gradient-to-br from-purple-500 to-fuchsia-600 rounded-lg flex items-center justify-center">
+                                <span class="text-white">${Icons.Cpu}</span>
+                            </div>
+                            <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">阿里云百炼 Qwen (DashScope)</span>
+                        </div>
+                        <div class="flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 focus-within:ring-2 focus-within:ring-purple-100 transition-all">
+                            <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>
+                            <input type="password" id="qwenApiKeyInput" class="flex-grow bg-transparent border-none text-xs focus:ring-0 p-0 ml-2 text-slate-700 outline-none font-mono" value="${escapeHtml(AppState.qwenApiKey)}" placeholder="sk-...">
+                            <button onclick="toggleApiKeyVisibility('qwenApiKeyInput')" class="text-slate-400 hover:text-slate-600 ml-2" title="Toggle visibility">
+                                ${Icons.Eye}
+                            </button>
+                        </div>
+                        <p class="text-[10px] text-slate-400 mt-2 px-1">
+                            Get your API key from <a href="https://bailian.console.aliyun.com/" target="_blank" class="text-purple-500 hover:underline">阿里云百炼控制台</a>
+                        </p>
+
+                        <!-- Qwen Base URL：下拉选国际/国内站预设，或直接改下面文本框自定义覆盖 -->
+                        <div class="mt-4 mb-3" data-tip="国际站与国内站均已实测支持浏览器直连（CORS 放行）；选一个预设，或直接改下面的地址框自定义覆盖。" data-tip-pos="bottom-start">
+                            <label class="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-2 block">服务地址（Base URL）</label>
+                            <select id="qwenBaseUrlPreset" onchange="applyQwenBaseUrlPreset(this.value)" class="w-full mb-2 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-700 outline-none focus:ring-2 focus:ring-purple-100">
+                                <option value="https://dashscope-intl.aliyuncs.com/compatible-mode/v1" ${AppState.qwenBaseUrl === 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1' ? 'selected' : ''}>国际站（默认，dashscope-intl.aliyuncs.com）</option>
+                                <option value="https://dashscope.aliyuncs.com/compatible-mode/v1" ${AppState.qwenBaseUrl === 'https://dashscope.aliyuncs.com/compatible-mode/v1' ? 'selected' : ''}>国内站（dashscope.aliyuncs.com）</option>
+                                <option value="" ${(AppState.qwenBaseUrl !== 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1' && AppState.qwenBaseUrl !== 'https://dashscope.aliyuncs.com/compatible-mode/v1') ? 'selected' : ''}>自定义（直接编辑下面的地址框）</option>
+                            </select>
+                            <div class="flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 focus-within:ring-2 focus-within:ring-purple-100 transition-all">
+                                ${Icons.Globe}
+                                <input type="text" id="qwenBaseUrlInput" class="flex-grow bg-transparent border-none text-xs focus:ring-0 p-0 ml-2 text-slate-700 outline-none font-mono" value="${escapeHtml(AppState.qwenBaseUrl)}" placeholder="https://dashscope-intl.aliyuncs.com/compatible-mode/v1">
+                            </div>
+                        </div>
+
+                        <button onclick="saveQwenSettings()" class="w-full mt-3 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-purple-200 active:scale-95 transition-all flex items-center justify-center gap-2">
+                            ${Icons.Save} Save Qwen Settings
+                        </button>
+                    </div>
+
                     <!-- Local Server Section -->
                     <div>
                         <div class="flex items-center gap-2 mb-3" data-tip="本地/局域网跑的 OpenAI 兼容服务地址（LM Studio、Ollama 等）。不花钱、不出网，适合大批量翻译。" data-tip-pos="bottom-start">
@@ -17668,6 +17876,7 @@ function renderModelSelector() {
     const geminiModels = getVisibleModels('gemini');
     const openaiModels = getVisibleModels('openai');
     const claudeModels = getVisibleModels('claude');
+    const qwenModels = getVisibleModels('qwen');
 
     let currentIcon, currentIconClass, currentLabel;
     if (AppState.apiProvider === 'local') {
@@ -17729,6 +17938,21 @@ function renderModelSelector() {
                         </div>
                         ${claudeModels.map(m => `
                             <button onclick="selectModel('claude','${escapeHtml(m.id)}')" title="${escapeAttr(formatPriceTitle(m.price))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'claude' && AppState.selectedModel === m.id ? 'bg-orange-50 text-orange-700 ring-1 ring-orange-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
+                                <div class="flex flex-col items-start overflow-hidden">
+                                    <span class="text-xs font-bold uppercase tracking-wide truncate max-w-[190px]">${escapeHtml(m.name)}</span>
+                                    <span class="text-[9px] opacity-70 truncate max-w-[190px]">${escapeHtml(m.sub || '')} · ${escapeHtml(formatPriceCompact(m.price))}</span>
+                                </div>
+                                <span class="${m.iconClass} shrink-0">${m.icon}</span>
+                            </button>
+                        `).join('') || MODEL_GROUP_EMPTY_HINT}
+                    </div>
+                    <div class="p-2 space-y-1 bg-purple-50/50 border-b border-slate-100">
+                        <div class="text-[10px] font-bold text-slate-400 px-2 py-1 uppercase flex items-center gap-2">
+                            <span>${Icons.Cpu}</span>
+                            阿里云百炼 Qwen
+                        </div>
+                        ${qwenModels.map(m => `
+                            <button onclick="selectModel('qwen','${escapeHtml(m.id)}')" title="${escapeAttr(formatPriceTitle(m.price))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'qwen' && AppState.selectedModel === m.id ? 'bg-purple-50 text-purple-700 ring-1 ring-purple-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
                                 <div class="flex flex-col items-start overflow-hidden">
                                     <span class="text-xs font-bold uppercase tracking-wide truncate max-w-[190px]">${escapeHtml(m.name)}</span>
                                     <span class="text-[9px] opacity-70 truncate max-w-[190px]">${escapeHtml(m.sub || '')} · ${escapeHtml(formatPriceCompact(m.price))}</span>
@@ -18239,6 +18463,35 @@ function saveClaudeSettings() {
     setState({ showSettings: false });
 }
 
+// v2 Pass P134：下拉选了一个预设地址时，把预设值写进旁边的自由文本框；
+// 选"自定义"（value===''）时什么都不做，留给用户手改文本框——不清空已填的内容。
+function applyQwenBaseUrlPreset(presetUrl) {
+    if (!presetUrl) return;
+    const input = document.getElementById('qwenBaseUrlInput');
+    if (input) input.value = presetUrl;
+}
+
+// v2 Pass P134：Qwen(DashScope) 密钥 + 服务地址，与 saveClaudeSettings 同一套模式——
+// 明文存 localStorage，只在用户点保存时才落盘，不做任何"帮用户获取/填入密钥"的流程。
+function saveQwenSettings() {
+    const apiKeyInput = document.getElementById('qwenApiKeyInput');
+    const baseUrlInput = document.getElementById('qwenBaseUrlInput');
+
+    if (apiKeyInput) {
+        AppState.qwenApiKey = apiKeyInput.value.trim();
+    }
+    if (baseUrlInput) {
+        AppState.qwenBaseUrl = baseUrlInput.value.trim();
+    }
+
+    try {
+        localStorage.setItem('qwenApiKey', AppState.qwenApiKey);
+        localStorage.setItem('qwenBaseUrl', AppState.qwenBaseUrl);
+    } catch (e) {}
+
+    setState({ showSettings: false });
+}
+
 function toggleSaveMenu() {
     AppState.showSaveMenu = !AppState.showSaveMenu;
     AppState.showModelMenu = false;
@@ -18336,14 +18589,14 @@ function selectModel(provider, modelId) {
 function openLocalSettings() {
     AppState.showLocalSettings = true;
     AppState.showModelMenu = false;
-    AppState.modelGroupExpanded = { gemini: false, openai: false, claude: false };
+    AppState.modelGroupExpanded = { gemini: false, openai: false, claude: false, qwen: false };
     renderApp();
 }
 
 function openSettings() {
     AppState.showSettings = true;
     AppState.showModelMenu = false;
-    AppState.modelGroupExpanded = { gemini: false, openai: false, claude: false };
+    AppState.modelGroupExpanded = { gemini: false, openai: false, claude: false, qwen: false };
     renderApp();
     // B1：先把弹窗画出来，再去问本地模型的能力（60 秒缓存，连开两次只发一个请求）。
     // 结果回来后只定点重绘那几个容器，绝不重渲染整页 —— 详见 xportCapsPaint 上方注释。
@@ -18530,7 +18783,7 @@ function toggleModelVisibility(modelId) {
     renderApp();
 }
 
-// 更新按钮入口。provider 传 'all' 更新三家，传 'gemini'/'openai'/'claude' 只重试一家
+// 更新按钮入口。provider 传 'all' 更新全部几家，传 'gemini'/'openai'/'claude'/'qwen' 只重试一家
 // （失败本来就是 per-provider 的，重试一家不该把另外两家的限流额度也烧掉）
 function refreshOnlineModelsClick(provider) {
     if (MODEL_PROVIDERS.some(p => AppState.modelRefresh[p].status === 'loading')) return;
@@ -19992,6 +20245,19 @@ async function chatCallModel(messages, systemPrompt, signal, meta, sink) {
         // meta 由 callLocalLLM 用 readLocalChoice 填满：text / reasoning / finish / truncated /
         // thinking / toolCalls / toolsUnsupported
         return await callLocalLLM(config.localBaseUrl, config.model, full, false, signal, meta, callOpts) || '';
+    }
+    // v2 Pass P134：Qwen(DashScope) 复用同一条 callLocalLLM 传输，只带 apiKey。
+    // 非流式、不接原生 tool_call（方案建议先做非流式，见 p134_qwen_plan.md §1a 第 10 条；
+    // 流式与原生工具调用未经真实实测，留作后续增量，不在本轮扩大范围）。
+    if (config.provider === 'qwen') {
+        req.stream = false;
+        ChatState.lastRequest = req;
+        const callOpts = {
+            temperature: req.temperature,
+            maxTokens: req.maxTokens,
+            apiKey: config.qwenApiKey
+        };
+        return await callLocalLLM(config.qwenBaseUrl, config.model, full, false, signal, meta, callOpts) || '';
     }
     // OpenAI / Claude：temperature 为 null 表示「这个模型上这个参数不可设」（新 OpenAI 模型只接受 1），
     // 那就一个字节都不发 —— 参数条那边同样不画这个控件，两处必须一致，否则就是画了个假控件。
@@ -22412,8 +22678,12 @@ async function chatAgentP2TRequestFigureBbox(dataUrl, figNum, signal) {
     try {
         let resp;
         try {
+            // v2 Pass P134：可选鉴权头，留空 = 现状不变。
+            const visionApiKey = (OvlSettings.pdf2texVisionApiKey || '').trim();
+            const visionHeaders = { 'Content-Type': 'application/json' };
+            if (visionApiKey) visionHeaders.Authorization = 'Bearer ' + visionApiKey;
             resp = await fetch(endpoint + '/chat/completions', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+                method: 'POST', headers: visionHeaders, signal: controller.signal,
                 body: JSON.stringify({
                     model: model, temperature: 0.1, max_tokens: 200, stream: false,
                     messages: [{ role: 'user', content: [{ type: 'text', text: userText }, { type: 'image_url', image_url: { url: dataUrl } }] }]
@@ -23796,7 +24066,9 @@ function chatApiConfig() {
         geminiApiKey: AppState.geminiApiKey,
         openaiApiKey: AppState.openaiApiKey,
         claudeApiKey: AppState.claudeApiKey,
-        claudeProxyUrl: AppState.claudeProxyUrl
+        claudeProxyUrl: AppState.claudeProxyUrl,
+        qwenApiKey: AppState.qwenApiKey,
+        qwenBaseUrl: AppState.qwenBaseUrl
     };
 }
 
@@ -23882,7 +24154,7 @@ function chatWireEffort(model) {
 // 这个参数**根本设不了**：返回 null ⇒ 不发送、且参数条上不画这个控件。两处必须同源。
 function chatTemperatureSettable(provider, model) {
     if (provider === 'openai') { try { return !isNewOpenAIModel(model); } catch (e) { return false; } }
-    return provider === 'local' || provider === 'gemini' || provider === 'claude';
+    return provider === 'local' || provider === 'gemini' || provider === 'claude' || provider === 'qwen';
 }
 
 function chatEffectiveTemperature(provider, model) {
@@ -26916,6 +27188,16 @@ function loadSavedSettings() {
         const savedClaudeProxyUrl = localStorage.getItem('claudeProxyUrl');
         if (savedClaudeProxyUrl) {
             AppState.claudeProxyUrl = savedClaudeProxyUrl;
+        }
+
+        // v2 Pass P134：加载 Qwen (DashScope) API Key + Base URL
+        const savedQwenKey = localStorage.getItem('qwenApiKey');
+        if (savedQwenKey) {
+            AppState.qwenApiKey = savedQwenKey;
+        }
+        const savedQwenBaseUrl = localStorage.getItem('qwenBaseUrl');
+        if (savedQwenBaseUrl) {
+            AppState.qwenBaseUrl = savedQwenBaseUrl;
         }
 
         // 加载 Local Base URL
@@ -40864,9 +41146,13 @@ function ovlAiSuggestMerge(hunk) {
             if (!model) return { ok: false, error: '未配置 AI 合并模型（见设置 → AI 辅助合并）' };
             let resp;
             try {
+                // v2 Pass P134：可选鉴权头，留空 = 现状不变（纯局域网 jump 用法一个字节都不发）。
+                const mergeApiKey = (OvlSettings.ovlAiMergeApiKey || '').trim();
+                const mergeHeaders = { 'Content-Type': 'application/json' };
+                if (mergeApiKey) mergeHeaders.Authorization = 'Bearer ' + mergeApiKey;
                 resp = await fetch(endpoint + '/chat/completions', {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: mergeHeaders,
                     signal: controller.signal,
                     body: JSON.stringify({
                         model: model,
@@ -42344,6 +42630,10 @@ async function ovlP2TCallVision(pageNum, dataUrl, userText, extSignal, maxTokens
     };
     if (disableThinking) bodyObj.chat_template_kwargs = { enable_thinking: false };
     const bodyText = JSON.stringify(bodyObj);
+    // v2 Pass P134：可选鉴权头，留空 = 现状不变（纯局域网 jump 用法一个字节都不发）。
+    const visionApiKey = (OvlSettings.pdf2texVisionApiKey || '').trim();
+    const visionHeaders = { 'Content-Type': 'application/json' };
+    if (visionApiKey) visionHeaders.Authorization = 'Bearer ' + visionApiKey;
     async function attemptOnce() {
         const controller = new AbortController();
         let extAbortHandler = null;
@@ -42357,7 +42647,7 @@ async function ovlP2TCallVision(pageNum, dataUrl, userText, extSignal, maxTokens
             let resp;
             try {
                 resp = await fetch(endpoint + '/chat/completions', {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: bodyText, signal: controller.signal
+                    method: 'POST', headers: visionHeaders, body: bodyText, signal: controller.signal
                 });
             } catch (e) {
                 const ms = Date.now() - startedAt;
@@ -42719,8 +43009,12 @@ async function ovlP2TCallBibParse(rawLines, signal) {
     try {
         let resp;
         try {
+            // v2 Pass P134：可选鉴权头（复用同一个 pdf2texVisionApiKey，因为端点/模型也是复用的）。
+            const bibApiKey = (OvlSettings.pdf2texVisionApiKey || '').trim();
+            const bibHeaders = { 'Content-Type': 'application/json' };
+            if (bibApiKey) bibHeaders.Authorization = 'Bearer ' + bibApiKey;
             resp = await fetch(endpoint + '/chat/completions', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+                method: 'POST', headers: bibHeaders, signal: controller.signal,
                 body: JSON.stringify({
                     model: model, temperature: 0.1, max_tokens: 4096, stream: false,
                     chat_template_kwargs: { enable_thinking: false },
@@ -43658,8 +43952,12 @@ async function ovlP2TVerifyCallFixModel(errorExcerpt, pageSnippet, signal) {
     try {
         let resp;
         try {
+            // v2 Pass P134：可选鉴权头（复用同一个 pdf2texVisionApiKey）。
+            const fixApiKey = (OvlSettings.pdf2texVisionApiKey || '').trim();
+            const fixHeaders = { 'Content-Type': 'application/json' };
+            if (fixApiKey) fixHeaders.Authorization = 'Bearer ' + fixApiKey;
             resp = await fetch(endpoint + '/chat/completions', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+                method: 'POST', headers: fixHeaders, signal: controller.signal,
                 body: JSON.stringify({
                     model: model, temperature: 0.1, max_tokens: 4096, stream: false,
                     chat_template_kwargs: { enable_thinking: false },
@@ -43862,8 +44160,12 @@ async function ovlP2TVerifyCallStructFixModel(pageSnippet, signal) {
     try {
         let resp;
         try {
+            // v2 Pass P134：可选鉴权头（复用同一个 pdf2texVisionApiKey）。
+            const structApiKey = (OvlSettings.pdf2texVisionApiKey || '').trim();
+            const structHeaders = { 'Content-Type': 'application/json' };
+            if (structApiKey) structHeaders.Authorization = 'Bearer ' + structApiKey;
             resp = await fetch(endpoint + '/chat/completions', {
-                method: 'POST', headers: { 'Content-Type': 'application/json' }, signal: controller.signal,
+                method: 'POST', headers: structHeaders, signal: controller.signal,
                 body: JSON.stringify({
                     model: model, temperature: 0.1, max_tokens: 4096, stream: false,
                     chat_template_kwargs: { enable_thinking: false },
@@ -47564,6 +47866,9 @@ const OVL_SETTINGS_DEFAULTS = {
     // 浏览器直连这个端点（不经过桥），见任务背景：该端点对 Origin: null 放行 CORS。
     ovlAiMergeEndpoint: 'http://100.98.164.17:1235/v1',
     ovlAiMergeModel: 'qwen/qwen3.8-27b',
+    // v2 Pass P134：可选鉴权头，留空 = 现状不变（纯局域网 jump 用法不发 Authorization）。
+    // 填了这个端点需要 Bearer 鉴权（比如换成 Qwen/DashScope 这类云端点）才需要填。
+    ovlAiMergeApiKey: '',
     // ---- v2 Pass P49：远程桥接（跨机访问 tools/latex-bridge/server.js）----
     // ''=用默认地址 http://127.0.0.1:8181（见 ovlBridgeOrigin），跟这套设置项加入之前
     // 逐字节一致；填了别的地址（如 http://100.98.164.17:8181）才会改用它。
@@ -47575,6 +47880,10 @@ const OVL_SETTINGS_DEFAULTS = {
     pdf2texDefaultOutDir: 'converted',   // 相对项目根；每次转换仍会弹窗确认，这里只是预选值
     pdf2texVisionEndpoint: 'http://100.98.164.17:1235/v1', // OpenAI 兼容端点，浏览器直连（不经过本机桥）；v2 Pass P84 切到 jump:1235（实测空闲），见 vision_benchmark.md
     pdf2texVisionModel: 'qwen/qwen3.8-27b', // v2 Pass P84：四格矩阵实测 8/8 满分且指令遵循最稳，见 vision_benchmark.md
+    // v2 Pass P134：同 ovlAiMergeApiKey，留空 = 现状不变；这条链路的 5 个调用点
+    // （ovlP2TCallVision / ovlP2TCallBibParse / ovlP2TVerifyCallFixModel / ovlP2TVerifyCallStructFixModel /
+    // chatAgentP2TRequestFigureBbox）共用同一个视觉端点/模型/密钥。
+    pdf2texVisionApiKey: '',
     pdf2texConcurrency: 3,   // 1-4，调高不一定更快，本地模型多为串行；v2 Pass P84 默认提到 3
     pdf2texDisableThinking: true, // v2 Pass P83：关掉视觉模型思考链，更快但可能降质，见 ovlP2TCallVision 上方注释；v2 Pass P84 实测两模型该任务 reasoning_tokens 恒为 0，默认关闭
     pdf2texMaxPx: 1800,      // 1200/1600/1800/2200，页面栅格最长边
@@ -47604,9 +47913,14 @@ const OVL_SETTINGS_DEFAULTS = {
 // settings.ovlAiMergeEndpoint / settings.ovlAiMergeModel、settings.pdf2texVisionEndpoint /
 // settings.pdf2texVisionModel / settings.pdf2texDefaultOutDir、settings.ovlBridgeAddr 都是
 // 地址/模型名/目录名，清空 = 回落到默认值，是合法且可逆的操作，不能纳入守卫。
-// 翻译器那三个 API Key（#geminiApiKeyInput / #openaiApiKeyInput / #claudeApiKeyInput）存在
-// AppState 而不是 OvlSettings，也不走 data-setpath 这套委托，不在本白名单的作用域内。
-const OVL_CREDENTIAL_SETPATHS = ['settings.ovlBridgeToken', 'settings.overleafToken'];
+// 翻译器那四个 API Key（#geminiApiKeyInput / #openaiApiKeyInput / #claudeApiKeyInput /
+// #qwenApiKeyInput）存在 AppState 而不是 OvlSettings，也不走 data-setpath 这套委托，
+// 不在本白名单的作用域内。
+// v2 Pass P134 新增两个：settings.ovlAiMergeApiKey / settings.pdf2texVisionApiKey——
+// 同样是 type="password" 的凭证，清空会让这两条链路从「带认证的云端点」退回「裸连、要么
+// 401、要么其实连的是不需要认证的局域网端点」，同一套理由必须纳入守卫，否则就是 P133d
+// 诊断记录过的同类事故重演。
+const OVL_CREDENTIAL_SETPATHS = ['settings.ovlBridgeToken', 'settings.overleafToken', 'settings.ovlAiMergeApiKey', 'settings.pdf2texVisionApiKey'];
 // 「恢复默认」要保留的键（= 上面白名单去掉 "settings." 前缀）。
 const OVL_RESET_PRESERVE_KEYS = OVL_CREDENTIAL_SETPATHS.map(function (p) { return p.split('.')[1]; });
 const OVL_FONT_FAMILIES = {
@@ -47785,7 +48099,7 @@ function ovlApplySettings() {
 function ovlResetSettings() {
     ovlConfirmDialog({
         title: '恢复默认设置',
-        message: '所有设置将恢复为默认值。已填写的「远程桥接 → 访问令牌」和「Overleaf 同步 → Overleaf Git Token」会被保留（这两项清掉之后没法自动找回）。确定继续吗？',
+        message: '所有设置将恢复为默认值。已填写的「远程桥接 → 访问令牌」「Overleaf 同步 → Overleaf Git Token」「AI 辅助合并 → API Key」「PDF 转 LaTeX → 视觉模型 API Key」会被保留（这几项清掉之后没法自动找回）。确定继续吗？',
         confirmLabel: '恢复默认',
         danger: true,
         onConfirm: ovlResetSettingsApply
@@ -48271,6 +48585,10 @@ function ovlSettingsAiMergeHtml() {
         'OpenAI 兼容的 /chat/completions 端点，默认指向 jump 机器上常驻的 LM Studio 服务。浏览器直接连这个地址（不经过本机桥接服务），所以要填一个当前网络能直连到的地址。');
     html += ovlSetRow('AI 合并模型', '<input type="text" data-setpath="settings.ovlAiMergeModel" style="width:260px" placeholder="qwen/qwen3.8-27b" value="' + escapeAttr(s.ovlAiMergeModel) + '">',
         '传给上面那个端点的 model 字段，要跟服务那边实际加载/注册的模型名一致。');
+    // v2 Pass P134：可选鉴权头，纯局域网 jump 端点留空即可（不发 Authorization，行为不变）；
+    // 换成需要 Bearer 鉴权的云端点（例如 Qwen/DashScope）时才需要填。
+    html += ovlSetRow('AI 合并 API Key（可选）', '<input type="password" data-setpath="settings.ovlAiMergeApiKey" style="width:260px" placeholder="留空 = 不发送 Authorization 头" value="' + escapeAttr(s.ovlAiMergeApiKey) + '">',
+        '只有上面的服务地址需要 Bearer Token 鉴权时才填（比如换成 Qwen/DashScope 这类云端点）。留空 = 现状不变，纯局域网/无认证端点不受影响。明文存本地 localStorage，跟这个 App 里其它 API Key 同一种存法。');
     return html;
 }
 
@@ -48366,6 +48684,12 @@ function ovlSettingsPdf2TexHtml() {
         'OpenAI 兼容端点（/chat/completions），浏览器直连，不经过本机桥；需要该服务对 file:// 页面开放 CORS（LM Studio 默认即可）。');
     html += ovlSetRow('视觉模型', '<input type="text" id="ovlP2TModelInput" data-setpath="settings.pdf2texVisionModel" style="width:220px" placeholder="qwen/qwen3.8-27b" value="' + escapeAttr(s.pdf2texVisionModel) + '">',
         '要跟服务端实际加载的模型名一致；必须是真正支持图片输入的视觉模型。');
+    // v2 Pass P134：可选鉴权头，纯局域网 jump 端点留空即可（不发 Authorization，行为不变）；
+    // 换成需要 Bearer 鉴权的云端点（例如 Qwen/DashScope 的 qwen-vl-max）时才需要填。
+    // 5 个调用点（ovlP2TCallVision / ovlP2TCallBibParse / ovlP2TVerifyCallFixModel /
+    // ovlP2TVerifyCallStructFixModel / chatAgentP2TRequestFigureBbox）共用这一个 Key。
+    html += ovlSetRow('视觉模型 API Key（可选）', '<input type="password" id="ovlP2TApiKeyInput" data-setpath="settings.pdf2texVisionApiKey" style="width:260px" placeholder="留空 = 不发送 Authorization 头" value="' + escapeAttr(s.pdf2texVisionApiKey) + '">',
+        '只有上面的服务地址需要 Bearer Token 鉴权时才填（比如换成 Qwen/DashScope 的 qwen-vl-max）。留空 = 现状不变，纯局域网/无认证端点不受影响。明文存本地 localStorage，跟这个 App 里其它 API Key 同一种存法。');
     html += ovlSetRow('并发页数', '<select data-setpath="settings.pdf2texConcurrency">'
         + [1, 2, 3, 4].map(function (n) { return ovlOptTag(n, String(n), s.pdf2texConcurrency); }).join('') + '</select>',
         '同时在跑的页数。调高不一定更快——本地模型服务多为串行处理，第一页永远单独跑（吸收冷启动）。');
