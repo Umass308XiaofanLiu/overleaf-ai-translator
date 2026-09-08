@@ -4392,8 +4392,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.15.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-07';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.16.00';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-08';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -4417,6 +4417,11 @@ const DEFAULT_MODEL_CATALOG = [
     { id: 'claude-opus-4-5-20251101',   name: 'Claude Opus 4.5',       sub: 'Best Quality',         short: 'Opus 4.5',   provider: 'claude', tier: 'pro'  },
     // v2 Pass P134：阿里云百炼 Qwen(DashScope OpenAI 兼容模式)。id 未经真实 /v1/models 拉取校验
     // （用户需求文本点名的型号名），走种子目录同一套"离线兜底，刷新按钮可覆盖"规则。
+    // v2 Pass P135：**刻意不改动这 4 条**——test_p134_qwen_provider.js 断言"顶栏 Qwen 分组恰好
+    // 4 个内置按钮"且真实点击选中 id 恰好是 'qwen-max'（P135 需保持的既有回归），改种子会直接
+    // 打红那条测试。新默认模型（qwen3.8-flash/qwen3.8-max）走的是 AppState 首次引导 + chatModelChoice
+    // 的独立回落逻辑（QWEN_DEFAULT_TEXT_MODEL/QWEN_DEFAULT_CHAT_MODEL，见其定义处），不依赖种子目录；
+    // 这三个新模型仍然可以通过 QWEN_CHAT_ALLOW 白名单被「更新」按钮实时拉取回来。
     { id: 'qwen-turbo',                 name: 'Qwen Turbo',            sub: 'Fast & Cheap',         short: 'Turbo',      provider: 'qwen',   tier: 'lite' },
     { id: 'qwen-plus',                  name: 'Qwen Plus',             sub: 'Balanced Performance', short: 'Plus',       provider: 'qwen',   tier: 'fast' },
     { id: 'qwen-max',                   name: 'Qwen Max',              sub: 'Best Quality',         short: 'Max',        provider: 'qwen',   tier: 'pro'  },
@@ -4470,6 +4475,31 @@ const OPENAI_DENY = /(^ft:|:ft-|embedding|^text-(similarity|search)|^code-search
 const OPENAI_ALLOW = /^(gpt-[0-9]|chatgpt-|o[1-9]($|[-.]))/i;
 const OPENAI_DATED_SNAPSHOT = /-\d{4}-\d{2}-\d{2}$/;
 
+// Qwen(DashScope)：v2 Pass P135。/v1/models 原样吐出 DashScope 全量模型广场（对话/视觉之外还有
+// 文生图/文生视频/语音合成识别/向量/重排/OCR/多模态omni 等几十上百个家族），零过滤会让
+// Settings→模型 tab 展开 Qwen 分组时看到一份未经筛选的原始清单（.claude/tmp/p135_recon.md A1）。
+// 白名单优先 + 黑名单关键词二次保险（p135_qwen_pricing.md ④节，抓取 2026-09-08）：
+//   白名单：qwen(3(.x)?)-<max|plus|turbo|flash|long> / qwq- / qvq- / qwen(3)?-vl-（排除 -ocr）。
+//   黑名单：tts/asr/realtime/embedding/rerank/image/video/-ocr/omni/music/aitryon/virtualmodel/
+//           wan(x)前缀/cosyvoice/sambert/paraformer，以及 T0 明确拍板排除的 qwen-mt-*
+//           （官方文档明文：不支持 system prompt / 多轮对话 / JSON 输出，接入主链路必然坏，
+//           见 p135_qwen_pricing.md「问题5」）。
+const QWEN_CHAT_ALLOW = /^(?:qwen(?:3(?:\.\d+)?)?-(?:max|plus|turbo|flash|long)(?:-|$)|qwen(?:3)?-vl-(?!ocr)|qwq-|qvq-)/i;
+const QWEN_NON_CHAT_DENY = /(^qwen-mt-|tts|[-_]asr(?:[-_]|$)|realtime|embedding|rerank|-image|^qwen-image|video|-ocr|omni|music|aitryon|virtualmodel|^wan(?:x|\d)|cosyvoice|sambert|paraformer)/i;
+function isQwenChatModelId(id) {
+    const s = String(id || '');
+    return QWEN_CHAT_ALLOW.test(s) && !QWEN_NON_CHAT_DENY.test(s);
+}
+
+// v2 Pass P135：新增/未配置时的 Qwen 推荐默认模型（T0 拍板，数字见 p135_qwen_pricing.md）。
+// 只在对应设置从未存过时生效，绝不覆盖用户已保存的选择——具体生效点见：
+//   文本翻译：loadSavedSettings 里 savedApiProvider==='qwen' 且从未存过 selectedModel 时。
+//   对话窗：chatModelChoice() 回落分支，ChatState.provider/model 都未配置、但 AppState.apiProvider
+//           已经是 qwen 时（对话窗独立于翻译主界面的模型选择，见 20205 行注释）。
+const QWEN_DEFAULT_TEXT_MODEL = 'qwen3.8-flash';
+const QWEN_DEFAULT_CHAT_MODEL = 'qwen3.8-max';
+const QWEN_DEFAULT_VISION_MODEL = 'qwen3-vl-plus'; // 体现在 DEFAULT_MODEL_CATALOG 的 Qwen Vision 种子条目里
+
 // ============= 模型价格表（内置，非实时拉取）=============
 // 单位：美元 / 每 1,000,000 tokens，付费层 Standard 档（非 Batch/Flex/Priority），来自
 // ai.google.dev/gemini-api/docs/pricing。目前只有 gemini 桶有数据；openai / claude 先留空对象，
@@ -4492,8 +4522,48 @@ const MODEL_PRICING = {
     },
     openai: {},   // 预留：结构与 gemini 桶一致，届时直接加 { 'gpt-5.2': { in, out } } 即可
     claude: {},   // 预留：同上
-    qwen: {}      // 预留：同上，UI 已有"价格未知"兜底文案
+    // v2 Pass P135：国际站（USD，AppState.qwenBaseUrl 默认值）价格，数据源
+    // .claude/tmp/p135_qwen_pricing.md ①/⑤节（抓取 2026-09-08，官方 alibabacloud.com/help/en/
+    // model-studio/model-pricing）。tiered:true = 阶梯计价，这里存的是官方表里"最低档"（0-32K 或
+    // 0-256K，视模型而定）——formatQwenPriceCompact() 据此加"起"字，不代表唯一价格。
+    // qwen3.7-plus 因两次抓取对"输入/输出/思考/非思考"归属解读不一致，本表刻意不填数字（待核实，
+    // 见下方 QWEN_PRICE_PENDING_IDS）。国内站 CNY 数据见下方 QWEN_PRICE_CNY（不合并进这张表——
+    // 这张桶的 {in,out} 语义是"美元/每 1M tokens"，跟 gemini/openai/claude 三家共用同一套单位，
+    // 混进人民币数字会让 getModelPrice()/formatPriceCompact() 这两个通用函数对其它三家也读错）。
+    qwen: {
+        'qwen3.8-flash': { in: 0.15, out: 0.47, note: '单一价，非阶梯（qwen-flash 经典命名系列才分阶梯，两者是不同模型）' },
+        'qwen-plus':     { in: 0.4,  out: 1.2,  tiered: true, note: '阶梯计价最低档（0-256K，非思考输出价）；国内站分档边界不同（128K/256K/1M）' },
+        'qwen3.8-max':   { in: 2,    out: 6,    note: '单一价，不分阶梯，不区分思考/非思考' },
+        'qwen3-vl-plus': { in: 0.2,  out: 1.6,  tiered: true, note: '阶梯计价最低档（0-32K，非思考输出价）' },
+        'qwen-turbo':    { in: 0.05, out: 0.2,  note: '官方标注"后续不再更新，建议替换为千问Flash"；此为非思考价' },
+        'qwen-max':      { in: 1.6,  out: 6.4,  note: '无阶梯' },
+        'qwen-vl-max':   { in: 0.8,  out: 3.2,  note: '无阶梯（官方页面明确 No tiered pricing）' },
+        'qwq-plus':      { in: 0.8,  out: 2.4,  note: '仅思考模式，无法关闭；全部输出按此价计费' },
+        'qwen-flash':    { in: 0.05, out: 0.4,  tiered: true, note: '阶梯计价最低档（0-256K）；与 qwen3.8-flash 是不同模型（经典命名系列）' },
+        'qwen3-max':     { in: 1.2,  out: 6,    tiered: true, note: '阶梯计价最低档（0-32K）' },
+        'qwen3.7-max':   { in: 2.5,  out: 7.5,  note: '无阶梯（比 qwen3.8-max 更贵，新一代反而降价，官方页数字如实记录）' }
+    }
 };
+
+// v2 Pass P135：国内站（CNY，人民币/百万 tokens）价格，键与上面 MODEL_PRICING.qwen 一一对应，
+// 只在用户当前配置的 AppState.qwenBaseUrl 命中国内站（dashscope.aliyuncs.com，不含 -intl）时使用。
+// 数据源同上，见 p135_qwen_pricing.md ①/⑤节「1.1 国内站」表。
+const QWEN_PRICE_CNY = {
+    'qwen3.8-flash': { in: 0.8,  out: 2.7 },
+    'qwen-plus':     { in: 0.8,  out: 2,   tiered: true },
+    'qwen3.8-max':   { in: 12,   out: 36 },
+    'qwen3-vl-plus': { in: 1,    out: 10,  tiered: true },
+    'qwen-turbo':    { in: 0.3,  out: 0.6 },
+    'qwen-max':      { in: 2.4,  out: 9.6 },
+    'qwen-vl-max':   { in: 1.6,  out: 4 },
+    'qwq-plus':      { in: 1.6,  out: 4 },
+    'qwen-flash':    { in: 0.15, out: 1.5, tiered: true },
+    'qwen3-max':     { in: 2.5,  out: 12,  tiered: true },
+    'qwen3.7-max':   { in: 12,   out: 36 }
+};
+// qwen3.7-plus：两次抓取对国内站表格「阶梯 × 思考/非思考 × 限时折扣」三维交叉的归属解读不一致
+// （p135_qwen_pricing.md 5.4 节原文逐字保留了两种读法），不代猜，UI 一律显示"待核实"。
+const QWEN_PRICE_PENDING_IDS = ['qwen3.7-plus'];
 
 // 前缀继承的**尾巴白名单**。规则：宁可少显示一个价，也绝不能显示一个错价。
 // 只有「同价变体」后缀才允许继承母模型价格 —— preview/exp/latest/thinking 这类标记、
@@ -4539,6 +4609,56 @@ function getModelPrice(id) {
     return resolvePromoPrice(Object.assign({ id: best.key, provider: best.provider }, best.price));
 }
 
+// ============= 模型能力元数据表（内置，非实时拉取）=============
+// v2 Pass P135。三家 /v1/models 都不返回上下文窗口/最大输出/是否支持思考这类信息，只能内置。
+// 字段全部可选，缺失=null="未知，不显示/不发送相关字段"，绝不推测（.claude/tmp/p135_qwen_pricing.md
+// ③/⑤节抓取 2026-09-08）。thinking：'none'（不支持，含"官方文档未提及"两种情况，用
+// thinkingUnknown 区分 tooltip 文案）｜'hybrid'（可关的混合思考）｜'always'（恒开、不可关，如 qwq-plus）。
+// thinkingBudgetMax：官方 thinking_budget 参数合法区间是 1~32768（各模型页面统一给出的通用规则），
+// 与部分模型"最大思维链长度"(81920/262144，模型不设置该参数时的固有上限，口径不同，不用于滑杆)
+// 是两回事——见 p135_qwen_pricing.md ③节"给前端做可调控件取值约束的建议读法"。
+// deprecated：true 且 UI 需显示"官方已停止更新"（当前只有 qwen-turbo，官方原文"后续不再更新，
+// 建议替换为千问Flash"）。local 走既有 xportFetchCaps 运行时发现，不进这张静态表。
+const MODEL_CAPS = {
+    qwen: {
+        'qwen-max':      { contextWindow: 32768,   maxInput: 30720,  maxOutput: 8192,   thinking: 'hybrid', thinkingDefault: false, thinkingBudgetMax: 32768 },
+        'qwen-plus':     { contextWindow: 1000000, maxInput: 997952, maxOutput: 32768,  thinking: 'hybrid', thinkingDefault: false, thinkingBudgetMax: 32768 },
+        'qwen-turbo':    { contextWindow: 131072,  maxInput: 98304,  maxOutput: 16384,  thinking: 'hybrid', thinkingDefault: false, thinkingBudgetMax: 32768, deprecated: true },
+        'qwen3-max':     { contextWindow: 262144,  maxInput: 258048, maxOutput: 65536,  thinking: 'hybrid', thinkingDefault: false, thinkingBudgetMax: 32768 },
+        'qwq-plus':      { contextWindow: 131072,  maxInput: 98304,  maxOutput: 8192,   thinking: 'always', thinkingDefault: true,  thinkingBudgetMax: null },
+        // qwen-vl-max：官方「深度思考」文档模型清单未列出该模型，页面未提及是否支持思考——
+        // 不代猜，thinking:'none' + thinkingUnknown:true，区别于「明确不支持」的展示文案。
+        'qwen-vl-max':   { contextWindow: 131072,  maxInput: 129024, maxOutput: 8192,   thinking: 'none',   thinkingUnknown: true },
+        'qwen3-vl-plus': { contextWindow: 262144,  maxInput: 260096, maxOutput: 32768,  thinking: 'hybrid', thinkingDefault: null,  thinkingBudgetMax: 32768 },
+        'qwen-flash':    { contextWindow: 1000000, maxInput: 997952, maxOutput: 32768,  thinking: 'hybrid', thinkingDefault: false, thinkingBudgetMax: 32768 },
+        'qwen3.8-max':   { contextWindow: 1000000, maxInput: 991808, maxOutput: 131072, thinking: 'hybrid', thinkingDefault: true,  thinkingBudgetMax: 32768 },
+        'qwen3.7-max':   { contextWindow: 1000000, maxInput: 991808, maxOutput: 131072, thinking: 'hybrid', thinkingDefault: true,  thinkingBudgetMax: 32768 },
+        'qwen3.7-plus':  { contextWindow: 1000000, maxInput: 991808, maxOutput: 131072, thinking: 'hybrid', thinkingDefault: true,  thinkingBudgetMax: 32768 }
+        // qwen3.8-flash：官方定价问答（p135_qwen_pricing.md「问题6」）确认了价格，但没有任何官方页面
+        // 给出这个具体 id 的上下文窗口/最大输出/思考支持数字（qwen-flash 是不同模型，数字不能互相
+        // 挪用）——不代猜，本条目缺失=全部走 getModelCaps() 的 null 兜底，UI 显示"未知"。
+    },
+    gemini: {}, // 预留：可收 gemini thinkingBudget 合法范围，与 CHAT_GEMINI_THINKING 现有固定四档对齐
+    openai: {}, // 预留：o 系/gpt-5 系 reasoning_effort 取值范围
+    claude: {}  // 预留：extended thinking 的 budget_tokens 范围
+};
+
+// 与 getModelPrice 同一套"最长前缀匹配 + 尾巴白名单"算法，供 MODEL_CAPS 复用（日期快照 id 能
+// 继承母模型的能力元数据，跟价格继承同一条规则）。找不到返回 null——调用方必须当"未知"处理。
+function getModelCaps(provider, id) {
+    const bucket = MODEL_CAPS[provider];
+    if (!bucket) return null;
+    const s = String(id || '');
+    let best = null;
+    Object.keys(bucket).forEach(function (key) {
+        if (s.indexOf(key) !== 0) return;
+        const tail = s.slice(key.length);
+        if (tail !== '' && !PRICE_KEY_TAIL_OK.test(tail)) return;
+        if (!best || key.length > best.key.length) best = { key: key, caps: bucket[key] };
+    });
+    return best ? best.caps : null;
+}
+
 // 统一价格数字的显示形式：固定两位小数（$0.1 → $0.10），JS 数字字面量会吞掉末尾 0
 function formatPriceUsd(n) {
     return `$${Number(n).toFixed(2)}`;
@@ -4563,6 +4683,74 @@ function formatPriceTitle(price) {
     }
     if (price.note) s += `；${price.note}`;
     s += `。价格为内置表（非 API 实时返回），截至 ${MODEL_PRICING_AS_OF}；推理/思考 token 按输出价计费，实际成本可能高于可见译文估算。`;
+    return s;
+}
+
+// ============= Qwen 专用价格格式化（v2 Pass P135）=============
+// 独立于上面 getModelPrice()/formatPriceCompact()/formatPriceTitle() 三个通用函数（那三个继续
+// 服务 gemini/openai/claude，且对 qwen 逐字节保持"读 MODEL_PRICING.qwen 的 USD 数字"这条既有
+// 行为不变）。这里单独一套的原因：Qwen 需要"按用户当前选的端点显示 CNY 或 USD"，通用函数的
+// {in,out} 只有一种货币语义，硬塞双币种进去会让其它三家的价格显示逻辑也要多判断一层。
+function qwenIsDomesticEndpoint() {
+    const u = String(AppState.qwenBaseUrl || '');
+    return /dashscope\.aliyuncs\.com/i.test(u) && !/dashscope-intl/i.test(u);
+}
+// 是否命中"待核实"名单（同价格/能力表一样的最长前缀 + 尾巴白名单匹配规则）
+function qwenPriceIsPending(id) {
+    const s = String(id || '');
+    for (let i = 0; i < QWEN_PRICE_PENDING_IDS.length; i++) {
+        const key = QWEN_PRICE_PENDING_IDS[i];
+        if (s.indexOf(key) !== 0) continue;
+        const tail = s.slice(key.length);
+        if (tail === '' || PRICE_KEY_TAIL_OK.test(tail)) return true;
+    }
+    return false;
+}
+// 按当前端点取价格：国内站读 QWEN_PRICE_CNY（人民币），国际站读 MODEL_PRICING.qwen（美元）。
+function getQwenPrice(id) {
+    const domestic = qwenIsDomesticEndpoint();
+    const bucket = domestic ? QWEN_PRICE_CNY : MODEL_PRICING.qwen;
+    const s = String(id || '');
+    let best = null;
+    Object.keys(bucket).forEach(function (key) {
+        if (s.indexOf(key) !== 0) return;
+        const tail = s.slice(key.length);
+        if (tail !== '' && !PRICE_KEY_TAIL_OK.test(tail)) return;
+        if (!best || key.length > best.key.length) best = { key: key, price: bucket[key] };
+    });
+    if (!best) return null;
+    return Object.assign({ id: best.key, currency: domestic ? 'CNY' : 'USD' }, best.price);
+}
+const QWEN_PRICE_OFFICIAL_URL = {
+    CNY: 'https://help.aliyun.com/zh/model-studio/model-pricing',
+    USD: 'https://www.alibabacloud.com/help/en/model-studio/model-pricing'
+};
+// 紧凑文案：阶梯计价加"起"字、待核实显示"待核实"、无数据显示"未知"。
+function formatQwenPriceCompact(id) {
+    if (qwenPriceIsPending(id)) return '价格待核实';
+    const price = getQwenPrice(id);
+    if (!price) return '价格未知';
+    const sym = price.currency === 'CNY' ? '¥' : '$';
+    const suf = price.tiered ? '起' : '';
+    const n = function (v) { return sym + Number(v).toFixed(2) + suf; };
+    return `入${n(price.in)} 出${n(price.out)} /1M`;
+}
+// 悬浮提示：完整口径 + 官方参考链接 + 抓取日期（T0 拍板：每处价格 UI 旁必须标注这条）。
+function formatQwenPriceTitle(id) {
+    if (qwenPriceIsPending(id)) {
+        return '价格待核实：官方两次抓取对该模型阶梯档位价格的归属解读不一致（阶梯/思考非思考交叉，页面表格复杂），'
+            + '未收录具体数字，避免展示可能错误的价格。参考价 · 抓取 2026-09-08 · 官方页：'
+            + QWEN_PRICE_OFFICIAL_URL[qwenIsDomesticEndpoint() ? 'CNY' : 'USD'];
+    }
+    const price = getQwenPrice(id);
+    if (!price) return '价格未知（不在内置价格表中，或官方页面未提供该模型价格，多为新模型/尚未收录）';
+    const sym = price.currency === 'CNY' ? '¥' : '$';
+    const unit = price.currency === 'CNY' ? '人民币元' : '美元';
+    let s = `${unit} / 每 1,000,000 tokens：输入 ${sym}${Number(price.in).toFixed(2)} / 输出 ${sym}${Number(price.out).toFixed(2)}`;
+    if (price.tiered) s += '（阶梯计价，以上为官方最低档，实际价格随单次请求输入长度升档，故标"起"）';
+    if (price.note) s += `；${price.note}`;
+    s += `。参考价 · 抓取 2026-09-08 · 官方页：${QWEN_PRICE_OFFICIAL_URL[price.currency]}`
+        + '（官方页面声明仅展示模型调用原价、不含限时优惠，请以百炼/DashScope 控制台实时价格为准）';
     return s;
 }
 
@@ -4758,6 +4946,14 @@ const AppState = {
     },
     settingsModelQuery: '',   // 设置弹窗里的模型搜索关键词
     showDatedSnapshots: false, // 是否保留 OpenAI 的 -YYYY-MM-DD 固定快照（下次更新生效）
+    // v2 Pass P135：Qwen「显示全部模型」开关，仿 showDatedSnapshots 同一套交互（下次点「更新」才生效）。
+    qwenShowAllModels: false,
+    // Qwen 思考开关/预算，按模型 id 存 { budget: number|null }；key 存在=已勾选启用思考，不存在=
+    // 完全不发 enable_thinking/thinking_budget（与改动前行为一致）。翻译主界面与对话窗共用同一份——
+    // 见 callLocalLLM 里的注入逻辑与 qwenThinkingControlHtml() 的说明。
+    qwenReasoningByModel: {},
+    // Qwen 每模型的「最大输出 tokens」用户覆盖值，未设置的模型走各调用点原有默认（翻译 16384）。
+    qwenMaxTokensByModel: {},
     newlyFoundIds: [],         // 本次刷新新发现的 id，用于 NEW 徽标和「全部显示」
     settingsModalWidth: SETTINGS_MODAL_DEFAULT_WIDTH, // Settings 弹窗宽度（px），拖拽手柄调整后持久化
     modelGroupExpanded: { gemini: false, openai: false, claude: false, qwen: false }, // Settings 弹窗里「展开了哪几家」；刻意不落 localStorage，每次开弹窗都回到折叠
@@ -8485,6 +8681,30 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
         }
     } catch (e) { effortSent = ''; }
 
+    // v2 Pass P135：Qwen(DashScope) 思考开关/预算 + 每模型最大输出覆盖。DashScope 走**顶层**
+    // enable_thinking / thinking_budget 字段——跟上面 reasoning_effort（local 专用词表）、以及
+    // pdf2texDisableThinking 用的 chat_template_kwargs.enable_thinking（本地自托管 OpenAI 兼容服务
+    // 的写法）都是**不同的字段路径**，三者互不冲突、各自独立发送（见 p135_recon.md B1 末尾）。
+    // 只在「这次请求确实打的是 AppState.qwenBaseUrl（用户 Settings→API 配的那个 Qwen 端点）
+    // 且这个模型在 AppState.qwenReasoningByModel/qwenMaxTokensByModel 里配过覆盖值」时才生效——
+    // 用 oApiKey 兜底一次（没带 key 的 local 调用不可能命中这两张 Qwen 专属表，双重保险）。
+    // 未配置的模型/未触碰这两个功能的用户，body 与改动前逐字节一致（不发新字段、max_tokens 仍是
+    // 未传时的既有默认 16384）——PDF 视觉/AI 合并链路那 6 个函数走的是 OvlSettings 各自的端点，
+    // 不会读写这两张表，因此逐字节不受影响，除非用户主动把它们也指到了一模一样的 Qwen 端点
+    // （那种情况下继承主界面存的偏好也是合理行为，不是本次改动引入的新风险）。
+    try {
+        if (oApiKey && AppState.qwenBaseUrl && xportCapsOrigin(baseUrl) === xportCapsOrigin(AppState.qwenBaseUrl)) {
+            if (AppState.qwenReasoningByModel && Object.prototype.hasOwnProperty.call(AppState.qwenReasoningByModel, model)) {
+                const pref = AppState.qwenReasoningByModel[model];
+                body.enable_thinking = true;
+                if (pref && typeof pref.budget === 'number' && pref.budget > 0) body.thinking_budget = Math.round(pref.budget);
+            }
+            if (oMax === null && AppState.qwenMaxTokensByModel && typeof AppState.qwenMaxTokensByModel[model] === 'number') {
+                body.max_tokens = AppState.qwenMaxTokensByModel[model];
+            }
+        }
+    } catch (e) {}
+
     // 构建endpoint - 直接使用/v1/chat/completions
     // v2 Pass P81：baseUrl 先归一成 ORIGIN 再拼（跟 xportCapsOrigin/xportFetchCaps 同一套
     // 归一逻辑，见该函数上方注释）。根因实测：用户按本仓库文档惯例把地址配成
@@ -8787,7 +9007,12 @@ async function fetchOpenaiModelList(apiKey, hideSnapshots) {
 // 响应形状是标准 OpenAI /v1/models（{object:"list", data:[{id, created, owned_by}, ...]}），
 // v2 Pass P134 实测（curl，不带密钥）确认该端点存在、需要 Bearer 鉴权、CORS 对 file://
 // 与局域网同源页面均放行（见 .claude/tmp/p134_qwen_plan.md §4）。
-async function fetchQwenModelList(apiKey, baseUrl) {
+// v2 Pass P135：第三个可选参数 showAll——DashScope /v1/models 原样吐出全量模型广场（图像/语音/
+// 向量/重排/OCR/omni 等几十上百个家族与文本对话无关），默认在拉取阶段就用 isQwenChatModelId()
+// 挡掉（跟 Gemini fetchGeminiModelList 同一套"拉取层过滤，不在渲染层过滤"的既有架构，理由见
+// .claude/tmp/p135_recon.md A3）；showAll 为真时跳过过滤，原样全部收下（"显示全部模型"开关，对齐
+// AppState.showDatedSnapshots 的既有交互模式）。
+async function fetchQwenModelList(apiKey, baseUrl, showAll) {
     if (!apiKey) throw modelFetchError('NO_KEY', '未填写 Qwen API Key');
     if (!baseUrl) throw modelFetchError('HTTP', '未填写 Qwen 服务地址（Base URL）');
 
@@ -8808,6 +9033,7 @@ async function fetchQwenModelList(apiKey, baseUrl) {
 
     return all
         .filter(m => m && typeof m.id === 'string')
+        .filter(m => showAll || isQwenChatModelId(m.id))
         .map(m => {
             const id = sanitizeModelId(m.id);
             if (!id) return null;
@@ -13216,6 +13442,12 @@ function loadOnlineCatalog() {
             if (p === 'gemini') {
                 models = models.filter(m => isGeminiTextChatModelId(m.id));
             }
+            // v2 Pass P135：同一条纪律用在 Qwen 上——缓存是纯回放，不会重新走 fetchQwenModelList，
+            // 过滤规则收紧后（或本次改动之前缓存过的全量原始列表）必须在回放时重新套一遍同一个
+            // 判定，否则「点更新之前」还是会看到未过滤的旧缓存。qwenShowAllModels 开着时跳过。
+            if (p === 'qwen' && !AppState.qwenShowAllModels) {
+                models = models.filter(m => isQwenChatModelId(m.id));
+            }
             if (models.length === 0) return;
 
             // 兜底补齐可见性键。缓存（onlineModelCatalog）和可见性表（modelVisibility）是两次
@@ -13305,7 +13537,7 @@ async function refreshOnlineModels(providers) {
     const tasks = targets.map(function (p) {
         if (p === 'gemini') return fetchGeminiModelList(AppState.geminiApiKey);
         if (p === 'openai') return fetchOpenaiModelList(AppState.openaiApiKey, !AppState.showDatedSnapshots);
-        if (p === 'qwen') return fetchQwenModelList(AppState.qwenApiKey, AppState.qwenBaseUrl);
+        if (p === 'qwen') return fetchQwenModelList(AppState.qwenApiKey, AppState.qwenBaseUrl, AppState.qwenShowAllModels);
         return fetchClaudeModelList(AppState.claudeApiKey, AppState.claudeProxyUrl);
     });
 
@@ -16626,10 +16858,21 @@ function renderOnlineModelCheckbox(m) {
     }
     // 价格挪到名字下面单独一行；同一行里再放模型的原始 id（等宽小字，超长时省略号 + title 兜底），
     // 这样「用户实际调用时要认的 id」和「价格」都可见，不用再靠悬停才能读到完整模型名。
-    const priceLine = `<span class="text-[9px] text-slate-400 font-mono shrink-0" title="${escapeAttr(formatPriceTitle(m.price))}">${escapeHtml(formatPriceCompact(m.price))}</span>`;
+    // v2 Pass P135：Qwen 走独立的 formatQwenPriceCompact/Title（CNY/USD 双币种 + 阶梯"起" +
+    // "待核实"，见该函数定义处），其余三家继续用通用 formatPriceCompact/Title，逐字节不变。
+    const priceCompact = m.provider === 'qwen' ? formatQwenPriceCompact(m.id) : formatPriceCompact(m.price);
+    const priceTitle = m.provider === 'qwen' ? formatQwenPriceTitle(m.id) : formatPriceTitle(m.price);
+    const priceLine = `<span class="text-[9px] text-slate-400 font-mono shrink-0" title="${escapeAttr(priceTitle)}">${escapeHtml(priceCompact)}</span>`;
     const idLine = `<span class="text-[9px] text-slate-400 font-mono truncate min-w-0 flex-1" title="${escapeAttr(m.id)}">${escapeHtml(m.id)}</span>`;
+    // Qwen 专属：思考开关/最大输出/上下文只读信息，放在 <label> 外面（同 Local 模型那行的既有做法，
+    // 见下方 Local Model Visibility Section 里 xportCapsRowHtml 的用法）——放进 <label> 内部会导致
+    // 点这些控件时连带触发可见性勾选框。
+    const qwenCapsBlock = m.provider === 'qwen'
+        ? `<div data-qwen-caps-model="${escapeAttr(m.id)}" class="px-2 pb-1.5 -mt-0.5">${qwenCapsRowHtml(m.id)}</div>`
+        : '';
     return `
-        <label class="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all ${bg}" title="${escapeHtml(m.id)}">
+        <div class="rounded-lg ${bg}">
+        <label class="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all" title="${escapeHtml(m.id)}">
             <input type="checkbox" ${visible ? 'checked' : ''} ${locked ? 'disabled' : ''} onchange="toggleModelVisibility('${escapeHtml(m.id)}')" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 shrink-0">
             <span class="flex flex-col min-w-0 flex-1 gap-0.5">
                 <span class="flex items-start gap-1 min-w-0">
@@ -16642,6 +16885,8 @@ function renderOnlineModelCheckbox(m) {
                 </span>
             </span>
         </label>
+        ${qwenCapsBlock}
+        </div>
     `;
 }
 
@@ -16940,6 +17185,106 @@ function xportCapsRowHtml(modelId) {
         const right = ctlHtml || '<span class="text-[9px] text-slate-300 italic" data-tip="'
             + escapeAttr('该模型没有声明任何推理档位（capabilities.reasoning 缺失），因此不提供推理开关。') + '" data-tip-pos="top-end">无推理档位</span>';
         return '<div class="flex items-center justify-between gap-3 flex-wrap">' + (chips || '<span></span>') + right + '</div>';
+    } catch (e) { return ''; }
+}
+
+// ============================================================================
+// Qwen(DashScope) 能力控件（v2 Pass P135）——数据驱动自 MODEL_CAPS.qwen（内置表），
+// 不是像 local 那样运行时探测（DashScope 没有 LM Studio 那种 /api/v1/models 能力发现端点）。
+// ============================================================================
+
+// 思考开关 + 预算滑杆/输入框。同一份 HTML 同时用在 Settings→模型 tab 的 Qwen 行、和对话窗参数条
+// （chatReasoningBarHtml 的 qwen 分支）——两处共用同一份 AppState.qwenReasoningByModel，
+// 「翻译」和「对话」对同一个模型的思考偏好是同一份，不像 local 那样各存各的（local 是因为
+// reasoning_effort 语义天生按场景取舍；DashScope 的 thinking_budget 更像模型固有属性）。
+// 规则（T0 拍板）：hybrid 正常可调；always（qwq-plus）只读常开；none/未知置灰禁用 + tooltip 说明
+// 原因（不隐藏——用户明确抱怨过"不可调"看不出为什么）。
+function qwenThinkingControlHtml(id) {
+    try {
+        const sid = sanitizeModelId(id);
+        if (!sid) return '';
+        const caps = getModelCaps('qwen', sid);
+        const kind = (caps && caps.thinking) || 'none';
+        if (kind === 'none') {
+            const tip = (caps && caps.thinkingUnknown)
+                ? '官方文档未提及该模型是否支持思考（不在「深度思考」文档的模型清单里），按不支持处理：不发送 enable_thinking / thinking_budget。'
+                : '该模型不支持思考（enable_thinking），未列入官方支持思考的模型清单。';
+            return '<span class="inline-flex items-center gap-1 opacity-40 cursor-not-allowed" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top">'
+                + '<input type="checkbox" disabled class="w-3.5 h-3.5 rounded border-slate-300">'
+                + '<span class="text-[10px] text-slate-400 font-medium">思考（不支持）</span></span>';
+        }
+        if (kind === 'always') {
+            return '<span class="inline-flex items-center gap-1 text-[10px] text-emerald-600 font-semibold" data-tip="'
+                + escapeAttr('该模型仅支持思考模式，无法关闭（DashScope 官方文档：该系列恒为思考，不接受 enable_thinking:false）。')
+                + '" data-tip-pos="top">思考：始终开启</span>';
+        }
+        // kind === 'hybrid'
+        const pref = (AppState.qwenReasoningByModel && AppState.qwenReasoningByModel[sid]) || null;
+        const enabled = !!pref;
+        const budget = (pref && typeof pref.budget === 'number' && pref.budget > 0) ? pref.budget : '';
+        const budgetMax = (caps && typeof caps.thinkingBudgetMax === 'number') ? caps.thinkingBudgetMax : 32768;
+        const tip = 'DashScope 顶层 enable_thinking / thinking_budget 字段（不是 chat_template_kwargs，那是本地自托管服务的写法，两者字段路径不同）。'
+            + '默认不勾选=完全不发送这两个字段，与改动前行为逐字节一致。勾选后发 enable_thinking:true；'
+            + '预算留空=不发 thinking_budget（用模型自己的固有上限），填了则夹在 1–' + budgetMax + '（官方参数合法区间）内发送。';
+        let html = '<span class="inline-flex items-center gap-1 flex-wrap" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top">'
+            + '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="setQwenThinkingEnabled(\'' + escapeAttr(sid) + '\', this.checked)" class="w-3.5 h-3.5 rounded border-slate-300 text-purple-600 focus:ring-purple-500">'
+            + '<span class="text-[10px] text-slate-500 font-medium">思考</span>';
+        if (enabled) {
+            html += '<input type="number" min="1" max="' + budgetMax + '" step="1" placeholder="预算(留空=模型默认)" value="' + escapeAttr(String(budget))
+                + '" onchange="setQwenThinkingBudget(\'' + escapeAttr(sid) + '\', this.value)" class="w-24 text-[10px] border border-slate-200 rounded px-1 py-0.5">';
+        }
+        html += '</span>';
+        return html;
+    } catch (e) { return ''; }
+}
+
+// 最大输出 tokens：数字输入框，留空=沿用改动前既有默认（翻译主链路 16384），填了会被夹到
+// MODEL_CAPS.qwen[id].maxOutput（未知上限时不夹）。占位文字提示官方推荐值，但不会自动生效——
+// 「显示的建议默认值」和「实际会发送的值」是两回事，后者必须用户主动填写才改变（T0 要求）。
+function qwenMaxOutputControlHtml(id) {
+    try {
+        const sid = sanitizeModelId(id);
+        if (!sid) return '';
+        const caps = getModelCaps('qwen', sid);
+        const capMax = (caps && typeof caps.maxOutput === 'number' && caps.maxOutput > 0) ? caps.maxOutput : null;
+        const saved = (AppState.qwenMaxTokensByModel && typeof AppState.qwenMaxTokensByModel[sid] === 'number') ? AppState.qwenMaxTokensByModel[sid] : null;
+        const placeholder = capMax ? ('官方上限 ' + capMax) : '未知上限';
+        const tip = '最大输出 tokens（max_tokens）。留空=完全不改这次请求，沿用改动前既有的默认值（翻译主链路是 16384）——'
+            + '这个输入框显示的官方上限只是参考，不会自动生效。'
+            + (capMax ? ('填了会被夹到 [1, ' + capMax + ']（该模型官方最大输出上限）。') : '官方文档未给出这个模型的最大输出上限，这里不做夹限。');
+        return '<span class="inline-flex items-center gap-1" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top">'
+            + '<span class="text-[10px] text-slate-500 font-medium">最大输出</span>'
+            + '<input type="number" min="1"' + (capMax ? (' max="' + capMax + '"') : '') + ' placeholder="' + escapeAttr(placeholder)
+            + '" value="' + (saved !== null ? escapeAttr(String(saved)) : '') + '" onchange="setQwenMaxOutput(\'' + escapeAttr(sid) + '\', this.value)"'
+            + ' class="w-20 text-[10px] border border-slate-200 rounded px-1 py-0.5"></span>';
+    } catch (e) { return ''; }
+}
+
+// 只读信息：上下文窗口 / 最大输入（T0 要求"只读展示"，不可编辑）+ 停更徽标。
+function qwenCapsInfoHtml(id) {
+    try {
+        const sid = sanitizeModelId(id);
+        if (!sid) return '';
+        const caps = getModelCaps('qwen', sid);
+        const ctx = (caps && typeof caps.contextWindow === 'number') ? String(caps.contextWindow) : '未知';
+        const maxIn = (caps && typeof caps.maxInput === 'number') ? String(caps.maxInput) : '未知';
+        const deprecated = (caps && caps.deprecated)
+            ? '<span class="text-[8px] px-1 py-0.5 rounded bg-amber-100 text-amber-700 font-bold ml-1" data-tip="'
+              + escapeAttr('官方原文："后续不再更新，建议替换为千问Flash"。仍可正常调用，只是不会再收到模型能力升级。')
+              + '" data-tip-pos="top">官方已停止更新</span>' : '';
+        return '<span class="text-[9px] text-slate-400 font-mono">上下文 ' + escapeHtml(ctx) + ' · 最大输入 ' + escapeHtml(maxIn) + '</span>' + deprecated;
+    } catch (e) { return ''; }
+}
+
+// 一行 Qwen 模型在 Settings 里的「能力 + 控件」，组合上面三个。**纯字符串、绝不抛**（同 xportCapsRowHtml 纪律）。
+function qwenCapsRowHtml(id) {
+    try {
+        const sid = sanitizeModelId(id);
+        if (!sid) return '';
+        return '<div class="flex items-center justify-between gap-2 flex-wrap">'
+            + qwenCapsInfoHtml(sid)
+            + '<span class="flex items-center gap-2 flex-wrap">' + qwenThinkingControlHtml(sid) + qwenMaxOutputControlHtml(sid) + '</span>'
+            + '</div>';
     } catch (e) { return ''; }
 }
 
@@ -17374,6 +17719,10 @@ ${renderSettingsTabBar(activeTab)}
                                 <input type="checkbox" ${AppState.showDatedSnapshots ? 'checked' : ''} onchange="toggleDatedSnapshots()" class="w-3.5 h-3.5 rounded border-slate-300 text-violet-600 focus:ring-violet-500">
                                 日期快照
                             </label>
+                            <label class="flex items-center gap-1.5 text-[10px] text-slate-500 cursor-pointer whitespace-nowrap" data-tip="Qwen(DashScope) /v1/models 原样吐出全量模型广场，默认只保留对话/视觉相关的（过滤掉图像/语音/向量/重排/OCR/omni/qwen-mt 翻译专用模型等）。勾上后要再点一次「更新」才会把被过滤的模型拉回来。" data-tip-pos="left">
+                                <input type="checkbox" ${AppState.qwenShowAllModels ? 'checked' : ''} onchange="toggleQwenShowAllModels()" class="w-3.5 h-3.5 rounded border-slate-300 text-purple-600 focus:ring-purple-500">
+                                显示全部 Qwen 模型
+                            </label>
                         </div>
 
                         ${AppState.newlyFoundIds.length > 0 ? `
@@ -17463,7 +17812,8 @@ ${renderSettingsTabBar(activeTab)}
                         <p class="text-[9px] text-slate-400 mt-2 leading-relaxed">
                             价格口径：<b>美元（USD）／每 1,000,000 tokens</b>，付费层<b>标准档</b>（非 Batch / Flex / Priority）；「入」= 输入价，「出」= 输出价；
                             带 <b>*</b> 的是厂商限时促销价（到期后本表会自动改显恢复价）。多数模型另有速率受限的<b>免费额度</b>，显示价并不等于一定会产生账单。
-                            价格为内置表（非 API 实时返回），截至 ${escapeHtml(MODEL_PRICING_AS_OF)}，目前仅收录 Gemini（OpenAI / Claude 待补）。
+                            价格为内置表（非 API 实时返回），截至 ${escapeHtml(MODEL_PRICING_AS_OF)}，目前收录 Gemini + Qwen（OpenAI / Claude 待补）。
+                            Qwen 单独按国内站(¥)/国际站($) 双币种显示，阶梯计价模型标"起"，部分数字待官方复核的显示"待核实"——悬停可看抓取日期与官方参考链接。
                             推理/思考 token 按输出价计费、部分模型 prompt 超过 200k tokens 会跳到更高档位——悬停价格可看完整说明。
                         </p>
                     </div>
@@ -17952,10 +18302,10 @@ function renderModelSelector() {
                             阿里云百炼 Qwen
                         </div>
                         ${qwenModels.map(m => `
-                            <button onclick="selectModel('qwen','${escapeHtml(m.id)}')" title="${escapeAttr(formatPriceTitle(m.price))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'qwen' && AppState.selectedModel === m.id ? 'bg-purple-50 text-purple-700 ring-1 ring-purple-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
+                            <button onclick="selectModel('qwen','${escapeHtml(m.id)}')" title="${escapeAttr(formatQwenPriceTitle(m.id))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'qwen' && AppState.selectedModel === m.id ? 'bg-purple-50 text-purple-700 ring-1 ring-purple-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
                                 <div class="flex flex-col items-start overflow-hidden">
                                     <span class="text-xs font-bold uppercase tracking-wide truncate max-w-[190px]">${escapeHtml(m.name)}</span>
-                                    <span class="text-[9px] opacity-70 truncate max-w-[190px]">${escapeHtml(m.sub || '')} · ${escapeHtml(formatPriceCompact(m.price))}</span>
+                                    <span class="text-[9px] opacity-70 truncate max-w-[190px]">${escapeHtml(m.sub || '')} · ${escapeHtml(formatQwenPriceCompact(m.id))}</span>
                                 </div>
                                 <span class="${m.iconClass} shrink-0">${m.icon}</span>
                             </button>
@@ -18850,6 +19200,93 @@ function toggleDatedSnapshots() {
         localStorage.setItem('showDatedSnapshots', AppState.showDatedSnapshots ? '1' : '0');
     } catch (e) {}
     renderApp();
+}
+
+// v2 Pass P135：仿上面那个，Qwen「显示全部模型」开关——勾上后跳过 isQwenChatModelId 过滤，
+// 图像/语音/向量/重排/OCR/omni/qwen-mt 等全部原样显示。下次点「更新」才生效（同 showDatedSnapshots）。
+function toggleQwenShowAllModels() {
+    AppState.qwenShowAllModels = !AppState.qwenShowAllModels;
+    try {
+        localStorage.setItem('qwenShowAllModels', AppState.qwenShowAllModels ? '1' : '0');
+    } catch (e) {}
+    renderApp();
+}
+
+// —— Qwen 思考开关/预算 · 最大输出 tokens（v2 Pass P135）——
+// 两个持久化 setter 都不走 renderApp（会冲掉未保存的 API Key 输入框），只定点重绘受影响的容器
+// （见 qwenCapsPaint），同 setModelReasoning() 那条既有纪律。
+function persistQwenReasoningByModel() {
+    try { localStorage.setItem('qwenReasoningByModel', JSON.stringify(AppState.qwenReasoningByModel)); } catch (e) {}
+}
+function persistQwenMaxTokensByModel() {
+    try { localStorage.setItem('qwenMaxTokensByModel', JSON.stringify(AppState.qwenMaxTokensByModel)); } catch (e) {}
+}
+function qwenCapsPaint() {
+    try {
+        if (typeof document === 'undefined') return;
+        const nodes = document.querySelectorAll('[data-qwen-caps-model]');
+        for (let i = 0; i < nodes.length; i++) {
+            nodes[i].innerHTML = qwenCapsRowHtml(nodes[i].getAttribute('data-qwen-caps-model'));
+        }
+    } catch (e) {}
+    // 对话窗参数条的思考控件读的是同一份 AppState.qwenReasoningByModel，改了要跟着重画。
+    try { chatRenderParamBar(); } catch (e) {}
+}
+// 勾选/取消「思考」。取消 = 从表里删掉这个 key（= 回到「完全不发字段」的原行为），不是显式存
+// enable:false——DashScope 对「省略」和「显式发 false」是否等价未经真实验证（见 p135_recon.md B1
+// 末尾），只有「完全不发」才是绝对安全、逐字等价改动前行为的选择。
+function setQwenThinkingEnabled(modelId, checked) {
+    try {
+        const id = sanitizeModelId(modelId);
+        if (!id) return;
+        const caps = getModelCaps('qwen', id);
+        if (!caps || caps.thinking !== 'hybrid') return; // 只有 hybrid 才可调，防御性拦一次
+        if (!AppState.qwenReasoningByModel || typeof AppState.qwenReasoningByModel !== 'object') AppState.qwenReasoningByModel = {};
+        if (checked) {
+            const prevBudget = (AppState.qwenReasoningByModel[id] && typeof AppState.qwenReasoningByModel[id].budget === 'number')
+                ? AppState.qwenReasoningByModel[id].budget : null;
+            AppState.qwenReasoningByModel[id] = { budget: prevBudget };
+        } else {
+            delete AppState.qwenReasoningByModel[id];
+        }
+        persistQwenReasoningByModel();
+        qwenCapsPaint();
+    } catch (e) {}
+}
+function setQwenThinkingBudget(modelId, value) {
+    try {
+        const id = sanitizeModelId(modelId);
+        if (!id) return;
+        if (!AppState.qwenReasoningByModel || !AppState.qwenReasoningByModel[id]) return; // 没开思考就没有预算这一说
+        const caps = getModelCaps('qwen', id);
+        const budgetMax = (caps && typeof caps.thinkingBudgetMax === 'number') ? caps.thinkingBudgetMax : 32768;
+        let n = parseInt(value, 10);
+        if (!isFinite(n) || n <= 0) n = null;
+        else n = Math.max(1, Math.min(budgetMax, n));
+        AppState.qwenReasoningByModel[id].budget = n;
+        persistQwenReasoningByModel();
+        qwenCapsPaint();
+    } catch (e) {}
+}
+// 最大输出 tokens：留空/非法值 = 删掉覆盖（回到各调用点原有默认，翻译主链路是 16384），
+// 否则夹到 [1, MODEL_CAPS.qwen[id].maxOutput]（未知上限时不夹，原样收下用户填的数字）。
+function setQwenMaxOutput(modelId, value) {
+    try {
+        const id = sanitizeModelId(modelId);
+        if (!id) return;
+        if (!AppState.qwenMaxTokensByModel || typeof AppState.qwenMaxTokensByModel !== 'object') AppState.qwenMaxTokensByModel = {};
+        let n = parseInt(value, 10);
+        if (!isFinite(n) || n <= 0) {
+            delete AppState.qwenMaxTokensByModel[id];
+        } else {
+            const caps = getModelCaps('qwen', id);
+            const capMax = (caps && typeof caps.maxOutput === 'number' && caps.maxOutput > 0) ? caps.maxOutput : null;
+            if (capMax) n = Math.min(n, capMax);
+            AppState.qwenMaxTokensByModel[id] = n;
+        }
+        persistQwenMaxTokensByModel();
+        qwenCapsPaint();
+    } catch (e) {}
 }
 
 // Settings 弹窗右边缘拖拽调宽。刻意不走 setState/renderApp——renderSettingsModal() 整段走
@@ -24052,6 +24489,13 @@ function chatModelChoice() {
         const m = sanitizeModelId(ChatState.model);
         if (m && (p === 'local' || MODEL_PROVIDERS.indexOf(p) !== -1)) return { provider: p, model: m, pinned: true };
     } catch (e) {}
+    // v2 Pass P135：对话窗从没单独配置过模型时，回落到翻译主界面的 provider/model；但如果那正好是
+    // Qwen，对话窗有自己独立的推荐默认（qwen3.8-max，比文本翻译默认的 qwen3.8-flash 更看重质量而
+    // 非吞吐，T0 拍板）——只在 ChatState 完全未配置（上面的 try 已经处理了"配置过"的情况）时生效，
+    // 不覆盖用户已经在对话参数条里选过的任何模型。
+    if (AppState.apiProvider === 'qwen') {
+        return { provider: 'qwen', model: QWEN_DEFAULT_CHAT_MODEL, pinned: false };
+    }
     return { provider: AppState.apiProvider, model: AppState.selectedModel, pinned: false };
 }
 
@@ -24336,6 +24780,12 @@ function chatReasoningBarHtml(choice) {
             + '<select class="aichat-psel" id="aiChatGemSel" style="max-width:82px">' + opts + '</select></span>';
     }
 
+    // —— Qwen(DashScope)：数据驱动自 MODEL_CAPS.qwen，复用 Settings→模型 tab 同一份渲染 +
+    // 同一份 AppState.qwenReasoningByModel 持久化（v2 Pass P135，见 qwenThinkingControlHtml 定义处）。
+    if (choice.provider === 'qwen') {
+        return '<span class="aichat-pgroup">' + qwenThinkingControlHtml(choice.model) + '</span>';
+    }
+
     // —— OpenAI / Claude：没有任何已接线的推理发现 ⇒ 一个控件都不画 ——
     // 画一个灰的、或者画一个「看起来能设其实不发」的，都是撒谎。解释放进 ⋮ 里。
     if (choice.provider !== 'local') return '';
@@ -24490,6 +24940,14 @@ function chatMoreBoxHtml(choice) {
                 + escapeHtml('上下文是「加载期」参数：实测发 context_length / num_ctx / n_ctx 会返回 200 但实际值纹丝不动，所以这里只读，不给任何滑块。')
                 + '</div>';
         }
+    } else if (choice.provider === 'qwen') {
+        // v2 Pass P135：Qwen 没有运行时能力发现端点（DashScope 不像 LM Studio 有 /api/v1/models），
+        // 走的是内置的 MODEL_CAPS.qwen 静态表——上面已经画了思考控件（qwenThinkingControlHtml），
+        // 这里补只读的上下文/最大输入信息，与 Settings→模型 tab 那份逐字同源。
+        html += '<div class="aichat-pchips">' + qwenCapsInfoHtml(choice.model) + '</div>'
+            + '<div class="aichat-pnote">'
+            + escapeHtml('数据来自内置表（DashScope 官方页面，非实时拉取），不是运行时探测；页面未提及的字段显示"未知"，不猜。')
+            + '</div>';
     } else {
         html += '<div class="aichat-pnote">'
             + escapeHtml('只有本地 LM Studio 有 /api/v1/models 这种逐模型能力端点。'
@@ -27254,6 +27712,12 @@ function loadSavedSettings() {
             const okId = sanitizeModelId(savedSelectedModel)
                 && (AppState.apiProvider !== 'gemini' || isGeminiTextChatModelId(savedSelectedModel));
             AppState.selectedModel = okId ? savedSelectedModel : DEFAULT_MODEL_CATALOG[0].id;
+        } else if (AppState.apiProvider === 'qwen') {
+            // v2 Pass P135：apiProvider 存过是 'qwen' 但 selectedModel 这个键从未存过（比如直接手改
+            // localStorage、旧版本迁移等场景）——文本翻译的 Qwen 推荐默认改为 qwen3.8-flash（T0 拍板，
+            // 官方当前主推的低成本高并发档）。只在 selectedModel 完全未存过时才生效，不覆盖任何已保存
+            // 的模型选择（那种情况已经在上面 if 分支处理掉了）。
+            AppState.selectedModel = QWEN_DEFAULT_TEXT_MODEL;
         }
 
         // 加载 Model Visibility 设置
@@ -27290,6 +27754,49 @@ function loadSavedSettings() {
         const savedShowSnapshots = localStorage.getItem('showDatedSnapshots');
         if (savedShowSnapshots === '1') {
             AppState.showDatedSnapshots = true;
+        }
+
+        // 加载「显示全部 Qwen 模型」开关（v2 Pass P135，仿上面这条）
+        const savedQwenShowAll = localStorage.getItem('qwenShowAllModels');
+        if (savedQwenShowAll === '1') {
+            AppState.qwenShowAllModels = true;
+        }
+
+        // 加载 Qwen 思考开关/预算（按模型 id）。逐键校验，脏值一律不收——同 B2 那段推理档位纪律。
+        const savedQwenReasoning = localStorage.getItem('qwenReasoningByModel');
+        if (savedQwenReasoning) {
+            try {
+                const parsed = JSON.parse(savedQwenReasoning);
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    const clean = {};
+                    Object.keys(parsed).forEach(function (k) {
+                        const id = sanitizeModelId(k);
+                        const v = parsed[k];
+                        if (id && v && typeof v === 'object') {
+                            const budget = (typeof v.budget === 'number' && isFinite(v.budget) && v.budget > 0) ? Math.round(v.budget) : null;
+                            clean[id] = { budget: budget };
+                        }
+                    });
+                    AppState.qwenReasoningByModel = clean;
+                }
+            } catch (e) {}
+        }
+
+        // 加载 Qwen 每模型「最大输出 tokens」覆盖值
+        const savedQwenMaxTokens = localStorage.getItem('qwenMaxTokensByModel');
+        if (savedQwenMaxTokens) {
+            try {
+                const parsed = JSON.parse(savedQwenMaxTokens);
+                if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                    const clean = {};
+                    Object.keys(parsed).forEach(function (k) {
+                        const id = sanitizeModelId(k);
+                        const v = parsed[k];
+                        if (id && typeof v === 'number' && isFinite(v) && v > 0) clean[id] = Math.round(v);
+                    });
+                    AppState.qwenMaxTokensByModel = clean;
+                }
+            } catch (e) {}
         }
 
         // 加载选词弹窗默认功能（'replace' | 'simplify' | 'grammar'，脏值一律回退默认 'replace'）
