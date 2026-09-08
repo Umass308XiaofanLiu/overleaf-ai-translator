@@ -4392,7 +4392,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.16.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.16.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-08';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -4484,7 +4484,12 @@ const OPENAI_DATED_SNAPSHOT = /-\d{4}-\d{2}-\d{2}$/;
 //           wan(x)前缀/cosyvoice/sambert/paraformer，以及 T0 明确拍板排除的 qwen-mt-*
 //           （官方文档明文：不支持 system prompt / 多轮对话 / JSON 输出，接入主链路必然坏，
 //           见 p135_qwen_pricing.md「问题5」）。
-const QWEN_CHAT_ALLOW = /^(?:qwen(?:3(?:\.\d+)?)?-(?:max|plus|turbo|flash|long)(?:-|$)|qwen(?:3)?-vl-(?!ocr)|qwq-|qvq-)/i;
+// v2 Pass P137：主版本号从固定的 "3(.x)?" 放宽成 "任意数字(.数字)?"——P135 对抗验证
+// （p135_verify.md §3）实测发现旧正则会把 qwen4-max 这类下一代主版本号命名误杀（只认 "3"/"3.x"），
+// 这里改成不设上限的形状，同一 shape 用在 max/plus/... 分支与 vl 分支两处；不影响
+// QWEN_NON_CHAT_DENY 侧的黑名单关键词拦截（两者互相独立），也不放宽任何非 "qwen<数字>-<后缀>"
+// 形状之外的 id。
+const QWEN_CHAT_ALLOW = /^(?:qwen(?:\d+(?:\.\d+)?)?-(?:max|plus|turbo|flash|long)(?:-|$)|qwen(?:\d+(?:\.\d+)?)?-vl-(?!ocr)|qwq-|qvq-)/i;
 const QWEN_NON_CHAT_DENY = /(^qwen-mt-|tts|[-_]asr(?:[-_]|$)|realtime|embedding|rerank|-image|^qwen-image|video|-ocr|omni|music|aitryon|virtualmodel|^wan(?:x|\d)|cosyvoice|sambert|paraformer)/i;
 function isQwenChatModelId(id) {
     const s = String(id || '');
@@ -8666,14 +8671,25 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
         body.tool_choice = (o && typeof o.toolChoice === 'string' && o.toolChoice) ? o.toolChoice : 'auto';
     }
 
+    // v2 Pass P137：判一次「这次请求是不是打 Qwen(DashScope) 端点」，跟下面思考默认值共用同一条
+    // 判据（oApiKey 目前只有 Qwen 调用点会传，见上方 opts.apiKey 注释；再用 baseUrl 同源兜底一次，
+    // 双重保险），避免下面两处各自重复算、以后改判据要同步改两处。
+    let isQwenReq = false;
+    try { isQwenReq = !!(oApiKey && AppState.qwenBaseUrl && xportCapsOrigin(baseUrl) === xportCapsOrigin(AppState.qwenBaseUrl)); } catch (e) { isQwenReq = false; }
+
     // B2：推理档位。**必须显式发，不能靠省略**——实测省略 reasoning_effort 等于关闭推理，
     // 哪怕 /api/v1/models 里 capabilities.reasoning.default 写着 "xhigh"。所以「关」也要
     // 老老实实发 "none"（发 "off" 是 400）。映射与禁发值见 XPORT_EFFORT_WIRE 上方注释。
     // 值从每模型持久化设置来，默认 'off'；xportWireEffort 自带兜底，任何异常都退回 'none'。
     // opts.reasoningEffort 只在对话窗那条路径上出现（对话有自己一套每模型档位，见 ChatState.reasoningByModel）。
+    // v2 Pass P137：这整套（XPORT_EFFORT_WIRE / xportWireEffort / xportClampReasoning）是给
+    // LM Studio「local」端点设计的私有词表——`reasoning_effort` 不是 DashScope 文档记录的参数
+    // （诊断见 .claude/tmp/p137_chat_truncation_diag.md §4）。之前 Qwen 请求会无条件落进
+    // xportWireEffort 的 'off' 兜底、发出 reasoning_effort:"none"；现在 Qwen 请求一律跳过这整个
+    // 分支，不发这个字段。
     let effortSent = '';
     try {
-        if (!xportEffortUnsupported.has(xportCapsOrigin(baseUrl))) {
+        if (!isQwenReq && !xportEffortUnsupported.has(xportCapsOrigin(baseUrl))) {
             const override = (o && typeof o.reasoningEffort === 'string'
                 && XPORT_WIRE_EFFORTS.indexOf(o.reasoningEffort) !== -1) ? o.reasoningEffort : '';
             effortSent = override || xportWireEffort(baseUrl, model);
@@ -8685,19 +8701,26 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
     // enable_thinking / thinking_budget 字段——跟上面 reasoning_effort（local 专用词表）、以及
     // pdf2texDisableThinking 用的 chat_template_kwargs.enable_thinking（本地自托管 OpenAI 兼容服务
     // 的写法）都是**不同的字段路径**，三者互不冲突、各自独立发送（见 p135_recon.md B1 末尾）。
-    // 只在「这次请求确实打的是 AppState.qwenBaseUrl（用户 Settings→API 配的那个 Qwen 端点）
-    // 且这个模型在 AppState.qwenReasoningByModel/qwenMaxTokensByModel 里配过覆盖值」时才生效——
-    // 用 oApiKey 兜底一次（没带 key 的 local 调用不可能命中这两张 Qwen 专属表，双重保险）。
-    // 未配置的模型/未触碰这两个功能的用户，body 与改动前逐字节一致（不发新字段、max_tokens 仍是
-    // 未传时的既有默认 16384）——PDF 视觉/AI 合并链路那 6 个函数走的是 OvlSettings 各自的端点，
-    // 不会读写这两张表，因此逐字节不受影响，除非用户主动把它们也指到了一模一样的 Qwen 端点
-    // （那种情况下继承主界面存的偏好也是合理行为，不是本次改动引入的新风险）。
+    // 只在「这次请求确实打的是 AppState.qwenBaseUrl」时才生效（判据见上面 isQwenReq）。
+    // v2 Pass P137：**改了未触碰时的默认值**——用户没在 AppState.qwenReasoningByModel 为这个
+    // 模型存过覆盖值时，不再「完全不发」，而是按 MODEL_CAPS.qwen[model].thinking 补一条安全默认
+    // （诊断见 p137_chat_truncation_diag.md §1，根因是 Qwen3.5+ 系列默认静默开思考，把聊天窗口
+    // 2048/翻译链路的 max_tokens 预算吃穿）：
+    //   hybrid（可关）→ 显式发 enable_thinking:false；
+    //   always（qwq-plus 这类恒开、不接受 enable_thinking:false，发了是 400）→ 不发；
+    //   caps 缺失/thinking 既非 hybrid 也非 always（未知）→ 不发，不猜。
+    // 用户碰过控件（勾选过「思考」，在 AppState.qwenReasoningByModel 里留下记录——只有勾选会
+    // 写入这张表，取消是删掉整条记录，见 setQwenThinkingEnabled 定义处）时，下面 if 分支直接
+    // 命中「有覆盖值」这条老路径，新默认完全不介入——控件状态永远优先于这条安全默认。
     try {
-        if (oApiKey && AppState.qwenBaseUrl && xportCapsOrigin(baseUrl) === xportCapsOrigin(AppState.qwenBaseUrl)) {
+        if (isQwenReq) {
             if (AppState.qwenReasoningByModel && Object.prototype.hasOwnProperty.call(AppState.qwenReasoningByModel, model)) {
                 const pref = AppState.qwenReasoningByModel[model];
                 body.enable_thinking = true;
                 if (pref && typeof pref.budget === 'number' && pref.budget > 0) body.thinking_budget = Math.round(pref.budget);
+            } else {
+                const qcaps = getModelCaps('qwen', model);
+                if (qcaps && qcaps.thinking === 'hybrid') body.enable_thinking = false;
             }
             if (oMax === null && AppState.qwenMaxTokensByModel && typeof AppState.qwenMaxTokensByModel[model] === 'number') {
                 body.max_tokens = AppState.qwenMaxTokensByModel[model];
@@ -24169,10 +24192,23 @@ function chatRenderAssistant(raw, meta) {
     };
 
     // 正文为空 + 有推理 = 推理吃光了预算。这是本地模型最典型的一种「什么都没返回」。
+    // v2 Pass P137：「到「设置 → 模型」把推理设为关」这句只对 provider==='local' 成立——Qwen
+    // 从 P135 起在对话窗参数条自己就有「思考」控件（chatReasoningBarHtml 的 qwen 分支，复用
+    // qwenThinkingControlHtml），文案不分叉会把 Qwen 用户指向一个不存在的入口（诊断见
+    // .claude/tmp/p137_chat_truncation_diag.md §3）。ChatState.lastRequest 是 chatCallModel 每次
+    // 请求前同步写下的快照，跟这里的 raw/meta 对应的正是同一次请求，读它不会读到别的请求。
     if (!String(raw || '').trim()) {
-        const errRow = chatErrorRow('对话', m.thinking
-            ? '模型把 token 预算全用在推理上了，正文是空的。到「设置 → 模型」把该模型的「推理」设为「关」再试。'
-            : '模型返回了空正文。');
+        const emptyProvider = (ChatState.lastRequest && ChatState.lastRequest.provider) || '';
+        let emptyMsg;
+        if (!m.thinking) {
+            emptyMsg = '模型返回了空正文。';
+        } else if (emptyProvider === 'qwen') {
+            emptyMsg = '模型把 token 预算全用在推理上了，正文是空的。在输入框下方的参数条里把「思考」关掉'
+                + '（该模型的思考如果无法关闭，就把旁边「最大输出」调大）；「设置 → 模型」的 Qwen 分组里也能调，是同一份设置。';
+        } else {
+            emptyMsg = '模型把 token 预算全用在推理上了，正文是空的。到「设置 → 模型」把该模型的「推理」设为「关」再试。';
+        }
+        const errRow = chatErrorRow('对话', emptyMsg);
         // 推理内容仍然给出来（诊断用），但没有推理时不要留一条空行。
         // 这一条**绕过**「显示思考过程」开关：正文是空的，此刻推理内容是屏幕上唯一的诊断线索，
         // 把它也藏起来，用户看到的就只剩一条「模型返回了空正文」而无从下手。
@@ -24609,8 +24645,12 @@ function chatEffectiveTemperature(provider, model) {
 
 // 「默认」= 这条链路本来就在用的值，改这个功能之前是多少，这里就是多少（本地 16384，
 // 在线 CHAT_MAX_TOKENS）。这样「没动过参数条」的用户逐字保持原行为。
+// v2 Pass P137：把 'qwen' 并入 16384 分支——P134/P135 遗留的既有小 bug，Qwen 聊天窗口此前跟
+// openai/claude/gemini 共用同一个偏低的 2048，Qwen3.5+ 系列默认静默开思考时极容易把 2048 的
+// 预算全部吃在思考上，正文要么半截要么整段空（诊断见 .claude/tmp/p137_chat_truncation_diag.md
+// §1.1，P135 对抗验证 p135_verify.md §7 已核实这条当时确实还是 2048，未被 P135 顺手修掉）。
 function chatDefaultMaxTokens(provider) {
-    return provider === 'local' ? 16384 : CHAT_MAX_TOKENS;
+    return (provider === 'local' || provider === 'qwen') ? 16384 : CHAT_MAX_TOKENS;
 }
 
 function chatEffectiveMaxTokens(provider) {
