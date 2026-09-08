@@ -852,6 +852,15 @@ body.is-resizing-settings-modal * {
     line-height: 1.4;
 }
 #aiChatRoot .aichat-filewatch-x:hover { color: #1e3a8a; }
+/* v2 Pass P136：本轮因四道上限（单文件夹 50 个文件/同时 3 个文件夹/合计 400KB/单文件 50KB）
+   被排除、没能发给模型的项——绝不静默丢弃，这里跟发给模型的 ==FILES== 块尾部读同一份
+   chatBuildFileWatchBlock().excluded，两处保证一致。 */
+#aiChatRoot .aichat-filewatch-excluded {
+    margin-top: 4px;
+    padding-top: 4px;
+    border-top: 1px dashed #bfdbfe;
+    color: #b45309;
+}
 
 /* ---- C6：上下文用量环 / 分解面板 / 会话历史 ----
    全部住在 .aichat-bar 与 .aichat-footer 里，和参数条同一条纪律：不依赖 Tailwind 的
@@ -2551,6 +2560,22 @@ body.ovl-translator-open #ovlTransWin { display: block; }
     height: 6px;
     border-radius: 50%;
     background: #60a5fa;
+}
+/* v2 Pass P136：文件夹关注的三态——文件夹自身直接被关注、或被上级已关注文件夹整体覆盖，
+   复用同一个实心圆点（跟文件语义一致："这个东西的内容会被发出去"）；文件夹内部有部分后代
+   被关注（自己没被直接关注）用空心圆环区分，同一颜色令牌，不新增配色。 */
+.ovl-tree-row-watched-partial { position: relative; }
+.ovl-tree-row-watched-partial::after {
+    content: "";
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    border: 1px solid #60a5fa;
+    background: transparent;
 }
 
 .ovl-tree-outline { border-top: 1px solid #2F3A4C; flex: 0 0 auto; max-height: 40%; display: flex; flex-direction: column; }
@@ -4392,7 +4417,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.16.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.17.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-08';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -7628,9 +7653,17 @@ function focusTexGutterLines() {
 // 两层共用的只是"关注"这个概念和相近的 UI 语言（chip、×、灰显失效），不是同一份数据。
 const FILEWATCH_MAX = 20;              // 整份文件比一句话重得多，上限比 FOCUS_MAX(40) 收紧
 const FILEWATCH_TRUNC = 50 * 1024;     // 单文件 >50KB：头尾各截一半，中间显式标注省略了多少
+// v2 Pass P136：关注文件不再局限于 tex/bib/md，且支持关注整个文件夹（用户反馈原话：
+// "关注文件这个功能貌似只局限于 tex bib md 文件……但是我希望的是 file tree 的所有文件都
+// 可以关注，甚至必要的时候关注 file tree 的某个文件夹"）。见 .claude/tmp/p136_focus_recon.md。
+const FILEWATCH_FOLDER_MAX = 3;               // 同时关注的文件夹数上限（跟 FILEWATCH_MAX 分开计数）
+const FILEWATCH_FOLDER_FILES_MAX = 50;        // 单个被关注文件夹递归展开出的文本/PDF 文件数上限
+const FILEWATCH_TOTAL_BYTES_MAX = 400 * 1024; // 本轮所有关注内容（直接文件 + 文件夹展开）合计注入字节上限
+const FILEWATCH_DIR_REFRESH_MS = 2000;        // 文件夹"动态跟随"的最短刷新间隔——避免估算路径高频调用时把磁盘打爆
+const FILEWATCH_DIR_SKIP = ['node_modules', '.git']; // 文件夹展开时跳过的噪音目录，跟 project_search 的 CHAT_AGENT_SEARCH_SKIP_DIRS 同一约定
 
 const FileWatchState = {
-    files: [],       // [relPath, ...]，当前项目已关注的文件，去重、有序（先关注的在前）
+    entries: [],     // [{kind:'file', relPath} | {kind:'dir', relPath}]，去重、有序（先关注的在前）
     seq: 0,          // 每次增删 +1，同 FocusState.seq 一个作用：进上下文身份串
     loadedKey: null  // 上一次从 localStorage 读取时对应的项目 key；跟当前项目对不上就重读
 };
@@ -7653,6 +7686,21 @@ function fileWatchProjectKey() {
     try { return ovlNormalizeProjectPath(ovlRemoteProjectRoot()); } catch (e) { return ''; }
 }
 
+// v2 Pass P136：旧版 localStorage 存的是纯字符串数组（每一项就是一个 relPath，全部当文件）。
+// 升级成 {kind,relPath} 之后读时兼容一次——纯字符串 item 视为 {kind:'file', relPath:item}，
+// 已经是新形状的 item 原样规整。不做写时迁移（下次 fileWatchPersist 自然落成新格式）。
+function fileWatchNormalizeStoredEntry(item) {
+    if (typeof item === 'string') return item ? { kind: 'file', relPath: item } : null;
+    if (item && typeof item === 'object') {
+        const rp = (typeof item.relPath === 'string') ? item.relPath : null;
+        if (rp == null) return null;
+        const kind = (item.kind === 'dir') ? 'dir' : 'file';
+        if (kind === 'file' && !rp) return null; // 空字符串只对文件夹（项目根）有意义
+        return { kind: kind, relPath: rp };
+    }
+    return null;
+}
+
 // 懒加载：谁第一个问"这个文件关没关注"，谁触发一次"当前项目跟上次加载的项目对不对得上"
 // 的检查，对不上就重读。不需要在"打开项目文件夹"那几个分散的调用点各自补一次加载——
 // 刷新页面之后 #ovlProjectPathInput 的值是先恢复好的（ovlSetProjectPath 一类的既有流程），
@@ -7662,20 +7710,25 @@ function fileWatchEnsureLoaded() {
     const key = fileWatchProjectKey();
     if (FileWatchState.loadedKey === key) return;
     FileWatchState.loadedKey = key;
-    FileWatchState.files = [];
+    FileWatchState.entries = [];
     if (!key) return;
     try {
         const map = fileWatchMapLoad();
         const arr = Array.isArray(map[key]) ? map[key] : [];
         const seen = {};
         const out = [];
-        for (let i = 0; i < arr.length && out.length < FILEWATCH_MAX; i++) {
-            const rp = String(arr[i] == null ? '' : arr[i]);
-            if (!rp || seen[rp]) continue;
-            seen[rp] = true;
-            out.push(rp);
+        let fileCount = 0, dirCount = 0;
+        for (let i = 0; i < arr.length; i++) {
+            const norm = fileWatchNormalizeStoredEntry(arr[i]);
+            if (!norm) continue;
+            const dedupKey = norm.kind + ':' + norm.relPath;
+            if (seen[dedupKey]) continue;
+            if (norm.kind === 'file') { if (fileCount >= FILEWATCH_MAX) continue; fileCount++; }
+            else { if (dirCount >= FILEWATCH_FOLDER_MAX) continue; dirCount++; }
+            seen[dedupKey] = true;
+            out.push(norm);
         }
-        FileWatchState.files = out;
+        FileWatchState.entries = out;
     } catch (e) {}
 }
 function fileWatchPersist() {
@@ -7683,39 +7736,95 @@ function fileWatchPersist() {
         const key = fileWatchProjectKey();
         if (!key) return;   // 没打开项目就没有persist的地方——内存态照旧生效，只是不落盘
         const map = fileWatchMapLoad();
-        map[key] = FileWatchState.files.slice();
+        map[key] = FileWatchState.entries.slice();
         fileWatchMapSave(map);
     } catch (e) {}
 }
 
-function fileWatchList() { fileWatchEnsureLoaded(); return FileWatchState.files.slice(); }
-function fileWatchHas(relPath) { fileWatchEnsureLoaded(); return FileWatchState.files.indexOf(relPath) !== -1; }
-
-// 只文本类文件能被"整份关注"——复用既有的 project_search 白名单（21286 行附近的
-// CHAT_AGENT_SEARCH_EXTS），不新写第二份判别标准；对不上就在右键菜单里置灰。
-function fileWatchIsTextExt(name) {
-    const m = /\.[^./\\]+$/.exec(String(name || ''));
-    const ext = m ? m[0].toLowerCase() : '';
-    return CHAT_AGENT_SEARCH_EXTS.indexOf(ext) !== -1;
+function fileWatchEntries() { fileWatchEnsureLoaded(); return FileWatchState.entries.slice(); }
+// 向后兼容：只返回"文件"类条目的 relPath 扁平数组（不含被关注文件夹展开出来的文件）——
+// chatUpdateBar「N 个关注文件」这行文案、以及 P115 既有测试用的就是这个语义，不改。
+function fileWatchList() {
+    fileWatchEnsureLoaded();
+    const out = [];
+    for (let i = 0; i < FileWatchState.entries.length; i++) if (FileWatchState.entries[i].kind === 'file') out.push(FileWatchState.entries[i].relPath);
+    return out;
 }
+function fileWatchDirList() {
+    fileWatchEnsureLoaded();
+    const out = [];
+    for (let i = 0; i < FileWatchState.entries.length; i++) if (FileWatchState.entries[i].kind === 'dir') out.push(FileWatchState.entries[i].relPath);
+    return out;
+}
+function fileWatchHasFileDirect(relPath) {
+    fileWatchEnsureLoaded();
+    for (let i = 0; i < FileWatchState.entries.length; i++) { const e = FileWatchState.entries[i]; if (e.kind === 'file' && e.relPath === relPath) return true; }
+    return false;
+}
+function fileWatchHasDirDirect(relPath) {
+    fileWatchEnsureLoaded();
+    for (let i = 0; i < FileWatchState.entries.length; i++) { const e = FileWatchState.entries[i]; if (e.kind === 'dir' && e.relPath === relPath) return true; }
+    return false;
+}
+// relPath 是不是落在某个被关注文件夹内部（严格祖先，不含它自己）——用来判断"这份文件/这个
+// 子文件夹已经通过上级文件夹被整体关注了，不需要（也不该再允许）单独重复关注一次"。
+function fileWatchIsCoveredByDir(relPath) {
+    fileWatchEnsureLoaded();
+    const rp = String(relPath || '');
+    for (let i = 0; i < FileWatchState.entries.length; i++) {
+        const e = FileWatchState.entries[i];
+        if (e.kind !== 'dir') continue;
+        const dp = e.relPath;
+        if (dp === '') { if (rp !== '') return true; continue; } // 项目根被整份关注 => 覆盖除它自己以外的一切
+        if (rp !== dp && rp.indexOf(dp + '/') === 0) return true;
+    }
+    return false;
+}
+// 三态判定，文件和文件夹统一走这一个函数：
+//   'on' + direct=true  —— 自己就是一条直接关注的条目（右键菜单/chip 都能直接取消）。
+//   'on' + direct=false —— 被上级已关注文件夹整体覆盖（右键菜单里置灰，要取消得先动上级）。
+//   'partial'（只有文件夹用得到）—— 自己不是条目，但内部有后代是条目（或被更上层覆盖）。
+//   'off' —— 什么关系都没有。
+function fileWatchNodeState(relPath, isDir) {
+    fileWatchEnsureLoaded();
+    const rp = String(relPath || '');
+    const directHit = isDir ? fileWatchHasDirDirect(rp) : fileWatchHasFileDirect(rp);
+    if (directHit) return { state: 'on', direct: true };
+    if (fileWatchIsCoveredByDir(rp)) return { state: 'on', direct: false };
+    if (!isDir) return { state: 'off', direct: false };
+    const prefix = rp === '' ? '' : rp + '/';
+    for (let i = 0; i < FileWatchState.entries.length; i++) {
+        const e = FileWatchState.entries[i];
+        if (e.relPath === rp) continue;
+        if (rp === '' || e.relPath.indexOf(prefix) === 0) return { state: 'partial', direct: false };
+    }
+    return { state: 'off', direct: false };
+}
+
+// 向后兼容旧名字：旧调用点（树文件行 class）只关心"这份文件此刻算不算已关注"（不区分是自己
+// 直接关注的还是被上级文件夹覆盖的），等价于 fileWatchNodeState(relPath,false).state!=='off'。
+function fileWatchHas(relPath) { return fileWatchNodeState(relPath, false).state !== 'off'; }
 
 function fileWatchAdd(relPath) {
     fileWatchEnsureLoaded();
-    if (FileWatchState.files.indexOf(relPath) !== -1) return true;
-    if (FileWatchState.files.length >= FILEWATCH_MAX) {
+    if (fileWatchHasFileDirect(relPath)) return true;
+    let fileCount = 0;
+    for (let i = 0; i < FileWatchState.entries.length; i++) if (FileWatchState.entries[i].kind === 'file') fileCount++;
+    if (fileCount >= FILEWATCH_MAX) {
         try { showToast('最多同时关注 ' + FILEWATCH_MAX + ' 个文件，先取消关注几个再加。', 'warning'); } catch (e) {}
         return false;
     }
-    FileWatchState.files.push(relPath);
+    FileWatchState.entries.push({ kind: 'file', relPath: relPath });
     FileWatchState.seq++;
     fileWatchPersist();
     return true;
 }
 function fileWatchRemove(relPath) {
     fileWatchEnsureLoaded();
-    const i = FileWatchState.files.indexOf(relPath);
+    let i = -1;
+    for (let k = 0; k < FileWatchState.entries.length; k++) { if (FileWatchState.entries[k].kind === 'file' && FileWatchState.entries[k].relPath === relPath) { i = k; break; } }
     if (i === -1) return false;
-    FileWatchState.files.splice(i, 1);
+    FileWatchState.entries.splice(i, 1);
     FileWatchState.seq++;
     fileWatchPersist();
     return true;
@@ -7723,15 +7832,200 @@ function fileWatchRemove(relPath) {
 // 返回切换之后的新状态（true=现在已关注，false=现在没关注了）——右键菜单和 chip 的 × 都
 // 靠这个返回值决定提示文案，不用各自再查一遍 fileWatchHas。
 function fileWatchToggle(relPath) {
-    if (fileWatchHas(relPath)) { fileWatchRemove(relPath); return false; }
+    if (fileWatchHasFileDirect(relPath)) { fileWatchRemove(relPath); return false; }
+    if (fileWatchIsCoveredByDir(relPath)) return true; // 已被上级文件夹整体覆盖，不产生重复的直接条目
     return fileWatchAdd(relPath);
 }
 
-// 身份串的一部分：关注文件集一变、或者 OvlFileTextCache 里有文件读到/读完了，用量环上的
-// 「实测」都该退回估算——跟 focusSig() 同一条纪律，共用同一个缓存代际计数。
+// v2 Pass P136：文件夹关注——同一套持久化/上限/toast 纪律，单独的 FILEWATCH_FOLDER_MAX 计数。
+function fileWatchAddDir(relPath) {
+    fileWatchEnsureLoaded();
+    if (fileWatchHasDirDirect(relPath)) return true;
+    if (fileWatchIsCoveredByDir(relPath)) return true; // 已被更上层文件夹整体覆盖，没必要重复关注
+    let dirCount = 0;
+    for (let i = 0; i < FileWatchState.entries.length; i++) if (FileWatchState.entries[i].kind === 'dir') dirCount++;
+    if (dirCount >= FILEWATCH_FOLDER_MAX) {
+        try { showToast('最多同时关注 ' + FILEWATCH_FOLDER_MAX + ' 个文件夹，先取消关注一个再加。', 'warning'); } catch (e) {}
+        return false;
+    }
+    // 卫生清理：这个文件夹内部原本已有的直接条目（文件或子文件夹）从此被整体覆盖，删掉——
+    // 避免同一份内容被注入两遍，顺带把名额还回去。
+    const prefix = relPath === '' ? '' : relPath + '/';
+    FileWatchState.entries = FileWatchState.entries.filter(function (e) {
+        if (e.relPath === relPath) return false;
+        return !(relPath === '' || e.relPath.indexOf(prefix) === 0);
+    });
+    FileWatchState.entries.push({ kind: 'dir', relPath: relPath });
+    FileWatchState.seq++;
+    fileWatchPersist();
+    return true;
+}
+function fileWatchRemoveDir(relPath) {
+    fileWatchEnsureLoaded();
+    let i = -1;
+    for (let k = 0; k < FileWatchState.entries.length; k++) { if (FileWatchState.entries[k].kind === 'dir' && FileWatchState.entries[k].relPath === relPath) { i = k; break; } }
+    if (i === -1) return false;
+    FileWatchState.entries.splice(i, 1);
+    FileWatchState.seq++;
+    fileWatchPersist();
+    return true;
+}
+function fileWatchToggleDir(relPath) {
+    if (fileWatchHasDirDirect(relPath)) { fileWatchRemoveDir(relPath); return false; }
+    return fileWatchAddDir(relPath);
+}
+
+// 已知二进制扩展名：不需要读内容也能判定——覆盖常见图片/压缩包/办公文档/媒体/字体/可执行
+// 文件。独立于 CHAT_AGENT_SEARCH_EXTS（那张表是白名单、只服务 project_search，绝不能碰，
+// 见 P136 任务书禁区）——这里是反过来的黑名单，服务关注功能，两者语义相反不能共用一份。
+// PDF 不在这张表里：PDF 单独判一档，走 pdf.js 文字层抽取，不是"仅路径引用"。
+const FILEWATCH_KNOWN_BINARY_EXT_RE = /\.(png|jpe?g|gif|webp|bmp|tiff?|ico|svg|heic|heif|zip|gz|tgz|tar|7z|rar|exe|dll|so|dylib|bin|dat|db|sqlite3?|class|jar|pyc|o|a|lib|psd|ai|indd|docx?|xlsx?|pptx?|ppt|rtf|numbers|pages|key|mp3|mp4|mov|avi|mkv|wav|flac|ogg|m4a|eot|ttf|otf|woff2?)$/i;
+
+// 关注功能的类型判定：'pdf'（走文字层抽取）/'binary'（已知二进制，只留路径引用，不读内容）/
+// 'text'（其余一切，含未知扩展名——"能解码成文本就能关注"：先乐观当文本候选，真读取时用
+// 内容里有没有 NUL 字节兜底纠正，见 fileWatchBuildFileItem）。纯扩展名判断，同步、不读内容
+// ——右键菜单/树角标渲染都是同步函数，不能在这一层 await。
+function fileWatchClassifyExt(name) {
+    const n = String(name || '');
+    if (/\.pdf$/i.test(n)) return 'pdf';
+    if (FILEWATCH_KNOWN_BINARY_EXT_RE.test(n)) return 'binary';
+    return 'text';
+}
+
+// 身份串的一部分：关注集合一变、或者 OvlFileTextCache/OvlDirWatchCache/OvlPdfWatchTextCache
+// 里有内容读到/读完了，用量环上的「实测」都该退回估算——跟 focusSig() 同一条纪律。
 function fileWatchSig() {
-    try { fileWatchEnsureLoaded(); return FileWatchState.files.length + ':' + FileWatchState.seq + ':' + __ovlFileTextCacheGen; }
-    catch (e) { return '0:0:0'; }
+    try {
+        fileWatchEnsureLoaded();
+        return FileWatchState.entries.length + ':' + FileWatchState.seq + ':' + __ovlFileTextCacheGen
+            + ':' + __ovlDirWatchGen + ':' + __ovlPdfWatchGen;
+    } catch (e) { return '0:0:0:0:0'; }
+}
+
+// ==================== v2 Pass P136：文件夹关注——递归展开 + "动态跟随" ====================
+// 每次装配聊天轮次都重新列一次目录（不是关注那一刻拍快照存死），用 stale-while-revalidate：
+// 缓存没有就报 pending 并后台发起一次；缓存已经有（哪怕是几秒钟前的）就先把旧结果原样给
+// 调用方，同时（如果没有正在飞行的请求、且离上次完成超过 FILEWATCH_DIR_REFRESH_MS）后台再
+// 发起一次刷新——避免"下一轮大约要花多少"的估算路径高频调用时把磁盘/桥打爆，又不会让内容
+// 永远停在关注那一刻。
+const OvlDirWatchCache = new Map();     // key -> { files:[{relPath,kind}], excluded:[{relPath,reason}], at, failed }
+const __ovlDirWatchLoading = new Set();
+let __ovlDirWatchGen = 0;
+function fileWatchDirCacheKey(relPath) { return ovlFileTextCacheKey(relPath) + '@dir'; }
+function dirWatchCacheGet(relPath) {
+    try { return OvlDirWatchCache.get(fileWatchDirCacheKey(relPath)) || null; } catch (e) { return null; }
+}
+
+async function fileWatchResolveDirHandle(rootDirHandle, relPath) {
+    const parts = String(relPath || '').replace(/\\/g, '/').split('/').filter(function (p) { return p && p !== '.'; });
+    let dir = rootDirHandle;
+    for (let i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i]);
+    return dir;
+}
+
+// 递归遍历，跟主文件树同一套"看得见的东西"约定：跳过点头文件/目录（ovlBuildTreeDom 同款）
+// 和 node_modules/.git 噪音目录（project_search 同款）。排序也照抄主树（目录在前、各自按
+// 名字），命中数硬上限 FILEWATCH_FOLDER_FILES_MAX——排在上限之后的文件如实记进 excluded，
+// 不是数到 50 就默默不再往下扫（继续扫完，只是不再收进 files，全部记进 excluded）。
+async function fileWatchWalkDirForWatch(dirHandle, relPrefix, state) {
+    let entries = [];
+    try {
+        for await (const pair of dirHandle.entries()) {
+            const name = pair[0], h = pair[1];
+            if (name.charAt(0) === '.') continue;
+            if (h && h.kind === 'directory' && FILEWATCH_DIR_SKIP.indexOf(name) !== -1) continue;
+            entries.push([name, h]);
+        }
+    } catch (e) { state.walkError = true; return; }
+    entries.sort(function (a, b) {
+        const ak = a[1].kind === 'directory' ? 0 : 1;
+        const bk = b[1].kind === 'directory' ? 0 : 1;
+        if (ak !== bk) return ak - bk;
+        return a[0].localeCompare(b[0]);
+    });
+    for (let i = 0; i < entries.length; i++) {
+        const name = entries[i][0], h = entries[i][1];
+        const relPath = relPrefix ? (relPrefix + '/' + name) : name;
+        if (h.kind === 'directory') { await fileWatchWalkDirForWatch(h, relPath, state); continue; }
+        if (state.files.length >= FILEWATCH_FOLDER_FILES_MAX) {
+            state.excluded.push({ relPath: relPath, reason: '所在文件夹关注的文件数已达上限 ' + FILEWATCH_FOLDER_FILES_MAX + '（按文件树排序只取前 ' + FILEWATCH_FOLDER_FILES_MAX + ' 个）' });
+            continue;
+        }
+        state.files.push({ relPath: relPath, kind: fileWatchClassifyExt(name) });
+    }
+}
+
+async function fileWatchExpandDirForWatch(relPath) {
+    const state = { files: [], excluded: [], walkError: false };
+    const dirHandle = (relPath === '') ? OvlState.dirHandle : await fileWatchResolveDirHandle(OvlState.dirHandle, relPath);
+    await fileWatchWalkDirForWatch(dirHandle, relPath, state);
+    if (state.walkError) throw new Error('读取文件夹失败');
+    return state;
+}
+
+function dirWatchCacheEnsure(relPath) {
+    try {
+        if (!OvlState || !OvlState.dirHandle) return;
+        const key = fileWatchDirCacheKey(relPath);
+        if (__ovlDirWatchLoading.has(key)) return;
+        const cached = OvlDirWatchCache.get(key);
+        if (cached && (Date.now() - cached.at) < FILEWATCH_DIR_REFRESH_MS) return; // 太快了，沿用现有结果
+        __ovlDirWatchLoading.add(key);
+        Promise.resolve(fileWatchExpandDirForWatch(relPath))
+            .then(function (state) { OvlDirWatchCache.set(key, { files: state.files, excluded: state.excluded, at: Date.now(), failed: false }); })
+            .catch(function () { OvlDirWatchCache.set(key, { files: [], excluded: [], at: Date.now(), failed: true }); })
+            .finally(function () {
+                __ovlDirWatchLoading.delete(key);
+                __ovlDirWatchGen++;
+                try { if (typeof fileWatchRenderChip === 'function') fileWatchRenderChip(); } catch (e) {}
+                try { if (typeof ChatState !== 'undefined' && ChatState && ChatState.open && typeof chatUpdateBar === 'function') chatUpdateBar(); } catch (e) {}
+            });
+    } catch (e) {}
+}
+
+// ==================== v2 Pass P136：PDF 关注——复用页面已加载好的 pdf.js 抽文字层 ====================
+// 不走视觉模型、不碰 callClaudeAPI、不引入新依赖——pdfjsLib 本来就是这个文件已经在用的现成库
+// （P72 直显/P75 转换/P106 反查都在用同一个 getDocument({data,...}) 调用形状，这里原样照抄）。
+// 抽不出文字层（扫描件/纯图 PDF）要显式提示，不能装作关注成功却发一段空内容。
+const OvlPdfWatchTextCache = new Map();  // key -> { text, noTextLayer, failed, at }
+const __ovlPdfWatchLoading = new Set();
+let __ovlPdfWatchGen = 0;
+function fileWatchPdfCacheKey(relPath) { return ovlFileTextCacheKey(relPath) + '@pdf'; }
+function pdfWatchTextCacheGet(relPath) {
+    try { return OvlPdfWatchTextCache.get(fileWatchPdfCacheKey(relPath)) || null; } catch (e) { return null; }
+}
+async function fileWatchExtractPdfText(relPath) {
+    const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, relPath);
+    const file = await resolved.handle.getFile();
+    const buf = await file.arrayBuffer();
+    const doc = await pdfjsLib.getDocument({ data: buf, isEvalSupported: false, isOffscreenCanvasSupported: false }).promise;
+    const parts = [];
+    for (let i = 1; i <= doc.numPages; i++) {
+        const page = await doc.getPage(i);
+        const content = await page.getTextContent();
+        const items = (content && content.items) || [];
+        const lineText = items.map(function (it) { return (it && it.str != null) ? it.str : ''; }).join(' ').replace(/\s+/g, ' ').trim();
+        if (lineText) parts.push(lineText);
+    }
+    const text = parts.join('\n\n');
+    return { text: text, empty: !text || !text.trim() };
+}
+function pdfWatchTextCacheEnsure(relPath) {
+    try {
+        if (!OvlState || !OvlState.dirHandle) return;
+        const key = fileWatchPdfCacheKey(relPath);
+        if (OvlPdfWatchTextCache.has(key) || __ovlPdfWatchLoading.has(key)) return;
+        __ovlPdfWatchLoading.add(key);
+        Promise.resolve(fileWatchExtractPdfText(relPath))
+            .then(function (r) { OvlPdfWatchTextCache.set(key, { text: r.text, noTextLayer: r.empty, failed: false, at: Date.now() }); })
+            .catch(function () { OvlPdfWatchTextCache.set(key, { text: '', noTextLayer: false, failed: true, at: Date.now() }); })
+            .finally(function () {
+                __ovlPdfWatchLoading.delete(key);
+                __ovlPdfWatchGen++;
+                try { if (typeof fileWatchRenderChip === 'function') fileWatchRenderChip(); } catch (e) {}
+                try { if (typeof ChatState !== 'undefined' && ChatState && ChatState.open && typeof chatUpdateBar === 'function') chatUpdateBar(); } catch (e) {}
+            });
+    } catch (e) {}
 }
 
 // —— 对话窗里的「正在关注」清单（跟句子级「额外关注」分开一个区块）——
@@ -7745,8 +8039,14 @@ function fileWatchRenderChip() {
         // 这排 chip：不能让用户看着"在关注"，其实这个窗口根本不发（【共同】条款：翻译窗口
         // 来源行为不变，这里连 UI 都不新增）。
         if (!ChatState || ChatState.contextOrigin !== 'editor') return;
-        const files = fileWatchList();
-        if (!files.length) return;
+        const entries = fileWatchEntries();
+        if (!entries.length) return;
+
+        // v2 Pass P136：跟真正发给模型的是同一份判定——调用同一个组装函数拿"这一轮因超限
+        // 被排除的项"，chip 和 ==FILES== 块尾部两处看到的是同一份 excluded 列表，不会一边
+        // 说超限一边不说（任务书："超限绝不静默截断……两处都列出"）。
+        let excluded = [];
+        try { excluded = chatBuildFileWatchBlock().excluded || []; } catch (e) {}
 
         const box = document.createElement('div');
         box.className = 'aichat-filewatch';
@@ -7754,92 +8054,198 @@ function fileWatchRenderChip() {
         head.className = 'aichat-filewatch-h';
         const label = document.createElement('span');
         label.className = 'aichat-filewatch-label';
-        label.textContent = '正在关注 · ' + files.length + ' 个文件';
-        label.setAttribute('data-tip', '这些文件的全文每一轮都会随问题一起发给模型（超过 50KB 的文件只发头尾，'
-            + '中间省略）。在文件树里右键「取消关注」，或者点这里的 × 都能移除。');
+        let fileCount = 0, dirCount = 0;
+        for (let i = 0; i < entries.length; i++) { if (entries[i].kind === 'dir') dirCount++; else fileCount++; }
+        label.textContent = '正在关注 · ' + fileCount + ' 个文件' + (dirCount ? '、' + dirCount + ' 个文件夹' : '');
+        label.setAttribute('data-tip', '这些文件/文件夹（递归展开、动态跟随）的内容每一轮都会随问题一起发给模型（文本超过 50KB'
+            + '只发头尾；图片等二进制只记路径不读内容；PDF 取文字层；本轮所有内容合计超过 '
+            + Math.round(FILEWATCH_TOTAL_BYTES_MAX / 1024) + 'KB 会按顺序跳过后面的，见下方列表）。'
+            + '在文件树里右键取消关注，或点这里的 × 都能移除。');
         label.setAttribute('data-tip-pos', 'top-start');
         head.appendChild(label);
         box.appendChild(head);
 
-        for (let i = 0; i < files.length; i++) {
-            const rp = files[i];
+        for (let i = 0; i < entries.length; i++) {
+            const e = entries[i];
             const row = document.createElement('div');
             row.className = 'aichat-filewatch-item';
             const txt = document.createElement('span');
             txt.className = 'aichat-filewatch-text';
-            txt.textContent = rp;   // relPath，可能含子目录，textContent 天然转义
+            txt.textContent = (e.kind === 'dir' ? '📁 ' : '') + (e.relPath || (e.kind === 'dir' ? '（项目根）' : ''));   // textContent 天然转义
             const x = document.createElement('button');
             x.type = 'button';
             x.className = 'aichat-filewatch-x';
             x.textContent = '×';
-            x.setAttribute('data-tip', '取消关注这个文件。');
+            x.setAttribute('data-tip', e.kind === 'dir' ? '取消关注这个文件夹。' : '取消关注这个文件。');
             x.setAttribute('data-tip-pos', 'top-end');
-            (function (path) {
+            (function (ent) {
                 x.addEventListener('click', function () {
-                    fileWatchRemove(path);
+                    if (ent.kind === 'dir') fileWatchRemoveDir(ent.relPath); else fileWatchRemove(ent.relPath);
                     try { if (OvlState.dirHandle) ovlRenderTree(OvlState.dirHandle); } catch (e) {}
                     fileWatchRenderChip();
                     try { if (ChatState && ChatState.open) chatUpdateBar(); } catch (e) {}
                 });
-            })(rp);
+            })(e);
             row.appendChild(txt);
             row.appendChild(x);
             box.appendChild(row);
         }
+
+        if (excluded.length) {
+            const warn = document.createElement('div');
+            warn.className = 'aichat-filewatch-excluded';
+            warn.setAttribute('data-ovl-filewatch-excluded-count', String(excluded.length));
+            const shown = excluded.slice(0, 30);
+            warn.textContent = '⚠ 本轮有 ' + excluded.length + ' 项因超限未发送：'
+                + shown.map(function (x) { return x.relPath + '（' + x.reason + '）'; }).join('；')
+                + (excluded.length > 30 ? '；以及其余 ' + (excluded.length - 30) + ' 个' : '') + '。';
+            box.appendChild(warn);
+        }
         slot.appendChild(box);
     } catch (e) { console.error('[filewatch] renderChip failed', e); }
+}
+
+// 单个待注入文件条目要拼出的那一段文案 + 占用的字节数（计入 400KB 总预算），直接关注的文件
+// 条目和文件夹展开出来的文件条目走同一份逻辑——三态/PDF/二进制判定只在这里做一次。
+// bytes=0 的情况（正在读取/失败/二进制/无文字层）不占预算，只有真正注入了原文才计入。
+function fileWatchBuildFileItem(relPath, kind, curRelPath) {
+    const label = '[文件] 「' + chatEscapeDelims(relPath) + '」';
+    if (kind === 'binary') {
+        return { text: label + '（二进制文件，无法读取内容，仅供你知道这个文件存在）', bytes: 0, truncated: false };
+    }
+    if (kind === 'pdf') {
+        const c = pdfWatchTextCacheGet(relPath);
+        if (!c) { pdfWatchTextCacheEnsure(relPath); return { text: label + '（正在抽取 PDF 文字层……这一轮先发不出内容，下一轮通常就有了）', bytes: 0, truncated: false }; }
+        if (c.failed) return { text: label + '（PDF 文字层抽取失败，可能文件已被删除或移动）', bytes: 0, truncated: false };
+        if (c.noTextLayer) return { text: label + '（这份 PDF 没有可提取的文字层——大概率是扫描件，关注不到内容）', bytes: 0, truncated: false };
+        let body = c.text, note = '', truncated = false;
+        if (body.length > FILEWATCH_TRUNC) {
+            const half = Math.floor(FILEWATCH_TRUNC / 2);
+            const omitted = body.length - half * 2;
+            body = body.slice(0, half) + '\n\n……（中间 ' + omitted + ' 字符已省略）……\n\n' + body.slice(body.length - half);
+            note = '（PDF 文字层已截断，只给了头尾各 ' + half + ' 字符）';
+            truncated = true;
+        } else {
+            note = '（PDF 文字层，版式/表格结构已丢失，只保留文字顺序）';
+        }
+        return { text: label + note + '\n' + chatEscapeDelims(body), bytes: body.length, truncated: truncated };
+    }
+    // text（含未知扩展名的乐观候选）
+    let text = null, unresolved = false;
+    if (relPath === curRelPath) {
+        const ta = document.getElementById('ovlCodeArea');
+        if (ta && !ta.disabled) text = ta.value;
+    } else {
+        const c = ovlFileTextCacheGet(relPath);
+        if (!c) { ovlFileTextCacheEnsure(relPath); }
+        else if (c.failed) { unresolved = true; }
+        else { text = c.text; }
+    }
+    if (text == null) {
+        return { text: label + (unresolved ? '（读取失败，可能已被删除或移动，内容这一轮发不出去）' : '（正在读取……这一轮先发不出内容，下一轮通常就有了）'), bytes: 0, truncated: false };
+    }
+    // 嗅探：解码后的内容里出现 NUL 字符（U+0000），判定这其实是二进制文件——扩展名认不出来
+    // 的乐观路径兜底，不当"失败"，改成路径引用降级。跟 server.js looksBinary 同一嗅探标准
+    // （前 8000 字节/这里是解码后前 8000 字符里找 \x00；TextDecoder 对 0x00 是无损透传的
+    // 合法单字节 UTF-8 序列，不会被替换成 U+FFFD，能稳定嗅探到）。
+    if (text.slice(0, 8000).indexOf('\u0000') !== -1) {
+        return { text: label + '（内容含二进制字节，判定为非文本文件，仅记录路径，不注入内容）', bytes: 0, truncated: false };
+    }
+    let body = text, note = '', truncated = false;
+    if (body.length > FILEWATCH_TRUNC) {
+        const half = Math.floor(FILEWATCH_TRUNC / 2);
+        const omitted = text.length - half * 2;
+        body = text.slice(0, half) + '\n\n……（中间 ' + omitted + ' 字符已省略，文件超过 '
+            + Math.round(FILEWATCH_TRUNC / 1024) + 'KB，只截取头尾）……\n\n' + text.slice(text.length - half);
+        note = '（已截断，只给了头尾各 ' + half + ' 字符）';
+        truncated = true;
+    }
+    return { text: label + note + '\n' + chatEscapeDelims(body), bytes: body.length, truncated: truncated };
 }
 
 // —— 发给模型的那一段：==FILES …== / ==FILESEND==，跟 chatBuildDocContext/chatBuildTreeOverview
 // 同一个返回形状（{on,text,tokens,...}），chatAssembleTurn 按同一套模式接进 parts。——
 // 只在 ChatState.contextOrigin==='editor' 时生效——跟 chatBuildTreeOverview 同一条门槛
 // （文件树本来就只在编辑器主界面才有意义），也满足【共同】条款"翻译窗口来源行为不变"。
+// v2 Pass P136：entries 现在是文件/文件夹混排——文件夹在这里只问缓存 + 触发/刷新后台展开
+// （dirWatchCacheEnsure，"动态跟随"），不在这个同步函数里现场读目录；四道上限（单文件夹 50
+// 个文件/同时 3 个文件夹/合计 400KB/单文件 50KB）任何一道触发，被排除的项都进 out.excluded，
+// 既进发给模型的文本尾部，也是 fileWatchRenderChip 读取的同一份数据——不静默截断。
 function chatBuildFileWatchBlock() {
-    const out = { on: false, text: '', tokens: 0, count: 0, truncated: 0, why: '' };
+    const out = { on: false, text: '', tokens: 0, count: 0, truncated: 0, why: '', excluded: [] };
     try {
         if (ChatState.contextOrigin !== 'editor') { out.why = '这个对话窗绑定的是翻译原文上下文，不发送关注文件'; return out; }
-        const files = fileWatchList();
-        if (!files.length) { out.why = '没有关注任何文件'; return out; }
+        const entries = fileWatchEntries();
+        if (!entries.length) { out.why = '没有关注任何文件或文件夹'; return out; }
         const cur = (OvlState && OvlState.currentFile) ? (OvlState.currentFile.relPath || OvlState.currentFile.name) : '';
 
-        const items = [];
-        for (let i = 0; i < files.length; i++) {
-            const rp = files[i];
-            let text = null, unresolved = false;
-            if (rp === cur) {
-                const ta = document.getElementById('ovlCodeArea');
-                if (ta && !ta.disabled) text = ta.value;
-            } else {
-                const c = ovlFileTextCacheGet(rp);
-                if (!c) { ovlFileTextCacheEnsure(rp); }
-                else if (c.failed) { unresolved = true; }
-                else { text = c.text; }
+        // 第一步：把 entries 展开成扁平"待注入项"清单。
+        const flat = []; // { relPath, kind, fromDir }
+        const excluded = []; // { relPath, reason }
+        for (let i = 0; i < entries.length; i++) {
+            const e = entries[i];
+            if (e.kind === 'file') { flat.push({ relPath: e.relPath, kind: fileWatchClassifyExt(e.relPath), fromDir: null }); continue; }
+            dirWatchCacheEnsure(e.relPath); // stale-while-revalidate：不管有没有缓存都（受节流地）触发一次后台刷新
+            const dc = dirWatchCacheGet(e.relPath);
+            if (!dc) { flat.push({ relPath: e.relPath, kind: 'dir-pending', fromDir: e.relPath }); continue; }
+            if (dc.failed) { flat.push({ relPath: e.relPath, kind: 'dir-failed', fromDir: e.relPath }); continue; }
+            if (!dc.files.length && !dc.excluded.length) { flat.push({ relPath: e.relPath, kind: 'dir-empty', fromDir: e.relPath }); continue; }
+            for (let j = 0; j < dc.files.length; j++) flat.push({ relPath: dc.files[j].relPath, kind: dc.files[j].kind, fromDir: e.relPath });
+            for (let j = 0; j < dc.excluded.length; j++) excluded.push(dc.excluded[j]);
+        }
+
+        // 第二步：逐项取内容，按 400KB 总预算顺序纳入/排除——超限绝不静默截断，挡住的每一项
+        // 都记进 excluded；只有真正注入了原文（bytes>0）才占预算，路径引用/占位/失败不占。
+        const parts = [];
+        let totalBytes = 0;
+        let curDirHeader; // 上一条 parts 是不是刚输出过这个文件夹的头，避免每个文件都重复一行
+        for (let i = 0; i < flat.length; i++) {
+            const it = flat[i];
+            const dirLabel = it.fromDir || '（项目根）';
+            if (it.kind === 'dir-pending') { parts.push('[文件夹] 「' + chatEscapeDelims(dirLabel) + '」（正在扫描目录……这一轮先不含内容，下一轮通常就有了）'); curDirHeader = null; continue; }
+            if (it.kind === 'dir-failed') { parts.push('[文件夹] 「' + chatEscapeDelims(dirLabel) + '」（读取失败，可能已被删除或移动）'); curDirHeader = null; continue; }
+            if (it.kind === 'dir-empty') { parts.push('[文件夹] 「' + chatEscapeDelims(dirLabel) + '」（这个文件夹目前没有可关注的文件）'); curDirHeader = null; continue; }
+
+            // fromDir===null 是直接关注的文件（不来自任何文件夹展开）——绝不能给它加"[文件夹]
+            // 「（项目根）」里的文件："这种头，那是在骗模型说这份文件是文件夹展开出来的。只有
+            // fromDir 是真的文件夹 relPath（''=项目根，或某个子路径）时才打头，且只在"跟上一条
+            // 不是同一个文件夹"时打（避免连续同文件夹的文件每条都重复一行）。
+            if (it.fromDir === null) {
+                curDirHeader = null; // 回到"不在任何文件夹上下文里"，下次再遇到文件夹条目要重新打头
+            } else if (it.fromDir !== curDirHeader) {
+                parts.push('[文件夹] 「' + chatEscapeDelims(dirLabel) + '」里的文件：');
+                curDirHeader = it.fromDir;
             }
-            if (text == null) {
-                items.push('[文件] 「' + chatEscapeDelims(rp) + '」'
-                    + (unresolved ? '（读取失败，可能已被删除或移动，内容这一轮发不出去）' : '（正在读取…这一轮先发不出内容，下一轮通常就有了）'));
+
+            const built = fileWatchBuildFileItem(it.relPath, it.kind, cur);
+            if (built.truncated) out.truncated++;
+            if (built.bytes > 0 && (totalBytes + built.bytes) > FILEWATCH_TOTAL_BYTES_MAX) {
+                excluded.push({ relPath: it.relPath, reason: '本轮所有关注内容合计已达 ' + Math.round(FILEWATCH_TOTAL_BYTES_MAX / 1024) + 'KB 预算上限，这份及排在它之后的文件本轮未发送' });
                 continue;
             }
-            let body = text;
-            let note = '';
-            if (body.length > FILEWATCH_TRUNC) {
-                const half = Math.floor(FILEWATCH_TRUNC / 2);
-                const omitted = text.length - half * 2;
-                body = text.slice(0, half) + '\n\n……（中间 ' + omitted + ' 字符已省略，文件超过 '
-                    + Math.round(FILEWATCH_TRUNC / 1024) + 'KB，只截取头尾）……\n\n' + text.slice(text.length - half);
-                note = '（已截断，只给了头尾各 ' + half + ' 字符）';
-                out.truncated++;
-            }
-            items.push('[文件] 「' + chatEscapeDelims(rp) + '」' + note + '\n' + chatEscapeDelims(body));
+            totalBytes += built.bytes;
+            parts.push(built.text);
         }
-        if (!items.length) return out;
+
+        out.excluded = excluded;
+        if (!parts.length) {
+            out.why = excluded.length ? '关注的内容全部因超限未能发送' : '关注的文件/文件夹还没有内容可发送';
+            return out;
+        }
 
         out.on = true;
-        out.count = items.length;
-        out.text = '==FILES n=' + items.length + '==\n'
-            + '用户在文件树里持续关注着以下 ' + items.length + ' 个文件的**完整内容**（不是片段，'
-            + '是整份文件），装在每个 [文件] 小节里，与上面 ==TREE== 的"只有文件名"不同。\n'
-            + items.join('\n\n')
+        out.count = parts.length;
+        let excludedNote = '';
+        if (excluded.length) {
+            const shown = excluded.slice(0, 30).map(function (x) { return chatEscapeDelims(x.relPath) + '（' + x.reason + '）'; }).join('；');
+            excludedNote = '\n\n【以下 ' + excluded.length + ' 项本轮未包含】：' + shown
+                + (excluded.length > 30 ? '；以及其余 ' + (excluded.length - 30) + ' 个（未逐一列出）' : '') + '。';
+        }
+        out.text = '==FILES n=' + parts.length + '==\n'
+            + '用户在文件树里持续关注着以下内容（可能来自直接关注的文件，也可能来自关注的文件夹递归'
+            + '展开出的文件）的**完整内容**（不是片段，是整份文件），与上面 ==TREE== 的"只有文件名"不同。\n'
+            + parts.join('\n\n')
+            + excludedNote
             + '\n==FILESEND==';
         out.tokens = chatEstTokens(out.text);
     } catch (e) { console.error('[filewatch] buildBlock failed', e); }
@@ -26520,9 +26926,13 @@ function chatUpdateBar() {
             // v2 Pass P115：关注文件只在编辑器来源的对话窗才真的发（跟 chatBuildFileWatchBlock
             // 同一条门槛），翻译器窗口不提这一句——避免暗示一件这个窗口根本不做的事。
             const liveFiles = (ChatState.contextOrigin === 'editor') ? fileWatchList().length : 0;
+            // v2 Pass P136：文件夹关注单独一档计数（跟 fileWatchList() 的"只数文件"语义保持
+            // 不变，向后兼容既有调用点/测试）。
+            const liveDirs = (ChatState.contextOrigin === 'editor' && typeof fileWatchDirList === 'function') ? fileWatchDirList().length : 0;
             const suffixParts = [];
             if (liveFocus > 0) suffixParts.push(liveFocus + ' 处额外关注');
             if (liveFiles > 0) suffixParts.push(liveFiles + ' 个关注文件');
+            if (liveDirs > 0) suffixParts.push(liveDirs + ' 个关注文件夹');
             const focusSuffix = suffixParts.length ? ('（连同 ' + suffixParts.join('、') + '一起发）') : '';
             div.textContent = (n > CHAT_HISTORY_MSGS
                 ? '共 ' + n + ' 条消息；每轮只把最近 ' + sent + ' 条发给模型（更早的不再发，但仍留在窗口里）。'
@@ -36588,9 +36998,15 @@ async function ovlBuildTreeDom(dirHandle, relPrefix, ctx, depth) {
         // v2 Pass P115：文件级关注的树节点角标——跟 mainfile 那颗星标同一个挂载模式（这里
         // 不新起一层 DOM，只加一个 class，配色靠 CSS）。fileWatchHas 内部会先按当前项目校验
         // 一遍加载状态（fileWatchEnsureLoaded），这正是"刷新恢复"不需要额外接线的原因。
+        // v2 Pass P136：关注角标从"只有文件"扩到"文件 + 文件夹三态"——文件夹自身直接关注/被
+        // 上级已关注文件夹整体覆盖，用跟文件同款的实心圆点；只有部分后代被关注（自己不是
+        // 条目），用空心圆环区分。fileWatchNodeState 内部已经 try/catch 到底，这里再包一层
+        // 保险——渲染路径（整棵树重建 DOM）绝不能因为角标判定异常打断，异常就按"未关注"处理。
+        let __fwState = { state: 'off', direct: false };
+        try { if (typeof fileWatchNodeState === 'function') __fwState = fileWatchNodeState(relPath, isDir); } catch (e) {}
         row.className = 'ovl-tree-row ' + (isDir ? 'ovl-tree-row-dir' : 'ovl-tree-row-file')
             + (!isDir && relPath === OvlState.mainDocFile ? ' ovl-tree-row-mainfile' : '')
-            + (!isDir && typeof fileWatchHas === 'function' && fileWatchHas(relPath) ? ' ovl-tree-row-watched' : '');
+            + (__fwState.state === 'on' ? ' ovl-tree-row-watched' : (__fwState.state === 'partial' ? ' ovl-tree-row-watched-partial' : ''));
         row.textContent = (isDir ? '▸ ' : '') + name;
         li.appendChild(row);
         if (isDir) {
@@ -39204,7 +39620,10 @@ function ovlOpenCtxMenu(x, y, entry) {
     if (!menu) return;
     let ids;
     if (entry.isRoot) {
-        ids = ['newfile', 'newfolder', 'upload']; // 空白处右键：项目根目录，没有改名/下载/删除的对象
+        // v2 Pass P136：空白处右键（项目根目录）现在也能"关注"——任务原话"甚至必要的时候
+        // 关注 file tree 的某个文件夹"，项目根就是最大的那个文件夹。relPath 取空字符串，
+        // fileWatchNodeState/fileWatchToggleDir 都把 '' 当"项目根"这个特殊 key 处理。
+        ids = ['newfile', 'newfolder', 'upload', 'focuswatch'];
     } else {
         ids = (entry.isDir ? OVL_CTX_ITEMS_FOLDER : OVL_CTX_ITEMS_FILE).slice();
         if (!entry.isDir) {
@@ -39218,11 +39637,11 @@ function ovlOpenCtxMenu(x, y, entry) {
                 const hasResult = (typeof ovlP2THasResult === 'function') && ovlP2THasResult(entry);
                 ids.push.apply(ids, hasResult ? ['pdf2texOpen', 'pdf2texRedo'] : ['pdf2tex']);
             }
-            // v2 Pass P115：文件级关注——所有非目录节点都给这个入口，含二进制/未知扩展名，
-            // 只是置灰 + 中文提示（不是像 pdf2tex 那样直接不出现）。任务原话"二进制置灰+
-            // 中文提示"，意味着用户要看得见"为什么这个文件关注不了"，而不是纳闷这一项去哪了。
-            ids.push('focuswatch');
         }
+        // v2 Pass P136：关注不再局限于文本扩展名——文件（任意类型，含二进制/未知扩展名，只是
+        // 内容注入方式不同）和文件夹（递归展开，"甚至必要的时候关注 file tree 的某个文件夹"）
+        // 都给这一项。P115 起文件已有；P136 起文件夹也能整份/递归关注。
+        ids.push('focuswatch');
     }
     if (OvlState.usingWebkitFallback) {
         // webkitdirectory 降级模式没有真句柄，写操作全部关掉（目前降级树也没接右键，这里是
@@ -39234,12 +39653,20 @@ function ovlOpenCtxMenu(x, y, entry) {
         const item = document.createElement('div');
         item.className = 'ovl-ctxmenu-item';
         if (id === 'focuswatch') {
-            const isText = fileWatchIsTextExt(entry.name || '');
-            const watched = isText && fileWatchHas(entry.relPath || entry.name);
-            item.textContent = watched ? '取消关注' : '关注此文件';
-            if (!isText) {
+            // v2 Pass P136：任意文件/文件夹都能关注——不再按扩展名置灰。唯一会置灰的情形是
+            // "已经通过上级被关注的文件夹整体覆盖"（state==='on' 且 direct===false），这时
+            // 单独取消/重复关注这一条没有意义，要先动上级文件夹。
+            const isDirEntry = !!entry.isDir; // 根条目本身就带 isDir:true（见 isRoot 分支构造），不需要再特判
+            const relForWatch = entry.isRoot ? '' : (entry.relPath || entry.name || '');
+            const st = fileWatchNodeState(relForWatch, isDirEntry);
+            if (isDirEntry) {
+                item.textContent = st.direct ? '取消关注此文件夹' : '关注此文件夹';
+            } else {
+                item.textContent = st.direct ? '取消关注' : '关注此文件';
+            }
+            if (st.state === 'on' && !st.direct) {
                 item.classList.add('ovl-ctxmenu-item-disabled');
-                item.setAttribute('data-tip', '只能关注文本类文件（.tex / .bib / .md / .txt），这份文件不支持整份关注。');
+                item.setAttribute('data-tip', '已经通过上级被关注的文件夹整体覆盖，如需单独调整请先取消上级文件夹的关注。');
                 item.setAttribute('data-tip-pos', 'left');
             }
         } else {
@@ -39369,20 +39796,24 @@ function ovlHandleCtxAction(id, entry) {
         case 'pdf2texRedo':
             if (typeof ovlP2TRedo === 'function') ovlP2TRedo(entry);
             break;
-        // v2 Pass P115：文件级关注/取消关注。二进制/未知扩展名在菜单里已经置灰，这里再判
-        // 一次是最后一道闸门——万一有别的调用路径绕过菜单直接派发这个 id，也不会把一个
-        // 不支持的文件塞进关注列表。
+        // v2 Pass P136：文件/文件夹关注/取消关注——任意类型都能关注（P115 起原来只有 tex/bib/
+        // md 能关注，这里放开，见 fileWatchClassifyExt 的类型判定只影响"内容怎么注入"，不影响
+        // "能不能关注"）。唯一的最后一道闸门是"已被上级已关注文件夹整体覆盖"——万一有别的调用
+        // 路径绕过菜单直接派发这个 id，也不会产生一条毫无意义的重复条目。
         case 'focuswatch': {
-            const rel = entry.relPath || entry.name;
-            if (!fileWatchIsTextExt(entry.name || '')) {
-                try { showToast('只能关注文本类文件（.tex / .bib / .md / .txt）。', 'warning'); } catch (e) {}
+            const isDirEntry = !!entry.isDir;
+            const rel = entry.isRoot ? '' : (entry.relPath || entry.name || '');
+            const st = fileWatchNodeState(rel, isDirEntry);
+            if (st.state === 'on' && !st.direct) {
+                try { showToast(isDirEntry ? '已经通过上级文件夹被整体关注，请先取消上级文件夹的关注。' : '已经通过所在文件夹被整体关注，请先取消该文件夹的关注。', 'warning'); } catch (e) {}
                 break;
             }
-            const nowWatched = fileWatchToggle(rel);
+            const nowWatched = isDirEntry ? fileWatchToggleDir(rel) : fileWatchToggle(rel);
+            const relLabel = rel || '（项目根）';
             try { ovlRenderTree(OvlState.dirHandle); } catch (e) {}
             try { if (typeof fileWatchRenderChip === 'function') fileWatchRenderChip(); } catch (e) {}
             try { if (typeof chatUpdateBar === 'function' && ChatState && ChatState.open) chatUpdateBar(); } catch (e) {}
-            try { ovlFlashSaveStatus(nowWatched ? ('已关注：' + rel) : ('已取消关注：' + rel), false); } catch (e) {}
+            try { ovlFlashSaveStatus(nowWatched ? ('已关注' + (isDirEntry ? '文件夹：' : '：') + relLabel) : ('已取消关注' + (isDirEntry ? '文件夹：' : '：') + relLabel), false); } catch (e) {}
             break;
         }
     }
