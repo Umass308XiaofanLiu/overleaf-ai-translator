@@ -4417,7 +4417,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.17.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.17.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-08';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -20720,7 +20720,12 @@ function chatBindShell(rootEl) {
 // 解析铁律：**没有 ==EDIT==/==END== 就当整段是白话，绝不从白话里凑一个修改出来。**
 
 const CHAT_HISTORY_MSGS = 6;      // 每轮最多带 6 条历史（3 个来回），超出的从最老的丢
-const CHAT_MAX_TOKENS = 2048;     // 只对 openai/claude/gemini 生效；本地走 callLocalLLM 自己的 16384
+// v2 Pass P138：从 2048 提到 16384，跟 local/qwen 一致——2048 约合 1300 个汉字，聊论文时
+// 一个完整回答就可能被腰斩（.claude/tmp/p138_impl.md）。只对 openai/claude/gemini 生效；
+// 本地走 callLocalLLM 自己的 16384（两边现在数值相同，但各自独立维护，不是同一个字面量）。
+// 具体型号的服务端真实上限比 16384 更低时（比如某些 Claude 型号），不在这里按型号硬编码
+// 特判——交给 chatCallOnlineWithDowngrade 一次性降级重试兜底，兜不住才把原始错误亮给用户。
+const CHAT_MAX_TOKENS = 16384;
 const CHAT_CTX_NEIGHBORS = 1;     // 目标行上下各带几行（**只**在关掉自动上下文、又附了选段时才用得上）
 const CHAT_CHIP_CHARS = 60;       // 附加选段 chip 上显示多少个字
 const CHAT_TICK_MS = 100;         // 「思考中… x.x s」的刷新间隔
@@ -21067,6 +21072,59 @@ async function chatCallGemini(config, messages, systemPrompt, signal, meta, req)
     return answer;
 }
 
+// ============================================================================
+// v2 Pass P138：openai/claude/gemini 共用的「输出上限设太大被拒」一次性降级重试
+// ============================================================================
+// callOpenAIAPI/callClaudeAPI/chatCallGemini 三个函数遇到非 2xx 响应时统一抛
+// `Error('<Provider> API Error: <status> - <errText>')`（三处逐字同一个模板，
+// 见各自函数体），所以这里只需要解析这一个错误信息的形状，不用碰任何一个函数体——
+// callClaudeAPI 尤其**一个字节都不许改**，这条重试只能在调用点外面包一层。
+//
+// 判据必须保守：**必须先解析出状态码是 400**，且错误正文里**同时**点名了
+// max_tokens 一类字段名、又带着「太大/超过/上限」这类含义的词，两者都不占就原样
+// 把原始错误抛出去——不许把任意 400 都当成这个原因（防误判，任务书明确要求）。
+function chatParseApiErrorStatus(err) {
+    const msg = String((err && err.message) || err || '');
+    const m = /API Error:\s*(\d+)\s*-/.exec(msg);
+    return m ? Number(m[1]) : NaN;
+}
+function chatMaxTokensRejectedError(err) {
+    const msg = String((err && err.message) || err || '');
+    if (chatParseApiErrorStatus(err) !== 400) return false;
+    const mentionsField = /max[_ -]?tokens|max_completion_tokens|maxoutputtokens|max_output_tokens/i.test(msg);
+    if (!mentionsField) return false;
+    return /(too large|too high|too big|exceed|greater than|more than|larger than|maximum (?:allowed|value|of|number)|must be (?:less than|no more than|<=|smaller)|超过|超出|太大|上限)/i.test(msg);
+}
+// 从 CHAT_MAXTOK_CHOICES（复用既有档位表，不新造一套数字）里找比 attempted 小一档的合法值；
+// 已经是最小档时没有更小的可降，返回 null。
+function chatDowngradedMaxTokens(attempted) {
+    const sorted = CHAT_MAXTOK_CHOICES.slice().sort(function (a, b) { return a - b; });
+    let lower = null;
+    for (let i = 0; i < sorted.length; i++) {
+        if (sorted[i] < attempted) lower = sorted[i]; else break;
+    }
+    return lower;
+}
+// callFn(maxTokens) 是调用方传进来的「用给定的 maxTokens 打一次真实请求」的闭包，对三家
+// provider 各自负责把 maxTokens 塞进自己那份请求体的正确字段。只重试一次——不是循环：
+// 第二次还失败（哪怕还是同一类错误）就原样把第二次的异常抛给上层，绝不再降第二档。
+// 命中时把发生了什么写进对话流的一条系统提示行（chatAppendRow('system', ...)）——
+// 任务书明确要求「不要静默降级」，用户要能在窗口里看到。
+async function chatCallOnlineWithDowngrade(providerLabel, req, callFn) {
+    try {
+        return await callFn(req.maxTokens);
+    } catch (err) {
+        if (!chatMaxTokensRejectedError(err)) throw err;
+        const lower = chatDowngradedMaxTokens(req.maxTokens);
+        if (lower === null) throw err;   // 已经是最小档，没有降级空间了，原样抛出
+        chatAppendRow('system', providerLabel + ' 服务端认为这次请求的输出上限（' + req.maxTokens
+            + '）设得太大而拒绝了，已自动降到 ' + lower + ' 重试一次。'
+            + '如果经常发生，建议到输入框下方的参数条里把「上限」手动调低。');
+        req.maxTokens = lower;   // 让 ChatState.lastRequest（同一个对象引用）如实反映真正发出去的值
+        return await callFn(lower);
+    }
+}
+
 // 【C4 的核心一行】这里读的是 chatApiConfig()，**不是** getApiConfig()。
 // 对话的 provider/model 独立于 AppState.apiProvider/selectedModel，见 chatModelChoice。
 // sink 只有开了流式（且 provider==='local'）时才有值。
@@ -21085,7 +21143,10 @@ async function chatCallModel(messages, systemPrompt, signal, meta, sink) {
         const g = chatGeminiOption(ChatState.geminiThinking);
         if (g && g.budget !== null) req.thinkingBudget = g.budget;
         ChatState.lastRequest = req;
-        return await chatCallGemini(config, messages, systemPrompt, signal, meta, req);
+        return await chatCallOnlineWithDowngrade('Gemini', req, function (mt) {
+            req.maxTokens = mt;
+            return chatCallGemini(config, messages, systemPrompt, signal, meta, req);
+        });
     }
     const full = [{ role: 'system', content: systemPrompt }].concat(messages);
     if (config.provider === 'local') {
@@ -21131,10 +21192,18 @@ async function chatCallModel(messages, systemPrompt, signal, meta, sink) {
     if (req.temperature !== null) opt.temperature = req.temperature;
     ChatState.lastRequest = req;
     if (config.provider === 'openai') {
-        return await callOpenAIAPI(config.model, full, opt, config.openaiApiKey, signal) || '';
+        return await chatCallOnlineWithDowngrade('OpenAI', req, function (mt) {
+            opt.max_tokens = mt;
+            return callOpenAIAPI(config.model, full, opt, config.openaiApiKey, signal);
+        }) || '';
     }
     if (config.provider === 'claude') {
-        return await callClaudeAPI(config.model, full, opt, config.claudeApiKey, signal, config.claudeProxyUrl) || '';
+        // ⚠️ callClaudeAPI 函数体是禁区、一个字节都不许改（见 CLAUDE.md）——降级重试只能
+        // 在这个调用点外面包一层，靠重新调用同一个函数、换一个更小的 opt.max_tokens 实现。
+        return await chatCallOnlineWithDowngrade('Claude', req, function (mt) {
+            opt.max_tokens = mt;
+            return callClaudeAPI(config.model, full, opt, config.claudeApiKey, signal, config.claudeProxyUrl);
+        }) || '';
     }
     throw new Error('未知的模型提供方：' + String(config.provider));
 }
@@ -24709,7 +24778,7 @@ const CHAT_TEMP_DEFAULT = 0.3;
 // 自由输入框做不到「穷尽验证」，而且 0 在 callOpenAIAPI 里会被 `config.temperature || 0.3`
 // 悄悄吃成 0.3（那个既有写法不在本轮改动范围内）—— 不提供 0 就不会踩到它。
 const CHAT_TEMPS = [0.1, 0.3, 0.7, 1.0];
-const CHAT_MAXTOK_CHOICES = [1024, 2048, 4096, 8192, 16384];
+const CHAT_MAXTOK_CHOICES = [1024, 2048, 4096, 8192, 16384, 32768]; // v2 Pass P138：加 32768 高档
 // Gemini 思考档。budget=null 表示**不发送** thinkingConfig。
 const CHAT_GEMINI_THINKING = [
     { v: '',        label: '默认', budget: null },
@@ -25055,6 +25124,11 @@ function chatEffectiveTemperature(provider, model) {
 // openai/claude/gemini 共用同一个偏低的 2048，Qwen3.5+ 系列默认静默开思考时极容易把 2048 的
 // 预算全部吃在思考上，正文要么半截要么整段空（诊断见 .claude/tmp/p137_chat_truncation_diag.md
 // §1.1，P135 对抗验证 p135_verify.md §7 已核实这条当时确实还是 2048，未被 P135 顺手修掉）。
+// v2 Pass P138：CHAT_MAX_TOKENS 本身也从 2048 提到了 16384（见该常量定义处的注释），
+// 所以这条 ternary 两支现在算出来是同一个数——保留分支结构只是为了不动 provider 形参和
+// 调用点签名，以后哪家真的需要单独的默认值，只需要改这一行。某家真实服务端上限比 16384
+// 更低时（比如部分 Claude 型号），不在这里按型号硬编码特判，交给下面新增的
+// chatCallOnlineWithDowngrade 一次性降级重试兜底。
 function chatDefaultMaxTokens(provider) {
     return (provider === 'local' || provider === 'qwen') ? 16384 : CHAT_MAX_TOKENS;
 }
@@ -25325,9 +25399,10 @@ function chatMoreBoxHtml(choice) {
             return '<option value="' + escapeAttr(String(v)) + '"' + ((!auto && v === mt) ? ' selected' : '') + '>' + escapeHtml(String(v)) + '</option>';
         })).join('');
     rows.push('<span class="aichat-pgroup" data-tip="'
-        + escapeAttr('这一轮最多生成多少 token，按请求生效。「默认」= 改这个功能之前这条链路本来就在用的值（本地 16384、在线 '
-            + CHAT_MAX_TOKENS + '），所以没动过这一项的用户行为逐字不变。回复被它截断时窗口里会出现一条明确的提示，'
-            + '而且半截的 ==EDIT== 块永远不会长出「应用」按钮。')
+        + escapeAttr('这一轮最多生成多少 token，按请求生效。「默认」= 没在这里手动选过档位时会用的值，v2 Pass P138 起四家 provider '
+            + '统一是 ' + CHAT_MAX_TOKENS + '（此前 openai/claude/gemini 偏低，只有 2048）。回复被它截断时窗口里会出现一条明确的提示，'
+            + '而且半截的 ==EDIT== 块永远不会长出「应用」按钮。服务端认为这个值设得太大而拒绝这次请求时，'
+            + '会自动降一档重试一次，对话里会出现一条说明——不会静默改掉你选的值。')
         + '" data-tip-pos="top-start"><span class="aichat-plabel">上限</span>'
         + '<select class="aichat-psel" id="aiChatMaxSel" style="max-width:96px">' + mtOpts + '</select></span>');
 
