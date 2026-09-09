@@ -4417,8 +4417,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.17.01';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-08';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.17.03';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-09';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -4663,10 +4663,31 @@ const MODEL_CAPS = {
         'qwen-flash':    { contextWindow: 1000000, maxInput: 997952, maxOutput: 32768,  thinking: 'hybrid', thinkingDefault: false, thinkingBudgetMax: 32768 },
         'qwen3.8-max':   { contextWindow: 1000000, maxInput: 991808, maxOutput: 131072, thinking: 'hybrid', thinkingDefault: true,  thinkingBudgetMax: 32768 },
         'qwen3.7-max':   { contextWindow: 1000000, maxInput: 991808, maxOutput: 131072, thinking: 'hybrid', thinkingDefault: true,  thinkingBudgetMax: 32768 },
-        'qwen3.7-plus':  { contextWindow: 1000000, maxInput: 991808, maxOutput: 131072, thinking: 'hybrid', thinkingDefault: true,  thinkingBudgetMax: 32768 }
-        // qwen3.8-flash：官方定价问答（p135_qwen_pricing.md「问题6」）确认了价格，但没有任何官方页面
-        // 给出这个具体 id 的上下文窗口/最大输出/思考支持数字（qwen-flash 是不同模型，数字不能互相
-        // 挪用）——不代猜，本条目缺失=全部走 getModelCaps() 的 null 兜底，UI 显示"未知"。
+        'qwen3.7-plus':  { contextWindow: 1000000, maxInput: 991808, maxOutput: 131072, thinking: 'hybrid', thinkingDefault: true,  thinkingBudgetMax: 32768 },
+        // qwen3.8-flash（v2 Pass P139，数字补全于 P139 第二轮）：数字字段来源
+        // https://www.qwencloud.com/models/qwen3.8-flash（Alibaba Cloud 官方 "Qwen Cloud" 全球平台
+        // 模型专页，抓取 2026-09-08）：Context 1M / Max Input 991K / Max Output 131K —— 页面显示的是
+        // 截断到 K 的值，与既有 qwen3.8-max 条目口径一致（同为 Qwen3.8 系列、同样的 991K/131K 截断
+        // 显示），取该条目已确认的精确值 991808/131072，不是自行拆算。定价 $0.15 输入/$0.47 输出
+        // 与本表已有的 MODEL_PRICING.qwen['qwen3.8-flash'] 逐字一致，交叉印证过。页面另确认该模型
+        // 输入支持 Image/Text/Video（多模态）——QWEN_CHAT_ALLOW/QWEN_NON_CHAT_DENY 过滤白/黑名单只按
+        // id 字符串匹配，不看模型是否多模态，'qwen3.8-flash' 本身不含 image/video/vl/ocr/omni 等黑名单
+        // 关键词，不受影响，已用 isQwenChatModelId('qwen3.8-flash')===true 复核（见 P139 报告）。
+        //
+        // thinkingBudgetMax **刻意不用**页面上的 "Max Reasoning 262K"：那是模型固有的最大思维链长度
+        // （同一概念、同一数值 262144，qwen3.8-max 条目在 p135_qwen_pricing.md 里也记录过），跟本字段
+        // 的语义（见本表头部注释：thinking_budget 参数的**用户可设**合法区间，官方通用规则统一给
+        // 1~32768）是两回事——qwen3.8-max/qwen3.7-max/qwen3.7-plus 等同样有 262144 这个"最大思维链
+        // 长度"事实，但表里全部存的是 32768，不是 262144，本条目跟随同一约定，不能因为这次拿到的
+        // 页面正好显示了这个数字就破例塞进这个字段（塞了会让最大输出预算输入框允许用户填到
+        // 262144，但 DashScope thinking_budget 官方合法区间只到 32768，真发出去大概率 400）。
+        //
+        // thinkingDefault=true 的证据强度：**这个模型专页没有写默认思考是开是关**——API 示例是显式
+        // 传 extra_body={"enable_thinking": True}，专页本身未单独确认默认值。true 仍然只来自 P135 就
+        // 记录的系列级声明（alibabacloud.com/help/en/model-studio/deep-thinking 原文 "Qwen3.8, Qwen3.7,
+        // Qwen3.6, Qwen3.5 series models... defaulting to true"），不是这个模型专页确认过的结论——
+        // 如果以后拿到明确写了默认值的专页，以专页为准复核。
+        'qwen3.8-flash': { contextWindow: 1000000, maxInput: 991808, maxOutput: 131072, thinking: 'hybrid', thinkingDefault: true, thinkingBudgetMax: 32768 }
     },
     gemini: {}, // 预留：可收 gemini thinkingBudget 合法范围，与 CHAT_GEMINI_THINKING 现有固定四档对齐
     openai: {}, // 预留：o 系/gpt-5 系 reasoning_effort 取值范围
