@@ -394,6 +394,31 @@ body.is-resizing-settings-modal * {
     transition-property: color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform, filter, -webkit-backdrop-filter, backdrop-filter;
 }
 
+/* ============= v2 Pass P151：分行对齐关闭时的「行内流」渲染 =============
+   返工 P150——P150 把关闭态整篇拼成一块 renderFormattedText，逐句功能（点击编辑/历史/
+   AI 工具栏/关注/高亮/颜色宏角标）全部失去锚点。P151 保留每个 pair 各自的 DOM 节点
+   （data-idx/data-side 原样在），只把「块级堆叠」改成「行内流式」。
+   .ovl-flow-para：段落容器（按 pair.brk 分组），里面装的是行内 .ovl-flow-pair span，
+   首尾相接流下去，不是一句一个盒子。
+   .ovl-flow-block：句对本身就是块级构造（列表/标题/表格/公式独占行……marked 判定的结果，
+   见 renderFlowPairInline）时的容器，跟 .ovl-flow-para 并列、不嵌套在里面——块级元素不能
+   是 <span> 的子节点，也不该被硬套成行内（那样列表/标题会渲染错）。
+   .ovl-flow-pair 是纯 <span>，不设 padding/border/background/外边距——这正是要消灭的
+   「一句一个带内边距的盒子」视觉；句与句之间的分隔靠 renderFlowPane 里插入的文本节点
+   （中英混排规则见 ovlFlowNeedsSpace），不靠 CSS 间距。
+   .ovl-flow-handle 默认 display:none（零布局占用，不影响相邻文本的自然换行），
+   只在 .ovl-flow-pair 被真实鼠标悬停 / 内部聚焦时切到 inline-flex——满足「未悬停不占
+   布局空间，悬停/选中时出现且可点」。 */
+.ovl-flow-para { margin: 0 0 1em 0; }
+.ovl-flow-para:last-child, .ovl-flow-block:last-child { margin-bottom: 0; }
+.ovl-flow-block { margin: 0 0 1em 0; }
+.ovl-flow-pair { display: inline; }
+.ovl-flow-pair.ovl-flow-block { display: block; }
+.ovl-flow-handle { display: none; vertical-align: middle; margin-left: 2px; }
+.ovl-flow-pair:hover > .ovl-flow-handle,
+.ovl-flow-pair:focus-within > .ovl-flow-handle { display: inline-flex; }
+.ovl-flow-warn { display: inline; color: #f59e0b; font-size: 11px; margin-right: 1px; cursor: default; }
+
 /* ============= 浮动 AI 对话窗（#aiChatRoot）=============
    为什么整块样式写死在这里，而不是像页面其它部分那样用 Tailwind 类：
    这个窗口的 DOM 是 JS 直接建到 <body> 上的，不经过 renderApp。Tailwind 是 CDN 版 JIT，
@@ -4454,7 +4479,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.21.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.23.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-10';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -6206,18 +6231,41 @@ function clearRenderedCrossHighlights() {
     } catch (e) {}
 }
 
-// 找到某一行「非编辑态」的正文容器；那一行正在编辑（是 textarea）时返回 null
-function findRenderedRowBody(idx, side) {
+// 找到某一行「非编辑态」的全部正文容器；那一行正在编辑（是 textarea）时那一个分片不算。
+//
+// v2 Pass P151：分行对齐关闭时不再是 [data-align-content] 那套配对块 DOM，而是
+// [data-flow-content] 那套行内流 DOM（见 renderFlowPane/renderFlowPairInline）——两套选择器
+// 在任一时刻只有一套能命中，这里两个都问一遍即可，不需要按 AppState.bilingualAlignEnabled
+// 分支。行内流模式下 row 自身没有嵌套 .prose（那是面板级的，见 renderSourcePanel/
+// renderTargetPanel），句子正文包在 .ovl-flow-text 里，跟"关注"复选框/⚠ 角标是兄弟节点
+// 而不是父子——不这样区分的话，跨栏高亮/关注高亮的文本节点游走器会把"关注"两个字和
+// ⚠ 提示一起当成正文扫进去，画错位置。
+//
+// v2 Pass P152：一个 pair 可能因为内部含空行渲染成多个顶层元素（见 renderFlowPairInline
+// 的 allP 分支），这些元素共享同一对 data-idx/data-side——用 querySelectorAll 把它们全部
+// 找出来，不能只用 querySelector 认第一个，否则命中恰好落在第二片及以后的内容永远找不到。
+// 绝大多数 pair 仍然只有一个分片，这时返回数组长度恰好是 1。
+function findRenderedRowBodies(idx, side) {
+    const out = [];
     try {
-        const pane = document.querySelector(`[data-align-content="${side}"]`);
-        if (!pane) return null;
-        const row = pane.querySelector(`[data-idx="${idx}"][data-side="${side}"]`);
-        if (!row) return null;
-        if (row.querySelector('textarea')) return null;   // 编辑态，归镜像层管
-        return row.querySelector('.prose') || row;
-    } catch (e) {
-        return null;
-    }
+        const pane = document.querySelector(`[data-align-content="${side}"], [data-flow-content="${side}"]`);
+        if (!pane) return out;
+        const rows = pane.querySelectorAll(`[data-idx="${idx}"][data-side="${side}"]`);
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            if (row.querySelector('textarea')) continue;   // 编辑态那一片，归镜像层管
+            out.push(row.querySelector('.prose') || row.querySelector('.ovl-flow-text') || row);
+        }
+    } catch (e) {}
+    return out;
+}
+
+// 单数版：只要"这一行有没有地方可以画"这种存在性判断（如 crossCanPaint）用这个即可，
+// 拿第一个分片代表整行——多分片时真正需要遍历全部分片画图的两处调用见
+// applyCrossHighlightToRendered / focusPaintRendered，它们直接用上面的复数版。
+function findRenderedRowBody(idx, side) {
+    const list = findRenderedRowBodies(idx, side);
+    return list.length ? list[0] : null;
 }
 
 // 收集容器里可以安全高亮的文本节点，同时拼出扁平文本。返回 { text, nodes:[{node, start, end}] }
@@ -6296,23 +6344,31 @@ function applyCrossHighlightToRendered() {
         const fragments = getCrossFragmentsFor(ch.idx, ch.toSide);
         if (!fragments) return;
 
-        const host = findRenderedRowBody(ch.idx, ch.toSide);
-        if (!host) return;                                            // 那一行是 textarea，镜像层已经画过了
-        const flat = collectCrossTextNodes(host);
-        if (!flat.text) return;
-        const ranges = crossResolveRanges(flat.text, fragments);
-        if (!ranges.length) return;
+        // v2 Pass P152：一个 pair 可能因为内部含空行拆成多个顶层元素（见
+        // renderFlowPairInline 的 allP 分支），这些元素共享同一对 data-idx/data-side——
+        // 全部找出来各自试一遍，不能只认第一个，否则命中恰好落在第二片及以后分片里的
+        // 内容永远画不出来。绝大多数 pair 仍然只有一个 host，下面的循环只跑一轮，跟
+        // 改动前逐字节等价。
+        const hosts = findRenderedRowBodies(ch.idx, ch.toSide);
+        if (!hosts.length) return;                                    // 那一行是 textarea，镜像层已经画过了
+        for (let hIdx = 0; hIdx < hosts.length; hIdx++) {
+            const host = hosts[hIdx];
+            const flat = collectCrossTextNodes(host);
+            if (!flat.text) continue;
+            const ranges = crossResolveRanges(flat.text, fragments);
+            if (!ranges.length) continue;
 
-        // 区间 → 每个文本节点上的局部区间
-        for (let n = 0; n < flat.nodes.length; n++) {
-            const entry = flat.nodes[n];
-            const intervals = [];
-            for (let r = 0; r < ranges.length; r++) {
-                const s = Math.max(ranges[r].start, entry.start);
-                const e = Math.min(ranges[r].end, entry.end);
-                if (e > s) intervals.push({ s: s - entry.start, e: e - entry.start });
+            // 区间 → 每个文本节点上的局部区间
+            for (let n = 0; n < flat.nodes.length; n++) {
+                const entry = flat.nodes[n];
+                const intervals = [];
+                for (let r = 0; r < ranges.length; r++) {
+                    const s = Math.max(ranges[r].start, entry.start);
+                    const e = Math.min(ranges[r].end, entry.end);
+                    if (e > s) intervals.push({ s: s - entry.start, e: e - entry.start });
+                }
+                if (intervals.length) wrapCrossIntervals(entry.node, intervals);
             }
-            if (intervals.length) wrapCrossIntervals(entry.node, intervals);
         }
     } catch (e) {
         // 装饰性功能：坏了就当没这个功能，绝不能把异常带回渲染路径
@@ -7207,31 +7263,57 @@ function focusPaintRendered() {
             const parts = keys[g].split('|');
             const idx = Number(parts[0]);
             const side = parts[1];
-            const host = findRenderedRowBody(idx, side);
-            if (!host) continue;
+            // v2 Pass P152：一个 pair 可能因为内部含空行拆成多个顶层元素（见
+            // renderFlowPairInline 的 allP 分支），这些元素共享同一对 data-idx/data-side——
+            // 全部找出来各自准备一份扁平文本。绝大多数 pair 仍然只有一个 host，这时下面这套
+            // 逻辑退化成改动前那一套，对 unresolved 计数和最终画出来的区间逐字节等价。
+            const hosts = findRenderedRowBodies(idx, side);
+            if (!hosts.length) continue;
 
             // ⚠️ C5：复用跨栏高亮那台游走器，**不另起一套方言**。它整棵跳过 .katex 子树 ——
             //    KaTeX 的 DOM 里同一段公式有 HTML + MathML 两份文本，收进来会让扁平文本凭空翻倍；
             //    往里插节点更是直接毁掉公式排版。代价是**公式里的片段一个字都画不出来**，
             //    这正是「要么整条公式、要么什么都不画」里的「什么都不画」那一支：
             //    宁可少画一个标记，也绝不去拆 KaTeX 的文本节点。
-            const flat = collectCrossTextNodes(host, { reject: ['katex'] });
-            if (!flat.text) continue;
+            const hostFlats = hosts.map((h) => collectCrossTextNodes(h, { reject: ['katex'] }));
+            if (hostFlats.every((f) => !f.text)) continue;   // 全部分片都没有可高亮文本，等价于改动前的 !flat.text 早退
 
-            const ranges = [];
             let whole = false;
+            const quoteEntries = [];
             for (let i = 0; i < list.length; i++) {
                 const e = list[i];
                 // 整行条目也要先解一次：解不出来（换了文档 / 整行被改写）就**一笔都不画**，
                 // 否则从这一帧到异步复核落地之间，整行黄底会盖在用户从没标过的一段话上。
                 if (e.whole) { if (focusResolve(e).ok) whole = true; else unresolved++; continue; }
-                // 已渲染正文的扁平文本 ≠ 这一行的原始文本（markdown 记号没了、公式被跳过了），
-                // 所以这里**不用**存下来的 offset，改成逐字找 + 只认唯一命中。
-                // 这条纪律和跨栏高亮完全一致：宁可不画，绝不画错。
+                quoteEntries.push(e);
+            }
+
+            // 整行条目：pair 拆成几片就该几片都整段标记（"关注整行"覆盖的是整个 pair，
+            // 不是碰巧渲染到的第一片）。
+            const hostRanges = hosts.map(() => []);
+            if (whole) {
+                for (let hi = 0; hi < hosts.length; hi++) {
+                    if (hostFlats[hi].text) hostRanges[hi].push({ start: 0, end: hostFlats[hi].text.length });
+                }
+            }
+            // 片段条目：已渲染正文的扁平文本 ≠ 这一行的原始文本（markdown 记号没了、公式被
+            // 跳过了），所以这里**不用**存下来的 offset，改成逐字找 + 只认唯一命中——这条
+            // 纪律和跨栏高亮完全一致：宁可不画，绝不画错。在这个 pair 名下的全部分片里找，
+            // 命中哪一片就画在哪一片上；全部分片都没有唯一命中才计入 unresolved（单分片时
+            // 跟改动前的判据完全一致）。
+            for (let qi = 0; qi < quoteEntries.length; qi++) {
+                const e = quoteEntries[qi];
                 const q = String(e.quote || '');
                 if (!q) continue;
-                const first = flat.text.indexOf(q);
-                if (first === -1 || flat.text.indexOf(q, first + 1) !== -1) {
+                let matchedHost = -1;
+                let matchStart = -1;
+                for (let hi = 0; hi < hosts.length; hi++) {
+                    const t = hostFlats[hi].text;
+                    if (!t) continue;
+                    const first = t.indexOf(q);
+                    if (first !== -1 && t.indexOf(q, first + 1) === -1) { matchedHost = hi; matchStart = first; break; }
+                }
+                if (matchedHost === -1) {
                     // 【「这里画不出来」和「这条标记已经失效」是两回事，绝不能混】
                     // 渲染后的扁平文本里没有这段字，最常见的原因是它根本不该在这里出现：
                     // `27.3\%` 渲染成 `27.3%`、`**粗**` 的星号被 marked 吃掉、公式整段被跳过。
@@ -7241,33 +7323,35 @@ function focusPaintRendered() {
                     if (!focusResolve(e).ok) unresolved++;
                     continue;
                 }
-                ranges.push({ start: first, end: first + q.length });
+                hostRanges[matchedHost].push({ start: matchStart, end: matchStart + q.length });
             }
-            let merged;
-            if (whole) {
-                merged = [{ start: 0, end: flat.text.length }];
-            } else {
+
+            for (let hi = 0; hi < hosts.length; hi++) {
+                const ranges = hostRanges[hi];
+                if (!ranges.length) continue;
+                const flat = hostFlats[hi];
+                const host = hosts[hi];
                 ranges.sort(function (a, b) { return a.start - b.start || b.end - a.end; });
-                merged = [];
+                const merged = [];
                 for (let i = 0; i < ranges.length; i++) {
                     const last = merged[merged.length - 1];
                     if (last && ranges[i].start <= last.end) { last.end = Math.max(last.end, ranges[i].end); continue; }
                     merged.push({ start: ranges[i].start, end: ranges[i].end });
                 }
-            }
-            if (!merged.length) continue;
+                if (!merged.length) continue;
 
-            for (let n = 0; n < flat.nodes.length; n++) {
-                const entry = flat.nodes[n];
-                if (focusInsideCross(entry.node, host)) continue;
-                const intervals = [];
-                for (let r = 0; r < merged.length; r++) {
-                    const s = Math.max(merged[r].start, entry.start);
-                    const e2 = Math.min(merged[r].end, entry.end);
-                    if (e2 > s) intervals.push({ s: s - entry.start, e: e2 - entry.start });
-                }
-                if (intervals.length) {
-                    wrapCrossIntervals(entry.node, intervals, { className: 'focus-hl-span', attr: 'data-focus-hl' });
+                for (let n = 0; n < flat.nodes.length; n++) {
+                    const entry = flat.nodes[n];
+                    if (focusInsideCross(entry.node, host)) continue;
+                    const intervals = [];
+                    for (let r = 0; r < merged.length; r++) {
+                        const s = Math.max(merged[r].start, entry.start);
+                        const e2 = Math.min(merged[r].end, entry.end);
+                        if (e2 > s) intervals.push({ s: s - entry.start, e: e2 - entry.start });
+                    }
+                    if (intervals.length) {
+                        wrapCrossIntervals(entry.node, intervals, { className: 'focus-hl-span', attr: 'data-focus-hl' });
+                    }
                 }
             }
         }
@@ -17598,18 +17682,31 @@ function renderAppCore(preserveScroll = true) {
     // 和放在最后一行对「什么时候真正跑」没有区别 —— 复核和重画状态条照旧发生在这一帧之后。
     try { focusNoteDocumentChanged(); } catch (e) {}
 
-    // 保存滚动位置。两栏是**联动**的（bindPaneScrollSync），逻辑上只有一个位置，
-    // 所以这里只存一个数。分开存两个数会在源栏那侧暂时没有滚动容器的那一轮出事：
+    // 保存滚动位置。两栏在「分行对齐」开着时是**联动**的（bindPaneScrollSync），逻辑上只有
+    // 一个位置，所以历来只存一个数。分开存两个数会在源栏那侧暂时没有滚动容器的那一轮出事：
     // viewMode 切到 'edit' 时源面板是一个 textarea，选择器选不到东西，存下来的是 0，
     // 切回 'preview' 又把这个 0 写回源栏，两栏当场差出一整页（实测 800px）；
     // syncBilingualAlignment 只管行高、从不碰 scrollTop，这个落差它救不回来。
     // 谁没有滚动容器就跟着另一边走，两边都没有才归零。
+    // 【P150】分行对齐关掉后两栏改成各自独立滚动（bindPaneScrollSync 直接不绑监听），
+    // 如果仍然只存一个数、两边都写回这同一个数，会让"独立滚动"在**每一次**渲染
+    // （不只是切开关那一下——showToast、自动存档定时器等任何状态变化都会触发 renderApp）
+    // 之后被强行拉回同一个位置，等于把独立滚动做成了只在两次渲染之间短暂成立的假象。
+    // 联动/独立是同一个布尔量（AppState.bilingualAlignEnabled）决定的，这里跟它保持一致：
+    // 开→仍按原逻辑存一个数；关→源栏、译栏分别存各自的位置，互不干扰。
     let savedScroll = 0;
+    let savedScrollSrc = 0, savedScrollTgt = 0;
+    const scrollLinked = AppState.bilingualAlignEnabled;
     if (preserveScroll) {
         const sourceContainer = document.querySelector('section:first-of-type .overflow-y-auto');
         const targetContainer = document.querySelector('section:last-of-type .overflow-y-auto');
-        if (sourceContainer) savedScroll = sourceContainer.scrollTop;
-        else if (targetContainer) savedScroll = targetContainer.scrollTop;
+        if (scrollLinked) {
+            if (sourceContainer) savedScroll = sourceContainer.scrollTop;
+            else if (targetContainer) savedScroll = targetContainer.scrollTop;
+        } else {
+            savedScrollSrc = sourceContainer ? sourceContainer.scrollTop : 0;
+            savedScrollTgt = targetContainer ? targetContainer.scrollTop : 0;
+        }
     }
 
     const root = document.getElementById('root');
@@ -17667,8 +17764,13 @@ function renderAppCore(preserveScroll = true) {
     if (preserveScroll) {
         const newSourceContainer = document.querySelector('section:first-of-type .overflow-y-auto');
         const newTargetContainer = document.querySelector('section:last-of-type .overflow-y-auto');
-        if (newSourceContainer) newSourceContainer.scrollTop = savedScroll;
-        if (newTargetContainer) newTargetContainer.scrollTop = savedScroll;
+        if (scrollLinked) {
+            if (newSourceContainer) newSourceContainer.scrollTop = savedScroll;
+            if (newTargetContainer) newTargetContainer.scrollTop = savedScroll;
+        } else {
+            if (newSourceContainer) newSourceContainer.scrollTop = savedScrollSrc;
+            if (newTargetContainer) newTargetContainer.scrollTop = savedScrollTgt;
+        }
     }
 
     // 渲染后调整弹窗位置
@@ -19409,7 +19511,7 @@ function renderSourcePanel() {
                             </button>
                         </div>
                         ${AppState.viewMode === 'preview' ? `
-                        <button id="bilingualAlignToggleBtn" onclick="setBilingualAlignEnabled(!AppState.bilingualAlignEnabled)" class="p-2 rounded-lg transition-colors ${AppState.bilingualAlignEnabled ? 'text-indigo-600 bg-indigo-50' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr('切换左右两栏的分行对齐。开：逐句配对、等高显示、滚动联动。关：两栏各自按自然高度排布、独立滚动（像 Google 翻译那样），渲染内容不受影响。')}" data-tip-pos="bottom-end">
+                        <button id="bilingualAlignToggleBtn" onclick="setBilingualAlignEnabled(!AppState.bilingualAlignEnabled)" class="p-2 rounded-lg transition-colors ${AppState.bilingualAlignEnabled ? 'text-indigo-600 bg-indigo-50' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr('切换左右两栏的分行对齐。开：逐句配对、等高显示、滚动联动。关：不再分块——两栏各自变成一整篇连续文本，保留原有段落/换行格式（像 Google 翻译那样贴一段出一段），公式等照常渲染，各自独立滚动。')}" data-tip-pos="bottom-end">
                             ${Icons.AlignRows}
                         </button>
                         ` : ''}
@@ -19417,7 +19519,7 @@ function renderSourcePanel() {
                 </div>
             </div>
             <div class="flex-grow flex flex-col overflow-hidden bg-slate-50/20">
-                ${AppState.translationPairs.length > 0 && AppState.viewMode === 'preview' ? `
+                ${AppState.translationPairs.length > 0 && AppState.viewMode === 'preview' ? (AppState.bilingualAlignEnabled ? `
                     <div class="overflow-y-auto h-full custom-scrollbar p-4" data-align-scroll="src" onclick="handleBlankAreaClick(event)">
                         <!-- 行距不再来自 space-y-2：改由 :root 上的 --pair-gap 统一驱动
                              （[data-align-content] > * + * { margin-top: var(--pair-gap) }），
@@ -19426,7 +19528,22 @@ function renderSourcePanel() {
                             ${AppState.translationPairs.map((pair, idx) => renderPairRow('src', pair, idx)).join('')}
                         </div>
                     </div>
-                ` : AppState.translationPairs.length > 0 && AppState.viewMode === 'original' ? `
+                ` : `
+                    <!-- v2 Pass P151（返工 P150）：「分行对齐」关闭 = 不再是"一句一个配对块"，
+                         但也不是 P150 那样整篇拼成一块渲染——那样会把逐句点击编辑/历史/AI 工具栏/
+                         关注复选框/高亮/颜色宏角标全部废掉（无 data-idx 可挂）。这里改成"行内流"：
+                         每个 pair 仍然各自是一个真实 DOM 节点（data-idx/data-side 原样在），只是从
+                         块级 <div> 改成行内 <span>（renderFlowPairInline），按 pair.brk 分段流下去
+                         （renderFlowPane），锚点不丢，逐句功能照常可用，见那两个函数上方的注释。
+                         data-flow-* 与 data-align-* 是两套完全独立的标记：任何按
+                         [data-align-content]/[data-align-scroll] 查询的旧机制
+                         （syncBilingualAlignment / bindPaneScrollSync / alignSyncKeepingScroll）
+                         在这里查不到任何节点、按自身既有的 try/catch 或早退逻辑安全跳过，
+                         不需要为「关闭态」额外改这几个函数。 -->
+                    <div class="overflow-y-auto h-full custom-scrollbar p-4" data-flow-scroll="src" onclick="handleBlankAreaClick(event)">
+                        <div class="prose prose-slate prose-sm max-w-none text-slate-700 leading-relaxed pb-24" data-flow-content="src">${renderFlowPane('src', AppState.translationPairs)}</div>
+                    </div>
+                `) : AppState.translationPairs.length > 0 && AppState.viewMode === 'original' ? `
                     <div class="w-full h-full p-10 overflow-y-auto custom-scrollbar">
                         <div class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4 flex items-center gap-2">
                             ${Icons.History} 原始输入内容 (用于重新生成翻译)
@@ -19450,7 +19567,7 @@ function renderTargetPanel() {
                 <h3 class="text-xs font-black text-slate-400 uppercase tracking-[0.2em] whitespace-nowrap">Target Panel</h3>
                 <button onclick="copyTargetText()" class="p-2 text-slate-400 hover:text-indigo-600 transition-colors" data-tip="把右栏所有译文按顺序拼起来复制到剪贴板（不含原文）。" data-tip-pos="bottom-end">${Icons.Copy}</button>
             </div>
-            <div class="flex-grow p-4 overflow-y-auto custom-scrollbar bg-slate-50/20" data-align-scroll="tgt" onclick="handleBlankAreaClick(event)">
+            <div class="flex-grow p-4 overflow-y-auto custom-scrollbar bg-slate-50/20" ${AppState.bilingualAlignEnabled ? 'data-align-scroll="tgt"' : 'data-flow-scroll="tgt"'} onclick="handleBlankAreaClick(event)">
                 ${AppState.isLoading && AppState.translationPairs.length === 0 ? `
                     <div class="h-full flex flex-col items-center justify-center text-slate-400 animate-pulse">
                         <span class="text-indigo-300 mb-6">${Icons.LoaderLarge}</span>
@@ -19461,11 +19578,18 @@ function renderTargetPanel() {
                         <div class="p-8 bg-slate-100 rounded-full mb-6">${Icons.ZapBig}</div>
                         <p class="text-xl font-black uppercase tracking-widest">Awaiting Input</p>
                     </div>
-                ` : `
+                ` : AppState.bilingualAlignEnabled ? `
                     <!-- 行距同源栏：--pair-gap，见 renderSourcePanel 里的注释 -->
                     <div class="pb-24" data-align-content="tgt" onclick="handleBlankAreaClick(event)">
                         ${AppState.translationPairs.map((pair, idx) => renderPairRow('tgt', pair, idx)).join('')}
                     </div>
+                ` : `
+                    <!-- v2 Pass P151（返工 P150）：右栏同源栏一样改成"行内流"，理由与实现见
+                         renderSourcePanel 对应分支上方的注释、以及 renderFlowPane/
+                         renderFlowPairInline 的定义。右栏没有 srcRaw 那样的"原始分隔"可用，
+                         段内句与句之间的空白由 ovlFlowNeedsSpace 按中英文边界判定，不是
+                         joinPairsAsDocument 那种整篇拼接。 -->
+                    <div class="prose prose-slate prose-sm max-w-none text-slate-700 leading-relaxed pb-24" data-flow-content="tgt">${renderFlowPane('tgt', AppState.translationPairs)}</div>
                 `}
             </div>
         </section>
@@ -19544,6 +19668,195 @@ function renderPairRow(side, pair, idx) {
             </div>
         `;
     }
+}
+
+// ============= v2 Pass P151：分行对齐关闭时的「行内流」渲染 =============
+// 返工 P150——P150 把关闭态整篇拼成一块 renderFormattedText 渲染，锚点（data-idx/data-side）
+// 全部消失，逐句点击编辑/历史/AI 工具栏/关注复选框/关注高亮/跨栏高亮/颜色宏角标全部失效。
+// 用户明确要求"尽可能保留大部分功能，仅分块功能可以选择关闭/打开"。这一组三个函数
+// （ovlFlowNeedsSpace / renderFlowPairInline / renderFlowPane）就是新的关闭态渲染路径：
+// 每个 pair 仍然各自是一个真实 DOM 节点，只是从 renderPairRow 那种块级 <div>（p-4、圆角、
+// 悬停背景——"一句一个盒子"的视觉来源）改成不带任何内边距/边框/背景的行内 <span>，段落
+// 结构仍由 pair.brk 驱动，首尾相接流下去。renderFormattedText 本身一个字节没改——这里只是
+// 换了它的外壳。
+
+// 中日韩字符判定：CJK 统一表意文字、CJK 标点、全角形式、平假名/片假名等常用区段。
+// 边界任意一侧是 CJK 字符就不插空格（中文句子之间原文本来就不留空格，硬插一个会在纯中文
+// 段落里凭空多出一道视觉缝隙）；两侧都不是 CJK（英文/数字/拉丁字符为主）才插一个空格
+// （否则相邻两句会在渲染出的连续文本里粘连成一个词，例如 "sentence one.sentence two"）。
+// 这是"中英混排时的分隔规则"里能不依赖原始分隔符、只看句子首尾字符就做出的最小闭环判断——
+// 不追求还原用户当初打字时敲的到底是空格还是无分隔，只保证"不粘连、不多余"这两条硬要求。
+const OVL_FLOW_CJK_RE = /[　-〿぀-ヿ㇀-㇯㈀-㋿㐀-䶿一-鿿豈-﫿＀-￯]/;
+function ovlFlowNeedsSpace(prevText, nextText) {
+    try {
+        const a = String(prevText == null ? '' : prevText).replace(/\s+$/, '');
+        const b = String(nextText == null ? '' : nextText).replace(/^\s+/, '');
+        if (!a || !b) return false;
+        const lastCh = a.charAt(a.length - 1);
+        const firstCh = b.charAt(0);
+        if (OVL_FLOW_CJK_RE.test(lastCh) || OVL_FLOW_CJK_RE.test(firstCh)) return false;
+        return true;
+    } catch (e) { return false; }
+}
+
+// P152（修 P151 遗留缺陷，对抗验证实测复现）：一个 pair 渲染出的 HTML 到底有几个顶层块、
+// 都是些什么标签——一律靠真实 DOM 解析拿答案（<template> 元素：innerHTML 赋值走标准
+// HTML 解析算法，不执行脚本/不发请求，是这个文件里唯一安全的"把一段 HTML 字符串变成
+// 可检查的 DOM 树"的手段），不再用正则猜 `<p>...</p>` 的边界。
+//
+// 【缺陷】P151 原来那条 `/^\s*<p>([\s\S]*)<\/p>\s*$/` 在 rendered 恰好只有一个顶层 <p>
+// 时工作正常，但只要这个 pair 的原文含至少一个真实空行（用户在编辑框里多打一次回车就能
+// 触发，完全可达），marked 就会切出不止一个顶层 <p>；正则的 `([\s\S]*)` 是贪婪匹配，会
+// 一路吃到*最后*一个 </p>，把中间那截 `</p><p>` 原样当成普通文本塞进 inner——那是一段
+// 没配平的畸形 HTML，插回 DOM 之后由浏览器的 HTML 解析器自己"抢救"，抢救结果不可控（实测
+// 复现：后面两个不相关的 pair 被解析器揉进当前 pair 的子树，行内流中间凭空插入一道真实
+// 的块级换行）。DOM 解析不存在这个问题：把 rendered 丢进 <template> 之后，浏览器自己的
+// 解析算法已经把它变成一棵结构良好的树（多个 <p> 该怎么互相隐式收尾、字面出现的
+// <p>/</p> 文本该怎么配对，全是浏览器按 HTML5 解析算法本身的规则处理的，不用我们猜），
+// 我们只需要按这棵树的顶层子节点分别处理，序列化出来的每一段 HTML 天生配平良好。
+function ovlFlowParseTopLevelNodes(html) {
+    const out = [];
+    try {
+        const tpl = document.createElement('template');
+        tpl.innerHTML = html || '';
+        const kids = tpl.content.childNodes;
+        for (let i = 0; i < kids.length; i++) {
+            const n = kids[i];
+            if (n.nodeType === 1) { out.push(n); continue; }              // 元素节点：算一个顶层块
+            if (n.nodeType === 3 && /\S/.test(n.nodeValue || '')) {
+                // marked 正常输出不会在顶层块之间夹带非空白文本；真出现了（比如原文字面写了
+                // 一段没配对的 HTML 标签文字）也不丢内容，包一层 <span> 凑成一个能挂
+                // data-idx 的顶层节点。
+                const span = document.createElement('span');
+                span.textContent = n.nodeValue;
+                out.push(span);
+            }
+            // 其余（纯空白文本节点、注释节点）跳过——marked 在相邻块级标签之间插入的换行符
+            // 属于这一类，不计入顶层块数。
+        }
+    } catch (e) { /* 解析失败：交给上层当"零个顶层节点"处理，不抛进渲染路径 */ }
+    return out;
+}
+
+// 单个 pair 在"行内流"里的非编辑态渲染。返回 { html, isBlock }：
+//   0 个顶层节点（空 pair / 只有空白）：保留 P151 原来"没内容也要有锚点"的空行内 span。
+//   恰好 1 个 <p>（绝大多数情况——纯散文句子）：拆掉这层 <p>，包一层行内 <span>，跟 P151
+//     原行为逐字一致。
+//   恰好 1 个非 <p> 节点（列表/标题/表格/公式独占行……marked 判成别的块类型）：整个节点的
+//     outerHTML 包一层 <div>，跟 P151 原行为逐字一致（只是取材从正则切片换成 DOM 序列化，
+//     不会再有配平不完整的风险）。
+//   ≥2 个顶层节点、且全部是 <p>：这正是"pair 内含空行"的确切特征——marked 对同一个 pair
+//     的原文只要有一个真实空行就会切出不止一个 <p>；用户字面打出 `</p><p>` 这种文本，经过
+//     浏览器 HTML 解析器的隐式收尾规则之后也会落到同样的结构（对抗验证实测两种输入方式，
+//     DOM 树形状完全一样，分辨"哪种原因导致"既不可能也没必要）。每个 <p> 各自变成一个
+//     独立的 .ovl-flow-block 分片——复用这个 P151 就在用的既有 CSS 类（1em 下外边距），
+//     让内部的空行读出来是真实的段落间距（实测过：不拆开、把多个 <p> 一起塞进零 margin 的
+//     .ovl-flow-text 会导致相邻两段紧贴在一起零间距，读不出"这是一次真实换段"），不是贴在
+//     一起看不出来的两行字；每个分片都挂满整套 data-idx/data-side + 点击入口（点任意一段
+//     都能进整个 pair 的编辑态），但只属于*这一个* pair——每个分片的 HTML 都来自某一个
+//     顶层节点自己的 innerHTML，单个顶层节点在真实 DOM 树里天生配平良好，不可能带着没
+//     配对的标签溢出到相邻的分片或别的 pair 里（对照：旧正则产出的畸形字符串没有这个保证，
+//     这正是缺陷的根源）。
+//   其余情况（≥2 个顶层节点、但不全是 <p>，例如"一行说明文字"后面跟一个标题/列表）：跟
+//     P151 原行为一致，整段一起装进同一个块，不拆——这不是本次任务要修的缺陷（缺陷特指
+//     "多个顶层 <p> 被正则误判成单个内联句子"），P151 本来就是把整段当一个块处理，这里
+//     只是改成 DOM 安全的拼接（各顶层节点的 outerHTML 首尾相接），不再依赖正则，但对这
+//     一类既有测试夹具（标题/列表前面带一行说明文字）的可见结构逐字节不变。
+// 所有分支都保留 data-idx/data-side（点击进编辑态、跨栏/关注高亮都靠它定位——一个 pair
+// 拆成多个分片时见 findRenderedRowBodies）、颜色宏丢失 ⚠ 角标（复用 xportRowDropsColorMacros，
+// 逐字同 renderPairRow）、「关注」复选框（复用 focusCheckboxHtml）——多分片时这两个只挂在
+// *最后一个*分片上（避免同一个 pair 的功能入口重复铺满好几段，且 focusCheckboxHtml 本身
+// 就是按 (idx,side) 一份状态，不需要每个分片各画一份）；点击进编辑态则每个分片都有自己的
+// 入口（点哪一段都要能进编辑态，理由同上）。复选框包了一层 .ovl-flow-handle，默认
+// display:none，悬停/内部聚焦时才 inline-flex（CSS 见文件顶部 <style>），不像
+// renderPairRow 里那样绝对定位常驻：绝对定位挂在行内 <span> 上会被断行行为体切碎，改成
+// "悬停才出现"更稳妥，也正好满足「常驻控件不占布局空间」的要求。正文本身包一层
+// .ovl-flow-text（不用 .prose——外层 data-flow-content 容器已经是 .prose，Tailwind
+// Typography 的排版规则是后代选择器，中间隔几层普通元素不影响；这里用 .ovl-flow-text 只是
+// 给 findRenderedRowBody(ies) 一个能精确排除「关注」复选框/⚠ 角标文字的选择器，避免跨栏
+// 高亮/关注高亮的文本节点游走器把这两处也当成正文扫进去）。
+function renderFlowPairInline(side, pair, idx) {
+    const textValue = side === 'src' ? pair.src : pair.tgt;
+    const rendered = textValue ? renderFormattedText(textValue) : '';
+    const nodes = ovlFlowParseTopLevelNodes(rendered);
+    const rowLocked = AppState.isRegeneratingAll || AppState.isLoading;
+    const lockTip = escapeAttr(AppState.isRegeneratingAll
+        ? '整篇重新生成进行中，这几分钟里逐句编辑是关掉的：跑完会把整篇译文换成新的一版。'
+        : '整篇翻译进行中，这几分钟里逐句编辑是关掉的：翻完会把整篇译文换成新的一版。');
+    const warnBadge = (side === 'src' && xportRowDropsColorMacros(pair))
+        ? `<span class="ovl-flow-warn" data-tip="${escapeAttr('这一行的 \\textcolor 修订标记带不回来：你改过这一行的原文，改动压在了颜色宏上。复制原文 / 切到大输入框 / 重新生成时，这一行是不带宏的纯文本（其余行原样保留）。需要那几处标记就到「历史」里取回改动前的那一版。')}" data-tip-pos="top">⚠</span>`
+        : '';
+    // variant 用 'toolbar' 不用 'row'：'row' 变体自带 .focus-row-chip
+    // （position:absolute + opacity:0，设计给 renderPairRow 那种带 .group 类的块级行、
+    // 靠 Tailwind 的 .group:hover 直接子代选择器翻开），套进这里两层嵌套之后那条选择器
+    // 够不着（.ovl-flow-handle 不是 .group），而且 position:absolute 的子节点不占用
+    // 任何正常流尺寸，会让 .ovl-flow-handle 悬停后 display:inline-flex 却量出 0×0（实测
+    // 复现过）。'toolbar' 变体是普通流内的 .focus-chip（自带边框/背景，不绝对定位），
+    // 悬停显隐完全交给下面这层 .ovl-flow-handle 自己的 CSS（display:none ->
+    // :hover/:focus-within 时 inline-flex），两套机制不再打架。
+    const cbHtml = focusCheckboxHtml(idx, side, 'toolbar');
+    const handleWrap = cbHtml ? `<span class="ovl-flow-handle" onclick="event.stopPropagation();">${cbHtml}</span>` : '';
+
+    const allP = nodes.length > 0 && nodes.every((n) => n.tagName === 'P');
+    let segments;
+    if (nodes.length === 0) {
+        segments = [{ inner: '', isBlock: false }];
+    } else if (nodes.length === 1 && nodes[0].tagName === 'P') {
+        segments = [{ inner: nodes[0].innerHTML, isBlock: false }];
+    } else if (allP) {
+        segments = nodes.map((n) => ({ inner: n.innerHTML, isBlock: true }));
+    } else {
+        segments = [{ inner: nodes.map((n) => n.outerHTML).join(''), isBlock: true }];
+    }
+
+    const html = segments.map((seg, i) => {
+        const isLast = i === segments.length - 1;
+        const outerTag = seg.isBlock ? 'div' : 'span';
+        const innerTag = seg.isBlock ? 'div' : 'span';
+        const cls = 'ovl-flow-pair' + (seg.isBlock ? ' ovl-flow-block' : '') + (rowLocked ? ' cursor-not-allowed opacity-60' : ' cursor-pointer');
+        const trail = isLast ? (warnBadge + handleWrap) : '';
+        return `<${outerTag} class="${cls}" data-idx="${idx}" data-side="${side}" onclick="handleRowClick(${idx},'${side}')"${rowLocked ? ` data-tip="${lockTip}" data-tip-pos="top"` : ''}><${innerTag} class="ovl-flow-text">${seg.inner}</${innerTag}>${trail}</${outerTag}>`;
+    }).join('');
+    const isBlock = segments.some((s) => s.isBlock);
+    return { html, isBlock };
+}
+
+// 整栏「行内流」渲染。段落结构仍由 pair.brk 驱动（P150 的段落边界推导直接复用这个既有
+// 语义，没有新增字段）：同一段内连续的非编辑态句对首尾相接摆进同一个 .ovl-flow-para；
+// 遇到块级句对（isBlock）先关掉当前段落容器，块级句对自己独立成 .ovl-flow-block，跟
+// .ovl-flow-para 并列，不嵌套在里面；正在编辑的那一句（AppState.activeIndex）整块复用
+// renderPairRow（block，带完整编辑框/历史控件/AI 工具栏）——这是"点击进编辑态"这条路唯一
+// 的入口，编辑期间这一句临时从行内流"跳出来"变成一个块，是预期效果，跟分行对齐开着时
+// 编辑同一句长得一模一样，AI 工具栏/历史撤销重做原样可用，不需要另写一套。
+function renderFlowPane(side, pairs) {
+    const list = Array.isArray(pairs) ? pairs : [];
+    let html = '';
+    let paraOpen = false;
+    let prevInlineText = null;
+    const closePara = () => { if (paraOpen) { html += '</div>'; paraOpen = false; prevInlineText = null; } };
+    const openPara = () => { if (!paraOpen) { html += '<div class="ovl-flow-para">'; paraOpen = true; prevInlineText = null; } };
+    for (let idx = 0; idx < list.length; idx++) {
+        const pair = list[idx] || {};
+        const textValue = side === 'src' ? pair.src : pair.tgt;
+        if (AppState.activeIndex === idx) {
+            closePara();
+            html += renderPairRow(side, pair, idx);
+        } else {
+            const r = renderFlowPairInline(side, pair, idx);
+            if (r.isBlock) {
+                closePara();
+                html += r.html;
+            } else {
+                openPara();
+                if (prevInlineText !== null && ovlFlowNeedsSpace(prevInlineText, textValue)) html += ' ';
+                html += r.html;
+                prevInlineText = textValue;
+            }
+        }
+        if (pair.brk === true) closePara();
+    }
+    closePara();
+    return html || '<div class="ovl-flow-para"></div>';
 }
 
 // ============= 历史控制按钮 =============
@@ -20096,28 +20409,24 @@ function setCrossHighlightEnabled(enabled) {
 }
 
 // ============= 分行对齐的开关 =============
-// 同样刻意**不**走 renderApp：按钮长在翻译器自己的工具栏上，整页重渲染没有
-// 「保住滚动位置」以外的额外收益，反而会打断用户正在编辑的那一行。
-// 直接调用 syncBilingualAlignment / bindPaneScrollSync 本身就够了——两个函数内部
-// 已经按 AppState.bilingualAlignEnabled 做早退/清理，这里调用等价于「立刻按新状态
-// 重新跑一遍」，开=马上补齐对齐+重新联动滚动，关=马上清掉 min-height+解绑联动，
-// 不需要刷新页面。
+// 【P150 改动，为什么不能再沿用旧的「不走 renderApp」做法】旧版（P141）关掉时两栏 DOM
+// 结构不变——只是清掉 min-height、解绑滚动联动——所以直接调 syncBilingualAlignment /
+// bindPaneScrollSync 原地打补丁就够了。P150 把「关闭」改成了完全不同的 DOM
+// （整篇连续文本 vs. 逐句配对块），两棵树没法原地互相打补丁，必须走 renderApp() 重建。
+// renderApp() 内部本来就无条件跑 syncBilingualAlignment() / bindPaneScrollSync()
+// （渲染路径见 renderAppCore），新 DOM 建好之后这两个函数自己会按新的
+// AppState.bilingualAlignEnabled 早退或正常绑定——不需要在这里重复调用一遍。
+// 按钮的高亮态也在模板里直接读 AppState.bilingualAlignEnabled（renderSourcePanel），
+// 重渲染后自然是新状态，不需要再手动切 class。
+// 「不需要刷新页面」= 不 location.reload()，renderApp() 本来就是这个应用所有状态变化
+// 的标准落地方式（setViewMode / setLanguage 等都是同一模式），不是新引入的重量级操作。
 function setBilingualAlignEnabled(enabled) {
     const on = !!enabled;
     AppState.bilingualAlignEnabled = on;
     try {
         localStorage.setItem('bilingualAlignEnabled', on ? '1' : '0');
     } catch (e) {}
-    syncBilingualAlignment();
-    bindPaneScrollSync();
-    try {
-        const btn = document.getElementById('bilingualAlignToggleBtn');
-        if (btn) {
-            btn.classList.toggle('text-indigo-600', on);
-            btn.classList.toggle('bg-indigo-50', on);
-            btn.classList.toggle('text-slate-400', !on);
-        }
-    } catch (e) {}
+    renderApp();
 }
 
 // 「显示」页里的「恢复默认宽度」按钮。resetSettingsModalWidth() 只改 DOM + 落盘、
