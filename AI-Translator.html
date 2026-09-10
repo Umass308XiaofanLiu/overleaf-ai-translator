@@ -4479,7 +4479,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.23.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.23.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-10';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -6231,7 +6231,7 @@ function clearRenderedCrossHighlights() {
     } catch (e) {}
 }
 
-// 找到某一行「非编辑态」的正文容器；那一行正在编辑（是 textarea）时返回 null
+// 找到某一行「非编辑态」的全部正文容器；那一行正在编辑（是 textarea）时那一个分片不算。
 //
 // v2 Pass P151：分行对齐关闭时不再是 [data-align-content] 那套配对块 DOM，而是
 // [data-flow-content] 那套行内流 DOM（见 renderFlowPane/renderFlowPairInline）——两套选择器
@@ -6240,17 +6240,32 @@ function clearRenderedCrossHighlights() {
 // renderTargetPanel），句子正文包在 .ovl-flow-text 里，跟"关注"复选框/⚠ 角标是兄弟节点
 // 而不是父子——不这样区分的话，跨栏高亮/关注高亮的文本节点游走器会把"关注"两个字和
 // ⚠ 提示一起当成正文扫进去，画错位置。
-function findRenderedRowBody(idx, side) {
+//
+// v2 Pass P152：一个 pair 可能因为内部含空行渲染成多个顶层元素（见 renderFlowPairInline
+// 的 allP 分支），这些元素共享同一对 data-idx/data-side——用 querySelectorAll 把它们全部
+// 找出来，不能只用 querySelector 认第一个，否则命中恰好落在第二片及以后的内容永远找不到。
+// 绝大多数 pair 仍然只有一个分片，这时返回数组长度恰好是 1。
+function findRenderedRowBodies(idx, side) {
+    const out = [];
     try {
         const pane = document.querySelector(`[data-align-content="${side}"], [data-flow-content="${side}"]`);
-        if (!pane) return null;
-        const row = pane.querySelector(`[data-idx="${idx}"][data-side="${side}"]`);
-        if (!row) return null;
-        if (row.querySelector('textarea')) return null;   // 编辑态，归镜像层管
-        return row.querySelector('.prose') || row.querySelector('.ovl-flow-text') || row;
-    } catch (e) {
-        return null;
-    }
+        if (!pane) return out;
+        const rows = pane.querySelectorAll(`[data-idx="${idx}"][data-side="${side}"]`);
+        for (let i = 0; i < rows.length; i++) {
+            const row = rows[i];
+            if (row.querySelector('textarea')) continue;   // 编辑态那一片，归镜像层管
+            out.push(row.querySelector('.prose') || row.querySelector('.ovl-flow-text') || row);
+        }
+    } catch (e) {}
+    return out;
+}
+
+// 单数版：只要"这一行有没有地方可以画"这种存在性判断（如 crossCanPaint）用这个即可，
+// 拿第一个分片代表整行——多分片时真正需要遍历全部分片画图的两处调用见
+// applyCrossHighlightToRendered / focusPaintRendered，它们直接用上面的复数版。
+function findRenderedRowBody(idx, side) {
+    const list = findRenderedRowBodies(idx, side);
+    return list.length ? list[0] : null;
 }
 
 // 收集容器里可以安全高亮的文本节点，同时拼出扁平文本。返回 { text, nodes:[{node, start, end}] }
@@ -6329,23 +6344,31 @@ function applyCrossHighlightToRendered() {
         const fragments = getCrossFragmentsFor(ch.idx, ch.toSide);
         if (!fragments) return;
 
-        const host = findRenderedRowBody(ch.idx, ch.toSide);
-        if (!host) return;                                            // 那一行是 textarea，镜像层已经画过了
-        const flat = collectCrossTextNodes(host);
-        if (!flat.text) return;
-        const ranges = crossResolveRanges(flat.text, fragments);
-        if (!ranges.length) return;
+        // v2 Pass P152：一个 pair 可能因为内部含空行拆成多个顶层元素（见
+        // renderFlowPairInline 的 allP 分支），这些元素共享同一对 data-idx/data-side——
+        // 全部找出来各自试一遍，不能只认第一个，否则命中恰好落在第二片及以后分片里的
+        // 内容永远画不出来。绝大多数 pair 仍然只有一个 host，下面的循环只跑一轮，跟
+        // 改动前逐字节等价。
+        const hosts = findRenderedRowBodies(ch.idx, ch.toSide);
+        if (!hosts.length) return;                                    // 那一行是 textarea，镜像层已经画过了
+        for (let hIdx = 0; hIdx < hosts.length; hIdx++) {
+            const host = hosts[hIdx];
+            const flat = collectCrossTextNodes(host);
+            if (!flat.text) continue;
+            const ranges = crossResolveRanges(flat.text, fragments);
+            if (!ranges.length) continue;
 
-        // 区间 → 每个文本节点上的局部区间
-        for (let n = 0; n < flat.nodes.length; n++) {
-            const entry = flat.nodes[n];
-            const intervals = [];
-            for (let r = 0; r < ranges.length; r++) {
-                const s = Math.max(ranges[r].start, entry.start);
-                const e = Math.min(ranges[r].end, entry.end);
-                if (e > s) intervals.push({ s: s - entry.start, e: e - entry.start });
+            // 区间 → 每个文本节点上的局部区间
+            for (let n = 0; n < flat.nodes.length; n++) {
+                const entry = flat.nodes[n];
+                const intervals = [];
+                for (let r = 0; r < ranges.length; r++) {
+                    const s = Math.max(ranges[r].start, entry.start);
+                    const e = Math.min(ranges[r].end, entry.end);
+                    if (e > s) intervals.push({ s: s - entry.start, e: e - entry.start });
+                }
+                if (intervals.length) wrapCrossIntervals(entry.node, intervals);
             }
-            if (intervals.length) wrapCrossIntervals(entry.node, intervals);
         }
     } catch (e) {
         // 装饰性功能：坏了就当没这个功能，绝不能把异常带回渲染路径
@@ -7240,31 +7263,57 @@ function focusPaintRendered() {
             const parts = keys[g].split('|');
             const idx = Number(parts[0]);
             const side = parts[1];
-            const host = findRenderedRowBody(idx, side);
-            if (!host) continue;
+            // v2 Pass P152：一个 pair 可能因为内部含空行拆成多个顶层元素（见
+            // renderFlowPairInline 的 allP 分支），这些元素共享同一对 data-idx/data-side——
+            // 全部找出来各自准备一份扁平文本。绝大多数 pair 仍然只有一个 host，这时下面这套
+            // 逻辑退化成改动前那一套，对 unresolved 计数和最终画出来的区间逐字节等价。
+            const hosts = findRenderedRowBodies(idx, side);
+            if (!hosts.length) continue;
 
             // ⚠️ C5：复用跨栏高亮那台游走器，**不另起一套方言**。它整棵跳过 .katex 子树 ——
             //    KaTeX 的 DOM 里同一段公式有 HTML + MathML 两份文本，收进来会让扁平文本凭空翻倍；
             //    往里插节点更是直接毁掉公式排版。代价是**公式里的片段一个字都画不出来**，
             //    这正是「要么整条公式、要么什么都不画」里的「什么都不画」那一支：
             //    宁可少画一个标记，也绝不去拆 KaTeX 的文本节点。
-            const flat = collectCrossTextNodes(host, { reject: ['katex'] });
-            if (!flat.text) continue;
+            const hostFlats = hosts.map((h) => collectCrossTextNodes(h, { reject: ['katex'] }));
+            if (hostFlats.every((f) => !f.text)) continue;   // 全部分片都没有可高亮文本，等价于改动前的 !flat.text 早退
 
-            const ranges = [];
             let whole = false;
+            const quoteEntries = [];
             for (let i = 0; i < list.length; i++) {
                 const e = list[i];
                 // 整行条目也要先解一次：解不出来（换了文档 / 整行被改写）就**一笔都不画**，
                 // 否则从这一帧到异步复核落地之间，整行黄底会盖在用户从没标过的一段话上。
                 if (e.whole) { if (focusResolve(e).ok) whole = true; else unresolved++; continue; }
-                // 已渲染正文的扁平文本 ≠ 这一行的原始文本（markdown 记号没了、公式被跳过了），
-                // 所以这里**不用**存下来的 offset，改成逐字找 + 只认唯一命中。
-                // 这条纪律和跨栏高亮完全一致：宁可不画，绝不画错。
+                quoteEntries.push(e);
+            }
+
+            // 整行条目：pair 拆成几片就该几片都整段标记（"关注整行"覆盖的是整个 pair，
+            // 不是碰巧渲染到的第一片）。
+            const hostRanges = hosts.map(() => []);
+            if (whole) {
+                for (let hi = 0; hi < hosts.length; hi++) {
+                    if (hostFlats[hi].text) hostRanges[hi].push({ start: 0, end: hostFlats[hi].text.length });
+                }
+            }
+            // 片段条目：已渲染正文的扁平文本 ≠ 这一行的原始文本（markdown 记号没了、公式被
+            // 跳过了），所以这里**不用**存下来的 offset，改成逐字找 + 只认唯一命中——这条
+            // 纪律和跨栏高亮完全一致：宁可不画，绝不画错。在这个 pair 名下的全部分片里找，
+            // 命中哪一片就画在哪一片上；全部分片都没有唯一命中才计入 unresolved（单分片时
+            // 跟改动前的判据完全一致）。
+            for (let qi = 0; qi < quoteEntries.length; qi++) {
+                const e = quoteEntries[qi];
                 const q = String(e.quote || '');
                 if (!q) continue;
-                const first = flat.text.indexOf(q);
-                if (first === -1 || flat.text.indexOf(q, first + 1) !== -1) {
+                let matchedHost = -1;
+                let matchStart = -1;
+                for (let hi = 0; hi < hosts.length; hi++) {
+                    const t = hostFlats[hi].text;
+                    if (!t) continue;
+                    const first = t.indexOf(q);
+                    if (first !== -1 && t.indexOf(q, first + 1) === -1) { matchedHost = hi; matchStart = first; break; }
+                }
+                if (matchedHost === -1) {
                     // 【「这里画不出来」和「这条标记已经失效」是两回事，绝不能混】
                     // 渲染后的扁平文本里没有这段字，最常见的原因是它根本不该在这里出现：
                     // `27.3\%` 渲染成 `27.3%`、`**粗**` 的星号被 marked 吃掉、公式整段被跳过。
@@ -7274,33 +7323,35 @@ function focusPaintRendered() {
                     if (!focusResolve(e).ok) unresolved++;
                     continue;
                 }
-                ranges.push({ start: first, end: first + q.length });
+                hostRanges[matchedHost].push({ start: matchStart, end: matchStart + q.length });
             }
-            let merged;
-            if (whole) {
-                merged = [{ start: 0, end: flat.text.length }];
-            } else {
+
+            for (let hi = 0; hi < hosts.length; hi++) {
+                const ranges = hostRanges[hi];
+                if (!ranges.length) continue;
+                const flat = hostFlats[hi];
+                const host = hosts[hi];
                 ranges.sort(function (a, b) { return a.start - b.start || b.end - a.end; });
-                merged = [];
+                const merged = [];
                 for (let i = 0; i < ranges.length; i++) {
                     const last = merged[merged.length - 1];
                     if (last && ranges[i].start <= last.end) { last.end = Math.max(last.end, ranges[i].end); continue; }
                     merged.push({ start: ranges[i].start, end: ranges[i].end });
                 }
-            }
-            if (!merged.length) continue;
+                if (!merged.length) continue;
 
-            for (let n = 0; n < flat.nodes.length; n++) {
-                const entry = flat.nodes[n];
-                if (focusInsideCross(entry.node, host)) continue;
-                const intervals = [];
-                for (let r = 0; r < merged.length; r++) {
-                    const s = Math.max(merged[r].start, entry.start);
-                    const e2 = Math.min(merged[r].end, entry.end);
-                    if (e2 > s) intervals.push({ s: s - entry.start, e: e2 - entry.start });
-                }
-                if (intervals.length) {
-                    wrapCrossIntervals(entry.node, intervals, { className: 'focus-hl-span', attr: 'data-focus-hl' });
+                for (let n = 0; n < flat.nodes.length; n++) {
+                    const entry = flat.nodes[n];
+                    if (focusInsideCross(entry.node, host)) continue;
+                    const intervals = [];
+                    for (let r = 0; r < merged.length; r++) {
+                        const s = Math.max(merged[r].start, entry.start);
+                        const e2 = Math.min(merged[r].end, entry.end);
+                        if (e2 > s) intervals.push({ s: s - entry.start, e: e2 - entry.start });
+                    }
+                    if (intervals.length) {
+                        wrapCrossIntervals(entry.node, intervals, { className: 'focus-hl-span', attr: 'data-focus-hl' });
+                    }
                 }
             }
         }
@@ -19648,30 +19699,86 @@ function ovlFlowNeedsSpace(prevText, nextText) {
     } catch (e) { return false; }
 }
 
+// P152（修 P151 遗留缺陷，对抗验证实测复现）：一个 pair 渲染出的 HTML 到底有几个顶层块、
+// 都是些什么标签——一律靠真实 DOM 解析拿答案（<template> 元素：innerHTML 赋值走标准
+// HTML 解析算法，不执行脚本/不发请求，是这个文件里唯一安全的"把一段 HTML 字符串变成
+// 可检查的 DOM 树"的手段），不再用正则猜 `<p>...</p>` 的边界。
+//
+// 【缺陷】P151 原来那条 `/^\s*<p>([\s\S]*)<\/p>\s*$/` 在 rendered 恰好只有一个顶层 <p>
+// 时工作正常，但只要这个 pair 的原文含至少一个真实空行（用户在编辑框里多打一次回车就能
+// 触发，完全可达），marked 就会切出不止一个顶层 <p>；正则的 `([\s\S]*)` 是贪婪匹配，会
+// 一路吃到*最后*一个 </p>，把中间那截 `</p><p>` 原样当成普通文本塞进 inner——那是一段
+// 没配平的畸形 HTML，插回 DOM 之后由浏览器的 HTML 解析器自己"抢救"，抢救结果不可控（实测
+// 复现：后面两个不相关的 pair 被解析器揉进当前 pair 的子树，行内流中间凭空插入一道真实
+// 的块级换行）。DOM 解析不存在这个问题：把 rendered 丢进 <template> 之后，浏览器自己的
+// 解析算法已经把它变成一棵结构良好的树（多个 <p> 该怎么互相隐式收尾、字面出现的
+// <p>/</p> 文本该怎么配对，全是浏览器按 HTML5 解析算法本身的规则处理的，不用我们猜），
+// 我们只需要按这棵树的顶层子节点分别处理，序列化出来的每一段 HTML 天生配平良好。
+function ovlFlowParseTopLevelNodes(html) {
+    const out = [];
+    try {
+        const tpl = document.createElement('template');
+        tpl.innerHTML = html || '';
+        const kids = tpl.content.childNodes;
+        for (let i = 0; i < kids.length; i++) {
+            const n = kids[i];
+            if (n.nodeType === 1) { out.push(n); continue; }              // 元素节点：算一个顶层块
+            if (n.nodeType === 3 && /\S/.test(n.nodeValue || '')) {
+                // marked 正常输出不会在顶层块之间夹带非空白文本；真出现了（比如原文字面写了
+                // 一段没配对的 HTML 标签文字）也不丢内容，包一层 <span> 凑成一个能挂
+                // data-idx 的顶层节点。
+                const span = document.createElement('span');
+                span.textContent = n.nodeValue;
+                out.push(span);
+            }
+            // 其余（纯空白文本节点、注释节点）跳过——marked 在相邻块级标签之间插入的换行符
+            // 属于这一类，不计入顶层块数。
+        }
+    } catch (e) { /* 解析失败：交给上层当"零个顶层节点"处理，不抛进渲染路径 */ }
+    return out;
+}
+
 // 单个 pair 在"行内流"里的非编辑态渲染。返回 { html, isBlock }：
-//   isBlock=false：内容是行内安全的散文（renderFormattedText 对纯句子固定产出单个
-//     <p>…</p>——marked 的默认行为，这里把外层 <p> 拆掉，跟 ovlRenderTextColor 摘
-//     \textcolor 外壳用的是同一条已验证过的正则技巧，不是新造的启发式），包一层 <span>。
-//   isBlock=true：renderFormattedText 判成别的块类型（列表/标题/表格/公式独占行……不是单个
-//     <p> 包起来的），说明这句本身就是一个块级构造，不勉强塞进行内 <span>（块级元素不能是
-//     <span> 的子节点，也不该被拆碎成"看起来还是行内"——那样列表/标题会渲染错），改包一层
-//     <div>，跟相邻的行内段落容器并列而不是嵌套在里面（见 renderFlowPane）。
-// 两种情况都保留 data-idx/data-side（点击进编辑态、跨栏/关注高亮都靠它定位）、颜色宏丢失
-// ⚠ 角标（复用 xportRowDropsColorMacros，逐字同 renderPairRow）、「关注」复选框（复用
-// focusCheckboxHtml）——只是复选框包了一层 .ovl-flow-handle，默认 display:none，悬停/
-// 内部聚焦时才 inline-flex（CSS 见文件顶部 <style>），不像 renderPairRow 里那样绝对定位
-// 常驻：绝对定位挂在行内 <span> 上会被断行行为体切碎，改成"悬停才出现"更稳妥，也正好满足
-// 「常驻控件不占布局空间」的要求。正文本身包一层 .ovl-flow-text（不用 .prose——外层
-// data-flow-content 容器已经是 .prose，Tailwind Typography 的排版规则是后代选择器，中间隔
-// 几层普通元素不影响；这里用 .ovl-flow-text 只是给 findRenderedRowBody 一个能精确排除
-// 「关注」复选框/⚠ 角标文字的选择器，避免跨栏高亮/关注高亮的文本节点游走器把这两处也当成
-// 正文扫进去）。
+//   0 个顶层节点（空 pair / 只有空白）：保留 P151 原来"没内容也要有锚点"的空行内 span。
+//   恰好 1 个 <p>（绝大多数情况——纯散文句子）：拆掉这层 <p>，包一层行内 <span>，跟 P151
+//     原行为逐字一致。
+//   恰好 1 个非 <p> 节点（列表/标题/表格/公式独占行……marked 判成别的块类型）：整个节点的
+//     outerHTML 包一层 <div>，跟 P151 原行为逐字一致（只是取材从正则切片换成 DOM 序列化，
+//     不会再有配平不完整的风险）。
+//   ≥2 个顶层节点、且全部是 <p>：这正是"pair 内含空行"的确切特征——marked 对同一个 pair
+//     的原文只要有一个真实空行就会切出不止一个 <p>；用户字面打出 `</p><p>` 这种文本，经过
+//     浏览器 HTML 解析器的隐式收尾规则之后也会落到同样的结构（对抗验证实测两种输入方式，
+//     DOM 树形状完全一样，分辨"哪种原因导致"既不可能也没必要）。每个 <p> 各自变成一个
+//     独立的 .ovl-flow-block 分片——复用这个 P151 就在用的既有 CSS 类（1em 下外边距），
+//     让内部的空行读出来是真实的段落间距（实测过：不拆开、把多个 <p> 一起塞进零 margin 的
+//     .ovl-flow-text 会导致相邻两段紧贴在一起零间距，读不出"这是一次真实换段"），不是贴在
+//     一起看不出来的两行字；每个分片都挂满整套 data-idx/data-side + 点击入口（点任意一段
+//     都能进整个 pair 的编辑态），但只属于*这一个* pair——每个分片的 HTML 都来自某一个
+//     顶层节点自己的 innerHTML，单个顶层节点在真实 DOM 树里天生配平良好，不可能带着没
+//     配对的标签溢出到相邻的分片或别的 pair 里（对照：旧正则产出的畸形字符串没有这个保证，
+//     这正是缺陷的根源）。
+//   其余情况（≥2 个顶层节点、但不全是 <p>，例如"一行说明文字"后面跟一个标题/列表）：跟
+//     P151 原行为一致，整段一起装进同一个块，不拆——这不是本次任务要修的缺陷（缺陷特指
+//     "多个顶层 <p> 被正则误判成单个内联句子"），P151 本来就是把整段当一个块处理，这里
+//     只是改成 DOM 安全的拼接（各顶层节点的 outerHTML 首尾相接），不再依赖正则，但对这
+//     一类既有测试夹具（标题/列表前面带一行说明文字）的可见结构逐字节不变。
+// 所有分支都保留 data-idx/data-side（点击进编辑态、跨栏/关注高亮都靠它定位——一个 pair
+// 拆成多个分片时见 findRenderedRowBodies）、颜色宏丢失 ⚠ 角标（复用 xportRowDropsColorMacros，
+// 逐字同 renderPairRow）、「关注」复选框（复用 focusCheckboxHtml）——多分片时这两个只挂在
+// *最后一个*分片上（避免同一个 pair 的功能入口重复铺满好几段，且 focusCheckboxHtml 本身
+// 就是按 (idx,side) 一份状态，不需要每个分片各画一份）；点击进编辑态则每个分片都有自己的
+// 入口（点哪一段都要能进编辑态，理由同上）。复选框包了一层 .ovl-flow-handle，默认
+// display:none，悬停/内部聚焦时才 inline-flex（CSS 见文件顶部 <style>），不像
+// renderPairRow 里那样绝对定位常驻：绝对定位挂在行内 <span> 上会被断行行为体切碎，改成
+// "悬停才出现"更稳妥，也正好满足「常驻控件不占布局空间」的要求。正文本身包一层
+// .ovl-flow-text（不用 .prose——外层 data-flow-content 容器已经是 .prose，Tailwind
+// Typography 的排版规则是后代选择器，中间隔几层普通元素不影响；这里用 .ovl-flow-text 只是
+// 给 findRenderedRowBody(ies) 一个能精确排除「关注」复选框/⚠ 角标文字的选择器，避免跨栏
+// 高亮/关注高亮的文本节点游走器把这两处也当成正文扫进去）。
 function renderFlowPairInline(side, pair, idx) {
     const textValue = side === 'src' ? pair.src : pair.tgt;
     const rendered = textValue ? renderFormattedText(textValue) : '';
-    const m = /^\s*<p>([\s\S]*)<\/p>\s*$/.exec(rendered);
-    const inner = m ? m[1] : rendered;
-    const isBlock = !!rendered && !m;
+    const nodes = ovlFlowParseTopLevelNodes(rendered);
     const rowLocked = AppState.isRegeneratingAll || AppState.isLoading;
     const lockTip = escapeAttr(AppState.isRegeneratingAll
         ? '整篇重新生成进行中，这几分钟里逐句编辑是关掉的：跑完会把整篇译文换成新的一版。'
@@ -19689,10 +19796,28 @@ function renderFlowPairInline(side, pair, idx) {
     // :hover/:focus-within 时 inline-flex），两套机制不再打架。
     const cbHtml = focusCheckboxHtml(idx, side, 'toolbar');
     const handleWrap = cbHtml ? `<span class="ovl-flow-handle" onclick="event.stopPropagation();">${cbHtml}</span>` : '';
-    const outerTag = isBlock ? 'div' : 'span';
-    const innerTag = isBlock ? 'div' : 'span';
-    const cls = 'ovl-flow-pair' + (isBlock ? ' ovl-flow-block' : '') + (rowLocked ? ' cursor-not-allowed opacity-60' : ' cursor-pointer');
-    const html = `<${outerTag} class="${cls}" data-idx="${idx}" data-side="${side}" onclick="handleRowClick(${idx},'${side}')"${rowLocked ? ` data-tip="${lockTip}" data-tip-pos="top"` : ''}><${innerTag} class="ovl-flow-text">${inner}</${innerTag}>${warnBadge}${handleWrap}</${outerTag}>`;
+
+    const allP = nodes.length > 0 && nodes.every((n) => n.tagName === 'P');
+    let segments;
+    if (nodes.length === 0) {
+        segments = [{ inner: '', isBlock: false }];
+    } else if (nodes.length === 1 && nodes[0].tagName === 'P') {
+        segments = [{ inner: nodes[0].innerHTML, isBlock: false }];
+    } else if (allP) {
+        segments = nodes.map((n) => ({ inner: n.innerHTML, isBlock: true }));
+    } else {
+        segments = [{ inner: nodes.map((n) => n.outerHTML).join(''), isBlock: true }];
+    }
+
+    const html = segments.map((seg, i) => {
+        const isLast = i === segments.length - 1;
+        const outerTag = seg.isBlock ? 'div' : 'span';
+        const innerTag = seg.isBlock ? 'div' : 'span';
+        const cls = 'ovl-flow-pair' + (seg.isBlock ? ' ovl-flow-block' : '') + (rowLocked ? ' cursor-not-allowed opacity-60' : ' cursor-pointer');
+        const trail = isLast ? (warnBadge + handleWrap) : '';
+        return `<${outerTag} class="${cls}" data-idx="${idx}" data-side="${side}" onclick="handleRowClick(${idx},'${side}')"${rowLocked ? ` data-tip="${lockTip}" data-tip-pos="top"` : ''}><${innerTag} class="ovl-flow-text">${seg.inner}</${innerTag}>${trail}</${outerTag}>`;
+    }).join('');
+    const isBlock = segments.some((s) => s.isBlock);
     return { html, isBlock };
 }
 
