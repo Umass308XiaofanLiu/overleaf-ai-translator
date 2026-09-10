@@ -1597,15 +1597,15 @@ body.ovl-shell-active #ovlShell { display: flex; }
        的宽度变量必须跟着"第 3 轨道=左侧内容列、第 5 轨道=右侧内容列"这个物理位置走，不能再
        跟哪个面板绑死——真正的 editor/pdf 语义换算在 JS 里做（ovlColSplitterApplyRatio()），
        这里只管两条轨道各自多宽。 */
-    grid-template-columns: 40px 188px var(--ovl-split-left-fr, 1fr) 6px var(--ovl-split-right-fr, 1fr);
+    grid-template-columns: 40px var(--ovl-tree-w, 188px) var(--ovl-split-left-fr, 1fr) 6px var(--ovl-split-right-fr, 1fr);
     background: #2F3A4C;
     z-index: 1000;
 }
 .ovl-body[data-tree="collapsed"] { grid-template-columns: 40px 0px var(--ovl-split-left-fr, 1fr) 6px var(--ovl-split-right-fr, 1fr); }
-.ovl-body[data-view="editor"] { grid-template-columns: 40px 188px 1fr; }
+.ovl-body[data-view="editor"] { grid-template-columns: 40px var(--ovl-tree-w, 188px) 1fr; }
 .ovl-body[data-view="editor"][data-tree="collapsed"] { grid-template-columns: 40px 0px 1fr; }
 .ovl-body[data-view="editor"] #ovlPdfPanel { display: none; }
-.ovl-body[data-view="pdf"] { grid-template-columns: 40px 188px 1fr; }
+.ovl-body[data-view="pdf"] { grid-template-columns: 40px var(--ovl-tree-w, 188px) 1fr; }
 .ovl-body[data-view="pdf"][data-tree="collapsed"] { grid-template-columns: 40px 0px 1fr; }
 .ovl-body[data-view="pdf"] #ovlEditorPanel { display: none; }
 /* v2 Pass P72：Overleaf 式单栏一键互切胶囊按钮（overleaf_reference.md §1/§6-1：editor-only
@@ -1725,8 +1725,29 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
     flex-direction: column;
     min-width: 0;
     border-right: 1px solid #2F3A4C;
+    /* v2 Pass P155：拖拽调宽手柄（.ovl-tree-splitter）绝对定位锚在这个面板自己的盒子上，
+       不新增 grid 列——跟 .ovl-col-splitter（那是 grid 第 4 列，独立的 6px 轨道）故意用不同
+       机制：文件树只有单栏，没有"两栏各占比例"的需求，把手柄嵌在面板自己右边缘内侧最省事，
+       不用改 6 条 grid-template-columns 的列数（那样要连带处理 order 镜像等一堆间接影响）。 */
+    position: relative;
 }
 .ovl-body[data-tree="collapsed"] .ovl-tree-panel { border-right: none; }
+/* v2 Pass P155：文件树侧边栏拖拽调宽手柄——结构/交互照抄 .ovl-col-splitter（Pointer Events +
+   setPointerCapture + rAF 合帧 + 只改一个 CSS 自定义属性），但落点不同：嵌在 .ovl-tree-panel
+   自己的右边缘内侧（position:absolute + right:0），不是独立的 grid 列。宽度 6px 跟
+   .ovl-col-splitter 一致；父容器 overflow:hidden，手柄贴着 right:0（不外扩到负值），命中区
+   完整落在面板盒子内部，不会被裁掉。折叠态（data-tree="collapsed"）没有宽度可拖，隐藏。 */
+.ovl-tree-splitter {
+    position: absolute;
+    top: 0; right: 0; bottom: 0;
+    width: 6px;
+    cursor: col-resize;
+    background: transparent;
+    touch-action: none;
+    z-index: 2;
+}
+.ovl-tree-splitter:hover, .ovl-tree-splitter.ovl-tree-splitter-active { background: #495365; }
+.ovl-body[data-tree="collapsed"] .ovl-tree-splitter { display: none; }
 .ovl-tree-header {
     display: flex;
     align-items: center;
@@ -4488,7 +4509,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.24.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.25.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-10';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -5164,6 +5185,23 @@ function usageCompactCostText(provider, model, taskUsage) {
     }
     if (cost.amount < 0.005) return '<' + sym + '0.01';
     return sym + cost.amount.toFixed(2);
+}
+// v2 Pass P155：聊天环主显示改成"本次对话累计"（usageSessionNew()/usageSessionAdd() 同一套
+// 结构，见 ChatState.convTaskUsageTotal 定义处），跟 usageCompactCostText 故意分开一个函数、
+// 不共用：那个函数吃的是单个 taskUsage + 一对 provider/model，现算一次价格；这里吃的是已经
+// 按各自真实模型分别算过价、按币种（costUsd/costCny）分开累加好的累计金额——一次对话内可能
+// 换过模型/换过币种（比如先问 Gemini 再问国内站 Qwen），没有单一 provider/model 可传，也不
+// 需要再查一次价格表。两种币种都 >0 时用 " + " 连接（跟 usageTipText 里"本会话累计"那段的
+// 既有连接方式一致，不新发明格式）。三条边界规则跟 usageCompactCostText 一致（P147 硬规则：
+// 整页面任何状态都不出现 "$0.00"）：<0.005 显示 "<$0.01"；一无所知（还没有一次成功任务、
+// 或全部任务都是"用量已知但价格未知"导致两种币种金额都是 0）统一显示成 "$—"，不显示 0。
+function usageCompactCumulativeCostText(cumTotal) {
+    if (!cumTotal || !cumTotal.hasUsage) return '$—';
+    const parts = [];
+    if (cumTotal.costUsd > 0) parts.push(cumTotal.costUsd < 0.005 ? '<$0.01' : '$' + cumTotal.costUsd.toFixed(2));
+    if (cumTotal.costCny > 0) parts.push(cumTotal.costCny < 0.005 ? '<¥0.01' : '¥' + cumTotal.costCny.toFixed(2));
+    if (!parts.length) return '$—'; // hasUsage 但两种币种都是 0（比如价格全未知）——跟"未知"同一个占位符，不假装 $0.00
+    return parts.join(' + ');
 }
 function usageTokensText(u) {
     const p = u.promptTokens || 0, c = u.completionTokens || 0;
@@ -21042,6 +21080,15 @@ const ChatState = {
     // usageAccum() 调用点。sessionTaskUsageTotal 是跨多次任务的会话累计，只累加已知的部分。
     lastTaskUsage: null,
     sessionTaskUsageTotal: usageSessionNew(),
+    // v2 Pass P155：用户原话"我希望环上显示的是累计而不是单次"，边界=本次对话累计（不是
+    // sessionTaskUsageTotal 那个跨对话的浏览器会话累计，也不是 lastTaskUsage 那个单次）。
+    // 跟 sessionTaskUsageTotal 用同一套结构/同一套累加函数（usageSessionNew/usageSessionAdd），
+    // 只是生命周期更短——随对话重置（见 chatResetConversation：新开对话/清理/取回归档对话
+    // 都会经过它），不随浏览器会话持续累加；切模型/关再开聊天窗都不碰它（跟另外两个累加器
+    // 同一条既有纪律，见 chatSetModel/chatOpen/chatClose 通读结论）。跟 lastTaskUsage/
+    // sessionTaskUsageTotal 一样纯内存、不落 localStorage——刷新页面清零是维持现状，不是本轮
+    // 新增的限制。
+    convTaskUsageTotal: usageSessionNew(),
     ringTimer: null,                // 打字时重画环的防抖句柄
     panel: '',                      // '' | 'ctx' | 'history'
     pendingCompact: null,           // 压缩的「先给预估、再确认」中间态
@@ -25890,12 +25937,17 @@ async function chatSend() {
         // v2 Pass P144："本次任务"（这一次 chatSend，跨可能的多轮工具调用）用量/花销——独立于
         // 上面那份"上一轮真实值"（C6 的校准逻辑专用，语义不能动），读 chatAgentRunLoop 挂在
         // meta.taskUsage 上的累加器。同时并入会话累计（只累加已知的部分，成本按币种分开）。
+        // v2 Pass P155：同一次 costResult 再并入 convTaskUsageTotal（本次对话累计，环上主显示
+        // 改的就是这个数字，见 chatRingHtml）——跟 sessionTaskUsageTotal 用同一套累加函数，
+        // 只算一次价格，不重复调用 usageComputeTaskCost。
         try {
             const c2 = chatModelChoice();
             ChatState.lastTaskUsage = (meta && meta.taskUsage) ? meta.taskUsage : null;
             if (!ChatState.sessionTaskUsageTotal) ChatState.sessionTaskUsageTotal = usageSessionNew();
-            usageSessionAdd(ChatState.sessionTaskUsageTotal, ChatState.lastTaskUsage,
-                usageComputeTaskCost(c2.provider, c2.model, ChatState.lastTaskUsage));
+            if (!ChatState.convTaskUsageTotal) ChatState.convTaskUsageTotal = usageSessionNew();
+            const costResult2 = usageComputeTaskCost(c2.provider, c2.model, ChatState.lastTaskUsage);
+            usageSessionAdd(ChatState.sessionTaskUsageTotal, ChatState.lastTaskUsage, costResult2);
+            usageSessionAdd(ChatState.convTaskUsageTotal, ChatState.lastTaskUsage, costResult2);
         } catch (e2b) { console.error('[chat] task usage record failed', e2b); }
         // 每轮落一次档（upsert 到同一条，不会越攒越多）。
         // 【为什么必须每轮存，而不是只在清理/切文档时存】那两个时机都要求用户**主动做点什么**。
@@ -28406,27 +28458,40 @@ function chatRingHtml(ro) {
     // v2 Pass P147：花销紧凑文本，紧跟在百分比（或没有百分比时的 "K tok"）右边，同一个
     // <span> 容器内——不是另开一个 DOM 节点。tooltip 拼接 usageTipText 的完整说明（含
     // P145 的"不含联网搜索按次计费"提醒）。
-    // 已完成任务的花销要钉在它**实际用的**模型上——taskUsage 自己就记着 provider/model
-    // （usageNewTask 造出来的时候就带上了），优先用它；只有 taskUsage 还没有（比如刚打开
-    // 聊天窗、一次请求都没发过）才回落到 chatModelChoice() 的当前选择，作为"预览这次会
-    // 用哪个模型的价格"。翻译器悬浮窗原来的 renderTaskUsageChip（已删除）就是这个钉死
-    // 逻辑（`u.provider || AppState.apiProvider`）——这里照搬同一条规则，不是新发明；
-    // 少了它，切换聊天模型下拉框会让上一轮已经花完的钱跟着新模型的单价重新算一遍，是错的
-    // （P144/test_p144 场景 7 那条回归测的就是这个，见 tools/e2e/test_p144_usage_cost.js）。
+    // v2 Pass P155：用户原话"我希望环上显示的是累计而不是单次"——环上主显示改成
+    // ChatState.convTaskUsageTotal（本次对话累计，见该字段定义处大注释），不再是
+    // ChatState.lastTaskUsage（本次任务/最近一次提问）。costProvider/costModel/u 三个变量
+    // 继续保留、继续喂给下面的 usageTipText——tooltip 里"单次花费"这条信息不能丢，只是不再
+    // 是环上显示的那个数字。已完成任务的花销要钉在它**实际用的**模型上——taskUsage 自己就
+    // 记着 provider/model（usageNewTask 造出来的时候就带上了），优先用它；只有 taskUsage
+    // 还没有（比如刚打开聊天窗、一次请求都没发过）才回落到 chatModelChoice() 的当前选择，
+    // 作为"预览这次会用哪个模型的价格"。少了这条钉死逻辑，切换聊天模型下拉框会让上一轮
+    // 已经花完的钱跟着新模型的单价重新算一遍，是错的（P144/test_p144 场景 7 的既有回归测的
+    // 就是这个，见 tools/e2e/test_p144_usage_cost.js；convTaskUsageTotal 是多任务累计，本身
+    // 已经在 usageSessionAdd 时按各自真实模型算好价、按币种分开累加，不存在这个问题，但
+    // "本次任务"这条线索继续保留供 tooltip 用）。
     const c = chatModelChoice();
     const u = ChatState.lastTaskUsage;
     const costProvider = (u && u.provider) || c.provider;
     const costModel = (u && u.model) || c.model;
-    const costText = usageCompactCostText(costProvider, costModel, u);
+    const convText = usageCompactCumulativeCostText(ChatState.convTaskUsageTotal);
     const searchOn = !!(ChatState.lastRequest && ChatState.lastRequest.webSearch);
     const costTip = usageTipText(costProvider, costModel, u, ChatState.sessionTaskUsageTotal, searchOn);
-    const fullTip = tip + ' ' + costTip;
+    // v2 Pass P155：额外补一句说明"环上这个数字到底是什么"——不改 usageTipText 本体（那份
+    // 文案有专门回归测试锁着具体措辞，见 test_p144_usage_cost.js），只在外面拼接追加，
+    // usageTipText 的返回值原样不动，"单次花费"+"本会话累计"两段既有信息都还在 costTip 里。
+    const convTaskCount = ChatState.convTaskUsageTotal ? ChatState.convTaskUsageTotal.tasks : 0;
+    const convTip = ' 本对话累计（环上显示的就是这个数字）：' + (ChatState.convTaskUsageTotal && ChatState.convTaskUsageTotal.hasUsage
+        ? convTaskCount + ' 次任务 · ' + chatFmtNum(ChatState.convTaskUsageTotal.totalTokens) + ' tok · ' + convText
+        : '暂无已知用量')
+        + '（新开对话 / 清理 / 取回归档对话会清零回 $—，切换模型不会，只在这个浏览器标签页当前会话内有效，刷新页面同样清零）。';
+    const fullTip = tip + ' ' + costTip + convTip;
     return '<button type="button" class="aichat-ringchip' + (ro.measured ? '' : ' is-est') + '" id="aiChatRingBtn"'
         + ' data-tip="' + escapeAttr(fullTip) + '" data-tip-pos="top-start">'
         + '<svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true">'
         + '<circle class="aichat-ring-track" cx="11" cy="11" r="8"></circle>'
         + (d ? '<path class="aichat-ring-arc" d="' + d + '"></path>' : '')
-        + '</svg><span>' + escapeHtml(label) + '<span class="aichat-ring-cost" id="aiChatRingCost">' + escapeHtml(costText) + '</span></span></button>';
+        + '</svg><span>' + escapeHtml(label) + '<span class="aichat-ring-cost" id="aiChatRingCost">' + escapeHtml(convText) + '</span></span></button>';
 }
 
 // 底部状态条：环 + 会话 + 「历史怎么裁的」那句老话。
@@ -28852,6 +28917,12 @@ function chatResetConversation() {
     // 状态条继续显示已经不属于当前对话的旧数字。sessionTaskUsageTotal（会话累计）不清，
     // 语义是"这个浏览器会话里花了多少"，不随单次对话清空重置。
     ChatState.lastTaskUsage = null;
+    // v2 Pass P155：环上主显示的"本次对话累计"——这里是唯一的清零点。三个调用点（下面
+    // chatClearConversation/chatArchiveOpen/chatSyncSession，穷举结论见任务报告）全部经过
+    // 这个共享函数，不需要各自记得清一次。取回归档对话那条路（chatArchiveOpen）没有把
+    // 归档当时的花费存下来（chatArchivePush 落盘字段里不含 usage/cost，见 P155 侦察），
+    // 取回后确实无从恢复原始花费，只能从 0 重新开始计——这是已知且已接受的限制。
+    ChatState.convTaskUsageTotal = usageSessionNew();
     ChatState.lastSent = null;
     ChatState.docSnapshot = null;
     ChatState.pendingCompact = null;
@@ -29909,6 +29980,11 @@ const OvlState = {
     booted: false,
     viewMode: 'split',       // 'split' | 'editor' | 'pdf'
     treeOpen: true,
+    // v2 Pass P155：文件树侧边栏宽度（px，"期望宽度"——窗口变窄时的视觉 clamp 不改这个值，
+    // 只改它渲染出来的 --ovl-tree-w，见 ovlTreeClampWidth/ovlTreeApplyWidth），跨刷新持久化
+    // 到 localStorage 'ovl.treeWidth'（风格对齐既有的 'ovl.treeOpen'，扁平 key，不塞进
+    // ovl.settings JSON blob）。默认值 188 跟改动前的硬编码默认一致。
+    treeWidth: 188,
     dirHandle: null,
     usingWebkitFallback: false,
     editorMode: 'code',      // 'code' | 'visual'
@@ -30059,6 +30135,9 @@ function ovlShellHtml() {
         +       '<div class="ovl-tree-outline-header" id="ovlOutlineToggle"><span id="ovlOutlineCaret">&#9656;</span> File outline</div>'
         +       '<div class="ovl-tree-outline-body" id="ovlOutlineBody"><div class="ovl-outline-empty">打开一个 .tex 文件后这里会列出章节大纲。</div></div>'
         +     '</div>'
+        // v2 Pass P155：文件树侧边栏拖拽调宽手柄——嵌在面板自己盒子的右边缘内侧（见 CSS
+        // .ovl-tree-splitter 注释），绑定在 ovlBindShell() 里（照抄 #ovlColSplitter 的绑定方式）。
+        +     '<div class="ovl-tree-splitter" id="ovlTreeSplitter" data-tip="拖拽调整文件树宽度" data-tip-pos="right" role="separator" aria-orientation="vertical"></div>'
         +   '</div>'
         +   '<div class="ovl-editor-panel" id="ovlEditorPanel">'
         // M2：脏点/保存状态由 ovlUpdateTabUI() / ovlFlashSaveStatus() 驱动，都是 CSS class + textContent
@@ -30589,12 +30668,147 @@ function ovlColSplitterBeginDrag(ev) {
 
 function ovlToggleTree() {
     try {
+        // v2 Pass P155：折叠之前先把进行中的树宽拖拽收尾——跟 ovlSetViewMode 里
+        // ovlColSplitterEndActive() 同一条纪律，防止拖到一半被折叠、监听器悬空。真实鼠标
+        // 交互下拖拽时手柄持有 pointer capture，几乎不可能同时点到折叠按钮，这里是防御性的。
+        try { ovlTreeSplitterEndActive(); } catch (e) {}
         OvlState.treeOpen = !OvlState.treeOpen;
         const body = document.getElementById('ovlBody');
         if (body) body.setAttribute('data-tree', OvlState.treeOpen ? 'open' : 'collapsed');
         try { localStorage.setItem('ovl.treeOpen', OvlState.treeOpen ? '1' : '0'); } catch (e) {}
     } catch (e) {
         console.error('[ovl] toggleTree failed', e);
+    }
+}
+
+// ==================== v2 Pass P155：文件树侧边栏拖拽调宽 ====================
+// 用户原话："我认为file tree的显示侧边栏可以用鼠标拖拉调整宽度"。结构照抄
+// ovlColSplitterBeginDrag（Pointer Events + setPointerCapture + rAF 合帧节流 + 只改一个 CSS
+// 自定义属性 + Math.max/min clamp），但文件树只有单栏（不是"两栏各占比例"），比它更简单：
+//   ① 改的是 --ovl-tree-w 这一个像素值，不是 --ovl-split-left-fr/right-fr 两个比例。
+//   ② 用户已拍板要跨刷新持久化（localStorage 'ovl.treeWidth'，风格对齐 'ovl.treeOpen'）——
+//      col-splitter 的比例故意不持久化，这里反过来故意要持久化，不能照搬"不存"这条。
+//   ③ 折叠态（OvlState.treeOpen===false）没有宽度可拖，手柄 CSS 已隐藏，这里再守一道。
+//   ④ 拖到极窄不自动折叠——只 clamp 到 OVL_TREE_MIN_W，折叠是用户自己点 #ovlTreeToggleBtn
+//      的独立动作，两件事不耦合（更可预测：拖拽的结果只由拖拽动作决定，不会因为松手位置
+//      不同而触发另一个不同类的状态变化）。
+const OVL_TREE_MIN_W = 140; // 文件树最小可用宽度——比 OVL_SPLIT_MIN_COL(260) 小，树不用像编辑器/PDF 那样宽
+const OVL_TREE_MAX_W = 480; // 树不该占掉大半个窗口的静态上限；窗口本身更窄时用下面的动态上限
+let OvlTreeSplitActiveEnd = null; // 跟 OvlSplitActiveEnd 同一纪律：拖拽中途被打断（折叠/等）前先收尾
+
+// 把任意原始宽度 clamp 到"当前真的能用"的范围：静态下限/上限之外，还要给内容列（编辑器/PDF）
+// 留出空间，用 #ovlBody 的真实宽度动态收紧上限——窗口变窄时不能允许树把内容列挤没。
+// 故意不跟 OVL_SPLIT_MIN_COL 共用同一个"给内容列留多少"的数字：那是"编辑器/PDF 单侧各自
+// 的最小宽度"，语义不同，硬绑在一起以后改一个会误伤另一个不相关的地方。
+function ovlTreeClampWidth(raw) {
+    let maxW = OVL_TREE_MAX_W;
+    try {
+        const body = document.getElementById('ovlBody');
+        if (body) {
+            const bw = body.getBoundingClientRect().width;
+            if (bw > 0) maxW = Math.min(OVL_TREE_MAX_W, Math.max(OVL_TREE_MIN_W, bw - 260));
+        }
+    } catch (e) {}
+    const n = (typeof raw === 'number' && isFinite(raw)) ? raw : OVL_TREE_MIN_W;
+    return Math.max(OVL_TREE_MIN_W, Math.min(maxW, n));
+}
+
+// 把 OvlState.treeWidth（"期望宽度"，拖拽落定/跨刷新读回来的那个值）应用成实际渲染宽度——
+// 经过 ovlTreeClampWidth 收紧后写进 --ovl-tree-w。**不**反过来改 OvlState.treeWidth 本身：
+// 窗口变窄时只是视觉上暂时收紧，窗口再变宽、或者下次拖拽起手时，"期望宽度"原样还在，不会
+// 因为中途有一次窄视口就被悄悄削低——这是任务书要求的"窗口变窄的 clamp"该有的行为：收缩是
+// 显示层面的暂时效果，不是用户又做了一次新的宽度选择。
+function ovlTreeApplyWidth() {
+    try {
+        const w = ovlTreeClampWidth(OvlState.treeWidth);
+        document.body.style.setProperty('--ovl-tree-w', w + 'px');
+    } catch (e) {
+        console.error('[ovl] tree apply width failed', e);
+    }
+}
+
+function ovlTreeSplitterEndActive() {
+    if (OvlTreeSplitActiveEnd) { try { OvlTreeSplitActiveEnd(); } catch (e) {} }
+}
+
+function ovlTreeSplitterBeginDrag(ev) {
+    try {
+        if (ev.button != null && ev.button !== 0) return; // 只认左键，跟 ovlColSplitterBeginDrag 同一条
+        if (!OvlState.treeOpen) return;                    // 折叠态手柄本来就 CSS 隐藏了，这里再守一道
+        const handle = ev.currentTarget || ev.target;
+        const treePanel = document.getElementById('ovlTreePanel');
+        if (!handle || !treePanel) return;
+        ev.preventDefault();
+
+        const startX = (typeof ev.clientX === 'number') ? ev.clientX : 0;
+        const startW = treePanel.getBoundingClientRect().width;
+        const pid = ev.pointerId;
+        let finished = false;
+
+        handle.classList.add('ovl-tree-splitter-active');
+        try { if (pid != null && handle.setPointerCapture) handle.setPointerCapture(pid); } catch (e) {}
+        try { document.body.setAttribute('data-ovl-splitdrag', '1'); } catch (e) {}
+
+        // rAF 合帧，跟 ovlColSplitterBeginDrag 的 schedule/flush 同一套——避免快拖时逐次同步
+        // 写 CSS 变量卡顿。
+        let pendingW = null;
+        let rafId = 0;
+        const raf = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame : null;
+        const caf = (typeof cancelAnimationFrame === 'function') ? cancelAnimationFrame : null;
+        function flush() {
+            rafId = 0;
+            if (pendingW == null) return;
+            OvlState.treeWidth = pendingW;
+            pendingW = null;
+            ovlTreeApplyWidth();
+        }
+        function schedule(w) {
+            pendingW = w;
+            if (!raf) { flush(); return; } // 没有 rAF 的环境（测试沙箱）退回同步
+            if (!rafId) rafId = raf(flush);
+        }
+
+        const thisEnd = function () { onUp(); };
+        OvlTreeSplitActiveEnd = thisEnd;
+
+        function onMove(e) {
+            try {
+                if (e.buttons === 0) { onUp(); return; } // 兜底 pointerup 丢失
+                const dx = (typeof e.clientX === 'number' ? e.clientX : startX) - startX;
+                schedule(ovlTreeClampWidth(startW + dx));
+            } catch (err) {
+                console.error('[ovl] tree splitter drag move failed', err);
+                onUp();
+            }
+        }
+
+        function onUp() {
+            if (finished) return; // 幂等哨兵
+            finished = true;
+            if (OvlTreeSplitActiveEnd === thisEnd) OvlTreeSplitActiveEnd = null;
+            try { document.removeEventListener('pointermove', onMove); } catch (e) {}
+            try { document.removeEventListener('pointerup', onUp); } catch (e) {}
+            try { document.removeEventListener('pointercancel', onUp); } catch (e) {}
+            try { window.removeEventListener('blur', onUp); } catch (e) {}
+            try { if (pid != null && handle.hasPointerCapture && handle.hasPointerCapture(pid)) handle.releasePointerCapture(pid); } catch (e) {}
+            try { document.body.removeAttribute('data-ovl-splitdrag'); } catch (e) {}
+            handle.classList.remove('ovl-tree-splitter-active');
+            try { if (rafId && caf) caf(rafId); } catch (e) {}
+            rafId = 0;
+            flush(); // 落盘前把攒着的那一帧写进去，快拖一下松手不能丢最后一帧
+            // 用户已拍板要持久化——跟 col-splitter（故意不存）反过来。
+            try { localStorage.setItem('ovl.treeWidth', String(OvlState.treeWidth)); } catch (e) {}
+            // v2 Polish 2（Bug 2）同一条纪律：宽度变化会改变软换行点，收尾必须防抖重算。
+            ovlScheduleLineOffsetRecompute(150);
+        }
+
+        document.addEventListener('pointermove', onMove);
+        document.addEventListener('pointerup', onUp);
+        document.addEventListener('pointercancel', onUp);
+        window.addEventListener('blur', onUp);
+    } catch (e) {
+        console.error('[ovl] tree splitter beginDrag failed', e);
+        try { document.body.removeAttribute('data-ovl-splitdrag'); } catch (e2) {}
     }
 }
 
@@ -50151,9 +50365,19 @@ function ovlBindShell() {
         const colSplitter = document.getElementById('ovlColSplitter');
         if (colSplitter) colSplitter.addEventListener('pointerdown', ovlColSplitterBeginDrag);
 
+        // v2 Pass P155：文件树侧边栏拖拽调宽手柄，绑定方式照抄上面 colSplitter 那一段。
+        const treeSplitter = document.getElementById('ovlTreeSplitter');
+        if (treeSplitter) treeSplitter.addEventListener('pointerdown', ovlTreeSplitterBeginDrag);
+
         // v2 Polish 2（Bug 2）：窗口 resize 会改变 #ovlCodeArea 的 clientWidth，软换行点跟着变，
         // 150ms 防抖到停手再重算（拖窗口整个过程可能连续触发几十次 resize，不能每次都重算）。
-        window.addEventListener('resize', function () { ovlScheduleLineOffsetRecompute(150); });
+        // v2 Pass P155：同一个入口顺带重新 clamp 一次文件树宽度——窗口变窄时 --ovl-tree-w
+        // 之前没有任何收缩逻辑，会把内容列挤没；ovlTreeApplyWidth() 只改视觉渲染值，不动
+        // OvlState.treeWidth 这个"期望宽度"本身（见该函数注释），窗口变宽后能原样恢复。
+        window.addEventListener('resize', function () {
+            ovlScheduleLineOffsetRecompute(150);
+            try { ovlTreeApplyWidth(); } catch (e) {}
+        });
 
         // 点菜单外部关闭菜单（捕获阶段挂一次，跟聊天窗的既有做法一样是全局单例监听）。
         document.addEventListener('click', function (e) {
@@ -57158,6 +57382,18 @@ function ovlBoot() {
         const body = document.getElementById('ovlBody');
         if (body) body.setAttribute('data-tree', 'collapsed');
     }
+
+    // v2 Pass P155：文件树侧边栏宽度——跟上面 ovl.treeOpen 同一条纪律（扁平 key，读回来直接
+    // 应用一次）。非法/越界值一律回退到 ovlTreeClampWidth 的收紧结果，不会把树渲染成 5px 宽
+    // 或 90000px 宽（脏 localStorage 值防御，跟 clampSettingsModalWidth 同一条思路）。
+    try {
+        const savedTreeWidth = localStorage.getItem('ovl.treeWidth');
+        if (savedTreeWidth != null) {
+            const n = parseInt(savedTreeWidth, 10);
+            if (Number.isFinite(n) && n > 0) OvlState.treeWidth = n;
+        }
+    } catch (e) {}
+    ovlTreeApplyWidth();
 
     // M9：主文档标记跨会话记一下就好，现在真的驱动编译了（M3 落地）：Recompile 默认拿这个当 mainFile。
     try {
