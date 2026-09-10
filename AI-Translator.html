@@ -4454,7 +4454,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.21.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.21.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-10';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -9662,6 +9662,25 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
             // 拿不到就退回估算，不拿字符数估一个冒充实测。
             meta.completionTokens = Number(data && data.usage && data.usage.completion_tokens) || 0;
             meta.totalTokens = Number(data && data.usage && data.usage.total_tokens) || 0;
+            // v2 Pass P149：Qwen(DashScope) 缓存命中 token。字段路径与 callOpenAIAPI（约 10433
+            // 行）一致——usage.prompt_tokens_details.cached_tokens，官方文档已核实隐式/显式缓存
+            // 共用同一个字段（https://help.aliyun.com/zh/model-studio/context-cache，原文："在
+            // usage.prompt_tokens_details.cached_tokens 可以查看命中缓存的 Token 数（该数值为
+            // usage.prompt_tokens 的一部分）"）。只在 isQwenReq 时解析并写 meta.cachedTokens——
+            // local（LM Studio）分支没有计价，不需要这个字段，逐字不受影响（this 分支之外
+            // meta.cachedTokens 保持 undefined，跟改动前完全一样）。
+            // 安全降级（高报不低报）：字段缺失 / null / 非 number / NaN / 负数 / 大于本次实测的
+            // promptTokens，一律当「无缓存命中」处理——写 0，不写 null，跟本函数其余 usage 字段
+            // 「缺失当 0」的既有惯例保持一致（usageAccum 对 0 和 null 处理结果相同，都不参与缓存
+            // 定价，这里选 0 只是为了跟上面三行同一种口径，不是语义要求）。绝不允许把一个损坏的
+            // 缓存数字算出负成本或负 token。
+            if (isQwenReq) {
+                const rawCachedTokens = data && data.usage && data.usage.prompt_tokens_details
+                    && data.usage.prompt_tokens_details.cached_tokens;
+                const cachedTokensValid = typeof rawCachedTokens === 'number' && isFinite(rawCachedTokens)
+                    && rawCachedTokens >= 0 && rawCachedTokens <= meta.promptTokens;
+                meta.cachedTokens = cachedTokensValid ? rawCachedTokens : 0;
+            }
         }
         // A3：被动探测。每一次真实响应都顺手判一次「这个模型在推理吗」，
         // 不额外花任何一次调用。判到了就把横幅弹出来（见 xportNoteThinking）。
