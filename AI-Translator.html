@@ -4454,7 +4454,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.21.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.21.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-10';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -4682,21 +4682,33 @@ const QWEN_PRICE_CNY = {
     'qwen3-max':     { in: 2.5,  out: 12,  tiered: true },
     'qwen3.7-max':   { in: 12,   out: 36 },
     // v2 Pass P144：已核实官方不分思考/非思考价，单一价、两档阶梯。来源模型专页
-    // https://help.aliyun.com/zh/model-studio/qwen3-7-plus（抓取 2026-09-09，CNY，元/百万tokens）。
-    // 缓存价：输入(缓存命中)=cacheRead，显式缓存创建=cacheWrite（国内站页面两者都有，逐档不同）。
+    // https://help.aliyun.com/zh/model-studio/qwen3-7-plus（CNY，元/百万tokens）。
+    // v2 Pass P148 修正：cacheRead 此前误存成官方「显式缓存命中」的数字（0.2/0.6），却挂着
+    // "输入(缓存命中)"的注释——字段名/注释/数值三者不自洽。判定依据：通读 callLocalLLM（Qwen
+    // 请求实际走的函数，见 body 拼装与 isQwenReq 判定）与 callOpenAIAPI 全部请求体拼装逻辑，
+    // 本 app 从未调用 DashScope 显式缓存创建 API（无 cache_id、无任何显式缓存相关请求头/字段），
+    // meta.cachedTokens 只从响应 usage.prompt_tokens_details.cached_tokens 读取——这是自动/
+    // 隐式前缀缓存命中时服务端主动回传的数字，不需要调用方预先建缓存对象。因此命中的必然是
+    // 「输入(缓存命中)」这一档，不是要求显式建缓存才能命中的「显式缓存命中」；否则会按低了
+    // 一半的单价算，实际花销被低报。已改存「输入(缓存命中)」官方数值 0.4/1.2（复核抓取
+    // 2026-09-10，同一模型专页，数字与 P142 报告§2.3 一致）。cacheWrite=2.5/7.5 对应「显式
+    // 缓存创建」，字段名/数值本身没错（官方页对应数字一致）——只是本 app 从不触发这条路径
+    // （usageComputeCostAmount 也只用 cacheRead 参与成本计算，cacheWrite 纯展示，不进金额），
+    // 留着仅供用户参考，未改动。同表其余条目（qwen-plus/qwen3-vl-plus/qwen-flash/qwen3-max 等）
+    // 均无 cacheRead/cacheWrite 字段，不存在同类注释/取值错档问题，已逐条核对，未发现其它错档。
     // 页面开篇声明"本文仅展示模型调用原价，不含限时优惠"。Batch 价官方页有但本 app 不发 Batch
     // 请求，按任务书优先级（tiers > 缓存价 > sourceUrl）不收录，字段留空不填。
     'qwen3.7-plus': {
         in: 2, out: 8, tiered: true,
-        cacheRead: 0.2, cacheWrite: 2.5,
+        cacheRead: 0.4, cacheWrite: 2.5,
         tiers: [
-            { upTo: 256000, in: 2, out: 8, cacheRead: 0.2, cacheWrite: 2.5 },
-            { upTo: null,   in: 6, out: 24, cacheRead: 0.6, cacheWrite: 7.5 }
+            { upTo: 256000, in: 2, out: 8, cacheRead: 0.4, cacheWrite: 2.5 },
+            { upTo: null,   in: 6, out: 24, cacheRead: 1.2, cacheWrite: 7.5 }
         ],
         tierBasis: 'perRequestInputTokens',
         sourceUrl: 'https://help.aliyun.com/zh/model-studio/qwen3-7-plus',
-        asOf: '2026-09-09',
-        note: '不分思考/非思考价（官方模型专页只有一个输出价，页面另有"最大输入长度（思考模式下）"是能力字段不是价格字段，不要混）'
+        asOf: '2026-09-10',
+        note: '不分思考/非思考价（官方模型专页只有一个输出价，页面另有"最大输入长度（思考模式下）"是能力字段不是价格字段，不要混）；cacheRead=「输入(缓存命中)」隐式缓存价（本 app 未创建显式缓存，v2 Pass P148 核实并修正），不是「显式缓存命中」'
     }
 };
 // v2 Pass P144：qwen3.7-plus 已核实（见上方两处 tiers 数据的 sourceUrl/asOf 与注释），
