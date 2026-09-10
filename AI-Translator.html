@@ -394,6 +394,31 @@ body.is-resizing-settings-modal * {
     transition-property: color, background-color, border-color, text-decoration-color, fill, stroke, opacity, box-shadow, transform, filter, -webkit-backdrop-filter, backdrop-filter;
 }
 
+/* ============= v2 Pass P151：分行对齐关闭时的「行内流」渲染 =============
+   返工 P150——P150 把关闭态整篇拼成一块 renderFormattedText，逐句功能（点击编辑/历史/
+   AI 工具栏/关注/高亮/颜色宏角标）全部失去锚点。P151 保留每个 pair 各自的 DOM 节点
+   （data-idx/data-side 原样在），只把「块级堆叠」改成「行内流式」。
+   .ovl-flow-para：段落容器（按 pair.brk 分组），里面装的是行内 .ovl-flow-pair span，
+   首尾相接流下去，不是一句一个盒子。
+   .ovl-flow-block：句对本身就是块级构造（列表/标题/表格/公式独占行……marked 判定的结果，
+   见 renderFlowPairInline）时的容器，跟 .ovl-flow-para 并列、不嵌套在里面——块级元素不能
+   是 <span> 的子节点，也不该被硬套成行内（那样列表/标题会渲染错）。
+   .ovl-flow-pair 是纯 <span>，不设 padding/border/background/外边距——这正是要消灭的
+   「一句一个带内边距的盒子」视觉；句与句之间的分隔靠 renderFlowPane 里插入的文本节点
+   （中英混排规则见 ovlFlowNeedsSpace），不靠 CSS 间距。
+   .ovl-flow-handle 默认 display:none（零布局占用，不影响相邻文本的自然换行），
+   只在 .ovl-flow-pair 被真实鼠标悬停 / 内部聚焦时切到 inline-flex——满足「未悬停不占
+   布局空间，悬停/选中时出现且可点」。 */
+.ovl-flow-para { margin: 0 0 1em 0; }
+.ovl-flow-para:last-child, .ovl-flow-block:last-child { margin-bottom: 0; }
+.ovl-flow-block { margin: 0 0 1em 0; }
+.ovl-flow-pair { display: inline; }
+.ovl-flow-pair.ovl-flow-block { display: block; }
+.ovl-flow-handle { display: none; vertical-align: middle; margin-left: 2px; }
+.ovl-flow-pair:hover > .ovl-flow-handle,
+.ovl-flow-pair:focus-within > .ovl-flow-handle { display: inline-flex; }
+.ovl-flow-warn { display: inline; color: #f59e0b; font-size: 11px; margin-right: 1px; cursor: default; }
+
 /* ============= 浮动 AI 对话窗（#aiChatRoot）=============
    为什么整块样式写死在这里，而不是像页面其它部分那样用 Tailwind 类：
    这个窗口的 DOM 是 JS 直接建到 <body> 上的，不经过 renderApp。Tailwind 是 CDN 版 JIT，
@@ -4454,7 +4479,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.22.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.23.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-10';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -6207,14 +6232,22 @@ function clearRenderedCrossHighlights() {
 }
 
 // 找到某一行「非编辑态」的正文容器；那一行正在编辑（是 textarea）时返回 null
+//
+// v2 Pass P151：分行对齐关闭时不再是 [data-align-content] 那套配对块 DOM，而是
+// [data-flow-content] 那套行内流 DOM（见 renderFlowPane/renderFlowPairInline）——两套选择器
+// 在任一时刻只有一套能命中，这里两个都问一遍即可，不需要按 AppState.bilingualAlignEnabled
+// 分支。行内流模式下 row 自身没有嵌套 .prose（那是面板级的，见 renderSourcePanel/
+// renderTargetPanel），句子正文包在 .ovl-flow-text 里，跟"关注"复选框/⚠ 角标是兄弟节点
+// 而不是父子——不这样区分的话，跨栏高亮/关注高亮的文本节点游走器会把"关注"两个字和
+// ⚠ 提示一起当成正文扫进去，画错位置。
 function findRenderedRowBody(idx, side) {
     try {
-        const pane = document.querySelector(`[data-align-content="${side}"]`);
+        const pane = document.querySelector(`[data-align-content="${side}"], [data-flow-content="${side}"]`);
         if (!pane) return null;
         const row = pane.querySelector(`[data-idx="${idx}"][data-side="${side}"]`);
         if (!row) return null;
         if (row.querySelector('textarea')) return null;   // 编辑态，归镜像层管
-        return row.querySelector('.prose') || row;
+        return row.querySelector('.prose') || row.querySelector('.ovl-flow-text') || row;
     } catch (e) {
         return null;
     }
@@ -19445,17 +19478,19 @@ function renderSourcePanel() {
                         </div>
                     </div>
                 ` : `
-                    <!-- P150：「分行对齐」关闭 = 不再分块。左栏是当前文档状态拼回的整篇连续文本
-                         （joinPairsAsDocument('src')——逐句改稿/颜色宏也跟着带回来，与「复制原文」
-                         按钮同一条已验证过的重建机制），保留原有段落/换行（pair.brk 记的空行边界），
-                         照样过 renderFormattedText 渲染成编译后的样子，不是裸源码。
+                    <!-- v2 Pass P151（返工 P150）：「分行对齐」关闭 = 不再是"一句一个配对块"，
+                         但也不是 P150 那样整篇拼成一块渲染——那样会把逐句点击编辑/历史/AI 工具栏/
+                         关注复选框/高亮/颜色宏角标全部废掉（无 data-idx 可挂）。这里改成"行内流"：
+                         每个 pair 仍然各自是一个真实 DOM 节点（data-idx/data-side 原样在），只是从
+                         块级 <div> 改成行内 <span>（renderFlowPairInline），按 pair.brk 分段流下去
+                         （renderFlowPane），锚点不丢，逐句功能照常可用，见那两个函数上方的注释。
                          data-flow-* 与 data-align-* 是两套完全独立的标记：任何按
                          [data-align-content]/[data-align-scroll] 查询的旧机制
                          （syncBilingualAlignment / bindPaneScrollSync / alignSyncKeepingScroll）
                          在这里查不到任何节点、按自身既有的 try/catch 或早退逻辑安全跳过，
                          不需要为「关闭态」额外改这几个函数。 -->
                     <div class="overflow-y-auto h-full custom-scrollbar p-4" data-flow-scroll="src" onclick="handleBlankAreaClick(event)">
-                        <div class="prose prose-slate prose-sm max-w-none text-slate-700 leading-relaxed pb-24" data-flow-content="src">${renderFormattedText(joinPairsAsDocument('src'))}</div>
+                        <div class="prose prose-slate prose-sm max-w-none text-slate-700 leading-relaxed pb-24" data-flow-content="src">${renderFlowPane('src', AppState.translationPairs)}</div>
                     </div>
                 `) : AppState.translationPairs.length > 0 && AppState.viewMode === 'original' ? `
                     <div class="w-full h-full p-10 overflow-y-auto custom-scrollbar">
@@ -19498,14 +19533,12 @@ function renderTargetPanel() {
                         ${AppState.translationPairs.map((pair, idx) => renderPairRow('tgt', pair, idx)).join('')}
                     </div>
                 ` : `
-                    <!-- P150：右栏同源栏一样不再分块。joinPairsAsDocument('tgt') 是「复制译文」
-                         按钮已经在用的同一条重建机制：按 pair.brk 记的段落边界把当前译文拼回整篇，
-                         没有 srcRaw 那样的「原始分隔」可用，所以段内句与句之间固定补单个 '\n'
-                         （见 joinPairsAsDocument 实现）——marked 默认 breaks:false，段内单个 '\n'
-                         渲染成软换行（=空格），和左栏那句原本就在同一行的效果视觉上一致，只有
-                         「段落」这一级的空行分隔是两栏都要对上的硬指标，这一级两栏共用同一份
-                         pair.brk 数组，天然一一对应。 -->
-                    <div class="prose prose-slate prose-sm max-w-none text-slate-700 leading-relaxed pb-24" data-flow-content="tgt">${renderFormattedText(joinPairsAsDocument('tgt'))}</div>
+                    <!-- v2 Pass P151（返工 P150）：右栏同源栏一样改成"行内流"，理由与实现见
+                         renderSourcePanel 对应分支上方的注释、以及 renderFlowPane/
+                         renderFlowPairInline 的定义。右栏没有 srcRaw 那样的"原始分隔"可用，
+                         段内句与句之间的空白由 ovlFlowNeedsSpace 按中英文边界判定，不是
+                         joinPairsAsDocument 那种整篇拼接。 -->
+                    <div class="prose prose-slate prose-sm max-w-none text-slate-700 leading-relaxed pb-24" data-flow-content="tgt">${renderFlowPane('tgt', AppState.translationPairs)}</div>
                 `}
             </div>
         </section>
@@ -19584,6 +19617,121 @@ function renderPairRow(side, pair, idx) {
             </div>
         `;
     }
+}
+
+// ============= v2 Pass P151：分行对齐关闭时的「行内流」渲染 =============
+// 返工 P150——P150 把关闭态整篇拼成一块 renderFormattedText 渲染，锚点（data-idx/data-side）
+// 全部消失，逐句点击编辑/历史/AI 工具栏/关注复选框/关注高亮/跨栏高亮/颜色宏角标全部失效。
+// 用户明确要求"尽可能保留大部分功能，仅分块功能可以选择关闭/打开"。这一组三个函数
+// （ovlFlowNeedsSpace / renderFlowPairInline / renderFlowPane）就是新的关闭态渲染路径：
+// 每个 pair 仍然各自是一个真实 DOM 节点，只是从 renderPairRow 那种块级 <div>（p-4、圆角、
+// 悬停背景——"一句一个盒子"的视觉来源）改成不带任何内边距/边框/背景的行内 <span>，段落
+// 结构仍由 pair.brk 驱动，首尾相接流下去。renderFormattedText 本身一个字节没改——这里只是
+// 换了它的外壳。
+
+// 中日韩字符判定：CJK 统一表意文字、CJK 标点、全角形式、平假名/片假名等常用区段。
+// 边界任意一侧是 CJK 字符就不插空格（中文句子之间原文本来就不留空格，硬插一个会在纯中文
+// 段落里凭空多出一道视觉缝隙）；两侧都不是 CJK（英文/数字/拉丁字符为主）才插一个空格
+// （否则相邻两句会在渲染出的连续文本里粘连成一个词，例如 "sentence one.sentence two"）。
+// 这是"中英混排时的分隔规则"里能不依赖原始分隔符、只看句子首尾字符就做出的最小闭环判断——
+// 不追求还原用户当初打字时敲的到底是空格还是无分隔，只保证"不粘连、不多余"这两条硬要求。
+const OVL_FLOW_CJK_RE = /[　-〿぀-ヿ㇀-㇯㈀-㋿㐀-䶿一-鿿豈-﫿＀-￯]/;
+function ovlFlowNeedsSpace(prevText, nextText) {
+    try {
+        const a = String(prevText == null ? '' : prevText).replace(/\s+$/, '');
+        const b = String(nextText == null ? '' : nextText).replace(/^\s+/, '');
+        if (!a || !b) return false;
+        const lastCh = a.charAt(a.length - 1);
+        const firstCh = b.charAt(0);
+        if (OVL_FLOW_CJK_RE.test(lastCh) || OVL_FLOW_CJK_RE.test(firstCh)) return false;
+        return true;
+    } catch (e) { return false; }
+}
+
+// 单个 pair 在"行内流"里的非编辑态渲染。返回 { html, isBlock }：
+//   isBlock=false：内容是行内安全的散文（renderFormattedText 对纯句子固定产出单个
+//     <p>…</p>——marked 的默认行为，这里把外层 <p> 拆掉，跟 ovlRenderTextColor 摘
+//     \textcolor 外壳用的是同一条已验证过的正则技巧，不是新造的启发式），包一层 <span>。
+//   isBlock=true：renderFormattedText 判成别的块类型（列表/标题/表格/公式独占行……不是单个
+//     <p> 包起来的），说明这句本身就是一个块级构造，不勉强塞进行内 <span>（块级元素不能是
+//     <span> 的子节点，也不该被拆碎成"看起来还是行内"——那样列表/标题会渲染错），改包一层
+//     <div>，跟相邻的行内段落容器并列而不是嵌套在里面（见 renderFlowPane）。
+// 两种情况都保留 data-idx/data-side（点击进编辑态、跨栏/关注高亮都靠它定位）、颜色宏丢失
+// ⚠ 角标（复用 xportRowDropsColorMacros，逐字同 renderPairRow）、「关注」复选框（复用
+// focusCheckboxHtml）——只是复选框包了一层 .ovl-flow-handle，默认 display:none，悬停/
+// 内部聚焦时才 inline-flex（CSS 见文件顶部 <style>），不像 renderPairRow 里那样绝对定位
+// 常驻：绝对定位挂在行内 <span> 上会被断行行为体切碎，改成"悬停才出现"更稳妥，也正好满足
+// 「常驻控件不占布局空间」的要求。正文本身包一层 .ovl-flow-text（不用 .prose——外层
+// data-flow-content 容器已经是 .prose，Tailwind Typography 的排版规则是后代选择器，中间隔
+// 几层普通元素不影响；这里用 .ovl-flow-text 只是给 findRenderedRowBody 一个能精确排除
+// 「关注」复选框/⚠ 角标文字的选择器，避免跨栏高亮/关注高亮的文本节点游走器把这两处也当成
+// 正文扫进去）。
+function renderFlowPairInline(side, pair, idx) {
+    const textValue = side === 'src' ? pair.src : pair.tgt;
+    const rendered = textValue ? renderFormattedText(textValue) : '';
+    const m = /^\s*<p>([\s\S]*)<\/p>\s*$/.exec(rendered);
+    const inner = m ? m[1] : rendered;
+    const isBlock = !!rendered && !m;
+    const rowLocked = AppState.isRegeneratingAll || AppState.isLoading;
+    const lockTip = escapeAttr(AppState.isRegeneratingAll
+        ? '整篇重新生成进行中，这几分钟里逐句编辑是关掉的：跑完会把整篇译文换成新的一版。'
+        : '整篇翻译进行中，这几分钟里逐句编辑是关掉的：翻完会把整篇译文换成新的一版。');
+    const warnBadge = (side === 'src' && xportRowDropsColorMacros(pair))
+        ? `<span class="ovl-flow-warn" data-tip="${escapeAttr('这一行的 \\textcolor 修订标记带不回来：你改过这一行的原文，改动压在了颜色宏上。复制原文 / 切到大输入框 / 重新生成时，这一行是不带宏的纯文本（其余行原样保留）。需要那几处标记就到「历史」里取回改动前的那一版。')}" data-tip-pos="top">⚠</span>`
+        : '';
+    // variant 用 'toolbar' 不用 'row'：'row' 变体自带 .focus-row-chip
+    // （position:absolute + opacity:0，设计给 renderPairRow 那种带 .group 类的块级行、
+    // 靠 Tailwind 的 .group:hover 直接子代选择器翻开），套进这里两层嵌套之后那条选择器
+    // 够不着（.ovl-flow-handle 不是 .group），而且 position:absolute 的子节点不占用
+    // 任何正常流尺寸，会让 .ovl-flow-handle 悬停后 display:inline-flex 却量出 0×0（实测
+    // 复现过）。'toolbar' 变体是普通流内的 .focus-chip（自带边框/背景，不绝对定位），
+    // 悬停显隐完全交给下面这层 .ovl-flow-handle 自己的 CSS（display:none ->
+    // :hover/:focus-within 时 inline-flex），两套机制不再打架。
+    const cbHtml = focusCheckboxHtml(idx, side, 'toolbar');
+    const handleWrap = cbHtml ? `<span class="ovl-flow-handle" onclick="event.stopPropagation();">${cbHtml}</span>` : '';
+    const outerTag = isBlock ? 'div' : 'span';
+    const innerTag = isBlock ? 'div' : 'span';
+    const cls = 'ovl-flow-pair' + (isBlock ? ' ovl-flow-block' : '') + (rowLocked ? ' cursor-not-allowed opacity-60' : ' cursor-pointer');
+    const html = `<${outerTag} class="${cls}" data-idx="${idx}" data-side="${side}" onclick="handleRowClick(${idx},'${side}')"${rowLocked ? ` data-tip="${lockTip}" data-tip-pos="top"` : ''}><${innerTag} class="ovl-flow-text">${inner}</${innerTag}>${warnBadge}${handleWrap}</${outerTag}>`;
+    return { html, isBlock };
+}
+
+// 整栏「行内流」渲染。段落结构仍由 pair.brk 驱动（P150 的段落边界推导直接复用这个既有
+// 语义，没有新增字段）：同一段内连续的非编辑态句对首尾相接摆进同一个 .ovl-flow-para；
+// 遇到块级句对（isBlock）先关掉当前段落容器，块级句对自己独立成 .ovl-flow-block，跟
+// .ovl-flow-para 并列，不嵌套在里面；正在编辑的那一句（AppState.activeIndex）整块复用
+// renderPairRow（block，带完整编辑框/历史控件/AI 工具栏）——这是"点击进编辑态"这条路唯一
+// 的入口，编辑期间这一句临时从行内流"跳出来"变成一个块，是预期效果，跟分行对齐开着时
+// 编辑同一句长得一模一样，AI 工具栏/历史撤销重做原样可用，不需要另写一套。
+function renderFlowPane(side, pairs) {
+    const list = Array.isArray(pairs) ? pairs : [];
+    let html = '';
+    let paraOpen = false;
+    let prevInlineText = null;
+    const closePara = () => { if (paraOpen) { html += '</div>'; paraOpen = false; prevInlineText = null; } };
+    const openPara = () => { if (!paraOpen) { html += '<div class="ovl-flow-para">'; paraOpen = true; prevInlineText = null; } };
+    for (let idx = 0; idx < list.length; idx++) {
+        const pair = list[idx] || {};
+        const textValue = side === 'src' ? pair.src : pair.tgt;
+        if (AppState.activeIndex === idx) {
+            closePara();
+            html += renderPairRow(side, pair, idx);
+        } else {
+            const r = renderFlowPairInline(side, pair, idx);
+            if (r.isBlock) {
+                closePara();
+                html += r.html;
+            } else {
+                openPara();
+                if (prevInlineText !== null && ovlFlowNeedsSpace(prevInlineText, textValue)) html += ' ';
+                html += r.html;
+                prevInlineText = textValue;
+            }
+        }
+        if (pair.brk === true) closePara();
+    }
+    closePara();
+    return html || '<div class="ovl-flow-para"></div>';
 }
 
 // ============= 历史控制按钮 =============
