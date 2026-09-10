@@ -4454,7 +4454,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.21.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.22.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-10';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -17598,18 +17598,31 @@ function renderAppCore(preserveScroll = true) {
     // 和放在最后一行对「什么时候真正跑」没有区别 —— 复核和重画状态条照旧发生在这一帧之后。
     try { focusNoteDocumentChanged(); } catch (e) {}
 
-    // 保存滚动位置。两栏是**联动**的（bindPaneScrollSync），逻辑上只有一个位置，
-    // 所以这里只存一个数。分开存两个数会在源栏那侧暂时没有滚动容器的那一轮出事：
+    // 保存滚动位置。两栏在「分行对齐」开着时是**联动**的（bindPaneScrollSync），逻辑上只有
+    // 一个位置，所以历来只存一个数。分开存两个数会在源栏那侧暂时没有滚动容器的那一轮出事：
     // viewMode 切到 'edit' 时源面板是一个 textarea，选择器选不到东西，存下来的是 0，
     // 切回 'preview' 又把这个 0 写回源栏，两栏当场差出一整页（实测 800px）；
     // syncBilingualAlignment 只管行高、从不碰 scrollTop，这个落差它救不回来。
     // 谁没有滚动容器就跟着另一边走，两边都没有才归零。
+    // 【P150】分行对齐关掉后两栏改成各自独立滚动（bindPaneScrollSync 直接不绑监听），
+    // 如果仍然只存一个数、两边都写回这同一个数，会让"独立滚动"在**每一次**渲染
+    // （不只是切开关那一下——showToast、自动存档定时器等任何状态变化都会触发 renderApp）
+    // 之后被强行拉回同一个位置，等于把独立滚动做成了只在两次渲染之间短暂成立的假象。
+    // 联动/独立是同一个布尔量（AppState.bilingualAlignEnabled）决定的，这里跟它保持一致：
+    // 开→仍按原逻辑存一个数；关→源栏、译栏分别存各自的位置，互不干扰。
     let savedScroll = 0;
+    let savedScrollSrc = 0, savedScrollTgt = 0;
+    const scrollLinked = AppState.bilingualAlignEnabled;
     if (preserveScroll) {
         const sourceContainer = document.querySelector('section:first-of-type .overflow-y-auto');
         const targetContainer = document.querySelector('section:last-of-type .overflow-y-auto');
-        if (sourceContainer) savedScroll = sourceContainer.scrollTop;
-        else if (targetContainer) savedScroll = targetContainer.scrollTop;
+        if (scrollLinked) {
+            if (sourceContainer) savedScroll = sourceContainer.scrollTop;
+            else if (targetContainer) savedScroll = targetContainer.scrollTop;
+        } else {
+            savedScrollSrc = sourceContainer ? sourceContainer.scrollTop : 0;
+            savedScrollTgt = targetContainer ? targetContainer.scrollTop : 0;
+        }
     }
 
     const root = document.getElementById('root');
@@ -17667,8 +17680,13 @@ function renderAppCore(preserveScroll = true) {
     if (preserveScroll) {
         const newSourceContainer = document.querySelector('section:first-of-type .overflow-y-auto');
         const newTargetContainer = document.querySelector('section:last-of-type .overflow-y-auto');
-        if (newSourceContainer) newSourceContainer.scrollTop = savedScroll;
-        if (newTargetContainer) newTargetContainer.scrollTop = savedScroll;
+        if (scrollLinked) {
+            if (newSourceContainer) newSourceContainer.scrollTop = savedScroll;
+            if (newTargetContainer) newTargetContainer.scrollTop = savedScroll;
+        } else {
+            if (newSourceContainer) newSourceContainer.scrollTop = savedScrollSrc;
+            if (newTargetContainer) newTargetContainer.scrollTop = savedScrollTgt;
+        }
     }
 
     // 渲染后调整弹窗位置
@@ -19409,7 +19427,7 @@ function renderSourcePanel() {
                             </button>
                         </div>
                         ${AppState.viewMode === 'preview' ? `
-                        <button id="bilingualAlignToggleBtn" onclick="setBilingualAlignEnabled(!AppState.bilingualAlignEnabled)" class="p-2 rounded-lg transition-colors ${AppState.bilingualAlignEnabled ? 'text-indigo-600 bg-indigo-50' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr('切换左右两栏的分行对齐。开：逐句配对、等高显示、滚动联动。关：两栏各自按自然高度排布、独立滚动（像 Google 翻译那样），渲染内容不受影响。')}" data-tip-pos="bottom-end">
+                        <button id="bilingualAlignToggleBtn" onclick="setBilingualAlignEnabled(!AppState.bilingualAlignEnabled)" class="p-2 rounded-lg transition-colors ${AppState.bilingualAlignEnabled ? 'text-indigo-600 bg-indigo-50' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr('切换左右两栏的分行对齐。开：逐句配对、等高显示、滚动联动。关：不再分块——两栏各自变成一整篇连续文本，保留原有段落/换行格式（像 Google 翻译那样贴一段出一段），公式等照常渲染，各自独立滚动。')}" data-tip-pos="bottom-end">
                             ${Icons.AlignRows}
                         </button>
                         ` : ''}
@@ -19417,7 +19435,7 @@ function renderSourcePanel() {
                 </div>
             </div>
             <div class="flex-grow flex flex-col overflow-hidden bg-slate-50/20">
-                ${AppState.translationPairs.length > 0 && AppState.viewMode === 'preview' ? `
+                ${AppState.translationPairs.length > 0 && AppState.viewMode === 'preview' ? (AppState.bilingualAlignEnabled ? `
                     <div class="overflow-y-auto h-full custom-scrollbar p-4" data-align-scroll="src" onclick="handleBlankAreaClick(event)">
                         <!-- 行距不再来自 space-y-2：改由 :root 上的 --pair-gap 统一驱动
                              （[data-align-content] > * + * { margin-top: var(--pair-gap) }），
@@ -19426,7 +19444,20 @@ function renderSourcePanel() {
                             ${AppState.translationPairs.map((pair, idx) => renderPairRow('src', pair, idx)).join('')}
                         </div>
                     </div>
-                ` : AppState.translationPairs.length > 0 && AppState.viewMode === 'original' ? `
+                ` : `
+                    <!-- P150：「分行对齐」关闭 = 不再分块。左栏是当前文档状态拼回的整篇连续文本
+                         （joinPairsAsDocument('src')——逐句改稿/颜色宏也跟着带回来，与「复制原文」
+                         按钮同一条已验证过的重建机制），保留原有段落/换行（pair.brk 记的空行边界），
+                         照样过 renderFormattedText 渲染成编译后的样子，不是裸源码。
+                         data-flow-* 与 data-align-* 是两套完全独立的标记：任何按
+                         [data-align-content]/[data-align-scroll] 查询的旧机制
+                         （syncBilingualAlignment / bindPaneScrollSync / alignSyncKeepingScroll）
+                         在这里查不到任何节点、按自身既有的 try/catch 或早退逻辑安全跳过，
+                         不需要为「关闭态」额外改这几个函数。 -->
+                    <div class="overflow-y-auto h-full custom-scrollbar p-4" data-flow-scroll="src" onclick="handleBlankAreaClick(event)">
+                        <div class="prose prose-slate prose-sm max-w-none text-slate-700 leading-relaxed pb-24" data-flow-content="src">${renderFormattedText(joinPairsAsDocument('src'))}</div>
+                    </div>
+                `) : AppState.translationPairs.length > 0 && AppState.viewMode === 'original' ? `
                     <div class="w-full h-full p-10 overflow-y-auto custom-scrollbar">
                         <div class="text-xs font-bold text-slate-400 uppercase tracking-wider mb-4 flex items-center gap-2">
                             ${Icons.History} 原始输入内容 (用于重新生成翻译)
@@ -19450,7 +19481,7 @@ function renderTargetPanel() {
                 <h3 class="text-xs font-black text-slate-400 uppercase tracking-[0.2em] whitespace-nowrap">Target Panel</h3>
                 <button onclick="copyTargetText()" class="p-2 text-slate-400 hover:text-indigo-600 transition-colors" data-tip="把右栏所有译文按顺序拼起来复制到剪贴板（不含原文）。" data-tip-pos="bottom-end">${Icons.Copy}</button>
             </div>
-            <div class="flex-grow p-4 overflow-y-auto custom-scrollbar bg-slate-50/20" data-align-scroll="tgt" onclick="handleBlankAreaClick(event)">
+            <div class="flex-grow p-4 overflow-y-auto custom-scrollbar bg-slate-50/20" ${AppState.bilingualAlignEnabled ? 'data-align-scroll="tgt"' : 'data-flow-scroll="tgt"'} onclick="handleBlankAreaClick(event)">
                 ${AppState.isLoading && AppState.translationPairs.length === 0 ? `
                     <div class="h-full flex flex-col items-center justify-center text-slate-400 animate-pulse">
                         <span class="text-indigo-300 mb-6">${Icons.LoaderLarge}</span>
@@ -19461,11 +19492,20 @@ function renderTargetPanel() {
                         <div class="p-8 bg-slate-100 rounded-full mb-6">${Icons.ZapBig}</div>
                         <p class="text-xl font-black uppercase tracking-widest">Awaiting Input</p>
                     </div>
-                ` : `
+                ` : AppState.bilingualAlignEnabled ? `
                     <!-- 行距同源栏：--pair-gap，见 renderSourcePanel 里的注释 -->
                     <div class="pb-24" data-align-content="tgt" onclick="handleBlankAreaClick(event)">
                         ${AppState.translationPairs.map((pair, idx) => renderPairRow('tgt', pair, idx)).join('')}
                     </div>
+                ` : `
+                    <!-- P150：右栏同源栏一样不再分块。joinPairsAsDocument('tgt') 是「复制译文」
+                         按钮已经在用的同一条重建机制：按 pair.brk 记的段落边界把当前译文拼回整篇，
+                         没有 srcRaw 那样的「原始分隔」可用，所以段内句与句之间固定补单个 '\n'
+                         （见 joinPairsAsDocument 实现）——marked 默认 breaks:false，段内单个 '\n'
+                         渲染成软换行（=空格），和左栏那句原本就在同一行的效果视觉上一致，只有
+                         「段落」这一级的空行分隔是两栏都要对上的硬指标，这一级两栏共用同一份
+                         pair.brk 数组，天然一一对应。 -->
+                    <div class="prose prose-slate prose-sm max-w-none text-slate-700 leading-relaxed pb-24" data-flow-content="tgt">${renderFormattedText(joinPairsAsDocument('tgt'))}</div>
                 `}
             </div>
         </section>
@@ -20096,28 +20136,24 @@ function setCrossHighlightEnabled(enabled) {
 }
 
 // ============= 分行对齐的开关 =============
-// 同样刻意**不**走 renderApp：按钮长在翻译器自己的工具栏上，整页重渲染没有
-// 「保住滚动位置」以外的额外收益，反而会打断用户正在编辑的那一行。
-// 直接调用 syncBilingualAlignment / bindPaneScrollSync 本身就够了——两个函数内部
-// 已经按 AppState.bilingualAlignEnabled 做早退/清理，这里调用等价于「立刻按新状态
-// 重新跑一遍」，开=马上补齐对齐+重新联动滚动，关=马上清掉 min-height+解绑联动，
-// 不需要刷新页面。
+// 【P150 改动，为什么不能再沿用旧的「不走 renderApp」做法】旧版（P141）关掉时两栏 DOM
+// 结构不变——只是清掉 min-height、解绑滚动联动——所以直接调 syncBilingualAlignment /
+// bindPaneScrollSync 原地打补丁就够了。P150 把「关闭」改成了完全不同的 DOM
+// （整篇连续文本 vs. 逐句配对块），两棵树没法原地互相打补丁，必须走 renderApp() 重建。
+// renderApp() 内部本来就无条件跑 syncBilingualAlignment() / bindPaneScrollSync()
+// （渲染路径见 renderAppCore），新 DOM 建好之后这两个函数自己会按新的
+// AppState.bilingualAlignEnabled 早退或正常绑定——不需要在这里重复调用一遍。
+// 按钮的高亮态也在模板里直接读 AppState.bilingualAlignEnabled（renderSourcePanel），
+// 重渲染后自然是新状态，不需要再手动切 class。
+// 「不需要刷新页面」= 不 location.reload()，renderApp() 本来就是这个应用所有状态变化
+// 的标准落地方式（setViewMode / setLanguage 等都是同一模式），不是新引入的重量级操作。
 function setBilingualAlignEnabled(enabled) {
     const on = !!enabled;
     AppState.bilingualAlignEnabled = on;
     try {
         localStorage.setItem('bilingualAlignEnabled', on ? '1' : '0');
     } catch (e) {}
-    syncBilingualAlignment();
-    bindPaneScrollSync();
-    try {
-        const btn = document.getElementById('bilingualAlignToggleBtn');
-        if (btn) {
-            btn.classList.toggle('text-indigo-600', on);
-            btn.classList.toggle('bg-indigo-50', on);
-            btn.classList.toggle('text-slate-400', !on);
-        }
-    } catch (e) {}
+    renderApp();
 }
 
 // 「显示」页里的「恢复默认宽度」按钮。resetSettingsModalWidth() 只改 DOM + 落盘、
