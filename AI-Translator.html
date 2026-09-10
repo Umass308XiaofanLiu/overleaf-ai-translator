@@ -4417,7 +4417,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.17.03';        // APP_VERSION_STAMP
+const APP_VERSION = '03.17.04';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-09';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -5029,6 +5029,12 @@ const AppState = {
     //   status: 'idle' 无 | 'pending' 请求在飞 | 'ok' 有可画的片段 | 'none' 查过了但一个都没逐字命中
     //   fragments: **已经逐字校验过、且在目标侧只出现一次**的片段；除此之外一律不进这里
     crossHighlight: { seq: 0, idx: null, fromSide: null, toSide: null, fragments: [], status: 'idle', via: '' },
+
+    // ---- 分行对齐（preview 视图里左右两栏是否逐句配对等高 + 滚动联动）----
+    // 开：现状——syncBilingualAlignment 给配对行写 min-height、bindPaneScrollSync 联动滚动。
+    // 关：两栏各自按自然高度流式排布、独立滚动（Google 翻译式），渲染内容本身不受影响。
+    // 默认开（= 现状）；持久化到 localStorage['bilingualAlignEnabled']。
+    bilingualAlignEnabled: true,
 
     // 模型可见性设置（键 = 模型 id，值 = 是否显示；键不存在时按 `!== false` 视为可见）
     // 初值由 DEFAULT_MODEL_CATALOG 派生，与原来手写的 9 个 true 完全等价
@@ -15657,6 +15663,7 @@ async function handleRegenerateTranslation(index) {
 // ============= SVG图标 (使用Lucide图标的SVG) =============
 const Icons = {
     Languages: `<svg xmlns="http://www.w3.org/2000/svg" width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m5 8 6 6"/><path d="m4 14 6-6 2-3"/><path d="M2 5h12"/><path d="M7 2h1"/><path d="m22 22-5-10-5 10"/><path d="M14 18h6"/></svg>`,
+    AlignRows: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="18" height="6" x="3" y="4" rx="1"/><rect width="18" height="6" x="3" y="14" rx="1"/></svg>`,
     ArrowRightLeft: `<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 3 4 4-4 4"/><path d="M20 7H4"/><path d="m8 21-4-4 4-4"/><path d="M4 17h16"/></svg>`,
     Copy: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>`,
     Trash2: `<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>`,
@@ -16151,6 +16158,22 @@ function scheduleAlignAfterFonts(depth) {
 }
 
 function syncBilingualAlignment() {
+    if (!AppState.bilingualAlignEnabled) {
+        // 关掉时不能只是 return：如果上一次（开着的时候）已经写过 min-height，
+        // 残留的内联样式会让两栏看起来还是等高对齐的，「关掉」形同没生效。
+        // 这里主动把两个容器的直接子节点清干净，并停掉可能还挂着的行高观察器，
+        // 让两栏回落到各自的自然高度、独立流动（Google 翻译式）。
+        try {
+            const srcBox = document.querySelector('[data-align-content="src"]');
+            const tgtBox = document.querySelector('[data-align-content="tgt"]');
+            if (srcBox) for (const el of srcBox.children) el.style.minHeight = '';
+            if (tgtBox) for (const el of tgtBox.children) el.style.minHeight = '';
+            if (alignRowObserver) alignRowObserver.disconnect();
+        } catch (e) {
+            console.warn('[align] 关闭分行对齐时清理残留样式失败：', e && e.message);
+        }
+        return;
+    }
     if (alignSyncApplying) return;
     alignSyncApplying = true;
     try {
@@ -16244,7 +16267,21 @@ function observeAlignRows(srcRows, tgtRows, n) {
 // 两栏滚动联动。注意：顶栏那个 AUTO SYNC 按钮跟滚动毫无关系（它是 isAutoTranslate，
 // 停止输入 1.5s 后自动触发一次翻译），所以这里必须自己把两栏绑在一起，
 // 否则用户一滚动，上面辛苦对齐的行立刻又错开。
+// 记录当前实际绑定的那一对监听器，专门给「分行对齐」开关用：renderApp 场景里节点每轮
+// 全新、旧监听器随旧节点一起被丢弃，不需要这个也不会泄漏；但开关是直接调用本函数
+// （不经过整页重渲染，DOM 节点还是同一批），不先解绑就会在同一节点上越叠越多监听器。
+let paneScrollSyncBound = null; // { a, b, handlerA, handlerB } | null
+
 function bindPaneScrollSync() {
+    if (paneScrollSyncBound) {
+        try {
+            paneScrollSyncBound.a.removeEventListener('scroll', paneScrollSyncBound.handlerA);
+            paneScrollSyncBound.b.removeEventListener('scroll', paneScrollSyncBound.handlerB);
+        } catch (e) {}
+        paneScrollSyncBound = null;
+    }
+    // 分行对齐关掉时两栏各自独立滚动——不绑联动，也不留任何监听器。
+    if (!AppState.bilingualAlignEnabled) return;
     try {
         const a = document.querySelector('[data-align-scroll="src"]');
         const b = document.querySelector('[data-align-scroll="tgt"]');
@@ -16258,9 +16295,11 @@ function bindPaneScrollSync() {
             if (Math.abs(to.scrollTop - from.scrollTop) < 0.5) return;
             to.scrollTop = from.scrollTop;
         };
-        // 每次 renderApp 都是全新节点，旧监听器随旧节点一起被丢弃，不会叠加
-        a.addEventListener('scroll', link(a, b), { passive: true });
-        b.addEventListener('scroll', link(b, a), { passive: true });
+        const handlerA = link(a, b);
+        const handlerB = link(b, a);
+        a.addEventListener('scroll', handlerA, { passive: true });
+        b.addEventListener('scroll', handlerB, { passive: true });
+        paneScrollSyncBound = { a, b, handlerA, handlerB };
     } catch (e) {
         console.warn('[align] 滚动联动绑定失败：', e && e.message);
     }
@@ -18851,6 +18890,11 @@ function renderSourcePanel() {
                                 ${Icons.History} Original
                             </button>
                         </div>
+                        ${AppState.viewMode === 'preview' ? `
+                        <button id="bilingualAlignToggleBtn" onclick="setBilingualAlignEnabled(!AppState.bilingualAlignEnabled)" class="p-2 rounded-lg transition-colors ${AppState.bilingualAlignEnabled ? 'text-indigo-600 bg-indigo-50' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr('切换左右两栏的分行对齐。开：逐句配对、等高显示、滚动联动。关：两栏各自按自然高度排布、独立滚动（像 Google 翻译那样），渲染内容不受影响。')}" data-tip-pos="bottom-end">
+                            ${Icons.AlignRows}
+                        </button>
+                        ` : ''}
                     ` : ''}
                 </div>
             </div>
@@ -19530,6 +19574,31 @@ function setCrossHighlightEnabled(enabled) {
     try {
         const label = document.getElementById('crossHighlightToggleRow');
         if (label) label.classList.toggle('bg-teal-50', on);
+    } catch (e) {}
+}
+
+// ============= 分行对齐的开关 =============
+// 同样刻意**不**走 renderApp：按钮长在翻译器自己的工具栏上，整页重渲染没有
+// 「保住滚动位置」以外的额外收益，反而会打断用户正在编辑的那一行。
+// 直接调用 syncBilingualAlignment / bindPaneScrollSync 本身就够了——两个函数内部
+// 已经按 AppState.bilingualAlignEnabled 做早退/清理，这里调用等价于「立刻按新状态
+// 重新跑一遍」，开=马上补齐对齐+重新联动滚动，关=马上清掉 min-height+解绑联动，
+// 不需要刷新页面。
+function setBilingualAlignEnabled(enabled) {
+    const on = !!enabled;
+    AppState.bilingualAlignEnabled = on;
+    try {
+        localStorage.setItem('bilingualAlignEnabled', on ? '1' : '0');
+    } catch (e) {}
+    syncBilingualAlignment();
+    bindPaneScrollSync();
+    try {
+        const btn = document.getElementById('bilingualAlignToggleBtn');
+        if (btn) {
+            btn.classList.toggle('text-indigo-600', on);
+            btn.classList.toggle('bg-indigo-50', on);
+            btn.classList.toggle('text-slate-400', !on);
+        }
     } catch (e) {}
 }
 
@@ -28375,6 +28444,12 @@ function loadSavedSettings() {
         const savedCrossHl = localStorage.getItem('crossHighlightEnabled');
         if (savedCrossHl !== null) {
             AppState.crossHighlightEnabled = savedCrossHl !== '0';
+        }
+
+        // 加载分行对齐开关。默认开（缺键 = 从没动过 = 开），只有显式存过 '0' 才算关。
+        const savedBilingualAlign = localStorage.getItem('bilingualAlignEnabled');
+        if (savedBilingualAlign !== null) {
+            AppState.bilingualAlignEnabled = savedBilingualAlign !== '0';
         }
 
         // 加载哨兵传输协议开关。默认开；只有显式存过 'false' 才回到旧的 JSON 协议。
