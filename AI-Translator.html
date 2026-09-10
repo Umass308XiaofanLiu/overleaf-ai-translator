@@ -4417,7 +4417,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.17.04';        // APP_VERSION_STAMP
+const APP_VERSION = '03.18.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-09';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -4531,11 +4531,27 @@ const QWEN_DEFAULT_CHAT_MODEL = 'qwen3.8-max';
 const QWEN_DEFAULT_VISION_MODEL = 'qwen3-vl-plus'; // 体现在 DEFAULT_MODEL_CATALOG 的 Qwen Vision 种子条目里
 
 // ============= 模型价格表（内置，非实时拉取）=============
-// 单位：美元 / 每 1,000,000 tokens，付费层 Standard 档（非 Batch/Flex/Priority），来自
-// ai.google.dev/gemini-api/docs/pricing。目前只有 gemini 桶有数据；openai / claude 先留空对象，
-// 以后补价格只需往对应桶里加条目，getModelPrice() / 两处渲染点都不用改。
+// 单位：美元 / 每 1,000,000 tokens，付费层 Standard 档（非 Batch/Flex/Priority）。四家桶
+// （gemini/openai/claude/qwen）v2 Pass P144 起均已补全种子目录里的型号（openai/claude 此前是
+// 空对象，见各桶开头的来源注释）；以后再补新模型只需往对应桶里加条目，getModelPrice() /
+// 两处渲染点都不用改。
 // 限时促销价**不写死**：promoUntil（含当日的最后一天）+ after（恢复价）是可求值的数据，
 // getModelPrice() 到期后会自动改用 after 的数字，避免 2027-01-01 起界面显示的价格只有真实账单一半。
+//
+// v2 Pass P144：单条记录字段扩展（向后兼容，旧字段 in/out/tiered/note/longContext/promoUntil/
+// after/deprecated 语义不变，读它们的既有代码不受影响）：
+//   tiers: [{ upTo, in, out, cacheRead?, cacheWrite? }]  —— 完整阶梯数组，upTo 是本档的
+//     input token 上限（用 tierBasis 声明的口径，最后一档 upTo:null 表示"以上全部"）。
+//     只有**确实拿到官方完整阶梯数据**的型号才有这个字段（目前只有 qwen3.7-plus 的 CNY/USD
+//     两条）；只知道最低档数字的老 tiered:true 型号**不**编出虚构的高档价格，仍然只有
+//     顶层 in/out（旧行为不变，UI 继续加"起"字）。
+//   tierBasis: 'perRequestInputTokens' —— 阶梯按单次请求的 input token 数落档（不是累计用量）。
+//   cacheRead / cacheWrite: 缓存读取价 / 缓存写入价，没有该字段=官方未列出，不当作 0。
+//   sourceUrl / asOf: 逐条来源 URL + 抓取日期，只在 P144 新增/复核的条目上补齐（openai 三条、
+//     claude 三条、qwen3.7-plus 两条）；P135 及更早的条目沿用原有的全局
+//     MODEL_PRICING_AS_OF / formatQwenPriceTitle 里硬编码日期，本轮不做批量回填。
+// 计价函数见本区块末尾 usageGetPriceTier() / usageComputeCostAmount()（P144 新增，按 tiers
+// 落档 + 缓存价单独计，不内置任何汇率换算）。
 const MODEL_PRICING_AS_OF = '2026-08-14';
 const MODEL_PRICING = {
     gemini: {
@@ -4550,8 +4566,29 @@ const MODEL_PRICING = {
         'gemini-2.5-flash':       { in: 0.30, out: 2.50,  note: '音频输入另计 $1.00 / 1M（文本翻译不受影响）' },
         'gemini-2.5-flash-lite':  { in: 0.10, out: 0.40,  note: '音频输入另计 $0.30 / 1M（文本翻译不受影响）' }
     },
-    openai: {},   // 预留：结构与 gemini 桶一致，届时直接加 { 'gpt-5.2': { in, out } } 即可
-    claude: {},   // 预留：同上
+    // v2 Pass P144：openai 桶补全（此前 100% 缺失）。来源 .claude/tmp/p142_pricing.md §2.1，
+    // 抓取 https://platform.openai.com/docs/pricing（301 到 developers.openai.com/api/docs/pricing），
+    // 抓取日期 2026-09-09，USD / 每 1M tokens，Standard 档（非 Batch/Priority/Flex）。
+    // cacheRead = 官方「缓存输入」价（命中提示缓存时按此价，未命中/无缓存字段时按 in 计，
+    // 见下方 usageComputeCostAmount）。未见按上下文分档的阶梯价、未见 reasoning token 独立
+    // 计费条目——outThinking 字段按任务书规则留空不填，不代猜。
+    openai: {
+        'gpt-5-nano': { in: 0.05, out: 0.40, cacheRead: 0.005, sourceUrl: 'https://developers.openai.com/api/docs/pricing', asOf: '2026-09-09', note: 'Standard 档；未见阶梯价、未见 reasoning token 独立计费条目' },
+        'gpt-5-mini': { in: 0.25, out: 2.00, cacheRead: 0.025, sourceUrl: 'https://developers.openai.com/api/docs/pricing', asOf: '2026-09-09', note: 'Standard 档；未见阶梯价、未见 reasoning token 独立计费条目' },
+        'gpt-5.2':    { in: 1.75, out: 14.00, cacheRead: 0.175, sourceUrl: 'https://developers.openai.com/api/docs/pricing', asOf: '2026-09-09', note: 'Standard 档；未见阶梯价、未见 reasoning token 独立计费条目' }
+    },
+    // v2 Pass P144：claude 桶补全（此前 100% 缺失）。来源 .claude/tmp/p142_pricing.md §2.2，
+    // 抓取 https://www.anthropic.com/pricing（301 到 claude.com/pricing），抓取日期 2026-09-09，
+    // USD / 每 1M tokens。cacheWrite = 5 分钟 TTL 缓存写入价，cacheRead = 缓存读取价（三档均满足
+    // cacheWrite=in×1.25、cacheRead=in×0.10 的官方公式，交叉印证）。另有 1 小时 TTL 缓存选项，
+    // 未取具体数字，不代猜。未见超过 200K 上下文的加价阶梯（页面原文：1M 上下文标准价）。
+    // ⚠️ 这三条只是**价格数据**，仍然拿不到 usage（callClaudeAPI 函数体是禁区，见任务书 C），
+    // 界面上这条链路一律显示「不支持用量统计」，不因为价格补齐了就去猜用量。
+    claude: {
+        'claude-haiku-4-5-20251001':  { in: 1.00, out: 5.00,  cacheWrite: 1.25, cacheRead: 0.10, sourceUrl: 'https://www.anthropic.com/pricing', asOf: '2026-09-09', note: '5 分钟 TTL 缓存写入价；另有 1 小时 TTL 缓存选项未取数字' },
+        'claude-sonnet-4-5-20250929': { in: 3.00, out: 15.00, cacheWrite: 3.75, cacheRead: 0.30, sourceUrl: 'https://www.anthropic.com/pricing', asOf: '2026-09-09', note: '5 分钟 TTL 缓存写入价；另有 1 小时 TTL 缓存选项未取数字' },
+        'claude-opus-4-5-20251101':   { in: 5.00, out: 25.00, cacheWrite: 6.25, cacheRead: 0.50, sourceUrl: 'https://www.anthropic.com/pricing', asOf: '2026-09-09', note: '5 分钟 TTL 缓存写入价；另有 1 小时 TTL 缓存选项未取数字' }
+    },
     // v2 Pass P135：国际站（USD，AppState.qwenBaseUrl 默认值）价格，数据源
     // .claude/tmp/p135_qwen_pricing.md ①/⑤节（抓取 2026-09-08，官方 alibabacloud.com/help/en/
     // model-studio/model-pricing）。tiered:true = 阶梯计价，这里存的是官方表里"最低档"（0-32K 或
@@ -4571,7 +4608,24 @@ const MODEL_PRICING = {
         'qwq-plus':      { in: 0.8,  out: 2.4,  note: '仅思考模式，无法关闭；全部输出按此价计费' },
         'qwen-flash':    { in: 0.05, out: 0.4,  tiered: true, note: '阶梯计价最低档（0-256K）；与 qwen3.8-flash 是不同模型（经典命名系列）' },
         'qwen3-max':     { in: 1.2,  out: 6,    tiered: true, note: '阶梯计价最低档（0-32K）' },
-        'qwen3.7-max':   { in: 2.5,  out: 7.5,  note: '无阶梯（比 qwen3.8-max 更贵，新一代反而降价，官方页数字如实记录）' }
+        'qwen3.7-max':   { in: 2.5,  out: 7.5,  note: '无阶梯（比 qwen3.8-max 更贵，新一代反而降价，官方页数字如实记录）' },
+        // v2 Pass P144：qwen3.7-plus 已从 QWEN_PRICE_PENDING_IDS 摘掉——P144 复核用模型专页
+        // （而非容易读串行的汇总大表）交叉核对两次，结论一致：官方**不分思考/非思考价**，
+        // 国际站总表结构上留了 non-thinking/thinking 两栏但对这一行数值恒等。来源
+        // https://www.alibabacloud.com/help/en/model-studio/model-pricing（抓取 2026-09-09，USD）。
+        // tiers 是完整两档（P142 §2.3 实测抓到的唯一一个有完整高档数据的阶梯模型），
+        // 按本次实际 input token 落档；国际站页面未列缓存价，cacheRead/cacheWrite 不填。
+        'qwen3.7-plus': {
+            in: 0.4, out: 1.6, tiered: true,
+            tiers: [
+                { upTo: 256000, in: 0.4, out: 1.6 },
+                { upTo: null,   in: 1.2, out: 4.8 }
+            ],
+            tierBasis: 'perRequestInputTokens',
+            sourceUrl: 'https://www.alibabacloud.com/help/en/model-studio/model-pricing',
+            asOf: '2026-09-09',
+            note: '不分思考/非思考价（国际站总表两栏数值恒等，与国内站模型专页只给一个输出价交叉印证）；官方页未列缓存价，未知不填'
+        }
     }
 };
 
@@ -4589,11 +4643,28 @@ const QWEN_PRICE_CNY = {
     'qwq-plus':      { in: 1.6,  out: 4 },
     'qwen-flash':    { in: 0.15, out: 1.5, tiered: true },
     'qwen3-max':     { in: 2.5,  out: 12,  tiered: true },
-    'qwen3.7-max':   { in: 12,   out: 36 }
+    'qwen3.7-max':   { in: 12,   out: 36 },
+    // v2 Pass P144：已核实官方不分思考/非思考价，单一价、两档阶梯。来源模型专页
+    // https://help.aliyun.com/zh/model-studio/qwen3-7-plus（抓取 2026-09-09，CNY，元/百万tokens）。
+    // 缓存价：输入(缓存命中)=cacheRead，显式缓存创建=cacheWrite（国内站页面两者都有，逐档不同）。
+    // 页面开篇声明"本文仅展示模型调用原价，不含限时优惠"。Batch 价官方页有但本 app 不发 Batch
+    // 请求，按任务书优先级（tiers > 缓存价 > sourceUrl）不收录，字段留空不填。
+    'qwen3.7-plus': {
+        in: 2, out: 8, tiered: true,
+        cacheRead: 0.2, cacheWrite: 2.5,
+        tiers: [
+            { upTo: 256000, in: 2, out: 8, cacheRead: 0.2, cacheWrite: 2.5 },
+            { upTo: null,   in: 6, out: 24, cacheRead: 0.6, cacheWrite: 7.5 }
+        ],
+        tierBasis: 'perRequestInputTokens',
+        sourceUrl: 'https://help.aliyun.com/zh/model-studio/qwen3-7-plus',
+        asOf: '2026-09-09',
+        note: '不分思考/非思考价（官方模型专页只有一个输出价，页面另有"最大输入长度（思考模式下）"是能力字段不是价格字段，不要混）'
+    }
 };
-// qwen3.7-plus：两次抓取对国内站表格「阶梯 × 思考/非思考 × 限时折扣」三维交叉的归属解读不一致
-// （p135_qwen_pricing.md 5.4 节原文逐字保留了两种读法），不代猜，UI 一律显示"待核实"。
-const QWEN_PRICE_PENDING_IDS = ['qwen3.7-plus'];
+// v2 Pass P144：qwen3.7-plus 已核实（见上方两处 tiers 数据的 sourceUrl/asOf 与注释），
+// 从待核实名单摘掉。若以后再发现别的模型两次抓取解读不一致，加回这个数组即可。
+const QWEN_PRICE_PENDING_IDS = [];
 
 // 前缀继承的**尾巴白名单**。规则：宁可少显示一个价，也绝不能显示一个错价。
 // 只有「同价变体」后缀才允许继承母模型价格 —— preview/exp/latest/thinking 这类标记、
@@ -4727,13 +4798,29 @@ function formatPriceCompact(price) {
 
 // 悬浮提示用的完整价格说明，含长上下文分档、备注、数据口径
 function formatPriceTitle(price) {
-    if (!price) return '价格未知（不在内置价格表中，多为 OpenAI/Claude 或尚未收录的新模型）';
+    if (!price) return '价格未知（不在内置价格表中，多为尚未收录的新模型）';
     let s = `美元 / 每 1,000,000 tokens：输入 ${formatPriceUsd(price.in)} / 输出 ${formatPriceUsd(price.out)}（付费层标准档，非 Batch/Flex/Priority）`;
     if (price.longContext) {
         s += `；prompt 超过 ${price.longContext.over / 1000}k tokens 时：输入 ${formatPriceUsd(price.longContext.in)} / 输出 ${formatPriceUsd(price.longContext.out)}（整个 prompt 按高档计价，非仅超出部分）`;
     }
+    // v2 Pass P144：完整阶梯数组存在时列出每一档（取代"只有最低档 + 起字"）；缓存价存在时一并说明。
+    if (Array.isArray(price.tiers) && price.tiers.length > 1) {
+        s += '；阶梯（按单次请求 input token 落档）：' + price.tiers.map(function (t) {
+            const range = t.upTo == null ? '超出上一档' : `≤${(t.upTo / 1000)}k`;
+            return `${range} 输入${formatPriceUsd(t.in)}/输出${formatPriceUsd(t.out)}`;
+        }).join('，');
+    }
+    if (typeof price.cacheRead === 'number' || typeof price.cacheWrite === 'number') {
+        const parts = [];
+        if (typeof price.cacheWrite === 'number') parts.push(`缓存写入${formatPriceUsd(price.cacheWrite)}`);
+        if (typeof price.cacheRead === 'number') parts.push(`缓存读取${formatPriceUsd(price.cacheRead)}`);
+        s += '；' + parts.join('、');
+    }
     if (price.note) s += `；${price.note}`;
-    s += `。价格为内置表（非 API 实时返回），截至 ${MODEL_PRICING_AS_OF}；推理/思考 token 按输出价计费，实际成本可能高于可见译文估算。`;
+    const asOf = price.asOf || MODEL_PRICING_AS_OF;
+    s += `。价格为内置表（非 API 实时返回），截至 ${asOf}`;
+    if (price.sourceUrl) s += `，官方页：${price.sourceUrl}`;
+    s += '；推理/思考 token 按输出价计费，实际成本可能高于可见译文估算。';
     return s;
 }
 
@@ -4798,10 +4885,221 @@ function formatQwenPriceTitle(id) {
     const sym = price.currency === 'CNY' ? '¥' : '$';
     const unit = price.currency === 'CNY' ? '人民币元' : '美元';
     let s = `${unit} / 每 1,000,000 tokens：输入 ${sym}${Number(price.in).toFixed(2)} / 输出 ${sym}${Number(price.out).toFixed(2)}`;
-    if (price.tiered) s += '（阶梯计价，以上为官方最低档，实际价格随单次请求输入长度升档，故标"起"）';
+    // v2 Pass P144：完整阶梯数组存在时（目前只有 qwen3.7-plus）列出每一档；否则维持旧文案。
+    if (Array.isArray(price.tiers) && price.tiers.length > 1) {
+        s += '；阶梯（按单次请求 input token 落档）：' + price.tiers.map(function (t) {
+            const range = t.upTo == null ? '超出上一档' : `≤${(t.upTo / 1000)}k`;
+            return `${range} 输入${sym}${Number(t.in).toFixed(2)}/输出${sym}${Number(t.out).toFixed(2)}`;
+        }).join('，');
+    } else if (price.tiered) {
+        s += '（阶梯计价，以上为官方最低档，实际价格随单次请求输入长度升档，故标"起"）';
+    }
+    if (typeof price.cacheRead === 'number' || typeof price.cacheWrite === 'number') {
+        const parts = [];
+        if (typeof price.cacheWrite === 'number') parts.push(`显式缓存创建${sym}${Number(price.cacheWrite).toFixed(2)}`);
+        if (typeof price.cacheRead === 'number') parts.push(`缓存命中${sym}${Number(price.cacheRead).toFixed(2)}`);
+        s += '；' + parts.join('、');
+    }
     if (price.note) s += `；${price.note}`;
-    s += `。参考价 · 抓取 2026-09-08 · 官方页：${QWEN_PRICE_OFFICIAL_URL[price.currency]}`
+    // v2 Pass P144：逐条 asOf/sourceUrl 存在时优先用（不再是两个格式化函数里硬编码的
+    // "抓取 2026-09-08" 字面量），没有的老条目原样落回全局 URL 表 + 旧硬编码日期。
+    const asOf = price.asOf || '2026-09-08';
+    const url = price.sourceUrl || QWEN_PRICE_OFFICIAL_URL[price.currency];
+    s += `。参考价 · 抓取 ${asOf} · 官方页：${url}`
         + '（官方页面声明仅展示模型调用原价、不含限时优惠，请以百炼/DashScope 控制台实时价格为准）';
+    return s;
+}
+
+// ============= v2 Pass P144：用量累加 + 按 usage 精确算花销 =============
+// 这一整块是 provider-agnostic 的（聊天栏、翻译器悬浮窗、翻译任务、对话任务共用同一套），
+// 不属于哨兵传输协议（xport* 前缀），也不是聊天窗专属（不用 chat* 前缀），所以用 usage*
+// 命名，跟上面两套价格表格式化函数（formatPriceTitle/formatQwenPriceTitle）互补：那两个只管
+// "这个模型标价多少"，这里管"这一次任务实测花了多少 token、算出多少钱"。
+//
+// 硬规则（任务书原话，代码里再重申一遍防止后来者破坏）：
+//   1) usage 字段缺失 / null / 只有一半 → 按"未知"处理，绝不当 0。「已知」的判据是
+//      promptTokens 与 completionTokens 两者都是合法 number；任一个不是，这一次调用整个
+//      不计入累加（不是计入一个 0）。
+//   2) 价格未知时格式化函数返回"价格未知"这个字符串，永远不返回 "$0.00" / "¥0.00"。
+//   3) 不内置任何 CNY↔USD 汇率——两种货币的花销分开累加、分开显示，绝不相加。
+//   4) claude 链路不在这里做任何"猜"的动作——callClaudeAPI 从不写 meta.promptTokens，
+//      taskUsage.hasUsage 对 claude 恒为 false，UI 层（usageDisplayFor）额外用 provider
+//      直接短路成"不支持用量统计"文案，不依赖 taskUsage 本身能不能测出这个区别。
+
+// ---- 任务级累加器：一次"任务"（一次翻译点击 / 一次聊天发送，可能对应多次真实 HTTP 调用）----
+function usageNewTask(provider, model) {
+    return {
+        provider: provider, model: model,
+        calls: 0, usageCalls: 0,               // calls=尝试次数（含失败重试）；usageCalls=其中取到用量的次数
+        promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0,
+        hasUsage: false
+    };
+}
+// 把一次真实调用的 meta（callLocalLLM/callOpenAIAPI/chatCallGemini 填好的那个对象）计入
+// taskUsage。meta.promptTokens/completionTokens 必须都是合法 number 才计入——这正是
+// "缺失/null/半份 → 不当 0" 的落地点，唯一一处判定，其余代码都只消费 taskUsage.hasUsage。
+function usageAccum(taskUsage, meta) {
+    if (!taskUsage || !meta) return;
+    taskUsage.calls++;
+    const p = meta.promptTokens, c = meta.completionTokens;
+    const pKnown = typeof p === 'number' && isFinite(p);
+    const cKnown = typeof c === 'number' && isFinite(c);
+    if (!pKnown || !cKnown) return;   // 半份/缺失：这一次调用不计入合计，不当 0
+    taskUsage.usageCalls++;
+    taskUsage.hasUsage = true;
+    taskUsage.promptTokens += p;
+    taskUsage.completionTokens += c;
+    const t = (typeof meta.totalTokens === 'number' && isFinite(meta.totalTokens)) ? meta.totalTokens : (p + c);
+    taskUsage.totalTokens += t;
+    const cached = (typeof meta.cachedTokens === 'number' && isFinite(meta.cachedTokens)) ? meta.cachedTokens : 0;
+    taskUsage.cachedTokens += cached;
+}
+// 单次调用的场景（比如 translateBulk 里不走哨兵协议的 openai/claude/local/qwen 旧路径）
+// 用这个包一层，跟批量累加共用同一套判定，不另写一份逻辑。
+function usageFromSingleMeta(provider, model, meta) {
+    const u = usageNewTask(provider, model);
+    usageAccum(u, meta);
+    return u;
+}
+
+// ---- 会话级累加：跨多次"任务"的运行总计（只累加已知的部分；成本按币种分开，不做汇率换算）----
+function usageSessionNew() {
+    return { tasks: 0, promptTokens: 0, completionTokens: 0, totalTokens: 0, cachedTokens: 0, hasUsage: false, costUsd: 0, costCny: 0 };
+}
+function usageSessionAdd(sessionTotal, taskUsage, costResult) {
+    if (!sessionTotal || !taskUsage || !taskUsage.hasUsage) return sessionTotal;
+    sessionTotal.tasks++;
+    sessionTotal.promptTokens += taskUsage.promptTokens;
+    sessionTotal.completionTokens += taskUsage.completionTokens;
+    sessionTotal.totalTokens += taskUsage.totalTokens;
+    sessionTotal.cachedTokens += taskUsage.cachedTokens;
+    sessionTotal.hasUsage = true;
+    if (costResult && costResult.usageKnown && costResult.priceKnown && typeof costResult.amount === 'number') {
+        if (costResult.currency === 'CNY') sessionTotal.costCny += costResult.amount;
+        else sessionTotal.costUsd += costResult.amount;
+    }
+    return sessionTotal;
+}
+
+// ---- 按 tiers 落档 + 算钱（货币无关：给的是哪种货币的 price，算出来的就是哪种货币的 amount）----
+// 没有 tiers 数组（老条目/只知道最低档）时退化成单一档，逐字等于改动前"只用 in/out"的行为。
+function usageGetPriceTier(price, inputTokens) {
+    if (!price) return null;
+    if (Array.isArray(price.tiers) && price.tiers.length) {
+        const n = Number(inputTokens);
+        for (let i = 0; i < price.tiers.length; i++) {
+            const t = price.tiers[i];
+            if (t.upTo == null || !isFinite(n) || n <= t.upTo) return t;
+        }
+        return price.tiers[price.tiers.length - 1];
+    }
+    return { upTo: null, in: price.in, out: price.out, cacheRead: price.cacheRead, cacheWrite: price.cacheWrite };
+}
+// usage 需要 promptTokens/completionTokens 两者皆为合法 number 才计算，否则返回 null（未知，
+// 调用方必须显示"用量未知"，不能当 0 处理）。缓存 token：tier 有 cacheRead 就按缓存价单独计
+// 那一部分，没有就按普通输入价计（任务书 E 的口径），并把是否真按缓存价计了带出去
+// （cachedPriced），供 tooltip 说明。
+function usageComputeCostAmount(price, usage) {
+    if (!price || !usage) return null;
+    const p = usage.promptTokens, c = usage.completionTokens;
+    if (typeof p !== 'number' || !isFinite(p) || typeof c !== 'number' || !isFinite(c)) return null;
+    const tier = usageGetPriceTier(price, p);
+    if (!tier || typeof tier.in !== 'number' || typeof tier.out !== 'number') return null;
+    const cached = (typeof usage.cachedTokens === 'number' && isFinite(usage.cachedTokens) && usage.cachedTokens > 0) ? usage.cachedTokens : 0;
+    const regularInput = Math.max(0, p - cached);
+    let amount = (regularInput / 1e6) * tier.in + (c / 1e6) * tier.out;
+    let cachedPriced = false;
+    if (cached > 0) {
+        const cacheRate = (typeof tier.cacheRead === 'number') ? tier.cacheRead : tier.in;
+        cachedPriced = typeof tier.cacheRead === 'number';
+        amount += (cached / 1e6) * cacheRate;
+    }
+    return { amount: amount, tier: tier, cachedPriced: cachedPriced };
+}
+// provider+model → 查价（qwen 走双币种 getQwenPrice，其余走通用 getModelPrice，USD）。
+// 不在这里判 claude——claude 在这里走的是"正常查价"分支（claude 桶已经有数字，用于聊天/
+// 翻译器下拉菜单显示"这个模型标价多少"），"这条链路不支持用量统计"是 usageDisplayFor
+// 单独短路的 UI 决策，不是价格查不到。
+function usageComputeTaskCost(provider, model, taskUsage) {
+    if (!taskUsage || !taskUsage.hasUsage) return { usageKnown: false, priceKnown: false, currency: null, amount: null };
+    let price, currency;
+    if (provider === 'qwen') {
+        price = getQwenPrice(model);
+        currency = price ? price.currency : (qwenIsDomesticEndpoint() ? 'CNY' : 'USD');
+    } else {
+        price = getModelPrice(model);
+        currency = 'USD';
+    }
+    if (!price) return { usageKnown: true, priceKnown: false, currency: currency, amount: null };
+    const r = usageComputeCostAmount(price, taskUsage);
+    if (!r) return { usageKnown: true, priceKnown: true, currency: currency, amount: null };
+    return { usageKnown: true, priceKnown: true, currency: currency, amount: r.amount, tier: r.tier, cachedPriced: r.cachedPriced };
+}
+
+// ---- 格式化：三条硬规则的落地点，价格/用量未知绝不显示成 0 ----
+function usageFormatCurrency(sym, amount) {
+    if (amount == null || typeof amount !== 'number' || !isFinite(amount)) return '价格未知';
+    if (amount <= 0) return sym + '0.00';                 // 真实算出来的 0（比如 0 token），不是"未知"
+    if (amount < 0.0001) return '<' + sym + '0.0001';      // 避免真实的小额费用被 toFixed 四舍五入成看起来像"未知被藏成 0"的 0.00
+    if (amount < 1) return sym + amount.toFixed(4);
+    return sym + amount.toFixed(2);
+}
+function usageFormatCostText(cost) {
+    if (!cost || !cost.usageKnown) return '用量未知';
+    if (!cost.priceKnown || cost.amount == null) return '价格未知';
+    const sym = cost.currency === 'CNY' ? '¥' : '$';
+    return usageFormatCurrency(sym, cost.amount);
+}
+function usageTokensText(u) {
+    const p = u.promptTokens || 0, c = u.completionTokens || 0;
+    const t = (typeof u.totalTokens === 'number' && u.totalTokens > 0) ? u.totalTokens : (p + c);
+    return '入' + chatFmtNum(p) + ' 出' + chatFmtNum(c) + ' 共' + chatFmtNum(t) + ' tok';
+}
+// 聊天栏 / 翻译器悬浮窗共用的顶层入口：claude 链路在这里短路成"不支持用量统计"，
+// 不管 taskUsage.hasUsage 是什么值——callClaudeAPI 是禁区，永远拿不到它的 usage，
+// 与其让用户以为"这次刚好是 0"，不如明说这条链路不支持。
+function usageDisplayFor(provider, model, taskUsage) {
+    if (provider === 'claude') {
+        return { unsupported: true, tokensText: '不支持用量统计', costText: '不支持用量统计' };
+    }
+    const known = !!(taskUsage && taskUsage.hasUsage);
+    const tokensText = known ? usageTokensText(taskUsage) : '用量未知';
+    const cost = usageComputeTaskCost(provider, model, taskUsage);
+    return { unsupported: false, tokensText: tokensText, costText: usageFormatCostText(cost), cost: cost };
+}
+// 完整 tooltip：本次任务的实测口径说明 + 本会话累计（任务书 D：主显示"本次任务"，
+// tooltip 里补"本会话累计"）。
+function usageTipText(provider, model, taskUsage, sessionTotal) {
+    if (provider === 'claude') {
+        return 'Claude 链路的用量字段（usage.input_tokens/output_tokens）需要改 callClaudeAPI 函数体才能解析，'
+            + '那是本项目的改动禁区——这条链路不解析用量，也就算不出花销，界面上如实标注"不支持用量统计"。';
+    }
+    const known = !!(taskUsage && taskUsage.hasUsage);
+    let s = '本次任务实测用量';
+    if (known) {
+        s += '：' + usageTokensText(taskUsage) + '（' + taskUsage.calls + ' 次调用，其中 ' + taskUsage.usageCalls + ' 次取到了用量；'
+            + '分批 + 自动重试 + 降级重试的每一次成功调用都计入这个合计，不是只取最后一次）';
+        if (taskUsage.cachedTokens > 0) {
+            s += '；其中缓存输入 ' + chatFmtNum(taskUsage.cachedTokens) + ' tok（有缓存价就按缓存价单独计这一部分，没有缓存价就按普通输入价计）';
+        }
+    } else {
+        s += '：未知（usage 字段缺失、为 null，或本次没有任何一次调用成功取到完整用量，不代表花了 0）。';
+    }
+    const cost = usageComputeTaskCost(provider, model, taskUsage);
+    if (known) {
+        if (!cost.priceKnown) s += ' 花销：价格未知（该模型不在内置价格表中，不代表免费）。';
+        else s += ' 花销：' + usageFormatCostText(cost) + '（阶梯计价按这次实际 input token 落档；不同币种不换算）。';
+    }
+    const sess = sessionTotal;
+    if (!sess || !sess.hasUsage) {
+        s += ' 本会话累计：暂无已知用量。';
+    } else {
+        const parts = [];
+        if (sess.costUsd > 0) parts.push(usageFormatCurrency('$', sess.costUsd));
+        if (sess.costCny > 0) parts.push(usageFormatCurrency('¥', sess.costCny));
+        s += ' 本会话累计：' + sess.tasks + ' 次任务 · ' + chatFmtNum(sess.totalTokens) + ' tok'
+            + (parts.length ? ' · ' + parts.join(' + ') : '（币种不同的花销分开算、不相加）');
+    }
     return s;
 }
 
@@ -4890,6 +5188,13 @@ const AppState = {
     isEditingMode: true,
     viewMode: 'edit',  // 'edit' | 'preview' | 'original'
     error: null,
+
+    // v2 Pass P144：本次翻译任务（含分批 + 自动重试 + 降级重试）实测用量累加器；null=还没有
+    // 任何一次任务产出过已知用量，或上一次任务失败（见 handleTranslate 开头的清空）。
+    // sessionTaskUsageTotal 是跨多次任务的会话累计，只累加已知的部分，成本按币种分开累加，
+    // 不做汇率换算（见 usageSessionNew/usageSessionAdd，定义在 MODEL_PRICING 区块）。
+    lastTaskUsage: null,
+    sessionTaskUsageTotal: usageSessionNew(),
 
     // API配置
     apiProvider: 'gemini', // 'gemini' | 'openai' | 'claude' | 'local' | 'qwen'
@@ -9941,7 +10246,10 @@ function getMaxTokensForModel(model, configMax) {
     return 4096;
 }
 
-async function callOpenAIAPI(model, messages, config = {}, apiKey = null, signal = null) {
+// v2 Pass P144：meta（第 6 个参数，可选、纯追加）——不传的既有调用点（8404/12027/12108/
+// 12235/12627/12754 一类辅助功能）逐字不受影响。传了就在成功响应后把 usage 三项 + 缓存/推理
+// token 写进去，供 usageAccum() 累加成"本次任务"的花销。
+async function callOpenAIAPI(model, messages, config = {}, apiKey = null, signal = null, meta = null) {
     if (!apiKey) {
         throw new Error("OpenAI API Key not configured. Please add your API key in Settings.");
     }
@@ -9988,7 +10296,25 @@ async function callOpenAIAPI(model, messages, config = {}, apiKey = null, signal
     // OpenAI 的响应形状与 LM Studio 的 OpenAI 兼容层同形，所以复用同一个读取口
     // （A2：「模型说了什么」全文件只判定一次）。取值与改动前逐字等价：
     // content 不是字符串时两边都得到 ""。
-    return readLocalChoice(data).text;
+    const choice = readLocalChoice(data);
+    if (meta) {
+        // usage 字段缺失/为 null/只有一半时，各字段落 null（不是 0）——usageAccum() 靠这个
+        // 区分"这次真测到 0 token"和"这次根本没测到"，绝不能把后者悄悄算成前者。
+        const u = (data && data.usage) || null;
+        meta.text = choice.text;
+        meta.finish = choice.finish;
+        meta.truncated = choice.truncated;
+        meta.reasoning = choice.reasoning;
+        meta.thinking = choice.thinking;
+        meta.promptTokens = (u && typeof u.prompt_tokens === 'number') ? u.prompt_tokens : null;
+        meta.completionTokens = (u && typeof u.completion_tokens === 'number') ? u.completion_tokens : null;
+        meta.totalTokens = (u && typeof u.total_tokens === 'number') ? u.total_tokens : null;
+        meta.cachedTokens = (u && u.prompt_tokens_details && typeof u.prompt_tokens_details.cached_tokens === 'number')
+            ? u.prompt_tokens_details.cached_tokens : null;
+        meta.reasoningTokens = (u && u.completion_tokens_details && typeof u.completion_tokens_details.reasoning_tokens === 'number')
+            ? u.completion_tokens_details.reasoning_tokens : choice.reasoningTokens;
+    }
+    return choice.text;
 }
 
 // ============= Claude API调用 =============
@@ -11534,7 +11860,10 @@ async function xportRequest(items, srcName, tgtName, config, signal, outMeta) {
 
 // 阶梯最后一级：退回**现行 JSON 协议**翻这一段。结果最差也就等于今天的已知行为，
 // 不可能更糟；而只要哨兵协议成功，这一级根本不会被触发。
-async function xportLegacyOne(seg, srcName, tgtName, config, signal) {
+// taskUsage（可选、纯追加，v2 Pass P144）：调用方想把这一级的用量并入"本次翻译任务"合计
+// 就传一个 usageNewTask() 累加器进来；不传的调用点（本文件里除 xportRecoverSegment 外没有
+// 别的调用点）逐字不受影响。
+async function xportLegacyOne(seg, srcName, tgtName, config, signal, taskUsage) {
     const systemPrompt = `You are a professional academic translator.
 1. Split input into logical sentences/segments.
 2. Translate ${srcName} to ${tgtName}.
@@ -11548,12 +11877,14 @@ async function xportLegacyOne(seg, srcName, tgtName, config, signal) {
         const meta = {};
         const r = await callLocalLLM(config.localBaseUrl, config.model,
             [{ role: 'system', content: systemPrompt }, { role: 'user', content: seg }], false, signal, meta);
+        if (taskUsage) usageAccum(taskUsage, meta);
         data = parseLocalJson(r, meta);
     } else if (config.provider === 'qwen') {
         // v2 Pass P134：同上一级，复用 callLocalLLM，换 baseUrl + 带 apiKey。
         const meta = {};
         const r = await callLocalLLM(config.qwenBaseUrl, config.model,
             [{ role: 'system', content: systemPrompt }, { role: 'user', content: seg }], false, signal, meta, { apiKey: config.qwenApiKey });
+        if (taskUsage) usageAccum(taskUsage, meta);
         data = parseLocalJson(r, meta);
     } else {
         const r = await callGeminiAPI(config.model, seg, {
@@ -11570,6 +11901,8 @@ async function xportLegacyOne(seg, srcName, tgtName, config, signal) {
                 required: ["translations"]
             }
         }, config.geminiApiKey, signal);
+        // callGeminiAPI（翻译专用）不解析 usage（见 translateBulk 的 Gemini Path 注释），
+        // 这里没有 meta 可累加——taskUsage 对这条分支保持不变，不是遗漏。
         data = JSON.parse(r || '{}');
     }
     const arr = (data && Array.isArray(data.translations)) ? data.translations : [];
@@ -11633,21 +11966,30 @@ function xportLegacyOk(body, map, rawSeg) {
 
 // 单段恢复阶梯。每一级都**改变了请求内容**——实测占位符丢失是确定性的，
 // 重发同样的请求 6/6 次丢同样的 token，所以「原样重试」被刻意排除在外。
-async function xportRecoverSegment(mm, rawSeg, wasBatched, srcName, tgtName, config, signal, spend) {
+// taskUsage（可选、纯追加，v2 Pass P144）：每一级只要真的发出了请求，不管这一级最终成功
+// 还是失败，用量都计入这个累加器——降级重试也是模型真花的钱，不能因为这一级没采用就不算。
+async function xportRecoverSegment(mm, rawSeg, wasBatched, srcName, tgtName, config, signal, spend, taskUsage) {
     // 级 1：从批次里单独拎出来重发（只有原来确实同批时才算「变了」）
     if (wasBatched && spend()) {
+        const meta1 = {};
         try {
-            const blocks = await xportRequest([mm], srcName, tgtName, config, signal);
+            const blocks = await xportRequest([mm], srcName, tgtName, config, signal, meta1);
+            if (taskUsage) usageAccum(taskUsage, meta1);
             const body = blocks[1];
             if (body != null && xportBlockOk(body, mm.map)) return { tgt: xportUnmask(body, mm.map), via: 'isolate' };
-        } catch (err) { if (err && err.name === 'AbortError') throw err; }
+        } catch (err) {
+            if (taskUsage) usageAccum(taskUsage, meta1);
+            if (err && err.name === 'AbortError') throw err;
+        }
     }
     // 级 2：把这一段再切开，降低单次请求的占位符密度、换掉边界
     const parts = xportSplitSegment(rawSeg);
     if (parts.length > 1 && spend()) {
+        const meta2 = {};
         try {
             const pm = parts.map(xportMask);
-            const blocks = await xportRequest(pm, srcName, tgtName, config, signal);
+            const blocks = await xportRequest(pm, srcName, tgtName, config, signal, meta2);
+            if (taskUsage) usageAccum(taskUsage, meta2);
             const pieces = [];
             let ok = true;
             for (let i = 0; i < pm.length; i++) {
@@ -11663,14 +12005,17 @@ async function xportRecoverSegment(mm, rawSeg, wasBatched, srcName, tgtName, con
             // 换成换行之后 `%` 只吃到它自己那个换行为止，下一块安然无恙；而 xportSplitSegment
             // 本来就是**按句/按行**切的，用换行拼回去比用空格更接近原文的排版。
             if (ok) return { tgt: pieces.join('\n'), via: 'split' };
-        } catch (err) { if (err && err.name === 'AbortError') throw err; }
+        } catch (err) {
+            if (taskUsage) usageAccum(taskUsage, meta2);
+            if (err && err.name === 'AbortError') throw err;
+        }
     }
     // 级 3：退回旧协议。**和前两级同一把尺子**：过不了 xportLegacyOk 就当这一级也失败，
     // 这一段回到调用方后是可见的失败标记 + failedCount + toast —— 交付一份查不过的内容
     // 并把它算成成功，正是这次要堵的那个洞。
     if (spend()) {
         try {
-            const legacy = await xportLegacyOne(rawSeg, srcName, tgtName, config, signal);
+            const legacy = await xportLegacyOne(rawSeg, srcName, tgtName, config, signal, taskUsage);
             if (legacy && xportLegacyOk(legacy, mm.map, rawSeg)) return { tgt: legacy, via: 'legacy' };
         } catch (err) { if (err && err.name === 'AbortError') throw err; }
     }
@@ -11773,6 +12118,11 @@ async function translateViaSentinel(text, srcLang, tgtLang, config, signal) {
     let firstErr = null;
     let budget = limits.recovery;
     const spend = function () { if (budget <= 0) return false; budget--; return true; };
+    // v2 Pass P144："本次翻译任务"的用量累加器——分批 + 每一级恢复阶梯（isolate/split/legacy）
+    // 只要真的发出过请求，不管这一次是成功还是失败，都计入这里（详见 xportRecoverSegment /
+    // xportLegacyOne 里的 usageAccum 调用点）。挂在返回值的 .usage 上，不修改函数返回形状里
+    // 已有的任何字段。
+    const taskUsage = usageNewTask(config.provider, config.model);
 
     for (let b = 0; b < batches.length; b++) {
         if (signal && signal.aborted) throw new DOMException('Aborted', 'AbortError');
@@ -11782,9 +12132,10 @@ async function translateViaSentinel(text, srcLang, tgtLang, config, signal) {
         try {
             blocks = await xportRequest(batch.map(i => masked[i]), srcName, tgtName, config, signal, bmeta);
         } catch (err) {
-            if (err && err.name === 'AbortError') throw err;
+            if (err && err.name === 'AbortError') { usageAccum(taskUsage, bmeta); throw err; }
             firstErr = firstErr || err;
         }
+        usageAccum(taskUsage, bmeta);
         const failed = [];
         for (let j = 0; j < batch.length; j++) {
             const si = batch[j];
@@ -11814,7 +12165,7 @@ async function translateViaSentinel(text, srcLang, tgtLang, config, signal) {
             if (budget <= 0) break;
             const si = failed[f];
             const r = await xportRecoverSegment(masked[si], segs[si], batch.length > 1,
-                srcName, tgtName, config, signal, spend);
+                srcName, tgtName, config, signal, spend, taskUsage);
             if (r) { tgts[si] = r.tgt; via[si] = r.via; }
         }
     }
@@ -11846,7 +12197,7 @@ async function translateViaSentinel(text, srcLang, tgtLang, config, signal) {
         // 靠它把整篇拼回去，不然全篇分段会在导出时被抹平。
         translations.push({ src: segs[i], tgt: tgts[i] === null ? XPORT_FAIL_MARK : tgts[i], brk: brks[i] === true });
     }
-    return { translations: translations, transport: 'sentinel', failedCount: failedCount, viaCount: viaCount, viaRows: via };
+    return { translations: translations, transport: 'sentinel', failedCount: failedCount, viaCount: viaCount, viaRows: via, usage: taskUsage };
 }
 
 // ============= 批量翻译 =============
@@ -11889,7 +12240,9 @@ async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
             signal,
             meta
         );
-        return parseLocalJson(response, meta);
+        const result = parseLocalJson(response, meta);
+        if (result && typeof result === 'object') result.usage = usageFromSingleMeta('local', config.model, meta);
+        return result;
     }
 
     // v2 Pass P134：Qwen 复用同一条 callLocalLLM 传输（旧版 JSON 协议兜底路径，
@@ -11908,11 +12261,15 @@ async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
             meta,
             { apiKey: config.qwenApiKey }
         );
-        return parseLocalJson(response, meta);
+        const result = parseLocalJson(response, meta);
+        if (result && typeof result === 'object') result.usage = usageFromSingleMeta('qwen', config.model, meta);
+        return result;
     }
 
     // OpenAI Path
     if (config.provider === 'openai') {
+        // v2 Pass P144：meta 走新增的第 6 个形参，attach 到返回对象上供翻译器悬浮窗读取。
+        const meta = {};
         const response = await callOpenAIAPI(
             config.model,
             [
@@ -11921,13 +12278,17 @@ async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
             ],
             { jsonMode: true },
             config.openaiApiKey,
-            signal
+            signal,
+            meta
         );
         if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-        return parseJsonResponse(response);
+        const result = parseJsonResponse(response);
+        if (result && typeof result === 'object') result.usage = usageFromSingleMeta('openai', config.model, meta);
+        return result;
     }
 
-    // Claude Path
+    // Claude Path —— callClaudeAPI 函数体是改动禁区，从不填 meta；usage 恒为「未知」，
+    // 界面层（usageDisplayFor）靠 provider==='claude' 短路成「不支持用量统计」，这里不用猜。
     if (config.provider === 'claude') {
         const response = await callClaudeAPI(
             config.model,
@@ -11941,10 +12302,14 @@ async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
             config.claudeProxyUrl
         );
         if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-        return parseJsonResponse(response);
+        const result = parseJsonResponse(response);
+        if (result && typeof result === 'object') result.usage = usageNewTask('claude', config.model);
+        return result;
     }
 
-    // Gemini Path
+    // Gemini Path —— 本函数用的是翻译专用 callGeminiAPI（不是聊天专用 chatCallGemini），
+    // 该函数不解析 usage（任务书 C 只要求补 chatCallGemini 的输出侧，未要求扩到这条翻译链路），
+    // 所以这里的 usage 恒为「未知」，不是遗漏。
     const responseSchema = {
         type: "OBJECT",
         properties: {
@@ -11970,7 +12335,9 @@ async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
     }, config.geminiApiKey, signal);
 
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
-    return JSON.parse(response || "{}");
+    const result = JSON.parse(response || "{}");
+    if (result && typeof result === 'object') result.usage = usageNewTask('gemini', config.model);
+    return result;
 }
 
 // ============= 句子精炼 =============
@@ -12880,6 +13247,9 @@ async function handleTranslate(opts) {
     }
 
     setState({ isLoading: true, error: null });
+    // v2 Pass P144：先清掉上一次任务的用量/花销，避免这一次真的失败（走到下面 catch）时
+    // 翻译器悬浮窗还挂着上一份任务的数字，让人误以为是这一次算出来的。
+    AppState.lastTaskUsage = null;
 
     // 初始化AbortController
     const controller = new AbortController();
@@ -12960,6 +13330,14 @@ async function handleTranslate(opts) {
                 translationPairs: pairs, isEditingMode: false, viewMode: 'preview', isLoading: false,
                 lastTransportFailures: Number(result.failedCount) || 0
             });
+            // v2 Pass P144："本次翻译任务"用量/花销——sentinel 路径挂在 translateViaSentinel
+            // 的返回值上，旧协议路径（openai/claude/gemini/未走 sentinel 的 local/qwen）挂在
+            // translateBulk 各分支上，这里统一只读 result.usage 一个字段。同时并入会话累计
+            // （只累加已知的部分，成本按币种分开，见 usageSessionAdd 定义处）。
+            AppState.lastTaskUsage = (result && result.usage) ? result.usage : null;
+            if (!AppState.sessionTaskUsageTotal) AppState.sessionTaskUsageTotal = usageSessionNew();
+            usageSessionAdd(AppState.sessionTaskUsageTotal, AppState.lastTaskUsage,
+                usageComputeTaskCost(config.provider, config.model, AppState.lastTaskUsage));
             AppState.srcEditedSinceTranslate = false;
             // 仅在成功后同步基线：失败时保持旧基线，TRANSLATE 才能重试
             AppState.lastTranslatedText = sentText;
@@ -18301,7 +18679,7 @@ ${renderSettingsTabBar(activeTab)}
                         <p class="text-[9px] text-slate-400 mt-2 leading-relaxed">
                             价格口径：<b>美元（USD）／每 1,000,000 tokens</b>，付费层<b>标准档</b>（非 Batch / Flex / Priority）；「入」= 输入价，「出」= 输出价；
                             带 <b>*</b> 的是厂商限时促销价（到期后本表会自动改显恢复价）。多数模型另有速率受限的<b>免费额度</b>，显示价并不等于一定会产生账单。
-                            价格为内置表（非 API 实时返回），截至 ${escapeHtml(MODEL_PRICING_AS_OF)}，目前收录 Gemini + Qwen（OpenAI / Claude 待补）。
+                            价格为内置表（非 API 实时返回），截至 ${escapeHtml(MODEL_PRICING_AS_OF)}（OpenAI / Claude 条目各自标注了更新的抓取日期）。
                             Qwen 单独按国内站(¥)/国际站($) 双币种显示，阶梯计价模型标"起"，部分数字待官方复核的显示"待核实"——悬停可看抓取日期与官方参考链接。
                             推理/思考 token 按输出价计费、部分模型 prompt 超过 200k tokens 会跳到更高档位——悬停价格可看完整说明。
                         </p>
@@ -18525,6 +18903,25 @@ function renderSynonymPopup() {
     return '';
 }
 
+// v2 Pass P144："本次翻译任务"（含分批 + 自动重试 + 降级重试）token 用量 + 按内置价格表算出
+// 的花销，挂在 AI 翻译器悬浮窗（P141 加「分行对齐」的那个工具栏所在窗口，就是这个 v1
+// #root 界面）顶栏的操作区，紧挨着 TRANSLATE 按钮。三条硬规则同聊天栏那颗 chip
+// （见 usageDisplayFor/usageFormatCurrency 定义处）：usage 未知显示"用量未知"、价格未知显示
+// "价格未知"、claude 链路显示"不支持用量统计"，绝不渲染成 $0.00。
+function renderTaskUsageChip() {
+    const u = AppState.lastTaskUsage;
+    const provider = (u && u.provider) || AppState.apiProvider;
+    const model = (u && u.model) || AppState.selectedModel;
+    const d = usageDisplayFor(provider, model, u);
+    const tip = usageTipText(provider, model, u, AppState.sessionTaskUsageTotal);
+    const label = d.unsupported ? d.tokensText : (d.tokensText + ' · ' + d.costText);
+    return `
+        <div id="ovlTaskUsageChip" class="flex items-center px-3 py-2 rounded-2xl border border-slate-200 bg-slate-50 text-[10px] font-bold text-slate-500 whitespace-nowrap${d.unsupported ? ' opacity-70' : ''}" data-tip="${escapeAttr(tip)}" data-tip-pos="bottom-end">
+            ${escapeHtml(label)}
+        </div>
+    `;
+}
+
 // ============= 头部 =============
 function renderHeader() {
     return `
@@ -18556,6 +18953,7 @@ function renderHeader() {
                 <button type="button" id="chatToggleBtn" onclick="chatToggle()" aria-pressed="${ChatState.open ? 'true' : 'false'}" class="${ChatState.open ? 'is-chat-open ' : ''}p-2.5 rounded-2xl border border-slate-200 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-all active:scale-95 flex items-center justify-center" data-tip="打开／关闭 AI 对话窗。" data-tip-pos="bottom-start">
                     ${Icons.MessageSquare}
                 </button>
+                ${renderTaskUsageChip()}
                 <!-- id 是给 syncTranslateButtonState() 用的：handleInputChange 刻意不重渲染
                      （避免焦点丢失），所以这颗按钮的 disabled 必须由那边直接改到 DOM 上，
                      否则它会一直停在「输入框还是空的」那一刻算出来的值上。 -->
@@ -20195,6 +20593,11 @@ const ChatState = {
     usage: null,                    // { promptTokens, parts, sum, overhead, templateOverhead, calibK, model, sig, at }
     lastSent: null,                 // 发出去那一刻的分项估算，等响应回来后和实测对账
     calib: null,                    // { model, k, at } 每模型的估算校准倍率（只影响估算显示）
+    // v2 Pass P144："本次任务"（一次 chatSend，跨可能的多轮工具调用）用量累加器——与上面的
+    // usage/calib（C6 的"上一轮真实值"校准逻辑）是两回事，见 chatAgentRunLoop/chatSend 里的
+    // usageAccum() 调用点。sessionTaskUsageTotal 是跨多次任务的会话累计，只累加已知的部分。
+    lastTaskUsage: null,
+    sessionTaskUsageTotal: usageSessionNew(),
     ringTimer: null,                // 打字时重画环的防抖句柄
     panel: '',                      // '' | 'ctx' | 'history'
     pendingCompact: null,           // 压缩的「先给预估、再确认」中间态
@@ -21150,6 +21553,12 @@ async function chatCallGemini(config, messages, systemPrompt, signal, meta, req)
         meta.truncated = meta.finish === 'MAX_TOKENS';
         // C6：Gemini 把输入 token 放在 usageMetadata.promptTokenCount，不是 usage.prompt_tokens。
         meta.promptTokens = Number(data && data.usageMetadata && data.usageMetadata.promptTokenCount) || 0;
+        // v2 Pass P144：补输出侧两个字段（此前只解析了输入侧）——跟上面一行同一套 ||0 惯例，
+        // 与本文件里 callLocalLLM 对 local/qwen 的既有约定保持一致，不单独发明"null=未知"的
+        // 新语义（那套语义只用在本轮新写的 callOpenAIAPI，两套约定互不干扰，usageAccum() 对
+        // 两种写法都能正确识别"这次是不是拿到了用量"）。
+        meta.completionTokens = Number(data && data.usageMetadata && data.usageMetadata.candidatesTokenCount) || 0;
+        meta.totalTokens = Number(data && data.usageMetadata && data.usageMetadata.totalTokenCount) || 0;
         // thought:true 的 part 是**思维链**，绝不能当答案（旧 callGeminiAPI 读 parts[0] 就会读到它）
         meta.reasoning = parts.filter(function (p) { return p && p.thought === true; }).map(partText).join('');
         meta.thinking = meta.reasoning.trim() !== '';
@@ -21284,7 +21693,7 @@ async function chatCallModel(messages, systemPrompt, signal, meta, sink) {
     if (config.provider === 'openai') {
         return await chatCallOnlineWithDowngrade('OpenAI', req, function (mt) {
             opt.max_tokens = mt;
-            return callOpenAIAPI(config.model, full, opt, config.openaiApiKey, signal);
+            return callOpenAIAPI(config.model, full, opt, config.openaiApiKey, signal, meta);
         }) || '';
     }
     if (config.provider === 'claude') {
@@ -24406,12 +24815,22 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
     let usedRetry = false;
     let raw = '';
 
+    // v2 Pass P144："本次任务"（一次 chatSend，可能对应多轮工具调用）的用量累加器。meta 每轮
+    // 被 chatCallModel 整体覆盖（C6 的校准逻辑需要"上一轮真实值"，不能改这个既有语义），所以
+    // 另开一个不被覆盖的对象，一次性挂在 meta.taskUsage 上——因为是同一个对象引用，下面每轮
+    // usageAccum() 改的是这个对象自己的字段，meta.taskUsage 读到的永远是最新值，不需要在每个
+    // return 点重新赋值。chatSend 那边读 meta.taskUsage 拿"本次任务"合计。
+    const chatCfg0 = chatApiConfig();
+    const taskUsage = usageNewTask(chatCfg0.provider, chatCfg0.model);
+    meta.taskUsage = taskUsage;
+
     const setLabel = function (text) {
         try { if (pending && pending.labelEl) pending.labelEl.textContent = text; } catch (e) {}
     };
 
     for (let iter = 1; iter <= CHAT_AGENT_MAX_ITERS; iter++) {
         raw = await chatCallModel(wire, sys, signal, meta, null);
+        usageAccum(taskUsage, meta);
 
         // v2 Pass P102：callLocalLLM 的兼容闸①证实了这一发的 tools 参数不被支持——记住这个
         // endpoint+模型组合，下一轮的系统提示（chatSystemPrompt/chatAgentNativeToolsActive）
@@ -24689,6 +25108,16 @@ async function chatSend() {
                 };
             }
         } catch (e2) { console.error('[chat] usage record failed', e2); }
+        // v2 Pass P144："本次任务"（这一次 chatSend，跨可能的多轮工具调用）用量/花销——独立于
+        // 上面那份"上一轮真实值"（C6 的校准逻辑专用，语义不能动），读 chatAgentRunLoop 挂在
+        // meta.taskUsage 上的累加器。同时并入会话累计（只累加已知的部分，成本按币种分开）。
+        try {
+            const c2 = chatModelChoice();
+            ChatState.lastTaskUsage = (meta && meta.taskUsage) ? meta.taskUsage : null;
+            if (!ChatState.sessionTaskUsageTotal) ChatState.sessionTaskUsageTotal = usageSessionNew();
+            usageSessionAdd(ChatState.sessionTaskUsageTotal, ChatState.lastTaskUsage,
+                usageComputeTaskCost(c2.provider, c2.model, ChatState.lastTaskUsage));
+        } catch (e2b) { console.error('[chat] task usage record failed', e2b); }
         // 每轮落一次档（upsert 到同一条，不会越攒越多）。
         // 【为什么必须每轮存，而不是只在清理/切文档时存】那两个时机都要求用户**主动做点什么**。
         // 用户直接关标签页、或者直接从 History 恢复另一份翻译，都不经过它们；
@@ -27049,6 +27478,19 @@ function chatRingHtml(ro) {
         + '</svg><span>' + escapeHtml(label) + '</span></button>';
 }
 
+// v2 Pass P144：「本次任务」token 用量 + 按内置价格表算出的美元/人民币花销。跟上面的环
+// （chatRingHtml，那是"这一轮上下文占了多少窗口"）是两个不同的量，各自一个 chip。
+// 硬规则：usage 拿不到显示"用量未知"、价格拿不到显示"价格未知"、claude 链路显示"不支持用量
+// 统计"——三者都绝不渲染成 $0.00（见 usageDisplayFor/usageFormatCurrency 定义处）。
+function chatTaskUsageChipHtml() {
+    const c = chatModelChoice();
+    const d = usageDisplayFor(c.provider, c.model, ChatState.lastTaskUsage);
+    const tip = usageTipText(c.provider, c.model, ChatState.lastTaskUsage, ChatState.sessionTaskUsageTotal);
+    const label = d.unsupported ? d.tokensText : (d.tokensText + ' · ' + d.costText);
+    return '<span class="aichat-taskusage-chip' + (d.unsupported ? ' is-unsupported' : '') + '" id="aiChatTaskUsageChip"'
+        + ' data-tip="' + escapeAttr(tip) + '" data-tip-pos="top">' + escapeHtml(label) + '</span>';
+}
+
 // 底部状态条：环 + 会话 + 「历史怎么裁的」那句老话。
 // 历史长了要花的是用户的钱（在线模型），不告诉他等于替他做决定。
 // v2 Pass P100：原来这里还有一颗「文档 开/关」按钮（#aiChatCtxToggle）——现在删掉了。
@@ -27067,6 +27509,7 @@ function chatUpdateBar() {
 
         bar.innerHTML = '<div class="aichat-ctxrow">'
             + chatRingHtml(ro)
+            + chatTaskUsageChipHtml()
             + '<span class="aichat-pspacer"></span>'
             + '<button type="button" class="aichat-minibtn' + (ChatState.panel === 'history' ? ' is-on' : '') + '"'
             + ' id="aiChatHistBtn" data-tip="'
@@ -27468,6 +27911,10 @@ function chatResetConversation() {
     ChatState.proposals = [];
     ChatState.target = null;
     ChatState.usage = null;
+    // v2 Pass P144：新开一段对话，"本次任务"不再指上一段对话最后一轮——清掉，避免悬浮窗/
+    // 状态条继续显示已经不属于当前对话的旧数字。sessionTaskUsageTotal（会话累计）不清，
+    // 语义是"这个浏览器会话里花了多少"，不随单次对话清空重置。
+    ChatState.lastTaskUsage = null;
     ChatState.lastSent = null;
     ChatState.docSnapshot = null;
     ChatState.pendingCompact = null;
