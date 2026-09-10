@@ -43,14 +43,14 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const crypto = require('crypto');
-const { spawn, execSync } = require('child_process');
+const { spawn, execSync, spawnSync } = require('child_process');
 let WebSocket = null;
 try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化处的兜底说明 */ }
 
 // v2 Pass P45：/health 里带的能力/版本自报——见该端点注释。每次给桥新增一个"前端需要能
 // 判断有没有"的能力（新端点、既有端点的行为变化），就在 BRIDGE_CAPABILITIES 里加一个字符串，
 // 版本号也提一位。已经上线的能力不会被撤销，这个数组只做加法。
-const BRIDGE_API_VERSION = 58;
+const BRIDGE_API_VERSION = 59;
 const BRIDGE_CAPABILITIES = [
     'overleaf-clone',          // POST /overleaf/clone
     'overleaf-pull-strategy',  // POST /overleaf/pull 认识 body.strategy（abort/stash/discard）
@@ -75,13 +75,20 @@ const BRIDGE_CAPABILITIES = [
                                 // WORK_ROOT/<id> outdir，换回一个可用的 id——供"刷新后从磁盘
                                 // 缓存恢复显示的 PDF"接上现成的 /synctex/forward、/synctex/edit
                                 // （它们只认 id -> outdir 这一种定位方式），不需要真的重新编译
-    'admin-restart'            // v2 Pass P119：POST /admin/restart——桥自己主动以非零退出码
+    'admin-restart',           // v2 Pass P119：POST /admin/restart——桥自己主动以非零退出码
                                 // (process.exit(1)) 退出，把"拉起新进程"这件事交给外部计划
                                 // 任务的自愈配置（本机 LatexBridge-AutoStart / jump 侧对应任务
                                 // 的 RestartCount 设置），供无人值守场景在改完 server.js 后不
                                 // 需要人手动重启桥。跟其余端点一样过统一令牌闸门，不进
                                 // TOKEN_EXEMPT_PATHS——远程模式必须带令牌，本地模式沿用
                                 // tokenAuthorized() 现行语义（无需令牌），没有特殊豁免。
+    'fs-root-allowlist'        // v2 Pass P154：可选的 projectDir 根目录白名单
+                                // （LATEX_BRIDGE_ALLOWED_ROOTS 环境变量，';' 分隔多条根路径）。
+                                // 未设置时行为与之前逐字节一致，不做任何限制；设置后所有接受
+                                // projectDir 的端点都会校验落在某个白名单根之下，越界返回 403。
+                                // /health 的 fsRootAllowlist.enabled 播报是否启用（不回显具体
+                                // 根路径——/health 在 TOKEN_EXEMPT_PATHS 里免令牌，不该顺带
+                                // 泄露服务器磁盘上的敏感目录结构）。
 ];
 
 // v2 Pass P49：监听地址可配（LATEX_BRIDGE_HOST），默认仍是 127.0.0.1——不传就跟以前
@@ -292,6 +299,157 @@ function consumeWsTicket(ticket) {
 // /output/*、/project-asset、/wordcount……）全部经过下面路由分发前的统一校验，不再逐个端点
 // 手动加。
 const TOKEN_EXEMPT_PATHS = new Set(['/health', '/', '/AI-Translator.html', '/routes', '/favicon.ico']);
+
+// ---------------------------------------------------------------------------
+// v2 Pass P154：可选的 projectDir 根目录白名单。
+//
+// 背景：resolveInProject()/safeProjectAssetPath() 只保证 relPath 逃不出 projectDir 本身，
+// 但 projectDir 这个起点可以是磁盘上任意存在的目录（含 C:\ 本身）——这是给"项目内部用
+// ../ 跳出去"设计的防线，从没打算当"整机沙箱"用（见 .claude/tmp/p154_filetree_design.md
+// §2）。用户拍板方案 3：加一条可配置的多根白名单，用环境变量 LATEX_BRIDGE_ALLOWED_ROOTS
+// （多条路径用 ';' 分隔）声明；不设置这个变量时（默认）——行为必须与之前逐字节一致，不做
+// 任何限制，这是硬要求（用户当前就在用不受限的既有路径工作）。
+//
+// 设置了变量后：所有接受 projectDir 的端点在拿到 projectDir 之后、真正碰文件系统之前，
+// 都要先过 checkProjectDirAllowed()；越界返回 403（不是 404——404 意味着"目录不存在"，
+// 403 才是"目录存在但不允许访问"，前端要能区分这两种情况分别给用户不同的提示）。
+// ---------------------------------------------------------------------------
+const ALLOWED_ROOTS_RAW = process.env.LATEX_BRIDGE_ALLOWED_ROOTS || '';
+
+// 规范化一个路径用于白名单比较：先 path.resolve 拿绝对路径，再尽量 realpath 展开
+// （解析符号链接/NTFS junction、Windows 上顺带统一短路径名 8.3 形式）；路径此刻不存在
+// （常见于"根目录还没建"或调用方传了个错的路径）时 realpath 会抛错，退回 resolve 的结果
+// ——两边（白名单元素自己 + 每次请求的 projectDir）用的是同一个函数、同一套规则，规则
+// 不对称就没有意义，所以整套白名单校验只认这一个函数出的值。
+function normalizeForRootCheck(p) {
+    let resolved;
+    try { resolved = path.resolve(p); } catch (e) { return null; }
+    try { return fs.realpathSync.native ? fs.realpathSync.native(resolved) : fs.realpathSync(resolved); }
+    catch (e) { return resolved; } // 路径不存在/不可读：退回纯字符串规范化结果
+}
+
+// 白名单根列表：启动时算一次（不是每次请求都重新 split/realpath），跟 BRIDGE_CAPABILITIES
+// 等其它启动期配置一致的做法。
+const ALLOWED_ROOTS = ALLOWED_ROOTS_RAW.split(';')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+    .map((p) => normalizeForRootCheck(p))
+    .filter((p) => p !== null);
+const ALLOWED_ROOTS_ENABLED = ALLOWED_ROOTS.length > 0;
+// 供 /health 展示用的"原始配置字符串"版本（未经 realpath 展开）——管理员在环境变量里怎么
+// 写就怎么显示，比展开后可能变了大小写/解析了符号链接的 ALLOWED_ROOTS 元素更符合直觉；
+// 两者描述的是同一组根，只是显示 vs 比较分别用各自更合适的形式。
+const ALLOWED_ROOTS_DISPLAY = ALLOWED_ROOTS_RAW.split(';')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
+// 大小写：Windows 文件系统默认不区分大小写（NTFS 底层区分，但两个大小写不同的路径字符串
+// 指向的是同一个文件/目录），前缀比较必须按平台归一化大小写，否则 "c:\\foo" 会被误判成不在
+// "C:\\Foo" 白名单根下——这本身就是一种绕过手法（用户随手打错大小写不算"绕过"，但如果
+// 白名单只做区分大小写的字符串比对，会把"大小写不同但其实是同一个目录"的合法路径也拒了，
+// 属于误伤而不是安全问题，这里一并修正）。
+function isPathUnderRoot(candidate, root) {
+    const c = process.platform === 'win32' ? candidate.toLowerCase() : candidate;
+    const r = process.platform === 'win32' ? root.toLowerCase() : root;
+    if (c === r) return true;
+    const rWithSep = r.endsWith(path.sep) ? r : r + path.sep;
+    return c.indexOf(rWithSep) === 0;
+}
+
+// 校验 projectDir 是否落在白名单根之下。未设置 LATEX_BRIDGE_ALLOWED_ROOTS 时永远放行
+// （{ok:true}）——跟之前逐字节一致的行为，不因为加了这套机制就在默认情况下多做任何检查。
+// 设置了但越界：{ok:false, status:403, error}；projectDir 本身不合法（空/无法 resolve）：
+// {ok:false, status:400, error}（不是安全边界问题，是请求本身有毛病，跟未设白名单时其它
+// 端点对空 projectDir 的既有 400 处理口径一致）。
+function checkProjectDirAllowed(projectDir) {
+    if (!ALLOWED_ROOTS_ENABLED) return { ok: true };
+    if (typeof projectDir !== 'string' || !projectDir) return { ok: false, status: 400, error: 'projectDir 缺失' };
+    const norm = normalizeForRootCheck(projectDir);
+    if (!norm) return { ok: false, status: 400, error: 'projectDir 无效: ' + projectDir };
+    const allowed = ALLOWED_ROOTS.some((root) => isPathUnderRoot(norm, root));
+    if (!allowed) {
+        return { ok: false, status: 403, error: 'projectDir 不在允许访问的根目录白名单内，拒绝: ' + projectDir };
+    }
+    return { ok: true };
+}
+
+// 路由分发处的统一收口：不通过就直接把 403/400 写回响应并返回 true（调用方据此 return，
+// 不再往下执行），通过就返回 false（调用方照常继续）。避免在十来个路由里重复同一段
+// "拿到 check 结果 -> 判断 -> sendJson -> return" 样板代码。
+function rejectIfProjectDirNotAllowed(res, projectDir) {
+    const check = checkProjectDirAllowed(projectDir);
+    if (!check.ok) {
+        sendJson(res, check.status || 403, { ok: false, error: check.error });
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// v2 Pass P154：OneDrive Files On-Demand"云端占位符"友好报错。
+//
+// 实测事实（.claude/tmp/p154_filetree_design.md 任务书原文 + 本轮 2026-09-10 在 jump 上
+// 交叉验证）：一个 OneDrive 按需同步、尚未下载到本地的文件，Windows 属性位包含
+// FILE_ATTRIBUTE_OFFLINE（0x1000）和/或 FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS（0x400000）
+// （通常还伴随 FILE_ATTRIBUTE_UNPINNED 0x100000、FILE_ATTRIBUTE_SPARSE_FILE 0x200、
+// FILE_ATTRIBUTE_REPARSE_POINT 0x400）；本地没有实体数据，Node 的 fs.readFileSync 对它
+// 会抛 `UNKNOWN: unknown error`，用户看到的就是这句天书。
+//
+// Node 的 fs.statSync 在 Windows 上拿不到这些底层 FILE_ATTRIBUTE_* 位（fs.Stats 没有
+// attributes 字段，只有 mode/mtime 这类 POSIX 概念的字段），本函数退而求其次调用 Windows
+// 自带的 attrib.exe 解析它的人类可读输出——`attrib /?` 明确记录了 O（Offline attribute）
+// 和 U（Unpinned attribute）两个跟 OneDrive Files On-Demand 直接相关的字母标记，命中任一
+// 个就判定为占位符。
+//
+// 可靠性（如实记录，不夸大）：本轮在 jump 上对设计文档点名的那个真实占位符文件做了交叉
+// 验证——用 PowerShell `(Get-Item path).Attributes.value__` 读原始属性整数（.NET 层面的
+// 权威来源）跟同一文件 `attrib` 命令的字母输出对比，两者在该文件当前状态（已被后续某次
+// 检查意外"预热"下载、属性从最初记录的 4199968 变成了 525344=Archive+ReparsePoint+
+// Pinned）下完全吻合——`attrib` 输出里出现的 P 字母，跟 PowerShell 报告的 Pinned 位
+// （0x80000）精确对应。这证明 attrib.exe 的字母输出确实忠实反映 Windows 记录的真实属性
+// 位，不是道听途说的猜测。但没能对 Offline/Unpinned 分支做同一种端到端交叉验证——唯一
+// 已知的样本文件在本轮实现开始前就已经从"仅云端"变成"已固定本地"（推测是仅有的一次检查
+// 过程本身、或后台杀毒/索引触发了 OneDrive 的隐式下载），jump 上目前没有找到第二个仍处于
+// 离线占位符状态的样本可供复现。因此：Offline/Unpinned 分支的检测逻辑基于 attrib.exe 自己
+// 的文档化字母含义（非独家猜测），但没有本轮的活体样本验证；一旦这个探测在未来因为
+// Windows 版本差异/attrib.exe 输出格式变化而失效，表现是"探测不到占位符特征，静默退回
+// 原始的 UNKNOWN 错误文案"——不会误报成功，也不会抛出新异常中断请求（spawnSync 的任何
+// 失败形态、非零退出码、超时都在 catch/条件判断里被吞成"不是占位符"，绝不是一个悄悄
+// 永远不触发的假实现：只要 attrib.exe 存在且遇到真正的占位符文件，这条路径就会命中）。
+// ---------------------------------------------------------------------------
+function isOneDrivePlaceholderByAttrib(absPath) {
+    if (process.platform !== 'win32') return false;
+    try {
+        const r = spawnSync('attrib', [absPath], { encoding: 'utf8', windowsHide: true, timeout: 3000 });
+        if (r.error || typeof r.stdout !== 'string' || !r.stdout) return false;
+        const firstLine = r.stdout.split(/\r?\n/)[0] || '';
+        const idx = firstLine.lastIndexOf(absPath);
+        // 只看路径之前的那一段属性字母，避免路径本身恰好含独立的大写 O/U 字母造成误判
+        // （比如某个项目目录名本身叫 "U-Boat" 之类）。
+        const attrPart = idx > 0 ? firstLine.slice(0, idx) : firstLine;
+        return /(^|\s)O(\s|$)/.test(attrPart) || /(^|\s)U(\s|$)/.test(attrPart);
+    } catch (e) {
+        return false;
+    }
+}
+
+const ONEDRIVE_PATH_HINT_RE = /onedrive/i;
+
+// 读文件失败时统一走这里，决定要不要把 Node 的原始报错替换成人话版本。只在
+// err.code === 'UNKNOWN'（Node 在 Windows 上对占位符读取失败的典型报错形状）且路径本身
+// 含 "OneDrive" 字样时才去调用 attrib.exe 探测——避免给每一次权限错误/文件不存在错误都
+// 多打一次子进程；探测不到占位符特征（或探测本身失败/超时/非 Windows）时原样返回
+// Node 的原始错误文案，不做任何改写。
+function describeFileReadError(err, absPath) {
+    const raw = (err && err.message) || String(err);
+    if (!err || err.code !== 'UNKNOWN') return raw;
+    if (typeof absPath !== 'string' || !ONEDRIVE_PATH_HINT_RE.test(absPath)) return raw;
+    if (!isOneDrivePlaceholderByAttrib(absPath)) return raw;
+    return '这个文件是 OneDrive 按需同步（Files On-Demand）的云端占位符，本机（桥所在机器）上没有下载实体数据，因此读取失败。'
+        + '解决办法：在桥所在机器上对该文件（或所在目录）执行 attrib +P -U "' + absPath + '"，'
+        + '或者在文件资源管理器里右键该文件/文件夹 → 「始终保留在此设备上」，等 OneDrive 下载完成后再重试。'
+        + '（原始错误：' + raw + '）';
+}
 
 let currentChild = null;
 let currentChildId = null;
@@ -2621,7 +2779,7 @@ async function doFsRead(projectDir, relPath) {
         return { ok: false, error: '文件过大（' + st.size + ' 字节 > ' + FS_READ_MAX_BYTES + ' 字节上限），拒绝读取', size: st.size, tooLarge: true };
     }
     let buf;
-    try { buf = fs.readFileSync(r.resolved); } catch (e) { return { ok: false, error: '读取失败: ' + e.message }; }
+    try { buf = fs.readFileSync(r.resolved); } catch (e) { return { ok: false, error: '读取失败: ' + describeFileReadError(e, r.resolved) }; }
     if (looksBinary(buf)) {
         return { ok: true, path: relPath, size: st.size, binary: true, content: null, mtimeMs: st.mtimeMs };
     }
@@ -3092,8 +3250,18 @@ const server = http.createServer(async (req, res) => {
                 // 或者误判成新桥（这个推断方向是单向且安全的：新桥必然带字段，缺字段只可能
                 // 是旧桥，不可能反过来）。
                 bridgeApiVersion: BRIDGE_API_VERSION,
-                bridgeCapabilities: BRIDGE_CAPABILITIES
+                bridgeCapabilities: BRIDGE_CAPABILITIES,
+                // v2 Pass P154：/health 在 TOKEN_EXEMPT_PATHS 里免令牌，任何能连上这个地址的人
+                // 都能读到它——默认只播报"启不启用"，不回显具体根路径，避免顺带泄露服务器磁盘
+                // 上的敏感目录结构给完全没有令牌的探测者。真正需要具体根路径列表来渲染"预设
+                // 位置"按钮的是已经持有合法令牌的前端本身——tokenAuthorized(req) 是纯函数，跟
+                // 这条路由要不要强制要求令牌无关，这里只是"如果这次请求恰好带对了令牌，就多给
+                // 一点信息"，不改变 /health 本身免令牌可访问这件事。
+                fsRootAllowlist: { enabled: ALLOWED_ROOTS_ENABLED }
             };
+            if (ALLOWED_ROOTS_ENABLED && tokenAuthorized(req)) {
+                healthBody.fsRootAllowlist.roots = ALLOWED_ROOTS_DISPLAY;
+            }
             // v2 Pass P49：/health 在 REMOTE_MODE 下豁免令牌校验（前端要靠它探活），所以绝不能
             // 顺带泄露本机敏感路径——latexmkPath/workRoot 只在本地模式下返回。
             if (!REMOTE_MODE) {
@@ -3158,6 +3326,9 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' });
                 return;
             }
+            // v2 Pass P154：根目录白名单——未设置 LATEX_BRIDGE_ALLOWED_ROOTS 时 rejectIfProjectDirNotAllowed
+            // 恒放行，逐字节不改变既有行为。
+            if (rejectIfProjectDirNotAllowed(res, projectDir)) { req._logOutcome = 'error(projectDir not allowed)'; return; }
             if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) {
                 req._logOutcome = 'error(projectDir not found)';
                 sendJson(res, 400, { ok: false, error: 'projectDir 不存在或不是目录: ' + projectDir });
@@ -3203,6 +3374,8 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' });
                 return;
             }
+            // v2 Pass P154：根目录白名单，未设置环境变量时恒放行。
+            if (rejectIfProjectDirNotAllowed(res, projectDir)) return;
             if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) {
                 sendJson(res, 400, { ok: false, error: 'projectDir 不存在或不是目录: ' + projectDir });
                 return;
@@ -3229,6 +3402,8 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' });
                 return;
             }
+            // v2 Pass P154：根目录白名单，未设置环境变量时恒放行。
+            if (rejectIfProjectDirNotAllowed(res, projectDir)) return;
             if (!line || line < 1) { sendJson(res, 400, { ok: false, error: 'line 必须是正整数' }); return; }
             const mainAbs = path.isAbsolute(mainFile) ? mainFile : path.join(projectDir, mainFile);
             const result = await doSyncTexForward(outdir, mainAbs, line, body.column || 0);
@@ -3278,6 +3453,8 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' });
                 return;
             }
+            // v2 Pass P154：根目录白名单，未设置环境变量时恒放行。
+            if (rejectIfProjectDirNotAllowed(res, projectDir)) return;
             if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) {
                 sendJson(res, 400, { ok: false, error: 'projectDir 不存在或不是目录: ' + projectDir });
                 return;
@@ -3300,7 +3477,13 @@ const server = http.createServer(async (req, res) => {
                 fs.copyFileSync(pdfAbs, path.join(outdir, 'output.pdf'));
                 if (synctexAbs) fs.copyFileSync(synctexAbs, path.join(outdir, 'output.synctex.gz'));
             } catch (e) {
-                sendJson(res, 500, { ok: false, error: 'rehydrate failed: ' + e.message });
+                // v2 Pass P154：OneDrive 占位符人话报错——两个候选源文件里，先看 output.pdf
+                // 是不是没落地（没落地说明是 pdfAbs 那次拷贝失败的），落地了就是 synctexAbs
+                // 那次失败；describeFileReadError 内部只在 err.code==='UNKNOWN' 且路径含
+                // "OneDrive" 时才会真的去探测，探测不到照样原样透传 e.message。
+                let failedSrc = pdfAbs;
+                try { if (fs.existsSync(path.join(outdir, 'output.pdf'))) failedSrc = (synctexAbs || pdfAbs); } catch (e2) {}
+                sendJson(res, 500, { ok: false, error: 'rehydrate failed: ' + describeFileReadError(e, failedSrc) });
                 return;
             }
             sendJson(res, 200, { ok: true, id: id, synctexExists: !!synctexAbs });
@@ -3340,6 +3523,8 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 400, { ok: false, error: 'projectDir 和 path 都是必填 query 参数' });
                 return;
             }
+            // v2 Pass P154：根目录白名单，未设置环境变量时恒放行。
+            if (rejectIfProjectDirNotAllowed(res, projectDir)) return;
             if (!fs.existsSync(projectDir) || !fs.statSync(projectDir).isDirectory()) {
                 sendJson(res, 404, { ok: false, error: 'projectDir 不存在或不是目录: ' + projectDir });
                 return;
@@ -3365,7 +3550,8 @@ const server = http.createServer(async (req, res) => {
             const contentType = ASSET_CONTENT_TYPES[path.extname(resolved).toLowerCase()] || 'application/octet-stream';
             let data;
             try { data = fs.readFileSync(resolved); } catch (e) {
-                sendJson(res, 404, { ok: false, error: 'read failed: ' + e.message });
+                // v2 Pass P154：OneDrive 按需占位符人话报错——见 describeFileReadError 头部注释。
+                sendJson(res, 404, { ok: false, error: 'read failed: ' + describeFileReadError(e, resolved) });
                 return;
             }
             res.writeHead(200, {
@@ -3421,6 +3607,10 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' });
                 return;
             }
+            // v2 Pass P154：根目录白名单——单点覆盖本 if 块下面全部 10 个 /fs/* 子路由
+            // （capabilities/list/read/mkdir/write/write-binary/move/copy/delete/restore）。
+            // 未设置 LATEX_BRIDGE_ALLOWED_ROOTS 时 rejectIfProjectDirNotAllowed 恒放行。
+            if (rejectIfProjectDirNotAllowed(res, projectDir)) return;
 
             if (pathname === '/fs/capabilities') {
                 sendJson(res, 200, await doFsCapabilities(projectDir));
@@ -3496,6 +3686,8 @@ const server = http.createServer(async (req, res) => {
             }
             const projectDir = body.projectDir;
             if (!projectDir || typeof projectDir !== 'string') { sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' }); return; }
+            // v2 Pass P154：根目录白名单，未设置环境变量时恒放行。
+            if (rejectIfProjectDirNotAllowed(res, projectDir)) return;
             const result = await doOverleafOrigin(projectDir);
             sendJson(res, 200, result);
             return;
@@ -3519,6 +3711,8 @@ const server = http.createServer(async (req, res) => {
             const projectDir = body.projectDir;
             const newName = body.newName;
             if (!projectDir || typeof projectDir !== 'string') { sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' }); return; }
+            // v2 Pass P154：根目录白名单，未设置环境变量时恒放行。
+            if (rejectIfProjectDirNotAllowed(res, projectDir)) return;
             if (!newName || typeof newName !== 'string') { sendJson(res, 400, { ok: false, error: 'newName is required' }); return; }
             // newName 必须是纯 basename——含任何路径分隔符或 ".." 都是在试图把这个端点当成
             // "移动到任意目录"的后门，请求体本身不合法，400 而不是业务性的 ok:false。
@@ -3553,6 +3747,8 @@ const server = http.createServer(async (req, res) => {
             // 这条路由对所有业务结果统一用 200，只有请求体本身不合法才用 400，见下面三行）。
             const strategy = body.strategy;
             if (!projectDir || typeof projectDir !== 'string') { sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' }); return; }
+            // v2 Pass P154：根目录白名单，未设置环境变量时恒放行。
+            if (rejectIfProjectDirNotAllowed(res, projectDir)) return;
             if (!gitUrl || typeof gitUrl !== 'string') { sendJson(res, 400, { ok: false, error: 'gitUrl is required' }); return; }
             if (!token || typeof token !== 'string') { sendJson(res, 400, { ok: false, error: 'token is required' }); return; }
             const result = await doOverleafPull(projectDir, gitUrl, token, strategy);
@@ -3577,6 +3773,8 @@ const server = http.createServer(async (req, res) => {
             const gitUrl = body.gitUrl;
             const token = body.token;
             if (!projectDir || typeof projectDir !== 'string') { sendJson(res, 400, { ok: false, error: 'projectDir is required (绝对路径)' }); return; }
+            // v2 Pass P154：根目录白名单，未设置环境变量时恒放行。
+            if (rejectIfProjectDirNotAllowed(res, projectDir)) return;
             if (!gitUrl || typeof gitUrl !== 'string') { sendJson(res, 400, { ok: false, error: 'gitUrl is required' }); return; }
             if (!token || typeof token !== 'string') { sendJson(res, 400, { ok: false, error: 'token is required' }); return; }
             const result = await doOverleafPush(projectDir, gitUrl, token, body.message);

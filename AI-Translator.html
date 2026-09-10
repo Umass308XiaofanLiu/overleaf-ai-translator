@@ -1769,6 +1769,15 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 .ovl-tree-row:hover { background: #2F3A4C; }
 .ovl-tree-children { display: none; }
 .ovl-tree-node.ovl-tree-open > .ovl-tree-children { display: block; }
+/* v2 Pass P154：远程「选择远程项目文件夹」弹窗里的懒加载树——复用上面这套 .ovl-tree-*
+   骨架（同一套折叠/展开/loading/error 视觉语言），只加两条这个场景独有的小样式：当前
+   选中行的高亮（跟主编辑区绿色主色调一致，呼应 .ovl-modal-btn-primary 的 #098842），
+   以及"这个目录读取失败/权限不足"时行本身的灰显提示（不影响 .ovl-tree-row 在主侧边栏
+   文件树里的既有外观，两处共用同一批基础类名，靠这条追加的修饰类区分）。 */
+.ovl-tree-row-picksel { background: #24361F; box-shadow: inset 3px 0 0 #098842; }
+.ovl-tree-row-picksel:hover { background: #2B4023; }
+.ovl-tree-row-dir-err { color: #9AA4B2; }
+.ovl-remote-pick-roots-label { padding: 6px 6px 2px; font-size: 11px; color: #9AA4B2; }
 
 .ovl-editor-panel {
     background: #FFFFFF;
@@ -4479,7 +4488,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.23.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.24.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-10';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -29925,6 +29934,11 @@ const OvlState = {
     bridgeCapabilities: null,
     // v2 Pass P53：本地模式 /health 自报的"克隆存放位置"默认父目录；远程模式恒为 null。
     defaultOverleafCloneRoot: null,
+    // v2 Pass P154：/health 自报的根目录白名单状态——{enabled, roots}|null。roots 只有在
+    // 桥真的设置了 LATEX_BRIDGE_ALLOWED_ROOTS 且这次 /health 请求带了合法令牌时才会有内容
+    // （桥端故意只对已认证请求回显具体根路径，见 server.js /health 处理器注释）；本地模式/
+    // 未启用白名单/还没探测过都是 null，远程文件树选择器据此决定"预设根"里要不要加白名单根。
+    fsRootAllowlist: null,
     // ---- v2 Pass P17：桥 WebSocket 磁盘改动推送的自触发回声过滤，见 ovlBridgeHandleExternalChange ----
     lastSelfWriteMtimeMs: null, // 自己上一次真的写盘成功后，FSA File.lastModified 读回来的值
     lastSelfWritePath: null,    // 上面那次写盘对应的绝对路径（ovlBridgeAbsPathFor 算出来的）
@@ -39009,7 +39023,18 @@ const OVL_REMOTE_KNOWN_BINARY_EXT_RE = /\.(pdf|png|jpe?g|gif|webp|bmp|tiff?|ico|
 async function ovlRemoteFetchAssetBytes(projectDir, relPath) {
     const assetUrl = ovlBridgeUrl('/project-asset?projectDir=' + encodeURIComponent(projectDir) + '&path=' + encodeURIComponent(relPath));
     const assetResp = await ovlBridgeFetch(assetUrl);
-    if (!assetResp.ok) throw new Error('读取远程二进制文件失败：HTTP ' + assetResp.status);
+    if (!assetResp.ok) {
+        // v2 Pass P154：桥端 /project-asset 失败时把确切原因放在响应体 JSON 的 error 字段里
+        // （404 路径不存在/越权、403 白名单越界、OneDrive 占位符人话文案……），原来这里只显示
+        // HTTP 状态码，把这些原因全丢了。先尝试读服务端给的 error，拿不到（响应体不是 JSON，
+        // 比如网关/代理返回的错误页）才回落到旧的 HTTP 状态码文案。
+        let serverError = null;
+        try {
+            const errBody = await assetResp.clone().json();
+            if (errBody && typeof errBody.error === 'string' && errBody.error) serverError = errBody.error;
+        } catch (e) { /* 响应体不是合法 JSON，回落到状态码 */ }
+        throw new Error(serverError || ('读取远程二进制文件失败：HTTP ' + assetResp.status));
+    }
     return await assetResp.arrayBuffer();
 }
 
@@ -39388,6 +39413,45 @@ function ovlRemoteFolderDialogClose() {
     if (OvlRemoteFolderDialogOnKey) { document.removeEventListener('keydown', OvlRemoteFolderDialogOnKey); OvlRemoteFolderDialogOnKey = null; }
 }
 
+// v2 Pass P154：远程目录选择器的"预设根"来源——B-lite 懒加载树的顶层节点。硬要求：打开
+// 弹窗后不手打任何字符就能开始点（用户原话："我们选择打开项目文件夹的时候...可不可以列出
+// jump 的 file tree 让我们选择?这样我就不用手动粘贴文件地址了"）。优先级：
+//   1) 桥配置了根目录白名单（LATEX_BRIDGE_ALLOWED_ROOTS）且这次 /health 探测已经带着合法
+//      令牌拿到了具体根路径（见 OvlState.fsRootAllowlist 头部注释——桥端只对已认证请求回显
+//      根路径，未认证/没设白名单时这里恒为 null）——直接且只用白名单本身当预设根：白名单
+//      之外的任何路径迟早会被服务端 403 拒绝，混进别的候选只会诱导用户点一个注定失败的按钮。
+//   2) 没有白名单：当前"项目绝对路径"输入框的值 + 对应 localStorage 存档 + 最近使用过的
+//      远程项目历史（ovlProjectHistoryLoad() 在远程模式下天然读 REMOTE 专用 key，见
+//      ovlProjectHistoryLsKey 定义处注释）——覆盖"这个桥已经至少成功打开过一次项目"的绝大
+//      多数场景（当前用户实际使用场景正是如此）。真正从零开始、桥没配白名单、历史也是空的
+//      冷启动场景，见下方 UI 对"没有预设位置"的显式说明文案（诚实降级，不假装有候选）。
+function ovlRemoteTreePickerDefaultRoots() {
+    const out = [];
+    const seen = new Set();
+    function pushIfNew(p) {
+        const s = String(p || '').trim();
+        if (!s) return;
+        const key = s.replace(/\\/g, '/').toLowerCase().replace(/\/+$/, '');
+        if (!key || seen.has(key)) return;
+        seen.add(key);
+        out.push(s);
+    }
+    try {
+        const allow = OvlState.fsRootAllowlist;
+        if (allow && allow.enabled && Array.isArray(allow.roots) && allow.roots.length > 0) {
+            allow.roots.forEach(pushIfNew);
+            return out;
+        }
+    } catch (e) {}
+    try { pushIfNew(ovlRemoteProjectRoot()); } catch (e) {}
+    try { pushIfNew(localStorage.getItem(ovlProjectPathLsKey())); } catch (e) {}
+    try {
+        const hist = ovlProjectHistoryLoad();
+        hist.slice(0, 8).forEach(function (it) { pushIfNew(it && it.path); });
+    } catch (e) {}
+    return out;
+}
+
 // v2 Pass P133（m1）：opts.initialPath 可选——"被令牌弹窗冲掉后自动重开"时把用户刚填的路径带回来
 // 预填（见下方 handleDismissed）。不传时行为跟以前一字不变（预填当前项目路径 / 上次存的路径）。
 function ovlRemotePickFolder(opts) {
@@ -39419,7 +39483,7 @@ function ovlRemotePickFolder(opts) {
         const msg = document.createElement('div');
         msg.className = 'ovl-modal-message';
         msg.textContent = '桥接服务跑在远程机器上，这里选的是那台远程机器上的目录（不是你眼前这台电脑）。'
-            + '直接填绝对路径，或点下面的目录名逐级浏览。';
+            + '下面点常用位置就能逐级展开浏览，也可以直接在下面填绝对路径。';
         box.appendChild(msg);
 
         const label = document.createElement('div');
@@ -39442,6 +39506,11 @@ function ovlRemotePickFolder(opts) {
         errEl.id = 'ovlRemotePickError';
         box.appendChild(errEl);
 
+        const rootsLabel = document.createElement('div');
+        rootsLabel.className = 'ovl-remote-pick-roots-label';
+        rootsLabel.id = 'ovlRemotePickRootsLabel';
+        box.appendChild(rootsLabel);
+
         const listWrap = document.createElement('div');
         listWrap.className = 'ovl-history-list';
         listWrap.id = 'ovlRemotePickList';
@@ -39451,65 +39520,185 @@ function ovlRemotePickFolder(opts) {
 
         function renderError(text) { errEl.textContent = text || ''; }
 
-        function listCurrent() {
+        // ==================== v2 Pass P154：B-lite 懒加载折叠树 ====================
+        // 顶层是"预设根"（见 ovlRemoteTreePickerDefaultRoots 头部注释），之后展开出来的任何
+        // 子目录都用同一套逻辑处理：懒加载（展开时才第一次调 /fs/list，不预先递归整棵树）、
+        // 加载态/错误态就地渲染在这个节点自己的子级里（权限不足/白名单越界等不会炸掉整棵
+        // 树）、已加载过的节点再折叠/展开不重新请求、同一节点展开动画进行中重复点击不重复
+        // 发请求、大目录只显示前 CAP 个子目录 + 提示还有多少未显示。复用侧边栏主文件树的
+        // .ovl-tree-* 类名，视觉风格保持一致；中文路径/反斜杠分隔符沿用既有 ovlRemoteFsJson/
+        // 路径拼接方式（POST JSON body，不经过 URL 编码，Node fs 在 Windows 上对中文目录名
+        // 本来就没有问题，见 P154 设计文档 §5"坑"一节）。
+        const rootKeys = []; // 与 treeRootUl 的直接子节点一一对应，判重用（大小写/斜杠归一化）
+        let treeRootUl = null;
+        let selectedRow = null;
+
+        function pathKey(p) { return String(p || '').trim().replace(/\\/g, '/').toLowerCase().replace(/\/+$/, ''); }
+
+        function selectPath(p, row) {
+            input.value = p;
+            if (selectedRow && selectedRow !== row) selectedRow.classList.remove('ovl-tree-row-picksel');
+            if (row) { row.classList.add('ovl-tree-row-picksel'); selectedRow = row; }
+        }
+
+        function ovlRemoteTreeNodeLi(absPath, label) {
+            const li = document.createElement('li');
+            li.className = 'ovl-tree-node';
+            const row = document.createElement('div');
+            row.className = 'ovl-tree-row ovl-tree-row-dir';
+            row.textContent = '▸ ' + label;
+            // 供测试/调试用的精确定位属性——不参与任何渲染逻辑，纯粹避免靠 textContent 前缀
+            // 剥离箭头字符这种脆弱的方式去找"就是这一个节点"。
+            row.setAttribute('data-ovlpath', absPath);
+            li.appendChild(row);
+            const childUl = document.createElement('ul');
+            childUl.className = 'ovl-tree-ul ovl-tree-children';
+            li.appendChild(childUl);
+            let loaded = false;
+            let loading = false;
+
+            function doLoad() {
+                loading = true;
+                childUl.textContent = '';
+                const loadingLi = document.createElement('li');
+                loadingLi.className = 'ovl-tree-loading';
+                loadingLi.textContent = '正在加载…';
+                childUl.appendChild(loadingLi);
+                inFlight++;
+                ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: absPath, path: '.' }).then(function (data) {
+                    inFlight--;
+                    loading = false;
+                    if (handleDismissed(input.value.trim())) return;
+                    childUl.textContent = '';
+                    if (!data || data.ok !== true) {
+                        // v2 Pass P154：权限不足/白名单越界（403）等——就地渲染成"这个节点点不
+                        // 开"，不影响树的其余部分；同时也写一份到共享错误条（跟 okBtn 同一个
+                        // errEl，方便用户在弹窗顶部一眼看到"最近一次操作失败了"是什么原因）。
+                        row.classList.add('ovl-tree-row-dir-err');
+                        const errLi = document.createElement('li');
+                        errLi.className = 'ovl-tree-error';
+                        errLi.textContent = (data && data.error) || '读取失败';
+                        childUl.appendChild(errLi);
+                        renderError((data && data.error) || '列出目录失败——检查路径是否存在、桥是否在线、令牌是否正确');
+                        return; // 不置 loaded=true：下次点击允许重试（权限问题可能是暂时的）
+                    }
+                    loaded = true;
+                    row.classList.remove('ovl-tree-row-dir-err');
+                    let dirs = (Array.isArray(data.entries) ? data.entries : []).filter(function (e) { return e && e.isDir; });
+                    dirs.sort(function (a, b) { return String(a.name).localeCompare(String(b.name)); });
+                    const CAP = 500; // 超大目录（比如塞了几万个子目录）只渲染前 CAP 个，避免卡死页面
+                    const totalDirs = dirs.length;
+                    const overflow = totalDirs > CAP;
+                    if (overflow) dirs = dirs.slice(0, CAP);
+                    if (!dirs.length) {
+                        const emptyLi = document.createElement('li');
+                        emptyLi.className = 'ovl-tree-empty';
+                        emptyLi.textContent = '（没有子目录）';
+                        childUl.appendChild(emptyLi);
+                    }
+                    const sep = (absPath.indexOf('\\') !== -1 && absPath.indexOf('/') === -1) ? '\\' : '/';
+                    dirs.forEach(function (e) {
+                        const childAbs = absPath.replace(/[\\/]+$/, '') + sep + e.name;
+                        childUl.appendChild(ovlRemoteTreeNodeLi(childAbs, e.name));
+                    });
+                    if (overflow) {
+                        const moreLi = document.createElement('li');
+                        moreLi.className = 'ovl-tree-empty';
+                        moreLi.textContent = '（目录很大，仅显示前 ' + CAP + ' 个子目录，还有 ' + (totalDirs - CAP) + ' 个未显示）';
+                        childUl.appendChild(moreLi);
+                    }
+                }).catch(function (e) {
+                    inFlight--;
+                    loading = false;
+                    if (handleDismissed(input.value.trim())) return;
+                    childUl.textContent = '';
+                    row.classList.add('ovl-tree-row-dir-err');
+                    const errLi = document.createElement('li');
+                    errLi.className = 'ovl-tree-error';
+                    errLi.textContent = '连接失败：' + (e && e.message ? e.message : String(e));
+                    childUl.appendChild(errLi);
+                    renderError('列出目录失败：' + (e && e.message ? e.message : String(e)));
+                });
+            }
+
+            row.addEventListener('click', function () {
+                selectPath(absPath, row);
+                renderError('');
+                const opening = !li.classList.contains('ovl-tree-open');
+                li.classList.toggle('ovl-tree-open', opening);
+                row.textContent = (opening ? '▾ ' : '▸ ') + label;
+                if (!opening) return; // 折叠不需要请求，也不打断正在进行中的加载
+                if (loaded || loading) return; // 已加载过 / 正在加载中：不重复发请求（"重复点击"坑）
+                doLoad();
+            });
+            return li;
+        }
+
+        function ensureRootNode(absPath) {
+            const key = pathKey(absPath);
+            if (!key) return null;
+            const idx = rootKeys.indexOf(key);
+            if (idx !== -1) return treeRootUl.children[idx];
+            rootKeys.push(key);
+            const li = ovlRemoteTreeNodeLi(absPath, absPath);
+            treeRootUl.appendChild(li);
+            return li;
+        }
+
+        // 展开一个根节点：不管是预设根还是用户刚手动输入的路径，统一走"确保节点存在→模拟点击
+        // 展开"这一条路径，跟用户直接点树里任意一行完全同一套逻辑（去重/懒加载/错误态/重复
+        // 点击防抖全部只写一份）。
+        function expandRoot(absPath) {
+            const li = ensureRootNode(absPath);
+            if (!li) return;
+            const row = li.querySelector(':scope > .ovl-tree-row');
+            if (!row) return;
+            if (!li.classList.contains('ovl-tree-open')) {
+                row.click();
+            } else {
+                selectPath(absPath, row);
+                try { li.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+            }
+        }
+
+        function renderRoots() {
+            treeRootUl = document.createElement('ul');
+            treeRootUl.className = 'ovl-tree-ul ovl-tree-root';
+            rootKeys.length = 0;
+            listWrap.textContent = '';
+            listWrap.appendChild(treeRootUl);
+            const roots = ovlRemoteTreePickerDefaultRoots();
+            if (!roots.length) {
+                rootsLabel.textContent = '';
+                const emptyLi = document.createElement('li');
+                emptyLi.className = 'ovl-tree-empty';
+                emptyLi.textContent = '还没有可用的常用位置——先在上面手动填一次远程绝对路径，之后每次打开都会记住它。';
+                treeRootUl.appendChild(emptyLi);
+                return;
+            }
+            rootsLabel.textContent = (OvlState.fsRootAllowlist && OvlState.fsRootAllowlist.enabled)
+                ? '桥已配置根目录白名单，下面是允许访问的位置：'
+                : '常用位置（点击展开浏览，也可以在上面直接输入任意路径）：';
+            roots.forEach(function (r) { ensureRootNode(r); });
+        }
+
+        // "列出/刷新"按钮：不再是"把当前列表推倒重列"，而是"把输入框里这条路径也变成一个
+        // 可展开的树节点并展开它"——手动输入路径的能力原样保留（硬要求：不能删掉现有入口），
+        // 只是接入方式换成了跟点树里任意一行同一套机制（去重/懒加载/错误态/重复点击防抖全部
+        // 复用，不用再写第二遍）。
+        function goToTypedPath() {
             const p = input.value.trim();
             renderError('');
-            listWrap.textContent = '';
-            if (!p) return;
-            const loading = document.createElement('div');
-            loading.className = 'ovl-tree-loading';
-            loading.textContent = '正在列出…';
-            listWrap.appendChild(loading);
-            inFlight++;
-            ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: p, path: '.' }).then(function (data) {
-                inFlight--;
-                if (handleDismissed(p)) return;
-                listWrap.textContent = '';
-                if (!data || data.ok !== true) {
-                    renderError((data && data.error) || '列出目录失败——检查路径是否存在、桥是否在线、令牌是否正确');
-                    return;
-                }
-                const dirs = (Array.isArray(data.entries) ? data.entries : []).filter(function (e) { return e.isDir; });
-                const parent = ovlRemoteParentPath(p);
-                if (parent && parent !== p) {
-                    const upRow = document.createElement('div');
-                    upRow.className = 'ovl-history-row';
-                    upRow.style.cursor = 'pointer';
-                    upRow.textContent = '.. 上一级';
-                    upRow.addEventListener('click', function () { input.value = parent; listCurrent(); });
-                    listWrap.appendChild(upRow);
-                }
-                if (!dirs.length) {
-                    const empty = document.createElement('div');
-                    empty.className = 'ovl-history-empty';
-                    empty.textContent = '（没有子目录）';
-                    listWrap.appendChild(empty);
-                }
-                dirs.forEach(function (e) {
-                    const row = document.createElement('div');
-                    row.className = 'ovl-history-row';
-                    row.style.cursor = 'pointer';
-                    row.textContent = '📁 ' + e.name;
-                    row.addEventListener('click', function () {
-                        const sep = (p.indexOf('\\') !== -1 && p.indexOf('/') === -1) ? '\\' : '/';
-                        input.value = p.replace(/[\\/]+$/, '') + sep + e.name;
-                        listCurrent();
-                    });
-                    listWrap.appendChild(row);
-                });
-            }).catch(function (e) {
-                inFlight--;
-                if (handleDismissed(p)) return;
-                listWrap.textContent = '';
-                renderError('列出目录失败：' + (e && e.message ? e.message : String(e)));
-            });
+            if (!p) { renderError('请先填写远程绝对路径'); return; }
+            if (!treeRootUl) renderRoots();
+            expandRoot(p);
         }
 
         const btnRow = document.createElement('div');
         btnRow.className = 'ovl-modal-btns';
         const listBtn = document.createElement('button');
         listBtn.type = 'button'; listBtn.id = 'ovlRemotePickListBtn'; listBtn.className = 'ovl-modal-btn'; listBtn.textContent = '列出/刷新';
-        listBtn.addEventListener('click', listCurrent);
+        listBtn.addEventListener('click', goToTypedPath);
         const cancelBtn = document.createElement('button');
         cancelBtn.type = 'button'; cancelBtn.id = 'ovlRemotePickCancelBtn'; cancelBtn.className = 'ovl-modal-btn'; cancelBtn.textContent = '取消';
         const okBtn = document.createElement('button');
@@ -39614,7 +39803,8 @@ function ovlRemotePickFolder(opts) {
             }).catch(function (e2) { inFlight--; okBtn.disabled = false; if (handleDismissed(p)) return; renderError('连接失败：' + (e2 && e2.message ? e2.message : String(e2))); });
         });
 
-        if (input.value) listCurrent();
+        renderRoots();
+        if (initial) expandRoot(initial);
     });
 }
 
@@ -42285,6 +42475,11 @@ async function ovlBridgeCheckHealth() {
         // v2 Pass P53：本地模式下 /health 会带上"克隆存放位置"弹窗要用的默认父目录（远程
         // 模式下这个字段不存在——桥那边故意不在 REMOTE_MODE 下透出本机路径，见桥端注释）。
         OvlState.defaultOverleafCloneRoot = (data && typeof data.defaultOverleafCloneRoot === 'string') ? data.defaultOverleafCloneRoot : null;
+        // v2 Pass P154：见 OvlState.fsRootAllowlist 头部注释——旧桥没有这个字段时 data.fsRootAllowlist
+        // 是 undefined，falls through 到 null，跟"桥在线但没这个能力"的既有处理口径一致。
+        OvlState.fsRootAllowlist = (data && data.fsRootAllowlist && typeof data.fsRootAllowlist === 'object')
+            ? { enabled: !!data.fsRootAllowlist.enabled, roots: Array.isArray(data.fsRootAllowlist.roots) ? data.fsRootAllowlist.roots.filter((r) => typeof r === 'string' && r) : [] }
+            : null;
     } catch (e) {
         online = false;
         bridgeCapabilities = null;
@@ -42292,6 +42487,9 @@ async function ovlBridgeCheckHealth() {
     const wasOnline = OvlState.bridgeOnline;
     OvlState.bridgeOnline = online;
     OvlState.bridgeCapabilities = online ? bridgeCapabilities : null;
+    // v2 Pass P154：桥离线时清掉陈旧的白名单快照，跟 bridgeCapabilities 同一条口径——
+    // 不让"上次在线时探到的根列表"在桥离线/换了个不同配置的桥之后继续误导选择器。
+    if (!online) OvlState.fsRootAllowlist = null;
     if (typeof chatUpdateCapabilityHint === 'function') { try { chatUpdateCapabilityHint(); } catch (e) {} }
     // 桥在线状态没有翻转的这一轮（绝大多数 5 秒轮询）不重渲 PDF body——ovlRenderPdfBody()
     // 末尾会无条件调 ovlPdfApplyView() 重画当前页 canvas，每轮都跑就是"PDF 每隔几秒闪一下"
@@ -49811,7 +50009,19 @@ async function ovlDownloadOtherFile(filename) {
     if (!data || !data.id || !filename) return;
     try {
         const resp = await ovlBridgeFetch('/output/' + data.id + '/' + encodeURIComponent(filename));
-        if (!resp.ok) { ovlFlashSaveStatus('下载失败（HTTP ' + resp.status + '）', true); return; }
+        if (!resp.ok) {
+            // v2 Pass P154：跟 ovlRemoteFetchAssetBytes 同一处丢弃服务端错误原因的问题——
+            // /output/:id/:file 失败时桥端把确切原因放在响应体 JSON 的 error 字段里
+            // （见 server.js /output/ 路由的 sendJson(res, 404, {ok:false, error:...})），
+            // 这里原来只显示 HTTP 状态码。优先读服务端 error，读不到才回落状态码文案。
+            let serverError = null;
+            try {
+                const errBody = await resp.clone().json();
+                if (errBody && typeof errBody.error === 'string' && errBody.error) serverError = errBody.error;
+            } catch (e) { /* 响应体不是合法 JSON，回落到状态码 */ }
+            ovlFlashSaveStatus(serverError ? ('下载失败：' + serverError) : ('下载失败（HTTP ' + resp.status + '）'), true);
+            return;
+        }
         const blob = await resp.blob();
         const objUrl = URL.createObjectURL(blob);
         const a = document.createElement('a');
