@@ -889,6 +889,10 @@ body.is-resizing-settings-modal * {
 #aiChatRoot .aichat-ringchip.is-est .aichat-ring-track { stroke: #e2e8f0; }
 #aiChatRoot .aichat-ring-arc { fill: none; stroke: #4f46e5; stroke-width: 3; stroke-linecap: round; }
 #aiChatRoot .aichat-ringchip.is-est .aichat-ring-arc { stroke: #94a3b8; stroke-dasharray: 2 2; stroke-linecap: butt; }
+/* v2 Pass P147：花销紧凑文本，紧跟在环的百分比/token 数右边，同一个 <span> 容器内——
+   用户明确要求"只保留价格"，字重比左边的用量数字略轻一点，靠左留个小间距即可，不需要
+   单独的背景/边框（那样又变回一颗独立 chip 了，正是这轮要去掉的东西）。 */
+#aiChatRoot .aichat-ring-cost { margin-left: 4px; opacity: .82; }
 #aiChatRoot .aichat-minibtn {
     flex: 0 0 auto;
     padding: 2px 8px;
@@ -4450,8 +4454,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.20.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-09';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.21.00';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-10';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -5070,10 +5074,18 @@ function usageComputeTaskCost(provider, model, taskUsage) {
 }
 
 // ---- 格式化：三条硬规则的落地点，价格/用量未知绝不显示成 0 ----
+// v2 Pass P147：T0 2026-09 收紧的硬规则——**整页面任何状态下都不出现字面量 "$0.00"**（连
+// tooltip 里"花销："这行也算，不只是新加的紧凑展示位）。P144 原本的设计是"真实算出来的 0
+// （比如 0 token）显示成 $0.00，用来跟'未知'（价格未知/用量未知）区分开"——这条本身没错，
+// 但字面量选得不对：真实测过短对话花费常是几厘钱，四舍五入成 0.00 会被用户误读成"免费"或
+// "功能坏了"（跟 <0.0001 那一档想避免的问题是同一个道理，只是旧代码只在 <0.0001 才躲，
+// 0.0001~<0.005 这段仍然会被 toFixed(4)/toFixed(2) 十进到看起来像整数 0 的写法）。改成：
+// 真实金额 <0.005（含恰好为 0）统一显示成 "<$0.01"——既不是"未知"（用量/价格确实都拿到了），
+// 也绝不是会被误读的 "$0.00"，跟 usageCompactCostText（紧凑展示专用，同一条边界规则）口径
+// 保持一致，不是本函数一套、那个函数另一套。
 function usageFormatCurrency(sym, amount) {
     if (amount == null || typeof amount !== 'number' || !isFinite(amount)) return '价格未知';
-    if (amount <= 0) return sym + '0.00';                 // 真实算出来的 0（比如 0 token），不是"未知"
-    if (amount < 0.0001) return '<' + sym + '0.0001';      // 避免真实的小额费用被 toFixed 四舍五入成看起来像"未知被藏成 0"的 0.00
+    if (amount < 0.005) return '<' + sym + '0.01';
     if (amount < 1) return sym + amount.toFixed(4);
     return sym + amount.toFixed(2);
 }
@@ -5082,6 +5094,30 @@ function usageFormatCostText(cost) {
     if (!cost.priceKnown || cost.amount == null) return '价格未知';
     const sym = cost.currency === 'CNY' ? '¥' : '$';
     return usageFormatCurrency(sym, cost.amount);
+}
+// v2 Pass P147：紧凑花销文本——只用两位小数、只显示价格、绝不显示 token 用量，专给聊天栏顶部
+// 「上下文用量环」徽标用（P144 原本单独一颗 chip，本轮用户要求并进这颗环的百分比右边，见
+// chatRingHtml；那颗独立 chip 与翻译器悬浮窗那颗一起被删掉，见 renderHeader/chatUpdateBar
+// 的改动）。刻意不复用 usageFormatCurrency——那个函数服务 tooltip 里的精细展示（<1 用 4 位
+// 小数、真 0 显示成"$0.00"），这里是标题栏寸土寸金的展示位，T0 2026-09 定的三条边界规则：
+//   1) 真花销 >0 但 <0.005（两位小数会四舍五入成"0.00"）显示 "<$0.01"；金额恰好为 0（或任何
+//      <0.005 的非负值）一律归进这一档——硬规则是"整页面任何状态都不出现 $0.00"，不区分
+//      "真免费"和"几厘钱"，两者用户都不关心具体差多少，但绝不能让 0 被读成"免费"或"功能坏了"。
+//   2) usage/价格拿不到（含 claude 链路——callClaudeAPI 是改动禁区，永远解析不出 usage）显示
+//      "$—"：不显示 0、不留空白，能跟"真的免费"区分开，原因写在 data-tip 里（复用
+//      usageTipText 的既有文案，不新造一份）。
+//   3) 其余情形固定两位小数，例如 "$1.09"。
+// 币种跟 usageFormatCostText 保持一致：按 cost.currency 选符号（qwen 国内站可能是 CNY，
+// 显示 ¥—），不做任何汇率换算（沿用 P144 的既有规矩，未越权新增机制）。
+function usageCompactCostText(provider, model, taskUsage) {
+    if (provider === 'claude') return '$—';
+    const cost = usageComputeTaskCost(provider, model, taskUsage);
+    const sym = cost.currency === 'CNY' ? '¥' : '$';
+    if (!cost.usageKnown || !cost.priceKnown || typeof cost.amount !== 'number' || !isFinite(cost.amount)) {
+        return sym + '—';
+    }
+    if (cost.amount < 0.005) return '<' + sym + '0.01';
+    return sym + cost.amount.toFixed(2);
 }
 function usageTokensText(u) {
     const p = u.promptTokens || 0, c = u.completionTokens || 0;
@@ -5104,9 +5140,9 @@ function usageDisplayFor(provider, model, taskUsage) {
 // tooltip 里补"本会话累计"）。
 // v2 Pass P145：webSearchOn——这次任务（ChatState.lastRequest.webSearch，"真正发出去的"那个值，
 // 不是控件当前的实时状态，两者可能因为用户改了开关又还没发新一轮请求而不同步）是否带了联网
-// 搜索。只有聊天栏会传这个参数（chatTaskUsageChipHtml），翻译器悬浮窗（renderTaskUsageChip）
-// 从不传——翻译链路从不读联网开关、从不发任何联网字段，那颗芯片如果也显示这条提醒就是在暗示
-// "翻译可能用了联网"，那是假的，绝不能两个芯片共用一份判断。
+// 搜索。只有聊天栏会传这个参数（v2 Pass P147 起挂在 chatRingHtml 里）——翻译链路已经不再
+// 显示任何花销信息（见 renderHeader 的改动），从不读联网开关、从不发任何联网字段，不存在
+// "两个芯片共用一份判断"的问题了。
 function usageTipText(provider, model, taskUsage, sessionTotal, webSearchOn) {
     if (provider === 'claude') {
         return 'Claude 链路的用量字段（usage.input_tokens/output_tokens）需要改 callClaudeAPI 函数体才能解析，'
@@ -18976,25 +19012,6 @@ function renderSynonymPopup() {
     return '';
 }
 
-// v2 Pass P144："本次翻译任务"（含分批 + 自动重试 + 降级重试）token 用量 + 按内置价格表算出
-// 的花销，挂在 AI 翻译器悬浮窗（P141 加「分行对齐」的那个工具栏所在窗口，就是这个 v1
-// #root 界面）顶栏的操作区，紧挨着 TRANSLATE 按钮。三条硬规则同聊天栏那颗 chip
-// （见 usageDisplayFor/usageFormatCurrency 定义处）：usage 未知显示"用量未知"、价格未知显示
-// "价格未知"、claude 链路显示"不支持用量统计"，绝不渲染成 $0.00。
-function renderTaskUsageChip() {
-    const u = AppState.lastTaskUsage;
-    const provider = (u && u.provider) || AppState.apiProvider;
-    const model = (u && u.model) || AppState.selectedModel;
-    const d = usageDisplayFor(provider, model, u);
-    const tip = usageTipText(provider, model, u, AppState.sessionTaskUsageTotal);
-    const label = d.unsupported ? d.tokensText : (d.tokensText + ' · ' + d.costText);
-    return `
-        <div id="ovlTaskUsageChip" class="flex items-center px-3 py-2 rounded-2xl border border-slate-200 bg-slate-50 text-[10px] font-bold text-slate-500 whitespace-nowrap${d.unsupported ? ' opacity-70' : ''}" data-tip="${escapeAttr(tip)}" data-tip-pos="bottom-end">
-            ${escapeHtml(label)}
-        </div>
-    `;
-}
-
 // ============= 头部 =============
 function renderHeader() {
     return `
@@ -19026,7 +19043,6 @@ function renderHeader() {
                 <button type="button" id="chatToggleBtn" onclick="chatToggle()" aria-pressed="${ChatState.open ? 'true' : 'false'}" class="${ChatState.open ? 'is-chat-open ' : ''}p-2.5 rounded-2xl border border-slate-200 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-all active:scale-95 flex items-center justify-center" data-tip="打开／关闭 AI 对话窗。" data-tip-pos="bottom-start">
                     ${Icons.MessageSquare}
                 </button>
-                ${renderTaskUsageChip()}
                 <!-- id 是给 syncTranslateButtonState() 用的：handleInputChange 刻意不重渲染
                      （避免焦点丢失），所以这颗按钮的 disabled 必须由那边直接改到 DOM 上，
                      否则它会一直停在「输入框还是空的」那一刻算出来的值上。 -->
@@ -21964,13 +21980,33 @@ const CHAT_LATEX_MATH_SENTINEL = '\uE002';
 // 结果被偷偷编译了。这个函数不管围栏里写的是什么语言（```python/```latex/裸 ```），
 // 一律先保护起来——反正数学占位符提取不会动到任何不含 $ / \[ / \( / \begin{} 的内容，
 // 保护范围宽一点没有副作用。
-// 正则只认标准三反引号围栏（可选语言标签，闭合围栏单独占一行），不认 ~~~ 变体、不认
-// 4 个以上反引号的围栏、也不认没有闭合围栏的截断输入——聊天场景模型几乎总是用最常见的写法，
-// 没有先例需要覆盖这些边缘情况；少数没被这条正则捕获的围栏会退化成"数学占位符提取正常扫描"，
-// 不会崩，只是保护不到（已知限制，聊天场景暂未见到过这类边缘写法）。
+// 正则只认标准三反引号围栏（可选语言标签），不认 ~~~ 变体、不认 4 个以上反引号的围栏——
+// 聊天场景模型几乎总是用最常见的写法，没有先例需要覆盖这些边缘情况；少数没被下面两条正则
+// 捕获的围栏会退化成"数学占位符提取正常扫描"，不会崩，只是保护不到（已知限制）。
+// v2 Pass P147：**未闭合的围栏**（模型输出被截断，或干脆没写收尾 ```）原来完全不受保护——
+// 退化路径原地暴雷：如果围栏内部恰好有 $...$，会被下面 chatExtractMath 的正则误当数学公式
+// 挖走、编译成 KaTeX HTML 占位符；真实 marked 对**未闭合**围栏的行为是"没有收尾就一路开到
+// 消息末尾"（实测 marked.parse('```py\\nprint(1)\\nno close') 输出一个 <pre><code> 包到底，
+// 跟 GFM 规范一致），于是那个未转义的 KaTeX HTML 占位符最终原样落在 marked 生成的
+// <pre><code> 内部展开——变成 HTML 节点混进本该是纯文本的代码块，显示错乱（内容本身经过
+// KaTeX 的 trust:false/throwOnError:false，不是新的 XSS 口子，但绝不该以 HTML 节点的形态
+// 出现在 <pre><code> 里，那里只应该有转义后的文本）。
+// 修法：第二遍正则专找"开了但没找到收尾 ```"的围栏，从开围栏那一行一路保护到文本末尾——
+// 跟 marked 自己的 GFM 语义对齐（"未闭合 = 到文档末尾"），保护之后原样交还给下面既有的
+// escapeHtml→marked 链路：marked 收到的是转义后的纯文本，生成的 <pre><code> 内容因此也是
+// 转义后的文本，不会再有任何 HTML 节点漏进去。
 function chatProtectFences(s) {
     const fences = [];
-    const text = String(s == null ? '' : s).replace(/^```([^\n`]*)\n([\s\S]*?)\n```[ \t]*$/gm, function (raw) {
+    let text = String(s == null ? '' : s).replace(/^```([^\n`]*)\n([\s\S]*?)\n```[ \t]*$/gm, function (raw) {
+        const id = CHAT_LATEX_FENCE_SENTINEL + 'F' + fences.length + CHAT_LATEX_FENCE_SENTINEL;
+        fences.push({ id: id, raw: raw });
+        return id;
+    });
+    // 上面那条正则只吃"闭合"的围栏；这里补吃"开了但一路到文本末尾都没有收尾 ```"的情形。
+    // 非全局（一次足够）——已闭合的围栏全部被上一步换成了哨兵占位符（不再含字面 ``` ），
+    // 剩下能匹配到的开围栏行最多只有一条（真正未闭合的那一条），[\s\S]*$ 贪婪吃到字符串
+    // 真正的结尾。
+    text = text.replace(/^```([^\n`]*)\n([\s\S]*)$/m, function (raw) {
         const id = CHAT_LATEX_FENCE_SENTINEL + 'F' + fences.length + CHAT_LATEX_FENCE_SENTINEL;
         fences.push({ id: id, raw: raw });
         return id;
@@ -22056,9 +22092,27 @@ function chatExtractMath(text) {
         return id;
     });
     pushPlaceholder(/\\\[([\s\S]*?)\\\]/g, 'display', function (match, p1) { return p1; });
-    pushPlaceholder(/\$\$([\s\S]*?)\$\$/g, 'display', function (match, p1) { return p1; });
+    // v2 Pass P147：修「这周花了 $5 和 $10」被当成行内数学、中间正文被吞掉的真回归（基线上是
+    // 纯文本，P146 引入的原版 /\$([^\$]+?)\$/g 对货币场景过于饥渴——它只要求"两个 $ 之间没有
+    // 第三个 $"，"$5 和 $10" 里第一个 $ 会一路吃到第二个 $ 收口，把"5 和 "整段错当成数学式）。
+    // 不自创启发式，照抄 Pandoc tex_math_dollars 扩展的业界通行三条规则（这三条合起来才是
+    // "行业标准"，只挑前两条并不够——下面 ★ 标注的场景会解释为什么）：
+    //   1) 开定界符 $ 紧跟空白 → 不算数学开头（(?!\s)）。
+    //   2) 闭定界符 $ 紧邻前方是空白 → 不算数学收尾（(?<!\s)）。
+    //   3) 闭定界符 $ 紧跟数字 → 不算数学收尾（(?!\d)）。★ 没有这条，"价格表：$5,$10,$15"
+    //      这类无空格、逗号分隔的连续多个 $ 会被规则 1/2 放过（逗号不是空白），第一个 $ 会跟
+    //      第二个 $ 错误配对成"$5,$10"；有了这条，第二个 $ 紧跟数字 '1' 不合法收尾，整段
+    //      正确退回纯文本。
+    // 加一条转义支持（任务书明确要求，非 Pandoc 原生规则）：$ 前面是反斜杠（\$）时，不管是
+    // 当开还是当闭都不算数——(?<!\\) 分别挡在开/闭两处。真实反斜杠转义本身不用额外处理：
+    // \$ 不会被这条正则消费，会原样连同反斜杠一起流入 escapeHtml→marked，marked 自己的
+    // CommonMark 转义（$ 属于可转义的 ASCII 标点）会把 "\$" 渲染成裸 "$"——跟真实浏览器加载
+    // 的 marked 实测一致（marked.parse('\\$5') === '<p>$5</p>'），不用在这里另外处理反斜杠。
+    // 真实数学（$x$ / $a+b$ / $\alpha_i$ / $E=mc^2$ / $\frac{a}{b}$ 等）不受影响：它们的收尾 $
+    // 前面从来不是空白、后面也从来不是数字，三条规则对它们全部放行。
+    pushPlaceholder(/(?<!\\)\$\$([\s\S]*?)(?<!\\)\$\$/g, 'display', function (match, p1) { return p1; });
     pushPlaceholder(/\\\(([\s\S]*?)\\\)/g, 'inline', function (match, p1) { return p1; });
-    pushPlaceholder(/\$([^\$]+?)\$/g, 'inline', function (match, p1) { return p1; });
+    pushPlaceholder(/(?<!\\)\$(?!\s)([^\$]+?)(?<!\s)(?<!\\)\$(?!\d)/g, 'inline', function (match, p1) { return p1; });
 
     return { text: content, placeholders: placeholders };
 }
@@ -27975,6 +28029,11 @@ function chatArcPath(cx, cy, r, frac) {
         + x.toFixed(3) + ' ' + y.toFixed(3);
 }
 
+// v2 Pass P147：P144 原本在这颗环旁边另开一颗独立 chip（chatTaskUsageChipHtml）显示"本次任务"
+// 用量+花销，用户明确要求返工——那颗独立 chip 太不美观，只保留价格、并进这颗环本身（百分比
+// 右边），不再显示 token 用量（用量这颗环自己已经在显示）。旧函数已删除，花销计算/tooltip
+// 全部复用 P144/P145 既有的 usageComputeTaskCost/usageTipText，只是显示口径变了（见
+// usageCompactCostText 定义处的三条边界规则）。
 function chatRingHtml(ro) {
     const w = ro.window;
     const frac = (w.known && w.denom > 0) ? (ro.tokens / w.denom) : 0;
@@ -27995,28 +28054,30 @@ function chatRingHtml(ro) {
               + '上下文长度是**现问出来的**（' + w.source + '），没有写死 —— LM Studio 一重启它就回落 4096。'
             : '这个提供方没有可发现的上下文长度，所以只报绝对 token 数、不报百分比（写死一个数字就是撒谎）。')
         + '低于 2% 时环上画的是一个最小可见刻度，真实比例以旁边的数字为准。点一下看分项。';
+    // v2 Pass P147：花销紧凑文本，紧跟在百分比（或没有百分比时的 "K tok"）右边，同一个
+    // <span> 容器内——不是另开一个 DOM 节点。tooltip 拼接 usageTipText 的完整说明（含
+    // P145 的"不含联网搜索按次计费"提醒）。
+    // 已完成任务的花销要钉在它**实际用的**模型上——taskUsage 自己就记着 provider/model
+    // （usageNewTask 造出来的时候就带上了），优先用它；只有 taskUsage 还没有（比如刚打开
+    // 聊天窗、一次请求都没发过）才回落到 chatModelChoice() 的当前选择，作为"预览这次会
+    // 用哪个模型的价格"。翻译器悬浮窗原来的 renderTaskUsageChip（已删除）就是这个钉死
+    // 逻辑（`u.provider || AppState.apiProvider`）——这里照搬同一条规则，不是新发明；
+    // 少了它，切换聊天模型下拉框会让上一轮已经花完的钱跟着新模型的单价重新算一遍，是错的
+    // （P144/test_p144 场景 7 那条回归测的就是这个，见 tools/e2e/test_p144_usage_cost.js）。
+    const c = chatModelChoice();
+    const u = ChatState.lastTaskUsage;
+    const costProvider = (u && u.provider) || c.provider;
+    const costModel = (u && u.model) || c.model;
+    const costText = usageCompactCostText(costProvider, costModel, u);
+    const searchOn = !!(ChatState.lastRequest && ChatState.lastRequest.webSearch);
+    const costTip = usageTipText(costProvider, costModel, u, ChatState.sessionTaskUsageTotal, searchOn);
+    const fullTip = tip + ' ' + costTip;
     return '<button type="button" class="aichat-ringchip' + (ro.measured ? '' : ' is-est') + '" id="aiChatRingBtn"'
-        + ' data-tip="' + escapeAttr(tip) + '" data-tip-pos="top-start">'
+        + ' data-tip="' + escapeAttr(fullTip) + '" data-tip-pos="top-start">'
         + '<svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true">'
         + '<circle class="aichat-ring-track" cx="11" cy="11" r="8"></circle>'
         + (d ? '<path class="aichat-ring-arc" d="' + d + '"></path>' : '')
-        + '</svg><span>' + escapeHtml(label) + '</span></button>';
-}
-
-// v2 Pass P144：「本次任务」token 用量 + 按内置价格表算出的美元/人民币花销。跟上面的环
-// （chatRingHtml，那是"这一轮上下文占了多少窗口"）是两个不同的量，各自一个 chip。
-// 硬规则：usage 拿不到显示"用量未知"、价格拿不到显示"价格未知"、claude 链路显示"不支持用量
-// 统计"——三者都绝不渲染成 $0.00（见 usageDisplayFor/usageFormatCurrency 定义处）。
-function chatTaskUsageChipHtml() {
-    const c = chatModelChoice();
-    const d = usageDisplayFor(c.provider, c.model, ChatState.lastTaskUsage);
-    // v2 Pass P145：读的是"真正发出去的那一次请求"（ChatState.lastRequest），不是控件的实时状态——
-    // 用户可能刚关掉开关但还没发下一轮，这时候上一次任务确实带着联网，芯片理应仍然提醒。
-    const searchOn = !!(ChatState.lastRequest && ChatState.lastRequest.webSearch);
-    const tip = usageTipText(c.provider, c.model, ChatState.lastTaskUsage, ChatState.sessionTaskUsageTotal, searchOn);
-    const label = d.unsupported ? d.tokensText : (d.tokensText + ' · ' + d.costText);
-    return '<span class="aichat-taskusage-chip' + (d.unsupported ? ' is-unsupported' : '') + '" id="aiChatTaskUsageChip"'
-        + ' data-tip="' + escapeAttr(tip) + '" data-tip-pos="top">' + escapeHtml(label) + '</span>';
+        + '</svg><span>' + escapeHtml(label) + '<span class="aichat-ring-cost" id="aiChatRingCost">' + escapeHtml(costText) + '</span></span></button>';
 }
 
 // 底部状态条：环 + 会话 + 「历史怎么裁的」那句老话。
@@ -28037,7 +28098,6 @@ function chatUpdateBar() {
 
         bar.innerHTML = '<div class="aichat-ctxrow">'
             + chatRingHtml(ro)
-            + chatTaskUsageChipHtml()
             + '<span class="aichat-pspacer"></span>'
             + '<button type="button" class="aichat-minibtn' + (ChatState.panel === 'history' ? ' is-on' : '') + '"'
             + ' id="aiChatHistBtn" data-tip="'
