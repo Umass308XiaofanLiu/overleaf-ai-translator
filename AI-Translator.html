@@ -1105,6 +1105,32 @@ body.is-resizing-settings-modal * {
 #aiChatRoot .aichat-md pre { background: #f1f5f9; border-radius: 8px; padding: 6px 8px; overflow-x: auto; }
 #aiChatRoot .aichat-md pre code { background: transparent; padding: 0; }
 
+/* v2 Pass P146：聊天气泡里编译后的 LaTeX 公式——KaTeX 默认字号相对聊天 12px 正文偏大，
+   收一收；行内/行间公式都可能比气泡宽（长求和/矩阵/多行 align），横向滚动而不是撑破气泡
+   布局（.katex-display 的横向滚动是全局规则，:31 已有，这里只补行内场景不会有的字号收敛）。
+   KaTeX 渲染失败的兜底（chatExtractMath 的 catch 分支）复用 .aichat-md code 的等宽底色，
+   只加一点点色调区分"这是渲染失败的原始源码"，不需要整套新样式。 */
+#aiChatRoot .aichat-md .katex { font-size: 1.02em; }
+#aiChatRoot .aichat-md .katex-display { overflow-x: auto; overflow-y: hidden; }
+#aiChatRoot .aichat-md code.aichat-latex-fallback { color: #b45309; }
+
+/* v2 Pass P146：```latex 围栏代码块的「代码 / 预览」切换。默认代码形态——现有 <pre> 原样
+   不动只是被挪进这个新壳里；预览面板首次点开才惰性渲染（chatWireLatexFences），隐藏用浏览器
+   原生 [hidden] 属性，不需要额外 display 规则。 */
+#aiChatRoot .aichat-latex-fence { margin: 6px 0; }
+#aiChatRoot .aichat-latex-fence-bar { display: flex; gap: 4px; margin-bottom: 4px; }
+#aiChatRoot .aichat-latex-fence-preview {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 8px 10px;
+    font-size: 12px;
+    line-height: 1.6;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+#aiChatRoot .aichat-latex-fence-preview .katex-display { margin: 4px 0; }
+
 /* ---- 缩放手柄：八向，四条边 + 四个角，光标形状照 Windows 的窗口边框 ----
    【尺寸不是拍的，是被两侧夹出来的】
      · 太薄抓不住；Windows 自己的可拖边框（SM_CXSIZEFRAME + 边框填充）实际约 4–8 px。
@@ -4417,7 +4443,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.18.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.19.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-09';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -21788,16 +21814,213 @@ function chatAppendCopyAnswer(row, answerText) {
     } catch (e) {}
 }
 
-// 助手气泡里的正文。**先 escapeHtml，再 marked.parse**，刻意不走 renderFormattedText：
+// v2 Pass P146：聊天气泡 LaTeX 编译渲染的两个私用区哨兵，跟 CHAT_MD_TILDE（上面 :21244）
+// 同一手法——解析前把一段原始文本换成一个绝不会跟正文冲突的码位序列，escapeHtml/marked 全程
+// 当透明字符穿过去，最后按需精确找回来换成真内容。用两个不同码位分别保护「围栏代码块」和
+// 「数学占位符」，不共用一个，哪怕将来某一套处理逻辑出 bug 也不会串到另一套头上。
+const CHAT_LATEX_FENCE_SENTINEL = '\uE001';
+const CHAT_LATEX_MATH_SENTINEL = '\uE002';
+
+// 从**原始未转义文本**里挖走围栏代码块（``` ... ```），换成哨兵占位符，返回
+// { text: 替换后的文本, fences: [{id, raw}] }（raw 含首尾的 ``` 行，原样一字不改）。
+// 必须在数学占位符提取**之前**跑——不然 ```latex\n$x$\n``` 这种代码块内部的 $x$ 会被
+// 下面 chatExtractMath 的正则当成数学公式挖走，用户明明想展示一段 LaTeX 源码字面量，
+// 结果被偷偷编译了。这个函数不管围栏里写的是什么语言（```python/```latex/裸 ```），
+// 一律先保护起来——反正数学占位符提取不会动到任何不含 $ / \[ / \( / \begin{} 的内容，
+// 保护范围宽一点没有副作用。
+// 正则只认标准三反引号围栏（可选语言标签，闭合围栏单独占一行），不认 ~~~ 变体、不认
+// 4 个以上反引号的围栏、也不认没有闭合围栏的截断输入——聊天场景模型几乎总是用最常见的写法，
+// 没有先例需要覆盖这些边缘情况；少数没被这条正则捕获的围栏会退化成"数学占位符提取正常扫描"，
+// 不会崩，只是保护不到（已知限制，聊天场景暂未见到过这类边缘写法）。
+function chatProtectFences(s) {
+    const fences = [];
+    const text = String(s == null ? '' : s).replace(/^```([^\n`]*)\n([\s\S]*?)\n```[ \t]*$/gm, function (raw) {
+        const id = CHAT_LATEX_FENCE_SENTINEL + 'F' + fences.length + CHAT_LATEX_FENCE_SENTINEL;
+        fences.push({ id: id, raw: raw });
+        return id;
+    });
+    return { text: text, fences: fences };
+}
+
+// 从**原始未转义文本**里挖出数学片段，逐个喂给 KaTeX 渲染，替换成占位符；返回
+// { text: 替换后的文本, placeholders: [{id, html}] }。调用方负责在剩下的散文部分做
+// escapeHtml→marked.parse，再按 placeholders **倒序**回填（跟 renderFormattedText 的
+// :9305 同一个理由——聊天目前没有 \textcolor 之类会嵌套占位符的构造，正序/倒序结果一样，
+// 但倒序是这套占位符机制的既有约定，跟着做不需要另外证明安全）。
+//
+// 【跟 renderFormattedText（:9147）共用同一套"占位符先挖出来"的手法，但两处关键差异
+// 不是疏漏，是聊天场景（不可信输入）跟 renderFormattedText 场景（用户自己打开的 .tex
+// 文件/翻译结果，视为可信）的安全边界不一样，故意不同】：
+//   1. trust:false（renderFormattedText 用 trust:true）。KaTeX 官方文档：trust:true 会放行
+//      \href/\url/\includegraphics/\htmlClass/\htmlId/\htmlData 这类可能指向任意协议
+//      （含 javascript:）或任意属性值的命令；trust:false（KaTeX 默认值）会挡下它们。
+//      聊天内容是模型自由生成的文本，在既有 XSS 威胁模型下跟"不可信输入"是同一档——聊天窗
+//      此前是纯文本、零 KaTeX 暴露面，套用 trust:true 会是一次新增的削弱，直接违反
+//      "不许削弱现有 XSS 防线"的硬约束。
+//   2. KaTeX 渲染失败（catch 分支）时，占位符内容是 escapeHtml(原始 match) 包一层
+//      <code class="aichat-latex-fallback">，不是裸 match——renderFormattedText 对应分支
+//      直接塞裸 match 是安全的，因为它的整条流水线从头到尾没有 escapeHtml，裸文本本来就
+//      还没被转义过、后面也不会再转义；聊天这边如果照抄，会让
+//      "$<img src=x onerror=alert(1)>$" 这种构造在 KaTeX 解析失败后被原样当成 HTML 插回
+//      气泡，正好绕过上面 escapeHtml→marked 那条链路，是这次任务书点名要测的
+//      "数学片段内部的注入尝试"。
+function chatExtractMath(text) {
+    const placeholders = [];
+    let content = text;
+    const nextId = () => CHAT_LATEX_MATH_SENTINEL + 'M' + placeholders.length + CHAT_LATEX_MATH_SENTINEL;
+
+    const pushPlaceholder = (regex, displayMode, getFormula) => {
+        content = content.replace(regex, function () {
+            const args = Array.prototype.slice.call(arguments);
+            const match = args[0];
+            const id = nextId();
+            let formula = getFormula.apply(null, args);
+            formula = cleanLatex(formula);
+            formula = stripCommand(formula, 'label');
+            formula = stripCommand(formula, 'tag');
+            formula = stripCommand(formula, 'eqref');
+            formula = stripCommand(formula, 'autoref');
+            formula = stripCommand(formula, 'ref');
+            let html;
+            try {
+                html = window.katex.renderToString(formula, {
+                    displayMode: displayMode === 'display',
+                    throwOnError: false,
+                    trust: false,
+                    strict: false,
+                    fleqn: false
+                });
+            } catch (e) {
+                html = '<code class="aichat-latex-fallback">' + escapeHtml(match) + '</code>';
+            }
+            placeholders.push({ id: id, html: html });
+            return id;
+        });
+    };
+
+    // 环境族（equation/align/gather/multline/eqnarray/alignat/cases/dcases/rcases）——
+    // 跟 renderFormattedText（:9237）同一份白名单，取消编号逻辑也照搬（聊天里的公式编号
+    // 没有跨消息的 \ref/\eqref 语义，直接转星号版本）。
+    pushPlaceholder(/\\begin\{(equation|align|gather|multline|eqnarray|alignat|cases|dcases|rcases)(\*?)\}(\{[^{}]*\})?([\s\S]*?)\\end\{\1\2\}/g, 'display', function (match, env, star, colSpec, body) {
+        const isCasesFamily = (env === 'cases' || env === 'dcases' || env === 'rcases');
+        const noNumberEnv = isCasesFamily ? (env + (star || '')) : (env + (star || '*'));
+        body = (colSpec || '') + body;
+        return '\\begin{' + noNumberEnv + '}' + body + '\\end{' + noNumberEnv + '}';
+    });
+    // flalign/IEEEeqnarray：跟 renderFormattedText（:9256）一样，KaTeX 0.16.9 实测不认识这两个
+    // 环境名，不硬喂给 KaTeX，用同一套「已知格式受限」说明框兜底（这里手动转义 rawMatch，
+    // 跟 renderFormattedText 那份一样本来就是安全的，不是本函数新增的安全考虑）。
+    content = content.replace(/\\begin\{(flalign|IEEEeqnarray)(\*?)\}(\{[^{}]*\})?([\s\S]*?)\\end\{\1\2\}/g, function (rawMatch, envName) {
+        const id = nextId();
+        placeholders.push({
+            id: id,
+            html: '<div class="ovl-math-unsupported"><div class="ovl-math-unsupported-note">KaTeX 暂不支持 '
+                + escapeHtml(envName) + ' 环境的渲染，以下为原始 LaTeX 源码</div><pre class="ovl-math-unsupported-src">' + escapeHtml(rawMatch) + '</pre></div>'
+        });
+        return id;
+    });
+    pushPlaceholder(/\\\[([\s\S]*?)\\\]/g, 'display', function (match, p1) { return p1; });
+    pushPlaceholder(/\$\$([\s\S]*?)\$\$/g, 'display', function (match, p1) { return p1; });
+    pushPlaceholder(/\\\(([\s\S]*?)\\\)/g, 'inline', function (match, p1) { return p1; });
+    pushPlaceholder(/\$([^\$]+?)\$/g, 'inline', function (match, p1) { return p1; });
+
+    return { text: content, placeholders: placeholders };
+}
+
+// ```latex 围栏代码块「预览」面板专用：直接把整段代码内容当 LaTeX 源码喂给 chatExtractMath，
+// 不经过 marked（它是代码，不是 Markdown 散文，不该被当成 Markdown 语法解析），换行靠 CSS
+// white-space:pre-wrap 保留（:1100 一带 .aichat-latex-fence-preview 已定义）。
+function chatRenderLatexFencePreview(rawSource) {
+    const extracted = chatExtractMath(String(rawSource == null ? '' : rawSource));
+    let html = escapeHtml(extracted.text);
+    for (let i = extracted.placeholders.length - 1; i >= 0; i--) {
+        const p = extracted.placeholders[i];
+        html = html.replace(p.id, p.html);
+    }
+    return html;
+}
+
+// 助手气泡渲染完之后，给每个 ```latex 围栏代码块加一个「代码 / 预览」切换（会话内存态，
+// 挂在闭包变量 rendered 里，不持久化）。默认 = 代码（跟围栏代码块现有的"保持代码形态"一致），
+// marked 生成的原 <pre><code class="language-latex"> 原样挪进新壳、绝不改动其内容——切换
+// 只是显隐两个既有 DOM 节点，「预览」面板首次点开才惰性渲染一次 KaTeX 并缓存，不给每条消息
+// 都摊上这份开销（多数消息里的围栏代码块从来不会被点开预览）。
+function chatWireLatexFences(bubble) {
+    if (!bubble) return;
+    const codes = bubble.querySelectorAll('pre > code');
+    for (let i = 0; i < codes.length; i++) {
+        const codeEl = codes[i];
+        if (!/(^|\s)language-latex(\s|$)/i.test(codeEl.className || '')) continue;
+        const preEl = codeEl.parentNode;
+        if (!preEl || preEl.getAttribute('data-aichat-latex-wired') === '1') continue;
+        preEl.setAttribute('data-aichat-latex-wired', '1');
+        const rawSource = codeEl.textContent;
+
+        const wrap = document.createElement('div');
+        wrap.className = 'aichat-latex-fence';
+        const bar = document.createElement('div');
+        bar.className = 'aichat-latex-fence-bar';
+        const btnCode = document.createElement('button');
+        btnCode.type = 'button';
+        btnCode.className = 'aichat-minibtn aichat-latex-fence-btn is-on';
+        btnCode.textContent = '代码';
+        btnCode.setAttribute('data-view', 'code');
+        const btnPreview = document.createElement('button');
+        btnPreview.type = 'button';
+        btnPreview.className = 'aichat-minibtn aichat-latex-fence-btn';
+        btnPreview.textContent = '预览';
+        btnPreview.setAttribute('data-view', 'preview');
+        bar.appendChild(btnCode);
+        bar.appendChild(btnPreview);
+        const previewEl = document.createElement('div');
+        previewEl.className = 'aichat-latex-fence-preview';
+        previewEl.hidden = true;
+
+        preEl.parentNode.insertBefore(wrap, preEl);
+        wrap.appendChild(bar);
+        wrap.appendChild(preEl);
+        wrap.appendChild(previewEl);
+
+        let rendered = false;
+        const setView = (view) => {
+            btnCode.classList.toggle('is-on', view === 'code');
+            btnPreview.classList.toggle('is-on', view === 'preview');
+            if (view === 'preview') {
+                if (!rendered) {
+                    try {
+                        previewEl.innerHTML = window.katex ? chatRenderLatexFencePreview(rawSource) : escapeHtml(rawSource);
+                    } catch (e) {
+                        previewEl.textContent = rawSource;
+                    }
+                    rendered = true;
+                }
+                previewEl.hidden = false;
+                preEl.hidden = true;
+            } else {
+                previewEl.hidden = true;
+                preEl.hidden = false;
+            }
+        };
+        btnCode.addEventListener('click', function () { setView('code'); });
+        btnPreview.addEventListener('click', function () { setView('preview'); });
+    }
+}
+
+// 助手气泡里的正文。**先从原始未转义文本挖出数学占位符，再 escapeHtml，再 marked.parse，
+// 最后倒序回填占位符**，刻意不整体走 renderFormattedText（见 chatExtractMath 上方注释的
+// trust:false / 转义兜底两条关键差异）：
 //   · escapeHtml 是本文件对「往 HTML 里塞不受控文本」的既有约定（见 escapeAttr 上方的注释），
 //     而气泡里装的是模型自由生成的文本。实测不转义时，回复里的
 //     `<img src=x onerror=...>` 会在气泡里变成活的元素并执行 —— 这不是安全加固问题，
 //     是「模型说的话被当成了标记」这种**正确性**问题。
 //   · 实测 escapeHtml→marked 不会把已有实体二次转义（`5 &lt; 6` 原样出来），
 //     Markdown 的加粗/列表/代码块全都照常工作。
-//   · 顺带的取舍：这样 `$\alpha_i$` 会**按源码原样显示**而不是渲染成公式。
-//     对这个工具反而是对的 —— 在讨论 LaTeX 的时候，用户要看的就是那串字节本身，
-//     提案卡的前后两栏也是同一个理由用等宽原样显示。
+//   · v2 Pass P146：`$\alpha_i$` / `$$...$$` / `\(...\)` / `\[...\]` / 裸
+//     `\begin{equation}...\end{equation}` 现在会渲染成编译后的公式（跟翻译器窗口/Visual
+//     模式一致），不再"按源码原样显示"——这条取舍随需求变化被推翻，上面 chatExtractMath 的
+//     两处安全差异就是为了在"渲染成公式"的同时不重新打开已经堵上的 XSS 口子。围栏代码块
+//     （包括 ` ```latex `）保持代码形态不受影响：chatProtectFences 在数学提取之前就把整段
+//     围栏挖成哨兵占位符，任何提取正则都碰不到围栏内部的字符。
 //   · **波浪号必须先藏起来。** marked 默认开着 GFM 的单波浪号删除线，而 LaTeX 里
 //     `第~\ref{sec:II}节` / `不确定性~\cite{10143419}` 这种不换行空格几乎出现在每一处引用上。
 //     实测（本地 qwen3.6 与 gemini-2.5-flash-lite 各一次真实对话，第一轮就中）气泡里出现
@@ -21812,21 +22035,38 @@ function chatAppendCopyAnswer(row, answerText) {
 //         `[文档](http://x/a~b)` 会整个不再是链接。
 //     私用区码位两条都躲开了；唯一要补的是链接目标会被 encodeURI 成 %EE%80%80，所以还原时
 //     把编码后的形式一起换回去（实测 `[主页](http://ece.umass.edu/~lorenzo)` href 逐字正确）。
+//   · **外层 try/catch 是最后一道保险，不是主要防线。** 单个公式渲染失败已经在
+//     chatExtractMath 内部逐个 try/catch 降级成原样源码，不会走到这里；这层 catch 兜的是
+//     "提取/转义/marked 本身"这一级更罕见的异常，兜不住时退回纯文本，绝不让异常穿透到
+//     调用方（渲染路径全 DOM 重建、没有外层 try/catch，见任务书"二号硬约束"）。
 function chatRenderProse(bubble, text) {
     const s = String(text == null ? '' : text);
     try {
         if (!window.marked) { bubble.textContent = s; return; }
         bubble.classList.add('aichat-md');
+        const fenceProtected = chatProtectFences(s);
+        const extracted = window.katex ? chatExtractMath(fenceProtected.text) : { text: fenceProtected.text, placeholders: [] };
+        let withFences = extracted.text;
+        fenceProtected.fences.forEach(function (f) { withFences = withFences.replace(f.id, f.raw); });
         // 先清掉模型自己写出来的哨兵码位，替换才是单射的（U+E000 是私用区，没有任何定义好的
         // 含义，浏览器本来也只会画一个豆腐块 —— 丢掉它不会丢掉任何可读内容）。
-        const md = escapeHtml(s).split(CHAT_MD_TILDE).join('').split('~').join(CHAT_MD_TILDE);
-        bubble.innerHTML = window.marked.parse(md)
+        const md = escapeHtml(withFences).split(CHAT_MD_TILDE).join('').split('~').join(CHAT_MD_TILDE);
+        let html = window.marked.parse(md)
             .split(CHAT_MD_TILDE).join('~')
             .split(encodeURI(CHAT_MD_TILDE)).join('~');
+        for (let i = extracted.placeholders.length - 1; i >= 0; i--) {
+            const p = extracted.placeholders[i];
+            html = html.replace(p.id, p.html);
+        }
+        bubble.innerHTML = html;
     } catch (e) {
         bubble.classList.remove('aichat-md');
         bubble.textContent = s;
+        return;
     }
+    // 预览/代码切换挂件失败不该连累已经渲染好的正文——单独一层 try/catch，出错顶多是
+    // 这条消息里的围栏代码块没长出切换按钮，比起整条消息退回裸文本轻得多。
+    try { chatWireLatexFences(bubble); } catch (e) {}
 }
 
 function chatSetBusy(on) {
