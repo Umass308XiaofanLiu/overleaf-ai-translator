@@ -1096,6 +1096,13 @@ body.is-resizing-settings-modal * {
 #aiChatRoot .aichat-msgacts { display: flex; gap: 6px; margin-top: 6px; }
 #aiChatRoot .aichat-msgacts .aichat-minibtn { font-size: 9px; padding: 1px 7px; }
 
+/* v2 Pass P145：Gemini grounding 来源链接——只在 API 真的回传了来源时才出现，纯文字+链接，
+   刻意不做成卡片，别让"这条回复用过联网"看起来比正文本身更醒目。 */
+#aiChatRoot .aichat-grounding { margin-top: 6px; font-size: 9px; color: #94a3b8; line-height: 1.6; }
+#aiChatRoot .aichat-grounding-label { margin-right: 2px; }
+#aiChatRoot .aichat-grounding-link { color: #0284c7; text-decoration: underline; word-break: break-all; }
+#aiChatRoot .aichat-grounding-link:hover { color: #0369a1; }
+
 /* 助手气泡里渲染 Markdown/KaTeX 之后，段落间距要收一收，否则一句话占三行高 */
 #aiChatRoot .aichat-md { white-space: normal; }
 #aiChatRoot .aichat-md p { margin: 0 0 6px 0; }
@@ -4417,7 +4424,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.18.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.19.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-09';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -5069,7 +5076,12 @@ function usageDisplayFor(provider, model, taskUsage) {
 }
 // 完整 tooltip：本次任务的实测口径说明 + 本会话累计（任务书 D：主显示"本次任务"，
 // tooltip 里补"本会话累计"）。
-function usageTipText(provider, model, taskUsage, sessionTotal) {
+// v2 Pass P145：webSearchOn——这次任务（ChatState.lastRequest.webSearch，"真正发出去的"那个值，
+// 不是控件当前的实时状态，两者可能因为用户改了开关又还没发新一轮请求而不同步）是否带了联网
+// 搜索。只有聊天栏会传这个参数（chatTaskUsageChipHtml），翻译器悬浮窗（renderTaskUsageChip）
+// 从不传——翻译链路从不读联网开关、从不发任何联网字段，那颗芯片如果也显示这条提醒就是在暗示
+// "翻译可能用了联网"，那是假的，绝不能两个芯片共用一份判断。
+function usageTipText(provider, model, taskUsage, sessionTotal, webSearchOn) {
     if (provider === 'claude') {
         return 'Claude 链路的用量字段（usage.input_tokens/output_tokens）需要改 callClaudeAPI 函数体才能解析，'
             + '那是本项目的改动禁区——这条链路不解析用量，也就算不出花销，界面上如实标注"不支持用量统计"。';
@@ -5089,6 +5101,11 @@ function usageTipText(provider, model, taskUsage, sessionTotal) {
     if (known) {
         if (!cost.priceKnown) s += ' 花销：价格未知（该模型不在内置价格表中，不代表免费）。';
         else s += ' 花销：' + usageFormatCostText(cost) + '（阶梯计价按这次实际 input token 落档；不同币种不换算）。';
+    }
+    if (webSearchOn) {
+        s += ' ⚠️ 这次任务开着联网搜索：以上金额不含联网搜索按次计费（比如 Gemini 官方按次另收 $14~35/1000 次'
+            + '查询，qwen/openai 是否有独立于 token 的按次计费本轮未核实）——这颗芯片只统计 token 换算出的花销，'
+            + '少报花销比多报危险，如实标注不含。';
     }
     const sess = sessionTotal;
     if (!sess || !sess.hasUsage) {
@@ -9463,6 +9480,14 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
             if (oMax === null && AppState.qwenMaxTokensByModel && typeof AppState.qwenMaxTokensByModel[model] === 'number') {
                 body.max_tokens = AppState.qwenMaxTokensByModel[model];
             }
+            // v2 Pass P145：联网搜索（顶层 enable_search，纯追加字段，跟上面 enable_thinking/
+            // thinking_budget 是各自独立的字段路径，互不覆盖）。只有 opts.webSearch===true 才发——
+            // 翻译链路的调用点一个都不传这个 opts 字段，逐字不受影响（同 opts.tools 那条"纯追加"
+            // 纪律）。目前唯一会传 true 的调用方是 chatCallModel 的 qwen 分支，且只在
+            // chatWebSearchCapability 判定"支持"时才会把 req.webSearch 置真——本函数不重新判定
+            // 模型是否在 DashScope 的联网搜索支持名单里，信任上层已经判过（qwen 这一档任务书没有
+            // 要求做 openai 那种模型级强制置灰，见 chatWebSearchCapability 定义处的风险说明）。
+            if (o && o.webSearch) body.enable_search = true;
         }
     } catch (e) {}
 
@@ -10234,6 +10259,18 @@ function isNewOpenAIModel(model) {
     return OPENAI_NEW_MODEL_PATTERN.test(id) || OPENAI_NEW_MODELS.some(m => id.startsWith(m));
 }
 
+// v2 Pass P145：联网搜索。查证（2026-09-09，developers.openai.com/api/docs/guides/tools-web-search）：
+// OpenAI 的 Chat Completions 端点（本 app 在用的 /v1/chat/completions，不是 Responses API）只有
+// **专门的搜索模型**支持 web_search_options 字段——gpt-5-search-api / gpt-4o-search-preview /
+// gpt-4o-mini-search-preview（官方页面标注后两个已于 2026-07-23 停用）。本 app 内置价格表里的
+// gpt-5-nano/gpt-5-mini/gpt-5.2 都不在这份名单里。官方对这类专用模型的命名统一带 "search" 字样，
+// 用正则而不是穷举名单——名单会随官方新增/停用模型变化，正则能顺带覆盖"以后新出的下一个搜索
+// 模型"，穷举只能覆盖"今天已知的这几个"（跟上面 OPENAI_NEW_MODEL_PATTERN 同一个取舍理由）。
+const OPENAI_SEARCH_MODEL_PATTERN = /search/i;
+function openaiModelSupportsSearch(model) {
+    return OPENAI_SEARCH_MODEL_PATTERN.test(String(model || ''));
+}
+
 // 根据模型获取合适的 max tokens 限制
 function getMaxTokensForModel(model, configMax) {
     if (configMax) return configMax;
@@ -10275,6 +10312,16 @@ async function callOpenAIAPI(model, messages, config = {}, apiKey = null, signal
     // 如果需要JSON响应（新模型不支持 response_format，通过 prompt 指示返回 JSON）
     if (config.jsonMode && !isNewOpenAIModel(model)) {
         body.response_format = { type: "json_object" };
+    }
+
+    // v2 Pass P145：联网搜索（顶层 web_search_options，纯追加字段）。只有调用方显式传了
+    // config.webSearch===true 才加，翻译链路（8404/12027/12108/12235/12627/12754 一类调用点，
+    // 见上方 P144 注释）一个都不传这个字段，逐字不受影响。这里**再判一次**模型是否支持
+    // （openaiModelSupportsSearch），不完全信任调用方已经判过——UI 层（chatWebSearchCapability）
+    // 已经按这条规则置灰过控件，这里是防御性第二道闸，双重保险不冲突（同 setQwenThinkingEnabled
+    // 定义处"防御性拦一次"的纪律）：不支持的模型即便 config.webSearch 意外为 true 也不会发这个字段。
+    if (config.webSearch && openaiModelSupportsSearch(model)) {
+        body.web_search_options = {};
     }
 
     const response = await fetch(OPENAI_API_BASE, {
@@ -20547,6 +20594,12 @@ const ChatState = {
     // Gemini 的推理是另一套合约（thinkingBudget，实测合法集 {0, -1} ∪ [512, 24576]），
     // 和 reasoning_effort 没有任何共用，所以单独一个字段。'' = 不发 thinkingConfig。
     geminiThinking: '',
+    // v2 Pass P145：各 provider 原生联网搜索开关（只加请求体字段，不自建抓取，见
+    // chatWebSearchCapability 定义处）。键 = provider+':'+model（chatWebSearchKey）——不能只用
+    // model id，qwen/gemini/openai 的模型 id 空间互不相关，复合键避免同名碰撞；值恒为 true，
+    // 关闭=删掉这条记录（跟 AppState.qwenReasoningByModel 的"关闭即删除"是同一条纪律）。
+    // 只服务对话窗；翻译链路完全不读这份状态，也不会给翻译请求加任何联网字段。默认全关。
+    webSearchByModel: {},
     temperature: null,              // null = 用各家原本的默认（本地/Claude 0.3、OpenAI 0.3）
     maxTokens: 0,                   // 0 = 用各家原本的默认（见 chatDefaultMaxTokens）
     stream: true,                   // 仅 local 生效；其余提供方隐藏这个开关（C5）
@@ -21533,6 +21586,24 @@ async function chatCallGemini(config, messages, systemPrompt, signal, meta, req)
     }
     if (systemPrompt) body.systemInstruction = { parts: [{ text: systemPrompt }] };
 
+    // v2 Pass P145：联网搜索——Gemini 原生 Google Search grounding，顶层 tools:[{google_search:{}}]。
+    // 查证结论（2026-09-09，ai.google.dev/gemini-api/docs/google-search 与 .../tool-combination）：
+    //   1) 这个 app 从来不给 Gemini 发 functionDeclarations（本文件的工具调用循环对 gemini 走的是
+    //      纯文本协议 ==TOOL name=xxx==，见 CHAT_AGENT_TOOLS 附近大段注释——只有 provider==='local'
+    //      才会真的拼一份原生 tools JSON schema），所以这里加的 tools 数组**只会有 google_search
+    //      这一个元素**，不会跟自定义 function 混在一起。
+    //   2) 官方文档里"混用内置工具（google_search）+ 自定义 functionDeclarations 需要 Gemini 3 +
+    //      新版 Interactions API"这条限制，管的正是"两者混在同一个 tools 数组"这种情况——本 app
+    //      从不产生这种情况，所以这条限制不适用，不需要判断模型是不是 Gemini 3。
+    //   3) 结论：只发 tools:[{google_search:{}}]，在经典 generateContent 端点（本 app 一直用的这个，
+    //      不是新 Interactions API）上有官方文档示例支持，跟文本协议工具循环之间**没有 JSON
+    //      schema 层面的冲突**。模型会不会把"系统提示要求的 ==TOOL== 文本格式"和"它自己能自主
+    //      调用的 google_search"搞混，是模型行为层面的问题，没有真实付费 API 调用不可能验证
+    //      （任务书禁止），如果以后用户实测发现异常，先怀疑这里。
+    if (r.webSearch) {
+        body.tools = [{ google_search: {} }];
+    }
+
     const url = `${GEMINI_API_BASE}/${config.model}:generateContent?key=${config.geminiApiKey}`;
     const resp = await fetch(url, {
         method: 'POST',
@@ -21562,6 +21633,24 @@ async function chatCallGemini(config, messages, systemPrompt, signal, meta, req)
         // thought:true 的 part 是**思维链**，绝不能当答案（旧 callGeminiAPI 读 parts[0] 就会读到它）
         meta.reasoning = parts.filter(function (p) { return p && p.thought === true; }).map(partText).join('');
         meta.thinking = meta.reasoning.trim() !== '';
+        // v2 Pass P145：grounding 来源链接。**只在 API 真的回传了 groundingChunks 时才有值**——
+        // 拿不到就是 null，绝不伪造/拼凑。只取 groundingChunks[].web.{uri,title}（官方响应形状），
+        // 且只收 http(s) 链接（uri 来自网络响应，属于不可信输入，见任务书诚实性要求第 3 条）。
+        // Google 官方文档另外要求展示 searchEntryPoint.renderedContent（"Search Suggestions"，
+        // 服务条款里的合规展示要求）——那是一段厂商提供、内容不受本 app 控制的 HTML/CSS，插入
+        // 页面 DOM 的安全审查超出本轮"只加请求字段"的范围，**本轮未实现**，只做这条更保守的
+        // 纯文本来源链接列表（见 chatAppendGroundingSources 定义处，同一条注释）。
+        meta.groundingSources = null;
+        try {
+            const gm = cand.groundingMetadata;
+            const chunks = (gm && Array.isArray(gm.groundingChunks)) ? gm.groundingChunks : [];
+            const gsrc = chunks.map(function (c) {
+                const w = c && c.web;
+                if (!w || typeof w.uri !== 'string' || !/^https?:\/\//i.test(w.uri)) return null;
+                return { uri: w.uri, title: (typeof w.title === 'string' && w.title) ? w.title : w.uri };
+            }).filter(Boolean);
+            if (gsrc.length) meta.groundingSources = gsrc;
+        } catch (e) {}
     }
     if (!parts.length) {
         throw new Error('Gemini 返回了空内容（可能是 thinking 预算耗尽或被安全策略拦截）。');
@@ -21636,7 +21725,11 @@ async function chatCallModel(messages, systemPrompt, signal, meta, sink) {
         maxTokens: chatEffectiveMaxTokens(config.provider),
         reasoningEffort: '',
         thinkingBudget: null,
-        stream: false
+        stream: false,
+        // v2 Pass P145：这次请求要不要带联网搜索字段——已经过 chatWebSearchCapability 能力闸门
+        // （claude/local 永远 false）。挂在 req 上是因为 ChatState.lastRequest 就是这个对象的引用，
+        // "上一次真正发出去的请求参数摘要"里天然带上这一项，不需要在别处另存一份。
+        webSearch: chatWebSearchEnabled(config.provider, config.model)
     };
     if (config.provider === 'gemini') {
         const g = chatGeminiOption(ChatState.geminiThinking);
@@ -21683,6 +21776,7 @@ async function chatCallModel(messages, systemPrompt, signal, meta, sink) {
             maxTokens: req.maxTokens,
             apiKey: config.qwenApiKey
         };
+        if (req.webSearch) callOpts.webSearch = true;
         return await callLocalLLM(config.qwenBaseUrl, config.model, full, false, signal, meta, callOpts) || '';
     }
     // OpenAI / Claude：temperature 为 null 表示「这个模型上这个参数不可设」（新 OpenAI 模型只接受 1），
@@ -21691,6 +21785,9 @@ async function chatCallModel(messages, systemPrompt, signal, meta, sink) {
     if (req.temperature !== null) opt.temperature = req.temperature;
     ChatState.lastRequest = req;
     if (config.provider === 'openai') {
+        // v2 Pass P145：只在这一支设置 opt.webSearch——claude 分支复用同一个 opt 变量，但两个
+        // if 互斥且各自 return，claude 那边永远不会读到这一行写的值。
+        if (req.webSearch) opt.webSearch = true;
         return await chatCallOnlineWithDowngrade('OpenAI', req, function (mt) {
             opt.max_tokens = mt;
             return callOpenAIAPI(config.model, full, opt, config.openaiApiKey, signal, meta);
@@ -21785,6 +21882,45 @@ function chatAppendCopyAnswer(row, answerText) {
         });
         bar.appendChild(btn);
         box.appendChild(bar);
+    } catch (e) {}
+}
+
+// v2 Pass P145：Gemini grounding 来源链接。**只在 meta.groundingSources 真的非空时才画**——
+// 拿不到就什么都不显示，绝不伪造/猜测来源（任务书硬要求）。只做"列出来源链接"这一件事：
+// Google 官方文档另外要求展示 searchEntryPoint.renderedContent（"Search Suggestions"，服务条款
+// 里的合规展示要求，见 ai.google.dev/gemini-api/docs/google-search）——那是一段厂商提供、内容
+// 不受本 app 控制的 HTML/CSS，插入页面 DOM 涉及的安全审查（第三方 HTML 注入面）超出本轮"只加
+// 请求字段"的范围，**本轮未实现**，只做这条更保守的纯文本+链接列表。href 只用 setAttribute 走
+// DOM 属性赋值（不拼 innerHTML），链接文字用 textContent（不当标签解析）——网页内容是不可信输入
+// （任务书诚实性要求第 3 条），uri 在 chatCallGemini 里已经过 /^https?:\/\//i 过滤，这里不重复。
+function chatAppendGroundingSources(row, sources) {
+    try {
+        if (!row) return;
+        // 第二道闸：chatCallGemini 的解析处已经过滤过协议，这里**再判一次** http(s)——
+        // 这个函数本身不该信任"upstream 已经洗过"，网页内容是不可信输入，防御要在每一层都成立
+        // （同 callOpenAIAPI 里"UI 已经按 openaiModelSupportsSearch 置灰过，这里仍再判一次"的纪律）。
+        const list = Array.isArray(sources) ? sources.filter(function (s) {
+            return s && typeof s.uri === 'string' && /^https?:\/\//i.test(s.uri);
+        }) : [];
+        if (!list.length) return;
+        const box = chatBubbleOf(row) || row;
+        const wrap = document.createElement('div');
+        wrap.className = 'aichat-grounding';
+        const label = document.createElement('span');
+        label.className = 'aichat-grounding-label';
+        label.textContent = '来源（联网搜索）：';
+        wrap.appendChild(label);
+        list.forEach(function (s, i) {
+            const a = document.createElement('a');
+            a.setAttribute('href', s.uri);
+            a.target = '_blank';
+            a.rel = 'noopener noreferrer';
+            a.className = 'aichat-grounding-link';
+            a.textContent = String(s.title || s.uri);
+            wrap.appendChild(a);
+            if (i < list.length - 1) wrap.appendChild(document.createTextNode(' · '));
+        });
+        box.appendChild(wrap);
     } catch (e) {}
 }
 
@@ -25226,6 +25362,10 @@ function chatRenderAssistant(raw, meta) {
     chatAppendThinking(row, record.reasoning, record.reasoningTokens);
     // 复制的永远是 parsed.prose（来自 message.content），和思考区读的是两个不同的字段。
     chatAppendCopyAnswer(row, parsed.prose || String(raw));
+    // v2 Pass P145：Gemini grounding 来源链接，排在「复制答案」下面。m.groundingSources 只有
+    // provider===gemini 且这次请求真的带了 tools:[{google_search:{}}] 且 API 真的回传了来源时
+    // 才非空——其余四家/没开联网/没有来源，这里什么都不画。
+    chatAppendGroundingSources(row, m.groundingSources);
 
     if (m.truncated) {
         chatAppendRow('system', '⚠ 这条回复被 token 上限截断了（finish_reason=length），下面的内容是半截的。');
@@ -25323,6 +25463,7 @@ function chatParamsSave() {
             model: ChatState.model,
             reasoningByModel: ChatState.reasoningByModel,
             geminiThinking: ChatState.geminiThinking,
+            webSearchByModel: ChatState.webSearchByModel,
             temperature: ChatState.temperature,
             maxTokens: ChatState.maxTokens,
             stream: !!ChatState.stream,
@@ -25363,6 +25504,24 @@ function chatParamsLoad() {
         }
         if (typeof p.geminiThinking === 'string' && chatGeminiOption(p.geminiThinking).v === p.geminiThinking) {
             ChatState.geminiThinking = p.geminiThinking;
+        }
+        // v2 Pass P145：键必须是 "provider:model" 形状（provider 合法、model 经 sanitizeModelId
+        // 非空），值必须严格是 true——不认识的 key/脏值一律丢弃，不回落成别的值（同上面几条同一条
+        // 纪律）。不在这里按 chatWebSearchCapability 重新判定"这个 provider/model 现在还支不支持"——
+        // 那是运行时判断（比如以后官方文档更新），加载阶段只做"数据形状对不对"这层校验，
+        // chatWebSearchEnabled() 读取时自己会再过一次能力闸门，双重保险不冲突。
+        if (p.webSearchByModel && typeof p.webSearchByModel === 'object' && !Array.isArray(p.webSearchByModel)) {
+            const cleanWs = {};
+            Object.keys(p.webSearchByModel).forEach(function (k) {
+                const i = k.indexOf(':');
+                if (i <= 0) return;
+                const prov = k.slice(0, i);
+                const id = sanitizeModelId(k.slice(i + 1));
+                if (id && (prov === 'local' || MODEL_PROVIDERS.indexOf(prov) !== -1) && p.webSearchByModel[k] === true) {
+                    cleanWs[prov + ':' + id] = true;
+                }
+            });
+            ChatState.webSearchByModel = cleanWs;
         }
         if (typeof p.temperature === 'number' && CHAT_TEMPS.indexOf(p.temperature) !== -1) {
             ChatState.temperature = p.temperature;
@@ -25552,6 +25711,127 @@ function chatModelLabel(provider, id) {
         const meta = getModelMeta(id);
         return (meta && meta.name) ? meta.name : String(id);
     } catch (e) { return String(id); }
+}
+
+// ============================================================================
+// v2 Pass P145：联网搜索开关（档 1——各 provider 原生联网开关，只加请求体字段）
+// ============================================================================
+// 用户已明确否决自建抓取工具与 deep research（见 .claude/tmp/p143_recon.md 议题2）。三条硬边界：
+//   1) 只在请求体里加官方认的字段——搜索发生在厂商服务端，本 app 不新增任何出站抓取工具、
+//      不给桥 server.js 加任何出站 HTTP 端点、不加文件下载落盘。
+//   2) claude / local 结构性不支持，一律「置灰 + tooltip 说明」（沿用本项目已定的惯例，不隐藏）：
+//        · claude：官方有服务端 web_search 工具，但要接入必须往 callClaudeAPI 的请求体加字段——
+//          那个函数体是改动禁区，所以判"不做"，不是"暂时没空"。
+//        · local：LM Studio 是纯本地推理服务器，身后没有搜索服务，结构上不可能。
+//   3) 默认关——联网搜索通常有独立计费（比如 Gemini 按次 $14~35/1000 次），不能默认替用户开销。
+// 只服务对话窗（挨着思考控件）；翻译链路完全不读这份状态，不会给翻译请求加任何联网字段。
+
+// 键 = provider+':'+model。不能只用 model id——qwen/gemini/openai 的模型 id 空间互不相关，
+// 复合键避免同名碰撞，也跟 ChatState.reasoningByModel（只服务单一 provider=local）的写法区分开。
+function chatWebSearchKey(provider, model) {
+    return String(provider || '') + ':' + String(model || '');
+}
+
+// 每个 provider 的联网能力判定：{ supported, tip }。这里只判定"控件该不该可点"——网络行为本身
+// （会不会 200）永远交给真实请求去验证，这里只做"结构上/官方文档上明确不支持"的静态判断，跟
+// qwenThinkingControlHtml 的 caps 驱动写法同一条纪律：拿不准就说"未核实"，不装懂、不隐藏控件。
+function chatWebSearchCapability(provider, model) {
+    if (provider === 'claude') {
+        return { supported: false, tip: '该链路不支持联网搜索。Anthropic 官方有服务端 web_search 工具，'
+            + '但接入必须往 callClaudeAPI 的请求体里加字段——这个函数体是本项目的改动禁区（见 CLAUDE.md），'
+            + '所以这里明确判"不做"，不是"暂时没空"。' };
+    }
+    if (provider === 'local') {
+        return { supported: false, tip: '本地模型不支持联网。LM Studio 是纯本地推理服务器，身后没有搜索'
+            + '服务——这不是"还没接"，是结构上不可能（联网搜索需要厂商服务端在推理之外另起一次网络检索，'
+            + '本地端点没有这一层）。' };
+    }
+    if (provider === 'gemini') {
+        return { supported: true, tip: 'Gemini 原生 Google Search grounding（请求体顶层 '
+            + 'tools:[{google_search:{}}]）。搜索发生在 Google 服务端，本 app 不新增任何出站抓取。'
+            + '按次另计费（Gemini 3 系列约 $14/1000 次查询、2.5 系列约 $35/1000 次，只对"确实返回了'
+            + '至少一条来源"的请求计费），这笔钱**不在**上方用量花销 chip 里——那颗芯片只统计 token '
+            + '换算出的花销，不含这笔按次计费。' };
+    }
+    if (provider === 'qwen') {
+        // DashScope 官方文档（docs.qwencloud.com/developer-guides/tool-calling/web-search，
+        // 2026-09-09 抓取）：Qwen3.5/3.6/3.7-Flash/3.7-Plus/3.8 系列因为"接受多模态输入"被归为
+        // "多模态模型"，这一类模型的联网搜索**要求走流式调用**，非流式会返回
+        // "Non-streaming mode does not support Web Search"。本 app 对 Qwen 的对话链路目前**永远
+        // 非流式**（chatCallModel 里 provider==='qwen' 分支硬编码 req.stream=false，DashScope 的
+        // SSE 解析也从没为 qwen 实现过）——如果当前选中的模型落在上述"多模态"档，开启后大概率会
+        // 看到一次请求失败（不是静默：chatErrorRow 会把 400 原样显示在对话流里）。这是已查证但
+        // 本轮未解决的已知风险（接流式是架构级改动，不在"只加请求字段"的范围内），如实写在这里，
+        // 不做模型级强制置灰——不确定"多模态模型"这个分类在 DashScope 文档里精确对应哪些具体
+        // id（本 app MODEL_CAPS.qwen 里的条目未逐个核对），宁可用文字风险提示，也不猜一张可能
+        // 错误的黑名单去关掉本来能用的模型。
+        return { supported: true, tip: 'DashScope 顶层 enable_search 字段。搜索发生在阿里云服务端，'
+            + '本 app 不新增任何出站抓取。⚠️ 已查证的已知风险：官方文档把 Qwen3.5/3.6/3.7-Flash/'
+            + '3.7-Plus/3.8 系列列为"多模态模型"，这一类模型的联网搜索要求走流式调用，而本对话链路'
+            + '对 Qwen 目前永远非流式——如果当前模型属于这一档，开启后可能会看到一次请求失败'
+            + '（400，会显示在对话流里，不是静默）。这是已知限制，接流式是架构级改动，不在本轮范围内。'
+            + '是否有独立于 token 的按次计费未核实，不代猜——上方用量花销 chip 的说明仍会提醒'
+            + '"不含联网搜索按次计费"。' };
+    }
+    if (provider === 'openai') {
+        if (!openaiModelSupportsSearch(model)) {
+            return { supported: false, tip: '当前模型「' + String(model || '')
+                + '」不支持联网搜索。OpenAI 的 Chat Completions 端点（本 app 在用的这个）只有专门的'
+                + '搜索模型（如 gpt-5-search-api / gpt-4o-search-preview，2026-09 查证，命名都带 '
+                + '"search"）支持 web_search_options 字段，普通模型发了这个字段不会生效，或者直接'
+                + '被拒绝——所以这里置灰而不是让你点了没反应或者点了静默 400。换一个名字里带 '
+                + '"search" 的搜索专用模型即可使用。' };
+        }
+        return { supported: true, tip: 'OpenAI 官方 web_search_options 字段（顶层）。搜索发生在 '
+            + 'OpenAI 服务端，本 app 不新增任何出站抓取。是否有独立于 token 的按次/额外计费本轮'
+            + '未核实，不代猜——上方用量花销 chip 的说明仍会提醒"不含联网搜索按次计费"。' };
+    }
+    return { supported: false, tip: '未知的 provider，不提供联网搜索开关。' };
+}
+
+// 当前是否已经开着（已经过能力闸门——不支持的 provider/model 永远返回 false，
+// 哪怕 localStorage 里因为切换模型前的旧记录还留着一条脏数据）。
+function chatWebSearchEnabled(provider, model) {
+    try {
+        const cap = chatWebSearchCapability(provider, model);
+        if (!cap.supported) return false;
+        return !!(ChatState.webSearchByModel && ChatState.webSearchByModel[chatWebSearchKey(provider, model)] === true);
+    } catch (e) { return false; }
+}
+
+// 勾选/取消「联网」。取消 = 从表里删掉这条记录（= 回到"完全不发字段"的原行为），跟
+// setQwenThinkingEnabled 同一条纪律：只有"开过"才在表里留记录，默认状态是"表里没有这一条"。
+function setChatWebSearchEnabled(provider, model, checked) {
+    try {
+        const cap = chatWebSearchCapability(provider, model);
+        if (!cap.supported) return;   // 防御性拦一次：不支持的 provider/model 不接受这次调用
+        if (!ChatState.webSearchByModel || typeof ChatState.webSearchByModel !== 'object') ChatState.webSearchByModel = {};
+        const key = chatWebSearchKey(provider, model);
+        if (checked) ChatState.webSearchByModel[key] = true;
+        else delete ChatState.webSearchByModel[key];
+        chatParamsSave();
+        chatRenderParamBar();
+    } catch (e) { console.error('[chat] setWebSearchEnabled failed', e); }
+}
+
+// 参数条上的联网开关控件。跟 qwenThinkingControlHtml 一样：不支持就画一个禁用的勾选框 +
+// tooltip 说明原因（沿用本项目"不支持的情况一律置灰+tooltip，不要隐藏"的既有惯例），支持就画
+// 一个可点的勾选框，两种情况共用同一个 data-tip 文案来源（chatWebSearchCapability().tip）。
+function chatWebSearchControlHtml(choice) {
+    try {
+        const cap = chatWebSearchCapability(choice.provider, choice.model);
+        if (!cap.supported) {
+            return '<span class="aichat-pgroup" style="opacity:.4;cursor:not-allowed" data-tip="'
+                + escapeAttr(cap.tip) + '" data-tip-pos="top">'
+                + '<input type="checkbox" disabled class="w-3.5 h-3.5 rounded border-slate-300">'
+                + '<span class="aichat-plabel">联网（不支持）</span></span>';
+        }
+        const on = chatWebSearchEnabled(choice.provider, choice.model);
+        return '<span class="aichat-pgroup" data-tip="' + escapeAttr(cap.tip) + '" data-tip-pos="top">'
+            + '<input type="checkbox" id="aiChatWebSearchToggle" ' + (on ? 'checked' : '')
+            + ' class="w-3.5 h-3.5 rounded border-slate-300 text-sky-600 focus:ring-sky-500">'
+            + '<span class="aichat-plabel">联网</span></span>';
+    } catch (e) { return ''; }
 }
 
 // 下拉里的分组。在线三家复用 getVisibleModels（尊重用户在设置里的模型可见性勾选），
@@ -26020,6 +26300,7 @@ function chatParamBarHtml() {
         + '<span class="aichat-plabel">模型</span>'
         + '<select class="aichat-psel" id="aiChatModelSel">' + optHtml + '</select></span>'
         + chatReasoningBarHtml(choice)
+        + chatWebSearchControlHtml(choice)
         + '<span class="aichat-pspacer"></span>'
         + '<button type="button" class="aichat-pmore' + (ChatState.paramsOpen ? ' is-on' : '') + '" id="aiChatMoreBtn" data-tip="'
         + escapeAttr('展开其余可按请求设置的参数（温度、生成上限、流式、是否回传上一轮思考），'
@@ -26054,6 +26335,10 @@ function chatBindParamBar(box) {
     on('aiChatThinkOn', 'click', function () { chatReasoningTurnOn(); });
     on('aiChatLevelSel', 'change', function () { chatSetReasoning(this.value); });
     on('aiChatGemSel', 'change', function () { chatSetGeminiThinking(this.value); });
+    on('aiChatWebSearchToggle', 'change', function () {
+        const c = chatModelChoice();
+        setChatWebSearchEnabled(c.provider, c.model, this.checked);
+    });
     on('aiChatMoreBtn', 'click', function () { chatToggleParams(); });
     on('aiChatTempSel', 'change', function () { chatSetTemperature(this.value); });
     on('aiChatMaxSel', 'change', function () { chatSetMaxTokens(this.value); });
@@ -27485,7 +27770,10 @@ function chatRingHtml(ro) {
 function chatTaskUsageChipHtml() {
     const c = chatModelChoice();
     const d = usageDisplayFor(c.provider, c.model, ChatState.lastTaskUsage);
-    const tip = usageTipText(c.provider, c.model, ChatState.lastTaskUsage, ChatState.sessionTaskUsageTotal);
+    // v2 Pass P145：读的是"真正发出去的那一次请求"（ChatState.lastRequest），不是控件的实时状态——
+    // 用户可能刚关掉开关但还没发下一轮，这时候上一次任务确实带着联网，芯片理应仍然提醒。
+    const searchOn = !!(ChatState.lastRequest && ChatState.lastRequest.webSearch);
+    const tip = usageTipText(c.provider, c.model, ChatState.lastTaskUsage, ChatState.sessionTaskUsageTotal, searchOn);
     const label = d.unsupported ? d.tokensText : (d.tokensText + ' · ' + d.costText);
     return '<span class="aichat-taskusage-chip' + (d.unsupported ? ' is-unsupported' : '') + '" id="aiChatTaskUsageChip"'
         + ' data-tip="' + escapeAttr(tip) + '" data-tip-pos="top">' + escapeHtml(label) + '</span>';
