@@ -4608,7 +4608,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.27.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.27.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-11';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -36964,6 +36964,16 @@ async function ovlVisualBlockRetryClick(el) {
                 detail: (err && err.message) || String(err),
                 echoCandidate: meta.echoCandidate
             });
+            // v2 Pass P157（B-3，对抗验证阶段补）：这条真实失败分支（非 AbortError、非陈旧
+            // seq）之前从不触发 gutter 重排——独立验证用真实 CDP 实测复现：把一个 partial
+            // （菱形标记）块喂进这条路径，桩固定失败后块的真实状态变成 failed（三角），但不
+            // 手动调用 ovlRenderVisualGutter() 时行号格子上的标记停留在旧的 partial 菱形，
+            // 直到下一次别的触发点才会更新——用户看着行号栏里一个"菱形"，实际上这块已经是
+            // "三角"。跟 B-1（chatAgentExecRetranslateBlock）、成功分支（约 36928 行）同一条
+            // 调度调用，同一条纪律。
+            if (typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') {
+                ovlScheduleVisualGutterAfterImage();
+            }
         }
         if (typeof showToast === 'function') {
             showToast('重新翻译失败：' + ((err && err.message) || String(err)), 'error');
