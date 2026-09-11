@@ -2218,6 +2218,30 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
     font-size: 11px; line-height: 1.4; padding: 1px 6px; border-radius: 3px;
     background: #f3f4f6; color: #6b7280; border: 1px solid #e5e7eb; pointer-events: none;
 }
+/* v2 Pass P156（用户反馈：段落右上角的状态气泡有时会遮挡正文）：以下全部状态提示/操作
+   入口整体搬进行号弹窗「定位」按钮右侧（见 #ovlQaVisualState / ovlQaRenderVisualState，
+   约 36940 行一带）。角标本身的 DOM 节点/data-ovl-trans-* 状态属性/既有点击委托
+  （ovlBindVisualPane）一个字节都没删——本 Pass 只是让它们在段落里不再可见（display:none），
+   弹窗侧的新按钮直接复用同一套函数（ovlVisualBlockForceTranslateClick/
+   ovlVisualBlockRetryClick/ovlVisualShowFailDetail/ovlVisualBlockForceAcceptClick），不是
+   另起一套翻译/重试逻辑，也不影响 Suite 13 那类"角标文案不泄漏进下游文本提取"的既有断言
+  （那些断言依据的是 data-* 排除表，跟本条 CSS 可见性无关）。
+   代价（已知，未做任何替代指示，见任务报告"发现性设计问题"一节）：pending/skipped/notrans/
+   inflight/ladder=raw/noprose/short/failed 这些状态在正文里不再有任何视觉标记——除了
+   pending/partial 仍保留的左侧竖线（border-left，不遮字），用户没法再"扫一眼段落就知道
+   哪些没译/失败"，必须逐行点开弹窗才能看到。 */
+.ovl-visual-block[data-ovl-trans-pending="1"]::after,
+.ovl-visual-block[data-ovl-trans-skipped]::after,
+.ovl-visual-block[data-ovl-trans-notrans]::after,
+.ovl-visual-block[data-ovl-trans-inflight="1"]::after,
+.ovl-visual-block[data-ovl-trans-ladder="raw"]::after,
+.ovl-visual-noprose-badge,
+.ovl-visual-short-badge,
+.ovl-visual-retry-badge,
+.ovl-visual-faildetail-badge,
+.ovl-visual-force-accept-badge {
+    display: none;
+}
 /* 整个 Visual 正文的第一块永远紧贴顶部，不管它是不是"段落起点"——旧版靠子元素顶 margin
    清零天然免费拿到这条，现在改由 margin-top 驱动间距了，要显式补一条覆盖掉上面
    [data-para-start="1"] 给的 0.6em（选择器优先级 0,3,0 > 0,2,0，天然赢，不用 !important）。 */
@@ -3318,6 +3342,20 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-quickactions button[data-qa="word.locate"] {
     width: auto; padding: 0 8px; font-size: 11px; margin-left: 2px;
 }
+/* v2 Pass P156：段落右上角的状态角标搬进这里——「定位」按钮右侧一段"状态文字 + 可选操作
+   按钮"，只在「单击行号（非拖选多行）打开弹窗」且 Visual 中文预览模式下、且这个块确实有
+   非"已正常译完"的状态时才出现（见 ovlQaRenderVisualState）；默认 hidden，不出现时对弹窗
+   宽度零影响。用 :not([hidden]) 而不是直接 display:flex——避免跟 HTML `hidden` 属性的默认
+   UA 样式打架（同优先级下 author 样式会赢，必须显式排除隐藏态）。 */
+.ovl-qa-state { margin-left: 4px; padding-left: 6px; border-left: 1px solid #2F3A4C; gap: 4px; align-items: center; }
+.ovl-qa-state:not([hidden]) { display: flex; }
+.ovl-qa-state-label { font-size: 11px; line-height: 1.3; color: #9AA4B2; white-space: nowrap; }
+.ovl-qa-state-btn {
+    background: transparent; border: 1px solid #495365; color: #E7E9EE; font-size: 11px;
+    padding: 0 7px; height: 22px; border-radius: 4px; cursor: pointer; white-space: nowrap;
+}
+.ovl-qa-state-btn:hover { background: #2F3A4C; }
+.ovl-qa-state-btn:disabled { opacity: .5; cursor: not-allowed; }
 .ovl-breadcrumb {
     font-size: 10.5px; color: #9AA4B2; padding: 2px 10px; background: #1B222C;
     border-bottom: 1px solid #2F3A4C; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: none;
@@ -4509,8 +4547,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.25.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-10';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.26.00';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-11';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -30411,6 +30449,13 @@ function ovlPortalHtml() {
         // 同一个 ovlSyncTexForward()（见 ovlQaLocateInPdf）：tex 模式走 SyncTeX 正向（原按钮
         // 行为不变），direct 模式走新写的文本反查句级定位（见 ovlP106TryReverseSentenceHighlight）。
         +   '<button type="button" data-qa="word.locate" data-tip="定位到 PDF 对应位置" data-tip-pos="top">定位</button>'
+        // v2 Pass P156（用户需求：段落右上角遮挡正文的状态气泡挪进这个弹窗，落点是「定位」
+        // 按钮右侧）：默认 hidden，只在单击行号（非拖选多行）+ Visual 中文预览模式 + 这个块
+        // 确实有非"已正常译完"的状态时才由 ovlQaRenderVisualState 填内容/摘掉 hidden。里面的
+        // 按钮走独立的 data-qas（不是 data-qa）——不落进上面 qa.addEventListener('click', ...)
+        // 那条"点任何 data-qa 都无条件 ovlHideQuickActions()"的委托匹配范围，点了不关弹窗，
+        // 见 ovlBindQaVisualState（约 36940 行一带，跟着 ovlBindVisualPane 放在一起）。
+        +   '<div class="ovl-qa-state" id="ovlQaVisualState" hidden></div>'
         + '</div>'
         // M7 Editor「Equation preview」：光标落在 $...$ 里时用既有 KaTeX 渲染一个悬浮预览。
         + '<div class="ovl-eqpreview" id="ovlEqPreview"></div>'
@@ -36935,6 +36980,115 @@ async function ovlVisualBlockForceTranslateClick(el) {
         // total（failed 块也计分母），这里块的分母归属本身就变了，必须重算。
         try { if (typeof ovlVisualLangSyncAfterRender === 'function') ovlVisualLangSyncAfterRender(); } catch (e) {}
     }
+}
+
+// ==================== v2 Pass P156：段落角标状态搬进行号弹窗「定位」右侧 ====================
+// 用户反馈：Visual 中文预览模式下段落右上角的状态气泡（待翻译/不翻译/参考文献·不翻译/
+// 翻译中…/兜底译出/无可译文本·强制翻译/可能漏译·重试/失败态 重试+详情+仍然采用这次结果）
+// 有时会遮住正文。用户确认方案「全搬 + 改关闭逻辑」——文字说明和可点按钮都挪进单击行号弹出
+// 的 #ovlQuickActions（「定位」按钮右侧），角标本身的 CSS/DOM/点击委托一个字节不删（见约
+// 2149 行一带的 display:none 覆盖注释），这里只是新增一条"从块的真实 data-ovl-trans-*
+// 属性现读现渲染"的展示层，复用既有的 ovlVisualBlockForceTranslateClick /
+// ovlVisualBlockRetryClick / ovlVisualShowFailDetail / ovlVisualBlockForceAcceptClick 四个
+// 函数，不是另起一套翻译/重试逻辑。
+//
+// 状态优先级（跟角标本身"pending/skipped/failed 互斥"这条既有纪律一致，busy 态优先于静态
+// 态）：force-translating/retrying（进行中）> failed（含 echo 回显逃生门）> noprose（无可译
+// 文本） > partial-reason=short（可能漏译） > notrans（参考文献） > skipped（不翻译） >
+// ladder=raw（兜底译出） > inflight（worker 后台翻译中） > pending（待翻译） > 都不是=已正常
+// 译完，返回 null（不显示这块区域）。
+function ovlQaVisualStateCompute(el) {
+    if (!el || !document.body.contains(el)) return null;
+    if (el.getAttribute('data-ovl-trans-force-translating') === '1') {
+        return { label: '翻译中…', buttons: [] };
+    }
+    if (el.getAttribute('data-ovl-trans-retrying') === '1') {
+        return { label: '重试中…', buttons: [] };
+    }
+    if (el.hasAttribute('data-ovl-trans-failed')) {
+        const reason = el.getAttribute('data-ovl-trans-fail-reason') || 'unknown';
+        const attempts = el.getAttribute('data-ovl-trans-attempts') || '0';
+        const tip = (typeof ovlVisualFailTipText === 'function' ? ovlVisualFailTipText(reason) : '')
+            + (parseInt(attempts, 10) > 0 ? ('（已尝试 ' + attempts + ' 次）') : '');
+        const buttons = [
+            { key: 'retry', text: '重试', title: tip },
+            { key: 'detail', text: '详情', title: '点开查看失败原因原文' }
+        ];
+        // v2 Pass P122（C3b）的回显逃生门——真值源就是角标读的同一个模块级 WeakMap
+        // （OvlVisualForceAcceptCandidates），不是重新判断一遍。
+        if (typeof OvlVisualForceAcceptCandidates !== 'undefined' && OvlVisualForceAcceptCandidates.has(el)) {
+            buttons.push({ key: 'accept', text: '仍然采用这次结果', title: '需要再点一次才会真正写入——独立于"重试"的第二次显式确认' });
+        }
+        return { label: '翻译失败', buttons: buttons };
+    }
+    if (el.getAttribute('data-ovl-trans-noprose') === '1') {
+        return { label: '无可译文本', buttons: [{ key: 'force', text: '强制翻译', title: '没有检测到需要翻译的自然语言，点击强制走一遍真正的翻译' }] };
+    }
+    if (el.getAttribute('data-ovl-trans-partial-reason') === 'short') {
+        const tip = (typeof OVL_VISUAL_PARTIAL_TIP !== 'undefined' && OVL_VISUAL_PARTIAL_TIP.short) || '本块译文的中文字符量明显低于源文可译内容的规模，可能有部分内容漏译。';
+        return { label: '可能漏译', buttons: [{ key: 'retry', text: '重试', title: tip }] };
+    }
+    if (el.hasAttribute('data-ovl-trans-notrans')) return { label: '参考文献·不翻译', buttons: [] };
+    if (el.hasAttribute('data-ovl-trans-skipped')) return { label: '不翻译', buttons: [] };
+    if (el.getAttribute('data-ovl-trans-ladder') === 'raw') return { label: '兜底译出', buttons: [] };
+    if (el.getAttribute('data-ovl-trans-inflight') === '1') return { label: '翻译中…', buttons: [] };
+    if (el.getAttribute('data-ovl-trans-pending') === '1') return { label: '待翻译', buttons: [] };
+    return null;
+}
+
+// 把 ovlQaVisualStateCompute 算出的状态渲染进 #ovlQaVisualState。每次调用都现读 DOM 真值，
+// 不缓存——ovlShowQuickActionsAt 每次打开弹窗（含"关掉再打开同一行"）都会调一次，弹窗按钮
+// 点击完成后也会再调一次，天然保证显示的不是渲染时的死快照。
+function ovlQaRenderVisualState() {
+    const box = document.getElementById('ovlQaVisualState');
+    if (!box) return;
+    const el = OvlQaState.visualBlockEl;
+    // v2 Pass P156 优雅降级：拖选多行 / 从代码侧打开 / 非中文模式 / 解析不到唯一段落
+    // （el 为 null，含 ovlQaVisualStateCompute 内部再核实一遍 document.body.contains）时，
+    // 这块区域整体不显示，弹窗其余功能不受影响。
+    const eligible = (OvlQaState.source === 'visual' && OvlVisualLangState.lang === 'zh' && !!el);
+    const state = eligible ? ovlQaVisualStateCompute(el) : null;
+    if (!state) { box.hidden = true; box.innerHTML = ''; return; }
+    box.hidden = false;
+    let html = '<span class="ovl-qa-state-label">' + escapeHtml(state.label) + '</span>';
+    state.buttons.forEach(function (b) {
+        html += '<button type="button" class="ovl-qa-state-btn" data-qas="' + escapeAttr(b.key) + '" data-tip="'
+            + escapeAttr(b.title || '') + '" data-tip-pos="top">' + escapeHtml(b.text) + '</button>';
+    });
+    box.innerHTML = html;
+}
+
+// 新按钮走独立的 data-qas（不是 data-qa）——ovlBindQuickActions 里 qa.addEventListener('click', ...)
+// 那条委托用的是 e.target.closest('[data-qa]')，天然匹配不到这里，点了不会被那条"无条件
+// ovlHideQuickActions()"收走。异步动作（强制翻译/重试）先同步调用（JS 对 async 函数的执行是
+// "同步跑到第一个 await 才让出"，被调函数在第一个 await 之前就已经把 busy 态属性写好了），
+// 调用完立刻重渲染一次把"翻译中…/重试中…"显示出来，再 await 完成后按最新真值重渲染一次
+// ——不是等整个异步操作结束才更新文案。
+function ovlBindQaVisualState() {
+    const box = document.getElementById('ovlQaVisualState');
+    if (!box) return;
+    box.addEventListener('click', function (e) {
+        const btn = e.target.closest('[data-qas]');
+        if (!btn || btn.disabled) return;
+        e.stopPropagation();
+        const key = btn.getAttribute('data-qas');
+        const el = OvlQaState.visualBlockEl;
+        if (!el || !document.body.contains(el)) { ovlQaRenderVisualState(); return; }
+        if (key === 'force' && typeof ovlVisualBlockForceTranslateClick === 'function') {
+            const p = ovlVisualBlockForceTranslateClick(el);
+            ovlQaRenderVisualState();
+            Promise.resolve(p).then(ovlQaRenderVisualState).catch(function () { ovlQaRenderVisualState(); });
+        } else if (key === 'retry' && typeof ovlVisualBlockRetryClick === 'function') {
+            const p = ovlVisualBlockRetryClick(el);
+            ovlQaRenderVisualState();
+            Promise.resolve(p).then(ovlQaRenderVisualState).catch(function () { ovlQaRenderVisualState(); });
+        } else if (key === 'detail' && typeof ovlVisualShowFailDetail === 'function') {
+            ovlVisualShowFailDetail(el);
+        } else if (key === 'accept' && typeof ovlVisualBlockForceAcceptClick === 'function') {
+            ovlVisualBlockForceAcceptClick(el);
+            ovlQaRenderVisualState();
+        }
+    });
 }
 
 // 折叠横条点击 / 失败块重试角标点击：委托绑定在 #ovlVisualPane 上（面板整个是动态内容，
@@ -54405,7 +54559,12 @@ function ovlBindDropMenus() {
 // word.replace/simplify/grammar 走 ovlEditorSynonymOpen(mode, source)；word.translate
 // 只在来源是 visual 时可点（CSS 已经把它在 Code 来源下藏起来，这里再守一道）；
 // fmt.bold/fmt.italic/ins.cite 照旧走 ovlRunCmd，不受本次改动影响。
-let OvlQaState = { source: 'code' };
+// v2 Pass P156：新增 visualBlockEl——只有「单击行号（非拖选多行）」这一条路径
+// （ovlVisualGutterCommitSelection）会把解出来的单个 .ovl-visual-block 元素传进来，其余全部
+// 调用 ovlShowQuickActionsAt 的地方（Code 选区/Visual 正文拖选文字/Code gutter 行选/兜底分支）
+// 都不传第 4 个参数，走 undefined -> null，弹窗里的状态区因此天然保持隐藏，不需要每个调用点
+// 都显式清一遍。
+let OvlQaState = { source: 'code', visualBlockEl: null };
 function ovlHideQuickActions() { const qa = document.getElementById('ovlQuickActions'); if (qa) qa.classList.remove('ovl-open'); }
 
 // ==================== v2 Pass P31：浮层避让选区统一布局器 ====================
@@ -55376,7 +55535,7 @@ function ovlInlineZhEditOpen() {
     }
 }
 
-function ovlShowQuickActionsAt(x, y, source) {
+function ovlShowQuickActionsAt(x, y, source, visualBlockEl) {
     // v2 Pass P33：就地编辑源码进行中时，工具条（含「替/简/语/译/关注/复制」六颗按钮）
     // 整体不弹出——不跟就地编辑器抢焦点/抢屏幕空间，用户要用那六颗就先保存/取消当前编辑。
     // 只在这里短路一次，不去改六颗按钮自己的任何逻辑。
@@ -55384,6 +55543,10 @@ function ovlShowQuickActionsAt(x, y, source) {
     const qa = document.getElementById('ovlQuickActions');
     if (!qa) return;
     OvlQaState.source = (source === 'visual') ? 'visual' : 'code';
+    // v2 Pass P156：每次打开都无条件重置成本次传入的值（undefined -> null）——不是只在
+    // gutter 单击路径里才清，避免"上一次是单击行号、这一次是拖选文字/切到 Code"时把上一次
+    // 解出来的块引用带过来显示成"陈旧但看着像当前的"状态。
+    OvlQaState.visualBlockEl = visualBlockEl || null;
     qa.classList.toggle('ovl-qa-src-visual', OvlQaState.source === 'visual');
     qa.classList.toggle('ovl-qa-nofmt', !OvlSettings.quickActions);
     qa.classList.toggle('ovl-qa-notranslate', OvlSettings.visualTranslate === 'off');
@@ -55454,11 +55617,15 @@ function ovlShowQuickActionsAt(x, y, source) {
         qa.style.left = cl.left + 'px';
         qa.style.top = cl.top + 'px';
     }
+    // v2 Pass P156：状态区内容永远现读 OvlQaState.visualBlockEl 当前的真实 data-ovl-trans-*
+    // 属性——每次打开（含"关掉再打开同一行"）都重新算一遍，不是渲染时的快照。
+    if (typeof ovlQaRenderVisualState === 'function') ovlQaRenderVisualState();
 }
 function ovlBindQuickActions() {
     const ta = document.getElementById('ovlCodeArea');
     const visualPane = document.getElementById('ovlVisualPane');
     const qa = document.getElementById('ovlQuickActions');
+    if (typeof ovlBindQaVisualState === 'function') ovlBindQaVisualState(); // v2 Pass P156
 
     if (ta) {
         ta.addEventListener('mouseup', function (e) {
@@ -56147,7 +56314,11 @@ function ovlVisualGutterCommitSelection(showQa) {
         // 同一个"别压住 gutter"的分寸，往右让开 gutter 的宽度。
         const gutter = document.getElementById('ovlGutter');
         const minX = gutter ? gutter.getBoundingClientRect().right + 8 : 8;
-        ovlShowQuickActionsAt(Math.max(r.left + 20, minX), Math.max(r.top, 36), 'visual');
+        // v2 Pass P156：只有单击行号（lo===hi，没有拖成多行）才把解出来的那个块元素带给
+        // 弹窗——拖选多行没有单一块可对应，第 4 个参数留空，弹窗侧的状态区自然保持隐藏
+        // （ovlShowQuickActionsAt 里 undefined -> null）。
+        const singleBlockEl = (lo === hi && OvlVisualBlockRects[lo]) ? OvlVisualBlockRects[lo].el : null;
+        ovlShowQuickActionsAt(Math.max(r.left + 20, minX), Math.max(r.top, 36), 'visual', singleBlockEl);
     }
 }
 
