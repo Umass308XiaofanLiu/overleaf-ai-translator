@@ -1924,6 +1924,67 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    往右挤 3px，和正文错位（.ovl-ln 没有 box-sizing:border-box）。P7 阶段不会有任何元素
    拿到这个 class（ovlPaintGutterMarks 里 foc 数组固定为空），纯声明不影响行为。 */
 .ovl-ln.ovl-ln-focus { box-shadow: inset 3px 0 0 #F59E0B; }
+/* v2 Pass P157：Visual 中文模式段落状态标记——P156 把段落右上角的 8 类状态气泡整体
+   display:none 藏起来之后（约 2149 行一带），扫一眼页面看不出哪些段落没译成功，用户要求
+   在不遮挡正文的行号栏补一个信号。画在 .ovl-ln-visual 格子内部左侧空白区（数字右对齐，
+   左边天生留白，见上面 .ovl-gutter 大注释），position:absolute 不占盒模型，
+   pointer-events:none 保证 elementFromPoint 直接穿透标记命中格子本身（结构性保证点击不被
+   抢，不是"风险低"——见 ovlGutterLineAtClientY/ovlVisualBlockAtClientY 的 closest() 命中
+   判定）。正常已译完的段落 ovlQaVisualStateCompute 返回 null，不产生任何标记元素——满屏
+   全打点等于没信息。8 类状态用「颜色 + 形状/填充状态」双重编码（不单靠颜色，色觉障碍也能
+   靠形状区分），title 属性原样复用气泡的完整文案，鼠标悬停即可读到，不用新造悬浮框。 */
+.ovl-ln-mark {
+    position: absolute;
+    left: 3px;
+    top: 5px;
+    width: 8px;
+    height: 8px;
+    pointer-events: none;
+    box-sizing: border-box;
+}
+.ovl-ln-mark-busy {           /* 翻译中…/重试中…——蓝色实心圆 + 脉冲动画，"有活动" */
+    border-radius: 50%;
+    background: #2563EB;
+    animation: ovlLnMarkPulse 1.4s ease-in-out infinite;
+}
+.ovl-ln-mark-failed {         /* 翻译失败——红色实心三角，形状/颜色都是最高优先级警示 */
+    background: #DC2626;
+    clip-path: polygon(50% 0%, 100% 100%, 0% 100%);
+}
+.ovl-ln-mark-partial {        /* 可能漏译——琥珀色实心菱形，介于"失败"和"正常"之间 */
+    background: #D97706;
+    clip-path: polygon(50% 0%, 100% 50%, 50% 100%, 0% 50%);
+}
+.ovl-ln-mark-noprose {        /* 无可译文本——紫色空心圆环，需要用户拍板但不是错误 */
+    border-radius: 50%;
+    border: 2px solid #7C3AED;
+    background: transparent;
+}
+.ovl-ln-mark-notrans {        /* 参考文献·不翻译——灰色空心方框，预期内的静态豁免 */
+    border: 2px solid #6B7280;
+    background: transparent;
+}
+.ovl-ln-mark-skipped {        /* 不翻译——灰色实心方块，跟 notrans 同色但用"空心/实心"区分 */
+    background: #6B7280;
+}
+.ovl-ln-mark-raw {            /* 兜底译出——青色实心圆 + 白色内圈，"译出了但走了兜底档" */
+    border-radius: 50%;
+    background: #0D9488;
+    box-shadow: inset 0 0 0 2px #ffffff;
+}
+.ovl-ln-mark-pending {        /* 待翻译——浅灰色小圆点，低透明度，最低优先级的"还没开始" */
+    border-radius: 50%;
+    width: 5px;
+    height: 5px;
+    left: 4.5px;
+    top: 6.5px;
+    background: #9CA3AF;
+    opacity: 0.75;
+}
+@keyframes ovlLnMarkPulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.45; transform: scale(0.72); }
+}
 .ovl-code-area {
     flex: 1 1 auto;
     border: none;
@@ -4547,7 +4608,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.26.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.27.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-11';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -24113,6 +24174,13 @@ async function chatAgentExecRetranslateBlock(args, signal, pending) {
             // 带上分类原因 + 尝试次数。
             ovlVisualEnsureRetryBadge(el, { reason: reason, attempts: meta.attempts || 1, detail: (translateErr && translateErr.message) || String(translateErr), echoCandidate: meta.echoCandidate });
         }
+        // v2 Pass P157（B-1）：这条路径（AI 聊天窗 retranslate_block 工具）之前改完
+        // data-ovl-trans-* 之后从不触发 gutter 重排（侦察 .claude/tmp/p157_recon.md §4.2
+        // 表格唯一标"否"的那一行）——gutter 行号格子里的状态标记会停在旧值直到用户手动触发
+        // 别的重排。跟队列 worker 失败分支（约 36360 行一带）同一条纪律，补上同一个调度调用。
+        if (typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') {
+            ovlScheduleVisualGutterAfterImage();
+        }
         const msg = label + ' 失败（模型调用出错：' + ((translateErr && translateErr.message) || String(translateErr))
             + '。该块已保留原来的内容不受影响，可以再试一次或提醒用户换个 provider/模型）。';
         chatAppendToolRow('🔧 retranslate_block（块 #' + idx + '）· 失败', msg);
@@ -24133,6 +24201,10 @@ async function chatAgentExecRetranslateBlock(args, signal, pending) {
     if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; } // v2 Pass P113：跟"翻译成功"区分开，供进度提示如实报告；title 见 v2 Pass P128（C2）
     if (typeof ovlVisualRemoveForceAcceptBadge === 'function') ovlVisualRemoveForceAcceptBadge(el);
     try { if (typeof ovlVisualLangProgressUpdate === 'function') ovlVisualLangProgressUpdate(); } catch (e) {}
+    // v2 Pass P157（B-1）：同上——成功路径同样要补一次 gutter 重排调度，不能只有失败分支有。
+    if (typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') {
+        ovlScheduleVisualGutterAfterImage();
+    }
 
     const newRendered = String(el.textContent == null ? '' : el.textContent).trim();
     const text = label + ' 完成。\n【重译前渲染文本】\n' + (oldRendered || '（空）') + '\n\n【重译后渲染文本】\n' + (newRendered || '（空）');
@@ -36892,6 +36964,16 @@ async function ovlVisualBlockRetryClick(el) {
                 detail: (err && err.message) || String(err),
                 echoCandidate: meta.echoCandidate
             });
+            // v2 Pass P157（B-3，对抗验证阶段补）：这条真实失败分支（非 AbortError、非陈旧
+            // seq）之前从不触发 gutter 重排——独立验证用真实 CDP 实测复现：把一个 partial
+            // （菱形标记）块喂进这条路径，桩固定失败后块的真实状态变成 failed（三角），但不
+            // 手动调用 ovlRenderVisualGutter() 时行号格子上的标记停留在旧的 partial 菱形，
+            // 直到下一次别的触发点才会更新——用户看着行号栏里一个"菱形"，实际上这块已经是
+            // "三角"。跟 B-1（chatAgentExecRetranslateBlock）、成功分支（约 36928 行）同一条
+            // 调度调用，同一条纪律。
+            if (typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') {
+                ovlScheduleVisualGutterAfterImage();
+            }
         }
         if (typeof showToast === 'function') {
             showToast('重新翻译失败：' + ((err && err.message) || String(err)), 'error');
@@ -36997,13 +37079,18 @@ async function ovlVisualBlockForceTranslateClick(el) {
 // 文本） > partial-reason=short（可能漏译） > notrans（参考文献） > skipped（不翻译） >
 // ladder=raw（兜底译出） > inflight（worker 后台翻译中） > pending（待翻译） > 都不是=已正常
 // 译完，返回 null（不显示这块区域）。
+// v2 Pass P157：每个分支新增一个稳定的 `key` 字段（8 类，busy 覆盖
+// force-translating/retrying/inflight 三个"进行中"子状态）——这是 gutter 行号格子里画状态
+// 标记（ovlVisualGutterApplyMarksAll，约 56010 行一带）用来选形状/颜色的唯一真值源，不是
+// 另一套判定逻辑，只是给这个函数本来就有的每个分支多贴一个机读标签，label/buttons 语义完全
+// 不变，字符串比较（title 悬浮文案）不受影响。
 function ovlQaVisualStateCompute(el) {
     if (!el || !document.body.contains(el)) return null;
     if (el.getAttribute('data-ovl-trans-force-translating') === '1') {
-        return { label: '翻译中…', buttons: [] };
+        return { key: 'busy', label: '翻译中…', buttons: [] };
     }
     if (el.getAttribute('data-ovl-trans-retrying') === '1') {
-        return { label: '重试中…', buttons: [] };
+        return { key: 'busy', label: '重试中…', buttons: [] };
     }
     if (el.hasAttribute('data-ovl-trans-failed')) {
         const reason = el.getAttribute('data-ovl-trans-fail-reason') || 'unknown';
@@ -37019,20 +37106,20 @@ function ovlQaVisualStateCompute(el) {
         if (typeof OvlVisualForceAcceptCandidates !== 'undefined' && OvlVisualForceAcceptCandidates.has(el)) {
             buttons.push({ key: 'accept', text: '仍然采用这次结果', title: '需要再点一次才会真正写入——独立于"重试"的第二次显式确认' });
         }
-        return { label: '翻译失败', buttons: buttons };
+        return { key: 'failed', label: '翻译失败', buttons: buttons };
     }
     if (el.getAttribute('data-ovl-trans-noprose') === '1') {
-        return { label: '无可译文本', buttons: [{ key: 'force', text: '强制翻译', title: '没有检测到需要翻译的自然语言，点击强制走一遍真正的翻译' }] };
+        return { key: 'noprose', label: '无可译文本', buttons: [{ key: 'force', text: '强制翻译', title: '没有检测到需要翻译的自然语言，点击强制走一遍真正的翻译' }] };
     }
     if (el.getAttribute('data-ovl-trans-partial-reason') === 'short') {
         const tip = (typeof OVL_VISUAL_PARTIAL_TIP !== 'undefined' && OVL_VISUAL_PARTIAL_TIP.short) || '本块译文的中文字符量明显低于源文可译内容的规模，可能有部分内容漏译。';
-        return { label: '可能漏译', buttons: [{ key: 'retry', text: '重试', title: tip }] };
+        return { key: 'partial', label: '可能漏译', buttons: [{ key: 'retry', text: '重试', title: tip }] };
     }
-    if (el.hasAttribute('data-ovl-trans-notrans')) return { label: '参考文献·不翻译', buttons: [] };
-    if (el.hasAttribute('data-ovl-trans-skipped')) return { label: '不翻译', buttons: [] };
-    if (el.getAttribute('data-ovl-trans-ladder') === 'raw') return { label: '兜底译出', buttons: [] };
-    if (el.getAttribute('data-ovl-trans-inflight') === '1') return { label: '翻译中…', buttons: [] };
-    if (el.getAttribute('data-ovl-trans-pending') === '1') return { label: '待翻译', buttons: [] };
+    if (el.hasAttribute('data-ovl-trans-notrans')) return { key: 'notrans', label: '参考文献·不翻译', buttons: [] };
+    if (el.hasAttribute('data-ovl-trans-skipped')) return { key: 'skipped', label: '不翻译', buttons: [] };
+    if (el.getAttribute('data-ovl-trans-ladder') === 'raw') return { key: 'raw', label: '兜底译出', buttons: [] };
+    if (el.getAttribute('data-ovl-trans-inflight') === '1') return { key: 'busy', label: '翻译中…', buttons: [] };
+    if (el.getAttribute('data-ovl-trans-pending') === '1') return { key: 'pending', label: '待翻译', buttons: [] };
     return null;
 }
 
@@ -55983,6 +56070,96 @@ let OvlVisualGutterSpacerEl = null; // v2 Pass P123（D1）：撑高 gutter 滚�
 let OvlVisualGutterLastSpacerTop = -1;
 const OVL_VISUAL_GUTTER_MIN_H = 1; // v2 Pass P123（D2）：渲染高度小于这个值（绝大多数是 \label 等被过滤掉的命令行，量出来是 0）不产生行号格子——统一套 16px 下限会让上千个零高块的行号互相压成一坨
 
+// ==================== v2 Pass P157：段落状态标记（不遮挡正文，画在 gutter 格子内部）====
+// 关键坑（侦察 .claude/tmp/p157_recon.md §4.3 已确认）：ovlRenderVisualGutter() 的增量分支
+// 只按"几何（top/height）变没变"决定要不要重画格子（changedIdx，见下面 ovlRenderVisualGutter
+// 内部）——pending→failed 这类内容不变（worker 失败分支只 setAttribute，不碰 innerHTML）、
+// 渲染高度不变的状态转换，会被那条 diff 直接判定"没变"跳过，标记停在旧状态。这里单独维护一份
+// "每个块上次汇报给标记层的状态指纹" WeakMap，指纹变了就重画，完全独立于几何 diff，
+// ovlRenderVisualGutter() 每次调用都会跑一遍（见下面调用点），不管 changedIdx 是否为空。
+const OvlVisualGutterMarkFp = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+// v2 Pass P157 性能返修（实测复现见 .claude/tmp/p157_impl.md）：第一版实现对每一块每次调用都
+// 直接跑 ovlQaVisualStateCompute（10 个分支的属性判定），在 P123（D3）那条"30s 内 348 次
+// 重排、550 块语料"的热路径下把 test_p123_gutter_align.js 的 A3c（单次重排均值阈值）从
+// 19.68ms 顶到 20.57~20.91ms（阈值约 20.4~20.6ms），是真实可测的额外开销，不是噪声（profiler
+// 实测该函数自身只占单次重排总耗时的 2.9%，真正的大头是"数百个 pending 块在翻译队列排队
+// 期间，状态其实没变，但每次仍要跑满 10 个属性读取才能证明没变"）。
+//
+// 两层指纹修法（不是又写一套状态判定，只是给"要不要调用 ovlQaVisualStateCompute"这件事加一层
+// 更便宜的前置证据）：
+//   ① 原始属性指纹（ovlVisualGutterRawAttrFp）——只读 blk.attributes 一遍，拼出全部
+//      data-ovl-trans-* 属性的 name=value。ovlQaVisualStateCompute 的 10 个分支逐条核对过，
+//      无一例外只读这一批属性——"原始属性指纹没变"在数学上就等价于"该函数这次会算出跟上次
+//      一模一样的结果"，不需要真的重新跑一遍 10 个分支去求证。跟当前语言一起比对（缓存在
+//      OvlVisualGutterMarkRawFp / OvlVisualGutterMarkLangSeen），语言切换（zh<->original）
+//      或属性真的变了，才会往下走到②；语言和属性都没变（绝大多数 pending 块在排队期间的
+//      常态）直接跳过，连 ovlQaVisualStateCompute 都不调用。
+//   ② 只有①判定"可能变了"时，才调用真正的 ovlQaVisualStateCompute(blk)（且只由它决定具体
+//      状态/label，不复制它的判断逻辑），再用现成的 key+label 指纹（OvlVisualGutterMarkFp）
+//      决定要不要真的动 DOM——这一层是原有设计，没有改变。
+let OvlVisualGutterMarkLangSeen = null;
+const OvlVisualGutterMarkRawFp = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+function ovlVisualGutterRawAttrFp(blk) {
+    const attrs = blk.attributes;
+    let fp = '';
+    for (let i = 0; i < attrs.length; i++) {
+        const a = attrs[i];
+        if (a.name.indexOf('data-ovl-trans-') === 0) fp += a.name + '=' + a.value + ';';
+    }
+    return fp;
+}
+// 对一批块（跟 ovlRenderVisualGutter 里 querySelectorAll 出来的 blocks 数组同一份）逐个比对
+// 状态指纹，只在真的变了的块上动 DOM（新增/替换/删掉 .ovl-ln-mark 子节点）。返回值供调用方
+// 判断"这一轮是不是该跳过后续重排"的早退条件要不要包含"标记也变了"。正常已译完的段落
+// state 为 null，不产生任何标记元素——满屏都是点等于没信息，只标"需要注意"的状态。
+function ovlVisualGutterApplyMarksAll(blocks) {
+    if (!OvlVisualGutterCellMap) return false;
+    const lang = (typeof OvlVisualLangState !== 'undefined') ? OvlVisualLangState.lang : null;
+    const langChanged = (OvlVisualGutterMarkLangSeen !== lang);
+    OvlVisualGutterMarkLangSeen = lang;
+    let changed = false;
+    for (let i = 0; i < blocks.length; i++) {
+        const blk = blocks[i];
+        const cell = OvlVisualGutterCellMap.get(blk);
+        if (!cell) continue; // 渲染高度 <1px 的块没有格子，没地方画标记（既有限制，不是本次新增）
+        const rawFp = ovlVisualGutterRawAttrFp(blk);
+        if (!langChanged) {
+            const lastRawFp = OvlVisualGutterMarkRawFp ? OvlVisualGutterMarkRawFp.get(blk) : undefined;
+            // 语言没切换、这块身上 data-ovl-trans-* 的原始属性也一个字节没变——
+            // ovlQaVisualStateCompute 这次必然算出跟上次一样的结果，不需要真的调用它。
+            if (lastRawFp === rawFp) continue;
+        }
+        if (OvlVisualGutterMarkRawFp) OvlVisualGutterMarkRawFp.set(blk, rawFp);
+        const state = (lang === 'zh' && rawFp && typeof ovlQaVisualStateCompute === 'function')
+            ? (function () { try { return ovlQaVisualStateCompute(blk); } catch (e) { return null; } })()
+            : null;
+        const key = (state && typeof state.key === 'string') ? state.key : '';
+        const label = (state && typeof state.label === 'string') ? state.label : '';
+        const fp = key + '|' + label;
+        const lastFp = OvlVisualGutterMarkFp ? OvlVisualGutterMarkFp.get(blk) : undefined;
+        if (lastFp === fp) continue;
+        if (OvlVisualGutterMarkFp) OvlVisualGutterMarkFp.set(blk, fp);
+        changed = true;
+        let markEl = cell.querySelector('.ovl-ln-mark');
+        if (!key) {
+            if (markEl) markEl.remove();
+            continue;
+        }
+        if (!markEl) {
+            markEl = document.createElement('span');
+            markEl.setAttribute('aria-hidden', 'true'); // 装饰性标记，屏幕阅读器走弹窗里的文字说明，不重复读两遍
+            cell.appendChild(markEl);
+        }
+        // className 整体覆盖写（不用 classList.add/remove 来回切）——每次最多一个状态 class，
+        // 用赋值保证旧 class 不会跟新 class 并存残留。title 直接复用 ovlQaVisualStateCompute
+        // 的 label 字面量（都是固定常量字符串，不是拼接任何 attribute 值，不存在注入风险），
+        // 跟原来气泡的措辞完全一致，鼠标悬停即可读到，不用新造悬浮框。
+        markEl.className = 'ovl-ln-mark ovl-ln-mark-' + key;
+        markEl.title = label;
+    }
+    return changed;
+}
+
 function ovlVisualGutterSameBlockOrder(blocks) {
     if (blocks.length !== OvlVisualGutterBlockOrder.length) return false;
     for (let i = 0; i < blocks.length; i++) {
@@ -56159,8 +56336,12 @@ function ovlRenderVisualGutter() {
         }
         OvlVisualGutterBlockOrder = blocks;
 
+        // v2 Pass P157：状态标记指纹跟几何 diff 完全独立地判断要不要重画（§4.3 的坑）——
+        // 无条件对这一轮的全部块跑一遍，不管上面 anyChanged 是不是 true；函数内部自己按
+        // WeakMap 记的上次指纹比对，没变的块不touch DOM，开销跟"什么都没变"时的空转一样。
+        const markChanged = ovlVisualGutterApplyMarksAll(blocks);
         const spacerChanged = ovlVisualGutterSyncSpacer(gutter, pane);
-        if (!anyChanged && !spacerChanged) return; // v2 Pass P123（D3）：这一轮测下来高度真没变——整趟到此为止，不碰 scrollTop/选区标记/字体重排
+        if (!anyChanged && !spacerChanged && !markChanged) return; // v2 Pass P123（D3）：这一轮测下来高度真没变——整趟到此为止，不碰 scrollTop/选区标记/字体重排；P157 追加 markChanged，纯状态变化（高度不变）也不能被这道早退吞掉
 
         gutter.scrollTop = pane.scrollTop;
         ovlPaintGutterMarks();
