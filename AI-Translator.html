@@ -2331,6 +2331,20 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 .ovl-visual-block[data-ovl-num]::before {
     content: attr(data-ovl-num); font-weight: 700; color: #111827; flex: 0 0 auto; white-space: nowrap;
 }
+/* v2 Pass P158：\cite/\ref/\eqref/\autoref/\pageref/\cref/\Cref 引用编号四档呈现——用户
+   明确要求"不能遮挡正文、不能满屏乱撒"，且刚经历过 P156/P157 两轮把气泡挪出正文的返工。
+   这里只用 display:inline + border-bottom 虚线 + color，不用 position:absolute/fixed/
+   sticky，不用 z-index，不设固定 width/height（避免撑破所在行行高/引发意外换行），不新增
+   任何浮层/角标；可信度全靠原生 title 属性 tooltip 传达，不需要额外 DOM 节点。也完全不碰
+   .ovl-visual-gutter* 相关选择器（那是并发中的 P157 地盘）。
+   Visual 面板目前没有深色皮肤（.ovl-visual-pane 背景写死 #ffffff，见 2082 行附近注释：
+   "以后 Visual 面板真的有了深色皮肤，只需要在 :root 那两个变量上覆盖新的深色值"）——这里
+   延续同一个既有事实，不新造一套目前没有消费场景的深色变量。 */
+.ovl-xref { display: inline; }
+.ovl-xref-real { color: inherit; } /* 真编号+新鲜：跟正文一样，不加任何装饰——"看起来正常"本身就是"可信"的信号 */
+.ovl-xref-stale { border-bottom: 1px dashed #b45309; color: #92400e; } /* 过期：暖色调 */
+.ovl-xref-approx { border-bottom: 1px dashed #1d4ed8; color: #1e40af; } /* 近似：冷色调，跟"过期"不同色相 */
+.ovl-xref-unknown { color: #9ca3af; } /* 查不到：沿用"??"这种既有 LaTeX 编译失败视觉习惯，弱化色不刺眼 */
 .ovl-visual-body p { margin: 0.6em 0; }
 .ovl-visual-body ul, .ovl-visual-body ol { margin: 0.4em 0 0.6em 1.4em; }
 .ovl-visual-body li { margin: 0.15em 0; }
@@ -4616,8 +4630,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.28.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-11';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.28.01';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-12';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -4754,6 +4768,15 @@ const QWEN_DEFAULT_VISION_MODEL = 'qwen3-vl-plus'; // 体现在 DEFAULT_MODEL_CA
 const MODEL_PRICING_AS_OF = '2026-08-14';
 const MODEL_PRICING = {
     gemini: {
+        // 2026-09-11 补充：gemini-3.8-flash 此前压根没进过这张表（不是匹配规则的问题——
+        // DEFAULT_MODEL_CATALOG 种子目录里也没有这一条，模型 id 靠 /v1/models 实时拉取拿到，
+        // getModelPrice() 对着表逐 key 做最长前缀匹配，表里没有任何以它开头的 key，直接返回
+        // null，界面按约定显示"未知"）。价格取自用户提供的官方页面
+        // https://ai.google.dev/gemini-api/docs/pricing（核对日期 2026-09-11）：输出价含
+        // thinking token；页面注明该价格有效期至 2026-12-31。不比照同桶 gemini-3.6/3.7-flash
+        // 的 promoUntil+after 限时价结构去猜到期后的恢复价——官方这条只给了到期日、没给恢复价
+        // 数字，未知不填，避免 resolvePromoPrice() 在字段不全时产出编造的价格。
+        'gemini-3.8-flash':       { in: 0.75, out: 3.75, sourceUrl: 'https://ai.google.dev/gemini-api/docs/pricing', asOf: '2026-09-11', note: '输出价含 thinking token；页面标注有效期至 2026-12-31，到期后价格官方未列，未知不填' },
         'gemini-3.7-flash':       { in: 0.75, out: 3.75,  promoUntil: '2026-12-31', after: { in: 1.50, out: 7.50 } },
         'gemini-3.6-flash':       { in: 0.75, out: 3.75,  promoUntil: '2026-12-31', after: { in: 1.50, out: 7.50 } },
         'gemini-3.5-flash':       { in: 1.50, out: 9.00 },
@@ -9473,9 +9496,14 @@ function ovlRenderTextColor(str, placeholders) {
 }
 
 // 渲染格式化文本（支持Markdown和LaTeX）
-function renderFormattedText(text) {
+// v2 Pass P158：新增第 2 个可选参数 xrefCtx——不传（undefined/null，聊天气泡/逐句对照卡片/
+// ovlRenderTextColor 内部递归调用等既有全部调用点都不传）时，label/tag/eqref/autoref/ref 照旧
+// 整段 stripCommand 删除、cite 系照旧原样透传，逐字节保持改动前行为。只有 Visual 渲染管线
+// （ovlVisualRenderChunk 及其内部 fallback 分支）显式传入 OvlXrefState 才会启用引用编号解析
+// （见 .claude/tmp/p158_design.md §7.2、§5.2）。
+function renderFormattedText(text, xrefCtx) {
     if (!text || !window.marked || !window.katex) return text || '';
-    
+
     let content = String(text).replace(/[\u00A0\u1680\u180E\u2000-\u200B\u202F\u205F\u3000\uFEFF]/g, ' ');
 
     // v2 Overleaf \u9884\u89C8 Pass\uFF1A\label/\tag/\eqref/\autoref/\ref \u66FE\u7ECF\u53EA\u5728\u4E0B\u9762 pushPlaceholder
@@ -9491,9 +9519,6 @@ function renderFormattedText(text) {
     // \u4E0D\u4F1A\u4E8C\u6B21\u8BEF\u4F24\u6216\u4EA7\u751F\u526F\u4F5C\u7528\u3002
     content = stripCommand(content, 'label');
     content = stripCommand(content, 'tag');
-    content = stripCommand(content, 'eqref');
-    content = stripCommand(content, 'autoref');
-    content = stripCommand(content, 'ref');
 
     const placeholders = [];
 
@@ -9511,9 +9536,11 @@ function renderFormattedText(text) {
             // equation（`\text{if \eqref{eq:x} ... hold}`）整条公式渲染失败。这几个命令跟
             // \label/\tag 是同一类"渲染这一步用不上、删掉不影响读懂公式本身"的东西，用
             // 同一条 stripCommand 处理，不新开一套逻辑。
-            formula = stripCommand(formula, 'eqref');
-            formula = stripCommand(formula, 'autoref');
-            formula = stripCommand(formula, 'ref');
+            // v2 Pass P158：xrefCtx 传入时，公式内部的 \eqref/\autoref/\ref 不再直接删除，
+            // 改成换算成纯文本编号后用 \text{} 包起来（KaTeX 内部无法挂颜色/tooltip，见
+            // .claude/tmp/p158_design.md §4E/§8 第7点，明确记录的能力边界，不是漏做）；
+            // 未传 xrefCtx 时 ovlXrefStripOrNumberFormula 逐字节回退到原来的三次 stripCommand。
+            formula = ovlXrefStripOrNumberFormula(formula, xrefCtx);
             try {
                 const rendered = window.katex.renderToString(formula, {
                     displayMode: type === 'display',
@@ -9596,6 +9623,26 @@ function renderFormattedText(text) {
     pushPlaceholder(/\$\$([\s\S]*?)\$\$/g, 'display', (match, p1) => p1);
     pushPlaceholder(/\\\(([\s\S]*?)\\\)/g, 'inline', (match, p1) => p1);
     pushPlaceholder(/\$([^\$]+?)\$/g, 'inline', (match, p1) => p1);
+
+    // v2 Pass P158：正文级 \eqref/\autoref/\ref/\pageref/\cref/\Cref/\cite 系查表替换成编号
+    // span（真编号/过期/近似/查不到四档），走跟数学/textcolor 占位符完全一样的
+    // placeholders 机制（先占位、marked.parse 之后倒序回填，见 §5.2）。**必须放在上面全部
+    // 数学占位符提取之后**——公式内部出现的这几个命令（`\text{if \eqref{eq:x} ... hold}`
+    // 这种写法，见 renderFormattedText 内 P14 注释）此时已经被整条公式一起提成占位符
+    // token，不会被这里的正则重复扫到；如果反过来放在数学提取之前，会把 token 塞进公式
+    // 源码里喂给 KaTeX（`%` 还会被 KaTeX 当注释符截断公式），是真实的功能回归，不是次要
+    // 细节。放在 ovlRenderTextColor 之前，让 `\textcolor{...}{\cite{key}}` 这种写法里的
+    // \cite 也能在 textcolor 摘取 inner 内容之前先被替换成 token，再靠既有的"倒序回填"
+    // 机制（见下面 ovlRenderTextColor 调用处注释）从内层挖出来，不需要给 ovlRenderTextColor
+    // 本身新增参数。未传 xrefCtx（聊天气泡/逐句对照卡片等既有调用点）时逐字节保持改动前
+    // 行为：label/tag 已经在函数开头删过，这里只 strip 这三个，cite 系原样透传不动。
+    if (xrefCtx) {
+        content = ovlXrefTransformProse(content, xrefCtx, placeholders);
+    } else {
+        content = stripCommand(content, 'eqref');
+        content = stripCommand(content, 'autoref');
+        content = stripCommand(content, 'ref');
+    }
 
     // v2 Overleaf 预览 Pass：\textcolor{name}{...} 内联上色。必须放在上面这几个数学占位符
     // 之后——\begin{equation}/$...$ 内部出现的 \textcolor（比如
@@ -32075,7 +32122,10 @@ function ovlVisualRenderChunk(tex) {
     // 太大），只改这一个调用点传的参数。
     const filtered = LatexFilter.filterLatexForTranslation(protectedInput.text, { comments: 'always', structure: true });
     const restored = ovlRestoreTextColorAfterFilter(filtered.text, protectedInput.tokens);
-    return renderFormattedText(restored);
+    // v2 Pass P158：Visual 渲染管线主路径，显式传入 OvlXrefState 启用引用编号解析
+    // （真编号/过期/近似/查不到四档）。这是唯一的模块级单例，不需要逐层传参——
+    // ovlVisualRender() 在渲染前已经按三重失效条件维护好它（§6.1）。
+    return renderFormattedText(restored, OvlXrefState);
 }
 
 // ---- v2 Overleaf 预览 Pass：表格 / 算法 / 图片近似渲染 ----
@@ -32459,7 +32509,9 @@ function ovlRenderVisualTable(tex) {
         html += ovlRenderTabularBodyAsTable(rawBody);
     } else {
         // 没找到 tabular——诚实退化：不假装解析出了表格，把清过噪声的原文当散文显示。
-        html += '<div class="ovl-visual-float-fallback">' + ovlUnwrapSingleParagraph(renderFormattedText(inner)) + '</div>';
+        // v2 Pass P158：fallback 路径同样传 OvlXrefState，caption/正文里的 \cite/\ref 一样要
+        // 显示编号，不因为落进"解析失败"分支就退化成裸源码。
+        html += '<div class="ovl-visual-float-fallback">' + ovlUnwrapSingleParagraph(renderFormattedText(inner, OvlXrefState)) + '</div>';
     }
     html += '</div>';
     return html;
@@ -32587,7 +32639,8 @@ function ovlRenderVisualAlgorithm(tex) {
         const lines = ovlParseAlgorithmicLines(algoM[2]);
         html += '<div class="ovl-visual-algo-body">' + ovlRenderAlgorithmicLines(lines, numbered) + '</div>';
     } else {
-        html += '<div class="ovl-visual-float-fallback">' + ovlUnwrapSingleParagraph(renderFormattedText(ovlStripFloatLayoutNoise(inner))) + '</div>';
+        // v2 Pass P158：同上——algorithmic 环境解析失败时的散文兜底也要走引用编号解析。
+        html += '<div class="ovl-visual-float-fallback">' + ovlUnwrapSingleParagraph(renderFormattedText(ovlStripFloatLayoutNoise(inner), OvlXrefState)) + '</div>';
     }
     html += '</div>';
     return html;
@@ -33034,7 +33087,8 @@ function ovlRenderVisualBibliography(tex) {
     // 起止标签本身找不到 / \end 在 \begin 之前（畸形源码）就不装懂——诚实退化成散文渲染，
     // 不硬凑，也不吞掉后面的内容（D2/边界纪律）。
     if (!beginM || endIdx === -1 || endIdx < beginM.index) {
-        return '<div class="ovl-visual-float-fallback">' + ovlUnwrapSingleParagraph(renderFormattedText(cleanedTex)) + '</div>';
+        // v2 Pass P158：thebibliography 解析失败的散文兜底也传 OvlXrefState。
+        return '<div class="ovl-visual-float-fallback">' + ovlUnwrapSingleParagraph(renderFormattedText(cleanedTex, OvlXrefState)) + '</div>';
     }
     const bodyStart = beginM.index + beginM[0].length;
     const inner = cleanedTex.slice(bodyStart, endIdx);
@@ -33043,7 +33097,8 @@ function ovlRenderVisualBibliography(tex) {
     const firstItemM = /\\bibitem\b/.exec(inner);
     const items = firstItemM ? ovlBibParseItems(inner.slice(firstItemM.index)) : [];
     if (!items.length) {
-        return '<div class="ovl-visual-float-fallback">' + ovlUnwrapSingleParagraph(renderFormattedText(cleanedTex)) + '</div>';
+        // v2 Pass P158：thebibliography 解析失败的散文兜底也传 OvlXrefState。
+        return '<div class="ovl-visual-float-fallback">' + ovlUnwrapSingleParagraph(renderFormattedText(cleanedTex, OvlXrefState)) + '</div>';
     }
     let html = '<div class="ovl-visual-bib">';
     for (let k = 0; k < items.length; k++) {
@@ -33055,6 +33110,592 @@ function ovlRenderVisualBibliography(tex) {
     }
     html += '</div>';
     return html;
+}
+
+// ==================== v2 Pass P158：Visual 模式 \cite/\ref/\eqref 引用编号 ====================
+// 设计文档：.claude/tmp/p158_design.md（已批准）。摘要：编译产物（.aux 的 \newlabel/\bibcite）
+// 优先，取不到/过期时退回前端自计数近似兜底，四档呈现（real/stale/approx/unknown）全部走
+// 原生 title 属性 tooltip + 行内样式差异，不新增浮层/角标，不碰行号栏（P157 的地盘）。
+//
+// 【安全边界，§5】label key / cite key / .aux 里取出的编号/页码/作者/年份字段全部是不可信输入
+// （renderFormattedText 是 KaTeX trust:true + 直接 DOM 注入的敏感区，被 Visual 编辑器/聊天气泡/
+// 逐句对照卡片共用）。属性上下文一律 escapeAttr()，文本节点一律 escapeHtml()，natbib 作者姓氏
+// 同样只过 escapeHtml（不走 ovlBibCleanText 的富文本清洗，避免多一层攻击面），且全部产出的 HTML
+// 走既有的 placeholders 占位符机制回填（不新开 innerHTML 写入点，不放宽 KaTeX trust/strict）。
+
+// ---- 模块级单例：跟 OvlVisualLangState/OvlCompileSettings 同一种写法 ----
+let OvlXrefState = {
+    srcHash: null,          // 上次建表时 ovlVisualHashSrc(当前打开文件整篇文本)
+    compileId: null,        // 上次建表时对应的 OvlState.lastCompile.id（null=没有可用编译）
+    currentFileKey: null,   // 上次建表时 OvlState.currentFile.relPath||name（切文件必须重建）
+    ready: false,
+    auxUsable: false,       // 是否有可用的真实编译产物数据（parsedOk && !restoredFromCache）
+    fresh: false,           // auxUsable 时，内容哈希是否跟编译时一致
+    biblatexDetected: false,// 当前文件是否加载了 biblatex（§4B 第5点：不支持，cite 一律走近似/查不到）
+    natbibFound: false,     // 当前文件是否找到 \usepackage{natbib} 这一行
+    natbibNumeric: false,   // natbib 选项是否含 numbers/super（决定 cite 显示数字还是作者-年份）
+    compiledAtLabel: '',    // tooltip 用的 HH:MM（编译完成时刻，ovlDoRecompile 里盖）
+    labels: null,           // Map<key,{display,page,anchorType,raw}>  来自 .aux \newlabel
+    crefTypes: null,        // Map<key,type>                            来自 @cref 影子 label
+    cites: null,            // Map<key,{ordinal,year,author,isNested}>  来自 .aux \bibcite
+    approxLabels: null,     // Map<key,{display,anchorType}>            前端自计数兜底
+    approxCites: null,      // Map<key,{display}>                       \bibitem 出现顺序兜底
+    auxDataRef: null        // 上次建表时看到的 lastCompile.xrefAux 引用（含 undefined/null）——
+                             // ovlDoRecompile 里 aux 解析是 await 出来的，跟 PDF 拉取之间隔着
+                             // 一次真正的网络往返，这期间完全可能已经有一次"compileId 没变但
+                             // xrefAux 还没到"的中间渲染发生过；只比较 compileId 会让这次
+                             // 渲染把"没数据"缓存住，之后 aux 真的到了也不会重建。单独比较
+                             // 这个引用，保证 aux 到达后下一次渲染一定能重建。
+};
+
+// ---- §4A/4B 共用：从一段 blob（形如 "{1}{1}{Intro}{equation.1}{}"）里依次切出配平的
+// 花括号分组，不假设固定段数——切不出来就到此为止，调用方按"切出几段用几段"处理。
+function ovlXrefSplitBraceGroups(blob) {
+    const groups = [];
+    const s = String(blob == null ? '' : blob);
+    let i = 0;
+    while (i < s.length) {
+        while (i < s.length && /\s/.test(s[i])) i++;
+        if (s[i] !== '{') break;
+        const close = ovlFindMatchingBrace(s, i);
+        if (close === -1) break;
+        groups.push(s.slice(i + 1, close));
+        i = close + 1;
+    }
+    return groups;
+}
+// {X} 形态（\tag{X} 在 aux 里产出的显示串就是再包一层花括号）剥掉这一层外壳；
+// 不是这个形状（没有完整包住整个字符串）原样返回，不误伤正常数字/罗马数字/subequations 的 "4a"。
+function ovlXrefUnwrapOuterBrace(s) {
+    const t = String(s == null ? '' : s);
+    if (t.length >= 2 && t.charAt(0) === '{' && t.charAt(t.length - 1) === '}') {
+        const close = ovlFindMatchingBrace(t, 0);
+        if (close === t.length - 1) return t.slice(1, -1);
+    }
+    return t;
+}
+
+// ---- §4A：解析 .aux 里的全部 \newlabel（含 cleveref 的 key@cref 影子条目）----
+// 每条 \newlabel 独立处理，一条坏（花括号不配平/切不出至少 2 段）不拖累其它行；全文件一条都
+// 解析不出来时 parsedOk=false，调用方据此判定整份 aux 不可用，不强行半吊子使用（§4A 第5点）。
+function ovlXrefParseAux(auxText) {
+    const labels = new Map();
+    const crefTypes = new Map();
+    const text = String(auxText == null ? '' : auxText);
+    const re = /\\newlabel\{([^{}]*)\}\{/g;
+    let m, any = false, guard = 0;
+    while ((m = re.exec(text)) && ++guard < 200000) {
+        const key = m[1];
+        const openIdx = m.index + m[0].length - 1;
+        const closeIdx = ovlFindMatchingBrace(text, openIdx);
+        if (closeIdx === -1) continue; // 配平失败（比如编译中途被打断的半截 aux）：这一条跳过
+        const blob = text.slice(openIdx + 1, closeIdx);
+        const groups = ovlXrefSplitBraceGroups(blob);
+        if (groups.length < 2) continue; // 切不出至少 2 段：不可解析，跳过
+        const cm = /^(.*)@cref$/.exec(key);
+        if (cm) {
+            // cleveref 影子 label：group[0] 形如 "[figure][1][]1"，只取方括号里的类型词，
+            // 不把这条整体当正常 label 用（真正的显示编号来自它对应的非 @cref 主条目）。
+            const typeM = /^\[([a-zA-Z]+)\]/.exec(groups[0]);
+            if (typeM) crefTypes.set(cm[1], typeM[1]);
+            any = true;
+            continue;
+        }
+        any = true;
+        const display = ovlXrefUnwrapOuterBrace(groups[0]);
+        const page = groups.length > 1 ? groups[1] : '';
+        const anchor = groups.length > 3 ? groups[3] : '';
+        const anchorType = anchor && anchor.indexOf('.') !== -1 ? anchor.slice(0, anchor.indexOf('.')) : (anchor || null);
+        labels.set(key, { display: display, page: page, anchorType: anchorType, raw: groups[0] });
+    }
+    return { labels: labels, crefTypes: crefTypes, parsedOk: any };
+}
+
+// ---- §4B：解析 .aux 里的全部 \bibcite（不碰 .bbl 一个字节，见设计文档摘要）----
+// 只切出结构性事实（数字 or 嵌套元组的序号/年份/姓氏），不在这里判定"该显示数字还是作者-年份"
+// ——那个判定依赖当前文件的 \usepackage[...]{natbib} 选项，属于渲染期上下文，见 ovlXrefBuild。
+function ovlXrefParseBibcite(auxText) {
+    const cites = new Map();
+    const text = String(auxText == null ? '' : auxText);
+    const re = /\\bibcite\{([^{}]*)\}\{/g;
+    let m, guard = 0;
+    while ((m = re.exec(text)) && ++guard < 200000) {
+        const key = m[1];
+        const openIdx = m.index + m[0].length - 1;
+        const closeIdx = ovlFindMatchingBrace(text, openIdx);
+        if (closeIdx === -1) continue;
+        const blob = text.slice(openIdx + 1, closeIdx);
+        const trimmed = blob.replace(/^\s+/, '');
+        if (trimmed.charAt(0) === '{') {
+            // natbib 嵌套元组：{序号}{年份}{{姓氏}}{{备用}}——numbers/authoryear 两种子模式
+            // 结构完全一样，光看这条数据本身分辨不出显示形态（§4B 核心发现）。
+            const groups = ovlXrefSplitBraceGroups(trimmed);
+            const ordinal = groups.length > 0 ? ovlXrefUnwrapOuterBrace(groups[0]) : '';
+            const year = groups.length > 1 ? groups[1] : '';
+            const author = groups.length > 2 ? ovlXrefUnwrapOuterBrace(groups[2]) : '';
+            cites.set(key, { ordinal: ordinal, year: year, author: author, isNested: true });
+        } else {
+            // 纯数字/{X}式 tag：numeric 档，直接当编号用。
+            cites.set(key, { ordinal: ovlXrefUnwrapOuterBrace(trimmed), year: null, author: null, isNested: false });
+        }
+    }
+    return cites;
+}
+
+// 供 ovlDoRecompile 编译完成后调用：一次性解析 aux 文本，产出的结果原样挂在
+// data.xrefAux 上缓存，避免每次 Visual 渲染都重新解析同一份 aux（§6.2）。
+// 实现时用真实 e2e 用例逮到的返修：parsedOk 不能只看 \newlabel 那一半——§4A 第5点"全文件
+// 一条 \newlabel 都解析不出来就整份 aux 判不可用"说的是 \ref/\eqref/\autoref 这一类，不
+// 覆盖 \bibcite；如果只 tie 给 auxParsed.parsedOk，一份只有参考文献、没有任何交叉引用的
+// 正常文档（\newlabel 天然 0 条）会被误判成"整份 aux 不可用"，连本来能查到的 \cite 也被
+// 一起打进近似/查不到档。改成"labels 或 cites 任一有数据就算可用"，对 \ref 类查找完全无副
+// 作用（this.labels 变成空 Map 而不是 null 时，Map.has() 对任何 key 恒为 false，效果跟
+// auxUsable 整体为 false 时一样都是"退到近似/查不到"，只是 \cite 这条独立通路不再被错误
+// 牵连）。
+function ovlXrefParseAuxAndBibcite(auxText) {
+    const auxParsed = ovlXrefParseAux(auxText);
+    const cites = ovlXrefParseBibcite(auxText);
+    const parsedOk = auxParsed.parsedOk || cites.size > 0;
+    return { labels: auxParsed.labels, crefTypes: auxParsed.crefTypes, cites: cites, parsedOk: parsedOk };
+}
+
+// ==================== §4F：兜底自计数（近似档）====================
+// 已知、明确不修的局限（照实实现，不编造修复，见设计文档 §4F/§8）：
+//   1. align/gather 等多行环境里单独一行的 \nonumber/\notag——该行不计数、也不产出可查找的
+//      label（复刻真实 aux 行为：真实编译里这种 label 会 "??"）。
+//   2. 单个 equation 环境内的 \nonumber/\tag{}——实测会让真实编译里紧邻的下一个公式"复用"
+//      同一个计数器值，机制未查明，近似档不复刻这个反直觉行为，只是同样不给这个 label 编号
+//      （判不出 = 落进 unknown 档，不冒充一个可能错误的真编号）。
+//   3. equation*/align*/gather* 等星号变体完全不计数（无歧义，参考 P116 对 \section* 的处理）。
+//   4. subequations 产出字母后缀编号，父计数器一次性递增+冻结；未测试过内部再套一层带
+//      \nonumber 的 align 这种组合场景。
+//   5. 只覆盖"当前打开文件"的文本，不跨 \input/\include 到未打开的文件（继承既有边界，
+//      ovlVisualRender 本来就只读 #ovlCodeArea 一份文件）。
+const OVL_XREF_MATH_ENV_RE = /\\begin\{(equation|align|gather|multline|eqnarray)(\*?)\}([\s\S]*?)\\end\{\1\2\}/g;
+const OVL_XREF_SUBEQ_RE = /\\begin\{subequations\}([\s\S]*?)\\end\{subequations\}/g;
+const OVL_XREF_FLOAT_RE = /\\begin\{(figure|table|algorithm)(\*?)\}([\s\S]*?)\\end\{\1\2\}/g;
+
+function ovlXrefLineHasNoNumber(line) {
+    return /\\nonumber\b/.test(line) || /\\notag\b/.test(line);
+}
+function ovlXrefFirstLabel(text) {
+    const m = /\\label\s*\{([^{}]*)\}/.exec(String(text == null ? '' : text));
+    return m ? m[1] : null;
+}
+// align/gather/multline/eqnarray 内部按顶层 \\ 切物理行，逐行判断是否计数/取 label；
+// 供顶层普通环境和 subequations 内部共用（区别只在显示串怎么拼，由各自调用方处理）。
+function ovlXrefEachCountableLine(body, cb) {
+    const lines = String(body == null ? '' : body).split(/\\\\/);
+    for (let li = 0; li < lines.length; li++) {
+        const line = lines[li];
+        if (!line.trim()) continue;
+        if (ovlXrefLineHasNoNumber(line)) continue; // §4F 第1点：跳过，不计数、不取 label
+        cb(line);
+    }
+}
+
+function ovlXrefApproxScan(srcRaw) {
+    const labels = new Map();
+    const cites = new Map();
+    const cleaned = (typeof ovlStripLatexCommentsForRender === 'function')
+        ? ovlStripLatexCommentsForRender(srcRaw) : String(srcRaw == null ? '' : srcRaw);
+
+    // ---- section/subsection/subsubsection：复用 P116 的同一套计数器函数，保证近似档跟
+    // 既有 Visual 章节编号（.ovl-visual-block[data-ovl-num]）不打架（§7.1 要求）。----
+    try {
+        const numState = { sec: 0, sub: 0, subsub: 0, appendix: false };
+        const paras = cleaned.split(/\n\s*\n/);
+        for (let pi = 0; pi < paras.length; pi++) {
+            let numLabel = null;
+            try { numLabel = ovlNumComputeForBlock(paras[pi], numState); } catch (e) { numLabel = null; }
+            if (numLabel == null) continue;
+            const key = ovlXrefFirstLabel(paras[pi]);
+            if (key) labels.set(key, { display: numLabel.replace(/\.$/, ''), anchorType: 'section' });
+        }
+    } catch (e) { /* 章节近似失败不影响其它类别 */ }
+
+    // ---- figure/table/algorithm：出现顺序计数（含星号变体——双栏浮动体星号只影响版式，
+    // 不影响是否编号，这一点跟 equation* 语义不同，不能共用同一条"星号不计数"规则）。----
+    try {
+        const counters = { figure: 0, table: 0, algorithm: 0 };
+        OVL_XREF_FLOAT_RE.lastIndex = 0;
+        let m, guard = 0;
+        while ((m = OVL_XREF_FLOAT_RE.exec(cleaned)) && ++guard < 20000) {
+            counters[m[1]] = (counters[m[1]] || 0) + 1;
+            const key = ovlXrefFirstLabel(m[3]);
+            if (key) labels.set(key, { display: String(counters[m[1]]), anchorType: m[1] });
+        }
+    } catch (e) { /* float 近似失败不影响其它类别 */ }
+
+    // ---- equation 家族：先挖出 subequations 块各自独立编号（父计数器冻结+字母后缀），
+    // 剩余文本里的普通数学环境正常递增顶层计数器。----
+    try {
+        const state = { eq: 0 };
+        let subOut = '';
+        let lastIdx = 0;
+        OVL_XREF_SUBEQ_RE.lastIndex = 0;
+        let sm, guard1 = 0;
+        while ((sm = OVL_XREF_SUBEQ_RE.exec(cleaned)) && ++guard1 < 20000) {
+            subOut += cleaned.slice(lastIdx, sm.index);
+            state.eq++;
+            const parentNum = state.eq;
+            let subCounter = 0;
+            OVL_XREF_MATH_ENV_RE.lastIndex = 0;
+            let im, guard2 = 0;
+            while ((im = OVL_XREF_MATH_ENV_RE.exec(sm[1])) && ++guard2 < 20000) {
+                if (im[2] === '*') continue;
+                if (im[1] === 'equation') {
+                    if (ovlXrefLineHasNoNumber(im[3])) continue;
+                    subCounter++;
+                    const suf = String.fromCharCode(96 + subCounter);
+                    const key = ovlXrefFirstLabel(im[3]);
+                    if (key) labels.set(key, { display: parentNum + suf, anchorType: 'equation' });
+                } else {
+                    ovlXrefEachCountableLine(im[3], function (line) {
+                        subCounter++;
+                        const suf = String.fromCharCode(96 + subCounter);
+                        const key = ovlXrefFirstLabel(line);
+                        if (key) labels.set(key, { display: parentNum + suf, anchorType: 'equation' });
+                    });
+                }
+            }
+            lastIdx = sm.index + sm[0].length;
+        }
+        subOut += cleaned.slice(lastIdx);
+        OVL_XREF_MATH_ENV_RE.lastIndex = 0;
+        let m2, guard3 = 0;
+        while ((m2 = OVL_XREF_MATH_ENV_RE.exec(subOut)) && ++guard3 < 20000) {
+            if (m2[2] === '*') continue; // §4F 第3点：星号变体不计数
+            if (m2[1] === 'equation') {
+                if (ovlXrefLineHasNoNumber(m2[3])) continue; // §4F 第2点：不冒充编号
+                state.eq++;
+                const key = ovlXrefFirstLabel(m2[3]);
+                if (key) labels.set(key, { display: String(state.eq), anchorType: 'equation' });
+            } else {
+                ovlXrefEachCountableLine(m2[3], function (line) {
+                    state.eq++;
+                    const key = ovlXrefFirstLabel(line);
+                    if (key) labels.set(key, { display: String(state.eq), anchorType: 'equation' });
+                });
+            }
+        }
+    } catch (e) { /* 公式近似失败不影响其它类别 */ }
+
+    // ---- \cite key 顺序：复用 ovlBibParseItems + ovlBibItemNumberAndBody，保证跟
+    // ovlRenderVisualBibliography 显示的编号一致（§7.1 要求，两条独立代码路径不能对不上）。----
+    try {
+        const bibRe = /\\begin\{thebibliography\}\s*\{[^{}]*\}([\s\S]*?)\\end\{thebibliography\}/g;
+        let bm, guard4 = 0;
+        while ((bm = bibRe.exec(cleaned)) && ++guard4 < 1000) {
+            const inner = bm[1];
+            const firstItemM = /\\bibitem\b/.exec(inner);
+            if (!firstItemM) continue;
+            const items = ovlBibParseItems(inner.slice(firstItemM.index));
+            for (let k = 0; k < items.length; k++) {
+                if (!items[k].key) continue;
+                const nb = ovlBibItemNumberAndBody(items[k], k + 1);
+                const disp = String(nb.num).replace(/^\[/, '').replace(/\]$/, '');
+                cites.set(items[k].key, { display: disp });
+            }
+        }
+    } catch (e) { /* 参考文献近似失败不影响其它类别 */ }
+
+    return { labels: labels, cites: cites };
+}
+
+// ==================== §6：缓存重建（三重失效条件）====================
+// 命中时零额外开销——只有下面三条任一为真才重新扫描/重新判定，其余渲染沿用已缓存的 Map。
+function ovlXrefCurrentFileKey() {
+    try {
+        const cf = OvlState.currentFile;
+        return (cf && (cf.relPath || cf.name)) || null;
+    } catch (e) { return null; }
+}
+function ovlXrefBuild(src) {
+    try {
+        const fileKey = ovlXrefCurrentFileKey();
+        const srcHash = ovlVisualHashSrc(src);
+        const lc = OvlState.lastCompile;
+        const compileId = (lc && lc.id) || null;
+        // ovlDoRecompile 里 .aux 是 await 出来的，跟"OvlState.lastCompile = data"赋值之间
+        // 隔着一次真正的网络往返——这期间完全可能已经发生过一次"compileId 没变但
+        // lc.xrefAux 还没写上"的中间渲染，把只比较 compileId 的缓存判定"钉死"在没数据的
+        // 状态。额外比较这个引用本身，保证 aux 真正到达后的下一次渲染一定会重建。
+        const auxRefNow = (lc && lc.xrefAux) || null;
+        const needRebuild = !OvlXrefState.ready
+            || srcHash !== OvlXrefState.srcHash
+            || compileId !== OvlXrefState.compileId
+            || fileKey !== OvlXrefState.currentFileKey
+            || auxRefNow !== OvlXrefState.auxDataRef;
+        if (!needRebuild) return;
+
+        OvlXrefState.srcHash = srcHash;
+        OvlXrefState.compileId = compileId;
+        OvlXrefState.currentFileKey = fileKey;
+        OvlXrefState.auxDataRef = auxRefNow;
+        OvlXrefState.ready = true;
+
+        // natbib 选项探测——跟 aux 新鲜度无关，只影响"该显示数字还是作者-年份"这个判定
+        // （§4B 第3点），扫描对象是当前整篇文本（含导言区），不是只读正文。
+        const natbibM = /\\usepackage\s*\[([^\]]*)\]\s*\{\s*natbib\s*\}/.exec(src);
+        const natbibBare = /\\usepackage\s*\{\s*natbib\s*\}/.test(src);
+        OvlXrefState.natbibFound = !!(natbibM || natbibBare);
+        OvlXrefState.natbibNumeric = false;
+        if (natbibM) {
+            const opts = natbibM[1].split(',').map(function (s) { return s.trim().toLowerCase(); });
+            OvlXrefState.natbibNumeric = opts.indexOf('numbers') !== -1 || opts.indexOf('super') !== -1;
+        }
+        // biblatex：明确不支持，未实测验证（§4B 第5点，如实标注"未确认"）。检测到就让 cite
+        // 查找直接跳过 aux 分支，全部走近似/查不到——套错 natbib 规则比不套更危险。
+        OvlXrefState.biblatexDetected = /\\usepackage(?:\[[^\]]*\])?\{\s*biblatex\s*\}/.test(src);
+
+        // 近似兜底：全文档一次预扫描（§6.2：跟 LatexFilter 全文转换、P116 按块扫描同一数量级）。
+        const approx = ovlXrefApproxScan(src);
+        OvlXrefState.approxLabels = approx.labels;
+        OvlXrefState.approxCites = approx.cites;
+
+        // 真编号：只读 ovlDoRecompile 编译完成时已经异步解析好、挂在 lastCompile.xrefAux 上
+        // 的缓存，这里不发任何网络请求（§6.2："每个 compileId 只请求一次、解析一次"）。
+        const auxData = auxRefNow;
+        const auxUsable = !!(lc && lc.ok && lc.pdfExists && !lc.restoredFromCache
+            && typeof lc.sourceHashAtCompile === 'string' && auxData && auxData.parsedOk);
+        OvlXrefState.auxUsable = auxUsable;
+        OvlXrefState.fresh = auxUsable && (srcHash === lc.sourceHashAtCompile);
+        OvlXrefState.labels = auxUsable ? auxData.labels : null;
+        OvlXrefState.crefTypes = auxUsable ? auxData.crefTypes : null;
+        OvlXrefState.cites = auxUsable ? auxData.cites : null;
+        OvlXrefState.compiledAtLabel = (lc && lc.xrefCompiledAtLabel) || '';
+    } catch (e) {
+        console.error('[ovl-xref] build failed，本次渲染全部退到近似/查不到档', e);
+        OvlXrefState.auxUsable = false;
+        OvlXrefState.fresh = false;
+    }
+}
+
+// ==================== §3：四档呈现 + §5：安全转义 ====================
+const OVL_XREF_TIER_TIP = {
+    real: '真实编号 · 来自最近一次编译',
+    stale: '过期编号 · 源码已改动但未重新编译，可能与最终 PDF 不符 · 点击 Recompile 更新',
+    approx: '近似编号 · 未编译，基于当前文档顺序估算，可能与最终 PDF 不同',
+    unknown: '找不到对应编号 · label/cite key 在当前文档和编译产物中均未找到'
+};
+// 统一的 span 产出口——四档共用同一个结构：<span class="ovl-xref ovl-xref-{tier}"
+// title="{tooltip}" data-ovl-xref-key="{key}">{display}</span>。key/display/tooltip 全部
+// 视为不可信输入：属性走 escapeAttr()，文本节点走 escapeHtml()（§5.1，不新开第二套转义）。
+function ovlXrefSpan(tier, display, key, tooltip) {
+    const t = OVL_XREF_TIER_TIP[tier] ? tier : 'unknown';
+    const tip = tooltip || OVL_XREF_TIER_TIP[t];
+    return '<span class="ovl-xref ovl-xref-' + t + '" title="' + escapeAttr(tip)
+        + '" data-ovl-xref-key="' + escapeAttr(key == null ? '' : key) + '">'
+        + escapeHtml(display == null ? '' : String(display)) + '</span>';
+}
+
+// §4D：cleveref 类型推断——优先用 crefTypes（cleveref 自己权威写下的类型），退回 aux/近似档
+// 里 label 自带的 anchorType（锚点串 "section.1"/"equation.3" 的 "." 前缀部分）。
+function ovlXrefTypeWordFor(key, ctx) {
+    if (ctx.crefTypes && ctx.crefTypes.has(key)) return ctx.crefTypes.get(key);
+    const entry = ctx.labels && ctx.labels.get(key);
+    if (entry && entry.anchorType) return entry.anchorType;
+    const ap = ctx.approxLabels && ctx.approxLabels.get(key);
+    if (ap && ap.anchorType) return ap.anchorType;
+    return null;
+}
+// §4E：各命令的具体输出形态。
+function ovlXrefFormatRef(cmdName, display, typeWord) {
+    if (cmdName === 'eqref') return '(' + display + ')';
+    if (cmdName === 'ref' || cmdName === 'pageref') return display;
+    // autoref/cref/Cref：类型词 + 编号；Cref（大写命令）首字母大写（cleveref 基本约定）。
+    let word = typeWord || '';
+    if (cmdName === 'Cref' && word) word = word.charAt(0).toUpperCase() + word.slice(1);
+    return word ? (word + ' ' + display) : display;
+}
+function ovlXrefLookupRef(key, cmdName, ctx) {
+    const wantPage = (cmdName === 'pageref');
+    if (ctx.auxUsable && ctx.labels && ctx.labels.has(key)) {
+        const entry = ctx.labels.get(key);
+        const tier = ctx.fresh ? 'real' : 'stale';
+        const raw = wantPage ? entry.page : entry.display;
+        const display = wantPage ? raw : ovlXrefFormatRef(cmdName, raw, ovlXrefTypeWordFor(key, ctx));
+        const tip = tier === 'stale' ? OVL_XREF_TIER_TIP.stale
+            : (OVL_XREF_TIER_TIP.real + (ctx.compiledAtLabel ? ('（' + ctx.compiledAtLabel + '）') : ''));
+        return ovlXrefSpan(tier, display, key, tip);
+    }
+    if (wantPage) {
+        // 近似档没有"页码"这个概念（近似只知道文档内顺序，不知道分页）——诚实判"查不到"，
+        // 不编造一个假页码。
+        return ovlXrefSpan('unknown', '??', key, '找不到对应编号 · 页码需要真实编译产物，近似档不提供');
+    }
+    const ap = ctx.approxLabels && ctx.approxLabels.get(key);
+    if (ap) {
+        const display = ovlXrefFormatRef(cmdName, ap.display, ovlXrefTypeWordFor(key, ctx));
+        return ovlXrefSpan('approx', display, key, OVL_XREF_TIER_TIP.approx);
+    }
+    return ovlXrefSpan('unknown', '??', key, OVL_XREF_TIER_TIP.unknown);
+}
+function ovlXrefLookupCite(key, ctx) {
+    if (!key) return ovlXrefSpan('unknown', '??', '', '找不到对应编号 · cite key 为空');
+    if (ctx.auxUsable && !ctx.biblatexDetected && ctx.cites && ctx.cites.has(key)) {
+        const entry = ctx.cites.get(key);
+        const tier = ctx.fresh ? 'real' : 'stale';
+        let display, extraCaveat = '';
+        if (!entry.isNested) {
+            display = '[' + entry.ordinal + ']';
+        } else if (ctx.natbibNumeric) {
+            display = '[' + entry.ordinal + ']';
+        } else {
+            // §4B 第4点：年份/姓氏来自真实编译产物，但标点/多作者连接方式由 natbib 自己的
+            // .bst 样式决定，aux 里没有——real 档但 tooltip 老实加一句，不新增第5种视觉档位。
+            display = '(' + (entry.author || '') + ', ' + (entry.year || '') + ')';
+            extraCaveat = ctx.natbibFound
+                ? ' · 标点/多作者连接方式可能与最终 PDF 不完全一致'
+                : ' · 样式无法从当前文件确认，按 natbib 默认（author-year）显示，标点/多作者连接方式可能与最终 PDF 不完全一致';
+        }
+        const tip = (tier === 'stale' ? OVL_XREF_TIER_TIP.stale
+            : (OVL_XREF_TIER_TIP.real + (ctx.compiledAtLabel ? ('（' + ctx.compiledAtLabel + '）') : ''))) + extraCaveat;
+        return ovlXrefSpan(tier, display, key, tip);
+    }
+    const ap = ctx.approxCites && ctx.approxCites.get(key);
+    if (ap) return ovlXrefSpan('approx', '[' + ap.display + ']', key, '近似编号 · 未编译，基于当前文档 \\bibitem 顺序估算，可能与最终 PDF 不同');
+    return ovlXrefSpan('unknown', '??', key, OVL_XREF_TIER_TIP.unknown);
+}
+
+// ==================== §5.2：占位符注入（不新开 innerHTML 写入点）====================
+// \cite 系（含 citep/citet/citeauthor 等变体——跟翻译哨兵 XPORT_OPAQUE_RE 同一条"命令名含
+// cite/Cite 子串"判定口径，10989 行附近）允许最多 2 组可选 [ ][ ]（natbib 前置/后置注），
+// 花括号内是逗号分隔的多个 key（§4C：展开显示，不压缩成范围）。
+const OVL_XREF_CITE_CMD_RE = /\\([a-zA-Z]*[Cc]ite[a-zA-Z]*)(\*)?/g;
+// 单 key 的 ref 家族：eqref/autoref/pageref/Cref/cref/ref。顺序对 JS 正则引擎无影响
+// （每个分支是不同字面量，同一起点不会互相截胡），这里按字母习惯排列。
+const OVL_XREF_REF_CMD_RE = /\\(eqref|autoref|pageref|Cref|cref|ref)(\*)?\s*\{/g;
+
+function ovlXrefRenderCiteGroup(keysRaw, ctx) {
+    const keys = String(keysRaw == null ? '' : keysRaw).split(',').map(function (k) { return k.trim(); });
+    const spans = [];
+    for (let i = 0; i < keys.length; i++) spans.push(ovlXrefLookupCite(keys[i], ctx));
+    return spans.join(', ');
+}
+
+// 把 content 里的 \cite 系 / \ref 系命令替换成占位符 token，对应的 HTML span 塞进调用方
+// 传入的 placeholders 数组——跟 ovlRenderTextColor/pushPlaceholder 完全同一套手法：先占位，
+// marked.parse() 跑完之后再倒序回填，避免 marked 把我们生成的 HTML 当 Markdown 语法二次解析。
+function ovlXrefTransformProse(content, ctx, placeholders) {
+    let text = String(content == null ? '' : content);
+
+    // ---- 第一遍：cite 家族（可能带 0~2 组可选方括号注） ----
+    (function () {
+        let out = '';
+        let i = 0;
+        let guard = 0;
+        while (i < text.length && ++guard < 200000) {
+            OVL_XREF_CITE_CMD_RE.lastIndex = i;
+            const m = OVL_XREF_CITE_CMD_RE.exec(text);
+            if (!m) { out += text.slice(i); i = text.length; break; }
+            out += text.slice(i, m.index);
+            let p = m.index + m[0].length;
+            for (let b = 0; b < 2; b++) {
+                let q = p;
+                while (q < text.length && /\s/.test(text[q])) q++;
+                if (text[q] !== '[') break;
+                const close = text.indexOf(']', q);
+                if (close === -1) break;
+                p = close + 1;
+            }
+            let q2 = p;
+            while (q2 < text.length && /\s/.test(text[q2])) q2++;
+            if (text[q2] !== '{') {
+                // 不是合法的 \cite{...} 调用（花括号没跟上）：命令名本身原样放过，不装懂。
+                out += text.slice(m.index, q2);
+                i = q2;
+                continue;
+            }
+            const closeIdx = ovlFindMatchingBrace(text, q2);
+            if (closeIdx === -1) { out += text.slice(m.index); i = text.length; break; } // 花括号不配平：整段放过，不崩
+            const keysRaw = text.slice(q2 + 1, closeIdx);
+            const html = ovlXrefRenderCiteGroup(keysRaw, ctx);
+            const id = '%%LATEX_' + placeholders.length + '%%';
+            placeholders.push({ id: id, html: html });
+            out += id;
+            i = closeIdx + 1;
+        }
+        text = out;
+    })();
+
+    // ---- 第二遍：单 key 的 ref 家族 ----
+    (function () {
+        let out = '';
+        let i = 0;
+        let guard = 0;
+        while (i < text.length && ++guard < 200000) {
+            OVL_XREF_REF_CMD_RE.lastIndex = i;
+            const m = OVL_XREF_REF_CMD_RE.exec(text);
+            if (!m) { out += text.slice(i); i = text.length; break; }
+            out += text.slice(i, m.index);
+            const openIdx = m.index + m[0].length - 1;
+            const closeIdx = ovlFindMatchingBrace(text, openIdx);
+            if (closeIdx === -1) { out += text.slice(m.index); i = text.length; break; } // 花括号不配平：整段放过
+            const key = text.slice(openIdx + 1, closeIdx);
+            const html = ovlXrefLookupRef(key, m[1], ctx);
+            const id = '%%LATEX_' + placeholders.length + '%%';
+            placeholders.push({ id: id, html: html });
+            out += id;
+            i = closeIdx + 1;
+        }
+        text = out;
+    })();
+
+    return text;
+}
+
+// ==================== §4E 数学模式内限制：退化成纯文本编号 ====================
+// KaTeX 0.16.9 原生不支持 \ref/\eqref/\autoref 的跨文档编号（见 renderFormattedText 内
+// pushPlaceholder 上方 P14 注释），公式字符串本身喂不进 <span>。本 Pass 未验证 \htmlClass{}{}
+// 在 trust:true 下是否可用（§4E 末段"未确认"），保守选择：替换成合法 LaTeX 文本
+// （\text{(3)} 这种写法，文件自己已有先例），没有真编号/近似/过期的视觉区分，只在正文（marked/
+// HTML 路径）里有完整分级——这是明确记录、不假装的能力边界（§8 第7点）。
+function ovlXrefFormulaPlainText(cmdName, key, ctx) {
+    if (!ctx) return null;
+    const wantPage = (cmdName === 'pageref');
+    if (ctx.auxUsable && ctx.labels && ctx.labels.has(key)) {
+        const entry = ctx.labels.get(key);
+        const raw = wantPage ? entry.page : entry.display;
+        return wantPage ? raw : ovlXrefFormatRef(cmdName, raw, ovlXrefTypeWordFor(key, ctx));
+    }
+    if (!wantPage) {
+        const ap = ctx.approxLabels && ctx.approxLabels.get(key);
+        if (ap) return ovlXrefFormatRef(cmdName, ap.display, ovlXrefTypeWordFor(key, ctx));
+    }
+    return '??';
+}
+// 把公式文本里的 \eqref{}/\autoref{}/\ref{} 换成纯文本编号（外面包一层 \text{}，避免破坏
+// 公式本身的数学模式语义）；ctx 缺省（未启用 xref）时逐字回退到旧的 stripCommand 行为。
+function ovlXrefStripOrNumberFormula(formula, ctx) {
+    let f = String(formula == null ? '' : formula);
+    if (!ctx) {
+        f = stripCommand(f, 'eqref');
+        f = stripCommand(f, 'autoref');
+        f = stripCommand(f, 'ref');
+        return f;
+    }
+    const re = /\\(eqref|autoref|ref)\s*\{/g;
+    let out = '', i = 0, guard = 0;
+    while (i < f.length && ++guard < 20000) {
+        re.lastIndex = i;
+        const m = re.exec(f);
+        if (!m) { out += f.slice(i); i = f.length; break; }
+        out += f.slice(i, m.index);
+        const openIdx = m.index + m[0].length - 1;
+        const closeIdx = ovlFindMatchingBrace(f, openIdx);
+        if (closeIdx === -1) { out += f.slice(m.index); i = f.length; break; }
+        const key = f.slice(openIdx + 1, closeIdx);
+        const plain = ovlXrefFormulaPlainText(m[1], key, ctx) || '??';
+        // \text{} 参数里出现 } 会提前把 \text{} 截断——公式编号本身不含花括号（display 值
+        // 来自 aux 的纯数字/字母/罗马数字/subequations 后缀，或近似档同款格式，不会出现 { }），
+        // 稳妥起见仍然过滤一次，避免任何异常输入破坏外层 \text{} 的花括号配平。
+        const safePlain = String(plain).replace(/[{}]/g, '');
+        out += '\\text{' + safePlain + '}';
+        i = closeIdx + 1;
+    }
+    return out;
 }
 
 // ==================== v2 Pass P18：\includegraphics 真缩略图（图标占位框的优雅升级）====================
@@ -36139,6 +36780,12 @@ function ovlVisualRender() {
             if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
             return;
         }
+
+        // v2 Pass P158：读到 src、confirm 渲染管线就绪之后，调用 ovlVisualRenderBodyWithLines
+        // 之前，按§6.1 的三重失效条件维护 OvlXrefState（内容哈希/编译 id/当前文件都没变就
+        // 直接命中缓存、零额外开销）。放在这里而不是更早的 src 非空检查之前，是因为空文档/
+        // 渲染管线未就绪时压根不会走到下面的块渲染循环，没有必要建表。
+        if (typeof ovlXrefBuild === 'function') { try { ovlXrefBuild(src); } catch (e) { console.error('[ovl-xref] 建表失败，本次渲染引用编号全部退到查不到档', e); } }
 
         // 导言区 / 正文 / 文末三段切分，照抄 Overleaf：导言区折成 "Show document preamble"，
         // 文末（\end{document} 之后，比如附录草稿）折成 "End of document"（§2.5）。
@@ -43378,6 +44025,15 @@ async function ovlDoRecompile(opts) {
         await ovlSaveCurrentFile({ silent: true });
     }
 
+    // v2 Pass P158（§2.2）：必须在发出编译请求前拍这个哈希快照，不能等 resp.json() 返回
+    // 之后再拍——编译是异步的（桥端最长可跑到 COMPILE_TIMEOUT_MAX_MS），这期间用户完全
+    // 可能继续敲字；响应落地后才对 #ovlCodeArea 取值算哈希，拿到的会是"响应到达那一刻的
+    // 文本"而不是"实际被编译的文本"，引入一个比现状更隐蔽的假新鲜 bug。上面的自动保存
+    // 已经把这一刻的内容落盘，这里对同一份文本取哈希，保证跟"这次真正送去编译的源码"
+    // 完全对应。
+    const __ovlXrefTa = document.getElementById('ovlCodeArea');
+    const __ovlXrefPreCompileHash = __ovlXrefTa ? ovlVisualHashSrc(__ovlXrefTa.value) : null;
+
     OvlState.compiling = true;
     if (OvlState.pdfObjectUrl) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} OvlState.pdfObjectUrl = null; }
     // v2 Pass P72：真的走编译了，无条件退出直显模式（编译永远是权威动作，见
@@ -43420,6 +44076,52 @@ async function ovlDoRecompile(opts) {
     OvlState.compiling = false;
     OvlState.bridgeOnline = true;
     OvlState.lastCompile = data;
+    // v2 Pass P158（§2.2/§6.2）：响应落地时把发编译请求前拍的哈希挂上去，供 ovlXrefBuild 做
+    // "内容有没有变"的过期判定；同时借这次编译成功的机会，一次性把 .aux 拉下来解析好缓存
+    // 进 xrefAux，Visual 渲染时（ovlXrefBuild）只读这份缓存，不再另外发请求——每个
+    // compileId 只请求一次、解析一次。这里不需要新端点：GET /output/:id/output.aux 是现成的
+    // 通用静态文件端点，本来就没有扩展名白名单（.claude/tmp/p158_design.md §1），
+    // ovlBridgeFetch 已经自动带令牌头，零 server.js 改动、零部署重启需求。
+    if (data) {
+        data.sourceHashAtCompile = __ovlXrefPreCompileHash;
+        try {
+            const __d = new Date();
+            data.xrefCompiledAtLabel = String(__d.getHours()).padStart(2, '0') + ':' + String(__d.getMinutes()).padStart(2, '0');
+        } catch (e) { data.xrefCompiledAtLabel = ''; }
+        if (data.ok && data.pdfExists && !data.restoredFromCache && data.id) {
+            // §1.3 优化：files 列表里明确没有 output.aux 就直接跳过，省一次必然 404 的往返
+            // （不是正确性要求，是性能优化——不带 files 字段的老版本桥仍然会照常尝试请求）。
+            const __xrefFilesKnown = Array.isArray(data.files);
+            const __xrefAuxListed = !__xrefFilesKnown || data.files.indexOf('output.aux') !== -1;
+            if (__xrefAuxListed) {
+                try {
+                    const auxResp = await ovlBridgeFetch(ovlBridgeUrl('/output/' + data.id + '/output.aux'));
+                    if (auxResp && auxResp.ok) {
+                        const auxText = await auxResp.text();
+                        data.xrefAux = (typeof ovlXrefParseAuxAndBibcite === 'function')
+                            ? ovlXrefParseAuxAndBibcite(auxText) : { parsedOk: false };
+                    } else {
+                        data.xrefAux = { parsedOk: false }; // 404/其它非 2xx——诚实记"查不到"，不是异常
+                    }
+                } catch (e) {
+                    data.xrefAux = { parsedOk: false }; // 网络失败/桥离线：同样只是"查不到"，不影响本次编译展示 PDF
+                }
+            } else {
+                data.xrefAux = { parsedOk: false };
+            }
+            // 上面这几个 await 期间用户完全可能已经发起了新一轮编译（新的 id）、切换了
+            // 打开的文件，或者 Visual 面板已经用"还没等到 aux"的状态渲染过一次（ovlXrefBuild
+            // 的 auxDataRef 判据就是为了兜住这种情况）——只有这份 data 仍然是
+            // OvlState.lastCompile 当前指向的那一个、且当前正在 Visual 模式时，才主动补一次
+            // 重渲染，让刚到手的真编号尽快替换掉之前显示的近似值；不是这种情况也无害
+            // （下一次任何触发重渲染的操作都会用 auxDataRef 判据自然捡到这份数据）。
+            if (OvlState.lastCompile === data && OvlState.editorMode === 'visual' && typeof ovlVisualRender === 'function') {
+                try { ovlVisualRender(); } catch (e) { console.error('[ovl-xref] aux 到达后重渲染失败', e); }
+            }
+        } else {
+            data.xrefAux = { parsedOk: false };
+        }
+    }
     // M4：每次新编译，翻页/缩放状态重置——旧 PDF 的页码对新 PDF 没有意义。
     // v2 Pass P35：缩放模式的默认值走 ovlPdfResolveDefaultZoomMode()——用户没存过偏好时是
     // 'fitwidth'，存过（OvlSettings.pdfDefaultZoomMode，见 ovlPdfSetZoomMode 等写入点）就用
