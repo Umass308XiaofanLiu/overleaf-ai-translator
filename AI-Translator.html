@@ -4630,7 +4630,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.29.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.29.03';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-12';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -33776,9 +33776,21 @@ function ovlParseGraphicsPathDirs(preambleText) {
 // OvlFigThumbCache 同样的"Promise 先占位、终态对象覆盖"缓存写法，同一 key 并发/重复调用
 // 不重复发请求。桥离线/文件缺失/没声明 \graphicspath 统一返回空数组，调用方原样退回 P60
 // 已有的两条候选兜底，是既有降级路径，不是新增故障。
+// v2 Pass P167（根因修复）：上面这段假设"当前打开的子文件本身没有导言区"，对"项目里每个
+// .tex 都各自是独立可编译完整文档"这种多文档场景（比如 03_report/XXX/XXX.tex 自己就有
+// \documentclass/\graphicspath，根本不是被谁 \input 的片段——跟 Bug A/P60 doCompile()
+// 的"cwd=path.dirname(mainAbs)"是同一个前提）不成立：mainDocFile 未显式设置时，原来直接
+// 兜底字面量 'main.tex'，会去读一个跟"这次实际会被编译的文件"毫不相干的路径（常见于项目
+// 根本没有 main.tex，或者根目录另有一份不相关的 main.tex），当前打开文件自己声明的
+// \graphicspath 永远读不到、缩略图跟着永远解析不出来。修复：兜底链改成跟 doCompile()/
+// SyncTeX 等既有 5 处调用（"mainDocFile || currentFile.relPath || 'main.tex'"，见 24840/
+// 43973/44111/51279/55535 行）完全一致——跟"编译时到底会拿哪个文件当主文档"用同一个判断，
+// 不是另发明一套。只在 mainDocFile 未设置时才生效，显式设置过主文档的项目零行为变化。
 const OvlGraphicsPathDirsCache = new Map();
 async function ovlResolveGraphicsPathDirs(projectDir) {
-    const mainFile = (typeof OvlState !== 'undefined' && OvlState && OvlState.mainDocFile) || 'main.tex';
+    const mainFile = (typeof OvlState !== 'undefined' && OvlState && OvlState.mainDocFile)
+        || (typeof OvlState !== 'undefined' && OvlState && OvlState.currentFile && OvlState.currentFile.relPath)
+        || 'main.tex';
     const key = projectDir + '|' + mainFile;
     const cached = OvlGraphicsPathDirsCache.get(key);
     if (cached) return cached;
