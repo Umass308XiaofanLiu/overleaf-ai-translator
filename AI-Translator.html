@@ -4630,7 +4630,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.29.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.29.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-12';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -50718,15 +50718,16 @@ function ovlExternalSilentReload(ta, text, mtimeMs) {
     // 在重渲之后才回来，凭旧的 mySeq 判断仍然"当前"，把属于旧文本的译文写进新 DOM。
     // ovlVisualLangCancelInFlight 内部只在有东西可取消时才有实际动作，非 zh/非在途时安全空跑。
     if (typeof ovlVisualLangCancelInFlight === 'function') { try { ovlVisualLangCancelInFlight(); } catch (e) {} }
-    // v2 Pass P159-fix2（FIX-3b，第 14 个未挂钩入口）：这里整篇替换 ta.value，之前在途的
-    // 位置锚点（prefixHash/charStart/charEnd 全部基于旧内容）不再可信。不能复用
-    // ovlResetProjectScopedState()（会错误地把当前文件关掉——这里文件没有切换，只是内容被
-    // 换成磁盘上的新版本），也不在这里另开一个 standalone if 判断（详见
-    // ovlVisualBtrInvalidateAllAnchors 定义处的注释）——改用同一档收口点设计的专用函数：只让
-    // 所有在途锚点集体失效，不弹 toast、不挡这次重载本身，落地时交给
-    // ovlVisualBtrResolveWriteRange 已有的 file-changed/zero-match/ambiguous-match 分支
-    // （见 ovlVisualBtrOnSuccess）统一走用户可见的“未写入，已保留你的输入”提示。
-    if (typeof ovlVisualBtrInvalidateAllAnchors === 'function') { try { ovlVisualBtrInvalidateAllAnchors(); } catch (e) {} }
+    // v2 Pass P159-fix2 Round2（第 14 个入口，"活锚点"设计下不需要专门代码）：这里整篇替换
+    // ta.value，之前在途的锚点全部基于旧内容。文件身份（fileKey=ovlVisualBtrCurrentFileKey()）
+    // 静默重载前后不变，所以落地时不会走 file-changed——真正兜底它的是"活锚点"本身：这一行
+    // 赋值会经过 #ovlCodeArea 上装好的实例访问器（有锚点在途时才会装上，见
+    // ovlLiveAnchorAccessorInstall），自动触发 ovlLiveAnchorObserve()；新旧内容几乎完全不同，
+    // diff 出的改动 hunk 覆盖全文档，所有相交的在途锚点在这次赋值里就被判定 dead，
+    // ovlVisualBtrResolveWriteRange 里 `!anchor.dead` 那道快速路径因此被跳过，强制退化到
+    // ovlLiveAnchorUniqueParagraphHit 段落对齐兜底——按当前（重载后）内容重新唯一定位，
+    // 找不到/找到多处时统一落进 zero-match/ambiguous-match，交给 ovlVisualBtrOnSuccess 已有的
+    // 提示分支处理，用户可见"未写入，已保留你的输入"。
     ta.value = text;
     OvlState.lastLoadedText = text;
     OvlState.lastLoadedMtimeMs = mtimeMs;
@@ -56074,13 +56075,13 @@ let OvlInlineSrcEdit = null; // null=未在编辑；打开时是 { wrap, ta, blo
 // 跑的任务的"在跑"标记也一并清空，导致本该拦截的并发窗口被漏判。跟 FIX-1/FIX-2 同一个"内容寻址
 // 当唯一键"反模式，改成位置锚点键后不再共享。
 let OvlVisualBtrInFlight = {};
-// v2 Pass P159-fix2（FIX-3b）：位置锚点的全局失效代。外部磁盘改动静默重载（ovlExternalSilentReload）这类
-// “内容被整篇替换但文档本身不能被关闭/清空”的入口，不能复用 ovlResetProjectScopedState()
-// 这个收口点（会错误地把当前文件关掉）。改用另一个专用收口点函数
-// ovlVisualBtrInvalidateAllAnchors()：在覆写 ta.value 之前调用，把这个计数器加一，所有此前创建的锚点
-// （无论是否登记在 OvlVisualBtrInFlight 里）落地时都会被 ovlVisualBtrResolveWriteRange 判定为
-// “锚点不可信”，强制退化到全文唯一性兜底匹配——不新增第 5 个 standalone if 判断。
-let OvlVisualBtrAnchorEpoch = 0;
+// v2 Pass P159-fix2 Round2（设计 4"活锚点"替换设计 3"前缀指纹"，见 .claude/tmp/p159_fix2.md
+// "设计 3→设计 4 迁移"一节）：上一轮这里维护一个全局 epoch 计数器，靠"递增即让所有锚点失效"
+// 应对"内容被整篇替换但文档不能被关闭"这类场景（如 ovlExternalSilentReload）。独立设计咨询
+// 指出设计 3 的定位机制本身有三处硬伤（无文件身份校验、哈希弱、回退搜索命中子串），改用下面
+// 的"活锚点"（OvlLiveAnchors + ovlLiveAnchorObserve）之后，整篇替换天然就是一个覆盖全文档的
+// 单一改动 hunk，会让所有跟它相交的锚点在 observe() 里被判定 dead——不需要再单独维护一个 epoch
+// 计数器/收口点，原 14 项 FIX-3 守卫表逐条仍然安全（各自的理由见交付报告）。
 // v2 Pass P159-fix（FIX-3）：判断"当前是否有单块回译正在后台跑"的唯一真源封装成一个函数——不
 // 引入新状态，只是把 Object.keys(OvlVisualBtrInFlight).length 这条判断收口一次，供
 // ovlResetProjectScopedState()/ovlOpenFileFromBlob/ovlPerformDelete 等多个真实入口复用，不需要
@@ -56091,16 +56092,10 @@ function ovlVisualBtrInFlightActive() {
         return !!(typeof OvlVisualBtrInFlight !== 'undefined' && Object.keys(OvlVisualBtrInFlight).length);
     } catch (e) { return false; }
 }
-// v2 Pass P159-fix2（FIX-3b）：专用于“内容被整篇替换但文档不能被关闭/清空”这类场景的收口点
-// （跟 ovlResetProjectScopedState 是同一档设计思路的另一半：那个负责“离开文档前拒绝”，这个负责
-// “文档没离开，但旧内容作废了，所有在途锚点必须失效”）。只做一件事：递增全局 epoch，让所有已创建的位置锚点
-// （无论是否登记在 OvlVisualBtrInFlight 里）在落地时统一被 ovlVisualBtrResolveWriteRange 判定为“锚点不可信”，
-// 强制退化到全文唯一性兜底匹配（找不到/找到多处时各自的用户提示已经存在，不需要在这里重复）。
-function ovlVisualBtrInvalidateAllAnchors() {
-    try {
-        OvlVisualBtrAnchorEpoch = (typeof OvlVisualBtrAnchorEpoch === 'number' ? OvlVisualBtrAnchorEpoch : 0) + 1;
-    } catch (e) {}
-}
+// v2 Pass P159-fix2 Round2：ovlVisualBtrInvalidateAllAnchors() 连同上面的 epoch 计数器一起
+// 已被"活锚点"取代并删除——原调用点（ovlExternalSilentReload，整篇覆写 ta.value 之前）现在
+// 什么额外代码都不用做：那次赋值经过下面装好的实例访问器，自动触发 ovlLiveAnchorObserve()，
+// 单一 hunk 覆盖全文档，天然杀死所有相交的在途锚点。见交付报告"设计 3→设计 4 迁移"一节。
 // v2 Pass P159（独立验证阶段发现并修复的一个真实竞态，设计文档没有覆盖）：单击/双击消歧计时器
 // 状态——见 ovlBindQuickActions 内 visualPane 的 mouseup/dblclick 监听器头部大注释。
 let OvlVisualClickEditPending = null;
@@ -56117,31 +56112,142 @@ function ovlVisualBtrCurrentFileKey() {
         return (typeof ovlFileTextCacheKey === 'function') ? ovlFileTextCacheKey(relPath) : null;
     } catch (e) { return null; }
 }
+// v2 Pass P159-fix2 Round2（设计 4"活锚点"，见 .claude/tmp/p159_fix2.md）：不再给锚点拍
+// 前缀哈希快照——独立设计咨询指出 32 位 JS 字符串哈希对抗构造平凡、随机碰撞 2⁻³²，"不要哈希"。
+// 改为把锚点对象本身登记进下面的 OvlLiveAnchors 活跃表：从创建这一刻起，#ovlCodeArea 上任何
+// 一次写入（无论走 .value=、execCommand 还是用户键入/IME）都会被观测到，charStart/charEnd
+// 随着改动实时平移，与改动相交则标记 dead——不需要"事后用前缀指纹反推位置是否还可信"。
+// dead:false 是初始值；ovlLiveAnchorObserve() 是唯一会把它翻成 true 的地方。
 function ovlVisualBtrMakeAnchor(charStart, charEnd, origText) {
-    // v2 Pass P159-fix2（FIX-1b）：除了 charStart/charEnd/origText 之外，在锚点创建时再抓一份
-    // “这个位置之前的整段前缀长什么样”的指纹（prefixLen/prefixHash），用于落笔时检测
-    // “更早处的编辑把整个文档平移了，导致这个陈旧的 [charStart,charEnd) 窗口恰好被挪到另一处
-    // 内容相同段落”这种幻影碰撞（_reverify_p159_core.js 的 R1 攻击）。再顺便抓一份 docLen
-    // （当时整文档长度）供日后诊断/廉价校验使用；不作为信任依据——锚点之后的编辑无害，不能因此拒写。
-    let prefixHash = null, prefixLen = null, docLen = null;
-    try {
-        const ta = document.getElementById('ovlCodeArea');
-        if (ta) {
-            const full = ta.value;
-            docLen = full.length;
-            prefixLen = (isFinite(charStart) && charStart >= 0) ? Math.min(charStart, full.length) : 0;
-            prefixHash = (typeof ovlVisualHashSrc === 'function') ? ovlVisualHashSrc(full.slice(0, prefixLen)) : null;
-        }
-    } catch (e) {}
-    const epoch = (typeof OvlVisualBtrAnchorEpoch === 'number') ? OvlVisualBtrAnchorEpoch : 0;
-    return {
-        charStart: charStart, charEnd: charEnd, origText: origText, fileKey: ovlVisualBtrCurrentFileKey(),
-        prefixLen: prefixLen, prefixHash: prefixHash, docLen: docLen, epoch: epoch
+    const anchor = {
+        charStart: charStart, charEnd: charEnd, origText: origText,
+        fileKey: ovlVisualBtrCurrentFileKey(), dead: false
     };
+    try { if (typeof ovlLiveAnchorRegister === 'function') ovlLiveAnchorRegister(anchor); } catch (e) {}
+    return anchor;
 }
 function ovlVisualBtrAnchorPosKey(anchor) {
     if (!anchor || !isFinite(anchor.charStart) || !isFinite(anchor.charEnd)) return '';
     return (anchor.fileKey == null ? '' : anchor.fileKey) + '|' + anchor.charStart + '|' + anchor.charEnd;
+}
+
+// ==================== v2 Pass P159-fix2 Round2：活锚点引擎（设计 4） ====================
+// 关键认识：拦截是零调用点成本的——不需要去改全文 16 处 `ta.value = …` 写入点。在
+// #ovlCodeArea 这一个 DOM 实例上覆盖 value 的访问器（委托给 HTMLTextAreaElement.prototype
+// 的原生 getter/setter，React inputValueTracking 同款手法），所有既有写入点自动经过同一个
+// observe()；execCommand('insertText', …)/IME 组合输入不经过 .value= setter，用 input 事件
+// 兜底覆盖（两者共用 observe，谁先观测到都行，观测到相同的 newVal 时第二次是 no-op）。
+// 访问器只在存在在途锚点（OvlLiveAnchors.length>0）时装上，归零就卸载复原——把改动面锁死在
+// 回译窗口那几秒内，不改写全程的 textarea 语义。
+let OvlLiveAnchors = [];               // 在途锚点（数组存的是引用，跟 anchor 对象是同一份）
+let __ovlLiveAnchorShadow = null;      // 最近一次已观测到的 #ovlCodeArea.value（字符串引用，零拷贝，不哈希）
+let __ovlLiveAnchorNativeDesc = null;  // 原生 value 访问器描述符，卸载时用来精确复原
+
+// 公共前缀 + 公共后缀，O(n)：{p, delOld, ins} = 从 oldVal 到 newVal 的最小单一改动区间。
+function ovlLiveAnchorDiff(oldVal, newVal) {
+    const oldLen = oldVal.length, newLen = newVal.length, maxCommon = Math.min(oldLen, newLen);
+    let p = 0;
+    while (p < maxCommon && oldVal.charCodeAt(p) === newVal.charCodeAt(p)) p++;
+    let sufOld = oldLen, sufNew = newLen;
+    while (sufOld > p && sufNew > p && oldVal.charCodeAt(sufOld - 1) === newVal.charCodeAt(sufNew - 1)) { sufOld--; sufNew--; }
+    return { p: p, delOld: sufOld - p, ins: sufNew - p };
+}
+// setter 与 input 事件共用：按三段式规则更新/杀死每个在途锚点——全在改动前不动，全在改动后
+// 跟着平移，跟改动区间相交就判 dead（字符串层面已经无法区分它跟改动前的哪一部分对应）。
+function ovlLiveAnchorObserve(newVal) {
+    const oldVal = __ovlLiveAnchorShadow;
+    if (oldVal == null || newVal == null || oldVal === newVal) { __ovlLiveAnchorShadow = newVal; return; }
+    const d = ovlLiveAnchorDiff(oldVal, newVal);
+    const shift = d.ins - d.delOld;
+    for (let i = 0; i < OvlLiveAnchors.length; i++) {
+        const a = OvlLiveAnchors[i];
+        if (a.dead || !isFinite(a.charStart) || !isFinite(a.charEnd)) continue;
+        if (a.charEnd <= d.p) { /* 全在改动前：不动 */ }
+        else if (a.charStart >= d.p + d.delOld) { a.charStart += shift; a.charEnd += shift; }
+        else { a.dead = true; }
+    }
+    __ovlLiveAnchorShadow = newVal;
+}
+function ovlLiveAnchorOnInput(ev) {
+    try { ovlLiveAnchorObserve(ev.target.value); } catch (e) {}
+}
+function ovlLiveAnchorAccessorInstall(ta) {
+    if (!ta || ta.__ovlLiveAnchorInstalled) return;
+    const proto = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value');
+    if (!proto || typeof proto.get !== 'function' || typeof proto.set !== 'function') return; // 拿不到原生访问器就不装，宁可不追踪也不能破坏原生读写
+    __ovlLiveAnchorNativeDesc = proto;
+    __ovlLiveAnchorShadow = proto.get.call(ta);
+    Object.defineProperty(ta, 'value', {
+        configurable: true,
+        get: function () { return proto.get.call(ta); },
+        set: function (v) { proto.set.call(ta, v); try { ovlLiveAnchorObserve(proto.get.call(ta)); } catch (e) {} }
+    });
+    ta.__ovlLiveAnchorInstalled = true;
+    ta.addEventListener('input', ovlLiveAnchorOnInput);
+}
+function ovlLiveAnchorAccessorUninstall(ta) {
+    if (!ta || !ta.__ovlLiveAnchorInstalled) return;
+    try { if (__ovlLiveAnchorNativeDesc) Object.defineProperty(ta, 'value', __ovlLiveAnchorNativeDesc); } catch (e) {}
+    try { ta.removeEventListener('input', ovlLiveAnchorOnInput); } catch (e) {}
+    ta.__ovlLiveAnchorInstalled = false;
+    __ovlLiveAnchorShadow = null;
+}
+function ovlLiveAnchorRegister(anchor) {
+    if (OvlLiveAnchors.indexOf(anchor) !== -1) return; // 幂等：多块失败重试路径会对同一个锚点对象重复调用
+    const ta = document.getElementById('ovlCodeArea');
+    if (OvlLiveAnchors.length === 0 && ta) ovlLiveAnchorAccessorInstall(ta);
+    OvlLiveAnchors.push(anchor);
+}
+function ovlLiveAnchorRelease(anchor) {
+    const idx = OvlLiveAnchors.indexOf(anchor);
+    if (idx !== -1) OvlLiveAnchors.splice(idx, 1);
+    if (OvlLiveAnchors.length === 0) { try { ovlLiveAnchorAccessorUninstall(document.getElementById('ovlCodeArea')); } catch (e) {} }
+}
+// 段落对齐的回退搜索用：把 text 切成跟 Visual 面板 .ovl-visual-block 完全同一套粒度的编辑
+// 单元（原子块整块保留；非原子块在断行开关打开时按 ovlSplitVisualLines 再细分），逐个换算成
+// 当前 text 里的字符区间。跟设计 3 的裸 indexOf 区别：候选命中必须跟这里某个单元（或若干个
+// 连续单元首尾相接）的边界完全重合，"origText 是更长段落的子串"不可能命中——修独立设计
+// 咨询发现的洞 3。
+function ovlLiveAnchorUnitRanges(text) {
+    // 行首偏移复用既有 ovlGutterLineRangeToChars 同款算法（ovlBuildLineStarts），不重复发明。
+    const lineStart = (typeof ovlBuildLineStarts === 'function') ? ovlBuildLineStarts(text) : [0];
+    const blocks = ovlSplitVisualBlocks(text, 0);
+    const units = [];
+    for (let i = 0; i < blocks.length; i++) {
+        const b = blocks[i];
+        const splitEnabled = !b.atomic && (typeof OvlSettings === 'undefined' || OvlSettings.ovlVisualLineBreaks !== false);
+        const subs = splitEnabled ? ovlSplitVisualLines(b.text, b.line) : null;
+        if (!subs || !subs.length) {
+            const s = lineStart[b.line] != null ? lineStart[b.line] : text.length;
+            units.push({ start: s, end: s + b.text.length, text: b.text });
+        } else {
+            for (let j = 0; j < subs.length; j++) {
+                const sb = subs[j];
+                const s = lineStart[sb.line] != null ? lineStart[sb.line] : text.length;
+                units.push({ start: s, end: s + sb.text.length, text: sb.text });
+            }
+        }
+    }
+    return units;
+}
+// 返回 {start,end}（恰好一个单元或若干连续单元拼接后与 needle 逐字节相等）、'ambiguous'
+// （>=2 处这样的命中）或 null（0 处）。
+function ovlLiveAnchorUniqueParagraphHit(cur, needle) {
+    let units;
+    try { units = ovlLiveAnchorUnitRanges(cur); } catch (e) { return null; }
+    let hit = null;
+    for (let i = 0; i < units.length; i++) {
+        let text = units[i].text, end = units[i].end;
+        for (let j = i; j < units.length && text.length <= needle.length; j++) {
+            if (j > i) { text += '\n' + units[j].text; end = units[j].end; }
+            if (text.length > needle.length) break;
+            if (text === needle) {
+                if (hit) return 'ambiguous';
+                hit = { start: units[i].start, end: end };
+            }
+        }
+    }
+    return hit;
 }
 // 回译失败/放弃写入时保留用户刚打的中文（用户决定：绝不丢弃）——v2 Pass P159-fix（FIX-2）
 // 之前 key 单独用【当前这一版英文源码】的哈希，两段字节相同的孪生段落会撞进同一个桶：没动过
@@ -56240,6 +56346,11 @@ function ovlInlineSrcCancel() {
         const st = OvlInlineSrcEdit;
         if (!st || st.closing) return;
         st.closing = true;
+        // v2 Pass P159-fix2 Round2（活锚点）：取消编辑=这个锚点不会再落笔了，从在途表里摘掉
+        // （回落到 0 个在途锚点时会自动卸载访问器）。注意 ovlInlineSrcTeardown() 是取消路径
+        // 和"保存交接给后台回译"路径共用的收口函数，不能把释放逻辑放在它里面——那样保存时
+        // 会在回译真正跑之前就把锚点提前释放掉。
+        if (st.btrAnchor && typeof ovlLiveAnchorRelease === 'function') { try { ovlLiveAnchorRelease(st.btrAnchor); } catch (e2) {} }
         st.blocks.forEach(function (b) { b.style.display = ''; });
         ovlInlineSrcTeardown();
     } catch (e) {
@@ -56391,6 +56502,9 @@ function ovlInlineSrcSave() {
 // 失败/用户取消预览）最终都走这里，保证"没有半写状态"。
 function ovlInlineZhAbort(st) {
     try {
+        // v2 Pass P159-fix2 Round2（活锚点）：noop（回译内容跟原文一样，不需要真的写回）也是
+        // 一次"这个锚点不会再落笔了"，同样要释放，否则它会一直占着在途表、访问器一直卸不掉。
+        if (st && st.btrAnchor && typeof ovlLiveAnchorRelease === 'function') { try { ovlLiveAnchorRelease(st.btrAnchor); } catch (e2) {} }
         st.blocks.forEach(function (b) { b.style.display = ''; });
         ovlInlineSrcTeardown();
     } catch (e) {
@@ -56490,6 +56604,10 @@ async function ovlInlineZhSaveAsyncMultiBlockSync(st) {
     const anchor = st.btrAnchor || (typeof ovlVisualBtrMakeAnchor === 'function'
         ? ovlVisualBtrMakeAnchor(NaN, NaN, st.origEnText || '')
         : { charStart: NaN, charEnd: NaN, origText: st.origEnText || '', fileKey: null });
+    // v2 Pass P159-fix2 Round2（活锚点）：失败重试态（ovlInlineZhSaveFailRetain）会让用户在
+    // 同一个 st.btrAnchor 上再跑一轮这个函数，而下面的 finally 每轮都会释放它——补一次幂等
+    // 注册，保证重试这一轮的等待窗口里这个锚点仍然在被 ovlLiveAnchorObserve 实时跟踪。
+    try { if (typeof ovlLiveAnchorRegister === 'function') ovlLiveAnchorRegister(anchor); } catch (e) {}
     const inflightKey = (typeof ovlVisualBtrAnchorPosKey === 'function' ? ovlVisualBtrAnchorPosKey(anchor) : '')
         || ((typeof ovlVisualHashSrc === 'function') ? ovlVisualHashSrc(st.origEnText || '') : (st.origEnText || '')) + '|' + Date.now() + '|' + Math.random();
     OvlVisualBtrInFlight[inflightKey] = { ts: Date.now() };
@@ -56597,6 +56715,9 @@ async function ovlInlineZhSaveAsyncMultiBlockSync(st) {
         // 永久拦住），在途登记都必须释放，跟 ovlVisualBtrRunBackground 同一个 try/finally 纪律。
         delete OvlVisualBtrInFlight[inflightKey];
         try { st.blocks.forEach(function (b) { b.removeAttribute('data-ovl-btr-inflight'); }); } catch (e) {}
+        // 同一条纪律用在活锚点上：这一轮等待窗口结束了（不管成功、拒写还是失败重试），锚点
+        // 就该从在途表摘掉；失败重试态会在下一轮开头用上面那次幂等注册重新挂回去。
+        try { if (typeof ovlLiveAnchorRelease === 'function') ovlLiveAnchorRelease(anchor); } catch (e) {}
     }
 }
 
@@ -56636,53 +56757,50 @@ function ovlInlineZhSaveFailRetain(st, newZhText, toastMsg) {
 // 独立的第二道保险，不依赖那道拦截单独也成立）。
 // 返回 {start,end}（可以直接 splice 的字符区间）或 null；null 时 outReason.reason 会带出
 // 放弃原因，供调用方选择合适的提示文案。
+// v2 Pass P159-fix2 Round2（设计 4"活锚点"，见 .claude/tmp/p159_fix2.md）：不再靠前缀指纹
+// 事后推算"陈旧坐标系是否还可信"（独立设计咨询指出的洞 1/洞 2：这既证明不了文件身份，
+// 哈希本身也弱）。改为对应 land() 语义：先补一次防御性 resync（万一有写入绕开了 setter/
+// input 双重拦截，比如极端场景下事件被别的监听器 stopImmediatePropagation 吞掉），再做严格
+// 身份闸门（liveFileKey/anchor.fileKey 任一拿不到、或对不上，直接拒绝，不再有旧代码里
+// `anchor.fileKey != null` 那个"拿不到身份就跳过校验"的豁免口子——那正是洞 1 的根源），
+// 最后 activeSlice===origText 走活锚点快速路径，否则退化到段落对齐的唯一命中兜底
+// （ovlLiveAnchorUniqueParagraphHit：按 .ovl-visual-block 同款粒度切分，"origText 是更长
+// 段落的子串"不可能命中——修洞 3）。整段校验+落笔坐标计算在同一个同步块内、同一份 cur 上，
+// 期间没有任何 await，避免 TOCTOU。
 function ovlVisualBtrResolveWriteRange(anchor, outReason) {
     try {
         const ta = document.getElementById('ovlCodeArea');
         if (!ta || ta.disabled) { if (outReason) outReason.reason = 'editor-unavailable'; return null; }
         if (!anchor) { if (outReason) outReason.reason = 'no-anchor'; return null; }
 
+        try {
+            if (__ovlLiveAnchorShadow !== null && __ovlLiveAnchorShadow !== ta.value) {
+                ovlLiveAnchorObserve(ta.value);
+            }
+        } catch (e) {}
+
         let liveFileKey = null;
         try { liveFileKey = (typeof ovlVisualBtrCurrentFileKey === 'function') ? ovlVisualBtrCurrentFileKey() : null; } catch (e) {}
-        if (anchor.fileKey != null && liveFileKey !== anchor.fileKey) {
+        if (liveFileKey == null || anchor.fileKey == null || liveFileKey !== anchor.fileKey) {
             if (outReason) outReason.reason = 'file-changed';
             return null;
         }
 
-        // v2 Pass P159-fix2（FIX-1b）：快速路径原来只检查“陈旧窗口的内容切片是否还等于 origText”，没有做全局唯一性校验——当更早处的一次编辑把文档整体平移，使另一处内容相同的段落恰好挪到这个陈旧窗口时，会把译文静默写进错误的段落（_reverify_p159_core.js 的 R1 攻击，独立对抗复核 .claude/tmp/p159_reverify.md §1 实测复现）。
-        // 修复：快速路径必须额外验证锚点创建时刻记录的前缀指纹（prefixHash：charStart 之前那段内容的哈希）
-        // 在当前文档里依然成立——前缀不匹配就说明“陈旧窗口”这个坐标系本身已经不可信，不能只凭内容碰巧
-        // 相等就动笔，必须退化到下面的全文唯一匹配兜底（内容相等只作为快速路径的第二重校验，
-        // 不能单独顶替前缀校验）。epoch 是 FIX-3b 的收口点（ovlVisualBtrInvalidateAllAnchors，被 ovlExternalSilentReload
-        // 等“内容整篇替换但文档不能被关闭”的入口调用）——epoch 不匹配同样视为锚点不可信，同样走同一条退化路径。
-        // docLen 只做一次廉价的“前缀长度没有超过当前文档长度”式检查，不替代 prefixHash：锚点
-        // 之后的编辑是无害的，不能仅凭文档变长/变短就拒写。
-        const epochOk = (typeof OvlVisualBtrAnchorEpoch !== 'number') || anchor.epoch == null || anchor.epoch === OvlVisualBtrAnchorEpoch;
-        const prefixTrusted = epochOk && anchor.prefixHash != null && isFinite(anchor.prefixLen) &&
-            anchor.prefixLen >= 0 && anchor.prefixLen <= ta.value.length &&
-            (typeof ovlVisualHashSrc === 'function') &&
-            ovlVisualHashSrc(ta.value.slice(0, anchor.prefixLen)) === anchor.prefixHash;
+        const cur = ta.value;
 
-        if (prefixTrusted && isFinite(anchor.charStart) && isFinite(anchor.charEnd) &&
-            anchor.charStart >= 0 && anchor.charEnd >= anchor.charStart && anchor.charEnd <= ta.value.length) {
-            const liveSlice = ta.value.slice(anchor.charStart, anchor.charEnd);
+        if (!anchor.dead && isFinite(anchor.charStart) && isFinite(anchor.charEnd) &&
+            anchor.charStart >= 0 && anchor.charEnd >= anchor.charStart && anchor.charEnd <= cur.length) {
+            const liveSlice = cur.slice(anchor.charStart, anchor.charEnd);
             if (liveSlice === anchor.origText) {
                 return { start: anchor.charStart, end: anchor.charEnd };
             }
         }
 
-        const needle = anchor.origText;
-        if (!needle) { if (outReason) outReason.reason = 'empty-anchor-text'; return null; }
-        const hay = ta.value;
-        const matches = [];
-        let idx = hay.indexOf(needle);
-        while (idx !== -1 && matches.length < 2) {  // 找到第 2 个就够判"歧义"了，不用扫到底
-            matches.push(idx);
-            idx = hay.indexOf(needle, idx + 1);
-        }
-        if (matches.length === 0) { if (outReason) outReason.reason = 'zero-match'; return null; }
-        if (matches.length >= 2) { if (outReason) outReason.reason = 'ambiguous-match'; return null; }
-        return { start: matches[0], end: matches[0] + needle.length };
+        if (!anchor.origText) { if (outReason) outReason.reason = 'empty-anchor-text'; return null; }
+        const hit = ovlLiveAnchorUniqueParagraphHit(cur, anchor.origText);
+        if (hit === 'ambiguous') { if (outReason) outReason.reason = 'ambiguous-match'; return null; }
+        if (!hit) { if (outReason) outReason.reason = 'zero-match'; return null; }
+        return { start: hit.start, end: hit.end };
     } catch (e) {
         if (outReason) outReason.reason = 'exception';
         return null;
@@ -56766,6 +56884,9 @@ async function ovlVisualBtrRunBackground(origEnText, cfg, newZhText, anchor, inf
         ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg, anchor);
     } finally {
         delete OvlVisualBtrInFlight[key];
+        // v2 Pass P159-fix2 Round2（活锚点）：不管上面走的是成功落笔还是任一失败分支，这个锚点
+        // 的生命周期到此为止——统一在这一个 finally 里释放，不用在每条 return 前各自补一句。
+        try { if (typeof ovlLiveAnchorRelease === 'function') ovlLiveAnchorRelease(anchor); } catch (e) {}
     }
 }
 
