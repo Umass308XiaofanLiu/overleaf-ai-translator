@@ -4630,7 +4630,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.29.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.29.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-12';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -50718,6 +50718,15 @@ function ovlExternalSilentReload(ta, text, mtimeMs) {
     // 在重渲之后才回来，凭旧的 mySeq 判断仍然"当前"，把属于旧文本的译文写进新 DOM。
     // ovlVisualLangCancelInFlight 内部只在有东西可取消时才有实际动作，非 zh/非在途时安全空跑。
     if (typeof ovlVisualLangCancelInFlight === 'function') { try { ovlVisualLangCancelInFlight(); } catch (e) {} }
+    // v2 Pass P159-fix2（FIX-3b，第 14 个未挂钩入口）：这里整篇替换 ta.value，之前在途的
+    // 位置锚点（prefixHash/charStart/charEnd 全部基于旧内容）不再可信。不能复用
+    // ovlResetProjectScopedState()（会错误地把当前文件关掉——这里文件没有切换，只是内容被
+    // 换成磁盘上的新版本），也不在这里另开一个 standalone if 判断（详见
+    // ovlVisualBtrInvalidateAllAnchors 定义处的注释）——改用同一档收口点设计的专用函数：只让
+    // 所有在途锚点集体失效，不弹 toast、不挡这次重载本身，落地时交给
+    // ovlVisualBtrResolveWriteRange 已有的 file-changed/zero-match/ambiguous-match 分支
+    // （见 ovlVisualBtrOnSuccess）统一走用户可见的“未写入，已保留你的输入”提示。
+    if (typeof ovlVisualBtrInvalidateAllAnchors === 'function') { try { ovlVisualBtrInvalidateAllAnchors(); } catch (e) {} }
     ta.value = text;
     OvlState.lastLoadedText = text;
     OvlState.lastLoadedMtimeMs = mtimeMs;
@@ -56065,6 +56074,13 @@ let OvlInlineSrcEdit = null; // null=未在编辑；打开时是 { wrap, ta, blo
 // 跑的任务的"在跑"标记也一并清空，导致本该拦截的并发窗口被漏判。跟 FIX-1/FIX-2 同一个"内容寻址
 // 当唯一键"反模式，改成位置锚点键后不再共享。
 let OvlVisualBtrInFlight = {};
+// v2 Pass P159-fix2（FIX-3b）：位置锚点的全局失效代。外部磁盘改动静默重载（ovlExternalSilentReload）这类
+// “内容被整篇替换但文档本身不能被关闭/清空”的入口，不能复用 ovlResetProjectScopedState()
+// 这个收口点（会错误地把当前文件关掉）。改用另一个专用收口点函数
+// ovlVisualBtrInvalidateAllAnchors()：在覆写 ta.value 之前调用，把这个计数器加一，所有此前创建的锚点
+// （无论是否登记在 OvlVisualBtrInFlight 里）落地时都会被 ovlVisualBtrResolveWriteRange 判定为
+// “锚点不可信”，强制退化到全文唯一性兜底匹配——不新增第 5 个 standalone if 判断。
+let OvlVisualBtrAnchorEpoch = 0;
 // v2 Pass P159-fix（FIX-3）：判断"当前是否有单块回译正在后台跑"的唯一真源封装成一个函数——不
 // 引入新状态，只是把 Object.keys(OvlVisualBtrInFlight).length 这条判断收口一次，供
 // ovlResetProjectScopedState()/ovlOpenFileFromBlob/ovlPerformDelete 等多个真实入口复用，不需要
@@ -56074,6 +56090,16 @@ function ovlVisualBtrInFlightActive() {
     try {
         return !!(typeof OvlVisualBtrInFlight !== 'undefined' && Object.keys(OvlVisualBtrInFlight).length);
     } catch (e) { return false; }
+}
+// v2 Pass P159-fix2（FIX-3b）：专用于“内容被整篇替换但文档不能被关闭/清空”这类场景的收口点
+// （跟 ovlResetProjectScopedState 是同一档设计思路的另一半：那个负责“离开文档前拒绝”，这个负责
+// “文档没离开，但旧内容作废了，所有在途锚点必须失效”）。只做一件事：递增全局 epoch，让所有已创建的位置锚点
+// （无论是否登记在 OvlVisualBtrInFlight 里）在落地时统一被 ovlVisualBtrResolveWriteRange 判定为“锚点不可信”，
+// 强制退化到全文唯一性兜底匹配（找不到/找到多处时各自的用户提示已经存在，不需要在这里重复）。
+function ovlVisualBtrInvalidateAllAnchors() {
+    try {
+        OvlVisualBtrAnchorEpoch = (typeof OvlVisualBtrAnchorEpoch === 'number' ? OvlVisualBtrAnchorEpoch : 0) + 1;
+    } catch (e) {}
 }
 // v2 Pass P159（独立验证阶段发现并修复的一个真实竞态，设计文档没有覆盖）：单击/双击消歧计时器
 // 状态——见 ovlBindQuickActions 内 visualPane 的 mouseup/dblclick 监听器头部大注释。
@@ -56092,7 +56118,26 @@ function ovlVisualBtrCurrentFileKey() {
     } catch (e) { return null; }
 }
 function ovlVisualBtrMakeAnchor(charStart, charEnd, origText) {
-    return { charStart: charStart, charEnd: charEnd, origText: origText, fileKey: ovlVisualBtrCurrentFileKey() };
+    // v2 Pass P159-fix2（FIX-1b）：除了 charStart/charEnd/origText 之外，在锚点创建时再抓一份
+    // “这个位置之前的整段前缀长什么样”的指纹（prefixLen/prefixHash），用于落笔时检测
+    // “更早处的编辑把整个文档平移了，导致这个陈旧的 [charStart,charEnd) 窗口恰好被挪到另一处
+    // 内容相同段落”这种幻影碰撞（_reverify_p159_core.js 的 R1 攻击）。再顺便抓一份 docLen
+    // （当时整文档长度）供日后诊断/廉价校验使用；不作为信任依据——锚点之后的编辑无害，不能因此拒写。
+    let prefixHash = null, prefixLen = null, docLen = null;
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (ta) {
+            const full = ta.value;
+            docLen = full.length;
+            prefixLen = (isFinite(charStart) && charStart >= 0) ? Math.min(charStart, full.length) : 0;
+            prefixHash = (typeof ovlVisualHashSrc === 'function') ? ovlVisualHashSrc(full.slice(0, prefixLen)) : null;
+        }
+    } catch (e) {}
+    const epoch = (typeof OvlVisualBtrAnchorEpoch === 'number') ? OvlVisualBtrAnchorEpoch : 0;
+    return {
+        charStart: charStart, charEnd: charEnd, origText: origText, fileKey: ovlVisualBtrCurrentFileKey(),
+        prefixLen: prefixLen, prefixHash: prefixHash, docLen: docLen, epoch: epoch
+    };
 }
 function ovlVisualBtrAnchorPosKey(anchor) {
     if (!anchor || !isFinite(anchor.charStart) || !isFinite(anchor.charEnd)) return '';
@@ -56604,7 +56649,21 @@ function ovlVisualBtrResolveWriteRange(anchor, outReason) {
             return null;
         }
 
-        if (isFinite(anchor.charStart) && isFinite(anchor.charEnd) &&
+        // v2 Pass P159-fix2（FIX-1b）：快速路径原来只检查“陈旧窗口的内容切片是否还等于 origText”，没有做全局唯一性校验——当更早处的一次编辑把文档整体平移，使另一处内容相同的段落恰好挪到这个陈旧窗口时，会把译文静默写进错误的段落（_reverify_p159_core.js 的 R1 攻击，独立对抗复核 .claude/tmp/p159_reverify.md §1 实测复现）。
+        // 修复：快速路径必须额外验证锚点创建时刻记录的前缀指纹（prefixHash：charStart 之前那段内容的哈希）
+        // 在当前文档里依然成立——前缀不匹配就说明“陈旧窗口”这个坐标系本身已经不可信，不能只凭内容碰巧
+        // 相等就动笔，必须退化到下面的全文唯一匹配兜底（内容相等只作为快速路径的第二重校验，
+        // 不能单独顶替前缀校验）。epoch 是 FIX-3b 的收口点（ovlVisualBtrInvalidateAllAnchors，被 ovlExternalSilentReload
+        // 等“内容整篇替换但文档不能被关闭”的入口调用）——epoch 不匹配同样视为锚点不可信，同样走同一条退化路径。
+        // docLen 只做一次廉价的“前缀长度没有超过当前文档长度”式检查，不替代 prefixHash：锚点
+        // 之后的编辑是无害的，不能仅凭文档变长/变短就拒写。
+        const epochOk = (typeof OvlVisualBtrAnchorEpoch !== 'number') || anchor.epoch == null || anchor.epoch === OvlVisualBtrAnchorEpoch;
+        const prefixTrusted = epochOk && anchor.prefixHash != null && isFinite(anchor.prefixLen) &&
+            anchor.prefixLen >= 0 && anchor.prefixLen <= ta.value.length &&
+            (typeof ovlVisualHashSrc === 'function') &&
+            ovlVisualHashSrc(ta.value.slice(0, anchor.prefixLen)) === anchor.prefixHash;
+
+        if (prefixTrusted && isFinite(anchor.charStart) && isFinite(anchor.charEnd) &&
             anchor.charStart >= 0 && anchor.charEnd >= anchor.charStart && anchor.charEnd <= ta.value.length) {
             const liveSlice = ta.value.slice(anchor.charStart, anchor.charEnd);
             if (liveSlice === anchor.origText) {
@@ -56642,10 +56701,25 @@ function ovlVisualBtrResolveWriteRange(anchor, outReason) {
 function ovlVisualBtrExtractTagLikeSpans(text) {
     const out = [];
     if (!text) return out;
-    const re = /<\/?[a-zA-Z][a-zA-Z0-9:-]*(?:\s[^<>]*)?\/?>/g;
+    // v2 Pass P159-fix2（FIX-4c）：原正则对无空格数学不等式（如 "n<k where k>0"）存在假阳性
+    // （独立对抗复核 .claude/tmp/p159_reverify.md 记录了实测复现）。收紧规则，分两层，都不做
+    // 无条件的 "<"/">" 转义或剥离（那会连累合法 LaTeX，如 "$x<y$"、"a<b<c"）：
+    //   1) 结构层：标签名必须是纯字母数字、长度不超过 15；标签名之后要么直接闭合（">" 或
+    //      "/>"），要么每一段都必须是“空白 + 属性名 + 可选空白 + '='”这种形状——像
+    //      "where k" 这种没有 "=" 的自由文本，结构上就不再匹配。
+    //   2) 语义层：即使结构上像标签，还要求标签名命中真实 HTML 危险元素白名单，或者带有危险
+    //      属性（onXxx=/src=/href=/srcdoc=/formaction=）——结构上碰巧像标签、但既不是真实
+    //      危险元素也没有危险属性的内容不拦。
+    const re = /<\/?([a-zA-Z][a-zA-Z0-9]{0,14})((?:\s+[a-zA-Z][a-zA-Z0-9-]*\s*=[^<>]*)*)\s*\/?>/g;
+    const ALLOW_TAGS = { script: 1, img: 1, iframe: 1, svg: 1, object: 1, embed: 1, video: 1, audio: 1, link: 1, style: 1, body: 1, math: 1, a: 1, div: 1, span: 1, input: 1, form: 1 };
+    const DANGEROUS_ATTR_RE = /\b(on\w+|src|href|srcdoc|formaction)\s*=/i;
     let m;
     while ((m = re.exec(text)) !== null) {
-        out.push(m[0]);
+        const tagName = (m[1] || '').toLowerCase();
+        const attrsPart = m[2] || '';
+        if (ALLOW_TAGS[tagName] || DANGEROUS_ATTR_RE.test(attrsPart)) {
+            out.push(m[0]);
+        }
         if (m.index === re.lastIndex) re.lastIndex++; // 防御性：避免零长匹配死循环（理论上不会发生）
     }
     return out;
