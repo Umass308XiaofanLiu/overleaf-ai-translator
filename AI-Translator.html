@@ -4630,7 +4630,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.28.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.29.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-12';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -36694,10 +36694,16 @@ function ovlVisualRestoreBtrMarks(pane) {
         });
     } catch (e) {}
 }
-// 按【原始英文全文内容】在当前 Visual 面板里重新找目标块——不信任任何提前记好的行号（那份
-// 行号可能因为文档别处的编辑已经整体偏移），只信内容本身逐字节相等。也供 P159 后台回译任务
-// 完成时定位落笔位置用（见 ovlVisualBtrOnSuccess/ovlVisualBtrOnFailure）。跟"撤销回译"共用
-// 同一个函数，不重复实现。
+// 按【原始英文全文内容】在当前 Visual 面板里重新找目标块——"内容完全相等就选它，多个候选取
+// 第一个"。v2 Pass P159-fix（FIX-1，见 .claude/tmp/p159_fix.md）之后：**不再用于任何决定
+// 写哪里的判断**——两段字节相同的孪生段落场景下，这个函数会认错块，核验对抗报告 §3.1 用
+// [UNIQ1,TWIN,UNIQ2,TWIN,UNIQ3] 复现了真实的数据错位。真正的落笔目标改由
+// ovlVisualBtrResolveWriteRange 决定（位置优先、内容仅兜底且要求唯一命中，歧义就放弃写入，
+// 完全不查 DOM 块，直接对 #ovlCodeArea 的字符偏移操作）。这个函数现在仅剩两处调用，都是
+// **纯装饰性收尾**（清一下"回译中…"角标，找错了/找不到顶多角标不消失，不影响是否写入/
+// 写到哪——见 ovlVisualBtrOnSuccess/ovlVisualBtrOnFailure 各自调用点的注释）：真要用于定位
+// 就应该先试 ovlVisualBlockAtCharRange（按位置，零歧义），这个函数只作为那个找不到时的
+// 尽力而为兜底。
 function ovlVisualBtrLocateBlock(origEnText) {
     try {
         const pane = document.getElementById('ovlVisualPane');
@@ -37103,6 +37109,31 @@ function ovlVisualBlockSrcText(blockEl) {
         const chars = ovlGutterLineRangeToChars(ta, lo, hi);
         return ta.value.slice(chars.start, chars.end);
     } catch (e) { return null; }
+}
+
+// v2 Pass P159-fix（FIX-1，见 .claude/tmp/p159_fix.md）：按【字符位置】而不是按内容，在当前
+// Visual 面板里找出恰好覆盖 [startChar,endChar) 这个区间的那个块——每个块的行区间互不重叠，
+// 位置相等是零歧义判据，不会像 ovlVisualBtrLocateBlock 的内容匹配那样在孪生段落场景下
+// 认错块。只用于"回译落笔之后要不要走局部重渲染/该给哪个块清角标"这类锦上添花的收尾，绝不
+// 是落笔目标本身的定位器——落笔目标由 ovlVisualBtrResolveWriteRange 决定，且完全不依赖
+// DOM 块（直接对 #ovlCodeArea 的字符偏移操作），找不到对应块顶多是回退成整篇重渲染，不影响
+// 正确性。
+function ovlVisualBlockAtCharRange(startChar, endChar) {
+    try {
+        if (!isFinite(startChar) || !isFinite(endChar)) return null;
+        const ta = document.getElementById('ovlCodeArea');
+        const pane = document.getElementById('ovlVisualPane');
+        if (!ta || !pane) return null;
+        const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+        for (let i = 0; i < blocks.length; i++) {
+            const lo = parseInt(blocks[i].getAttribute('data-src-line'), 10);
+            const hi = parseInt(blocks[i].getAttribute('data-src-line-end'), 10);
+            if (!isFinite(lo) || !isFinite(hi)) continue;
+            const c = ovlGutterLineRangeToChars(ta, lo, hi);
+            if (c.start === startChar && c.end === endChar) return blocks[i];
+        }
+    } catch (e) {}
+    return null;
 }
 
 // 懒翻译取块顺序：视口内（含前后各一屏）优先，其余按文档顺序殿后——用户原话"先翻当前视口
@@ -40152,6 +40183,15 @@ function ovlDomFromFsNode(node) {
 
 async function ovlOpenFileFromBlob(file, name) {
     try {
+        // v2 Pass P159-fix（FIX-3，本会话新发现的一处旁路）：webkitdirectory 只读降级模式下，
+        // 在文件树里点开另一个文件走的是这条路径——跟 ovlOpenFile 一样会直接把 #ovlCodeArea
+        // 换成另一个文件的内容，但完全没经过 ovlOpenFile 本身，也就没有它那条"有回译在跑就拦"
+        // 的既有守卫（见 ovlOpenFile 头部 P159 注释）。在改 currentFile/ta.value 之前补上同一条
+        // 纪律、同一句文案。
+        if (typeof ovlVisualBtrInFlightActive === 'function' && ovlVisualBtrInFlightActive()) {
+            try { showToast('有段落正在后台回译，请稍候再切换文件。', 'warning'); } catch (e) {}
+            return;
+        }
         const text = await file.text();
         OvlState.currentFile = { name: name, handle: null };
         try { if (OvlVisualLangState.failLog) OvlVisualLangState.failLog.clear(); } catch (e) {} // v2 Pass P128（C1，卫生清理）
@@ -40522,8 +40562,26 @@ class OvlRemoteDirHandle {
 // 一个函数，在真正切换项目文件夹的入口处统一调用一次。只清 finding 明确点名的这几项
 // （pdfObjectUrl/pdfSourceMode/pdfDirectFile/lastCompile/currentFile），不动 mainDocFile 等
 // 未被指出的字段，避免超出本次确认范围引入新行为变化。
+// v2 Pass P159-fix（FIX-3）：这里是"真正切换项目文件夹"唯一的公共收口点——上面这段 P80 注释
+// 原文就写着"收口成一个函数，在真正切换项目文件夹的入口处统一调用一次"，已确认至少 5 条真实
+// 入口（ovlPickFolder / 远程项目路径输入框 okBtn / ovlProjectHistoryOpenEntry 的 openViaBridge /
+// ovlWebkitDirInput change 处理器 / ovlProjectMakeCopyRemote 复制后自动切换）全部调用这个函数。
+// 独立核验报告指出 ovlProjectHistoryOpenEntry→openViaBridge()不经过 ovlOpenFile，导致
+// OvlVisualBtrInFlight 的"有回译在跑就拦"这条既有纪律在这条入口上完全失效——核实这是同一个
+// bug 模式第 4 次复发（见 ovlProjectHistoryOpenEntry 头部 P131d 注释），不能只是再打一次
+// "补丁 whack-a-mole"，得把判断本身放进所有入口都必经的这个函数里。返回 boolean：
+// true=已正常清空并可以继续渲染新项目；false=检测到有回译在后台跑，直接拒绝、什么都没清，
+// 调用方必须据此中止本次切换（不能再往下走 ovlAutoFillProjectPath/ovlRenderTree）。
+// 已知限制（见 .claude/tmp/p159_fix.md 第 7 节）：5 条入口里有几条在调用这个函数之前，已经先
+// 递增了 __ovlProjectEpoch / 替换了 OvlState.dirHandle（P115d 明确要求这个顺序不能倒——
+// 见下面 ovlBumpProjectEpochIfChanged 头注释），所以这里只是兜底；各入口真正的第一道防线是
+// 它们各自在拿到新 handle/递增 epoch 之前就先调用一次 ovlVisualBtrInFlightActive()。
 function ovlResetProjectScopedState() {
     try {
+        if (ovlVisualBtrInFlightActive()) {
+            try { showToast('有段落正在后台回译，请稍候再切换项目/文件夹。', 'warning'); } catch (e) {}
+            return false;
+        }
         if (typeof ovlAutoSaveTimer !== 'undefined' && ovlAutoSaveTimer) { clearTimeout(ovlAutoSaveTimer); ovlAutoSaveTimer = null; }
         OvlState.currentFile = null;
         OvlState.dirty = false;
@@ -40545,7 +40603,8 @@ function ovlResetProjectScopedState() {
         if (typeof ovlRenderLogList === 'function') ovlRenderLogList();
         if (typeof ovlRenderLogRaw === 'function') ovlRenderLogRaw();
         if (typeof ovlRenderLogOtherFiles === 'function') ovlRenderLogOtherFiles();
-    } catch (e) { console.error('[ovl] resetProjectScopedState failed', e); }
+        return true;
+    } catch (e) { console.error('[ovl] resetProjectScopedState failed', e); return true; }
 }
 
 // v2 Pass P115d（第 3 轮终核·唯一阻塞项）：本地「打开项目文件夹…」这条真实入口的身份字符串
@@ -40590,6 +40649,12 @@ async function ovlPickFolder() {
                 if (e && e.name === 'AbortError') return;
                 throw e;
             }
+            // v2 Pass P159-fix（FIX-3）：下面这几行会立刻改 dirHandle/epoch，改完再发现"其实
+            // 不该切"就没法干净回滚——在任何状态变更之前先问一次。
+            if (typeof ovlVisualBtrInFlightActive === 'function' && ovlVisualBtrInFlightActive()) {
+                try { showToast('有段落正在后台回译，请稍候再切换项目文件夹。', 'warning'); } catch (e2) {}
+                return;
+            }
             OvlState.usingWebkitFallback = false;
             const __ovlPrevDirHandle = OvlState.dirHandle;
             OvlState.dirHandle = handle;
@@ -40597,7 +40662,7 @@ async function ovlPickFolder() {
             // await 完——后面 OvlFileTextCache 的读取、FocusState 条目的身份判定用的都是这次
             // 事件之后的 __ovlProjectEpoch，不能让它们抢在判定完成之前用旧值跑。
             await ovlBumpProjectEpochIfChanged(__ovlPrevDirHandle, handle);
-            ovlResetProjectScopedState();
+            if (!ovlResetProjectScopedState()) return; // v2 Pass P159-fix（FIX-3 兜底，见该函数头注释）
             ovlAutoFillProjectPath(handle);
             await ovlRenderTree(handle);
             ovlUpdateTreeToolbtnsVisibility();
@@ -41026,6 +41091,12 @@ function ovlRemotePickFolder(opts) {
                     renderError((data && data.error) || '这个路径打不开——检查是否存在/是否是目录');
                     return;
                 }
+                // v2 Pass P159-fix（FIX-3）：下面 ovlSetProjectPath/dirHandle/epoch 都要改了，
+                // 改之前先问一次。
+                if (typeof ovlVisualBtrInFlightActive === 'function' && ovlVisualBtrInFlightActive()) {
+                    try { showToast('有段落正在后台回译，请稍候再切换项目文件夹。', 'warning'); } catch (e3) {}
+                    return;
+                }
                 // v2 Pass P66：改走统一收口函数，顺带反向同步 Overleaf 项目 ID。watch 沿用
                 // 原有时序，在下面 renderTree 之后另调，这里跳过。
                 ovlSetProjectPath(p, { skipWatch: true });
@@ -41036,7 +41107,7 @@ function ovlRemotePickFolder(opts) {
                 // __ovlProjectEpoch，双保险：哪怕字符串判定这一侧将来出现遗漏，epoch 这道闸依然
                 // 兜得住（见 __ovlProjectEpoch 头注释）。
                 __ovlProjectEpoch++;
-                ovlResetProjectScopedState();
+                if (!ovlResetProjectScopedState()) return; // v2 Pass P159-fix（FIX-3 兜底）
                 ovlUpdateTreeToolbtnsVisibility();
                 Promise.resolve(ovlRenderTree(OvlState.dirHandle)).then(function () {
                     try { ovlBridgeUpdateWatch(); } catch (e3) {}
@@ -41766,6 +41837,9 @@ function ovlProjectHistoryOpenEntry(entry, onClosed) {
         // v2 Pass P131d（NB-b）：这条入口最终走 openViaBridge()，直接
         // __ovlProjectEpoch++ / ovlResetProjectScopedState()，不经过 ovlOpenFile —— 守卫得在这里
         // 挂。解决冲突后状态清空，递归进来这一次不会再弹第二遍（不会死循环）。
+        // v2 Pass P159-fix（FIX-3，落实上面这条 P131d 遗留的 TODO）：回译在跑的守卫已经挂进
+        // openViaBridge() 内部最开头（见该函数），且 ovlResetProjectScopedState() 自己也补了一层
+        // 兜底——这里不用重复判断。
         if (typeof ovlExternalConflictActive === 'function' && ovlExternalConflictActive()) {
             ovlExternalConflictGuardBeforeLeave().then(function (proceed) {
                 if (proceed) ovlProjectHistoryOpenEntry(entry, null);
@@ -41803,6 +41877,14 @@ function ovlProjectHistoryOpenEntry(entry, onClosed) {
         // 声明，isRemoteEntry===true（真·远程桥，比如 ovlIsRemoteBridge()===true 的生产环境）
         // 那条分支也复用同一个闭包——见下方 isRemoteEntry 分支新增的说明。
         function openViaBridge() {
+            // v2 Pass P159-fix（FIX-3）：这正是独立核验报告点名的那条入口——它不经过
+            // ovlOpenFile，OvlVisualBtrInFlight 的既有拦截从来没在这里生效过（见函数头部
+            // P131d 注释）。在改任何状态之前先问一次，两处调用点（isRemoteEntry 的远程分支、
+            // 本地桥分支）共用这一个闭包，一并覆盖。
+            if (typeof ovlVisualBtrInFlightActive === 'function' && ovlVisualBtrInFlightActive()) {
+                try { showToast('有段落正在后台回译，请稍候再切换项目文件夹。', 'warning'); } catch (e) {}
+                return Promise.resolve();
+            }
             // 顺序照抄 ovlRemotePickFolder()：先换 OvlState.dirHandle/usingWebkitFallback 再渲染
             // 树，跟既有的远程打开路径保持同一套状态更新顺序，不额外制造一种新的时序。
             const handle = new OvlRemoteDirHandle('.', expectedBasename || entry.path);
@@ -41818,7 +41900,7 @@ function ovlProjectHistoryOpenEntry(entry, onClosed) {
             // …) 过（本地桥分支/远程分支都会先跑到那一行），本来就可信——跟 ovlRemotePickFolder
             // 的"选择此文件夹"同一条理由，无条件递增即可，双保险见 __ovlProjectEpoch 头注释。
             __ovlProjectEpoch++;
-            ovlResetProjectScopedState();
+            if (!ovlResetProjectScopedState()) return Promise.resolve(); // v2 Pass P159-fix（FIX-3 兜底）
             ovlUpdateTreeToolbtnsVisibility();
             return Promise.resolve(ovlRenderTree(handle)).then(function () {
                 try { ovlProjectHistoryAdd({ name: entry.name, path: entry.path, kind: entry.kind, projectId: entry.projectId }); } catch (e) {}
@@ -42320,6 +42402,18 @@ async function ovlPerformRename(parentHandle, oldName, isDir, newName, oldRelPat
 // 比对同样必须按完整相对路径，不能再按裸 name。
 async function ovlPerformDelete(parentHandle, name, isDir, relPath) {
     relPath = relPath || name;
+    // v2 Pass P159-fix（FIX-3，本会话新发现的一处旁路）：删除的如果正好是当前打开的这个文件，
+    // 下面会直接清空 currentFile/ta.value（“文件关闭”这一类），同样没经过 ovlOpenFile，同样会
+    // 让一个即将写回的后台回译落进已经被清空/正在被别的内容占用的编辑器。这里只用同步的
+    // relPath 字符串比对做前置判断（不等真正删除之后才用 isSameEntry 异步确认）——删除操作本身
+    // 不可逆，必须在真的调用 removeEntry() 之前就把这次操作整个拒绝掉，不能先删了盘上的文件再
+    // 回头后悔。用抛错让调用方既有的 catch+flash 报错通道展示，不额外弹 toast（跟上面
+    // "没有写入权限" 那条走的是同一套既有约定）。
+    if (!isDir && OvlState.currentFile && (OvlState.currentFile.relPath || OvlState.currentFile.name) === relPath) {
+        if (typeof ovlVisualBtrInFlightActive === 'function' && ovlVisualBtrInFlightActive()) {
+            throw new Error('有段落正在后台回译，请稍候再删除这个文件');
+        }
+    }
     const rwOk = await ovlEnsureRW(parentHandle);
     if (!rwOk) throw new Error('没有写入权限');
     await parentHandle.removeEntry(name, { recursive: true });
@@ -51845,8 +51939,14 @@ function ovlBindShell() {
             dirInput.addEventListener('change', function (e) {
                 const files = e.target.files;
                 if (!files || !files.length) return;
+                // v2 Pass P159-fix（FIX-3）：webkitdirectory 降级入口，改 dirHandle 之前先问一次。
+                if (typeof ovlVisualBtrInFlightActive === 'function' && ovlVisualBtrInFlightActive()) {
+                    try { showToast('有段落正在后台回译，请稍候再切换项目文件夹。', 'warning'); } catch (e2) {}
+                    e.target.value = ''; // 允许用户之后再次选择同一个文件夹能重新触发 change
+                    return;
+                }
                 OvlState.dirHandle = null;
-                ovlResetProjectScopedState();
+                if (!ovlResetProjectScopedState()) return; // v2 Pass P159-fix（FIX-3 兜底）
                 const tree = ovlBuildTreeFromFileList(files);
                 const body = document.getElementById('ovlTreeBody');
                 if (body) {
@@ -55358,11 +55458,18 @@ function ovlProjectMakeCopyRemote() {
                 // 树报「projectDir 不存在」。根治（桥端改 fs.promises.cp）在 server.js 一侧。
                 return ovlRemoteFsJson(ovlBridgeUrl('/fs/list'), { projectDir: newRoot, path: '.' }).then(function (lst) {
                     if (!lst || lst.ok !== true) throw new Error('桥端报告复制成功，但副本目录「' + name + '」不存在（复制未生效）' + (lst && lst.error ? '：' + lst.error : ''));
+                    // v2 Pass P159-fix（FIX-3）：文件已经真的复制好了（上面 /fs/copy 已经落盘），
+                    // 这里挡的只是"自动切换过去"这一步——有回译在跑就保留在当前项目，不切换，
+                    // 副本仍然留在磁盘上，不丢用户的复制结果。
+                    if (typeof ovlVisualBtrInFlightActive === 'function' && ovlVisualBtrInFlightActive()) {
+                        ovlFlashSaveStatus('已复制到「' + name + '」，但有段落正在后台回译，暂不自动切换——请稍候手动打开该副本', true);
+                        return;
+                    }
                     ovlSetProjectPath(newRoot, { skipWatch: true });
                     OvlState.usingWebkitFallback = false;
                     OvlState.dirHandle = new OvlRemoteDirHandle('.', ovlProjectHistoryBasename(newRoot) || newRoot);
                     __ovlProjectEpoch++;
-                    ovlResetProjectScopedState();
+                    if (!ovlResetProjectScopedState()) return; // v2 Pass P159-fix（FIX-3 兜底）
                     ovlUpdateTreeToolbtnsVisibility();
                     return Promise.resolve(ovlRenderTree(OvlState.dirHandle)).then(function () {
                         try { ovlBridgeUpdateWatch(); } catch (e3) {}
@@ -55947,37 +56054,99 @@ let OvlInlineSrcEdit = null; // null=未在编辑；打开时是 { wrap, ta, blo
 // 多块编辑（跨段选中+工具条「编辑」这条旧路径）继续走同步阻塞路径——见
 // ovlInlineZhSaveAsyncMultiBlockSync 头部注释，这是本 Pass 明确保留、不假装已解决的范围边界。
 //
-// OvlVisualBtrInFlight：key = ovlVisualHashSrc(回译前的英文原文)，只用于"要不要拦语言模式/
-// 文件切换"这个全局判断（非空即拦，见 ovlVisualLangSetMode/ovlOpenFile），不参与目标块定位
-// ——定位靠 ovlVisualBtrLocateBlock 的内容匹配（哈希寻址同一套哲学，见 §5.2）。
+// OvlVisualBtrInFlight：key = 位置锚点键（ovlVisualBtrAnchorPosKey，拿不到有效偏移量时退化成
+// 哈希+时间戳+随机数，见 ovlInlineZhSaveAsyncSingleBlock），只用于"要不要拦语言模式/文件/项目
+// 切换"这个全局判断（非空即拦，见 ovlVisualLangSetMode/ovlOpenFile/
+// ovlVisualBtrInFlightActive 的调用点），不参与目标块定位——定位靠
+// ovlVisualBtrResolveWriteRange（位置优先，内容仅做校验，歧义即放弃写入，见
+// .claude/tmp/p159_fix.md FIX-1）。
+// v2 Pass P159-fix（FIX-1 附带修复）：这个 key 本来是纯 ovlVisualHashSrc(回译前英文原文)——两个
+// 内容完全相同的孪生段落同时回译时会撞同一个 key，一个任务 finally 里的 delete 会把另一个仍在
+// 跑的任务的"在跑"标记也一并清空，导致本该拦截的并发窗口被漏判。跟 FIX-1/FIX-2 同一个"内容寻址
+// 当唯一键"反模式，改成位置锚点键后不再共享。
 let OvlVisualBtrInFlight = {};
+// v2 Pass P159-fix（FIX-3）：判断"当前是否有单块回译正在后台跑"的唯一真源封装成一个函数——不
+// 引入新状态，只是把 Object.keys(OvlVisualBtrInFlight).length 这条判断收口一次，供
+// ovlResetProjectScopedState()/ovlOpenFileFromBlob/ovlPerformDelete 等多个真实入口复用，不需要
+// 各自重复这一行判断。用哪种方式通知用户（toast 还是既有的 flash 状态条+throw）由各调用点自己
+// 决定，跟各自原有的错误提示习惯保持一致——这个函数只回答"现在能不能继续"。
+function ovlVisualBtrInFlightActive() {
+    try {
+        return !!(typeof OvlVisualBtrInFlight !== 'undefined' && Object.keys(OvlVisualBtrInFlight).length);
+    } catch (e) { return false; }
+}
 // v2 Pass P159（独立验证阶段发现并修复的一个真实竞态，设计文档没有覆盖）：单击/双击消歧计时器
 // 状态——见 ovlBindQuickActions 内 visualPane 的 mouseup/dblclick 监听器头部大注释。
 let OvlVisualClickEditPending = null;
 const OVL_VISUAL_CLICK_EDIT_DELAY_MS = 260; // 略短于常见浏览器双击判定窗口（约 300-500ms）
-// 回译失败时保留用户刚打的中文（用户决定：绝不丢弃）——key 用【当前这一版英文源码】的哈希，
-// 下次用户点开这一段编辑（ovlInlineZhEditOpenForBlocks）优先读这里而不是缓存里的旧译文，
-// 读到即消费清空（一次性草稿，不是持久历史）。
+// v2 Pass P159-fix（FIX-1/FIX-2 共用定位锚，见 .claude/tmp/p159_fix.md）：给"编辑打开
+// 那一刻"拍一张位置身份快照——文件/项目身份（复用既有 ovlFileTextCacheKey 的
+// epoch|projectKey|relPath 范式，跟 OvlFileTextCache 同一套哲学，不新发明一套）+ 源文档里
+// 这一块当时占据的字符偏移区间 [charStart,charEnd) + 那个区间当时的原始文本。落笔目标
+// （ovlVisualBtrResolveWriteRange）和草稿表的钥匙（ovlVisualBtrDraftSet/Take）都从这张
+// 快照算，内容哈希只作为位置失效之后的兜底校验，不再单独当钥匙用。
+function ovlVisualBtrCurrentFileKey() {
+    try {
+        const relPath = (typeof OvlState !== 'undefined' && OvlState && OvlState.currentFile) ? OvlState.currentFile.relPath : null;
+        return (typeof ovlFileTextCacheKey === 'function') ? ovlFileTextCacheKey(relPath) : null;
+    } catch (e) { return null; }
+}
+function ovlVisualBtrMakeAnchor(charStart, charEnd, origText) {
+    return { charStart: charStart, charEnd: charEnd, origText: origText, fileKey: ovlVisualBtrCurrentFileKey() };
+}
+function ovlVisualBtrAnchorPosKey(anchor) {
+    if (!anchor || !isFinite(anchor.charStart) || !isFinite(anchor.charEnd)) return '';
+    return (anchor.fileKey == null ? '' : anchor.fileKey) + '|' + anchor.charStart + '|' + anchor.charEnd;
+}
+// 回译失败/放弃写入时保留用户刚打的中文（用户决定：绝不丢弃）——v2 Pass P159-fix（FIX-2）
+// 之前 key 单独用【当前这一版英文源码】的哈希，两段字节相同的孪生段落会撞进同一个桶：没动过
+// 的那一份一读就把真正失败那一份的草稿偷走并删掉（核验对抗报告 §3.2 实测复现）。现在 key
+// 换成"位置锚 + 内容哈希"复合键：写入（Set）总是按完整复合键落桶；取出（Take）优先按复合键
+// 精确命中直接消费，位置对不上时退化成只按内容哈希在全表里找，但要求恰好唯一命中才算数——
+// 内容哈希单独一个字段永远不再是"可以直接命中并删除"的钥匙，多候选一律不猜、不删、返回
+// null（宁可这次找不回草稿，也不允许把别人的草稿错发/错删）。
 let OvlVisualBtrFailedDrafts = {};
 const OVL_VISUAL_BTR_DRAFTS_MAX = 200;
-function ovlVisualBtrDraftSet(origEnText, zhText) {
+function ovlVisualBtrDraftSet(origEnText, zhText, anchor) {
     try {
-        const key = ovlVisualHashSrc(origEnText);
+        const contentKey = ovlVisualHashSrc(origEnText);
+        const posKey = ovlVisualBtrAnchorPosKey(anchor);
+        const key = posKey + '||' + contentKey; // posKey 可能为空串（防御性兜底），仍然合法可用
         const keys = Object.keys(OvlVisualBtrFailedDrafts);
-        if (keys.length >= OVL_VISUAL_BTR_DRAFTS_MAX) {
+        if (keys.length >= OVL_VISUAL_BTR_DRAFTS_MAX && !OvlVisualBtrFailedDrafts[key]) {
             keys.sort(function (a, b) { return (OvlVisualBtrFailedDrafts[a].ts || 0) - (OvlVisualBtrFailedDrafts[b].ts || 0); });
             delete OvlVisualBtrFailedDrafts[keys[0]];
         }
-        OvlVisualBtrFailedDrafts[key] = { zhText: zhText, ts: Date.now() };
+        OvlVisualBtrFailedDrafts[key] = { zhText: zhText, ts: Date.now(), origEnText: origEnText, contentKey: contentKey, posKey: posKey };
     } catch (e) {}
 }
-function ovlVisualBtrDraftTake(enText) {
+function ovlVisualBtrDraftTake(enText, anchor) {
     try {
-        const key = ovlVisualHashSrc(enText);
-        const rec = OvlVisualBtrFailedDrafts[key];
-        if (!rec) return null;
-        delete OvlVisualBtrFailedDrafts[key];
-        return rec.zhText;
+        const contentKey = ovlVisualHashSrc(enText);
+        const posKey = ovlVisualBtrAnchorPosKey(anchor);
+        // 第一优先：位置+内容复合键精确命中——不含糊，直接消费（这就是"真主人"的判据）。
+        if (posKey) {
+            const exactKey = posKey + '||' + contentKey;
+            const exact = OvlVisualBtrFailedDrafts[exactKey];
+            if (exact) { delete OvlVisualBtrFailedDrafts[exactKey]; return exact.zhText; }
+        }
+        // 第二优先：位置对不上（比如打开这一刻文档别处的编辑已经挪动了偏移）——退化成只按
+        // 内容哈希在全表里找，但要求恰好唯一命中才算数，>=2 个候选一律放弃（不猜、不删）。
+        let candidateKeys = [];
+        const allKeys = Object.keys(OvlVisualBtrFailedDrafts);
+        for (let i = 0; i < allKeys.length; i++) {
+            const rec = OvlVisualBtrFailedDrafts[allKeys[i]];
+            if (rec && rec.contentKey === contentKey) {
+                candidateKeys.push(allKeys[i]);
+                if (candidateKeys.length > 1) break; // 找到第 2 个就足够判定"歧义"，不用扫完全表
+            }
+        }
+        if (candidateKeys.length === 1) {
+            const rec = OvlVisualBtrFailedDrafts[candidateKeys[0]];
+            delete OvlVisualBtrFailedDrafts[candidateKeys[0]];
+            return rec.zhText;
+        }
+        return null;
     } catch (e) { return null; }
 }
 
@@ -56217,28 +56386,53 @@ async function ovlInlineZhSaveAsyncSingleBlock(st) {
     const newZhText = st.ta.value;
     const origEnText = st.origEnText;
     const cfg = st.cfg || getApiConfig();
+    // v2 Pass P159-fix（FIX-1 锚点）：打开编辑时拍下的定位快照，随这次后台任务一路带到底。
+    // 防御性兜底（正常情况下 mode==='zh' 的会话一定带着它，见 ovlInlineZhEditOpenForBlocks）。
+    const anchor = st.btrAnchor || (typeof ovlVisualBtrMakeAnchor === 'function'
+        ? ovlVisualBtrMakeAnchor(NaN, NaN, origEnText)
+        : { charStart: NaN, charEnd: NaN, origText: origEnText, fileKey: null });
 
     // 立刻收尾：原块恢复显示 + 拆 wrap + 释放单例——用户可以立刻点别的段落继续编辑。跟旧版
     // 最大的区别：旧版会锁住这个 textarea 等回译结果，这里直接把这次编辑会话"交出去"，剩下
-    // 的事交给后台任务（ovlVisualBtrRunBackground）在完成时自己按内容哈希找回目标块。
+    // 的事交给后台任务（ovlVisualBtrRunBackground）在完成时按定位锚找回落笔目标（FIX-1：
+    // 位置优先、内容仅兜底且要求唯一命中，不再单独信"内容哈希/内容匹配"）。
     try { st.blocks.forEach(function (b) { b.style.display = ''; }); } catch (e) { console.error('[ovl] inlineZhSave restore blocks failed', e); }
     try { ovlInlineSrcTeardown(); } catch (e) { OvlInlineSrcEdit = null; }
 
     // 打"回译中"标记 + 登记进全局在途表 + 排一次 gutter 刷新——用户会在行号栏看到"回译中…"，
     // 不是新的遮挡正文的浮层（复用 ovlQaVisualStateCompute 的 key 机制，见该函数头部新增分支）。
+    // v2 Pass P159-fix：在途表的 key 也从纯内容哈希改成位置锚——两个孪生段落几乎同时进入
+    // 后台回译时，纯内容哈希会撞成同一把钥匙，先完成的那个 finally 里的 delete 会把还没跑完
+    // 的另一个也一起"清空"，导致 OvlVisualBtrInFlight 在真实仍有任务在跑时被误判成"空"
+    // （这条全局判断被 ovlOpenFile/ovlVisualLangSetMode 等多处用作"能不能切换"的唯一依据，
+    // 误判空等于让 FIX-3 的守卫失效）。位置锚在同一时刻内必然互不相同（同一时刻只可能有一个
+    // OvlInlineSrcEdit 会话，每次新会话的字符区间都是当场重新计算的），天然不会撞车。
     try { st.blocks.forEach(function (b) { b.setAttribute('data-ovl-btr-inflight', '1'); }); } catch (e) {}
-    const inflightKey = (typeof ovlVisualHashSrc === 'function') ? ovlVisualHashSrc(origEnText) : origEnText;
+    const inflightKey = (typeof ovlVisualBtrAnchorPosKey === 'function' ? ovlVisualBtrAnchorPosKey(anchor) : '')
+        || ((typeof ovlVisualHashSrc === 'function') ? ovlVisualHashSrc(origEnText) : origEnText) + '|' + Date.now() + '|' + Math.random();
     OvlVisualBtrInFlight[inflightKey] = { ts: Date.now() };
     if (typeof ovlScheduleVisualGutterAfterImage === 'function') ovlScheduleVisualGutterAfterImage();
 
     if (typeof ovlVisualBtrRunBackground === 'function') {
-        ovlVisualBtrRunBackground(origEnText, cfg, newZhText).catch(function (e) {
+        ovlVisualBtrRunBackground(origEnText, cfg, newZhText, anchor, inflightKey).catch(function (e) {
             console.error('[ovl] btr background task rejected unexpectedly', e);
         });
     }
 }
 
 // ---- 多块（跨段选中的旧路径）：继续同步阻塞，但去掉确认框、加上失败态保留输入 ----
+// v2 Pass P159-fix（FIX-1/FIX-3 补漏，本轮全文件排查新发现，见 .claude/tmp/p159_fix.md）：
+// 这条路径原来完全绕开了 FIX-1 的锚点落笔校验和 FIX-3 的"在途登记"——st.btrAnchor 在
+// ovlInlineZhEditOpenForBlocks 里本来就已经拍好快照（单块路径 ovlInlineZhSaveAsyncSingleBlock
+// 一直在用），但这里改之前一直是【用 stale 的 st.lineFrom/st.lineTo 硬算字符区间，真正落笔那一刻
+// 不做任何校验】，也从未登记进 OvlVisualBtrInFlight。真实网络 await（下面的
+// ovlBacktranslateZhToEn）期间，用户切到同一项目内的另一个文件：ovlOpenFile 不会把
+// ta.disabled 置 true（只会直接覆盖 ta.value），而且因为这里从不登记 OvlVisualBtrInFlight，
+// ovlOpenFile 里"有回译在跑就拦"的既有守卫也看不到这个任务在跑——两个缺口叠加，await
+// 结束后原代码只查 `!ta || ta.disabled`（切文件不会让它变 true）就会直接按旧文件的行号把
+// 回译结果盲写进新打开的、无关的文件，真实数据损坏。这里补齐同一套已经建好、已经在单块
+// 路径上跑通的机制（ovlVisualBtrResolveWriteRange / OvlVisualBtrInFlight /
+// ovlVisualBtrDraftSet / ovlVisualBtrHasNewTagLikeContent），不新发明一套写入决策。
 async function ovlInlineZhSaveAsyncMultiBlockSync(st) {
     st.closing = true;
     const newZhText = st.ta.value;
@@ -56248,70 +56442,116 @@ async function ovlInlineZhSaveAsyncMultiBlockSync(st) {
         if (hint) hint.textContent = '回译中，请稍候…';
     } catch (e) {}
 
-    let newEnText = null;
+    const anchor = st.btrAnchor || (typeof ovlVisualBtrMakeAnchor === 'function'
+        ? ovlVisualBtrMakeAnchor(NaN, NaN, st.origEnText || '')
+        : { charStart: NaN, charEnd: NaN, origText: st.origEnText || '', fileKey: null });
+    const inflightKey = (typeof ovlVisualBtrAnchorPosKey === 'function' ? ovlVisualBtrAnchorPosKey(anchor) : '')
+        || ((typeof ovlVisualHashSrc === 'function') ? ovlVisualHashSrc(st.origEnText || '') : (st.origEnText || '')) + '|' + Date.now() + '|' + Math.random();
+    OvlVisualBtrInFlight[inflightKey] = { ts: Date.now() };
+    try { st.blocks.forEach(function (b) { b.setAttribute('data-ovl-btr-inflight', '1'); }); } catch (e) {}
+    if (typeof ovlScheduleVisualGutterAfterImage === 'function') { try { ovlScheduleVisualGutterAfterImage(); } catch (e) {} }
+
     try {
-        newEnText = await ovlBacktranslateZhToEn(newZhText, st.cfg || getApiConfig(), null);
-    } catch (e) {
-        console.error('[ovl] inlineZhSave backtranslate failed', e);
-        ovlInlineZhSaveFailRetain(st, newZhText,
-            '回译失败：' + (e && e.message ? e.message : String(e)) + '，英文原文未改动，已保留你的输入，可以再试一次或按 Esc 放弃。');
-        return;
-    }
-    if (!newEnText || !newEnText.trim()) {
-        ovlInlineZhSaveFailRetain(st, newZhText, '回译失败：模型返回了空结果，英文原文未改动，已保留你的输入，可以再试一次或按 Esc 放弃。');
-        return;
-    }
-    const origEnText = st.origEnText || '';
-    const ratio = origEnText.length > 0 ? (newEnText.length / origEnText.length) : 1;
-    if (ratio < 0.15 || ratio > 6) {
-        ovlInlineZhSaveFailRetain(st, newZhText, '回译失败：回译结果长度异常（可能翻译跑偏），英文原文未改动，已保留你的输入，请检查后重试。');
-        return;
-    }
-
-    let spliced = false;
-    try {
-        const ta = document.getElementById('ovlCodeArea');
-        if (!ta || ta.disabled) throw new Error('编辑器未就绪');
-        const chars = ovlGutterLineRangeToChars(ta, st.lineFrom, st.lineTo);
-        const oldLineCount = st.lineTo - st.lineFrom + 1;
-        const newLineCount = newEnText.split('\n').length;
-
-        const wasHidden = ta.style.display === 'none';
-        if (wasHidden) ta.style.display = '';
-        ta.focus();
-        ta.setSelectionRange(chars.start, chars.end);
-        document.execCommand('insertText', false, newEnText);
-        if (wasHidden) ta.style.display = 'none';
-        spliced = true;
-        if (typeof focusNoteTexChanged === 'function') { try { focusNoteTexChanged(); } catch (e) {} }
-
-        // 缓存一致性：splice 成功后立刻写，用跟渲染路径完全相同的 key 算法
-        // （ovlVisualTransCacheKey = hash(新英文源码) + '|zh|' + provider + '|' + model），
-        // 这样下一次渲染直接命中，显示的就是用户手改的中文，不会再调模型。第 6 个实参
-        // （forced）显式传 true——这是用户亲手打的中文，跳过 CJK 质量闸门的事后审查。
-        try { ovlVisualTransCachePut(newEnText, st.cfg || getApiConfig(), newZhText, null, false, true); } catch (e) { console.error('[ovl] inlineZhSave cache put failed', e); }
-        if (typeof ovlVisualBtrMarkSet === 'function') { try { ovlVisualBtrMarkSet(newEnText, origEnText); } catch (e) {} }
-
-        if (newLineCount === oldLineCount) {
-            ovlInlineSrcRerenderLocal(st, newEnText);
-        } else {
-            try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e) {}
-            if (typeof ovlVisualRender === 'function') ovlVisualRender();
+        let newEnText = null;
+        try {
+            newEnText = await ovlBacktranslateZhToEn(newZhText, st.cfg || getApiConfig(), null);
+        } catch (e) {
+            console.error('[ovl] inlineZhSave backtranslate failed', e);
+            ovlInlineZhSaveFailRetain(st, newZhText,
+                '回译失败：' + (e && e.message ? e.message : String(e)) + '，英文原文未改动，已保留你的输入，可以再试一次或按 Esc 放弃。');
+            return;
         }
-        if (typeof ovlScheduleVisualGutterAfterImage === 'function') ovlScheduleVisualGutterAfterImage();
-        try { showToast('已回译并自动写回英文原文。', 'success'); } catch (e) {}
-    } catch (e) {
-        console.error('[ovl] inlineZhSave splice failed', e);
-        try { showToast(spliced ? '保存后重渲染出错，已用整篇重渲染兜底。' : ('保存失败：' + (e && e.message ? e.message : String(e))), 'error'); } catch (e2) {}
-        if (!spliced) {
-            try { st.blocks.forEach(function (b) { b.style.display = ''; }); } catch (e3) {}
-            try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e4) {}
-        } else {
-            try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e3) {}
-            try { if (typeof ovlVisualRender === 'function') ovlVisualRender(); } catch (e5) {}
+        if (!newEnText || !newEnText.trim()) {
+            ovlInlineZhSaveFailRetain(st, newZhText, '回译失败：模型返回了空结果，英文原文未改动，已保留你的输入，可以再试一次或按 Esc 放弃。');
+            return;
+        }
+        const origEnText = st.origEnText || '';
+        const ratio = origEnText.length > 0 ? (newEnText.length / origEnText.length) : 1;
+        if (ratio < 0.15 || ratio > 6) {
+            ovlInlineZhSaveFailRetain(st, newZhText, '回译失败：回译结果长度异常（可能翻译跑偏），英文原文未改动，已保留你的输入，请检查后重试。');
+            return;
+        }
+
+        let spliced = false;
+        try {
+            const reasonBox = {};
+            const range = ovlVisualBtrResolveWriteRange(anchor, reasonBox);
+            if (!range) {
+                // v2 Pass P159-fix（FIX-2 同款纪律）：放弃写入不等于丢弃译文——存草稿，重新
+                // 点开这一段能读回来（跟单块路径 ovlVisualBtrOnSuccess 完全同一套处理）。
+                try { ovlVisualBtrDraftSet(origEnText, newZhText, anchor); } catch (e) {}
+                let msg = '回译已完成，但该段内容在等待期间发生了变化，未写入，已保留你的输入，重新点开这一段可以继续编辑。';
+                if (reasonBox.reason === 'ambiguous-match') {
+                    msg = '回译已完成，但文档中出现了多处一模一样的内容，无法确定唯一的落笔位置，未写入，已保留你的输入，重新点开这一段可以继续编辑。';
+                } else if (reasonBox.reason === 'file-changed') {
+                    msg = '回译已完成，但已经切换到其他文件或项目，未写入，已保留你的输入，重新打开原文件后可以找回。';
+                } else if (reasonBox.reason === 'zero-match') {
+                    msg = '回译已完成，但找不到该段原文（可能已被删除或改写），未写入，已保留你的输入，重新点开这一段可以继续编辑。';
+                }
+                try { showToast(msg, 'warning'); } catch (e) {}
+                try { st.blocks.forEach(function (b) { b.style.display = ''; }); } catch (e2) {}
+                try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e3) {}
+                return;
+            }
+            // v2 Pass P159-fix（FIX-4(b)，跟单块路径同一道闸，理由见 ovlVisualBtrOnSuccess
+            // 头部注释 / .claude/tmp/p159_fix.md）：不新发明判断逻辑，复用同一个检测函数。
+            if (typeof ovlVisualBtrHasNewTagLikeContent === 'function' && ovlVisualBtrHasNewTagLikeContent(origEnText, newEnText)) {
+                try { ovlVisualBtrDraftSet(origEnText, newZhText, anchor); } catch (e) {}
+                try { showToast('回译结果里出现了原文没有的、形似 HTML 标签的内容，出于安全考虑未自动写入，已保留你的输入，请人工检查后再决定是否手动采用。', 'warning'); } catch (e) {}
+                try { st.blocks.forEach(function (b) { b.style.display = ''; }); } catch (e2) {}
+                try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e3) {}
+                return;
+            }
+
+            const ta = document.getElementById('ovlCodeArea');
+            if (!ta || ta.disabled) throw new Error('编辑器未就绪');
+            const oldLineCount = st.lineTo - st.lineFrom + 1;
+            const newLineCount = newEnText.split('\n').length;
+
+            const wasHidden = ta.style.display === 'none';
+            if (wasHidden) ta.style.display = '';
+            ta.focus();
+            ta.setSelectionRange(range.start, range.end);
+            document.execCommand('insertText', false, newEnText);
+            if (wasHidden) ta.style.display = 'none';
+            spliced = true;
+            if (typeof focusNoteTexChanged === 'function') { try { focusNoteTexChanged(); } catch (e) {} }
+
+            // 缓存一致性：splice 成功后立刻写，用跟渲染路径完全相同的 key 算法
+            // （ovlVisualTransCacheKey = hash(新英文源码) + '|zh|' + provider + '|' + model），
+            // 这样下一次渲染直接命中，显示的就是用户手改的中文，不会再调模型。第 6 个实参
+            // （forced）显式传 true——这是用户亲手打的中文，跳过 CJK 质量闸门的事后审查。
+            try { ovlVisualTransCachePut(newEnText, st.cfg || getApiConfig(), newZhText, null, false, true); } catch (e) { console.error('[ovl] inlineZhSave cache put failed', e); }
+            if (typeof ovlVisualBtrMarkSet === 'function') { try { ovlVisualBtrMarkSet(newEnText, origEnText); } catch (e) {} }
+
+            if (newLineCount === oldLineCount) {
+                ovlInlineSrcRerenderLocal(st, newEnText);
+            } else {
+                try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e) {}
+                if (typeof ovlVisualRender === 'function') ovlVisualRender();
+            }
+            if (typeof ovlScheduleVisualGutterAfterImage === 'function') ovlScheduleVisualGutterAfterImage();
+            try { showToast('已回译并自动写回英文原文。', 'success'); } catch (e) {}
+        } catch (e) {
+            console.error('[ovl] inlineZhSave splice failed', e);
+            try { showToast(spliced ? '保存后重渲染出错，已用整篇重渲染兜底。' : ('保存失败：' + (e && e.message ? e.message : String(e))), 'error'); } catch (e2) {}
+            if (!spliced) {
+                try { st.blocks.forEach(function (b) { b.style.display = ''; }); } catch (e3) {}
+                try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e4) {}
+            } else {
+                try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e3) {}
+                try { if (typeof ovlVisualRender === 'function') ovlVisualRender(); } catch (e5) {}
+            }
+        } finally {
+            OvlInlineSrcEdit = null;
         }
     } finally {
-        OvlInlineSrcEdit = null;
+        // v2 Pass P159-fix（FIX-3）：不管上面走哪条分支退出（含 ovlInlineZhSaveFailRetain 的
+        // 保留输入重试分支——那条分支故意不清 OvlInlineSrcEdit，让用户能继续重试，但这次网络
+        // 请求本身确实已经跑完了，"在途"状态必须跟着结束，不能一直占着导致文件/项目切换被
+        // 永久拦住），在途登记都必须释放，跟 ovlVisualBtrRunBackground 同一个 try/finally 纪律。
+        delete OvlVisualBtrInFlight[inflightKey];
+        try { st.blocks.forEach(function (b) { b.removeAttribute('data-ovl-btr-inflight'); }); } catch (e) {}
     }
 }
 
@@ -56337,8 +56577,94 @@ function ovlInlineZhSaveFailRetain(st, newZhText, toastMsg) {
 // 内容】重新在当前 Visual 面板里找目标块（ovlVisualBtrLocateBlock，逐字节比对，不是猜行号）。
 // 找不到就说明这段内容在回译飞行途中已经被别的方式改变（比如 Code 模式手改了同一段，或者
 // 撤销栈把它改回去了）——安全放弃写入，宁可不写，不能写错地方。
-async function ovlVisualBtrRunBackground(origEnText, cfg, newZhText) {
-    const key = (typeof ovlVisualHashSrc === 'function') ? ovlVisualHashSrc(origEnText) : origEnText;
+// v2 Pass P159-fix（FIX-1，见 .claude/tmp/p159_fix.md）：位置优先、内容仅兜底校验的落笔目标
+// 定位器——绝不"多个候选取第一个"。完全不查 DOM 块，直接对 #ovlCodeArea 当前的字符内容
+// 操作：
+//   第一优先：anchor 记的 [charStart,charEnd) 这个区间，此刻内容仍然逐字节等于
+//            anchor.origText——命中就直接用这个区间，不做任何内容搜索（绝大多数情况：
+//            回译期间文档别处没有发生偏移量变化）。
+//   第二优先：位置失效（文档别处的编辑挪动了偏移）——退化成全文内容搜索 anchor.origText，
+//            但只有恰好唯一命中才算数；0 次或 >=2 次一律放弃，不猜、不写。
+// 另外先过一道身份闸：目标文件/项目身份（anchor.fileKey，复用既有 ovlFileTextCacheKey 范式）
+// 跟此刻的当前文件身份必须完全一致，不一致时 ta.value 压根不是同一份源文档，任何内容搜索都
+// 没有意义，直接放弃、不搜（FIX-3 修完之后，回译在途时切换文件本身已经被全局拦住，这里是
+// 独立的第二道保险，不依赖那道拦截单独也成立）。
+// 返回 {start,end}（可以直接 splice 的字符区间）或 null；null 时 outReason.reason 会带出
+// 放弃原因，供调用方选择合适的提示文案。
+function ovlVisualBtrResolveWriteRange(anchor, outReason) {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta || ta.disabled) { if (outReason) outReason.reason = 'editor-unavailable'; return null; }
+        if (!anchor) { if (outReason) outReason.reason = 'no-anchor'; return null; }
+
+        let liveFileKey = null;
+        try { liveFileKey = (typeof ovlVisualBtrCurrentFileKey === 'function') ? ovlVisualBtrCurrentFileKey() : null; } catch (e) {}
+        if (anchor.fileKey != null && liveFileKey !== anchor.fileKey) {
+            if (outReason) outReason.reason = 'file-changed';
+            return null;
+        }
+
+        if (isFinite(anchor.charStart) && isFinite(anchor.charEnd) &&
+            anchor.charStart >= 0 && anchor.charEnd >= anchor.charStart && anchor.charEnd <= ta.value.length) {
+            const liveSlice = ta.value.slice(anchor.charStart, anchor.charEnd);
+            if (liveSlice === anchor.origText) {
+                return { start: anchor.charStart, end: anchor.charEnd };
+            }
+        }
+
+        const needle = anchor.origText;
+        if (!needle) { if (outReason) outReason.reason = 'empty-anchor-text'; return null; }
+        const hay = ta.value;
+        const matches = [];
+        let idx = hay.indexOf(needle);
+        while (idx !== -1 && matches.length < 2) {  // 找到第 2 个就够判"歧义"了，不用扫到底
+            matches.push(idx);
+            idx = hay.indexOf(needle, idx + 1);
+        }
+        if (matches.length === 0) { if (outReason) outReason.reason = 'zero-match'; return null; }
+        if (matches.length >= 2) { if (outReason) outReason.reason = 'ambiguous-match'; return null; }
+        return { start: matches[0], end: matches[0] + needle.length };
+    } catch (e) {
+        if (outReason) outReason.reason = 'exception';
+        return null;
+    }
+}
+
+// v2 Pass P159-fix（FIX-4(b)，见 .claude/tmp/p159_fix.md）：回译结果如果出现了源文本里原本
+// 没有的"带标签样式"内容，一律当可疑，走跟位置/内容定位失败完全相同的放弃写入路径——不是
+// 新发明一套"要不要自动写入"的判断机制。判据是"抓所有形如 <tag ...>/</tag> 的子串，逐个比对
+// 新旧文本各自出现过的集合，新文本里只要冒出一个旧文本没有过的就判定可疑"，而不是简单地
+// "新文本里出现了 </>"——LaTeX 数学模式里的 a<b、a>b 是合法语法，绝不能因为出现了裸的尖括号
+// 就被拒绝，也绝不做任何转义/清洗（那是明确禁止的范围蔓延，见任务书 FIX-4 段）。识别"形似
+// 标签"用的正则要求 < 后紧跟字母（标签名起手）、以 /> 或 > 收尾——这个形状是 HTML 标签的
+// 最小充要特征，跟合法的裸大小于号用法（后者两侧几乎不会同时凑出"字母开头 + 收尾尖括号"
+// 这整套形状）区分得开。
+function ovlVisualBtrExtractTagLikeSpans(text) {
+    const out = [];
+    if (!text) return out;
+    const re = /<\/?[a-zA-Z][a-zA-Z0-9:-]*(?:\s[^<>]*)?\/?>/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+        out.push(m[0]);
+        if (m.index === re.lastIndex) re.lastIndex++; // 防御性：避免零长匹配死循环（理论上不会发生）
+    }
+    return out;
+}
+function ovlVisualBtrHasNewTagLikeContent(origEnText, newEnText) {
+    try {
+        const newSpans = ovlVisualBtrExtractTagLikeSpans(newEnText);
+        if (!newSpans.length) return false;
+        const oldSet = {};
+        ovlVisualBtrExtractTagLikeSpans(origEnText).forEach(function (s) { oldSet[s] = true; });
+        for (let i = 0; i < newSpans.length; i++) {
+            if (!oldSet[newSpans[i]]) return true; // 新文本里出现了旧文本没有过的标签样式子串
+        }
+        return false;
+    } catch (e) { return false; } // 判不出来就不拦——这道闸是"有额外可疑信号才拦"，不是默认拒绝
+}
+
+async function ovlVisualBtrRunBackground(origEnText, cfg, newZhText, anchor, inflightKey) {
+    const key = inflightKey || ((typeof ovlVisualHashSrc === 'function') ? ovlVisualHashSrc(origEnText) : origEnText);
     try {
         let newEnText = null;
         try {
@@ -56346,12 +56672,12 @@ async function ovlVisualBtrRunBackground(origEnText, cfg, newZhText) {
         } catch (e) {
             console.error('[ovl] btr background backtranslate failed', e);
             ovlVisualBtrOnFailure(origEnText, newZhText,
-                '回译失败：' + (e && e.message ? e.message : String(e)) + '，英文原文未改动，已保留你的输入，重新点开这一段可以继续编辑。');
+                '回译失败：' + (e && e.message ? e.message : String(e)) + '，英文原文未改动，已保留你的输入，重新点开这一段可以继续编辑。', anchor);
             return;
         }
         // 空结果：跟"没抛错但明显没译"同一档，不当成功处理。
         if (!newEnText || !newEnText.trim()) {
-            ovlVisualBtrOnFailure(origEnText, newZhText, '回译失败：模型返回了空结果，英文原文未改动，已保留你的输入，重新点开这一段可以继续编辑。');
+            ovlVisualBtrOnFailure(origEnText, newZhText, '回译失败：模型返回了空结果，英文原文未改动，已保留你的输入，重新点开这一段可以继续编辑。', anchor);
             return;
         }
         // 长度比值粗筛——不是取代 ovlBacktranslateZhToEn 内部已有的哨兵完整性校验（那条查的是
@@ -56360,19 +56686,23 @@ async function ovlVisualBtrRunBackground(origEnText, cfg, newZhText) {
         // 比值粗筛"的设计思路。
         const ratio = origEnText.length > 0 ? (newEnText.length / origEnText.length) : 1;
         if (ratio < 0.15 || ratio > 6) {
-            ovlVisualBtrOnFailure(origEnText, newZhText, '回译失败：回译结果长度异常（可能翻译跑偏），英文原文未改动，已保留你的输入，重新点开这一段可以继续编辑。');
+            ovlVisualBtrOnFailure(origEnText, newZhText, '回译失败：回译结果长度异常（可能翻译跑偏），英文原文未改动，已保留你的输入，重新点开这一段可以继续编辑。', anchor);
             return;
         }
-        ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg);
+        ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg, anchor);
     } finally {
         delete OvlVisualBtrInFlight[key];
     }
 }
 
-function ovlVisualBtrOnFailure(origEnText, newZhText, toastMsg) {
-    try { ovlVisualBtrDraftSet(origEnText, newZhText); } catch (e) {}
+function ovlVisualBtrOnFailure(origEnText, newZhText, toastMsg, anchor) {
+    try { ovlVisualBtrDraftSet(origEnText, newZhText, anchor); } catch (e) {}
+    // 清"回译中"角标——纯装饰性收尾（见 ovlVisualBtrLocateBlock 头部注释）：位置优先（零歧义
+    // 的 ovlVisualBlockAtCharRange），位置找不到再退化到内容匹配兜底；找错/找不到顶多角标
+    // 不消失，不影响任何数据正确性——回译失败分支本来就不写任何东西。
     try {
-        const blk = ovlVisualBtrLocateBlock(origEnText);
+        const blk = (anchor && typeof ovlVisualBlockAtCharRange === 'function' && ovlVisualBlockAtCharRange(anchor.charStart, anchor.charEnd))
+            || ovlVisualBtrLocateBlock(origEnText);
         if (blk) {
             blk.removeAttribute('data-ovl-btr-inflight');
             if (typeof ovlScheduleVisualGutterAfterImage === 'function') ovlScheduleVisualGutterAfterImage();
@@ -56381,36 +56711,80 @@ function ovlVisualBtrOnFailure(origEnText, newZhText, toastMsg) {
     try { showToast(toastMsg, 'error'); } catch (e) {}
 }
 
-function ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg) {
-    const blk = ovlVisualBtrLocateBlock(origEnText);
-    if (!blk) {
-        try { showToast('回译已完成，但该段内容在等待期间发生了变化，未写入，请重新编辑该段。', 'warning'); } catch (e) {}
+function ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg, anchor) {
+    const reasonBox = {};
+    const range = ovlVisualBtrResolveWriteRange(anchor, reasonBox);
+    if (!range) {
+        // v2 Pass P159-fix（FIX-2 的另一半）：旧版这个分支只弹提示、从不存草稿——回译结果被
+        // 直接丢弃且用户毫无感知（核验对抗报告 §3.4 实测复现：taValueLen 352->0、结果静默
+        // 丢失）。现在放弃写入的同时把译文存进草稿表，下次重新点开这一段能读回来。
+        try { ovlVisualBtrDraftSet(origEnText, newZhText, anchor); } catch (e) {}
+        let msg = '回译已完成，但该段内容在等待期间发生了变化，未写入，已保留你的输入，重新点开这一段可以继续编辑。';
+        if (reasonBox.reason === 'ambiguous-match') {
+            msg = '回译已完成，但文档中出现了多处一模一样的内容，无法确定唯一的落笔位置，未写入，已保留你的输入，重新点开这一段可以继续编辑。';
+        } else if (reasonBox.reason === 'file-changed') {
+            msg = '回译已完成，但已经切换到其他文件或项目，未写入，已保留你的输入，重新打开原文件后可以找回。';
+        } else if (reasonBox.reason === 'zero-match') {
+            msg = '回译已完成，但找不到该段原文（可能已被删除或改写），未写入，已保留你的输入，重新点开这一段可以继续编辑。';
+        }
+        try { showToast(msg, 'warning'); } catch (e) {}
+        try {
+            const blk = (anchor && typeof ovlVisualBlockAtCharRange === 'function' && ovlVisualBlockAtCharRange(anchor.charStart, anchor.charEnd))
+                || ovlVisualBtrLocateBlock(origEnText);
+            if (blk) {
+                blk.removeAttribute('data-ovl-btr-inflight');
+                if (typeof ovlScheduleVisualGutterAfterImage === 'function') ovlScheduleVisualGutterAfterImage();
+            }
+        } catch (e) {}
         return;
     }
-    const lineFrom = parseInt(blk.getAttribute('data-src-line'), 10);
-    const lineTo = parseInt(blk.getAttribute('data-src-line-end'), 10);
-    if (!isFinite(lineFrom) || !isFinite(lineTo)) {
-        try { showToast('回译已完成，但定位该段行号失败，未写入，请重新编辑该段。', 'warning'); } catch (e) {}
+
+    // v2 Pass P159-fix（FIX-4(b)）：新写入内容里如果出现了源文本原本没有的"带标签样式"内容，
+    // 一律当可疑，走跟上面完全相同的放弃写入+留草稿+提示路径，不新发明一套写入决策——预先
+    // 存在的漏洞本身（renderFormattedText 对 <img onerror> 之类没有防护，见 P159-fix 报告
+    // FIX-4(a) 的基线复现结论）不在这个 Pass 的整改范围内，这里只掐断"回译自动 splice 帮它把
+    // 新的可疑内容塞进源码、且不经过任何人工审阅"这一条 P159 新增的路径。
+    if (typeof ovlVisualBtrHasNewTagLikeContent === 'function' && ovlVisualBtrHasNewTagLikeContent(origEnText, newEnText)) {
+        try { ovlVisualBtrDraftSet(origEnText, newZhText, anchor); } catch (e) {}
+        try { showToast('回译结果里出现了原文没有的、形似 HTML 标签的内容，出于安全考虑未自动写入，已保留你的输入，请人工检查后再决定是否手动采用。', 'warning'); } catch (e) {}
+        try {
+            const blk = ovlVisualBlockAtCharRange(range.start, range.end) || ovlVisualBtrLocateBlock(origEnText);
+            if (blk) {
+                blk.removeAttribute('data-ovl-btr-inflight');
+                if (typeof ovlScheduleVisualGutterAfterImage === 'function') ovlScheduleVisualGutterAfterImage();
+            }
+        } catch (e) {}
         return;
     }
-    const parent = blk.parentNode;
-    const firstParaStart = blk.getAttribute('data-para-start');
+
+    // v2 Pass P159-fix：局部重渲染要用到的 DOM 块改成按【位置】零歧义反查（不是按内容匹配）
+    // ——找不到（理论上不该发生：range 已经确认是当前源码里唯一/精确的一段）就退化成整篇
+    // 重渲染兜底，不影响正确性，只是没有局部重渲染的性能优势。
+    const blkForRerender = (typeof ovlVisualBlockAtCharRange === 'function') ? ovlVisualBlockAtCharRange(range.start, range.end) : null;
+    const parent = blkForRerender ? blkForRerender.parentNode : null;
+    const firstParaStart = blkForRerender ? blkForRerender.getAttribute('data-para-start') : null;
+    let lineFrom = null, lineTo = null;
+    if (blkForRerender) {
+        lineFrom = parseInt(blkForRerender.getAttribute('data-src-line'), 10);
+        lineTo = parseInt(blkForRerender.getAttribute('data-src-line-end'), 10);
+        if (!isFinite(lineFrom) || !isFinite(lineTo)) { lineFrom = null; lineTo = null; }
+    }
+
     let spliced = false;
     try {
         const ta = document.getElementById('ovlCodeArea');
         if (!ta || ta.disabled) throw new Error('编辑器未就绪');
-        const chars = ovlGutterLineRangeToChars(ta, lineFrom, lineTo);
-        // 二次确认：定位到的这一段内容此刻仍然逐字节等于回译前的原文——双重保险，防止
-        // ovlVisualBtrLocateBlock 命中之后、真正 splice 之前的极短窗口里内容又被动过。
-        const liveSlice = ta.value.slice(chars.start, chars.end);
+        // 落笔前最后一次原样核验——resolveWriteRange 到这里之间全程同步、没有任何 await，
+        // 理论上不会再变，这道检查纯粹是双保险，跟旧版"二次确认"同样的谨慎精神。
+        const liveSlice = ta.value.slice(range.start, range.end);
         if (liveSlice !== origEnText) throw new Error('目标内容已变化');
-        const oldLineCount = lineTo - lineFrom + 1;
+        const oldLineCount = (lineFrom != null && lineTo != null) ? (lineTo - lineFrom + 1) : null;
         const newLineCount = newEnText.split('\n').length;
 
         const wasHidden = ta.style.display === 'none';
         if (wasHidden) ta.style.display = '';
         ta.focus();
-        ta.setSelectionRange(chars.start, chars.end);
+        ta.setSelectionRange(range.start, range.end);
         document.execCommand('insertText', false, newEnText);
         if (wasHidden) ta.style.display = 'none';
         spliced = true;
@@ -56419,11 +56793,11 @@ function ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg) {
         try { ovlVisualTransCachePut(newEnText, cfg, newZhText, null, false, true); } catch (e) { console.error('[ovl] btr cache put failed', e); }
         if (typeof ovlVisualBtrMarkSet === 'function') { try { ovlVisualBtrMarkSet(newEnText, origEnText); } catch (e) {} }
 
-        const synthSt = {
-            blocks: [blk], parent: parent, wrap: null, lineFrom: lineFrom, lineTo: lineTo,
-            firstParaStart: firstParaStart, origEnText: origEnText, origText: origEnText
-        };
-        if (newLineCount === oldLineCount && typeof ovlInlineSrcRerenderLocal === 'function') {
+        if (blkForRerender && oldLineCount != null && newLineCount === oldLineCount && typeof ovlInlineSrcRerenderLocal === 'function') {
+            const synthSt = {
+                blocks: [blkForRerender], parent: parent, wrap: null, lineFrom: lineFrom, lineTo: lineTo,
+                firstParaStart: firstParaStart, origEnText: origEnText, origText: origEnText
+            };
             ovlInlineSrcRerenderLocal(synthSt, newEnText);
         } else if (typeof ovlVisualRender === 'function') {
             ovlVisualRender();
@@ -56433,7 +56807,8 @@ function ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg) {
     } catch (e) {
         console.error('[ovl] btr onSuccess splice failed', e);
         if (!spliced) {
-            try { showToast('回译已完成，但写回时发生变化，未写入，请重新编辑该段。', 'warning'); } catch (e2) {}
+            try { ovlVisualBtrDraftSet(origEnText, newZhText, anchor); } catch (e2) {}
+            try { showToast('回译已完成，但写回时发生变化，未写入，已保留你的输入，请重新编辑该段。', 'warning'); } catch (e2) {}
         } else {
             try { showToast('保存后重渲染出错，已用整篇重渲染兜底。', 'error'); } catch (e2) {}
             try { if (typeof ovlVisualRender === 'function') ovlVisualRender(); } catch (e3) {}
@@ -56667,10 +57042,15 @@ function ovlInlineZhEditOpenForBlocks(touchedBlocks) {
         }
         const chars = ovlGutterLineRangeToChars(codeTa, lineFrom, lineTo);
         const enText = codeTa.value.slice(chars.start, chars.end);
+        // v2 Pass P159-fix（FIX-1 锚点）：编辑打开这一刻就把"这是源文档里哪个精确字符区间"
+        // 记下来——落笔/草稿定位全靠这张快照，不再等回译跑完之后才现找。
+        const anchor = (typeof ovlVisualBtrMakeAnchor === 'function')
+            ? ovlVisualBtrMakeAnchor(chars.start, chars.end, enText)
+            : { charStart: chars.start, charEnd: chars.end, origText: enText, fileKey: null };
 
         let cfg;
         try { cfg = getApiConfig(); } catch (e) { cfg = null; }
-        let zhText = (typeof ovlVisualBtrDraftTake === 'function') ? ovlVisualBtrDraftTake(enText) : null;
+        let zhText = (typeof ovlVisualBtrDraftTake === 'function') ? ovlVisualBtrDraftTake(enText, anchor) : null;
         const fromDraft = (zhText != null);
         if (zhText == null) zhText = cfg ? ovlVisualTransCacheGet(enText, cfg) : null;
         if (zhText == null) {
@@ -56704,7 +57084,10 @@ function ovlInlineZhEditOpenForBlocks(touchedBlocks) {
             wrap: wrap, ta: ta, blocks: touched, parent: parent,
             lineFrom: lineFrom, lineTo: lineTo, firstParaStart: firstParaStart,
             origText: zhText, closing: false,
-            mode: 'zh', origEnText: enText, cfg: cfg
+            mode: 'zh', origEnText: enText, cfg: cfg,
+            // v2 Pass P159-fix（FIX-1）：定位锚，随会话一路传到 ovlInlineZhSaveAsyncSingleBlock
+            // -> ovlVisualBtrRunBackground -> ovlVisualBtrOnSuccess/onFailure。
+            btrAnchor: anchor
         };
 
         ta.addEventListener('input', ovlInlineSrcOnInput);
