@@ -4685,7 +4685,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.30.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.30.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-12';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -37348,9 +37348,67 @@ function ovlBilingualObserveRows(rows) {
     }
 }
 
+// v2 Pass P160 补丁（独立验收 p160_verify.md Step2 #5 命中的真实缺陷）：左侧 #ovlVisualPane
+// 头上摞着 tabbar(30px)+banner+breadcrumb+.ovl-editor-toolbar(34px)+findbar 一整套编辑器
+// chrome，右侧 #ovlVisualPaneMirror 头上只有一条复用的 .ovl-editor-tabbar(30px)——两侧
+// pane 本身的 getBoundingClientRect().top 天生不在同一条水平线上，下面的逐行 min-height
+// 拉伸对齐再准也没用："同一行号"从第 0 行就已经错位一个固定量。
+//
+// 明确不写死任何像素数（不是"减 34px"）：这里现测两侧 pane 各自的真实渲染起点，把差值
+// 转成较短一侧的 marginTop 补偿。工具条换按钮、换字号、换语言、窄屏换行、以后随便谁改了
+// chrome 高度，这个差值都是当次现算的，不会像硬编码常量那样只在今天这组 DOM 状态下成立。
+// 方向不预设"永远是左边更高"——诚实处理两个方向，谁的 chrome 更矮就补谁。
+//
+// 三阶段"清空 -> 纯读 -> 纯写"跟下面 ovlBilingualSyncAlignment 逐行高度对齐同一条纪律、
+// 同一个理由：不清空的话，这一轮量到的是上一轮已经补偿过的 marginTop，测出来的差值会
+// 越叠越大，永远收敛不到真实差值。
+function ovlBilingualAlignPaneTops() {
+    const leftPane = document.getElementById('ovlVisualPane');
+    const rightPane = document.getElementById('ovlVisualPaneMirror');
+    if (!leftPane || !rightPane) return;
+    leftPane.style.marginTop = '';
+    rightPane.style.marginTop = '';
+    const leftTop = leftPane.getBoundingClientRect().top;
+    const rightTop = rightPane.getBoundingClientRect().top;
+    const diff = leftTop - rightTop; // >0：左侧起点更靠下（左侧 chrome 更高）——补右侧；<0 反之
+    if (diff > 0.5) {
+        rightPane.style.marginTop = diff.toFixed(2) + 'px';
+    } else if (diff < -0.5) {
+        leftPane.style.marginTop = (-diff).toFixed(2) + 'px';
+    }
+}
+
+// pane 级 ResizeObserver：跟上面行级的是两个独立观察器，观察对象不同——这里盯的是
+// #ovlVisualPane/#ovlVisualPaneMirror 两个 pane 本身的高度。两侧 pane 都是同一个
+// flex:1 1 auto，挤在各自固定高度的 flex 列（#ovlEditorPanel / .ovl-bilingual-mirror-panel）
+// 里——上面任何一层 chrome（tabbar/breadcrumb/toolbar/findbar）高度一变，都会挤压/放开
+// pane 自己的高度，天然能被这个观察器捕捉到，不需要另外去逐个盯 chrome 元素的高度（也盯
+// 不全：工具条本身的按钮增减、语言切换导致的文字变长、以后新加的任何一条 chrome，来源
+// 太多，反而是"盯 pane 高度变化"这个间接信号更稳）。
+let OvlBilingualPaneRO = null;
+const OvlBilingualObservedPaneEls = (typeof WeakSet !== 'undefined') ? new WeakSet() : null;
+function ovlBilingualEnsurePaneResizeObserver() {
+    if (OvlBilingualPaneRO) return OvlBilingualPaneRO;
+    if (typeof ResizeObserver === 'undefined') return null;
+    try {
+        OvlBilingualPaneRO = new ResizeObserver(function () { ovlBilingualScheduleAlign(); });
+    } catch (e) { OvlBilingualPaneRO = null; }
+    return OvlBilingualPaneRO;
+}
+function ovlBilingualObservePanes() {
+    const ro = ovlBilingualEnsurePaneResizeObserver();
+    if (!ro) return;
+    const leftPane = document.getElementById('ovlVisualPane');
+    const rightPane = document.getElementById('ovlVisualPaneMirror');
+    if (leftPane && OvlBilingualObservedPaneEls && !OvlBilingualObservedPaneEls.has(leftPane)) { OvlBilingualObservedPaneEls.add(leftPane); try { ro.observe(leftPane); } catch (e) {} }
+    if (rightPane && OvlBilingualObservedPaneEls && !OvlBilingualObservedPaneEls.has(rightPane)) { OvlBilingualObservedPaneEls.add(rightPane); try { ro.observe(rightPane); } catch (e) {} }
+}
+
 function ovlBilingualSyncAlignment() {
     if (OvlState.viewMode !== 'bilingual') return;
     if (OvlBilingualAlignState.circuitTripped) return;
+    ovlBilingualObservePanes(); // chrome 高度以后再变（加按钮/语言切换/窄屏换行）也能自动补挂、自动重排
+    ovlBilingualAlignPaneTops(); // 先把两侧内容区起点拉平，逐行高度对齐才有意义（见函数注释）
     const rows = ovlBilingualCollectRows();
     ovlBilingualObserveRows(rows); // 新出现的块（任何一次重渲染之后）在这里补挂观察器，见函数注释
     if (!rows.length) return;
@@ -37392,11 +37450,13 @@ function ovlBilingualClearRowAlignment() {
         }
         const leftPane = document.getElementById('ovlVisualPane');
         if (leftPane) {
+            leftPane.style.marginTop = ''; // 清掉 ovlBilingualAlignPaneTops 可能写过的补偿，避免残留到其它视图模式
             const els = leftPane.querySelectorAll('.ovl-visual-block[data-src-line]');
             for (let i = 0; i < els.length; i++) els[i].style.minHeight = '';
         }
         const rightPane = document.getElementById('ovlVisualPaneMirror');
         if (rightPane) {
+            rightPane.style.marginTop = '';
             const els2 = rightPane.querySelectorAll('.ovl-visual-block[data-src-line]');
             for (let i = 0; i < els2.length; i++) els2[i].style.minHeight = '';
         }
@@ -40680,6 +40740,23 @@ async function ovlOpenFile(fileHandle, name, parentHandle, relPath, opts) {
 // .tex 文件不受影响，PDF 面板另外单独跟踪 pdfDirectFile（见 spec_viewmodes.md §5 风险清单 #4/#6）。
 async function ovlOpenPdfDirect(fileHandle, name, parentHandle, relPath) {
     try {
+        // P160 补丁（独立验收 p160_verify.md Step2 #6 命中的真实缺陷）：文件树行点击本身
+        // 完全没有 hidden/disabled 门槛（见 row.addEventListener('click', ...) 里对 .pdf 的
+        // 分支），所以双语模式下直接点 PDF 文件能一路跑到这里——不能靠"点不到"防守。这里补
+        // 的是状态层的真实判断，且必须是这个函数体里的第一条语句、排在下面任何一行状态赋值
+        // （pdfObjectUrl/pdfSourceMode/pdfDirectFile/pdfView/data-pdfsrc）之前：一旦通过菜单
+        // 之外的路径（比如另一个尚未发现的调用点）打进来，也保证被拒绝时这些字段一个都不会
+        // 被改动，不是先改状态再"回滚"或者"顺便切个视图"。
+        //
+        // 设计上选择"直接拒绝并提示"而不是"自动切到 pdf 视图再打开"：这跟已有的
+        // ovlBilingualAvailable() 对称——那边是 pdfSourceMode==='direct' 时不许进双语模式，
+        // 这里反过来是双语模式下不许把 pdfSourceMode 切成 'direct'，两条闸门互相印证同一个
+        // "双语视图与直接源 PDF 视图互斥"的产品规则，不会出现"从双语模式点 PDF 又被自动弹回
+        // 双语模式"之类的用户没预期到的联动。
+        if (OvlState.viewMode === 'bilingual') {
+            if (typeof showToast === 'function') showToast('双语对照视图下无法直接打开源 PDF，请先切换到编辑器或 PDF 视图。', 'warning');
+            return;
+        }
         const file = await fileHandle.getFile();
         const buf = await file.arrayBuffer();
         if (OvlState.pdfObjectUrl) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} }
