@@ -4659,8 +4659,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.30.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-12';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.30.01';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-13';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -15458,6 +15458,15 @@ function xportPersistBadgeSync() {
     } catch (e) {}
 }
 
+// P164/P165 缺陷3修复：xportPersistRestore() 是异步的（IndexedDB），它可能把
+// AppState.sessionId 从解析期同步生成的新值改回刷新前的值（见下方函数体
+// `if (typeof rec.sessionId === 'string' ...) AppState.sessionId = rec.sessionId;`）。
+// chatAutoRestoreCheck() 必须等这条 promise 落定之后才能读 AppState.sessionId，
+// 否则永远读到"刚生成的新 id"，跟归档里的旧 id 永远比不上——自动恢复因此结构性
+// 永不触发。这里把 DOMContentLoaded 里发起的那次调用的 promise 存起来，供
+// chatAutoRestoreCheck() 挂靠。
+let xportPersistRestorePromise = null;
+
 // 启动时把盘上那份读回来。异步，落在首帧之后，所以拿到之后要自己 renderApp。
 function xportPersistRestore() {
     return xportPersistOpen().then(function (db) {
@@ -15474,6 +15483,14 @@ function xportPersistRestore() {
         // 判据全靠它：之后 savedAt 再往前走，就一定是**别人**写的（见 xportPersistNow）。
         xportPersistSeenAt = (rec && Number(rec.savedAt)) || 0;
         if (!rec) return false;
+        // 缺陷3补丁：sessionId 的恢复要跟"classic 文档内容值不值得恢复"脱钩——聊天自动恢复
+        // （chatAutoRestoreCheck/chatAutoRestoreCheckRun）只看 AppState.sessionId 对不对得上
+        // 聊天归档，跟 translationPairs/inputText 是否非空毫无关系。这行原来卡在下面两个
+        // "没什么可恢复就提前 return false" 判断之后，导致"文档是空的、但有一段聊天记录"这种
+        // 真实场景里 sessionId 永远恢复不回来，chatAutoRestoreCheckRun 的比对因此恒不匹配、
+        // 自动恢复分支恒不可达。挪到这两个 return 之前：只要盘上确实有一条持久化记录就先把
+        // id 对齐，不影响下面 pairs/inputText 该保护用户"刚打的新字"还是照样保护。
+        if (typeof rec.sessionId === 'string' && rec.sessionId) AppState.sessionId = rec.sessionId;
         // 恢复期间用户可能已经开始打字/粘贴了 —— 那份是新的，绝不拿盘上的旧内容盖掉它。
         if ((AppState.translationPairs && AppState.translationPairs.length > 0) || (AppState.inputText || '').trim()) return false;
         const pairs = normalizeTranslationPairs(Array.isArray(rec.translationPairs) ? rec.translationPairs : []);
@@ -15481,7 +15498,6 @@ function xportPersistRestore() {
             return it && Array.isArray(it.pairs) && it.pairs.length > 0;
         }) : [];
         if (pairs.length === 0 && !(rec.inputText || '').trim() && gh.length === 0) return false;
-        if (typeof rec.sessionId === 'string' && rec.sessionId) AppState.sessionId = rec.sessionId;
         AppState.lastTranslatedText = typeof rec.lastTranslatedText === 'string' ? rec.lastTranslatedText : '';
         AppState.srcEditedSinceTranslate = rec.srcEditedSinceTranslate === true;
         // ============= 语言方向必须跟着内容一起回来 =============
@@ -15544,8 +15560,8 @@ function armAutoSaveTimer() {
 // 多个监听器互不影响，函数声明有提升，谁先谁后都成立。
 document.addEventListener('DOMContentLoaded', function () {
     try {
-        xportPersistRestore().then(function () { armAutoSaveTimer(); });
-    } catch (e) { xportPersistBooted = true; armAutoSaveTimer(); }
+        xportPersistRestorePromise = xportPersistRestore().then(function () { armAutoSaveTimer(); });
+    } catch (e) { xportPersistBooted = true; armAutoSaveTimer(); xportPersistRestorePromise = Promise.resolve(); }
     // ============= 这两个监听器各自到底兑现了什么（别再写「抢存一次」）=============
     // 上一版这里写的是「关标签 / 切到后台时抢存一次：防抖窗口里的最后一次编辑不能就这么
     // 没了」。**pagehide 那一半是假的**，实测（真 Chrome，127.0.0.1:8765）：
@@ -23805,10 +23821,11 @@ function chatAgentConfirm(opts, signal) {
     return new Promise(function (resolve) {
         if (signal && signal.aborted) { resolve(false); return; }
         // v2 Pass P164："只读操作免确认"——只在调用方显式传了 opts.toolName 且那个工具名在
-        // 只读白名单里时才短路。今天没有任何调用点会传 toolName（10 个写工具的内部调用点
-        // 一律不传、也不会补上；11 个只读工具本来就不走 chatAgentConfirm），所以这条判断是
-        // "安全但眼下没有可观察效果"的防御性开关——见 p164_impl.md 里对这一点的坦白说明，
-        // 不是漏做了一半却没说。
+        // 只读白名单里时才短路。缺陷1修复（P164/P165 复查）：chatAgentDispatchToolCall() 现在
+        // 会在派发 CHAT_AGENT_READONLY_CONFIRM_SKIP_TOOLS 里的 11 个只读工具之前主动调这里、
+        // 显式传 toolName，这条短路从此真正生效——开关 ON 时这里提前 resolve(true)，连确认卡
+        // 的 DOM 都不会创建；开关 OFF 时照常往下走、弹卡等用户点。10 个写工具的内部调用点仍然
+        // 不传 toolName（它们本来就该每次都确认，不受这个开关影响）。
         if (opts.toolName && ChatState.agentSkipReadonlyConfirm
             && CHAT_AGENT_READONLY_CONFIRM_SKIP_TOOLS.indexOf(opts.toolName) !== -1) {
             resolve(true);
@@ -25795,6 +25812,27 @@ async function chatAgentDispatchToolCall(toolName, args, projectDir, signal, pen
     const isGlossaryListTool = toolName === 'glossary_list';
     const isGlossaryWriteTool = CHAT_AGENT_GLOSSARY_WRITE_TOOLS.indexOf(toolName) !== -1;
     const selfDisplaying = isWriteTool || isZhWriteTool || isHighlightTool || isP2TWriteTool || isGlossaryWriteTool;
+    // v2 Pass P164/P165 缺陷1修复：CHAT_AGENT_READONLY_CONFIRM_SKIP_TOOLS 里的 11 个纯只读
+    // 工具，默认也先弹一张确认卡（文案换成"允许"，不带 danger 样式）——只有
+    // ChatState.agentSkipReadonlyConfirm 打开时才跳过。这是只读工具第一次真正走到
+    // chatAgentConfirm：之前它内部虽然写了 toolName 短路判断，但没有任何真实调用点会传
+    // toolName，开关因此永远看不出效果（见 chatAgentConfirm 函数头注释、
+    // .claude/tmp/p164_verify.md 缺陷1）。这里直接复用既有白名单，不新造分类。
+    const isReadonlyConfirmTool = CHAT_AGENT_READONLY_CONFIRM_SKIP_TOOLS.indexOf(toolName) !== -1;
+    if (isReadonlyConfirmTool) {
+        if (setLabel) setLabel('等待你确认「' + toolName + '」…');
+        const roConfirmed = await chatAgentConfirm({
+            toolName: toolName,
+            title: '只读操作确认',
+            message: '模型请求执行只读工具「' + toolName + '」。' + ((args && typeof args.path === 'string' && args.path) ? ('\n路径：' + args.path) : '')
+                + '\n该操作不会修改任何文件。如果不想每次都确认，可以在参数设置里把"只读操作免确认"打开。',
+            confirmLabel: '允许'
+        }, signal);
+        if (!roConfirmed) {
+            const roMsg = '用户取消了该只读操作。';
+            return { ok: false, refused: true, uiSummary: '用户取消', uiDetail: roMsg, textForModel: roMsg, bytes: 0 };
+        }
+    }
     if (setLabel) {
         setLabel(isWriteTool
             ? ('准备执行「' + (CHAT_AGENT_TOOL_LABELS[toolName] || toolName) + '」…')
@@ -26631,10 +26669,18 @@ function chatParamsLoad() {
             ChatState.maxTokens = p.maxTokens;
         }
         // v2 Pass P164：逐键校验同一条纪律——不在表里的脏值一律丢弃，不回落成别的值。
-        if (typeof p.agentMaxIters === 'number' && CHAT_AGENT_MAX_ITERS_CHOICES.indexOf(p.agentMaxIters) !== -1) {
+        // 缺陷4修复：0（无限档）是个例外，刻意不在这里直接恢复。chatSetAgentMaxIters()/
+        // chatSetAgentReadBudget() 选到无限档时必须先过 chatAgentConfirmUnlimited() 的
+        // 一次性警告，而 agentUnlimitedWarned 按设计每次刷新都归零（见该字段声明处注释
+        // ——"刷新会重弹，这是刻意的"）。如果这里把存档里的 0 直接写回 ChatState，等于绕开
+        // 了那道警告：刷新后无限档静默生效，却从没真正弹过一次警告，直接违反那条注释。
+        // 所以 0 不当"可以直接恢复"的档位处理：让 ChatState.agentMaxIters/agentReadBudget
+        // 保持 null（getter 回落到 DEFAULT），用户想要无限档，本次页面会话得重新从下拉框
+        // 选一次，照常触发警告——这才是"刷新会重弹"应有的效果。
+        if (typeof p.agentMaxIters === 'number' && p.agentMaxIters !== 0 && CHAT_AGENT_MAX_ITERS_CHOICES.indexOf(p.agentMaxIters) !== -1) {
             ChatState.agentMaxIters = p.agentMaxIters;
         }
-        if (typeof p.agentReadBudget === 'number' && CHAT_AGENT_READ_BUDGET_CHOICES.indexOf(p.agentReadBudget) !== -1) {
+        if (typeof p.agentReadBudget === 'number' && p.agentReadBudget !== 0 && CHAT_AGENT_READ_BUDGET_CHOICES.indexOf(p.agentReadBudget) !== -1) {
             ChatState.agentReadBudget = p.agentReadBudget;
         }
         if (typeof p.stream === 'boolean') ChatState.stream = p.stream;
@@ -29763,7 +29809,17 @@ function chatArchiveItemLooksIntact(item) {
 function chatAutoRestoreCheck() {
     try {
         if (chatAutoRestoreDone) return;
-        chatAutoRestoreDone = true;
+        chatAutoRestoreDone = true;   // 立刻置位，防止重入；真正的检查推迟到 sessionId 落定之后。
+        // 缺陷3修复：AppState.sessionId 的 IndexedDB 恢复是异步的，此刻读到的多半还是解析期同步生成的新 id。等 xportPersistRestorePromise 落定（不论成功/失败/从未发起）之后再真正比对，否则永远读到错的 sessionId，自动恢复分支永远不可达。
+        Promise.resolve(xportPersistRestorePromise).then(chatAutoRestoreCheckRun, chatAutoRestoreCheckRun);
+    } catch (e) {
+        console.error('[chat] autoRestoreCheck failed', e);
+    }
+}
+
+// chatAutoRestoreCheck() 的实际比对逻辑，挪到这里是为了能等 sessionId 恢复落定后再跑（见上面的调用点注释）。
+function chatAutoRestoreCheckRun() {
+    try {
         if (ChatState.messages && ChatState.messages.length) return;   // 已经有内容了，不覆盖
         const list = chatArchiveLoad();
         if (!list.length) return;
