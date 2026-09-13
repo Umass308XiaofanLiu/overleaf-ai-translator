@@ -2996,6 +2996,45 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-backtrans-text { font-size: 12px; line-height: 1.6; white-space: pre-wrap; word-break: break-word; background: #1B2029; border: 1px solid #333B49; border-radius: 4px; padding: 6px 8px; }
 .ovl-diff-del { color: #F87171; text-decoration: line-through; }
 .ovl-diff-ins { color: #4ADE80; text-decoration: underline; }
+/* v2 Pass P166：回译确认卡片——非阻塞浮动栈，跟 .ovl-modal 不是一回事：不遮罩、不挡其它
+   段落的编辑，多张卡片各自独立堆叠。沿用上面 .ovl-backtrans-* / .ovl-diff-* 同一套深色配色，
+   跟旧版 ovlConfirmDialog 的视觉语言保持一致，只是从"挡住整个页面"改成"贴在右下角"。
+   z-index 参考既有 .ovl-p2t-pill/.ovl-p2tb-panel（1085）：卡片属于"用户主动要处理的事项"，
+   理应盖在那些装饰性小面板之上，所以取 1092。 */
+.ovl-btr-card-stack {
+    position: fixed; right: 16px; bottom: 16px; z-index: 1092;
+    display: flex; flex-direction: column-reverse; gap: 10px;
+    max-height: calc(100vh - 32px); overflow-y: auto;
+    width: 380px; max-width: calc(100vw - 32px);
+    pointer-events: none;
+}
+.ovl-btr-card-stack[hidden] { display: none; }
+.ovl-btr-card {
+    pointer-events: auto;
+    background: #1B222C; color: #F4F5F6; border: 1px solid #333B49; border-radius: 8px;
+    box-shadow: 0 12px 32px -8px rgba(0,0,0,0.55);
+    padding: 10px 12px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+}
+.ovl-btr-card-failed { border-color: #F87171; }
+.ovl-btr-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.ovl-btr-card-title { font-size: 12px; font-weight: 700; }
+.ovl-btr-card-failed .ovl-btr-card-title { color: #F87171; }
+.ovl-btr-card-reason { font-size: 12px; line-height: 1.6; color: #FCA5A5; margin-bottom: 8px; }
+.ovl-btr-card .ovl-backtrans-diff { max-width: none; max-height: 220px; }
+.ovl-btr-card-copytext {
+    width: 100%; box-sizing: border-box; font-size: 12px; line-height: 1.5; color: #E7E9EE;
+    background: #1B2029; border: 1px solid #333B49; border-radius: 4px; padding: 6px 8px;
+    resize: vertical; font-family: inherit; margin: 4px 0 8px;
+}
+.ovl-btr-card-actions { display: flex; gap: 8px; margin-top: 8px; justify-content: flex-end; }
+.ovl-btr-card-btn {
+    font-size: 12px; padding: 4px 10px; border-radius: 4px; border: 1px solid #495365;
+    background: #262E3B; color: #E7E9EE; cursor: pointer;
+}
+.ovl-btr-card-btn:hover { background: #2E3847; }
+.ovl-btr-card-btn-primary { background: #2563EB; border-color: #2563EB; color: #fff; }
+.ovl-btr-card-btn-primary:hover { background: #1D4ED8; }
+.ovl-btr-locate-flash { outline: 2px solid #2563EB; outline-offset: 2px; }
 .ovl-modal-input {
     width: 100%;
     box-sizing: border-box;
@@ -4630,7 +4669,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.29.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.30.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-12';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -51685,7 +51724,12 @@ function ovlBindShell() {
             // v2 Pass P159（并发矩阵，关闭页面）：即便 OvlState.dirty 恰好是 false（比如刚自动
             // 保存过），还有单块回译在后台飞着也要拦一下——关掉页面等于让这次回译结果彻底丢失，
             // 用户应该有机会先等它落地。
-            const btrPending = (typeof OvlVisualBtrInFlight !== 'undefined') && Object.keys(OvlVisualBtrInFlight).length > 0;
+            // v2 Pass P166：改成直接复用 ovlVisualBtrInFlightActive()（已经把"确认卡片待处理"
+            // 也并进这个函数，见该函数头部注释），不再只看 OvlVisualBtrInFlight——不然会漏掉
+            // "回译已经跑完、结果正摆在确认卡片上等用户点确认/舍弃"这个窗口：这时
+            // OvlVisualBtrInFlight 早就清空了，但用户的翻译成果还没有真正落地，关页面一样会
+            // 静默丢弃，跟任务书"绝不能静默丢弃用户的翻译成果"直接冲突。
+            const btrPending = (typeof ovlVisualBtrInFlightActive === 'function') && ovlVisualBtrInFlightActive();
             if (!OvlState.dirty && !btrPending) return;
             e.preventDefault();
             e.returnValue = '';
@@ -52006,6 +52050,10 @@ const OVL_SETTINGS_DEFAULTS = {
     visualTransModel: '',       // P4 消费：''=跟随翻译器当前选中的模型
     ovlVisualLineBreaks: true,  // Visual 断行 Pass 消费：true=按源码行切细渲染，false=退回整段渲染
     ovlVisualOutlineSelection: true, // Pass Sel-Outline 消费：true=方框描边选区，false=退回浏览器原生高亮
+    // v2 Pass P166：中文改写触发的回译写回，是否要求用户先确认再落笔。true（默认）=非阻塞
+    // 确认卡片，展示中文输入/原英文/新英文+差异，用户点"确认写入"才落笔，"舍弃"则放弃；
+    // false=P159 原有行为，回译完成直接后台写入（保留给不想每次都手动确认的用户）。
+    ovlVisualBtrConfirmFirst: true,
     // ---- v2 Pass P35：PDF 默认缩放模式 ----
     // ''=用户从没手动改过缩放（走 ovlPdfResolveDefaultZoomMode() 的兜底 'fitwidth'）；
     // 'value'|'fitwidth'|'fitheight' = 用户手动改过（见 ovlPdfSetZoomMode/ovlPdfSetZoomValue/
@@ -52614,6 +52662,11 @@ function ovlSettingsTranslatorHtml() {
         '开启后 Visual 预览里每个源码行单独渲染一行（跟 Code 模式的行号对得上，方便切模式时对照）；关闭则退回按段落整段渲染。');
     html += ovlSetRow('Visual 模式用方框标示选区', '<input type="checkbox" data-setpath="settings.ovlVisualOutlineSelection"' + (s.ovlVisualOutlineSelection ? ' checked' : '') + '>',
         '开启后选中文字显示为深蓝色描边方框、不填充背景色，公式（KaTeX 渲染）区域也是整行一个框，不会碎成一节一节；关闭则恢复浏览器原生的填色高亮。');
+    // v2 Pass P166：回译确认卡片开关。默认开启——中文改完不再是"后台悄悄写英文"，而是
+    // 先弹一张可以晾在一边、不挡其它段落编辑的卡片，展示中文输入/原英文/新英文差异，
+    // 用户点"确认写入"才真正落笔；关闭则退回 P159 原有的后台自动写入。
+    html += ovlSetRow('回译后先确认', '<input type="checkbox" data-setpath="settings.ovlVisualBtrConfirmFirst"' + (s.ovlVisualBtrConfirmFirst !== false ? ' checked' : '') + '>',
+        'Visual 模式用中文改写一段后，默认先弹出确认卡片：展示你的中文输入、原英文、回译出的新英文及差异高亮，点"确认写入"才写回源码，"舍弃"则放弃这次改动，原文不变。关闭则直接写入（P159 原有的后台自动写入行为，不再弹卡片）。');
     // v2 P5：版本号从翻译器窗口的品牌区（已删除，见 renderHeader 顶部注释）迁到这里。
     // 直接读全局的 APP_VERSION/APP_BUILD_DATE 常量（约第 3247 行，pre-commit hook 每次
     // 提交自动改写这两个值），不是在这里另外抄一份写死的字符串——那样两处会迟早不同步。
@@ -56087,9 +56140,18 @@ let OvlVisualBtrInFlight = {};
 // ovlResetProjectScopedState()/ovlOpenFileFromBlob/ovlPerformDelete 等多个真实入口复用，不需要
 // 各自重复这一行判断。用哪种方式通知用户（toast 还是既有的 flash 状态条+throw）由各调用点自己
 // 决定，跟各自原有的错误提示习惯保持一致——这个函数只回答"现在能不能继续"。
+// v2 Pass P166：这个函数原本只回答"有没有单块回译正在后台跑"，现在的语义扩大成"现在能不能
+// 安全切文件/切项目/切模式/关页面"——所以除了 OvlVisualBtrInFlight（网络请求真的还在飞），
+// 还要把"挂着等用户确认/等用户看完失败原因手动关闭"的确认卡片也算进来（见
+// ovlVisualBtrConfirmCardsPendingCount）：卡片存在期间用户的翻译成果还没有真正落地，此刻
+// 切走文件/关掉页面等于让这次回译结果彻底丢失，跟原来"回译在途"要拦的是同一类事故。9 个既有
+// 调用点（文件切换/项目切换/编辑模式切换等）和下面的 beforeunload 不需要各自改一遍，全部
+// 通过这一个收口点自动获得新保护。
 function ovlVisualBtrInFlightActive() {
     try {
-        return !!(typeof OvlVisualBtrInFlight !== 'undefined' && Object.keys(OvlVisualBtrInFlight).length);
+        const inFlight = !!(typeof OvlVisualBtrInFlight !== 'undefined' && Object.keys(OvlVisualBtrInFlight).length);
+        const cardsPending = (typeof ovlVisualBtrConfirmCardsPendingCount === 'function') && ovlVisualBtrConfirmCardsPendingCount() > 0;
+        return inFlight || cardsPending;
     } catch (e) { return false; }
 }
 // v2 Pass P159-fix2 Round2：ovlVisualBtrInvalidateAllAnchors() 连同上面的 epoch 计数器一起
@@ -56883,10 +56945,21 @@ async function ovlVisualBtrRunBackground(origEnText, cfg, newZhText, anchor, inf
         }
         ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg, anchor);
     } finally {
+        // v2 Pass P159-fix2 Round2（活锚点）网络请求本身到这里确实已经跑完，不管走的是成功
+        // 落笔还是任一失败分支，登记在 OvlVisualBtrInFlight 里的"在途"状态都该清掉——这条
+        // 跟 P159 时代完全一样，不受下面的卡片分支影响。
         delete OvlVisualBtrInFlight[key];
-        // v2 Pass P159-fix2 Round2（活锚点）：不管上面走的是成功落笔还是任一失败分支，这个锚点
-        // 的生命周期到此为止——统一在这一个 finally 里释放，不用在每条 return 前各自补一句。
-        try { if (typeof ovlLiveAnchorRelease === 'function') ovlLiveAnchorRelease(anchor); } catch (e) {}
+        // v2 Pass P166：唯一的例外——ovlVisualBtrOnSuccess 如果把这次结果转交给了一张待确认
+        // 卡片（ovlVisualBtrShowConfirmCard 会同步打上 anchor.__ovlBtrCardPending = true），
+        // 这个锚点的生命周期还没结束：卡片可能要挂很久，期间文档还会继续被编辑，只有活锚点
+        // 继续跟踪才能让"确认写入"那一刻的重新校验有意义（不然锚点坐标从卡片弹出那一刻起
+        // 就是陈旧的，跟 P159 要修的那类 bug 一个性质）。真正的释放挪到卡片被确认/舍弃/
+        // （失败后）关闭时（见 ovlVisualBtrConfirmCardConfirm/Discard）。不满足这个条件时
+        // （direct-write 模式、或任一失败分支、或卡片模式下走到这里 anchor 本身就是 null）
+        // 照旧在这里释放，行为跟 P159 完全一致。
+        if (!(anchor && anchor.__ovlBtrCardPending)) {
+            try { if (typeof ovlLiveAnchorRelease === 'function') ovlLiveAnchorRelease(anchor); } catch (e) {}
+        }
     }
 }
 
@@ -56906,7 +56979,45 @@ function ovlVisualBtrOnFailure(origEnText, newZhText, toastMsg, anchor) {
     try { showToast(toastMsg, 'error'); } catch (e) {}
 }
 
-function ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg, anchor) {
+// v2 Pass P166：ovlVisualBtrResolveWriteRange 一共 7 种放弃写入的原因码，P159 时代只有
+// 'ambiguous-match'/'file-changed'/'zero-match' 三种给了专属文案，其余 4 种
+// （'editor-unavailable'/'no-anchor'/'empty-anchor-text'/'exception'）共用一句笼统提示——
+// 那是因为当时写入本来就是后台静默的，用户压根看不到这句话，写不写清楚无所谓。现在回译
+// 结果要摆在确认卡片上给用户看（confirm-first 模式）或者至少弹 toast（direct-write 模式），
+// 全部 7 种原因都必须让用户明白"为什么不能写"。三条旧文案原样保留（byte 级不变，
+// test_p159_fix_verify.js 对其中三条做了子串断言），只是从内联 if/else 挪进这个函数里，
+// 外加新补的 4 条。
+function ovlVisualBtrReasonMessage(reason) {
+    const TAIL_REOPEN = '未写入，已保留你的输入，重新点开这一段可以继续编辑。';
+    switch (reason) {
+        case 'ambiguous-match':
+            return '回译已完成，但文档中出现了多处一模一样的内容，无法确定唯一的落笔位置，' + TAIL_REOPEN;
+        case 'file-changed':
+            return '回译已完成，但已经切换到其他文件或项目，未写入，已保留你的输入，重新打开原文件后可以找回。';
+        case 'zero-match':
+            return '回译已完成，但找不到该段原文（可能已被删除或改写），' + TAIL_REOPEN;
+        case 'editor-unavailable':
+            return '回译已完成，但编辑器当前不可用（可能切到了预览、只读或其它视图），' + TAIL_REOPEN;
+        case 'no-anchor':
+            return '回译已完成，但这段文字的定位信息丢失了（内部状态异常），' + TAIL_REOPEN;
+        case 'empty-anchor-text':
+            return '回译已完成，但这段文字的原始内容记录为空（内部状态异常，无法比对定位），' + TAIL_REOPEN;
+        case 'exception':
+            return '回译已完成，但校验这段文字的位置时发生了内部错误，' + TAIL_REOPEN;
+        default:
+            return '回译已完成，但该段内容在等待期间发生了变化，' + TAIL_REOPEN;
+    }
+}
+
+// v2 Pass P166：真正执行"落笔"的函数，从旧版 ovlVisualBtrOnSuccess 原样拆出来（判断顺序、
+// 每一步的副作用——草稿表/toast 文案/角标清除/局部重渲染兜底——一个字都没改，只是：
+//   1) 原来内联的原因文案 if/else 链换成上面的 ovlVisualBtrReasonMessage(reason)；
+//   2) 每个出口都带上结构化返回值 {ok, reason}，供调用方（下面的 dispatcher 直接写入分支，
+//      或者确认卡片"确认写入"按钮）判断这次落笔到底成没成，而不是只能靠一次性的 toast。
+// direct-write 模式（设置关闭）和确认卡片模式的"确认写入"按钮，走的是同一个函数、同一套
+// 校验顺序——resolveWriteRange → FIX-4(b) 标签护栏 → 落笔前原样核验 → splice，绝不会因为
+// 走了哪条 UI 分支而有任何检查被跳过或放宽。
+function ovlVisualBtrCommitWrite(origEnText, newEnText, newZhText, cfg, anchor) {
     const reasonBox = {};
     const range = ovlVisualBtrResolveWriteRange(anchor, reasonBox);
     if (!range) {
@@ -56914,14 +57025,7 @@ function ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg, anchor) {
         // 直接丢弃且用户毫无感知（核验对抗报告 §3.4 实测复现：taValueLen 352->0、结果静默
         // 丢失）。现在放弃写入的同时把译文存进草稿表，下次重新点开这一段能读回来。
         try { ovlVisualBtrDraftSet(origEnText, newZhText, anchor); } catch (e) {}
-        let msg = '回译已完成，但该段内容在等待期间发生了变化，未写入，已保留你的输入，重新点开这一段可以继续编辑。';
-        if (reasonBox.reason === 'ambiguous-match') {
-            msg = '回译已完成，但文档中出现了多处一模一样的内容，无法确定唯一的落笔位置，未写入，已保留你的输入，重新点开这一段可以继续编辑。';
-        } else if (reasonBox.reason === 'file-changed') {
-            msg = '回译已完成，但已经切换到其他文件或项目，未写入，已保留你的输入，重新打开原文件后可以找回。';
-        } else if (reasonBox.reason === 'zero-match') {
-            msg = '回译已完成，但找不到该段原文（可能已被删除或改写），未写入，已保留你的输入，重新点开这一段可以继续编辑。';
-        }
+        const msg = ovlVisualBtrReasonMessage(reasonBox.reason);
         try { showToast(msg, 'warning'); } catch (e) {}
         try {
             const blk = (anchor && typeof ovlVisualBlockAtCharRange === 'function' && ovlVisualBlockAtCharRange(anchor.charStart, anchor.charEnd))
@@ -56931,7 +57035,7 @@ function ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg, anchor) {
                 if (typeof ovlScheduleVisualGutterAfterImage === 'function') ovlScheduleVisualGutterAfterImage();
             }
         } catch (e) {}
-        return;
+        return { ok: false, reason: reasonBox.reason, message: msg };
     }
 
     // v2 Pass P159-fix（FIX-4(b)）：新写入内容里如果出现了源文本原本没有的"带标签样式"内容，
@@ -56941,7 +57045,8 @@ function ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg, anchor) {
     // 新的可疑内容塞进源码、且不经过任何人工审阅"这一条 P159 新增的路径。
     if (typeof ovlVisualBtrHasNewTagLikeContent === 'function' && ovlVisualBtrHasNewTagLikeContent(origEnText, newEnText)) {
         try { ovlVisualBtrDraftSet(origEnText, newZhText, anchor); } catch (e) {}
-        try { showToast('回译结果里出现了原文没有的、形似 HTML 标签的内容，出于安全考虑未自动写入，已保留你的输入，请人工检查后再决定是否手动采用。', 'warning'); } catch (e) {}
+        const tagMsg = '回译结果里出现了原文没有的、形似 HTML 标签的内容，出于安全考虑未自动写入，已保留你的输入，请人工检查后再决定是否手动采用。';
+        try { showToast(tagMsg, 'warning'); } catch (e) {}
         try {
             const blk = ovlVisualBlockAtCharRange(range.start, range.end) || ovlVisualBtrLocateBlock(origEnText);
             if (blk) {
@@ -56949,7 +57054,7 @@ function ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg, anchor) {
                 if (typeof ovlScheduleVisualGutterAfterImage === 'function') ovlScheduleVisualGutterAfterImage();
             }
         } catch (e) {}
-        return;
+        return { ok: false, reason: 'suspicious-content', message: tagMsg };
     }
 
     // v2 Pass P159-fix：局部重渲染要用到的 DOM 块改成按【位置】零歧义反查（不是按内容匹配）
@@ -56999,16 +57104,214 @@ function ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg, anchor) {
         }
         if (typeof ovlScheduleVisualGutterAfterImage === 'function') ovlScheduleVisualGutterAfterImage();
         try { showToast('已回译并自动写回英文原文。', 'success'); } catch (e) {}
+        return { ok: true };
     } catch (e) {
         console.error('[ovl] btr onSuccess splice failed', e);
         if (!spliced) {
             try { ovlVisualBtrDraftSet(origEnText, newZhText, anchor); } catch (e2) {}
             try { showToast('回译已完成，但写回时发生变化，未写入，已保留你的输入，请重新编辑该段。', 'warning'); } catch (e2) {}
+            return { ok: false, reason: 'write-changed', message: '回译已完成，但写回时发生变化，未写入，已保留你的输入，请重新编辑该段。' };
         } else {
             try { showToast('保存后重渲染出错，已用整篇重渲染兜底。', 'error'); } catch (e2) {}
             try { if (typeof ovlVisualRender === 'function') ovlVisualRender(); } catch (e3) {}
+            return { ok: true, warning: 'rerender-error' };
         }
     }
+}
+
+// v2 Pass P166：入口分发——'ovlVisualBtrConfirmFirst' 设置默认 true（非阻塞确认卡片，见
+// ovlVisualBtrShowConfirmCard），用户可以在设置里关掉退回 P159 原有的后台直接写入
+// （ovlVisualBtrCommitWrite 原样执行，不弹卡片、行为跟这个 Pass 之前完全一致）。两条路径
+// 共用同一个 ovlVisualBtrCommitWrite，不会出现"卡片模式走一套校验、直接写入模式走另一套"
+// 的分叉。
+function ovlVisualBtrOnSuccess(origEnText, newEnText, newZhText, cfg, anchor) {
+    const confirmFirst = (typeof OvlSettings === 'undefined' || !OvlSettings) ? true : (OvlSettings.ovlVisualBtrConfirmFirst !== false);
+    if (confirmFirst) {
+        ovlVisualBtrShowConfirmCard(origEnText, newEnText, newZhText, cfg, anchor);
+        return;
+    }
+    ovlVisualBtrCommitWrite(origEnText, newEnText, newZhText, cfg, anchor);
+}
+
+// v2 Pass P166：非阻塞回译确认卡片。跟 ovlConfirmDialog（阻塞式弹窗，P159 之前用来做这件
+// 事、P159 时代整个删掉）是两条不同的路——P159 已经把"回译在途不阻塞其它段落编辑"这条
+// 能力做扎实了（活锚点 + in-flight 表），这里延续同一条精神：确认卡片本身也绝不能挡住用户
+// 继续编辑别的段落，所以只挂一个浮动的卡片栈，不加遮罩、不抢焦点、不用 <dialog>/modal。
+// 多张卡片各自独立：key 是自增 id，互不影响彼此的确认/舍弃——原任务书要求"编辑三段就有
+// 三张卡片，各自独立确认/舍弃互不干扰"。
+// 卡片存在期间（不管是 pending 等待用户确认，还是 failed 等待用户看到失败原因后关闭）对应
+// 的活锚点绝不能被提前释放——那是"确认时刻重新核验位置"这件事成立的唯一依据，见
+// ovlVisualBtrRunBackground 的 finally 块（anchor.__ovlBtrCardPending 那个判断分支）。
+var OvlVisualBtrConfirmCards = {};
+var OvlVisualBtrConfirmCardSeq = 0;
+
+// 供 ovlVisualBtrInFlightActive()/beforeunload 复用的"还有没有没着落的回译成果"判断——
+// pending（等确认）和 failed（等用户看到原因、手动复制/关闭）都算数：两种状态下用户的
+// 翻译成果都还没有真正保存下来，任由页面关掉/切文件都会造成"静默丢弃"，跟任务书的硬性
+// 要求直接冲突。
+function ovlVisualBtrConfirmCardsPendingCount() {
+    try { return Object.keys(OvlVisualBtrConfirmCards).length; } catch (e) { return 0; }
+}
+
+function ovlVisualBtrShowConfirmCard(origEnText, newEnText, newZhText, cfg, anchor) {
+    const id = 'c' + (++OvlVisualBtrConfirmCardSeq);
+    if (anchor) anchor.__ovlBtrCardPending = true;
+    OvlVisualBtrConfirmCards[id] = {
+        id: id, anchor: anchor, origEnText: origEnText, newEnText: newEnText, newZhText: newZhText,
+        cfg: cfg, status: 'pending', reason: null, message: null, ts: Date.now()
+    };
+    // 装饰性收尾：回译已经跑完了，不再是"进行中"，先把 inflight 角标摘掉（跟旧版
+    // onSuccess/onFailure 收尾同一套逻辑——位置优先，内容匹配兜底，找不到顶多角标不消失，
+    // 不影响任何数据正确性）。卡片本身才是"待确认"状态真正的展示位置。
+    try {
+        const blk = (anchor && typeof ovlVisualBlockAtCharRange === 'function' && ovlVisualBlockAtCharRange(anchor.charStart, anchor.charEnd))
+            || ovlVisualBtrLocateBlock(origEnText);
+        if (blk) {
+            blk.removeAttribute('data-ovl-btr-inflight');
+            if (typeof ovlScheduleVisualGutterAfterImage === 'function') ovlScheduleVisualGutterAfterImage();
+        }
+    } catch (e) {}
+    try { showToast('回译已完成，等待你确认是否写入英文原文。', 'info'); } catch (e) {}
+    ovlVisualBtrRenderConfirmCards();
+}
+
+// 定位：位置优先（活锚点没死就用它当前的 charStart/charEnd 零歧义反查 DOM 块），锚点已经
+// 失效（fail 状态）再退化成内容匹配兜底——纯装饰性滚动定位，找错/找不到顶多滚不过去，
+// 不参与任何写入判断。
+function ovlVisualBtrConfirmCardLocate(id) {
+    const rec = OvlVisualBtrConfirmCards[id];
+    if (!rec) return;
+    try {
+        const a = rec.anchor;
+        let blk = null;
+        if (a && !a.dead && typeof ovlVisualBlockAtCharRange === 'function') {
+            blk = ovlVisualBlockAtCharRange(a.charStart, a.charEnd);
+        }
+        if (!blk) blk = ovlVisualBtrLocateBlock(rec.origEnText);
+        if (blk && typeof blk.scrollIntoView === 'function') {
+            blk.scrollIntoView({ behavior: 'smooth', block: 'center' });
+            blk.classList.add('ovl-btr-locate-flash');
+            setTimeout(function () { try { blk.classList.remove('ovl-btr-locate-flash'); } catch (e) {} }, 1200);
+        }
+    } catch (e) {}
+}
+
+// "确认写入"：真正落笔用的是跟 direct-write 模式完全同一个 ovlVisualBtrCommitWrite——
+// resolveWriteRange 在这一刻重新对活锚点当前的位置/内容做校验，这就是"卡片挂着的这段时间
+// 文档可能已经变了"这件事的正面回答：不管挂了多久，确认的这一刻永远拿当前最新状态重新核验，
+// 不会用卡片刚创建那一刻的陈旧判断去落笔（TOCTOU 由 ovlVisualBtrResolveWriteRange 内部的
+// 同步块保证，这里只是调用时机本身也不早于用户真正点下"确认写入"）。
+// 失败（锚点在这段等待期间失效——文档变了/切文件了/段落被删了等）时绝不能让卡片直接消失：
+// 转成 'failed' 状态，带上专属原因文案 + 可复制的新英文文本，等用户自己关掉。
+function ovlVisualBtrConfirmCardConfirm(id) {
+    const rec = OvlVisualBtrConfirmCards[id];
+    if (!rec || rec.status !== 'pending') return;
+    const result = ovlVisualBtrCommitWrite(rec.origEnText, rec.newEnText, rec.newZhText, rec.cfg, rec.anchor);
+    try { if (typeof ovlLiveAnchorRelease === 'function') ovlLiveAnchorRelease(rec.anchor); } catch (e) {}
+    if (result && result.ok) {
+        delete OvlVisualBtrConfirmCards[id];
+    } else {
+        rec.status = 'failed';
+        rec.reason = result && result.reason;
+        rec.message = (result && result.message) || ovlVisualBtrReasonMessage(rec.reason);
+    }
+    ovlVisualBtrRenderConfirmCards();
+}
+
+// "舍弃"：用户明确表示不要这次回译结果——跟"确认时失败"不是一回事（那是想用但用不了），
+// 这里是主动放弃，所以不进草稿表（草稿表是给"想用但当场落不了笔"的场景兜底找回用的）。
+function ovlVisualBtrConfirmCardDiscard(id) {
+    const rec = OvlVisualBtrConfirmCards[id];
+    if (!rec) return;
+    try { if (typeof ovlLiveAnchorRelease === 'function') ovlLiveAnchorRelease(rec.anchor); } catch (e) {}
+    delete OvlVisualBtrConfirmCards[id];
+    try { showToast('已舍弃这次回译结果，英文原文未改动。', 'info'); } catch (e) {}
+    ovlVisualBtrRenderConfirmCards();
+}
+
+// 'failed' 卡片的最终关闭——只有走到这里，这条回译结果才算真正"处理完"（用户已经看过原因、
+// 有机会复制走新英文）。ovlVisualBtrConfirmCardsPendingCount() 在此之前一直把它算作"未着落"。
+function ovlVisualBtrConfirmCardDismiss(id) {
+    delete OvlVisualBtrConfirmCards[id];
+    ovlVisualBtrRenderConfirmCards();
+}
+
+function ovlVisualBtrConfirmCardCopy(id) {
+    const rec = OvlVisualBtrConfirmCards[id];
+    if (!rec) return;
+    try {
+        const ta = document.querySelector('.ovl-btr-card[data-card-id="' + id + '"] .ovl-btr-card-copytext');
+        if (ta) {
+            ta.focus(); ta.select();
+            const ok = document.execCommand('copy');
+            showToast(ok ? '已复制到剪贴板。' : '复制失败，请手动选中文本复制。', ok ? 'success' : 'warning');
+            return;
+        }
+    } catch (e) {}
+    try { showToast('复制失败，请手动选中文本复制。', 'warning'); } catch (e2) {}
+}
+
+function ovlVisualBtrConfirmCardHtml(rec) {
+    const zhHtml = '<div class="ovl-backtrans-label">你的中文输入</div><div class="ovl-backtrans-text">' + escapeHtml(rec.newZhText || '') + '</div>';
+    if (rec.status === 'failed') {
+        return '<div class="ovl-btr-card ovl-btr-card-failed" data-card-id="' + rec.id + '">'
+            + '<div class="ovl-btr-card-head"><span class="ovl-btr-card-title">未能写入</span>'
+            + '<button type="button" class="ovl-btr-card-btn" data-act="locate">定位段落</button></div>'
+            + '<div class="ovl-btr-card-reason">' + escapeHtml(rec.message || '') + '</div>'
+            + zhHtml
+            + '<div class="ovl-backtrans-label">新英文（未写入，可手动复制）</div>'
+            + '<textarea class="ovl-btr-card-copytext" readonly rows="4">' + escapeHtml(rec.newEnText || '') + '</textarea>'
+            + '<div class="ovl-btr-card-actions">'
+            + '<button type="button" class="ovl-btr-card-btn" data-act="copy">复制新英文</button>'
+            + '<button type="button" class="ovl-btr-card-btn ovl-btr-card-btn-primary" data-act="dismiss">关闭</button>'
+            + '</div></div>';
+    }
+    return '<div class="ovl-btr-card" data-card-id="' + rec.id + '">'
+        + '<div class="ovl-btr-card-head"><span class="ovl-btr-card-title">回译确认</span>'
+        + '<button type="button" class="ovl-btr-card-btn" data-act="locate">定位段落</button></div>'
+        + zhHtml
+        + ovlDiffPreviewHtml(rec.origEnText, rec.newEnText)
+        + '<div class="ovl-btr-card-actions">'
+        + '<button type="button" class="ovl-btr-card-btn ovl-btr-card-btn-primary" data-act="confirm">确认写入</button>'
+        + '<button type="button" class="ovl-btr-card-btn" data-act="discard">舍弃</button>'
+        + '</div></div>';
+}
+
+function ovlVisualBtrEnsureCardStack() {
+    let stack = document.getElementById('ovlBtrCardStack');
+    if (!stack) {
+        stack = document.createElement('div');
+        stack.id = 'ovlBtrCardStack';
+        stack.className = 'ovl-btr-card-stack';
+        stack.hidden = true;
+        stack.addEventListener('click', function (e) {
+            const btn = (e.target && e.target.closest) ? e.target.closest('button[data-act]') : null;
+            if (!btn) return;
+            const cardEl = btn.closest('.ovl-btr-card');
+            const id = cardEl ? cardEl.getAttribute('data-card-id') : null;
+            if (!id) return;
+            const act = btn.getAttribute('data-act');
+            if (act === 'confirm') ovlVisualBtrConfirmCardConfirm(id);
+            else if (act === 'discard') ovlVisualBtrConfirmCardDiscard(id);
+            else if (act === 'dismiss') ovlVisualBtrConfirmCardDismiss(id);
+            else if (act === 'locate') ovlVisualBtrConfirmCardLocate(id);
+            else if (act === 'copy') ovlVisualBtrConfirmCardCopy(id);
+        });
+        document.body.appendChild(stack);
+    }
+    return stack;
+}
+
+function ovlVisualBtrRenderConfirmCards() {
+    try {
+        const ids = Object.keys(OvlVisualBtrConfirmCards);
+        const stack = ovlVisualBtrEnsureCardStack();
+        if (!ids.length) { stack.innerHTML = ''; stack.hidden = true; return; }
+        stack.hidden = false;
+        // 新卡片排在最上面，跟大多数通知栈的直觉一致；不影响任何一张卡片的独立可操作性。
+        ids.sort(function (a, b) { return (OvlVisualBtrConfirmCards[b].ts || 0) - (OvlVisualBtrConfirmCards[a].ts || 0); });
+        stack.innerHTML = ids.map(function (cid) { return ovlVisualBtrConfirmCardHtml(OvlVisualBtrConfirmCards[cid]); }).join('');
+    } catch (e) { console.error('[ovl] btr confirm card render failed', e); }
 }
 
 // 入口：跟 ovlEditorSynonymOpen(mode, source) 同一个调用形状。source: 'code' | 'visual'。
