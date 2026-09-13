@@ -684,6 +684,12 @@ body.is-resizing-settings-modal * {
 /* 发送按钮在请求进行中变成「停止」。只换配色和字，不换节点 —— 换节点会丢监听。 */
 #aiChatRoot .aichat-send.is-busy { background: #e11d48; }
 #aiChatRoot .aichat-send.is-busy:hover { background: #be123c; }
+/* v2 Pass P164：无限档运行时叠加在 .is-busy 之上的强调态——脉冲提醒"这次没有内置封顶替你叫停"。 */
+#aiChatRoot .aichat-send.is-unlimited { box-shadow: 0 0 0 3px rgba(225, 29, 72, 0.35); animation: aichatUnlimitedPulse 1.4s ease-in-out infinite; }
+@keyframes aichatUnlimitedPulse {
+    0%, 100% { box-shadow: 0 0 0 3px rgba(225, 29, 72, 0.35); }
+    50% { box-shadow: 0 0 0 6px rgba(225, 29, 72, 0.12); }
+}
 
 /* ---- C4：输入框下面那条参数条 ---- */
 /* 和窗口其它部分同一条纪律：**不使用 Tailwind 工具类**。这一整块 DOM 由 JS 直接建到
@@ -1138,6 +1144,29 @@ body.is-resizing-settings-modal * {
     border-top: 1px solid #fde68a;
     flex: 0 0 auto;
 }
+/* v2 Pass P164：无限档进度读数——跟挂起确认提示同一档位置逻辑，不阻塞输入。 */
+#aiChatRoot .aichat-agentprogress {
+    font-size: 10.5px;
+    line-height: 1.5;
+    padding: 4px 10px;
+    color: #4338ca;
+    background: #eef2ff;
+    border-top: 1px solid #c7d2fe;
+    flex: 0 0 auto;
+}
+/* v2 Pass P165：恢复横幅，插在消息日志最上方；关掉/撤销都只影响这条横幅，不碰底层归档。 */
+#aiChatRoot .aichat-restore-banner {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    line-height: 1.5;
+    padding: 6px 10px;
+    color: #1e3a8a;
+    background: #eff6ff;
+    border-bottom: 1px solid #bfdbfe;
+}
+#aiChatRoot .aichat-restore-banner span { flex: 1 1 auto; }
 
 /* ---- 「思考」折叠区：reasoning_content 只能待在这里，绝不能当答案显示 ---- */
 #aiChatRoot .aichat-think { margin-top: 6px; }
@@ -4775,7 +4804,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.30.03';        // APP_VERSION_STAMP
+const APP_VERSION = '03.30.04';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-13';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -15583,6 +15612,15 @@ function xportPersistBadgeSync() {
     } catch (e) {}
 }
 
+// P164/P165 缺陷3修复：xportPersistRestore() 是异步的（IndexedDB），它可能把
+// AppState.sessionId 从解析期同步生成的新值改回刷新前的值（见下方函数体
+// `if (typeof rec.sessionId === 'string' ...) AppState.sessionId = rec.sessionId;`）。
+// chatAutoRestoreCheck() 必须等这条 promise 落定之后才能读 AppState.sessionId，
+// 否则永远读到"刚生成的新 id"，跟归档里的旧 id 永远比不上——自动恢复因此结构性
+// 永不触发。这里把 DOMContentLoaded 里发起的那次调用的 promise 存起来，供
+// chatAutoRestoreCheck() 挂靠。
+let xportPersistRestorePromise = null;
+
 // 启动时把盘上那份读回来。异步，落在首帧之后，所以拿到之后要自己 renderApp。
 function xportPersistRestore() {
     return xportPersistOpen().then(function (db) {
@@ -15599,6 +15637,14 @@ function xportPersistRestore() {
         // 判据全靠它：之后 savedAt 再往前走，就一定是**别人**写的（见 xportPersistNow）。
         xportPersistSeenAt = (rec && Number(rec.savedAt)) || 0;
         if (!rec) return false;
+        // 缺陷3补丁：sessionId 的恢复要跟"classic 文档内容值不值得恢复"脱钩——聊天自动恢复
+        // （chatAutoRestoreCheck/chatAutoRestoreCheckRun）只看 AppState.sessionId 对不对得上
+        // 聊天归档，跟 translationPairs/inputText 是否非空毫无关系。这行原来卡在下面两个
+        // "没什么可恢复就提前 return false" 判断之后，导致"文档是空的、但有一段聊天记录"这种
+        // 真实场景里 sessionId 永远恢复不回来，chatAutoRestoreCheckRun 的比对因此恒不匹配、
+        // 自动恢复分支恒不可达。挪到这两个 return 之前：只要盘上确实有一条持久化记录就先把
+        // id 对齐，不影响下面 pairs/inputText 该保护用户"刚打的新字"还是照样保护。
+        if (typeof rec.sessionId === 'string' && rec.sessionId) AppState.sessionId = rec.sessionId;
         // 恢复期间用户可能已经开始打字/粘贴了 —— 那份是新的，绝不拿盘上的旧内容盖掉它。
         if ((AppState.translationPairs && AppState.translationPairs.length > 0) || (AppState.inputText || '').trim()) return false;
         const pairs = normalizeTranslationPairs(Array.isArray(rec.translationPairs) ? rec.translationPairs : []);
@@ -15606,7 +15652,6 @@ function xportPersistRestore() {
             return it && Array.isArray(it.pairs) && it.pairs.length > 0;
         }) : [];
         if (pairs.length === 0 && !(rec.inputText || '').trim() && gh.length === 0) return false;
-        if (typeof rec.sessionId === 'string' && rec.sessionId) AppState.sessionId = rec.sessionId;
         AppState.lastTranslatedText = typeof rec.lastTranslatedText === 'string' ? rec.lastTranslatedText : '';
         AppState.srcEditedSinceTranslate = rec.srcEditedSinceTranslate === true;
         // ============= 语言方向必须跟着内容一起回来 =============
@@ -15669,8 +15714,8 @@ function armAutoSaveTimer() {
 // 多个监听器互不影响，函数声明有提升，谁先谁后都成立。
 document.addEventListener('DOMContentLoaded', function () {
     try {
-        xportPersistRestore().then(function () { armAutoSaveTimer(); });
-    } catch (e) { xportPersistBooted = true; armAutoSaveTimer(); }
+        xportPersistRestorePromise = xportPersistRestore().then(function () { armAutoSaveTimer(); });
+    } catch (e) { xportPersistBooted = true; armAutoSaveTimer(); xportPersistRestorePromise = Promise.resolve(); }
     // ============= 这两个监听器各自到底兑现了什么（别再写「抢存一次」）=============
     // 上一版这里写的是「关标签 / 切到后台时抢存一次：防抖窗口里的最后一次编辑不能就这么
     // 没了」。**pagehide 那一半是假的**，实测（真 Chrome，127.0.0.1:8765）：
@@ -21274,6 +21319,9 @@ const CHAT_RESTORE_PAD = 8;      // 从 localStorage 恢复时，整窗回到视
 // 所以在这里存一份引用；onUp 自己跑完后立刻把这里清回 null（幂等，不依赖谁先调用）。
 let chatActiveDragEnd = null;
 
+// v2 Pass P165：本次页面生命周期内，"自动恢复上次会话"检查只做一次（哨兵，不持久化）。
+let chatAutoRestoreDone = false;
+
 // 聊天的全部状态。刻意是一个独立对象而不是 AppState 的字段：
 // 放进 AppState 就意味着「改聊天状态 = 可能触发 renderApp」，那正是要躲开的东西。
 const ChatState = {
@@ -21409,7 +21457,18 @@ const ChatState = {
     sessionId: null,                // 这段对话属于哪个 AppState.sessionId（换文档要归档、不许静默带过去）
     // 这段对话在归档里的**稳定身份**。有了它，反复归档同一段对话是 upsert 而不是不断新增
     // （否则「打开一份旧对话 → 换个文档 → 换回来」每来回一次就多一份重复记录，配额几轮就烧光）。
-    convId: ''
+    convId: '',
+    // v2 Pass P164：以下六个字段全部只在内存里、绝不写 localStorage 的字段初始化成 null/false
+    // 字面量，而不是直接引用 CHAT_AGENT_MAX_ITERS_DEFAULT 之类的常量——那些常量在文件里
+    // 声明得比 ChatState 靠后，const 的暂时性死区会让这里的初始化在脚本解析阶段就抛
+    // ReferenceError。真正的默认值由 chatAgentMaxIters()/chatAgentReadBudget() 在被调用的
+    // 那一刻通过"不是 number 就退回默认"的判断补上，不需要在这里预先知道默认值是多少。
+    agentMaxIters: null,             // 会话选的轮数上限档位；null=未选过，用 DEFAULT
+    agentReadBudget: null,           // 会话选的读取预算档位；null=未选过，用 DEFAULT
+    agentSkipReadonlyConfirm: false, // "只读操作免确认"，刻意不持久化，刷新页面必须回到关
+    agentUnlimitedWarned: false,     // 本次页面会话是否已经弹过一次"无限"警告，不重复打扰
+    agentPendingContinue: null,      // 撞上轮数上限时留下的 {wire, sys}，供"继续执行"接力
+    agentProgress: null              // 无限档运行中的 {iter, bytes}，供进度条读取
 };
 
 // 渲染路径（renderHeader）会读这个函数来决定顶栏按钮的样子。
@@ -21561,6 +21620,8 @@ function chatShellHtml() {
         +   '<div class="aichat-footer">'
         // v2 Pass P69：挂起确认卡的细提示——不阻塞输入，只提醒还有事没了结（见 chatUpdatePendingConfirmHint）。
         +     '<div class="aichat-pendinghint" id="aiChatPendingHint" hidden></div>'
+        // v2 Pass P164：无限档运行时的轮数/字节进度读数，默认隐藏（chatRenderAgentProgress 控制）。
+        +     '<div class="aichat-agentprogress" id="aiChatAgentProgress" hidden></div>'
         // v2 Pass P115：文件级「正在关注」清单，摆在句子级清单上方——先看到"整份文件"级别
         // 的大范围关注，再看句子级的细节标注，跟右键菜单/树角标读到的顺序一致。
         +     '<div id="aiChatFileWatchSlot"></div>'
@@ -23112,10 +23173,19 @@ function chatSetBusy(on) {
     try {
         ChatState.busy = !!on;
         const btn = document.getElementById('aiChatSendBtn');
-        if (!btn) return;
-        btn.textContent = on ? 'STOP' : 'SEND';
-        if (on) btn.classList.add('is-busy');
-        else btn.classList.remove('is-busy');
+        if (btn) {
+            btn.textContent = on ? 'STOP' : 'SEND';
+            if (on) btn.classList.add('is-busy');
+            else btn.classList.remove('is-busy');
+            // v2 Pass P164：无限档运行时给 STOP 按钮加一个视觉强调。按钮本身"一直可见、不缩在
+            // 某个角落"这条要求，既有的 SEND⇄STOP 切换按钮（固定在输入框右边的 footer 里）
+            // 已经满足了——这里只是在"这次没有内置轮数/字节封顶会替你叫停"时让它更显眼。
+            if (on && chatAgentMaxIters() === 0) btn.classList.add('is-unlimited');
+            else btn.classList.remove('is-unlimited');
+        }
+        // 无论从 chatSend 还是 chatAgentContinueRun 结束，"这一轮跑完了"都在这里收口一次，
+        // 不需要在两个调用点各自记得清进度条。
+        if (!on) { ChatState.agentProgress = null; try { chatRenderAgentProgress(); } catch (e) {} }
     } catch (e) {}
 }
 
@@ -23149,8 +23219,27 @@ function chatSetBusy(on) {
 //      超了就截断并提示模型可以用行区间续读。
 // 格式纠错只给一次机会（usedRetry），再错就把那段原始文本原样交给 chatParseEnvelope
 // 当白话处理——那边对没有 ==CHAT== 标记的文本本来就会整段当白话，不会因为这里多包一层而崩。
-const CHAT_AGENT_MAX_ITERS = 8;
-const CHAT_AGENT_TOTAL_READ_BUDGET = 300 * 1024;      // 这一整轮（可能好几次工具调用）的累计读取预算
+// v2 Pass P164：轮数上限 / 读取预算从写死的常量改成"档位表 + 会话可配置当前档"——
+// UI 只允许在 CHOICES 里选，不能填任意数字，不会变成真正的无界输入框。0 是一个显式档位
+// （无限/无上限），不是"忘了填"的默认值：两个 getter 在 ChatState 里存的值不在表里
+// （比如被脏数据污染）时一律回退到 DEFAULT，绝不把非法值直接喂给循环条件。
+// 【为什么两个都要能提到无上限】只放开轮数、不放开字节预算，等于把"卡死"从"撞轮数上限"
+// 换成"撞字节预算上限"——不是真正的修复，只是换了个地方撞墙，这一点写死在这里防止以后
+// 有人以为只调一个常量就够。
+const CHAT_AGENT_MAX_ITERS_CHOICES = [8, 20, 40, 80, 200, 0];      // 0 = 无限（无上限）
+const CHAT_AGENT_MAX_ITERS_DEFAULT = 40;
+const CHAT_AGENT_READ_BUDGET_CHOICES = [
+    256 * 1024, 512 * 1024, 1024 * 1024, 2 * 1024 * 1024, 8 * 1024 * 1024, 0
+];                                                                  // 0 = 无上限
+const CHAT_AGENT_READ_BUDGET_DEFAULT = 2 * 1024 * 1024;
+function chatAgentMaxIters() {
+    const v = (ChatState && typeof ChatState.agentMaxIters === 'number') ? ChatState.agentMaxIters : CHAT_AGENT_MAX_ITERS_DEFAULT;
+    return (CHAT_AGENT_MAX_ITERS_CHOICES.indexOf(v) === -1) ? CHAT_AGENT_MAX_ITERS_DEFAULT : v;
+}
+function chatAgentReadBudget() {
+    const v = (ChatState && typeof ChatState.agentReadBudget === 'number') ? ChatState.agentReadBudget : CHAT_AGENT_READ_BUDGET_DEFAULT;
+    return (CHAT_AGENT_READ_BUDGET_CHOICES.indexOf(v) === -1) ? CHAT_AGENT_READ_BUDGET_DEFAULT : v;
+}
 const CHAT_AGENT_SINGLE_READ_MAX_LINES = 2000;        // 没给行区间时，单次 read_file 最多注入这么多行
 const CHAT_AGENT_SINGLE_READ_MAX_BYTES = 200 * 1024;  // 同上，字节上限（两条谁先触发都截）
 // v2 Pass P43：只读两个工具之外，补上 write_file/mkdir/move/copy/delete 五个写工具——全部映射到
@@ -23193,6 +23282,20 @@ const CHAT_AGENT_GLOSSARY_WRITE_TOOLS = ['glossary_set', 'glossary_remove'];
 const CHAT_AGENT_TOOLS = ['list_dir', 'read_file'].concat(CHAT_AGENT_WRITE_TOOLS).concat(CHAT_AGENT_ZH_TOOLS).concat(CHAT_AGENT_HIGHLIGHT_TOOLS)
     .concat(CHAT_AGENT_STATUS_TOOLS).concat(CHAT_AGENT_COMPILE_TOOLS).concat(CHAT_AGENT_P2T_WRITE_TOOLS)
     .concat(CHAT_AGENT_SEARCH_TOOLS).concat(CHAT_AGENT_QA_TOOLS).concat(CHAT_AGENT_GLOSSARY_READ_TOOLS).concat(CHAT_AGENT_GLOSSARY_WRITE_TOOLS);
+
+// v2 Pass P164："只读操作免确认"开关的白名单——只囊括本来就不会触发 chatAgentConfirm 的
+// 只读工具（list_dir/read_file/read_block_translation/list_block_status/read_compile_log/
+// project_search/translation_qa_scan/glossary_list/doc_highlight/doc_highlight_clear）。
+// 写/改/删/编译类工具（含 retranslate_block、reconvert_page/recrop_figure、glossary_set/remove、
+// compile）**永远不进这张表**——过滤规则是"CHAT_AGENT_TOOLS 全集减去所有写/改动类分组"。
+const CHAT_AGENT_READONLY_CONFIRM_SKIP_TOOLS = CHAT_AGENT_TOOLS.filter(function (t) {
+    if (CHAT_AGENT_WRITE_TOOLS.indexOf(t) !== -1) return false;
+    if (CHAT_AGENT_P2T_WRITE_TOOLS.indexOf(t) !== -1) return false;
+    if (CHAT_AGENT_GLOSSARY_WRITE_TOOLS.indexOf(t) !== -1) return false;
+    if (t === 'retranslate_block') return false;
+    if (t === 'compile') return false;
+    return true;
+});
 
 // ============================================================================
 // v2 Pass P102：本地模型（provider==='local'）路径下的 OpenAI 原生 tool_call 迁移
@@ -24016,6 +24119,17 @@ function chatAgentConfirm(opts, signal) {
     opts = opts || {};
     return new Promise(function (resolve) {
         if (signal && signal.aborted) { resolve(false); return; }
+        // v2 Pass P164："只读操作免确认"——只在调用方显式传了 opts.toolName 且那个工具名在
+        // 只读白名单里时才短路。缺陷1修复（P164/P165 复查）：chatAgentDispatchToolCall() 现在
+        // 会在派发 CHAT_AGENT_READONLY_CONFIRM_SKIP_TOOLS 里的 11 个只读工具之前主动调这里、
+        // 显式传 toolName，这条短路从此真正生效——开关 ON 时这里提前 resolve(true)，连确认卡
+        // 的 DOM 都不会创建；开关 OFF 时照常往下走、弹卡等用户点。10 个写工具的内部调用点仍然
+        // 不传 toolName（它们本来就该每次都确认，不受这个开关影响）。
+        if (opts.toolName && ChatState.agentSkipReadonlyConfirm
+            && CHAT_AGENT_READONLY_CONFIRM_SKIP_TOOLS.indexOf(opts.toolName) !== -1) {
+            resolve(true);
+            return;
+        }
         const log = document.getElementById('aiChatLog');
         let settled = false;
         const entry = {};
@@ -25997,6 +26111,27 @@ async function chatAgentDispatchToolCall(toolName, args, projectDir, signal, pen
     const isGlossaryListTool = toolName === 'glossary_list';
     const isGlossaryWriteTool = CHAT_AGENT_GLOSSARY_WRITE_TOOLS.indexOf(toolName) !== -1;
     const selfDisplaying = isWriteTool || isZhWriteTool || isHighlightTool || isP2TWriteTool || isGlossaryWriteTool;
+    // v2 Pass P164/P165 缺陷1修复：CHAT_AGENT_READONLY_CONFIRM_SKIP_TOOLS 里的 11 个纯只读
+    // 工具，默认也先弹一张确认卡（文案换成"允许"，不带 danger 样式）——只有
+    // ChatState.agentSkipReadonlyConfirm 打开时才跳过。这是只读工具第一次真正走到
+    // chatAgentConfirm：之前它内部虽然写了 toolName 短路判断，但没有任何真实调用点会传
+    // toolName，开关因此永远看不出效果（见 chatAgentConfirm 函数头注释、
+    // .claude/tmp/p164_verify.md 缺陷1）。这里直接复用既有白名单，不新造分类。
+    const isReadonlyConfirmTool = CHAT_AGENT_READONLY_CONFIRM_SKIP_TOOLS.indexOf(toolName) !== -1;
+    if (isReadonlyConfirmTool) {
+        if (setLabel) setLabel('等待你确认「' + toolName + '」…');
+        const roConfirmed = await chatAgentConfirm({
+            toolName: toolName,
+            title: '只读操作确认',
+            message: '模型请求执行只读工具「' + toolName + '」。' + ((args && typeof args.path === 'string' && args.path) ? ('\n路径：' + args.path) : '')
+                + '\n该操作不会修改任何文件。如果不想每次都确认，可以在参数设置里把"只读操作免确认"打开。',
+            confirmLabel: '允许'
+        }, signal);
+        if (!roConfirmed) {
+            const roMsg = '用户取消了该只读操作。';
+            return { ok: false, refused: true, uiSummary: '用户取消', uiDetail: roMsg, textForModel: roMsg, bytes: 0 };
+        }
+    }
     if (setLabel) {
         setLabel(isWriteTool
             ? ('准备执行「' + (CHAT_AGENT_TOOL_LABELS[toolName] || toolName) + '」…')
@@ -26105,11 +26240,11 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
     let usedRetry = false;
     let raw = '';
 
-    // v2 Pass P144："本次任务"（一次 chatSend，可能对应多轮工具调用）的用量累加器。meta 每轮
-    // 被 chatCallModel 整体覆盖（C6 的校准逻辑需要"上一轮真实值"，不能改这个既有语义），所以
+    // v2 Pass P144：“本次任务”（一次 chatSend，可能对应多轮工具调用）的用量累加器。meta 每轮
+    // 被 chatCallModel 整体覆盖（C6 的校准逻辑需要“上一轮真实值”，不能改这个既有语义），所以
     // 另开一个不被覆盖的对象，一次性挂在 meta.taskUsage 上——因为是同一个对象引用，下面每轮
     // usageAccum() 改的是这个对象自己的字段，meta.taskUsage 读到的永远是最新值，不需要在每个
-    // return 点重新赋值。chatSend 那边读 meta.taskUsage 拿"本次任务"合计。
+    // return 点重新赋值。chatSend 那边读 meta.taskUsage 拿“本次任务”合计。
     const chatCfg0 = chatApiConfig();
     const taskUsage = usageNewTask(chatCfg0.provider, chatCfg0.model);
     meta.taskUsage = taskUsage;
@@ -26118,7 +26253,14 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
         try { if (pending && pending.labelEl) pending.labelEl.textContent = text; } catch (e) {}
     };
 
-    for (let iter = 1; iter <= CHAT_AGENT_MAX_ITERS; iter++) {
+    // v2 Pass P164：轮数上限 / 读取预算改成会话可配置（chatAgentMaxIters()/chatAgentReadBudget()），
+    // 不再是写死的 8 轮 / 300KB；两个都在本函数里只取一次值，跑到一半改设置不会让同一轮的判断
+    // 前后不一致。两者都把 0 当"无上限"（沿用 chatSetMaxTokens/CHAT_MAXTOK_CHOICES 里
+    // "0=用服务商默认"同一套哨兵写法，这里改成"0=不封顶"）。
+    const maxIters = chatAgentMaxIters();
+    const readBudget = chatAgentReadBudget();
+
+    for (let iter = 1; maxIters === 0 || iter <= maxIters; iter++) {
         raw = await chatCallModel(wire, sys, signal, meta, null);
         usageAccum(taskUsage, meta);
 
@@ -26126,20 +26268,27 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
         // endpoint+模型组合，下一轮的系统提示（chatSystemPrompt/chatAgentNativeToolsActive）
         // 就会自动换回带 ==TOOL== 说明的文本协议版本。toolsUnsupported===true 时这一发本来
         // 就没有 tool_calls（重试请求没带 tools），所以这里不用 continue，往下走到普通的
-        // parsed.isToolCall 分支即可（多半是最终答案或者模型自己"记得"文本协议、直接吐了
+        // parsed.isToolCall 分支即可（多半是最终答案或者模型自己“记得”文本协议、直接吐了
         // ==TOOL== 块——两种情况下面都能正确处理）。
         if (meta && meta.toolsUnsupported) {
             chatAgentMarkNativeToolsUnsupported();
         }
 
+        // v2 Pass P164：无限档运行时，把当前轮数/累计字节写进 ChatState 供输入框上方的进度条读取。
+        // 只在 maxIters===0 时画——有限档从来不会用到这块 UI，不给它徒增一次无意义的重绘。
+        if (maxIters === 0) {
+            ChatState.agentProgress = { iter: iter, bytes: bytesUsed };
+            try { chatRenderAgentProgress(); } catch (e) {}
+        }
+
         // ---- native tool_call 分支 ----
         if (meta && Array.isArray(meta.toolCalls) && meta.toolCalls.length) {
-            if (iter === CHAT_AGENT_MAX_ITERS) break;   // 最后一轮还在要工具：不执行，进入下面的封顶处理
+            if (maxIters !== 0 && iter === maxIters) break;   // 最后一轮还在要工具：不执行，进入下面的封顶处理
 
             const toolCallsRaw = meta.toolCalls;
             wire.push({ role: 'assistant', content: (typeof raw === 'string' ? raw : '') || '', tool_calls: toolCallsRaw });
 
-            const overBudget = bytesUsed >= CHAT_AGENT_TOTAL_READ_BUDGET;
+            const overBudget = readBudget !== 0 && bytesUsed >= readBudget;
             for (let ti = 0; ti < toolCallsRaw.length; ti++) {
                 const tc = toolCallsRaw[ti] || {};
                 const tcId = tc.id || ('call_' + ti);
@@ -26147,7 +26296,7 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
                 const toolName = String(fn.name || '');
                 let toolContent;
                 if (overBudget) {
-                    toolContent = '已经达到这一轮的累计读取上限（约 ' + Math.round(CHAT_AGENT_TOTAL_READ_BUDGET / 1024)
+                    toolContent = '已经达到这一轮的累计读取上限（约 ' + Math.round(readBudget / 1024)
                         + 'KB），不会再执行新的工具调用了。请直接基于目前已经读到的内容回答。';
                 } else if (CHAT_AGENT_TOOLS.indexOf(toolName) === -1) {
                     toolContent = '不认识的工具名「' + toolName + '」（只支持 ' + CHAT_AGENT_TOOLS.join(' / ') + '）';
@@ -26176,14 +26325,14 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
 
         // v2 Pass P102：这一轮明明发了 tools schema（native 生效），模型却还是吐了旧式
         // ==TOOL== 文本——证明它不会真的用 native 协议，记住它，之后整个会话都退回文本协议，
-        // 不再重复浪费一次"发了 tools 却被无视"的往返。这一轮本身仍按文本协议正常处理下去，
+        // 不再重复浪费一次“发了 tools 却被无视”的往返。这一轮本身仍按文本协议正常处理下去，
         // 不浪费模型已经算出来的这次工具调用。
         if (chatAgentNativeToolsActive()) {
             chatAgentMarkNativeToolsUnsupported();
         }
 
         if (parsed.malformed) {
-            if (!usedRetry && iter < CHAT_AGENT_MAX_ITERS) {
+            if (!usedRetry && (maxIters === 0 || iter < maxIters)) {
                 usedRetry = true;
                 wire.push({ role: 'assistant', content: raw });
                 wire.push({ role: 'user', content: '你上一条回复的工具调用格式不对：' + parsed.reason
@@ -26193,16 +26342,16 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
                 continue;
             }
             // 纠错机会已经用掉、或者已经没有轮次可用——把这段原始文本原样交出去，当白话处理，
-            // 不为了"再猜一次"无限重试。
+            // 不为了“再猜一次”无限重试。
             return raw;
         }
 
-        if (iter === CHAT_AGENT_MAX_ITERS) break;   // 最后一轮还在要工具：不执行，进入下面的封顶处理
+        if (maxIters !== 0 && iter === maxIters) break;   // 最后一轮还在要工具：不执行，进入下面的封顶处理
 
-        if (bytesUsed >= CHAT_AGENT_TOTAL_READ_BUDGET) {
+        if (readBudget !== 0 && bytesUsed >= readBudget) {
             wire.push({ role: 'assistant', content: raw });
             wire.push({ role: 'user', content: '[工具结果]\n已经达到这一轮的累计读取上限（约 '
-                + Math.round(CHAT_AGENT_TOTAL_READ_BUDGET / 1024) + 'KB），不会再执行新的工具调用了。'
+                + Math.round(readBudget / 1024) + 'KB），不会再执行新的工具调用了。'
                 + '请直接基于目前已经读到的内容回答。' });
             setLabel('已到读取上限…');
             continue;
@@ -26216,9 +26365,14 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
     }
 
     // 撞上了轮数上限：如实告诉用户，不再继续、不装作给出了完整答案。
-    chatAppendRow('system', '已达到工具调用轮数上限（' + CHAT_AGENT_MAX_ITERS + ' 轮），以下是目前已经掌握的信息。');
-    return '==CHAT==\n已经达到这一轮工具调用的轮数上限（' + CHAT_AGENT_MAX_ITERS + ' 轮），我先基于目前已经读到的内容回答；'
-        + '如果还需要继续深入，请再发一次消息，我会接着往下查。';
+    // v2 Pass P164："继续执行" checkpoint——这条路径在 maxIters===0（无限档）时永远不会走到
+    // （for 循环条件本身就不会为假），不需要额外挡一层；只有有限档撞顶时才把 wire/sys 原样
+    // 存进 ChatState.agentPendingContinue，供"继续执行"按钮带着同一份上下文接力。
+    ChatState.agentPendingContinue = { wire: wire, sys: sys };
+    meta.hitIterCap = true;
+    chatAppendRow('system', '已达到工具调用轮数上限（' + maxIters + ' 轮），以下是目前已经掌握的信息。');
+    return '==CHAT==\n已经达到这一轮工具调用的轮数上限（' + maxIters + ' 轮），我先基于目前已经读到的内容回答；'
+        + '点下面的“继续执行”可以带着同样的上下文接着查，不会丢历史。';
 }
 
 function chatPushUser(text) {
@@ -26527,6 +26681,10 @@ async function chatSend() {
             return;
         }
         chatRenderAssistant(raw, meta);
+        // v2 Pass P164：撞上轮数上限时 chatAgentRunLoop 已经把 wire/sys 存进
+        // ChatState.agentPendingContinue 并标了 meta.hitIterCap——这里只负责在对话流里补一条
+        // 带"继续执行"按钮的行，不做任何状态计算。
+        if (meta && meta.hitIterCap) { try { chatAppendContinueRow(); } catch (e) {} }
         // C6：**实测**用量落袋。分项之和不会等于 prompt_tokens（服务器的 chat template 还要加
         // 角色标记和分隔符），残差就叫「模板开销」，明着显示、当场对账，绝不摊进别的分项里。
         try {
@@ -26610,6 +26768,123 @@ async function chatSend() {
         }
         chatScrollToBottom();
     }
+}
+
+// v2 Pass P164：“继续执行”——撞上轮数上限不是死胡同，这里接力 chatAgentRunLoop 已经攒好的
+// wire/sys（跟原来那一轮完全同一份上下文，不重新组装文档、不追加新的用户消息），再跑一整个
+// 新的封顶周期。刻意**不**改造 chatSend 本身去复用它的尾段——那段 try/finally 已经和 C6 校准块、
+// docSnapshot、lastSent 等好几处状态耦合得很紧，硬拆共享函数的风险明显大于照抄一份必要逻辑。
+// 跳过的东西也是刻意的：
+//   · C6 单轮校准块（ChatState.usage/calib）依赖这一轮**新组装**的 ChatState.lastSent——
+//     继续执行没有“重新组装文档”这回事，硬凑一个只会把跟这次请求无关的旧校准数字糊上去。
+//   · chatSyncSession/chatAssembleTurn/chatPushUser 这些“开始新一轮提问”才需要的步骤——
+//     继续执行不是新的一轮提问，是同一轮工具调用的延续。
+async function chatAgentContinueRun() {
+    const pend = ChatState.agentPendingContinue;
+    if (!pend || !pend.wire) { chatAppendRow('system', '没有可以继续的上下文了。'); return; }
+    ChatState.agentPendingContinue = null;
+
+    let pendingRow = null;
+    let tick = null;
+    let live = null;
+    chatStop();
+    chatAgentSettlePendingConfirms('开始了新一轮');
+    const mySeq = ++ChatState.seq;
+    try {
+        const controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+        ChatState.abort = controller;
+        chatSetBusy(true);
+
+        const pending = chatAppendPendingRow();
+        pendingRow = pending ? pending.row : null;
+        const t0 = Date.now();
+        tick = setInterval(function () {
+            try { if (pending && pending.timeEl) pending.timeEl.textContent = ((Date.now() - t0) / 1000).toFixed(1) + 's'; } catch (e) {}
+        }, CHAT_TICK_MS);
+
+        const meta = {};
+        const killPending = function () {
+            try { if (tick) { clearInterval(tick); tick = null; } } catch (e) {}
+            try { if (pendingRow && pendingRow.parentNode) pendingRow.parentNode.removeChild(pendingRow); } catch (e) {}
+            pendingRow = null;
+        };
+        const sink0 = chatLiveSink();
+        live = {
+            reasoning: function (s) {
+                try { if (pending && pending.tokEl) pending.tokEl.textContent = '≈' + chatFmtNum(chatEstTokens(s)) + ' tok'; } catch (e) {}
+                if (ChatState.showThinking) sink0.reasoning(s);
+            },
+            text: function (s) { killPending(); sink0.text(s); },
+            destroy: sink0.destroy
+        };
+
+        const raw = await chatAgentRunLoop(pend.wire, pend.sys, controller ? controller.signal : null, meta, pending);
+
+        if (mySeq !== ChatState.seq) return;
+        live.destroy();
+        live = null;
+        if (meta.aborted) {
+            if (String(raw || '').trim()) {
+                chatRenderAssistant(raw, meta);
+                chatAppendRow('system', '已停止 —— 上面是中止前已经收到的内容。');
+            } else {
+                chatAppendRow('system', '已停止。');
+            }
+            return;
+        }
+        chatRenderAssistant(raw, meta);
+        if (meta && meta.hitIterCap) { try { chatAppendContinueRow(); } catch (e) {} }
+
+        // 本次任务用量：跟 chatSend 同一套累加函数，只是没有 C6 那份单轮校准（原因见上方大注释）。
+        try {
+            const c2 = chatModelChoice();
+            ChatState.lastTaskUsage = (meta && meta.taskUsage) ? meta.taskUsage : null;
+            if (!ChatState.sessionTaskUsageTotal) ChatState.sessionTaskUsageTotal = usageSessionNew();
+            if (!ChatState.convTaskUsageTotal) ChatState.convTaskUsageTotal = usageSessionNew();
+            const costResult2 = usageComputeTaskCost(c2.provider, c2.model, ChatState.lastTaskUsage);
+            usageSessionAdd(ChatState.sessionTaskUsageTotal, ChatState.lastTaskUsage, costResult2);
+            usageSessionAdd(ChatState.convTaskUsageTotal, ChatState.lastTaskUsage, costResult2);
+        } catch (e2b) { console.error('[chat] task usage record failed', e2b); }
+        try { chatArchivePush('自动存档'); } catch (e3) { console.error('[chat] autosave archive failed', e3); }
+        chatUpdateBar();
+    } catch (e) {
+        if (mySeq !== ChatState.seq) return;
+        if (e && e.name === 'AbortError') {
+            chatAppendRow('system', '已停止。');
+        } else {
+            chatErrorRow('对话', chatDescribeError(e));
+        }
+    } finally {
+        try { if (tick) clearInterval(tick); } catch (e2) {}
+        try { if (pendingRow && pendingRow.parentNode) pendingRow.parentNode.removeChild(pendingRow); } catch (e2) {}
+        try { if (live) live.destroy(); } catch (e2) {}
+        if (mySeq === ChatState.seq) {
+            ChatState.abort = null;
+            chatSetBusy(false);
+        }
+        chatScrollToBottom();
+    }
+}
+
+// 撞上轮数上限时，在对话流里追加一条带“继续执行”按钮的行——点一下用同一份 wire/sys 接着跑，
+// 不重开会话、不丢历史。按钮点过一次就地禁用，避免手快连点出并发的两条 continue 争用同一个 seq。
+function chatAppendContinueRow() {
+    try {
+        const row = chatAppendRow('system', '');
+        if (!row) return;
+        const bubble = chatBubbleOf(row) || row;
+        bubble.textContent = '';
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'aichat-minibtn';
+        btn.textContent = '继续执行';
+        btn.addEventListener('click', function () {
+            btn.disabled = true;
+            btn.textContent = '继续执行中…';
+            chatAgentContinueRun();
+        });
+        bubble.appendChild(btn);
+    } catch (e) { console.error('[chat] appendContinueRow failed', e); }
 }
 
 // LM Studio 的报错措辞有时是误导性的（body 稍有不对就一律说 "failed to parse JSON value"），
@@ -26793,6 +27068,10 @@ function chatParamsSave() {
             webSearchByModel: ChatState.webSearchByModel,
             temperature: ChatState.temperature,
             maxTokens: ChatState.maxTokens,
+            // v2 Pass P164：只持久化档位选择本身，不持久化 agentSkipReadonlyConfirm（那个必须
+            // 每次刷新页面回到关，见 ChatState 字段声明处注释）。
+            agentMaxIters: ChatState.agentMaxIters,
+            agentReadBudget: ChatState.agentReadBudget,
             stream: !!ChatState.stream,
             keepReasoning: !!ChatState.keepReasoning,
             paramsOpen: !!ChatState.paramsOpen,
@@ -26855,6 +27134,21 @@ function chatParamsLoad() {
         }
         if (typeof p.maxTokens === 'number' && CHAT_MAXTOK_CHOICES.indexOf(p.maxTokens) !== -1) {
             ChatState.maxTokens = p.maxTokens;
+        }
+        // v2 Pass P164：逐键校验同一条纪律——不在表里的脏值一律丢弃，不回落成别的值。
+        // 缺陷4修复：0（无限档）是个例外，刻意不在这里直接恢复。chatSetAgentMaxIters()/
+        // chatSetAgentReadBudget() 选到无限档时必须先过 chatAgentConfirmUnlimited() 的
+        // 一次性警告，而 agentUnlimitedWarned 按设计每次刷新都归零（见该字段声明处注释
+        // ——"刷新会重弹，这是刻意的"）。如果这里把存档里的 0 直接写回 ChatState，等于绕开
+        // 了那道警告：刷新后无限档静默生效，却从没真正弹过一次警告，直接违反那条注释。
+        // 所以 0 不当"可以直接恢复"的档位处理：让 ChatState.agentMaxIters/agentReadBudget
+        // 保持 null（getter 回落到 DEFAULT），用户想要无限档，本次页面会话得重新从下拉框
+        // 选一次，照常触发警告——这才是"刷新会重弹"应有的效果。
+        if (typeof p.agentMaxIters === 'number' && p.agentMaxIters !== 0 && CHAT_AGENT_MAX_ITERS_CHOICES.indexOf(p.agentMaxIters) !== -1) {
+            ChatState.agentMaxIters = p.agentMaxIters;
+        }
+        if (typeof p.agentReadBudget === 'number' && p.agentReadBudget !== 0 && CHAT_AGENT_READ_BUDGET_CHOICES.indexOf(p.agentReadBudget) !== -1) {
+            ChatState.agentReadBudget = p.agentReadBudget;
         }
         if (typeof p.stream === 'boolean') ChatState.stream = p.stream;
         if (typeof p.keepReasoning === 'boolean') ChatState.keepReasoning = p.keepReasoning;
@@ -27342,6 +27636,74 @@ function chatSetMaxTokens(v) {
     } catch (e) {}
 }
 
+// v2 Pass P164：轮数上限 / 读取预算 / 只读免确认——写法照抄 chatSetMaxTokens 这一档
+// （立即生效 + 立即持久化 + 立即重画参数条），只多一件事：选到“无限”档时如果这次页面会话
+// 还没警告过，先弹一次性确认，用户没点“知道了”就不提交这次选择、参数条退回原值。
+function chatSetAgentMaxIters(v) {
+    try {
+        const n = Number(v);
+        const next = (CHAT_AGENT_MAX_ITERS_CHOICES.indexOf(n) !== -1) ? n : CHAT_AGENT_MAX_ITERS_DEFAULT;
+        if (next === 0 && !ChatState.agentUnlimitedWarned) {
+            chatAgentConfirmUnlimited(function () {
+                ChatState.agentMaxIters = 0;
+                chatParamsSave();
+                chatRenderParamBar();
+            });
+            return;
+        }
+        ChatState.agentMaxIters = next;
+        chatParamsSave();
+        chatRenderParamBar();
+    } catch (e) {}
+}
+
+function chatSetAgentReadBudget(v) {
+    try {
+        const n = Number(v);
+        const next = (CHAT_AGENT_READ_BUDGET_CHOICES.indexOf(n) !== -1) ? n : CHAT_AGENT_READ_BUDGET_DEFAULT;
+        if (next === 0 && !ChatState.agentUnlimitedWarned) {
+            chatAgentConfirmUnlimited(function () {
+                ChatState.agentReadBudget = 0;
+                chatParamsSave();
+                chatRenderParamBar();
+            });
+            return;
+        }
+        ChatState.agentReadBudget = next;
+        chatParamsSave();
+        chatRenderParamBar();
+    } catch (e) {}
+}
+
+// “无限”一次性警告——任选一个 0 档触发，本次页面会话内只弹一次（刷新会重弹，这是刻意的：
+// agentUnlimitedWarned 和 agentSkipReadonlyConfirm 一样绝不持久化）。复用 ovlConfirmDialog
+// （真实 DOM 模态），绝不用 window.confirm/alert。取消时重画参数条，把 <select> 显示值拨回
+// ChatState 里真正生效的那个档位（用户没确认，选择就没有真的发生）。
+function chatAgentConfirmUnlimited(onConfirm) {
+    try {
+        ovlConfirmDialog({
+            title: '确认切换到“无限”',
+            message: '轮数或读取预算设为“无限”后，这一轮对话会一直调用模型、执行工具，'
+                + '直到模型自己给出最终答案为止——不会再有内置的硬性封顶替你叫停，也会持续消耗 API 额度。'
+                + '运行期间输入框旁边会一直是醒目的 STOP 按钮，上方会实时显示当前轮数和累计读取字节数，'
+                + '随时点 STOP 都能干净地中止，不会留下写了一半的回复。',
+            confirmLabel: '知道了，继续',
+            danger: true,
+            onConfirm: function () {
+                ChatState.agentUnlimitedWarned = true;
+                onConfirm();
+            },
+            onCancel: function () { try { chatRenderParamBar(); } catch (e) {} }
+        });
+    } catch (e) { onConfirm(); }
+}
+
+// “只读操作免确认”。刻意**不**调用 chatParamsSave()——这个开关必须在刷新页面后回到关，
+// 见 ChatState.agentSkipReadonlyConfirm 声明处的注释；这里只重画参数条。
+function chatSetAgentSkipReadonlyConfirm(on) {
+    try { ChatState.agentSkipReadonlyConfirm = !!on; chatRenderParamBar(); } catch (e) {}
+}
+
 function chatSetStream(on) {
     try { ChatState.stream = !!on; chatParamsSave(); chatRenderParamBar(); } catch (e) {}
 }
@@ -27400,6 +27762,21 @@ function chatCapsWarmForBar() {
 // 纯字符串拼接 + escapeAttr/escapeHtml，画完再按 id 绑监听（每次重画都是新节点，
 // 旧监听随节点一起被回收）。整个函数带 try/catch 且不抛：它虽然在 renderApp 之外，
 // 但抛出去会让参数条永久停在上一帧。
+// v2 Pass P164：无限档运行时的进度读数。只在 ChatState.agentProgress 非空时显示；
+// chatSetBusy(false) 会把它清空/隐藏，两个调用点（chatSend / chatAgentContinueRun）都不用
+// 各自记得清一次。
+function chatRenderAgentProgress() {
+    try {
+        const el = document.getElementById('aiChatAgentProgress');
+        if (!el) return;
+        const p = ChatState.agentProgress;
+        if (!p) { el.hidden = true; el.textContent = ''; return; }
+        const kb = Math.round((Number(p.bytes) || 0) / 1024);
+        el.hidden = false;
+        el.textContent = '⚡ 无限模式运行中 · 第 ' + p.iter + ' 轮 · 已读取 ' + kb + 'KB · 需要停止请点右下角 STOP';
+    } catch (e) {}
+}
+
 function chatSegHtml(idOff, idOn, labOff, labOn, on) {
     return '<span class="aichat-seg">'
         + '<button type="button" id="' + idOff + '" class="' + (on ? '' : 'is-on') + '">' + labOff + '</button>'
@@ -27564,6 +27941,44 @@ function chatMoreBoxHtml(choice) {
         + '" data-tip-pos="top-start"><span class="aichat-plabel">回传思考</span>'
         + chatSegHtml('aiChatKeepOff', 'aiChatKeepOn', '关', '开', !!ChatState.keepReasoning) + '</span>');
 
+    // —— v2 Pass P164：agent 工具调用轮数上限 ——
+    (function () {
+        const cur = chatAgentMaxIters();
+        const opts = CHAT_AGENT_MAX_ITERS_CHOICES.map(function (v) {
+            return '<option value="' + v + '"' + (v === cur ? ' selected' : '') + '>' + (v === 0 ? '无限' : String(v)) + '</option>';
+        }).join('');
+        rows.push('<span class="aichat-pgroup" data-tip="'
+            + escapeAttr('这一次提问最多允许模型调用几轮工具。默认 40。单独调大轮数、不调大下面的读取预算'
+                + '解决不了"卡住"——那只是把卡住的位置从"轮数"换成"读取字节数"。撞上限也不是死胡同：'
+                + '对话里会出现一个"继续执行"按钮，带着同样的上下文接着往下查，不丢历史。'
+                + '"无限"是真的不封顶，选它会先弹一次性警告。')
+            + '" data-tip-pos="top-start"><span class="aichat-plabel">轮数上限</span>'
+            + '<select class="aichat-psel" id="aiChatAgentItersSel" style="max-width:70px">' + opts + '</select></span>');
+    })();
+
+    // —— v2 Pass P164：agent 累计读取预算 ——
+    (function () {
+        const cur = chatAgentReadBudget();
+        const opts = CHAT_AGENT_READ_BUDGET_CHOICES.map(function (v) {
+            return '<option value="' + v + '"' + (v === cur ? ' selected' : '') + '>'
+                + (v === 0 ? '无上限' : Math.round(v / 1024) + 'KB') + '</option>';
+        }).join('');
+        rows.push('<span class="aichat-pgroup" data-tip="'
+            + escapeAttr('这一次提问里，工具读取内容的累计字节上限，撞到就不再执行新的工具调用、直接让模型基于'
+                + '已读到的内容回答。默认 2MB。"无上限"要配合上面"轮数上限=无限"才是真正不设防；'
+                + '单独调大这一项、轮数仍是有限档时，多半会先撞轮数上限。')
+            + '" data-tip-pos="top-start"><span class="aichat-plabel">读取预算</span>'
+            + '<select class="aichat-psel" id="aiChatAgentBudgetSel" style="max-width:78px">' + opts + '</select></span>');
+    })();
+
+    // —— v2 Pass P164：只读操作免确认（会话级、刻意不持久化）——
+    rows.push('<span class="aichat-pgroup" data-tip="'
+        + escapeAttr('打开后，模型调用纯只读工具（浏览目录、读文件、读编译日志等）时不再逐次弹确认卡。'
+            + '任何会改动磁盘或文档内容的工具（写文件、删除、移动、编译、改译文/术语表……）永远还是要确认，'
+            + '这一条没有例外。这个开关只在这次打开页面期间有效，刷新后固定回到关。')
+        + '" data-tip-pos="top-start"><span class="aichat-plabel">只读免确认</span>'
+        + chatSegHtml('aiChatSkipRoOff', 'aiChatSkipRoOn', '关', '开', !!ChatState.agentSkipReadonlyConfirm) + '</span>');
+
     let html = '<div class="aichat-pmorebox"><div class="aichat-prow">' + rows.join('') + '</div>';
 
     // —— 分割线以下：只读 ——
@@ -27675,6 +28090,10 @@ function chatBindParamBar(box) {
     on('aiChatKeepOn', 'click', function () { chatSetKeepReasoning(true); });
     on('aiChatShowThinkOff', 'click', function () { chatSetShowThinking(false); });
     on('aiChatShowThinkOn', 'click', function () { chatSetShowThinking(true); });
+    on('aiChatAgentItersSel', 'change', function () { chatSetAgentMaxIters(this.value); });
+    on('aiChatAgentBudgetSel', 'change', function () { chatSetAgentReadBudget(this.value); });
+    on('aiChatSkipRoOff', 'click', function () { chatSetAgentSkipReadonlyConfirm(false); });
+    on('aiChatSkipRoOn', 'click', function () { chatSetAgentSkipReadonlyConfirm(true); });
 }
 
 // ============================================================================
@@ -29927,6 +30346,109 @@ function chatArchiveLoadInto(item) {
     ChatState.sessionId = String(item.sessionId || ChatState.sessionId || '');
 }
 
+// v2 Pass P165：一条归档记录“看起来完整”才允许被自动喂给模型——半截的/结构不对的绝不能
+// 被拿来当上下文。这里只做防御性校验，不代表 chatArchiveWrite/chatArchiveTrim 平时会产出
+// 半截消息（它们按整条消息为单位裁剪），而是给“ localStorage 万一被外部写坏”兜底。
+function chatArchiveItemLooksIntact(item) {
+    try {
+        if (!item || typeof item !== 'object') return false;
+        if (!Array.isArray(item.messages) || !item.messages.length) return false;
+        let hasUser = false;
+        for (let i = 0; i < item.messages.length; i++) {
+            const m = item.messages[i];
+            if (!m || typeof m !== 'object') return false;
+            if (m.role !== 'user' && m.role !== 'assistant') return false;
+            if (typeof m.content !== 'string' && typeof m.prose !== 'string') return false;
+            if (m.role === 'user') hasUser = true;
+        }
+        // 只有 assistant、一条 user 提问都没有 = 半截对话（比如写到一半被打断）：喂给模型会让它
+        // 对着一个根本不存在的问题继续作答。
+        return hasUser;
+    } catch (e) { return false; }
+}
+
+// v2 Pass P165：自动恢复上次会话。当前对话是空的（没有正在进行的会话）时，从归档里找
+// 最近一条“看起来完整”的记录：
+//   · sessionId 跟当前文档一致 ⇒ 直接接回来，并给一条可撤销、不删归档的横幅；
+//   · 不一致（属于另一份文档/项目）⇒ **绝不静默带过去**，只给一个可点的入口，
+//     用户自己决定要不要取回——静默导入一份不相干的对话，比什么都不恢复更误导人。
+// 任何一步出错（包括 localStorage 里的 JSON 本身就是坏的）都只 console.error，绝不抛出去
+// 砸坏聊天窗——chatArchiveLoad 自己也有同样一层 try/catch，这里是双保险。
+function chatAutoRestoreCheck() {
+    try {
+        if (chatAutoRestoreDone) return;
+        chatAutoRestoreDone = true;   // 立刻置位，防止重入；真正的检查推迟到 sessionId 落定之后。
+        // 缺陷3修复：AppState.sessionId 的 IndexedDB 恢复是异步的，此刻读到的多半还是解析期同步生成的新 id。等 xportPersistRestorePromise 落定（不论成功/失败/从未发起）之后再真正比对，否则永远读到错的 sessionId，自动恢复分支永远不可达。
+        Promise.resolve(xportPersistRestorePromise).then(chatAutoRestoreCheckRun, chatAutoRestoreCheckRun);
+    } catch (e) {
+        console.error('[chat] autoRestoreCheck failed', e);
+    }
+}
+
+// chatAutoRestoreCheck() 的实际比对逻辑，挪到这里是为了能等 sessionId 恢复落定后再跑（见上面的调用点注释）。
+function chatAutoRestoreCheckRun() {
+    try {
+        if (ChatState.messages && ChatState.messages.length) return;   // 已经有内容了，不覆盖
+        const list = chatArchiveLoad();
+        if (!list.length) return;
+        let best = null;
+        for (let i = 0; i < list.length; i++) {
+            const it = list[i];
+            if (!chatArchiveItemLooksIntact(it)) continue;
+            if (!best || Number(it.at || 0) > Number(best.at || 0)) best = it;
+        }
+        if (!best) return;
+        const sid = String(AppState.sessionId || '');
+        const matches = !!sid && String(best.sessionId || '') === sid;
+        if (matches) {
+            chatArchiveLoadInto(best);
+            chatAppendRestoreBanner('已恢复上次会话 · 撤销', '撤销', function () {
+                chatResetConversation();
+            });
+            chatRenderTargetChip();
+            chatRenderBatchBar();
+            chatRenderParamBar();
+            chatUpdateBar();
+            chatScrollToBottom();
+        } else {
+            chatAppendRestoreBanner('有上次会话可恢复：「' + String(best.title || '') + '」', '取回', function () {
+                chatArchiveOpen(best.id);
+            });
+        }
+    } catch (e) {
+        console.error('[chat] autoRestoreCheck failed', e);
+    }
+}
+
+// 可关闭、不删除底层归档的横幅。text 可能包含归档标题（用户自己起的名字），一律 textContent。
+function chatAppendRestoreBanner(text, actionLabel, onAction) {
+    try {
+        const log = document.getElementById('aiChatLog');
+        if (!log) return;
+        const bar = document.createElement('div');
+        bar.className = 'aichat-restore-banner';
+        const t = document.createElement('span');
+        t.textContent = text;
+        bar.appendChild(t);
+        const act = document.createElement('button');
+        act.type = 'button';
+        act.className = 'aichat-minibtn';
+        act.textContent = actionLabel;
+        act.addEventListener('click', function () {
+            try { bar.remove(); } catch (e) {}
+            try { onAction(); } catch (e) { console.error('[chat] restore banner action failed', e); }
+        });
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.className = 'aichat-minibtn';
+        closeBtn.textContent = '×';
+        closeBtn.addEventListener('click', function () { try { bar.remove(); } catch (e) {} });
+        bar.appendChild(act);
+        bar.appendChild(closeBtn);
+        log.insertBefore(bar, log.firstChild);
+    } catch (e) { console.error('[chat] appendRestoreBanner failed', e); }
+}
+
 // 打开一份归档：先把当前这段也归档（绝不覆盖），再把消息装回窗口。
 function chatArchiveOpen(id) {
     try {
@@ -30263,6 +30785,12 @@ function chatOpen() {
     try {
         const rootEl = ensureChatRoot();
         if (!rootEl) return;
+        // v2 Pass P165：自动恢复上次会话的检查点。放在这里而不是 DOMContentLoaded：boot() 尾部
+        // 的 `if (chatLoadOpen()) chatOpen();` 本身就会在页面启动时自动调用这个函数一次，覆盖了
+        // "刷新前开着 ⇒ 刷新后自动展开、自动恢复"这条最常见路径；窗口当时关着的那一半场景，
+        // 在它从未被打开之前根本没有地方能画出恢复横幅，所以推迟到用户真正点开聊天窗那一刻
+        // 才检查，既不提前也不遗漏。chatAutoRestoreDone 保证同一次页面生命周期只检查一次。
+        try { chatAutoRestoreCheck(); } catch (eAR) { console.error('[chat] autoRestoreCheck threw', eAR); }
         // 已经开着但折叠着 ⇒ 这次「打开」的意思是**还原**，不是再开一个。
         // 顶栏那颗 Chat 按钮走的就是这条路（chatToggle）。
         if (ChatState.open && ChatState.minimized) { chatExpand(); return; }
