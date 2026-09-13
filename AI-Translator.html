@@ -602,6 +602,52 @@ body.is-resizing-settings-modal * {
     padding: 8px 8px 12px;
 }
 #aiChatRoot .aichat-inputrow { display: flex; align-items: flex-end; gap: 8px; }
+/* v2 Pass P163：附件按钮跟标题栏那几颗 .aichat-iconbtn 共用同一份底色/hover，只是挪到输入行、
+   跟输入框垂直居中对齐（align-items:flex-end 是给多行 textarea 长高时按钮别跟着拉伸用的，
+   附件按钮固定高度不受影响）。disabled 态（当前模型不支持视觉）明显调暗 + 不显示手型指针。 */
+#aiChatRoot .aichat-attachbtn { flex: 0 0 auto; margin-bottom: 1px; }
+#aiChatRoot .aichat-attachbtn:disabled { opacity: 0.35; cursor: not-allowed; }
+/* 附件条：贴图缩略图 + 目的地一行提示。默认隐藏（没有待发附件时），见 chatRenderAttachBar。 */
+#aiChatRoot .aichat-attachbar {
+    flex: 0 0 auto;
+    padding: 6px 8px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+#aiChatRoot .aichat-attach-thumbs { display: flex; flex-wrap: wrap; gap: 6px; }
+#aiChatRoot .aichat-attach-thumb {
+    position: relative;
+    display: inline-block;
+    width: 44px;
+    height: 44px;
+    border-radius: 6px;
+    overflow: hidden;
+    border: 1px solid #e2e8f0;
+    background: #f1f5f9;
+}
+#aiChatRoot .aichat-attach-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+#aiChatRoot .aichat-attach-remove {
+    position: absolute;
+    top: 0; right: 0;
+    width: 16px; height: 16px;
+    line-height: 14px;
+    text-align: center;
+    padding: 0;
+    border: none;
+    border-radius: 0 0 0 6px;
+    background: rgba(15, 23, 42, 0.65);
+    color: #fff;
+    font-size: 12px;
+    cursor: pointer;
+}
+/* 目的地提示——**这是新增第三方曝光面的一次性告知**（贴图前用户看不见的东西，发送前必须
+   看得见），非阻塞的一行说明，不做弹窗（见 p163 任务书第 6 条）。 */
+#aiChatRoot .aichat-attach-dest {
+    font-size: 10.5px;
+    line-height: 1.4;
+    color: #64748b;
+}
 #aiChatRoot .aichat-input {
     flex: 1 1 auto;
     min-width: 0;
@@ -4729,7 +4775,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.30.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.30.03';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-13';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -4865,6 +4911,12 @@ const QWEN_DEFAULT_VISION_MODEL = 'qwen3-vl-plus'; // 体现在 DEFAULT_MODEL_CA
 // 计价函数见本区块末尾 usageGetPriceTier() / usageComputeCostAmount()（P144 新增，按 tiers
 // 落档 + 缓存价单独计，不内置任何汇率换算）。
 const MODEL_PRICING_AS_OF = '2026-08-14';
+// v2 Pass P163：视觉输入计价——官方文档确认 Gemini 的图像 token（≤384×384 记 258 token，更大
+// 按 768×768 切 tile 每 tile 258）与 Qwen 的图像 token（h×w/(32×32)+2）都折算进同一个输入 token
+// 池，跟文本 token 同一价，官方定价页没有单独的"图像价"行——所以下面 gemini 桶的**每一条**
+// {in,out} 价格本来就覆盖图像开销，不需要为视觉模型新增字段；真实成本计算读的是响应里
+// usage.prompt_tokens/usageMetadata.promptTokenCount（已经在读，见 usageComputeCostAmount），
+// 那是服务器按官方公式折算好的真实数字，本表不需要、也不应该自己再算一遍（见 p163 设计稿第五节）。
 const MODEL_PRICING = {
     gemini: {
         // 2026-09-11 补充：gemini-3.8-flash 此前压根没进过这张表（不是匹配规则的问题——
@@ -4922,10 +4974,10 @@ const MODEL_PRICING = {
         'qwen3.8-flash': { in: 0.15, out: 0.47, note: '单一价，非阶梯（qwen-flash 经典命名系列才分阶梯，两者是不同模型）' },
         'qwen-plus':     { in: 0.4,  out: 1.2,  tiered: true, note: '阶梯计价最低档（0-256K，非思考输出价）；国内站分档边界不同（128K/256K/1M）' },
         'qwen3.8-max':   { in: 2,    out: 6,    note: '单一价，不分阶梯，不区分思考/非思考' },
-        'qwen3-vl-plus': { in: 0.2,  out: 1.6,  tiered: true, note: '阶梯计价最低档（0-32K，非思考输出价）' },
+        'qwen3-vl-plus': { in: 0.2,  out: 1.6,  tiered: true, note: '阶梯计价最低档（0-32K，非思考输出价）；图像 token 按官方 h×w/(32×32)+2 公式折进这个输入价，不是独立计费项（v2 Pass P163）' },
         'qwen-turbo':    { in: 0.05, out: 0.2,  note: '官方标注"后续不再更新，建议替换为千问Flash"；此为非思考价' },
         'qwen-max':      { in: 1.6,  out: 6.4,  note: '无阶梯' },
-        'qwen-vl-max':   { in: 0.8,  out: 3.2,  note: '无阶梯（官方页面明确 No tiered pricing）' },
+        'qwen-vl-max':   { in: 0.8,  out: 3.2,  note: '无阶梯（官方页面明确 No tiered pricing）；图像 token 按官方 h×w/(32×32)+2 公式折进这个输入价，不是独立计费项（v2 Pass P163）' },
         'qwq-plus':      { in: 0.8,  out: 2.4,  note: '仅思考模式，无法关闭；全部输出按此价计费' },
         'qwen-flash':    { in: 0.05, out: 0.4,  tiered: true, note: '阶梯计价最低档（0-256K）；与 qwen3.8-flash 是不同模型（经典命名系列）' },
         'qwen3-max':     { in: 1.2,  out: 6,    tiered: true, note: '阶梯计价最低档（0-32K）' },
@@ -5062,8 +5114,11 @@ const MODEL_CAPS = {
         'qwq-plus':      { contextWindow: 131072,  maxInput: 98304,  maxOutput: 8192,   thinking: 'always', thinkingDefault: true,  thinkingBudgetMax: null },
         // qwen-vl-max：官方「深度思考」文档模型清单未列出该模型，页面未提及是否支持思考——
         // 不代猜，thinking:'none' + thinkingUnknown:true，区别于「明确不支持」的展示文案。
-        'qwen-vl-max':   { contextWindow: 131072,  maxInput: 129024, maxOutput: 8192,   thinking: 'none',   thinkingUnknown: true },
-        'qwen3-vl-plus': { contextWindow: 262144,  maxInput: 260096, maxOutput: 32768,  thinking: 'hybrid', thinkingDefault: null,  thinkingBudgetMax: 32768 },
+        // v2 Pass P163：Qwen 没有运行时能力发现端点（DashScope 不像 LM Studio 有 /api/v1/models，
+        // 见本表头部注释同一条纪律），vision 只能走这张静态表手工标——这两个 id 本身就是官方的
+        // 「视觉理解」模型（VL = Vision-Language），沿用 thinking 字段同一种"手工维护"先例。
+        'qwen-vl-max':   { contextWindow: 131072,  maxInput: 129024, maxOutput: 8192,   thinking: 'none',   thinkingUnknown: true, vision: true },
+        'qwen3-vl-plus': { contextWindow: 262144,  maxInput: 260096, maxOutput: 32768,  thinking: 'hybrid', thinkingDefault: null,  thinkingBudgetMax: 32768, vision: true },
         'qwen-flash':    { contextWindow: 1000000, maxInput: 997952, maxOutput: 32768,  thinking: 'hybrid', thinkingDefault: false, thinkingBudgetMax: 32768 },
         'qwen3.8-max':   { contextWindow: 1000000, maxInput: 991808, maxOutput: 131072, thinking: 'hybrid', thinkingDefault: true,  thinkingBudgetMax: 32768 },
         'qwen3.7-max':   { contextWindow: 1000000, maxInput: 991808, maxOutput: 131072, thinking: 'hybrid', thinkingDefault: true,  thinkingBudgetMax: 32768 },
@@ -16615,6 +16670,8 @@ const Icons = {
     // 对话窗标题栏那三颗按钮的图标（+ 新建对话 / − 最小化 / ⃞ 还原）。尺寸和 XSmall 对齐，
     // 三颗按钮的视觉重量才一致；stroke-width 也一样，否则 + 会显得比 × 细。
     PlusSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>`,
+    // v2 Pass P163：聊天窗附件按钮用——纯装饰，不承载任何业务逻辑。
+    Paperclip: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>`,
     MinusSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/></svg>`,
     RestoreSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="14" x="5" y="5" rx="2"/></svg>`,
     ArrowRightLeftSmall: `<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m16 3 4 4-4 4"/><path d="M20 7H4"/><path d="m8 21-4-4 4-4"/><path d="M4 17h16"/></svg>`,
@@ -21246,6 +21303,10 @@ const ChatState = {
     //   { role, content(原始回复), prose, reasoning, editBody, proposalId }
     // reasoning **只**进折叠的「思考」区，永远不发回给模型、永远不当答案。
     messages: [],
+    // v2 Pass P163：待发送的图片附件（PNG/JPG，PDF 第 2 期再渲成图片走这条同一个槽位）。
+    // { id, name, mimeType, dataUrl, w, h }。只在"还没发出去"这段时间存在——chatSend 成功
+    // 组装完这一轮之后立刻清空（chatClearAttachments），不是持久状态，不进 chatSaveOpen 那类存档。
+    pendingAttachments: [],
     seq: 0,                         // 单调递增。回来的响应 seq 对不上就是陈旧响应，直接丢弃。
     abort: null,                    // 当前在飞那一轮的 AbortController
     busy: false,
@@ -21506,7 +21567,12 @@ function chatShellHtml() {
         +     '<div id="aiChatFocusSlot"></div>'
         +     '<div id="aiChatTargetSlot"></div>'
         +     '<div id="aiChatBatchSlot"></div>'
+        // v2 Pass P163：附件条——贴图的缩略图 + 目的地提示（这张图会发到哪个 provider，
+        // 见 chatRenderAttachBar）。没有待发附件时整块隐藏，不占地方。
+        +     '<div class="aichat-attachbar" id="aiChatAttachBar" hidden></div>'
         +     '<div class="aichat-inputrow">'
+        +       '<button type="button" class="aichat-iconbtn aichat-attachbtn" id="aiChatAttachBtn" data-tip="附加图片（PNG/JPG）：点击选择、粘贴或拖拽都可以。发送前会提示这张图会发到哪个 provider。" data-tip-pos="top-start">' + Icons.Paperclip + '</button>'
+        +       '<input type="file" id="aiChatFileInput" accept="image/png,image/jpeg" multiple hidden>'
         +       '<textarea class="aichat-input" id="aiChatInput" rows="1" placeholder="问点什么…（Enter 发送，Shift+Enter 换行）"></textarea>'
         +       '<button type="button" class="aichat-send" id="aiChatSendBtn" data-tip="发送（Enter 也一样）。请求进行中这颗按钮变成 STOP，点一下当场中止，已经收到的字会留在窗口里。" data-tip-pos="top-end">SEND</button>'
         +     '</div>'
@@ -21887,6 +21953,61 @@ function chatBindShell(rootEl) {
                 chatSend();
             } catch (err) { console.error('[chat] enter-to-send failed', err); }
         });
+        // v2 Pass P163：粘贴截图——只挑 clipboardData.items 里 kind==='file' 且
+        // type 在白名单里的那几项，文字粘贴（绝大多数情况）完全不受影响，走浏览器
+        // 默认行为，这里不 preventDefault 那部分。
+        input.addEventListener('paste', function (e) {
+            try {
+                const items = (e.clipboardData && e.clipboardData.items) || [];
+                const files = [];
+                for (let i = 0; i < items.length; i++) {
+                    const it = items[i];
+                    if (it && it.kind === 'file' && CHAT_IMG_ACCEPT_TYPES.indexOf(it.type) !== -1) {
+                        const f = it.getAsFile();
+                        if (f) files.push(f);
+                    }
+                }
+                if (files.length) chatAddAttachmentFiles(files);
+            } catch (err) { console.error('[chat] paste-image failed', err); }
+        });
+        // 拖拽图片进输入框。dragover 必须 preventDefault，否则浏览器不触发 drop
+        // （标准拖放 API 行为，不是这里特有）。
+        input.addEventListener('dragover', function (e) { try { e.preventDefault(); } catch (err) {} });
+        input.addEventListener('drop', function (e) {
+            try {
+                e.preventDefault();
+                const dt = e.dataTransfer;
+                const files = dt && dt.files;
+                if (files && files.length) chatAddAttachmentFiles(files);
+            } catch (err) { console.error('[chat] drop-image failed', err); }
+        });
+    }
+
+    // 附件按钮：点击 = 打开原生文件选择框（真正的读取逻辑在 chatAddAttachmentFiles，
+    // 跟粘贴/拖拽三个入口共用同一份校验+估算）。disabled 时浏览器原生不派发 click 到
+    // 这里，所以不需要在处理函数里再判一次 chatSupportsVision——按钮状态本身就是闸门。
+    const attachBtn = rootEl.querySelector('#aiChatAttachBtn');
+    const fileInput = rootEl.querySelector('#aiChatFileInput');
+    if (attachBtn && fileInput) {
+        attachBtn.addEventListener('click', function () { fileInput.click(); });
+        fileInput.addEventListener('change', function () {
+            chatAddAttachmentFiles(fileInput.files);
+            // 清空 value：不这样做，连续两次选同一个文件时第二次不会触发 change。
+            fileInput.value = '';
+        });
+    }
+
+    // 附件条上的移除按钮：事件委托在容器上（缩略图是动态生成/销毁的，逐个绑定
+    // 会在每次 chatRenderAttachBar 重画后失效）。
+    const attachBar = rootEl.querySelector('#aiChatAttachBar');
+    if (attachBar) {
+        attachBar.addEventListener('click', function (e) {
+            try {
+                const btn = e.target && e.target.closest && e.target.closest('[data-remove-att]');
+                if (!btn) return;
+                chatRemoveAttachment(btn.getAttribute('data-remove-att'));
+            } catch (err) { console.error('[chat] remove-attachment failed', err); }
+        });
     }
 
     // 这颗按钮在请求进行中就是 STOP，点它 = 中止，绝不当成「再发一条」。
@@ -22209,6 +22330,12 @@ function chatBuildTargetTurn(userText, withNeighbors) {
 // 再重复一份没有意义；**还没应用**的提案则原样保留，用户正靠它继续说「再短一点」。
 function chatWireContent(m) {
     if (!m) return '';
+    // v2 Pass P163：user 消息的 content 贴图之后可能是数组（chatPushUser 里那个
+    // [{type:'text'},...imageParts] 形状）。这里必须原样透传，绝不能走下面的 String()——
+    // 那会把它拍成 "[object Object],[object Object]" 这种垃圾，正是多轮场景里"第 2 轮
+    // 历史里第 1 轮的图不能被拍成乱码"这条要求要卡住的地方。没贴图时 m.content 还是
+    // 原来的字符串，Array.isArray 为假，逐字节落回下面那一行，纯文本路径不变。
+    if (m.role !== 'assistant' && Array.isArray(m.content)) return m.content;
     if (m.role !== 'assistant') return String(m.content == null ? '' : m.content);
     let s = String(m.prose == null ? '' : m.prose);
     // C4：「回传思考」是一个**客户端**开关（ChatState.keepReasoning），不是模型参数 ——
@@ -22245,18 +22372,88 @@ function chatWireHistory() {
 // 所以这里为聊天单写一条 Gemini 通道（实测：真正的多轮 contents 数组 HTTP 200，
 // promptTokenCount 91），**不动** callGeminiAPI 一行，也不把多轮对话拍扁成一个字符串
 // 再假装它是记忆。
+// v2 Pass P163：Gemini inline 图片 part 的字段大小写——官方 REST/proto3 JSON 惯例是
+// camelCase（inlineData/mimeType，各语言 client library 与 REST 文档示例统一这么写），
+// 设计稿"未知项 #1"没做过真实调用验证。默认发 camelCase；如果服务端实际认的是
+// snake_case，4xx 错误正文通常会点名"unknown field/name"这一类措辞——chatCallGemini
+// 里那层重试（见 chatGeminiUnknownFieldError）用这个函数换一次大小写再打一次，只有
+// 这一次，不是循环，避免真正的错误（密钥错/内容被拦/别的字段问题）被误判成大小写
+// 问题反复重试。data URL 形如 "data:image/png;base64,AAAA..."：冒号前取 mimeType，
+// 逗号后是纯 base64，跟 chatReadImageFile 产出的格式对应。
+function chatGeminiImagePart(part, snakeCase) {
+    const meta = CHAT_IMG_META.get(part) || {};
+    const url = String((part && part.image_url && part.image_url.url) || '');
+    const comma = url.indexOf(',');
+    const head = comma >= 0 ? url.slice(0, comma) : '';
+    const b64 = comma >= 0 ? url.slice(comma + 1) : url;
+    const mimeMatch = /^data:([^;]+)/.exec(head);
+    const mimeType = (mimeMatch && mimeMatch[1]) || meta.mimeType || 'image/png';
+    return snakeCase
+        ? { inline_data: { mime_type: mimeType, data: b64 } }
+        : { inlineData: { mimeType: mimeType, data: b64 } };
+}
+// content 是字符串（没贴图，绝大多数历史调用）或数组（OpenAI 风格文字+图片 part，见
+// chatPushUser/chatAssembleTurn）。字符串分支跟 P163 之前逐字节相同——这是
+// chatCallGemini 这一侧"纯文本零回归"的来源。
+function chatGeminiPartsFromContent(content, snakeCase) {
+    if (!Array.isArray(content)) return [{ text: String(content == null ? '' : content) }];
+    const parts = [];
+    for (let i = 0; i < content.length; i++) {
+        const p = content[i];
+        if (!p) continue;
+        if (p.type === 'image_url') parts.push(chatGeminiImagePart(p, snakeCase));
+        else if (typeof p.text === 'string') parts.push({ text: p.text });
+    }
+    // 万一数组里没有任何可识别 part（理论上不该发生），退化成一个空文本 part，
+    // 避免整条 contents[i] 变成 {role, parts:[]}（Gemini 对空 parts 数组的 400 更难排查）。
+    return parts.length ? parts : [{ text: '' }];
+}
+function chatGeminiBuildContents(messages, snakeCase) {
+    return messages.map(function (m) {
+        return {
+            role: m.role === 'assistant' ? 'model' : 'user',
+            parts: chatGeminiPartsFromContent(m.content, snakeCase)
+        };
+    });
+}
+// 判据必须保守，同一条纪律见下面 chatMaxTokensRejectedError 的注释：必须同时满足
+// (a) 4xx 状态码 (b) 错误正文提到"未知字段/名称"这一类措辞 (c) 这次请求确实带着图片
+// （纯文本请求报同样的错大概率是别的原因，不该被这条兜底吞掉再伪装成"重试后成功"）。
+function chatGeminiUnknownFieldError(err, hasImage) {
+    if (!hasImage) return false;
+    const status = chatParseApiErrorStatus(err);
+    if (!(status >= 400 && status < 500)) return false;
+    const msg = String((err && err.message) || err || '');
+    return /unknown (name|field)|cannot find field|invalid json payload|no such field/i.test(msg);
+}
+async function chatGeminiFetchOnce(url, bodyObj, signal) {
+    const resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(bodyObj),
+        signal
+    });
+    if (!resp.ok) {
+        const errText = await resp.text();
+        throw new Error(`Gemini API Error: ${resp.status} - ${errText}`);
+    }
+    return await resp.json();
+}
+
 async function chatCallGemini(config, messages, systemPrompt, signal, meta, req) {
     if (!config.geminiApiKey) {
         throw new Error('Gemini API Key 没配置。到「设置」里填一个再试。');
     }
     const r = req || {};
+    // v2 Pass P163：贴没贴图只影响 contents 里每条消息的 parts 怎么拼（见
+    // chatGeminiPartsFromContent），下面 generationConfig/thinkingConfig/systemInstruction/
+    // tools 那几段一个字节都不需要为图片改——这正是"未知项 #1"只用一层兜底重试就能
+    // 兜住的原因：出问题的只可能是 contents 里的 inlineData/inline_data 这一处字段名。
+    const hasImage = messages.some(function (m) {
+        return Array.isArray(m.content) && m.content.some(function (p) { return p && p.type === 'image_url'; });
+    });
     const body = {
-        contents: messages.map(function (m) {
-            return {
-                role: m.role === 'assistant' ? 'model' : 'user',
-                parts: [{ text: String(m.content == null ? '' : m.content) }]
-            };
-        }),
+        contents: chatGeminiBuildContents(messages, false),
         generationConfig: {
             temperature: (typeof r.temperature === 'number' && isFinite(r.temperature)) ? r.temperature : 0.3,
             maxOutputTokens: (typeof r.maxTokens === 'number' && r.maxTokens > 0) ? r.maxTokens : CHAT_MAX_TOKENS
@@ -22296,17 +22493,20 @@ async function chatCallGemini(config, messages, systemPrompt, signal, meta, req)
     }
 
     const url = `${GEMINI_API_BASE}/${config.model}:generateContent?key=${config.geminiApiKey}`;
-    const resp = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-        signal
-    });
-    if (!resp.ok) {
-        const errText = await resp.text();
-        throw new Error(`Gemini API Error: ${resp.status} - ${errText}`);
+    let data;
+    try {
+        data = await chatGeminiFetchOnce(url, body, signal);
+    } catch (err) {
+        // v2 Pass P163：见 chatGeminiUnknownFieldError 顶部注释——只有"带图片 + 4xx +
+        // 错误正文点名未知字段"三者同时成立才会走到这里。只换 body.contents 这一处
+        // （snake_case 的 inline_data/mime_type），generationConfig 等其余字段原样复用，
+        // 只重打这一次，不是循环；第二次还失败就把第二次的异常原样抛给上层。
+        if (!chatGeminiUnknownFieldError(err, hasImage)) throw err;
+        chatAppendRow('system', 'Gemini 说请求里有未知字段，已把图片字段从 camelCase（inlineData）'
+            + '自动换成 snake_case（inline_data）重试一次。');
+        body.contents = chatGeminiBuildContents(messages, true);
+        data = await chatGeminiFetchOnce(url, body, signal);
     }
-    const data = await resp.json();
     const cand = (data && data.candidates && data.candidates[0]) || {};
     const parts = (cand.content && Array.isArray(cand.content.parts)) ? cand.content.parts : [];
     const partText = function (p) { return (p && typeof p.text === 'string') ? p.text : ''; };
@@ -26022,7 +26222,19 @@ async function chatAgentRunLoop(wire, sys, signal, meta, pending) {
 }
 
 function chatPushUser(text) {
-    ChatState.messages.push({ role: 'user', content: String(text == null ? '' : text) });
+    // v2 Pass P163：贴了图就把这一条消息的 content 存成数组（文字 part 在前，图片 part
+    // 在后），没贴图时 content 还是原来那个纯字符串——**这一行 if/else 就是"纯文本零回归"
+    // 断言的根**：没有 pendingAttachments 时，唯一改变的是多了一层永远为假的判断，
+    // 落到 else 分支产出跟 P163 之前逐字节相同的 { role:'user', content:String(text) }。
+    // 这条消息会被存进 ChatState.messages 长期留存（不像 pendingAttachments 那样发完即清），
+    // 所以图片一旦发出去，就跟着这一轮的历史记录走——回传历史时 chatWireContent 得原样
+    // 透传这个数组，不能 String() 它（那正是多轮场景"第 2 轮不能把第 1 轮的图拍成乱码"
+    // 这条测试要卡住的地方）。
+    const imgParts = chatBuildImageParts();
+    const content = imgParts.length
+        ? [{ type: 'text', text: String(text == null ? '' : text) }].concat(imgParts)
+        : String(text == null ? '' : text);
+    ChatState.messages.push({ role: 'user', content: content });
     chatAppendRow('user', text);
     chatUpdateBar();
 }
@@ -26034,6 +26246,155 @@ function chatStop() {
             try { ChatState.abort.abort(); } catch (e) {}
         }
     } catch (e) {}
+}
+
+// —— 附件（v2 Pass P163）——
+// 生命周期：贴图/选图/拖拽 → chatAddAttachmentFiles 读成 dataURL 存进
+// ChatState.pendingAttachments → chatRenderAttachBar 画缩略图条 → chatSend 里
+// chatPushUser/chatAssembleTurn 各自读一次组装成请求 → 两边都组装完之后 chatSend
+// 显式调用 chatClearAttachments 清空。不是"发送成功"才清——中止/失败时图片和草稿
+// 文本走同一条既有行为（草稿在点发送那一刻就已经清空了输入框），不特殊挽留。
+
+// 三家各自的 supportsVision 判定（设计稿第三节结论）：
+//   · local：读 xportCapsPeek(...).vision——LM Studio 专有 /api/v1/models 端点已经
+//     在查（聊天参数条一直在用同一个函数展示别的能力芯片），只是以前没接到"能不能发图"
+//     这个行为上。
+//   · qwen：DashScope 没有运行时能力发现端点，只能走 MODEL_CAPS.qwen[id] 那张手工表
+//     （跟 thinking 字段同一种先例）。
+//   · gemini：官方没有按模型返回"是否支持视觉"的元数据，但现役对话模型全部原生支持
+//     图像输入（多模态是模型基座能力），所以"通过 isGeminiTextChatModelId 判定"本身
+//     即视为支持视觉——这条已经在筛掉"gemini-pro-vision"这类图像专用/非文本模型
+//     （GEMINI_NON_TEXT_DENY 含 vision 关键字），剩下能通过的都是正常对话模型。
+function chatSupportsVision(provider, model) {
+    try {
+        if (provider === 'gemini') return isGeminiTextChatModelId(model);
+        if (provider === 'qwen') {
+            const caps = getModelCaps('qwen', model);
+            return !!(caps && caps.vision);
+        }
+        if (provider === 'local') {
+            // xportCapsPeek 三态：undefined=这台 origin 还没查过缓存，null=查到了但这个
+            // model 不在返回列表里，两者都当"不支持"处理——附件按钮禁用取保守方向，
+            // 宁可让真支持视觉的本地模型多点一次「刷新能力」，也不要让不支持的模型
+            // 贴了图才在发送时才收到 400（任务书明确要求"赶在用户贴图之前"）。
+            const caps = xportCapsPeek(AppState.localBaseUrl, model);
+            return !!(caps && caps.vision);
+        }
+        return false; // openai/claude 不在本任务范围（设计稿明确排除，也不会有按钮可点）
+    } catch (e) { return false; }
+}
+
+// 附件条上的目的地一行提示——非阻塞展示，不是每次都要点的确认弹窗（任务书第 6 条，
+// 已单独报给用户；如果要改强度会另行通知）。
+function chatAttachDestText(provider) {
+    if (provider === 'gemini') return '将发送至 Gemini（Google 云端）';
+    if (provider === 'qwen') return '将发送至 Qwen（阿里云）';
+    if (provider === 'local') return '将发送至本地 LM Studio';
+    return '';
+}
+
+// File → {dataUrl, w, h}。FileReader 读 base64，Image 解出像素尺寸（chatEstImageTokens
+// 要用）；任一步失败就 reject，调用方（chatAddAttachmentFiles）负责用一行系统消息
+// 告诉用户，不静默吞掉。
+function chatReadImageFile(file) {
+    return new Promise(function (resolve, reject) {
+        const reader = new FileReader();
+        reader.onerror = function () { reject(new Error('读取图片文件失败：' + (file && file.name || ''))); };
+        reader.onload = function () {
+            const dataUrl = String(reader.result || '');
+            const img = new Image();
+            img.onerror = function () { reject(new Error('解析图片尺寸失败：' + (file && file.name || ''))); };
+            img.onload = function () {
+                resolve({ dataUrl: dataUrl, w: img.naturalWidth || 0, h: img.naturalHeight || 0 });
+            };
+            img.src = dataUrl;
+        };
+        reader.readAsDataURL(file);
+    });
+}
+
+// 校验 + 读取 + 入队一步做完。files 可以是 <input type=file>.files（FileList）也可以是
+// 拖拽/粘贴事件里取出来的 File 数组——两者都有 length + 下标访问，够用，不需要转数组。
+async function chatAddAttachmentFiles(files) {
+    if (!files || !files.length) return;
+    const list = ChatState.pendingAttachments || (ChatState.pendingAttachments = []);
+    for (let i = 0; i < files.length; i++) {
+        const f = files[i];
+        if (!f) continue;
+        if (list.length >= CHAT_IMG_MAX_COUNT) {
+            chatAppendRow('system', '一次最多附加 ' + CHAT_IMG_MAX_COUNT + ' 张图片，多出的已忽略。');
+            break;
+        }
+        if (CHAT_IMG_ACCEPT_TYPES.indexOf(f.type) === -1) {
+            chatAppendRow('system', '「' + (f.name || '') + '」不是 PNG/JPG，已跳过。');
+            continue;
+        }
+        if (f.size > CHAT_IMG_MAX_BYTES) {
+            chatAppendRow('system', '「' + (f.name || '') + '」超过 ' + Math.round(CHAT_IMG_MAX_BYTES / 1024 / 1024) + 'MB，已跳过。');
+            continue;
+        }
+        try {
+            const got = await chatReadImageFile(f);
+            list.push({
+                id: 'att' + (++ChatState.seq) + '_' + Date.now(),
+                name: f.name || '',
+                mimeType: f.type,
+                dataUrl: got.dataUrl,
+                w: got.w,
+                h: got.h
+            });
+        } catch (e) {
+            chatAppendRow('system', '「' + (f.name || '图片') + '」读取失败：' + (e && e.message || e));
+        }
+    }
+    chatRenderAttachBar();
+    chatUpdateBar();
+}
+
+function chatRemoveAttachment(id) {
+    ChatState.pendingAttachments = (ChatState.pendingAttachments || []).filter(function (a) { return a.id !== id; });
+    chatRenderAttachBar();
+    chatUpdateBar();
+}
+
+// 只应该在 chatSend 组装完这一轮**之后**调用（见 chatSend 里 chatAssembleTurn 之后的
+// 调用点注释）——组装之前清掉就等于图片从没发生过。
+function chatClearAttachments() {
+    ChatState.pendingAttachments = [];
+    chatRenderAttachBar();
+}
+
+// 缩略图条 + 目的地提示。没有待发附件时整块 hidden（不留空隙，不是显示一个空条）。
+function chatRenderAttachBar() {
+    const bar = document.getElementById('aiChatAttachBar');
+    if (!bar) return;
+    const atts = ChatState.pendingAttachments || [];
+    if (!atts.length) { bar.hidden = true; bar.innerHTML = ''; return; }
+    bar.hidden = false;
+    const thumbs = atts.map(function (a) {
+        return '<span class="aichat-attach-thumb" data-att-id="' + escapeAttr(a.id) + '">'
+            + '<img src="' + escapeAttr(a.dataUrl) + '" alt="">'
+            + '<button type="button" class="aichat-attach-remove" data-remove-att="' + escapeAttr(a.id) + '" title="移除这张图">×</button>'
+            + '</span>';
+    }).join('');
+    const c = chatModelChoice();
+    const dest = chatAttachDestText(c.provider);
+    bar.innerHTML = '<div class="aichat-attach-thumbs">' + thumbs + '</div>'
+        + (dest ? '<div class="aichat-attach-dest">' + escapeHtml(dest) + '</div>' : '');
+}
+
+// 附件按钮的可用性——模型不支持视觉时禁用 + 说明原因，赶在用户点了之后才发现发不出去
+// 之前（任务书明确要求）。chatUpdateBar() 已经是"模型/上下文一变就会被调用"的既有
+// 汇合点，挂在它上面不需要另外新增一套触发时机。
+function chatUpdateAttachBtnState() {
+    const btn = document.getElementById('aiChatAttachBtn');
+    if (!btn) return;
+    const c = chatModelChoice();
+    const ok = chatSupportsVision(c.provider, c.model);
+    btn.disabled = !ok;
+    btn.setAttribute('data-tip', ok
+        ? '附加图片（PNG/JPG）：点击选择、粘贴或拖拽都可以。发送前会提示这张图会发到哪个 provider。'
+        : '当前模型（' + chatModelLabel(c.provider, c.model) + '）不支持图像输入，换一个支持视觉的模型再贴图。');
 }
 
 async function chatSend() {
@@ -26078,6 +26439,13 @@ async function chatSend() {
         // 现生成一份，绝不复用上一轮那份 —— 「压缩后文档还在 / 清理后仍带全文 / 重译后带的是新文档」
         // 这三条因此是结构上成立的，不是靠谁记得刷新。
         const assembled = chatAssembleTurn(draft, true);
+        // v2 Pass P163：chatPushUser（上面已经调过）和 chatAssembleTurn（刚调完这一行）
+        // 各自独立读了一次 ChatState.pendingAttachments，分别组装出"永久存档进
+        // ChatState.messages 的那一份"和"这一轮真正发出去的 wire 里那一份"——两份内容
+        // 等价但是两个不同的对象。两边都读完了，才是清空待发附件槽位的正确时机；
+        // 提前到 chatPushUser 里面清，chatAssembleTurn 这边就会读到空数组，图片只会
+        // 进历史存档、发不出当前这一轮。
+        chatClearAttachments();
         const sys = assembled.sys;
         const wire = assembled.wire;
         const docNow = assembled.doc;
@@ -28266,7 +28634,11 @@ const CHAT_TOK_DENSE = 0.90;    // 反斜杠 / 花括号 / $ ^ _ & % # ~ [] 和�
 const CHAT_TOK_OTHER = 0.19;    // 其余（英文散文、空白、普通标点）
 const CHAT_TOK_MSG = 5;         // 每条消息的角色标记与分隔符
 const CHAT_TOK_BASE = 7;        // chat template 本身的固定头
-function chatEstTokens(s) {
+// v2 Pass P163：纯文本估算器改名，原来的 chatEstTokens(s) 逻辑逐字节原样搬进来——
+// 没有任何数值/分支改动。下面新的 chatEstTokens 只是在它前面加一层「是不是数组」的分发，
+// 所有旧调用点（永远传字符串）落到 else 分支，跟 P163 之前完全等价，这就是本任务书要求的
+// 「纯文本零回归」在估算这一侧的来源。
+function chatEstTokensText(s) {
     const str = String(s == null ? '' : s);
     let cjk = 0, dense = 0;
     for (let i = 0; i < str.length; i++) {
@@ -28281,6 +28653,82 @@ function chatEstTokens(s) {
     }
     return Math.round(cjk * CHAT_TOK_CJK + dense * CHAT_TOK_DENSE
         + (str.length - cjk - dense) * CHAT_TOK_OTHER);
+}
+
+// v2 Pass P163：content 贴图之后可能是数组（OpenAI 风格
+// [{type:'text',text},{type:'image_url',image_url:{url}}, ...]），不再总是字符串。
+// 这里是全部 11 个既有调用点唯一改动的地方：数组就分片分别估、按类型分别累加；
+// 不是数组（也就是过去这些年所有调用点的唯一实参形状）直接原样转给 chatEstTokensText，
+// 字节对字节等价于改造前的 chatEstTokens——不这样分发，数组会被上面的 String(s) 拍扁成
+// "[object Object],[object Object]"，产出的 token 数毫无意义（任务书明确点名要避免的那种垃圾估算）。
+function chatEstTokens(s) {
+    if (Array.isArray(s)) {
+        let t = 0;
+        for (let i = 0; i < s.length; i++) {
+            const part = s[i];
+            if (!part) continue;
+            if (part.type === 'image_url') t += chatEstImageTokens(part);
+            else if (typeof part.text === 'string') t += chatEstTokensText(part.text);
+        }
+        return t;
+    }
+    return chatEstTokensText(s);
+}
+
+// —— 图片附件（v2 Pass P163）——
+// 只在这三家里做：local（LM Studio）、qwen（DashScope）、gemini。设计稿第三节结论，
+// 不含 openai/claude（那两家的聊天链路是 callOpenAIAPI/callClaudeAPI，红线不许碰）。
+const CHAT_IMG_ACCEPT_TYPES = ['image/png', 'image/jpeg'];
+const CHAT_IMG_MAX_COUNT = 4;                 // 一轮最多贴 4 张——纯 UI 层限制，不是哪家 API 的硬限
+const CHAT_IMG_MAX_BYTES = 8 * 1024 * 1024;   // 单张 8MB（base64 之前），超了直接拒绝并说明原因
+// part 对象 → {w,h,mimeType} 的旁挂元数据，供 chatEstImageTokens 读尺寸。
+// 用 WeakMap 而不是直接挂在 part 上：part 会被原样 JSON.stringify 发给服务端，
+// 多出来的 w/h 字段服务端未必认识（尤其 DashScope 对 schema 比较严格）——见本任务书
+// 「不新增图像专属计价字段」同一条纪律的技术落地。part 对象自身被丢弃后 WeakMap 条目自动回收。
+const CHAT_IMG_META = new WeakMap();
+
+// v2 Pass P163：图片 token 估算——三家各自的公式（设计稿第五节结论：不新增计费字段，
+// 真实费用继续从 usage.prompt_tokens / usageMetadata.promptTokenCount 读；这里只是不让
+// chatEstTokens 在数组 content 上产出垃圾数，纯粹是"发送前大概要花多少"的显示用途）。
+//   · Gemini 官方文档：每 768×768 tile 计 258 token，不满一块按一块算（向上取整）。
+//   · Qwen（DashScope 官方公式，qwen-vl 系列文档明确给出）：h×w/(32×32)+2。
+//   · 本地（LM Studio）：**没有官方公式**——不同 vision 模型（llava/qwen2-vl/gemma3 等等）
+//     用的视觉编码器互不相同，无法像 Gemini/Qwen 那样引用一份"官方公式"，沿用 Qwen 的公式
+//     只是"总比 String([object Object]) 强"的一个近似值。UI 上这个数字的既有显示惯例
+//     本来就统一带 "≈" 前缀（chatFmtNum 调用点，见 chatSend 里的 pending.tokEl），如实
+//     标记着"这是估算不是精确值"，不需要另外发明一套"约"字样的展示逻辑。
+function chatEstImageTokens(part) {
+    try {
+        const meta = CHAT_IMG_META.get(part) || {};
+        const w = Number(meta.w) || 0;
+        const h = Number(meta.h) || 0;
+        if (!w || !h) return 258; // 拿不到尺寸时给一个保守的单 tile 值——绝不能是 0，0 会让面板显得"这张图不占地方"。
+        const provider = (chatModelChoice() || {}).provider;
+        if (provider === 'gemini') {
+            const tilesX = Math.max(1, Math.ceil(w / 768));
+            const tilesY = Math.max(1, Math.ceil(h / 768));
+            return tilesX * tilesY * 258;
+        }
+        // qwen 与 local 共用同一条 DashScope 公式（local 没有官方公式可引用，见上面大注释）。
+        return Math.round((h * w) / (32 * 32)) + 2;
+    } catch (e) { return 258; }
+}
+
+// ChatState.pendingAttachments → OpenAI 风格 image_url part 数组。
+// 本仓库已有先例（ovlP2TCallVision 用的就是这个形状），local/qwen 两条 OpenAI 兼容链路
+// 直接把这个数组接在 content 后面即可；Gemini 不吃这个形状，chatCallGemini 内部另外
+// 转一次（见该函数新增的 chatGeminiPartsFromContent），两边各自转换、互不影响对方格式。
+function chatBuildImageParts() {
+    const atts = ChatState.pendingAttachments || [];
+    const parts = [];
+    for (let i = 0; i < atts.length; i++) {
+        const a = atts[i];
+        if (!a || !a.dataUrl) continue;
+        const part = { type: 'image_url', image_url: { url: a.dataUrl } };
+        CHAT_IMG_META.set(part, { w: a.w || 0, h: a.h || 0, mimeType: a.mimeType || '' });
+        parts.push(part);
+    }
+    return parts;
 }
 
 // chat template 本身的固定开销（角色标记 + 分隔符）。上面那组差分量出来的：
@@ -28566,8 +29014,16 @@ function chatAssembleTurn(draft, pushed) {
     const tail = (focusBlock ? focusBlock + '\n\n' : '') + chatBuildTargetTurn(draft, !doc.on);
     const full = (doc.on ? doc.text + '\n\n' : '') + (tree.on ? tree.text + '\n\n' : '')
         + (filesCtx.on ? filesCtx.text + '\n\n' : '') + tail;
-    if (pushed && wire.length) wire[wire.length - 1] = { role: 'user', content: full };
-    else wire.push({ role: 'user', content: full });
+    // v2 Pass P163：有待发图片（ChatState.pendingAttachments）时，这一轮的 user content
+    // 从字符串变成数组 [{type:'text',text:full}, ...imageParts]；没有附件时 imgParts.length
+    // 恒为 0，content 落回原来那个纯字符串 full——这一处三元判断就是"纯文本零回归"在
+    // chatAssembleTurn 这一层的全部改动，上面 doc/tree/files/focus 的拼接逐字节未动。
+    // pushed 是 false（chatCtxReadout 的"下一轮大约要花多少"估算路径）时也要走这条分支，
+    // 否则贴了图但还没点发送的这段时间，估算环会对着一张已经贴上的图视而不见。
+    const imgParts = chatBuildImageParts();
+    const content = imgParts.length ? [{ type: 'text', text: full }].concat(imgParts) : full;
+    if (pushed && wire.length) wire[wire.length - 1] = { role: 'user', content: content };
+    else wire.push({ role: 'user', content: content });
     let hist = 0;
     for (let i = 0; i < wire.length - 1; i++) hist += chatEstTokens(wire[i].content);
     // 【推理自成一项】开着「回传思考」时，chatWireContent 会把上一轮的推理原样塞回历史里，
@@ -28590,7 +29046,12 @@ function chatAssembleTurn(draft, pushed) {
             files: filesCtx.on ? filesCtx.tokens : 0,
             history: Math.max(0, hist - reasoningBack),
             reasoning: reasoningBack,
-            draft: chatEstTokens(tail)
+            draft: chatEstTokens(tail),
+            // v2 Pass P163：待发图片单独一项，不掺进 draft——理由跟上面 files 那一项的注释
+            // 是同一条：把图片 token 埋进"本轮提问"会让分解面板显得像是用户自己打了很长的字。
+            // imgParts 是数组，chatEstTokens 会走新加的数组分发分支按 image_url part 类型求和；
+            // 没有附件时 imgParts 是空数组，chatEstTokens([]) 返回 0，恒定不影响原有总量。
+            images: chatEstTokens(imgParts)
         }
     };
 }
@@ -28623,7 +29084,10 @@ function chatPartsSum(p) {
     if (!p) return 0;
     return (Number(p.system) || 0) + (Number(p.document) || 0) + (Number(p.tree) || 0)
          + (Number(p.files) || 0)
-         + (Number(p.history) || 0) + (Number(p.reasoning) || 0) + (Number(p.draft) || 0);
+         + (Number(p.history) || 0) + (Number(p.reasoning) || 0) + (Number(p.draft) || 0)
+         // v2 Pass P163：p.images 在贴图之前的所有历史调用点上都是 undefined ⇒ Number(undefined)||0
+         // ⇒ 0，对总量零影响；只有 chatAssembleTurn 新增的 images 字段会让它非零。
+         + (Number(p.images) || 0);
 }
 
 // 当前上下文的「身份」。和上一次实测时的身份一致 ⇒ 环继续显示那个实测值；只要有一处变了
@@ -28772,6 +29236,11 @@ function chatUpdateBar() {
         try { focusRenderChip(); } catch (eF) {}
         // v2 Pass P115：文件级「正在关注」清单同一条纪律，紧挨着句子级清单一起刷新。
         try { if (typeof fileWatchRenderChip === 'function') fileWatchRenderChip(); } catch (eFW) {}
+        // v2 Pass P163：附件条 + 附件按钮可用性同一条纪律——模型/provider 一变
+        // （chatUpdateBar 本来就是这类变化的既有汇合点），目的地提示文案和"这个模型
+        // 还支不支持视觉"都要跟着重算，不能等到用户点了按钮才发现过时。
+        try { chatRenderAttachBar(); } catch (eAB) {}
+        try { chatUpdateAttachBtnState(); } catch (eAS) {}
         const ro = chatCtxReadout();
 
         bar.innerHTML = '<div class="aichat-ctxrow">'
