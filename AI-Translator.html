@@ -2393,6 +2393,11 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 }
 .ovl-visual-fig-icon { font-size: 22px; opacity: 0.6; }
 .ovl-visual-fig-name { margin-top: 6px; font-size: 11.5px; color: #6b7280; word-break: break-all; text-align: center; }
+/* v2 Pass P167（H-A 次要诉求）：.eps 等"认识但前端确定渲不了"的格式，通用图标占位框容易被
+   误读成"路径解析失败/破图"——这里换成写明原因的小字文案，跟下面 .ovl-visual-fig-name
+   （文件名）分两行显示，不复用 .ovl-visual-fig-icon 的 22px 大字号（那是给单字符图标用的，
+   一整句话会太挤）。 */
+.ovl-visual-fig-unsupported-note { font-size: 11.5px; color: #6b7280; text-align: center; line-height: 1.4; }
 /* v2 Pass P18：真缩略图（<img>，raster/svg 直连 /project-asset，PDF 是 pdf.js 渲染出的
    data URL）替换掉图标那一格，文件名说明文字保持不变——跟旧占位框视觉上是"同一个盒子
    升级"，不是另起一套样式。 */
@@ -4630,7 +4635,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.29.03';        // APP_VERSION_STAMP
+const APP_VERSION = '03.29.04';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-12';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -33991,6 +33996,24 @@ function ovlApplyFigureThumb(box, result) {
     icon.replaceWith(img);
 }
 
+// v2 Pass P167（H-A 次要诉求，跟根因修复一起处理但相互独立）：.eps 从 P77 起就是"已知但前端
+// 确定渲不了"的格式（见上面 ovlFigureCandidatePaths 注释——不产出候选，维持占位框），不引入
+// 任何第三方 EPS 渲染库，只是把"维持占位框"从沉默的通用图标换成写明原因的文字，避免用户把
+// "这本来就渲染不了"误读成"路径解析失败"。只在 ovlVisualLoadFigureThumbnails 里对 .eps 短路
+// 生效，不改 ovlFigureCandidatePaths/ovlResolveOneFigureCandidate/ovlApplyFigureThumb 的既有
+// 契约——其它格式（含 .tikz 等同样"认识但渲不了"的扩展名）行为一个字节不变，仍然是原始的
+// 图标+文件名占位框。
+function ovlApplyFigureUnsupportedNote(box) {
+    if (!box) return;
+    if (box.querySelector('.ovl-visual-fig-thumb') || box.querySelector('.ovl-visual-fig-unsupported-note')) return;
+    const icon = box.querySelector('.ovl-visual-fig-icon');
+    if (!icon) return;
+    const note = document.createElement('div');
+    note.className = 'ovl-visual-fig-unsupported-note';
+    note.textContent = 'EPS 无法在 Visual 中预览，编译后可见';
+    icon.replaceWith(note);
+}
+
 // Visual 面板整篇重渲染之后调用一次：扫一遍这次渲染里所有待解析的占位框，异步补真缩略图。
 // 不阻塞——ovlVisualRender() 已经把占位框同步画完并返回了，这里全是 fire-and-forget 的
 // then() 回调，回调触发时该 box 如果因为用户又敲了字导致整篇重渲染而已经不在 DOM 里
@@ -34005,8 +34028,11 @@ function ovlVisualLoadFigureThumbnails(root) {
     // v2 Pass P60：baseDir 取自当前正在渲染的文件（Visual 面板渲染的一定是当前打开的这一个
     // 文件，两个调用点——ovlVisualRender() 末尾 / ovlInlineSrcRerenderLocal()——都是如此，
     // 不存在一个 pane 里混着多个来源文件的情况，所以读 OvlState.currentFile 是正确且充分的。
-    // OvlOpenFileFromBlob() 建的 currentFile 没有 relPath 字段（webkitdirectory 只读降级模式）
-    // ——用 name 兜底，兜底不到就是空字符串，等价于回到 P18 旧行为（老项目零回归）。
+    // v2 Pass P167（根因修复）：OvlOpenFileFromBlob() 建的 currentFile 曾经没有 relPath 字段
+    // （webkitdirectory 只读降级模式），这里的 cf.name 兜底会退化成裸文件名、baseDir 算成
+    // 项目根，导致子目录 .tex 引用的图一律按错误目录解析。现在 ovlDomFromFsNode 的叶子点击
+    // 会把树里已知的目录前缀一起传给 ovlOpenFileFromBlob，currentFile.relPath 正常带值；下面
+    // 这条 cf.name 兜底只在真拿不到 relPath 时才生效，保留是防御性写法，不是本 Pass 的主路径。
     const cf = (typeof OvlState !== 'undefined') && OvlState && OvlState.currentFile;
     const curRel = (cf && (cf.relPath || cf.name)) || (typeof OvlState !== 'undefined' && OvlState.mainDocFile) || '';
     const baseDir = ovlDirnameRel(curRel);
@@ -34016,6 +34042,7 @@ function ovlVisualLoadFigureThumbnails(root) {
         boxes.forEach(function (box) {
             const relPath = box.getAttribute('data-fig-src');
             if (!relPath) return;
+            if (ovlFigThumbExt(relPath) === 'eps') { ovlApplyFigureUnsupportedNote(box); return; } // P167：见上方 ovlApplyFigureUnsupportedNote 注释
             const outcome = ovlGetFigureThumb(projectDir, baseDir, relPath, extraDirs);
             if (outcome && typeof outcome.then === 'function') {
                 outcome.then(function (result) { if (box.isConnected) ovlApplyFigureThumb(box, result); });
@@ -40144,8 +40171,21 @@ function ovlBuildTreeFromFileList(fileList) {
     const root = { dirs: new Map(), files: new Map() };
     for (let i = 0; i < fileList.length; i++) {
         const f = fileList[i];
-        const relPath = f.webkitRelativePath || f.name;
-        const parts = String(relPath).split('/').filter(function (p) { return p.length > 0; });
+        // v2 Pass P167（根因修复，H-B 关联发现）：webkitdirectory 选择器给出的 webkitRelativePath
+        // 规范上永远带着"用户选中的那个文件夹自己的名字"作为第一段（比如选了 myproj 文件夹，
+        // 每个文件的 webkitRelativePath 都是 "myproj/xxx..."），但 #ovlProjectPathInput 的契约
+        // （30457 行 placeholder"项目绝对路径"，跟 FSA 模式 ovlAutoFillProjectPath 填的是同一件
+        // 事——被选中那个文件夹自己的绝对路径）要求这里算出的 relPath 相对被选中文件夹本身，
+        // 不含它自己的名字这一层。不去掉会让 ovlOpenFileFromBlob 里新补的 relPath/baseDir 比
+        // 正确值多出一层，跟用户实际填的 projectDir 对不上——这条链路直接决定关联的 H-B 根因
+        // 修复在真实浏览器里是否真的生效，不能假设调用方会处理。没有 webkitRelativePath（理论上
+        // 不会发生在真正的目录选择器上，防御性兜底）时按旧行为用 f.name 原样，不做任何切分。
+        let relPath = String(f.webkitRelativePath || f.name);
+        if (f.webkitRelativePath) {
+            const firstSlash = relPath.indexOf('/');
+            if (firstSlash !== -1) relPath = relPath.slice(firstSlash + 1);
+        }
+        const parts = relPath.split('/').filter(function (p) { return p.length > 0; });
         if (parts.some(function (p) { return p.charAt(0) === '.'; })) continue;
         let node = root;
         for (let j = 0; j < parts.length - 1; j++) {
@@ -40158,7 +40198,13 @@ function ovlBuildTreeFromFileList(fileList) {
     return root;
 }
 
-function ovlDomFromFsNode(node) {
+function ovlDomFromFsNode(node, relPrefix) {
+    // v2 Pass P167（根因修复，H-B）：relPrefix 是"到这个子树为止已经走过的目录路径"（非空时
+    // 末尾带 '/'，根节点调用不传即为空串），往目录下钻递归时累加一层——这样每个叶子文件行
+    // 点击时能带上自己真正的项目内相对路径，而不是像旧版那样只有裸文件名。node.dirs/
+    // node.files 这棵树从 ovlBuildTreeFromFileList 建好那一刻就已经知道完整目录结构（靠的是
+    // f.webkitRelativePath），这里只是把已经有的信息带到叶子点击回调里，不是新增推断逻辑。
+    const prefix = relPrefix || '';
     const ul = document.createElement('ul');
     ul.className = 'ovl-tree-ul';
     const dirNames = Array.from(node.dirs.keys()).sort();
@@ -40170,7 +40216,7 @@ function ovlDomFromFsNode(node) {
         row.className = 'ovl-tree-row ovl-tree-row-dir';
         row.textContent = '▸ ' + name;
         li.appendChild(row);
-        const childUl = ovlDomFromFsNode(node.dirs.get(name));
+        const childUl = ovlDomFromFsNode(node.dirs.get(name), prefix + name + '/');
         childUl.className += ' ovl-tree-children';
         li.appendChild(childUl);
         row.addEventListener('click', function () {
@@ -40186,14 +40232,14 @@ function ovlDomFromFsNode(node) {
         const row = document.createElement('div');
         row.className = 'ovl-tree-row ovl-tree-row-file';
         row.textContent = name;
-        row.addEventListener('click', function () { ovlOpenFileFromBlob(node.files.get(name), name); });
+        row.addEventListener('click', function () { ovlOpenFileFromBlob(node.files.get(name), name, prefix + name); });
         li.appendChild(row);
         ul.appendChild(li);
     });
     return ul;
 }
 
-async function ovlOpenFileFromBlob(file, name) {
+async function ovlOpenFileFromBlob(file, name, relPath) {
     try {
         // v2 Pass P159-fix（FIX-3，本会话新发现的一处旁路）：webkitdirectory 只读降级模式下，
         // 在文件树里点开另一个文件走的是这条路径——跟 ovlOpenFile 一样会直接把 #ovlCodeArea
@@ -40205,7 +40251,13 @@ async function ovlOpenFileFromBlob(file, name) {
             return;
         }
         const text = await file.text();
-        OvlState.currentFile = { name: name, handle: null };
+        // v2 Pass P167（根因修复，H-B）：曾经这里恒为 { name, handle:null }，不带 relPath——
+        // ovlVisualLoadFigureThumbnails 里 baseDir 的计算靠 cf.relPath 兜底到 cf.name，裸文件名
+        // 没有 '/'，ovlDirnameRel 算出空字符串，等价于把子目录 .tex 的图片引用错误地按项目根
+        // 解析（根目录文件恰好 baseDir 本来就该是空串，所以只有子目录场景会暴露）。现在调用方
+        // （ovlDomFromFsNode 叶子点击）已经把树里已知的目录前缀一起传进来，relPath || name 这条
+        // 兜底链跟 ovlOpenFile 里 39985 行那条写法保持一致，不是另发明一套。
+        OvlState.currentFile = { name: name, relPath: relPath || name, handle: null };
         try { if (OvlVisualLangState.failLog) OvlVisualLangState.failLog.clear(); } catch (e) {} // v2 Pass P128（C1，卫生清理）
         const ta = document.getElementById('ovlCodeArea');
         // webkitdirectory 只读、无持久化 —— 明确禁用编辑，避免用户以为改了会存下去。
