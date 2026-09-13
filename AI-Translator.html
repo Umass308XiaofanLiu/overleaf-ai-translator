@@ -4804,7 +4804,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.30.04';        // APP_VERSION_STAMP
+const APP_VERSION = '03.30.05';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-13';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -9678,12 +9678,60 @@ function ovlRenderTextColor(str, placeholders) {
     return out;
 }
 
+// v2 Pass P168：公式编号模块级开关——只在 ovlVisualRenderBodyWithLines 处理"整份内容"
+// （全文渲染 or 已排除编号环境的局部 patch，见该函数与 ovlInlineSrcRerenderLocal 内注释）期间
+// 被置成一个 {n:0} 计数器对象，渲染完（含异常路径）立刻在 finally 里清回 null。仿照
+// OvlXrefState"唯一模块级单例、不逐层传参"的先例——不改 renderFormattedText 的调用签名，
+// 也不用给 ovlVisualRenderChunk/ovlVisualRenderBlockContent 的十几个调用点都加新参数。为 null
+// 时（聊天气泡、逐句对照卡片、选区翻译弹窗等所有其它调用点，以及此模块自身未激活时）
+// 完全不编号——跟这些调用点改动前的行为一致，不会被主文档的计数器误吃号。
+let OvlEqNumCounter = null;
+
+// v2 Pass P168：给可编号的数学环境按 §4F 规则手工分配/插入 \tag{N}。
+// 背景：探针实测（.claude/tmp/p168_impl.md）KaTeX 0.16.9 并不会给未写 \tag 的编号环境自动
+// 填数字——tag 列渲染出来是空白 vlist，占位但没有可见文字；\tag{X}/\tag*{X} 本身渲染正常
+// （含星号环境内部）。因此编号只能自己在喂给 KaTeX 之前拼进公式源码里，绝不会写回 .tex
+// （body 只是这次渲染用的临时字符串）。
+// 规则：\nonumber/\notag 命中的行跳过、不占号；已经自带 \tag{...}/\tag*{...} 的行用用户自己
+// 的 tag、不占号（§4F"\tag 不消耗计数器"）；multline 语义上是"一个公式跨多物理行"，整块只占
+// 一个号，标在最后一行末尾；equation 当成单行处理；align/gather/alignat 按顶层 \\ 逐行拆分、
+// 逐行占号（flalign/eqnarray 走 KaTeX 不认识这两个环境的兜底路径，只借这个函数算号，不借它
+// 拼 \tag，见下方 flalign/IEEEeqnarray 兜底分支）。
+function ovlEqNumAssign(env, body, counterState) {
+    const hasOwnTag = (line) => /\\tag\*?\s*\{/.test(line);
+    const numbers = [];
+    if (env === 'multline') {
+        if (ovlXrefLineHasNoNumber(body) || hasOwnTag(body)) return { numbers: numbers, taggedBody: body };
+        counterState.n++;
+        numbers.push(counterState.n);
+        const mlLines = body.split(/\\\\/);
+        mlLines[mlLines.length - 1] = mlLines[mlLines.length - 1] + '\\tag{' + counterState.n + '}';
+        return { numbers: numbers, taggedBody: mlLines.join('\\\\') };
+    }
+    const rowLines = (env === 'equation') ? [body] : body.split(/\\\\/);
+    for (let ri = 0; ri < rowLines.length; ri++) {
+        const line = rowLines[ri];
+        if (!line.trim()) continue;
+        if (ovlXrefLineHasNoNumber(line) || hasOwnTag(line)) continue;
+        counterState.n++;
+        numbers.push(counterState.n);
+        rowLines[ri] = line + '\\tag{' + counterState.n + '}';
+    }
+    return { numbers: numbers, taggedBody: (env === 'equation') ? rowLines[0] : rowLines.join('\\\\') };
+}
+
 // 渲染格式化文本（支持Markdown和LaTeX）
 // v2 Pass P158：新增第 2 个可选参数 xrefCtx——不传（undefined/null，聊天气泡/逐句对照卡片/
 // ovlRenderTextColor 内部递归调用等既有全部调用点都不传）时，label/tag/eqref/autoref/ref 照旧
 // 整段 stripCommand 删除、cite 系照旧原样透传，逐字节保持改动前行为。只有 Visual 渲染管线
 // （ovlVisualRenderChunk 及其内部 fallback 分支）显式传入 OvlXrefState 才会启用引用编号解析
 // （见 .claude/tmp/p158_design.md §7.2、§5.2）。
+// v2 Pass P168：label 照旧整段 stripCommand；tag 不再无条件 strip——不然编号环境内用户自己写的
+// \tag{X}/\tag*{X} 会在数学占位符提取之前就被删掉，永远看不到，也没法用来判断"这行不占计数器"
+// （见 ovlEqNumAssign）。只有 OvlEqNumCounter 处于非编号语境的调用点（未传 xrefCtx 那批）会因为
+// 不再 strip 而多出一种边界情况：正文散文里孤立出现、且从没被 \begin{...} 数学占位符捞走的裸
+// \tag{...}，之前会被删掉、现在原样漏出来——真实 LaTeX 里 \tag 只在编号数学环境内合法，这种
+// 情况理论上不该出现在正常文档里，本次改动记作已知取舍，不新增专门处理。
 function renderFormattedText(text, xrefCtx) {
     if (!text || !window.marked || !window.katex) return text || '';
 
@@ -9701,7 +9749,9 @@ function renderFormattedText(text, xrefCtx) {
     // \u4E0B\u9762 pushPlaceholder \u5185\u90E8\u5BF9 formula \u53D8\u91CF\u7684\u540C\u540D stripCommand \u8C03\u7528\u5BF9\u5DF2\u7ECF\u5E72\u51C0\u7684\u6587\u672C\u662F\u7A7A\u64CD\u4F5C\uFF0C
     // \u4E0D\u4F1A\u4E8C\u6B21\u8BEF\u4F24\u6216\u4EA7\u751F\u526F\u4F5C\u7528\u3002
     content = stripCommand(content, 'label');
-    content = stripCommand(content, 'tag');
+    // v2 Pass P168：不再无条件 strip tag——见函数顶部注释，编号环境里的 \tag{X}/\tag*{X}
+    // 要留到 pushPlaceholder 里判断"这一行占不占计数器"，再决定是保留（用户自己的 tag）
+    // 还是（走不到这里，因为已经保留）额外插入 \tag{N}。
 
     const placeholders = [];
 
@@ -9712,7 +9762,9 @@ function renderFormattedText(text, xrefCtx) {
             let formula = getFormula(...args);
             formula = cleanLatex(formula);
             formula = stripCommand(formula, 'label');
-            formula = stripCommand(formula, 'tag');
+            // v2 Pass P168：tag 不再在这里 strip——理由同函数顶部注释；\tag 是否保留/是否要
+            // 额外插入 \tag{N} 在下面 pushPlaceholder 的具体环境回调（§4F 编号规则）里处理，
+            // 这里的 formula 变量到达那个回调之前不会再被这条 stripCommand 删过。
             // v2 Pass P14：这个版本的 KaTeX 压根没实现 \ref/\eqref/\autoref（跨文档交叉引用，
             // 依赖 LaTeX 编译时的 aux 文件，单条公式独立渲染天生做不到，KaTeX 直接
             // "Undefined control sequence"）——实测一条引用了自己文档内其他公式 label 的
@@ -9773,32 +9825,56 @@ function renderFormattedText(text, xrefCtx) {
     // 对不带这个参数的环境（cases 等）该捕获组匹配空字符串，等价于没加过；即使正则贪婪地
     // 把 body 本该开头的一个裸 `{...}` 误判成"列参数"，重新拼接后落地位置跟没摘之前完全
     // 一样，不影响渲染结果，不需要为"区分真列参数 vs 碰巧开头的花括号"专门写判断逻辑。
-    pushPlaceholder(/\\begin\{(equation|align|gather|multline|eqnarray|alignat|cases|dcases|rcases)(\*?)\}(\{[^{}]*\})?([\s\S]*?)\\end\{\1\2\}/g, 'display', (match, env, star, colSpec, body) => {
+    // v2 Pass P168：multline/eqnarray 从这条白名单里挪走——探针实测（.claude/tmp/p168_impl.md）
+    // KaTeX 0.16.9 压根不认识这两个环境（katex/dist/katex.js 源码里搜 "multline"/"eqnarray"
+    // 都是 0 处命中，不是没测到而是真没实现），转成星号版一样会抛 "No such environment"，
+    // 改动前会被 catch(e) 兜到 `html: match`——把原始未转义的反斜杠源码直接当 HTML 插回
+    // DOM，是一个改动前就存在、这次顺带发现的漏洞（不是本次新引入）。这两个环境改走下面
+    // flalign/IEEEeqnarray 那条"已知不支持、显示转义源码"的诚实兜底，一并解决。
+    pushPlaceholder(/\\begin\{(equation|align|gather|alignat|cases|dcases|rcases)(\*?)\}(\{[^{}]*\})?([\s\S]*?)\\end\{\1\2\}/g, 'display', (match, env, star, colSpec, body) => {
         // cases/dcases/rcases 在 amsmath 里从来不参与编号，没有"去编号转星号"这回事——
         // 强行拼一个 cases*/dcases*/rcases* 是 mathtools 才有的扩展变体名，不保证 KaTeX
         // 认识（会把现在能正常渲染的 cases 改坏成渲染失败），原样保留环境名不动。
-        // 其余（equation/align/gather/multline/eqnarray/alignat）未加星号（带编号）的
-        // 一律转换成加星号版本——Visual 模式是只读预览，公式编号跟正文里的 \eqref/\ref
-        // 没有意义，且编号状态在这里维护不了；alignat/alignat* 探针已验证两种都能正常渲染。
         const isCasesFamily = (env === 'cases' || env === 'dcases' || env === 'rcases');
-        const noNumberEnv = isCasesFamily ? (env + (star || '')) : (env + (star || '*'));
         body = (colSpec || '') + body;
-        return `\\begin{${noNumberEnv}}${body}\\end{${noNumberEnv}}`;
+        // v2 Pass P168：equation/align/gather/alignat 不再强制转星号——探针实测 KaTeX 0.16.9
+        // 对这四个环境本身是否加星号不影响是否显示编号（未加 \tag 时星号/非星号都不会自动
+        // 填数字，见函数顶部 ovlEqNumAssign 注释），这里保留原始星号状态只是为了让
+        // ovlEqNumAssign 能用"有没有星号"判断"这一段要不要占计数器"（§4F：星号变体不编号）。
+        // OvlEqNumCounter 为 null（未处于 ovlVisualRenderBodyWithLines 渲染期间的所有其它
+        // 调用点，见该模块级变量顶部注释）时完全不插 \tag，逐字节维持这些调用点改动前的
+        // 观感（不显示编号）。
+        if (!isCasesFamily && !star && OvlEqNumCounter) {
+            body = ovlEqNumAssign(env, body, OvlEqNumCounter).taggedBody;
+        }
+        const outEnv = env + (star || '');
+        return `\\begin{${outEnv}}${body}\\end{${outEnv}}`;
     });
-    // flalign/IEEEeqnarray：探针实测 KaTeX 0.16.9 真不认识这两个环境名（见上方大段注释）。
-    // 不裸露源码（现状的"没匹配上、原样进 marked 段落流"）、也不硬喂给 KaTeX 生成一个
-    // 刺眼的红色 "No such environment" ParseError——改成一条独立的"已知格式受限"兜底：
-    // 转义后用等宽字体的说明框包起来展示，明确标注环境名和"暂不支持渲染"，让用户看得出
-    // 这是"这一种排版格式受限"，不是"翻译/渲染出错了"。IEEEeqnarray 的列格式参数
+    // flalign/IEEEeqnarray/multline/eqnarray：探针实测 KaTeX 0.16.9 真不认识这四个环境名
+    // （IEEEeqnarray/flalign 见上方大段旧注释；multline/eqnarray 是本次 P168 新测出的同类
+    // 问题）。不裸露源码（旧版"没匹配上、原样进 marked 段落流"）、也不硬喂给 KaTeX 生成一个
+    // 刺眼的红色 "No such environment" ParseError——统一走"已知格式受限"兜底：转义后用等宽
+    // 字体的说明框包起来展示，明确标注环境名和"暂不支持渲染"。IEEEeqnarray 的列格式参数
     // （如 `{rCl}`）跟环境名之间没有花括号数量歧义（这条兜底整体保留原始文本，不拆列参数），
     // 不需要额外处理。
-    content = content.replace(/\\begin\{(flalign|IEEEeqnarray)(\*?)\}(\{[^{}]*\})?([\s\S]*?)\\end\{\1\2\}/g, (rawMatch, envName) => {
+    // v2 Pass P168：flalign/multline/eqnarray 仍在 §4F 编号范围内（IEEEeqnarray 不在，本来
+    // 就不参与编号，不用管星号）——KaTeX 没法渲染就没法用 \tag 让它自己在正确基线上显示号，
+    // 只能退化成在说明文字里把这一块占用的号列出来（不追求跟公式基线像素对齐，是明确记录
+    // 的降级，不是遗漏）。numbers 仍然要真实消耗 OvlEqNumCounter，不然后面挨着的可渲染环境
+    // 编号会重复/错位。
+    content = content.replace(/\\begin\{(flalign|IEEEeqnarray|multline|eqnarray)(\*?)\}(\{[^{}]*\})?([\s\S]*?)\\end\{\1\2\}/g, (rawMatch, envName, star, colSpec, body) => {
         const id = `%%LATEX_${placeholders.length}%%`;
         const esc = String(rawMatch).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        let numNote = '';
+        if (envName !== 'IEEEeqnarray' && !star && OvlEqNumCounter) {
+            const assigned = ovlEqNumAssign(envName, body, OvlEqNumCounter).numbers;
+            if (assigned.length === 1) numNote = '，对应编号 (' + assigned[0] + ')';
+            else if (assigned.length > 1) numNote = '，对应编号 ' + assigned.map((n) => '(' + n + ')').join(' ');
+        }
         placeholders.push({
             id,
             html: '<div class="ovl-math-unsupported"><div class="ovl-math-unsupported-note">KaTeX 暂不支持 '
-                + envName + ' 环境的渲染，以下为原始 LaTeX 源码</div><pre class="ovl-math-unsupported-src">' + esc + '</pre></div>'
+                + envName + ' 环境的渲染' + numNote + '，以下为原始 LaTeX 源码</div><pre class="ovl-math-unsupported-src">' + esc + '</pre></div>'
         });
         return id;
     });
@@ -37713,6 +37789,16 @@ function ovlNumComputeForBlock(blockText, numState) {
 
 function ovlVisualRenderBodyWithLines(body, baseLine) {
     const blocks = ovlSplitVisualBlocks(body, baseLine);
+    // v2 Pass P168：公式编号计数器仿照上面 numState 的先例，每次调用本函数都从 0 现开
+    // 一份——本函数的两个真实调用点分别是 ovlVisualRender()（body=全文）和
+    // ovlInlineSrcRerenderLocal()（body=局部编辑片段，但该函数已经把"片段命中任一编号
+    // 环境就整篇重渲染"补进了跟标题/appendix 同一条兜底判断里，能走到这里的局部片段
+    // 保证不含编号环境），所以两种情况下从 0 起算都是对的，不需要跨调用记忆真实进度。
+    // try/finally 确保哪怕中途抛异常，也一定会把模块级开关清回 null，不留给后续无关调用
+    // （聊天气泡、选区翻译弹窗等）误吃一个"半开着"的计数器。
+    const eqCounter = { n: 0 };
+    OvlEqNumCounter = eqCounter;
+    try {
     if (!blocks.length) return ovlVisualRenderChunk(body);
     let html = '';
     const numState = { sec: 0, sub: 0, subsub: 0, appendix: false };
@@ -37732,9 +37818,21 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
             // .ovl-visual-block，永远是"段落起点"——跟旧行为（切分前）逐像素一致。
             // data-src-line/data-src-line-end/data-para-start 三个属性逐字节不变——P37 的
             // 黄色标记高亮、单击 PDF 跳转、查找跳转全靠它们，中文模式下也必须继续可用。
+            // v2 Pass P168（异步单块补丁路径补丁）：渲染前先摘一份 eqCounter.n 快照挂在
+            // data-ovl-eqnum-start 上——ovlVisualLangRunQueue 的 worker() 落地译文时走的是
+            // el.innerHTML = ovlVisualRenderChunk(tgt)（37336 行附近），完全在本函数
+            // try/finally 打开的 OvlEqNumCounter 作用域之外（那次调用早已 return、计数器已被
+            // finally 清回 null）。没有这个快照，该分支的 pushPlaceholder 判据
+            // `OvlEqNumCounter` 会直接读到 null——不是抛异常，是静默不打编号（判据本身就是
+            // `&& OvlEqNumCounter` 短路防呆），效果是"译文一落地，这块刚显示出来的编号就消失"，
+            // 同一文档里翻完的块掉编号、没翻完的块留着编号，肉眼可见地不一致。修法：把这块
+            // 开始渲染前的计数器起点存下来，worker() 落地译文前用这个起点现开一个临时计数器
+            // 复算同一批编号（见 ovlVisualLangRunQueue 里的调用点），因为翻译只换块内散文、
+            // 受保护的公式环境本身逐字节不动，起点相同就能重算出完全相同的编号序列。
+            const eqStartB = OvlEqNumCounter ? OvlEqNumCounter.n : 0;
             const rc = ovlVisualRenderBlockContent(b.text);
             html += '<div class="ovl-visual-block" data-src-line="' + b.line + '" data-src-line-end="' + blockLineEnd
-                + '" data-para-start="1"' + numAttrHtml + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
+                + '" data-para-start="1"' + numAttrHtml + ' data-ovl-eqnum-start="' + eqStartB + '"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
                 + (rc.skipped ? ' data-ovl-trans-skipped="1" title="' + escapeAttr(OVL_VISUAL_SKIPPED_TITLE) + '"' : '') + (rc.forced ? ' data-ovl-trans-forced="1"' : '')
                 + (rc.noprose ? ' data-ovl-trans-noprose="1" title="' + escapeAttr(OVL_VISUAL_NOPROSE_TITLE) + '"' : '') // v2 Pass P128e（B3-1）：分块阶段判定"无可译文本"，不入队、不计分母
                 + (rc.partial ? ovlVisualPartialAttrHtml(rc.partialReason) : '') // v2 Pass P122c（BV2-2）：缓存命中回填 partial
@@ -37746,9 +37844,13 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
         }
         for (let j = 0; j < subs.length; j++) {
             const sb = subs[j];
+            // v2 Pass P168（异步单块补丁路径补丁）：同上——按子块各自的渲染前快照分别挂
+            // data-ovl-eqnum-start，不能只挂一次整块共用的起点（子块可能各自含独立的编号
+            // 环境，起点逐块前移）。
+            const eqStartSb = OvlEqNumCounter ? OvlEqNumCounter.n : 0;
             const rc = ovlVisualRenderBlockContent(sb.text);
             html += '<div class="ovl-visual-block" data-src-line="' + sb.line + '" data-src-line-end="' + sb.lineEnd
-                + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '"' + (j === 0 ? numAttrHtml : '') + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
+                + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '"' + (j === 0 ? numAttrHtml : '') + ' data-ovl-eqnum-start="' + eqStartSb + '"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
                 + (rc.skipped ? ' data-ovl-trans-skipped="1" title="' + escapeAttr(OVL_VISUAL_SKIPPED_TITLE) + '"' : '') + (rc.forced ? ' data-ovl-trans-forced="1"' : '')
                 + (rc.noprose ? ' data-ovl-trans-noprose="1" title="' + escapeAttr(OVL_VISUAL_NOPROSE_TITLE) + '"' : '') // v2 Pass P128e（B3-1）：分块阶段判定"无可译文本"，不入队、不计分母
                 + (rc.partial ? ovlVisualPartialAttrHtml(rc.partialReason) : '') // v2 Pass P122c（BV2-2）：缓存命中回填 partial
@@ -37759,6 +37861,39 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
         }
     }
     return html;
+    } finally {
+        OvlEqNumCounter = null;
+    }
+}
+
+// v2 Pass P168（异步单块补丁路径补丁）：ovlVisualLangRunQueue 的 worker()、
+// ovlVisualBlockRetryClick、ovlVisualBlockForceTranslateClick 三处都是"整篇渲染完之后、
+// 某个真实网络请求 await 落地时"才执行的 el.innerHTML = ovlVisualRenderChunk(...) 单块
+// 原地патch——发生在上面 ovlVisualRenderBodyWithLines 的 try/finally 早已 return、
+// OvlEqNumCounter 早已被清回 null 之后，不在那个作用域内。pushPlaceholder 里的编号判据是
+// `&& OvlEqNumCounter` 短路防呆（该模块级变量顶部注释原话：为 null 时"完全不插 \tag"），
+// 所以这三处直接调 ovlVisualRenderChunk 不会抛异常，而是静默不打编号——效果是块翻译落地的
+// 瞬间，这块里所有编号环境的编号消失（其它未刷新的块仍然显示编号），肉眼可见的不一致。
+// 用整篇渲染时挂在块自己身上的 data-ovl-eqnum-start 快照（见上面两处 eqStartB/eqStartSb）
+// 现开一个临时计数器复算，前提是翻译只换块内散文、真正的公式环境本身不变——这正是本项目
+// 翻译管线的既有设计（公式全程走占位符掩码，翻译模型看不到也改不到真实 LaTeX，见
+// ovlVisualCodeMask/掩码相关注释），起点相同、环境结构相同，复算出来的编号序列逐字节
+// 跟整篇渲染时相同。用完照 ovlVisualRenderBodyWithLines 同一条纪律把 OvlEqNumCounter
+// 还原（正常情况下还原成 null；prevCounter 兜底只是防万一意外嵌套在别的计数器作用域里，
+// 不会拿走外层还没用完的状态——三处调用点都发生在异步回调里、跟同步的整篇渲染不会真的
+// 交叠，这一层只是防御性写法，不依赖它才能正确）。
+function ovlVisualRenderChunkWithEqNum(el, tex) {
+    const raw = el && el.getAttribute ? el.getAttribute('data-ovl-eqnum-start') : null;
+    if (raw == null) return ovlVisualRenderChunk(tex); // 没有快照（比如老版本 DOM/非本函数产出的块）：退化成原有行为，不编号
+    const start = parseInt(raw, 10);
+    if (!(start >= 0)) return ovlVisualRenderChunk(tex);
+    const prevCounter = OvlEqNumCounter;
+    OvlEqNumCounter = { n: start };
+    try {
+        return ovlVisualRenderChunk(tex);
+    } finally {
+        OvlEqNumCounter = prevCounter;
+    }
 }
 
 // ==================== v2 Pass P128（不变量自检）：无标记英文块审计 ====================
@@ -39003,7 +39138,7 @@ async function ovlVisualLangRunQueue() {
                 try { ovlVisualTransCachePut(text, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel); } catch (e) {} // v2 Pass P113 返修（问题2）：跟着译文一起落盘 skipped 标记；partial 见 P122c BV2-2；ladderLevel 见 P128b N-4
                 if (typeof ovlVisualFailLogDelete === 'function') ovlVisualFailLogDelete(text, cfg); // v2 Pass P128（C1，清除点）：这一块这次成功了，清掉旧的失败记录
                 if (document.body.contains(el)) {
-                    el.innerHTML = ovlVisualRenderChunk(tgt);
+                    el.innerHTML = ovlVisualRenderChunkWithEqNum(el, tgt); // v2 Pass P168：异步单块补丁路径也要复算编号，见 ovlVisualRenderChunkWithEqNum 头部注释
                     el.removeAttribute('data-ovl-trans-failed'); // v2 Pass P128（C1）：failLog 回填过的失败标记，成功后清掉
                     el.removeAttribute('data-ovl-trans-fail-reason');
                     el.removeAttribute('data-ovl-trans-fail-detail');
@@ -39472,7 +39607,7 @@ async function ovlVisualBlockRetryClick(el) {
             // v2 Pass P122b（B1）：打/清 partial 标记 + 悬停说明，见 ovlVisualApplyPartialMark。
             if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta); else if (meta.partial) el.setAttribute('data-ovl-trans-partial', '1'); else el.removeAttribute('data-ovl-trans-partial');
             if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta); // v2 Pass P128b（N-4）：打/清"经兜底档译出"标记
-            el.innerHTML = ovlVisualRenderChunk(tgt); // 整个块子节点被冲掉，角标自然一并消失
+            el.innerHTML = ovlVisualRenderChunkWithEqNum(el, tgt); // 整个块子节点被冲掉，角标自然一并消失；v2 Pass P168：手动重试同样要复算编号
             if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; } // title 见 v2 Pass P128（C2）
             if (typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(el);
             if (typeof ovlRenderVisualGutter === 'function' && OvlState.editorMode === 'visual') ovlRenderVisualGutter();
@@ -39569,7 +39704,7 @@ async function ovlVisualBlockForceTranslateClick(el) {
             el.removeAttribute('data-ovl-trans-noprose');
             if (el.getAttribute('title')) el.removeAttribute('title');
             if (badge) badge.remove();
-            el.innerHTML = ovlVisualRenderChunk(tgt);
+            el.innerHTML = ovlVisualRenderChunkWithEqNum(el, tgt); // v2 Pass P168：强制翻译落地同样要复算编号
             if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; }
             if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta);
             if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta);
@@ -58205,7 +58340,13 @@ function ovlInlineSrcRerenderLocal(st, newText) {
     // （zh 模式已回译），旧文本优先取 st.origEnText（zh 模式下 st.origText 是中文译文，不能
     // 拿去跟 LaTeX 命令正则比对）。
     try {
-        const headingOrAppendixTest = /\\appendix\b|\\(?:subsubsection|subsection|section)\*?(?:\[[^\]]*\])?\{/;
+        // v2 Pass P168：同一条兜底再加一类触发条件——编辑片段命中任一需要编号的数学环境
+        // （equation/align/gather/multline/eqnarray/alignat/flalign，星号变体不编号但保险起见
+        // 一起触发，检测成本可忽略）时，这一段之后所有公式的编号都会跟着挪位，局部 patch 里
+        // 现开的 {n:0} 计数器（ovlVisualRenderBodyWithLines）算不出正确的起始值——退化到
+        // 整篇 ovlVisualRender()，让计数器从文档最前面重新数一遍，跟标题/appendix 那条
+        // 是同一个道理、同一条退化路径。
+        const headingOrAppendixTest = /\\appendix\b|\\(?:subsubsection|subsection|section)\*?(?:\[[^\]]*\])?\{|\\begin\{(?:equation|align|gather|multline|eqnarray|alignat|flalign)\*?\}/;
         const oldEnText = (st && st.origEnText != null) ? st.origEnText : ((st && st.origText != null) ? st.origText : '');
         if (headingOrAppendixTest.test(oldEnText) || headingOrAppendixTest.test(newText)) {
             try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (eW) {}
