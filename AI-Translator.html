@@ -1756,6 +1756,15 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 .ovl-body[data-view="bilingual"][data-tree="collapsed"] { grid-template-columns: 40px 0px var(--ovl-bilingual-left-fr, 1fr) 6px var(--ovl-bilingual-right-fr, 1fr); }
 .ovl-body[data-view="bilingual"] .ovl-col-splitter { display: none; }
 .ovl-body[data-view="bilingual"] #ovlPdfPanel { display: none; }
+/* v2 Pass P169（R2）：一键左右交换——照抄约 1738 行 [data-pdfleft="1"] 那三条 CSS order
+   规则的同一个思路（不碰 DOM 结构，只用 order 换 3 个 grid 子项的视觉顺序）。
+   #ovlEditorPanel/.ovl-bilingual-splitter/#ovlBilingualMirrorPanel 在双语视图下都是靠
+   DOM 源码顺序自动落位（无显式 grid-column，见约 1750 行大注释），跟 order 机制天然兼容。
+   分栏手柄必须显式卡在中间（order:1），理由跟 P82 那组规则完全一样——不然会用默认
+   order:0 跟排最前的面板打平局，按源码顺序排到它前面，变成手柄跑到最左边。 */
+.ovl-body[data-view="bilingual"][data-bilingual-swapped="1"] #ovlBilingualMirrorPanel { order: 0; }
+.ovl-body[data-view="bilingual"][data-bilingual-swapped="1"] .ovl-bilingual-splitter { order: 1; }
+.ovl-body[data-view="bilingual"][data-bilingual-swapped="1"] #ovlEditorPanel { order: 2; }
 /* 独立于 .ovl-col-splitter 的一套样式（故意不复用那个类）——.ovl-col-splitter 有一条
    `.ovl-body[data-view="split"] .ovl-col-splitter { display:flex; }` 规则，如果这颗新手柄
    也挂 .ovl-col-splitter 类，会在 split 视图下被那条规则一起点亮，变成网格里第 6 个可见
@@ -1789,6 +1798,17 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 .ovl-bilingual-mirror-label { color: #9AA4B2; font-size: 12px; }
 /* 镜像面板内部的 .ovl-visual-pane 是既有类，自带 flex:1 1 auto/overflow-y:auto/padding
    等全部样式（见约 2039 行），这里不用再重复定义——直接复用，天然跟左侧 Visual 视觉一致。 */
+/* v2 Pass P169（R2）：交换按钮——margin-left:auto 把它推到 tabbar 右端（tabbar 本身只是
+   display:flex;align-items:center，没有 justify-content:space-between，故用 auto margin
+   而不是改动共享的 .ovl-editor-tabbar 规则，不影响左侧同样复用这个类名的场景）。样式
+   参照既有 .ovl-log-clearbtn（约 3436 行）同一档"小号描边文字按钮"，不新起一套视觉语言。 */
+.ovl-bilingual-swap-btn {
+    margin-left: auto; background: transparent; border: 1px solid #4A5568; color: #9AA4B2;
+    font-size: 11px; padding: 3px 9px; border-radius: 4px; cursor: pointer;
+}
+.ovl-bilingual-swap-btn:hover { background: #3b4759; color: #E7E9EE; }
+/* .ovl-editor-body/.ovl-gutter 是既有类（约 2010/2018 行），镜像面板复用同一套规则，
+   字号/行高/宽度/padding 不新增/修改任何声明——R5 加行号 gutter 不会改变行高（P160 铁律）。 */
 /* v2 Pass P160：#ovlModeToggle 的 Code 选项在双语模式下视觉置灰——真正的行为闸门在
    ovlSetEditorMode() 里（拒绝切到 'code'），这里只是让用户不会以为按钮坏了。不用
    pointer-events:none（label 本身没有 disabled 概念，硬挡点击反而让"为什么点不动"更
@@ -3133,11 +3153,17 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-diff-ins { color: #4ADE80; text-decoration: underline; }
 /* v2 Pass P166：回译确认卡片——非阻塞浮动栈，跟 .ovl-modal 不是一回事：不遮罩、不挡其它
    段落的编辑，多张卡片各自独立堆叠。沿用上面 .ovl-backtrans-* / .ovl-diff-* 同一套深色配色，
-   跟旧版 ovlConfirmDialog 的视觉语言保持一致，只是从"挡住整个页面"改成"贴在右下角"。
+   跟旧版 ovlConfirmDialog 的视觉语言保持一致，原来是"贴在右下角"。
+   v2 Pass P169（R4）：改成屏幕居中——任务书原话"从右下角移到屏幕中央（只是定位调整）"，
+   理由是双语对照场景下右下角容易被误当成常规通知瞥过去、错过确认时机。只改 position 的
+   锚点（left/top/transform），不改宽度/最大高度/滚动行为/z-index 等其它任何既有属性。
+   居中之后有可能刚好盖住正在对照的双语块本身——JS 侧配一个 ovlBtrCardStackAvoidOverlap()
+   在渲染后检测重叠并挪开（贴顶/贴底），见该函数头部注释；这里的 left/top/transform 是
+   "没有重叠时"的默认落点，挪开时由 JS 写内联样式覆盖 top/bottom/transform 三个值。
    z-index 参考既有 .ovl-p2t-pill/.ovl-p2tb-panel（1085）：卡片属于"用户主动要处理的事项"，
    理应盖在那些装饰性小面板之上，所以取 1092。 */
 .ovl-btr-card-stack {
-    position: fixed; right: 16px; bottom: 16px; z-index: 1092;
+    position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 1092;
     display: flex; flex-direction: column-reverse; gap: 10px;
     max-height: calc(100vh - 32px); overflow-y: auto;
     width: 380px; max-width: calc(100vw - 32px);
@@ -4804,7 +4830,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.31.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.32.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-13';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -31397,7 +31423,13 @@ const OvlState = {
     // 进入双语模式前 editorMode 的原值（同上一条同款成对字段）——双语模式强制 editorMode
     // 为 'visual'（左侧必须是 Visual 渲染），退出时原样恢复，不让"进去看一眼双语对照"
     // 意外把用户原本在 Code 模式的状态改没了。
-    bilingualPrevEditorMode: null
+    bilingualPrevEditorMode: null,
+    // v2 Pass P169（R2）：左右两栏是否已交换显示位置——true 表示 #ovlBilingualMirrorPanel
+    // （原文）排在 #ovlEditorPanel（左栏原本固定的中文栏）左边。这是纯 DOM 顺序/展示层面
+    // 的状态，不改变哪个面板"负责"哪种语言内容（左栏渲染逻辑仍固定中文、镜像栏固定原文，
+    // 见 ovlBilingualApplySwapOrder 头部注释），跨刷新持久化到 localStorage
+    // 'ovl.bilingualSwapped'，跟既有 'ovl.viewMode' 同一套扁平 key 约定。
+    bilingualSwapped: false
 };
 
 function ovlShellHtml() {
@@ -31668,13 +31700,28 @@ function ovlShellHtml() {
         // 手柄故意不叫 #ovlColSplitter 第二份实例、也不共用那个类名——见 CSS 里
         // .ovl-bilingual-splitter 那段注释，避免 split 视图下被"同类名"规则一起点亮。
         +   '<div class="ovl-bilingual-splitter" id="ovlBilingualSplitter" data-tip="拖拽调整左右宽度比例" data-tip-pos="top" role="separator" aria-orientation="vertical"></div>'
-        // 镜像面板：右侧=原文 Visual，只读展示，没有工具条/查找栏/gutter/textarea——
-        // 那些都是"可编辑源码"相关的 UI，双语模式右侧从设计上就不可编辑（任务书边界：
-        // 本车道不做可编辑双栏）。内部结构对齐 .ovl-visual-pane 本体（M5 那一条），
-        // 内容由 ovlBilingualRefreshMirror() 用"翻转渲染复原"技巧灌入，见该函数注释。
+        // 镜像面板：右侧=原文 Visual。v2 Pass P169（R1/R5）之前是"只读展示，没有工具条/
+        // 查找栏/gutter/textarea"——那条边界写在任务书里是给 P160 车道的范围声明，不是本车道
+        // 的边界；P169 任务书明确要求两侧都可编辑，这里改成跟左侧同款 .ovl-editor-body
+        // 包裹层（gutter + pane 两个水平兄弟），复用 P123 现成的 CSS（字号/行高/宽度/padding
+        // 逐字节相同，不新增一行相关 CSS）。行号由 ovlRenderVisualGutterMirror() 填充
+        // （见约 60219 行 ovlRenderVisualGutter 之后的镜像版兄弟函数）。内容仍由
+        // ovlBilingualRefreshMirror() 用"翻转渲染复原"技巧灌入 #ovlVisualPaneMirror，见该
+        // 函数注释；编辑相关监听器由 ovlBilingualBindMirrorClick()（进入/离开双语模式时
+        // 绑定/解绑，跟 ovlBilingualBindScrollSync 同一套生命周期纪律）负责挂载。
         +   '<div class="ovl-bilingual-mirror-panel" id="ovlBilingualMirrorPanel">'
-        +     '<div class="ovl-editor-tabbar"><span class="ovl-bilingual-mirror-label">Original（只读）</span></div>'
-        +     '<div class="ovl-visual-pane" id="ovlVisualPaneMirror"><div class="ovl-visual-empty">打开一个 .tex 文件后这里会显示只读预览。</div></div>'
+        +     '<div class="ovl-editor-tabbar">'
+        +       '<span class="ovl-bilingual-mirror-label">Original</span>'
+        // v2 Pass P169（R2）：一键左右交换按钮——点击调用 ovlBilingualToggleSwap()，
+        // 交换 #ovlEditorPanel/#ovlBilingualMirrorPanel 两个面板在 DOM 里的顺序（CSS Grid
+        // 按源码顺序隐式落位，见约 1670 行注释），选择持久化到 localStorage 的
+        // 'ovl.bilingualSwapped'，跟既有 'ovl.viewMode' 同一套扁平 key 约定。
+        +       '<button type="button" class="ovl-bilingual-swap-btn" id="ovlBilingualSwapBtn" data-tip="交换左右两侧显示位置" data-tip-pos="top">⇄ 交换左右</button>'
+        +     '</div>'
+        +     '<div class="ovl-editor-body">'
+        +       '<div class="ovl-gutter" id="ovlGutterMirror"></div>'
+        +       '<div class="ovl-visual-pane" id="ovlVisualPaneMirror"><div class="ovl-visual-empty">打开一个 .tex 文件后这里会显示预览。</div></div>'
+        +     '</div>'
         +   '</div>'
         + '</div>';
 }
@@ -31964,6 +32011,9 @@ function ovlSetViewMode(mode, opts) {
             // #ovlVisualPaneMirror 两个 DOM 节点本身自始至终都在（每次渲染只换 innerHTML，
             // 不整个替换节点），不需要跟着每次内容刷新重新绑定。
             if (typeof ovlBilingualBindScrollSync === 'function') ovlBilingualBindScrollSync();
+            // v2 Pass P169（R1）：镜像面板点击就地编辑的绑定，跟滚动联动同一条纪律——只在
+            // 真正进入双语模式这一刻绑一次，#ovlVisualPaneMirror 节点本身不会被换掉。
+            if (typeof ovlBilingualBindMirrorClick === 'function') ovlBilingualBindMirrorClick();
         } else if (leavingBilingual) {
             const prevLang = OvlState.bilingualPrevLang;
             const prevEditorMode = OvlState.bilingualPrevEditorMode;
@@ -31979,6 +32029,8 @@ function ovlSetViewMode(mode, opts) {
             // 离开双语模式——解绑滚动联动，不留悬空监听器（跟上面 ovlColSplitterEndActive/
             // ovlBilingualSplitterEndActive 同一条"切视图前先收尾"纪律）。
             if (typeof ovlBilingualBindScrollSync === 'function') ovlBilingualBindScrollSync();
+            // v2 Pass P169（R1）：同上，离开时解绑镜像面板点击编辑监听器。
+            if (typeof ovlBilingualBindMirrorClick === 'function') ovlBilingualBindMirrorClick();
         }
         const menu = document.getElementById('ovlLayoutMenu');
         if (menu) {
@@ -32128,10 +32180,13 @@ function ovlColSplitterBeginDrag(ev) {
 
 // ==================== v2 Pass P160：双语对照模式拖拽分栏 ====================
 // 结构照抄 ovlColSplitterApplyRatio/EndActive/BeginDrag 三件套（Pointer Events +
-// setPointerCapture + rAF 合帧节流 + Math.max/min clamp），但比 col-splitter 更简单：
-// 双语模式左右两侧身份是固定的（左=#ovlEditorPanel 中文 Visual、右=#ovlBilingualMirrorPanel
-// 原文镜像），从不存在 col-splitter 那种 direct 模式下 PDF/编辑器互相镜像换算左右的问题，
-// 所以不需要 [data-pdfleft] 那一套 mirrored 判断——少了一个分支，不是漏写。
+// setPointerCapture + rAF 合帧节流 + Math.max/min clamp）。
+// v2 Pass P169（R2）：原本这里的注释说"双语模式左右两侧身份是固定的，不需要 mirrored
+// 判断"——这个前提在交换按钮（ovlBilingualToggleSwap）加入后不再成立：交换用 CSS order
+// 换视觉位置（同 P82 [data-pdfleft] 那条既有机制，不碰 DOM 结构，见约 1670/1790 行 CSS），
+// #ovlEditorPanel 交换后可能视觉在右。ovlBilingualSplitterBeginDrag 因此改成跟
+// ovlColSplitterBeginDrag 同一条纪律：不猜测/不读 OvlState.bilingualSwapped，直接读拖拽
+// 起手那一刻两个面板的真实屏幕坐标判断谁在左边。
 // 比例单独存 OvlState.bilingualLeftFr/bilingualRightFr（跟 --ovl-bilingual-left-fr/
 // --ovl-bilingual-right-fr 两个独立 CSS 变量配对），故意不复用 splitEditorFr/splitPdfFr，
 // 见约 1670 行 CSS 大注释：两套比例状态必须互不干扰，否则在双语模式拖一下分栏，切回
@@ -32155,16 +32210,21 @@ function ovlBilingualSplitterBeginDrag(ev) {
         if (ev.button != null && ev.button !== 0) return; // 只认左键，跟 ovlColSplitterBeginDrag 同一条
         if (OvlState.viewMode !== 'bilingual') return;      // CSS 已经把手柄藏了，这里再守一道
         const handle = ev.currentTarget || ev.target;
-        const leftPanel = document.getElementById('ovlEditorPanel');
-        const rightPanel = document.getElementById('ovlBilingualMirrorPanel');
-        if (!handle || !leftPanel || !rightPanel) return;
+        const editorPanel = document.getElementById('ovlEditorPanel');
+        const mirrorPanel = document.getElementById('ovlBilingualMirrorPanel');
+        if (!handle || !editorPanel || !mirrorPanel) return;
         ev.preventDefault();
 
         const startX = (typeof ev.clientX === 'number') ? ev.clientX : 0;
-        const leftRectAtStart = leftPanel.getBoundingClientRect();
-        const rightRectAtStart = rightPanel.getBoundingClientRect();
-        const availW = leftRectAtStart.width + rightRectAtStart.width;
-        const startLeftW = leftRectAtStart.width;
+        const editorRectAtStart = editorPanel.getBoundingClientRect();
+        const mirrorRectAtStart = mirrorPanel.getBoundingClientRect();
+        const availW = editorRectAtStart.width + mirrorRectAtStart.width;
+        // v2 Pass P169（R2）：--ovl-bilingual-left-fr/-right-fr 两个 CSS 变量本身是"第 3/5
+        // 轨道"的宽度而不是"某个具体面板"的宽度——交换后谁的 order 小，谁就落在左边轨道
+        // （左边轨道用 leftFr）。这里只是决定"鼠标右移=哪个面板变宽"的符号，不影响两个
+        // fr 变量各自该写多少，见下面 flush() 里仍然是无条件写 bilingualLeftFr/RightFr。
+        const editorIsLeft = editorRectAtStart.left <= mirrorRectAtStart.left;
+        const startLeftW = editorIsLeft ? editorRectAtStart.width : mirrorRectAtStart.width;
         const pid = ev.pointerId;
         let finished = false;
 
@@ -32197,7 +32257,10 @@ function ovlBilingualSplitterBeginDrag(ev) {
             try {
                 if (e.buttons === 0) { onUp(); return; }
                 const dx = (typeof e.clientX === 'number' ? e.clientX : startX) - startX;
-                const rawLeftW = startLeftW + dx; // 左=编辑器区，从不镜像，鼠标右移直接就是左边变宽
+                // v2 Pass P169（R2）：鼠标右移＝分栏线右边那块变窄、左边那块变宽——这个方向
+                // 关系跟"左边具体是哪个面板"无关，startLeftW 已经是拖拽起手那一刻真实在左边
+                // 的那个面板的宽度（见上面 editorIsLeft 判断），不需要在这里再区分。
+                const rawLeftW = startLeftW + dx;
                 const clampedLeftW = Math.max(OVL_SPLIT_MIN_COL, Math.min(availW - OVL_SPLIT_MIN_COL, rawLeftW));
                 schedule(clampedLeftW / availW);
             } catch (err) {
@@ -32233,6 +32296,58 @@ function ovlBilingualSplitterBeginDrag(ev) {
     } catch (e) {
         console.error('[ovl] bilingual splitter beginDrag failed', e);
         try { document.body.removeAttribute('data-ovl-splitdrag'); } catch (e2) {}
+    }
+}
+
+// ==================== v2 Pass P169（R2）：双语对照模式一键左右交换 ====================
+// 照抄 P82 [data-pdfleft="1"] 那套"只用 CSS order 换视觉位置，不碰 DOM 结构"的既有机制
+// （约 1738 行三条 order 规则 + 约 45753 行 ovlUpdatePdfToolbarUI() 的 setAttribute/
+// removeAttribute 写法），不是设计文档草稿里最初设想的"物理 insertBefore 挪节点"方案——
+// 两者效果对使用者一样，但 CSS order 完全不改变 #ovlEditorPanel/#ovlBilingualMirrorPanel
+// 在 DOM 树里的位置，任何"假设某元素挂在某个父节点第几个子节点"的既有/未来代码天然不受
+// 影响，风险明显更低，选它。
+//
+// 交换只影响"整个面板"（tabbar + gutter + pane 这一整条 .ovl-editor-body 竖切列）的视觉
+// 左右位置——面板内部渲染逻辑完全不知道自己在屏幕的哪一侧：左栏固定渲染中文 Visual 进
+// #ovlVisualPane/#ovlGutter、镜像栏固定渲染原文进 #ovlVisualPaneMirror/#ovlGutterMirror
+// （ovlVisualRender/ovlBilingualRefreshMirror 都是按元素 ID 找目标，不查"自己是不是在
+// 左边"），所以行号 gutter 天生跟着自己所属的 pane 一起挪位置（同一个 .ovl-editor-body
+// 内两个水平排列的兄弟节点），不需要额外代码维持"gutter 跟对齐的 pane"这层关系。
+// P160 对齐算法比较的是两侧同序号块的高度、写各自的 minHeight，同样不关心谁在屏幕左边、
+// 谁在右边，交换后依然按原有逻辑正确工作。
+//
+// 真正需要显式处理的只有一件事：--ovl-bilingual-left-fr/-right-fr 是"第 3/5 轨道"的宽度
+// 而不是"某个面板"的宽度（见 ovlBilingualSplitterApplyRatio 注释）——交换后谁的 order 小
+// 谁就落进第 3 轨道，如果用户之前拖出过不对称比例，两个面板会互换宽度，导致换行结果变化、
+// 块高度变化，两侧 gutter 的行号位置、P160 对齐都要在新宽度下重新算一遍。
+function ovlBilingualApplySwapOrder() {
+    const body = document.getElementById('ovlBody');
+    if (!body) return;
+    if (OvlState.bilingualSwapped) body.setAttribute('data-bilingual-swapped', '1');
+    else body.removeAttribute('data-bilingual-swapped');
+    // 按钮态跟当前状态同步——aria-pressed 供辅助技术识别开关态，不影响任何既有测试断言
+    // （data-tip 提示文案不用跟着变，"交换左右两侧显示位置"这句在两种状态下都成立）。
+    const btn = document.getElementById('ovlBilingualSwapBtn');
+    if (btn) btn.setAttribute('aria-pressed', OvlState.bilingualSwapped ? 'true' : 'false');
+}
+
+function ovlBilingualToggleSwap() {
+    try {
+        OvlState.bilingualSwapped = !OvlState.bilingualSwapped;
+        try { localStorage.setItem('ovl.bilingualSwapped', OvlState.bilingualSwapped ? '1' : '0'); } catch (e) {}
+        ovlBilingualApplySwapOrder();
+        // data-bilingual-swapped 属性刚改完就读布局，浏览器会同步补一次样式/布局重算——跟
+        // ovlSetViewMode 改 data-view 后立刻调 ovlRenderVisualGutter() 同一条既有纪律（约
+        // 1975 行注释），不需要额外等一帧。只在真正处于双语模式时才有意义（按钮本身也只在
+        // 这个视图下可见可点，这层判断是防御性的）。两个 gutter 全量重排 + 各自 finally 里
+        // 会顺带各排一次对齐（不传 skipAlignSchedule，走既有默认路径），覆盖"拖过不对称比例
+        // 再交换，宽度互换导致换行变化"这个场景。
+        if (OvlState.viewMode === 'bilingual') {
+            if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
+            if (typeof ovlRenderVisualGutterMirror === 'function') ovlRenderVisualGutterMirror();
+        }
+    } catch (e) {
+        console.error('[ovl] bilingual toggle swap failed', e);
     }
 }
 
@@ -38402,7 +38517,10 @@ function ovlBilingualRefreshMirror() {
         const ta = document.getElementById('ovlCodeArea');
         const src = ta ? ta.value : '';
         if (!src) {
-            pane.innerHTML = '<div class="ovl-visual-empty">打开一个 .tex 文件后这里会显示只读预览。</div>';
+            pane.innerHTML = '<div class="ovl-visual-empty">打开一个 .tex 文件后这里会显示预览。</div>';
+            // v2 Pass P169（R5）：这条早退没有任何 .ovl-visual-block，镜像 gutter 也要跟着清空
+            // （不清空的话，上一份文档留下的行号格子会残留在这份"空状态"画面上）。
+            if (typeof ovlRenderVisualGutterMirror === 'function') { try { ovlRenderVisualGutterMirror(); } catch (eG) {} }
             if (typeof ovlBilingualScheduleAlign === 'function') ovlBilingualScheduleAlign();
             return;
         }
@@ -38410,6 +38528,7 @@ function ovlBilingualRefreshMirror() {
             pane.innerHTML = '<div class="ovl-visual-empty">Visual 预览暂不可用（LatexFilter/marked/KaTeX 未就绪），已显示原始源码：</div><pre class="ovl-visual-raw"></pre>';
             const pre = pane.querySelector('.ovl-visual-raw');
             if (pre) pre.textContent = src;
+            if (typeof ovlRenderVisualGutterMirror === 'function') { try { ovlRenderVisualGutterMirror(); } catch (eG) {} }
             if (typeof ovlBilingualScheduleAlign === 'function') ovlBilingualScheduleAlign();
             return;
         }
@@ -38442,6 +38561,10 @@ function ovlBilingualRefreshMirror() {
         if (tailEl) tailEl.textContent = tail;
         // v2 Pass P18 同款：占位框先同步画完，缩略图异步补（不阻塞对齐计算）。
         if (typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(pane);
+        // v2 Pass P169（R5）：新的一批 .ovl-visual-block 落地之后重画镜像 gutter——顺序放在
+        // ovlBilingualScheduleAlign() 之前（gutter 渲染函数自己的 finally 也会再调度一次对齐，
+        // 双重调度是无害的，ovlBilingualScheduleAlign 内部按 rafId 去重）。
+        if (typeof ovlRenderVisualGutterMirror === 'function') { try { ovlRenderVisualGutterMirror(); } catch (eG) {} }
         // v2 Pass P160：两侧内容都落地之后再触发对齐重算——放在 innerHTML 赋值之后，
         // 跟左侧 ovlRenderVisualGutter() 摆在渲染最后一步同一条纪律。
         if (typeof ovlBilingualScheduleAlign === 'function') ovlBilingualScheduleAlign();
@@ -38449,6 +38572,7 @@ function ovlBilingualRefreshMirror() {
         console.error('[ovl] bilingualRefreshMirror failed', e);
         const pane = document.getElementById('ovlVisualPaneMirror');
         if (pane) pane.innerHTML = '<div class="ovl-visual-empty">Original 预览渲染失败。</div>';
+        if (typeof ovlRenderVisualGutterMirror === 'function') { try { ovlRenderVisualGutterMirror(); } catch (eG) {} }
     }
 }
 
@@ -38572,19 +38696,38 @@ function ovlBilingualObserveRows(rows) {
 // 三阶段"清空 -> 纯读 -> 纯写"跟下面 ovlBilingualSyncAlignment 逐行高度对齐同一条纪律、
 // 同一个理由：不清空的话，这一轮量到的是上一轮已经补偿过的 marginTop，测出来的差值会
 // 越叠越大，永远收敛不到真实差值。
+//
+// v2 Pass P169（R5 补丁，回归测试 test_p169_bilingual_edit.js 组 E 实测命中）：这个函数是
+// P160 时代写的，那时候镜像栏（#ovlVisualPaneMirror）还没有自己的 gutter——只把 marginTop
+// 写在 pane 自己身上就够了。P169（R5）给镜像栏加了 #ovlGutterMirror，且
+// ovlRenderVisualGutter()/ovlRenderVisualGutterMirror() 两个函数的行号定位数学都建立在"gutter
+// 和它同一侧的 pane 是同一个 flex 行里的兄弟节点、边框盒顶边天然对齐"这条假设上（见那两个
+// 函数头部注释）。只把 marginTop 补给 pane、不补给同一侧的 gutter，这条假设当场被打破——
+// 拿到 marginTop 补偿的那一侧，pane 被压下去一截，gutter 原地不动，两者不再同一条水平线，
+// 行号栏跟着整体错位一个 marginTop 那么大的量（跟 pane 自己内部逐行对不对齐无关，从第 0 行
+// 就已经错了）。修法：gutter 永远跟着它配对的 pane 拿一样的 marginTop，两者当一个整体一起
+// 挪，不单独处理。
 function ovlBilingualAlignPaneTops() {
     const leftPane = document.getElementById('ovlVisualPane');
     const rightPane = document.getElementById('ovlVisualPaneMirror');
     if (!leftPane || !rightPane) return;
+    const leftGutter = document.getElementById('ovlGutter');
+    const rightGutter = document.getElementById('ovlGutterMirror');
     leftPane.style.marginTop = '';
     rightPane.style.marginTop = '';
+    if (leftGutter) leftGutter.style.marginTop = '';
+    if (rightGutter) rightGutter.style.marginTop = '';
     const leftTop = leftPane.getBoundingClientRect().top;
     const rightTop = rightPane.getBoundingClientRect().top;
     const diff = leftTop - rightTop; // >0：左侧起点更靠下（左侧 chrome 更高）——补右侧；<0 反之
     if (diff > 0.5) {
-        rightPane.style.marginTop = diff.toFixed(2) + 'px';
+        const px = diff.toFixed(2) + 'px';
+        rightPane.style.marginTop = px;
+        if (rightGutter) rightGutter.style.marginTop = px;
     } else if (diff < -0.5) {
-        leftPane.style.marginTop = (-diff).toFixed(2) + 'px';
+        const px = (-diff).toFixed(2) + 'px';
+        leftPane.style.marginTop = px;
+        if (leftGutter) leftGutter.style.marginTop = px;
     }
 }
 
@@ -38687,6 +38830,17 @@ function ovlBilingualRunAlignPass() {
         return;
     }
     try { ovlBilingualSyncAlignment(); } catch (e) { console.error('[ovl] bilingual align pass failed', e); }
+    // v2 Pass P169（R5）：对齐会改块的 minHeight，导致块的实际渲染高度变化；两侧 gutter 的行号
+    // cell 位置是按块渲染矩形算的，这里必须在对齐完成后重新算一遍位置，否则行号会跟对齐后的
+    // 文本错位。两个调用都传 skipAlignSchedule=true——它们各自的 finally 原本会在双语模式下
+    // 再排一次 ovlBilingualScheduleAlign()，如果不传 true 就会形成"对齐->重画 gutter->又排
+    // 对齐"的循环（不会自然停止，只能靠断路器硬中止，等于双语模式进入后自动对齐很快失效）。
+    try {
+        if (OvlState.viewMode === 'bilingual') {
+            if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter(true);
+            if (typeof ovlRenderVisualGutterMirror === 'function') ovlRenderVisualGutterMirror(true);
+        }
+    } catch (eGutter) { console.error('[ovl] post-align gutter refresh failed', eGutter); }
 }
 
 function ovlBilingualScheduleAlign() {
@@ -38744,6 +38898,99 @@ function ovlBilingualBindScrollSync() {
         OvlBilingualScrollSyncBound = { a: a, b: b, handlerA: handlerA, handlerB: handlerB };
     } catch (e) {
         console.warn('[ovl] bilingual scroll sync bind failed', e);
+    }
+}
+
+// ---- v2 Pass P169（R1）：双语模式镜像面板（右侧）单击就地编辑 ----
+// 目标：镜像面板不再是"设计上就不可编辑"（P160 原本的定位），复用左侧同一套内核
+// ovlInlineSrcEditOpenForBlocks（不新发明机制）。跟左侧 ovlBindQuickActions 里 visualPane
+// 的 mouseup 分支比，这里刻意做得更薄：
+//   1. 镜像面板固定显示 Original（英文源码渲染），不会有 zh 分支——不需要
+//      ovlInlineZhEditOpenForBlocks 那条回译路径的判断。
+//   2. 不接六颗按钮的工具条（替/简/语/译/关注/复制）——那一整套是 Code/Visual 单栏模式的
+//      选区操作面板，双语对照场景的编辑需求只是"点哪段改哪段"，接完整工具条会让镜像栏
+//      多出一堆在这个场景下没意义的按钮（比如"在 PDF 中定位"对镜像栏也成立但不是本次
+//      任务范围，克制不做，避免范围蔓延）。
+//   3. 双击选词的坑跟左侧一样存在（第一次 mouseup 也是 collapsed 选区），沿用同一个
+//      OVL_VISUAL_CLICK_EDIT_DELAY_MS 延迟 + OvlVisualClickEditPending 判断——两侧共用
+//      同一个模块级 pending 状态即可，同一时刻用户只可能在其中一侧产生手势，不会撞车。
+let OvlBilingualMirrorClickBound = null;
+function ovlBilingualMirrorBlockEditOpenAtPoint(clientX, clientY) {
+    // 三条闸门跟 ovlInlineSrcEditOpen/ovlVisualBlockEditOpenAtPoint 头部完全一致，直接照抄。
+    if (OvlInlineSrcEdit) {
+        try { showToast('已经有一处在就地编辑，请先保存（Ctrl+Enter）或取消（Esc）。', 'warning'); } catch (e) {}
+        return;
+    }
+    if (OvlState.compiling) {
+        try { showToast('正在编译，请等编译结束后再编辑。', 'warning'); } catch (e) {}
+        return;
+    }
+    if (OvlState.ovlSyncBusy) {
+        try { showToast('正在与 Overleaf 同步，请等同步结束后再编辑。', 'warning'); } catch (e) {}
+        return;
+    }
+    let hitEl;
+    try { hitEl = document.elementFromPoint(clientX, clientY); } catch (e) { hitEl = null; }
+    if (!hitEl) return;
+    try {
+        const excludeSel = (typeof ovlVisualBadgeExcludeSelector === 'function')
+            ? ovlVisualBadgeExcludeSelector() + ', img, a, button, #ovlVisualPreambleBar, #ovlVisualTailBar'
+            : 'img, a, button, #ovlVisualPreambleBar, #ovlVisualTailBar';
+        if (hitEl.closest(excludeSel)) return;
+    } catch (e) {}
+    const blockEl = hitEl.closest('.ovl-visual-block[data-src-line]');
+    if (!blockEl) return;
+    // 镜像面板固定是 Original——直接走源码编辑内核，没有 zh 分流。
+    ovlInlineSrcEditOpenForBlocks([blockEl]);
+}
+function ovlBilingualBindMirrorClick() {
+    // 跟 ovlBilingualBindScrollSync 同一条纪律：先解绑旧的，再按条件重绑，避免重复
+    // 进入/切出双语模式时监听器越叠越多。
+    if (OvlBilingualMirrorClickBound) {
+        try {
+            OvlBilingualMirrorClickBound.pane.removeEventListener('mouseup', OvlBilingualMirrorClickBound.onMouseup);
+            OvlBilingualMirrorClickBound.pane.removeEventListener('dblclick', OvlBilingualMirrorClickBound.onDblclick);
+        } catch (e) {}
+        OvlBilingualMirrorClickBound = null;
+    }
+    if (OvlState.viewMode !== 'bilingual') return; // 不在双语模式——摘完监听器就结束
+    try {
+        const pane = document.getElementById('ovlVisualPaneMirror');
+        if (!pane) return;
+        const onMouseup = function (e) {
+            try {
+                const sel = ovlWinOf(pane).getSelection();
+                if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+                    // 无拖动的单击——同左侧 P159 §2.2 的双击防抖延迟逻辑，逐字节照搬判断结构。
+                    if (e.detail && e.detail > 1) return;
+                    if (OvlVisualClickEditPending) { clearTimeout(OvlVisualClickEditPending.timer); OvlVisualClickEditPending = null; }
+                    const pendClientX = e.clientX, pendClientY = e.clientY;
+                    const timer = setTimeout(function () {
+                        OvlVisualClickEditPending = null;
+                        try {
+                            const sel2 = ovlWinOf(pane).getSelection();
+                            if (sel2 && sel2.rangeCount > 0 && !sel2.isCollapsed) return;
+                        } catch (eSel) {}
+                        ovlBilingualMirrorBlockEditOpenAtPoint(pendClientX, pendClientY);
+                    }, OVL_VISUAL_CLICK_EDIT_DELAY_MS);
+                    OvlVisualClickEditPending = { timer: timer };
+                }
+                // 非 collapsed 选区（拖选/双击选词展开的选区）——镜像面板没有六颗按钮工具条，
+                // 什么都不做，让用户正常复制文本；只需要在这里也取消掉待打开的编辑定时器。
+                else if (OvlVisualClickEditPending) {
+                    clearTimeout(OvlVisualClickEditPending.timer);
+                    OvlVisualClickEditPending = null;
+                }
+            } catch (err) {}
+        };
+        const onDblclick = function () {
+            if (OvlVisualClickEditPending) { clearTimeout(OvlVisualClickEditPending.timer); OvlVisualClickEditPending = null; }
+        };
+        pane.addEventListener('mouseup', onMouseup);
+        pane.addEventListener('dblclick', onDblclick);
+        OvlBilingualMirrorClickBound = { pane: pane, onMouseup: onMouseup, onDblclick: onDblclick };
+    } catch (e) {
+        console.warn('[ovl] bilingual mirror click bind failed', e);
     }
 }
 
@@ -53492,6 +53739,12 @@ function ovlBindShell() {
         const bilingualSplitter = document.getElementById('ovlBilingualSplitter');
         if (bilingualSplitter) bilingualSplitter.addEventListener('pointerdown', ovlBilingualSplitterBeginDrag);
 
+        // v2 Pass P169（R2）：一键左右交换按钮。
+        const bilingualSwapBtn = document.getElementById('ovlBilingualSwapBtn');
+        if (bilingualSwapBtn) bilingualSwapBtn.addEventListener('click', function () {
+            try { ovlBilingualToggleSwap(); } catch (e) { console.error('[ovl] bilingual swap toggle failed', e); }
+        });
+
         // v2 Pass P155：文件树侧边栏拖拽调宽手柄，绑定方式照抄上面 colSplitter 那一段。
         const treeSplitter = document.getElementById('ovlTreeSplitter');
         if (treeSplitter) treeSplitter.addEventListener('pointerdown', ovlTreeSplitterBeginDrag);
@@ -58213,12 +58466,15 @@ function ovlLiveAnchorUniqueParagraphHit(cur, needle) {
     return hit;
 }
 // 回译失败/放弃写入时保留用户刚打的中文（用户决定：绝不丢弃）——v2 Pass P159-fix（FIX-2）
-// 之前 key 单独用【当前这一版英文源码】的哈希，两段字节相同的孪生段落会撞进同一个桶：没动过
-// 的那一份一读就把真正失败那一份的草稿偷走并删掉（核验对抗报告 §3.2 实测复现）。现在 key
-// 换成"位置锚 + 内容哈希"复合键：写入（Set）总是按完整复合键落桶；取出（Take）优先按复合键
-// 精确命中直接消费，位置对不上时退化成只按内容哈希在全表里找，但要求恰好唯一命中才算数——
-// 内容哈希单独一个字段永远不再是"可以直接命中并删除"的钥匙，多候选一律不猜、不删、返回
-// null（宁可这次找不回草稿，也不允许把别人的草稿错发/错删）。
+// + v2 Pass P169（DT-b）两轮修复的最终形态。FIX-2 之前 key 单独用【当前这一版英文源码】的
+// 哈希，两段字节相同的孪生段落会撞进同一个桶：没动过的那一份一读就把真正失败那一份的草稿
+// 偷走并删掉（核验对抗报告 §3.2 实测复现）。FIX-2 把 key 换成"位置锚 + 内容哈希"复合键，
+// 但 Take 侧仍保留了一条"位置对不上就退化成只按内容哈希在全表里找、要求唯一命中"的兜底——
+// 这条兜底本身就是残留漏洞：当孪生块字节相同、且全表恰好只有一条草稿时，"唯一命中"是平凡
+// 满足的，草稿仍会被错发给内容相同但身份不同的另一块（DT-b 复现的正是这个场景）。P169 彻底
+// 删除了这条内容哈希兜底：草稿身份只认"位置锚 + 内容哈希"复合键的精确匹配，位置对不上一律
+// 返回 null，不再有任何"仅凭内容相同就能取走"的路径（宁可这次找不回草稿，也不允许把别人的
+// 草稿错发）。详见 .claude/tmp/p169_design.md "DT-b" 一节。
 let OvlVisualBtrFailedDrafts = {};
 const OVL_VISUAL_BTR_DRAFTS_MAX = 200;
 function ovlVisualBtrDraftSet(origEnText, zhText, anchor) {
@@ -58234,31 +58490,24 @@ function ovlVisualBtrDraftSet(origEnText, zhText, anchor) {
         OvlVisualBtrFailedDrafts[key] = { zhText: zhText, ts: Date.now(), origEnText: origEnText, contentKey: contentKey, posKey: posKey };
     } catch (e) {}
 }
+// v2 Pass P169 DT-b 修复：删除原先"位置对不上就退化成只按内容哈希在全表里找，要求恰好
+// 唯一命中"的兜底分支——那条分支看似安全（要求>=2个候选才放弃），但当文档里存在两个字节
+// 完全相同的孪生块、且全表里恰好只有一条草稿时，"唯一命中"这个条件会被平凡满足：草稿明明
+// 是 A 块编辑失败留下的，B 块第一次打开时内容哈希照样命中、"候选数=1"照样通过，草稿被错误
+// 地判给了 B——这正是"字节相同的孪生块之间草稿互相串"的根因。修复后草稿身份只认"块在文档
+// 里的位置"（posKey），不再有任何"允许仅凭内容相同就取走"的路径：位置精确命中才返回，
+// 否则一律 null（草稿留在原处不动、不丢弃、也绝不发错对象——参见 .claude/tmp/p169_design.md
+// "DT-b" 一节）。
 function ovlVisualBtrDraftTake(enText, anchor) {
     try {
         const contentKey = ovlVisualHashSrc(enText);
         const posKey = ovlVisualBtrAnchorPosKey(anchor);
-        // 第一优先：位置+内容复合键精确命中——不含糊，直接消费（这就是"真主人"的判据）。
+        // 唯一允许的命中路径：位置+内容复合键精确匹配——即"这条草稿本来就是给这个位置这块
+        // 内容留的"，不含糊，直接消费。位置对不上就是对不上，不再退化、不再靠内容猜。
         if (posKey) {
             const exactKey = posKey + '||' + contentKey;
             const exact = OvlVisualBtrFailedDrafts[exactKey];
             if (exact) { delete OvlVisualBtrFailedDrafts[exactKey]; return exact.zhText; }
-        }
-        // 第二优先：位置对不上（比如打开这一刻文档别处的编辑已经挪动了偏移）——退化成只按
-        // 内容哈希在全表里找，但要求恰好唯一命中才算数，>=2 个候选一律放弃（不猜、不删）。
-        let candidateKeys = [];
-        const allKeys = Object.keys(OvlVisualBtrFailedDrafts);
-        for (let i = 0; i < allKeys.length; i++) {
-            const rec = OvlVisualBtrFailedDrafts[allKeys[i]];
-            if (rec && rec.contentKey === contentKey) {
-                candidateKeys.push(allKeys[i]);
-                if (candidateKeys.length > 1) break; // 找到第 2 个就足够判定"歧义"，不用扫完全表
-            }
-        }
-        if (candidateKeys.length === 1) {
-            const rec = OvlVisualBtrFailedDrafts[candidateKeys[0]];
-            delete OvlVisualBtrFailedDrafts[candidateKeys[0]];
-            return rec.zhText;
         }
         return null;
     } catch (e) { return null; }
@@ -58348,7 +58597,19 @@ function ovlInlineSrcRerenderLocal(st, newText) {
         // 是同一个道理、同一条退化路径。
         const headingOrAppendixTest = /\\appendix\b|\\(?:subsubsection|subsection|section)\*?(?:\[[^\]]*\])?\{|\\begin\{(?:equation|align|gather|multline|eqnarray|alignat|flalign)\*?\}/;
         const oldEnText = (st && st.origEnText != null) ? st.origEnText : ((st && st.origText != null) ? st.origText : '');
-        if (headingOrAppendixTest.test(oldEnText) || headingOrAppendixTest.test(newText)) {
+        // v2 Pass P169（R3 方向 2 修复）：局部 patch 的假设是"被编辑的块就活在
+        // #ovlVisualPane 自己的 DOM 子树里"——但双语模式下从右侧镜像面板发起的编辑，
+        // st.parent/st.blocks 全部来自 #ovlVisualPaneMirror（ovlBilingualMirrorBlockEditOpenAtPoint
+        // 直接把镜像块传给了同一套 ovlInlineSrcEditOpenForBlocks 内核），局部 patch 只会在
+        // 镜像自己的子树里换块，左侧 #ovlVisualPane 对应块完全没被碰过，它绑着的旧翻译缓存
+        // 结果也就永远不会因为内容变了而失效——ovlVisualLangSyncAfterRender() 扫的是
+        // #ovlVisualPane，扫不到任何新 pending，方向 2（镜像英文编辑->左侧中文重译）就哑火了。
+        // 跟标题/appendix 那条退化路径同理：这里同样直接退化到整篇 ovlVisualRender()，
+        // 它自己内部 4 个退出点已经统一处理了双语模式的镜像刷新（ovlBilingualRefreshMirror），
+        // 左侧也会用同一份翻译缓存查找逻辑重新算一遍，miss 的块自然被标 pending 排队重译。
+        // 镜像编辑本来就比左侧正文编辑少得多，牺牲这一种情况的"只重渲一段"优化换正确性完全值得。
+        const isMirrorTouched = !!(st && st.parent && typeof st.parent.closest === 'function' && st.parent.closest('#ovlVisualPaneMirror'));
+        if (isMirrorTouched || headingOrAppendixTest.test(oldEnText) || headingOrAppendixTest.test(newText)) {
             try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (eW) {}
             try { st.blocks.forEach(function (b) { if (b.parentNode) b.parentNode.removeChild(b); }); } catch (eB) {}
             if (typeof ovlVisualRender === 'function') ovlVisualRender();
@@ -58381,6 +58642,13 @@ function ovlInlineSrcRerenderLocal(st, newText) {
         // 重新渲染出来的新块如果落在中文模式下会自动带 data-ovl-trans-pending（缓存按内容哈希，
         // 编辑过的文本天然 miss），这里补一次同步把调度器踢起来翻这一块；没改过的块不受影响。
         if (typeof ovlVisualLangSyncAfterRender === 'function') ovlVisualLangSyncAfterRender();
+        // v2 Pass P169（R3）：本地 patch 是整篇 ovlVisualRender() 之外第二条会改动
+        // #ovlCodeArea 内容的路径（被 ovlInlineSrcSave 直接编辑、和 ovlVisualBtrCommitWrite
+        // 回译确认写入共用）。双语对照模式下，ovlVisualRender() 的 4 个调用点都已经在改动后
+        // 顺带刷新镜像 pane（见 ovlBilingualRefreshMirror 调用点），但这条局部 patch 快速路径
+        // 之前漏了——镜像 pane 在双语模式下编辑左侧/回译写入后会显示过期内容，直到下一次触发
+        // 整篇重渲染才纠正。补上同款钩子，跟已有 4 处写法一致，不新发明逻辑。
+        if (OvlState.viewMode === 'bilingual' && typeof ovlBilingualRefreshMirror === 'function') { try { ovlBilingualRefreshMirror(); } catch (eMirror) {} }
     } catch (e) {
         console.error('[ovl] inlineSrcRerenderLocal failed, falling back to full re-render', e);
         try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e2) {}
@@ -59218,7 +59486,74 @@ function ovlVisualBtrRenderConfirmCards() {
         // 新卡片排在最上面，跟大多数通知栈的直觉一致；不影响任何一张卡片的独立可操作性。
         ids.sort(function (a, b) { return (OvlVisualBtrConfirmCards[b].ts || 0) - (OvlVisualBtrConfirmCards[a].ts || 0); });
         stack.innerHTML = ids.map(function (cid) { return ovlVisualBtrConfirmCardHtml(OvlVisualBtrConfirmCards[cid]); }).join('');
+        // v2 Pass P169（R4）：每次内容变化（新卡片进来/卡片被关掉致使栈变矮变高）都要重新
+        // 判断一次有没有盖住对照文本——不能只在首次显示时判断一次，栈的实际尺寸会随卡片
+        // 数量变化。
+        if (typeof ovlBtrCardStackAvoidOverlap === 'function') ovlBtrCardStackAvoidOverlap();
     } catch (e) { console.error('[ovl] btr confirm card render failed', e); }
+}
+
+// v2 Pass P169（R4）：回译确认卡片改屏幕居中显示（原来贴右下角，见 CSS .ovl-btr-card-stack
+// 头部注释）——居中意味着它有可能刚好盖住用户正在对照阅读的那个双语块本身，任务书原话
+// "不能挡住被对照的文本"。回译确认卡片只会由"左侧中文块编辑→回译"这一条路径产生（R3
+// 方向 1，见 ovlVisualBtrShowConfirmCard 的调用链——镜像栏英文编辑走的是缓存未命中重译，
+// 不经过这里），每张卡片的 anchor.{charStart,charEnd} 天然只对应左侧 #ovlVisualPane 里的
+// 块，用既有 ovlVisualBlockAtCharRange 定位即可，不需要另外检查镜像栏。
+// 不复用 ovlClampPopupToViewport——那个函数是给"从某个触发点长出来、贴着触发点摆放"的
+// 单点浮框（翻译气泡/右键菜单）设计的定位逻辑；这里卡片栈居中是固定的设计意图，不是从
+// 某个点算出来的，真正要解决的是"跟一组矩形不重叠"这个不同的几何问题，硬套反而要拆掉
+// 它内部那些跟触发点相关的假设，不如照着这里的真实需求单独写更清楚、风险更低。
+function ovlBtrCardStackAvoidOverlap() {
+    try {
+        const stack = document.getElementById('ovlBtrCardStack');
+        if (!stack || stack.hidden) return;
+        // 每次先回到 CSS 默认的居中基准（清掉上一轮可能写过的内联覆盖）——避免"上一轮判定
+        // 挪到贴顶，这一轮明明已经不重叠了却还锁在贴顶位置回不去居中"这种状态残留。
+        stack.style.top = '';
+        stack.style.bottom = '';
+        stack.style.transform = '';
+        const ids = Object.keys(OvlVisualBtrConfirmCards);
+        if (!ids.length) return;
+        const blockRects = [];
+        ids.forEach(function (id) {
+            const rec = OvlVisualBtrConfirmCards[id];
+            if (!rec || !rec.anchor) return;
+            try {
+                const blk = (typeof ovlVisualBlockAtCharRange === 'function')
+                    ? ovlVisualBlockAtCharRange(rec.anchor.charStart, rec.anchor.charEnd)
+                    : null;
+                if (blk && blk.offsetParent) blockRects.push(blk.getBoundingClientRect());
+            } catch (e) {}
+        });
+        if (!blockRects.length) return; // 锚点都已失效/找不到对应块——没有"对照文本"要避让，居中即可
+        function overlaps(a, b) {
+            return !(a.right <= b.left || a.left >= b.right || a.bottom <= b.top || a.top >= b.bottom);
+        }
+        const stackRect = stack.getBoundingClientRect();
+        const hasOverlap = blockRects.some(function (r) { return overlaps(stackRect, r); });
+        if (!hasOverlap) return;
+        const vh = window.innerHeight || document.documentElement.clientHeight;
+        const margin = 16;
+        // 两个候选落点：贴视口顶部 / 贴视口底部，水平方向仍然居中（只挪垂直位置）。
+        // 不做逐像素精细避让——卡片栈本身允许内部滚动（max-height/overflow-y:auto），贴顶/
+        // 贴底两个固定候选已经覆盖"块在屏幕中间、块在上半屏、块在下半屏"绝大多数实际场景。
+        const topCandidateRect = { top: margin, bottom: margin + stackRect.height, left: stackRect.left, right: stackRect.right };
+        const bottomCandidateRect = { top: vh - margin - stackRect.height, bottom: vh - margin, left: stackRect.left, right: stackRect.right };
+        const topOk = !blockRects.some(function (r) { return overlaps(topCandidateRect, r); });
+        const bottomOk = !blockRects.some(function (r) { return overlaps(bottomCandidateRect, r); });
+        if (topOk) {
+            stack.style.top = margin + 'px';
+            stack.style.bottom = 'auto';
+            stack.style.transform = 'translateX(-50%)';
+        } else if (bottomOk) {
+            stack.style.top = 'auto';
+            stack.style.bottom = margin + 'px';
+            stack.style.transform = 'translateX(-50%)';
+        }
+        // 贴顶/贴底都盖住（块本身很高、接近占满整屏这种极端情况）——原样留在居中，宁可跟
+        // 块有一部分重叠，也不让卡片栈跑出视口变得点不到；跟任务书"只是定位调整，不改变
+        // 卡片本身内容/交互"的范围保持一致，不为这种边界情况新增更复杂的避让算法。
+    } catch (e) {}
 }
 
 // 入口：跟 ovlEditorSynonymOpen(mode, source) 同一个调用形状。source: 'code' | 'visual'。
@@ -59227,12 +59562,11 @@ function ovlVisualBtrRenderConfirmCards() {
 // Code 分支刻意什么都不做，不去动 ta.selectionStart/End 已经天然精确这件事）。
 function ovlInlineSrcEditOpen(source) {
     try {
-        // v2 Pass P160：双语对照模式全程只读——左侧 pane 复用的是既有 #ovlVisualPane，
-        // P159 的既有监听器原样还在，不加这道闸就会在双语模式下也能就地编辑，
-        // 跟"本车道不做可编辑双栏"的边界要求冲突。镜像面板本来就没绑这些监听器
-        // （ovlBindQuickActions 里 visualPane 变量固定引用 #ovlVisualPane 这一个元素），
-        // 这里只需要单独堵住左侧这一条路径。
-        if (OvlState.viewMode === 'bilingual') return;
+        // v2 Pass P160：原本这里挡住双语对照模式下的就地编辑（左侧只读）。
+        // v2 Pass P169（R1）：双栏都要能编辑——去掉这道闸，左侧 pane 复用的还是既有
+        // #ovlVisualPane 监听器（ovlBindQuickActions 里没变），右侧镜像面板走独立的
+        // ovlBilingualBindMirrorClick() 绑定 + ovlBilingualMirrorBlockEditOpenAtPoint()，
+        // 两条路径最终都汇到同一个 ovlInlineSrcEditOpenForBlocks 内核，不新发明机制。
         if (OvlInlineSrcEdit) {
             try { showToast('已经有一处在就地编辑，请先保存（Ctrl+Enter）或取消（Esc）。', 'warning'); } catch (e) {}
             return;
@@ -59373,8 +59707,8 @@ function ovlInlineSrcEditOpenForBlocks(touchedBlocks, opts) {
 // 失败都原样退回、源码零改动，跟 ovlInlineSrcCancel/ovlInlineSrcTeardown 共用同一套收尾。
 function ovlInlineZhEditOpen() {
     try {
-        // v2 Pass P160：同 ovlInlineSrcEditOpen 头部——双语对照模式左侧只读。
-        if (OvlState.viewMode === 'bilingual') return;
+        // v2 Pass P160：原本这里同 ovlInlineSrcEditOpen 头部——双语对照模式左侧只读。
+        // v2 Pass P169（R1）：去掉这道闸，理由同上（见 ovlInlineSrcEditOpen 头部新注释）。
         if (OvlInlineSrcEdit) {
             try { showToast('已经有一处在就地编辑，请先保存（Ctrl+Enter）或取消（Esc）。', 'warning'); } catch (e) {}
             return;
@@ -59526,8 +59860,8 @@ function ovlInlineZhEditOpenForBlocks(touchedBlocks) {
 // 现有手势（拖选/双击选词天然产生非 collapsed 选区，走既有分支；点击行号栏在 #ovlGutter
 // 这个完全不同的 DOM 子树，两套监听器互不相交）。
 function ovlVisualBlockEditOpenAtPoint(clientX, clientY) {
-    // v2 Pass P160：同上两个函数头部——双语对照模式左侧只读，这条新入口也要堵。
-    if (OvlState.viewMode === 'bilingual') return;
+    // v2 Pass P160：原本这里同上两个函数头部——双语对照模式左侧只读，这条新入口也堵过。
+    // v2 Pass P169（R1）：去掉这道闸，理由同 ovlInlineSrcEditOpen 头部新注释。
     // 三条闸门跟 ovlInlineSrcEditOpen/ovlInlineZhEditOpen 头部完全一致，直接照抄。
     if (OvlInlineSrcEdit) {
         try { showToast('已经有一处在就地编辑，请先保存（Ctrl+Enter）或取消（Esc）。', 'warning'); } catch (e) {}
@@ -60216,7 +60550,15 @@ function ovlVisualGutterSyncSpacer(gutter, pane) {
     return false;
 }
 
-function ovlRenderVisualGutter() {
+// v2 Pass P169（R5 支线修复）：skipAlignSchedule 是新增的可选参数，唯一调用方是
+// ovlBilingualRunAlignPass()（见该函数）——不传（既有全部调用点）语义完全不变。理由：这个
+// 函数的 finally 块本来就无条件在双语模式下调用 ovlBilingualScheduleAlign() 触发下一轮对齐；
+// 如果反过来让"对齐这一步"自己也去调用这个函数（R5 要求对齐改完行高后重新量一遍 gutter，
+// 见下面 R5 那段调用），финally 又会立刻排下一次对齐，对齐再触发 gutter 重画，形成不会自然
+// 停止的 rAF 循环——唯一能让它停下来的是熔断器，代价是双语模式打开后没几帧自动对齐就会被
+// 熔断关闭，这是真实的行为倒退，不是可以接受的权衡。加这一个参数就是为了斩断这条环路：
+// 对齐流程自己触发的这次重画，明确告诉函数"不用再替我排下一轮对齐，我这就是对齐流程的一部分"。
+function ovlRenderVisualGutter(skipAlignSchedule) {
     try {
         const gutter = document.getElementById('ovlGutter');
         const pane = document.getElementById('ovlVisualPane');
@@ -60359,8 +60701,186 @@ function ovlRenderVisualGutter() {
         // 对齐重算需要知道的信号之一（左侧确实没变，只需要看右侧是否变了），finally 保证
         // 不管走哪条早退路径都不会漏掉这次触发；ovlBilingualScheduleAlign 内部自己 rAF
         // 合帧节流，这里高频调用不会有性能问题（跟 ovlScheduleVisualGutterAfterImage 那种
-        // "调度器自己去重，调用方随便调"的既有纪律一致）。
-        if (OvlState.viewMode === 'bilingual' && typeof ovlBilingualScheduleAlign === 'function') {
+        // "调度器自己去重，调用方随便调"的既有纪律一致）。skipAlignSchedule=true 时不排——
+        // 唯一传 true 的调用方是 ovlBilingualRunAlignPass() 自己，见 skipAlignSchedule 参数
+        // 头部注释，避免"对齐 -> 重画 gutter -> finally 又排一轮对齐"的不会自然停止的循环。
+        if (!skipAlignSchedule && OvlState.viewMode === 'bilingual' && typeof ovlBilingualScheduleAlign === 'function') {
+            try { ovlBilingualScheduleAlign(); } catch (e2) {}
+        }
+    }
+}
+
+// ==================== v2 Pass P169（R5）：镜像 pane（#ovlGutterMirror/#ovlVisualPaneMirror）
+// 的行号 gutter —— 独立的一套模块级状态 + 独立函数，不是参数化 ovlRenderVisualGutter()。
+// 理由（详见 .claude/tmp/p169_design.md "R5" 一节）：镜像 pane 的内容只有一种更新方式——
+// ovlBilingualRefreshMirror() 每次整篇重写 .innerHTML，块元素引用每次都是全新的，"块集合
+// 没变、只是某几块高度变了"这种触发 ovlRenderVisualGutter() 增量 diff 分支的场景在镜像侧
+// 永远不会发生，所以这里只搬运"块集合变了 -> 全量重建"那一条分支的测量数学（gutter/pane
+// 顶边同一个 Y、padding-top 清零、OVL_VISUAL_GUTTER_MIN_H 阈值、spacer 补偿手法——全部照抄
+// 左侧已经调试稳定的实现，不重新发明），换一套完全独立的模块级单例（下面这几个变量），
+// 避免跟左侧 P123 的六个模块级状态互相踩踏。
+let OvlVisualBlockRectsMirror = [];
+let OvlVisualGutterBlockOrderMirror = []; // 防御性保留：即使镜像侧理论上每次都是全新块，仍然按同一套"块集合变没变"判断走，不假设调用方一定重建了全部块
+let OvlVisualGutterSpacerElMirror = null;
+let OvlVisualGutterLastSpacerTopMirror = -1;
+
+function ovlVisualGutterSameBlockOrderMirror(blocks) {
+    if (blocks.length !== OvlVisualGutterBlockOrderMirror.length) return false;
+    for (let i = 0; i < blocks.length; i++) {
+        if (blocks[i] !== OvlVisualGutterBlockOrderMirror[i]) return false;
+    }
+    return true;
+}
+
+function ovlVisualGutterEnsureSpacerMirror(gutter) {
+    if (OvlVisualGutterSpacerElMirror && OvlVisualGutterSpacerElMirror.parentNode === gutter) return OvlVisualGutterSpacerElMirror;
+    const sp = document.createElement('div');
+    sp.className = 'ovl-ln-spacer';
+    sp.setAttribute('aria-hidden', 'true');
+    sp.style.position = 'absolute';
+    sp.style.left = '0';
+    sp.style.width = '1px';
+    sp.style.height = '1px';
+    sp.style.visibility = 'hidden';
+    sp.style.pointerEvents = 'none';
+    gutter.appendChild(sp);
+    OvlVisualGutterSpacerElMirror = sp;
+    OvlVisualGutterLastSpacerTopMirror = -1;
+    return sp;
+}
+
+function ovlVisualGutterSyncSpacerMirror(gutter, pane) {
+    const sp = ovlVisualGutterEnsureSpacerMirror(gutter);
+    const targetTop = Math.max(0, pane.scrollHeight - 1);
+    if (Math.abs(targetTop - OvlVisualGutterLastSpacerTopMirror) > 0.5) {
+        sp.style.top = targetTop + 'px';
+        OvlVisualGutterLastSpacerTopMirror = targetTop;
+        return true;
+    }
+    return false;
+}
+
+// 独立的 ResizeObserver——不复用左侧 OvlVisualBlockRO，避免镜像块尺寸变化误触发左侧 gutter
+// 重渲染（或反过来）。逻辑照抄 ovlEnsureVisualBlockResizeObserver，只是回调目标换成镜像
+// 渲染函数、状态换成独立的 WeakSet/WeakMap。
+let OvlVisualBlockROMirror = null;
+const OvlVisualObservedBlocksMirror = (typeof WeakSet !== 'undefined') ? new WeakSet() : null;
+const OvlVisualBlockLastHMirror = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+let OvlVisualGutterMirrorImageRaf = null;
+function ovlScheduleVisualGutterAfterImageMirror() {
+    if (OvlVisualGutterMirrorImageRaf !== null) return;
+    OvlVisualGutterMirrorImageRaf = requestAnimationFrame(function () {
+        OvlVisualGutterMirrorImageRaf = null;
+        if (OvlState.viewMode === 'bilingual' && typeof ovlRenderVisualGutterMirror === 'function') ovlRenderVisualGutterMirror();
+    });
+}
+function ovlEnsureVisualBlockResizeObserverMirror() {
+    if (OvlVisualBlockROMirror) return OvlVisualBlockROMirror;
+    if (typeof ResizeObserver === 'undefined') return null;
+    try {
+        OvlVisualBlockROMirror = new ResizeObserver(function (entries) {
+            let changed = false;
+            for (let i = 0; i < entries.length; i++) {
+                const t = entries[i].target;
+                let rect;
+                try { rect = t.getBoundingClientRect(); } catch (e2) { continue; }
+                const h = rect.height;
+                const lastH = OvlVisualBlockLastHMirror ? OvlVisualBlockLastHMirror.get(t) : undefined;
+                if (OvlVisualBlockLastHMirror) OvlVisualBlockLastHMirror.set(t, h);
+                if (lastH === undefined || Math.abs(h - lastH) > 0.5) changed = true;
+            }
+            if (changed) ovlScheduleVisualGutterAfterImageMirror();
+        });
+    } catch (e) { OvlVisualBlockROMirror = null; }
+    return OvlVisualBlockROMirror;
+}
+function ovlVisualGutterObserveBlockMirror(blk, h) {
+    if (!OvlVisualObservedBlocksMirror || OvlVisualObservedBlocksMirror.has(blk)) return;
+    const ro = ovlEnsureVisualBlockResizeObserverMirror();
+    if (!ro) return;
+    OvlVisualObservedBlocksMirror.add(blk);
+    if (OvlVisualBlockLastHMirror) OvlVisualBlockLastHMirror.set(blk, h);
+    try { ro.observe(blk); } catch (e3) {}
+}
+
+// 字体延迟落地兜底——逻辑照抄 ovlScheduleVisualGutterAfterFonts，调用目标换成镜像渲染函数。
+let ovlVisualGutterFontSettlePendingMirror = false;
+function ovlScheduleVisualGutterAfterFontsMirror(depth) {
+    try {
+        if (ovlVisualGutterFontSettlePendingMirror) return;
+        const fonts = document.fonts;
+        if (!fonts || fonts.status !== 'loading') return;
+        if (!fonts.ready || typeof fonts.ready.then !== 'function') return;
+        const next = (depth || 0) + 1;
+        ovlVisualGutterFontSettlePendingMirror = true;
+        fonts.ready.then(function () {
+            ovlVisualGutterFontSettlePendingMirror = false;
+            if (OvlState.viewMode === 'bilingual') ovlRenderVisualGutterMirror();
+            if (next < 4) ovlScheduleVisualGutterAfterFontsMirror(next);
+        }, function () {
+            ovlVisualGutterFontSettlePendingMirror = false;
+        });
+    } catch (e) {}
+}
+
+// 全量重建——镜像版 ovlRenderVisualGutter()，只保留"块集合变了"那一条分支（见函数组头部
+// 注释）。不调用 ovlPaintGutterMarks()/状态角标相关逻辑——那些是左侧 gutter 行选/翻译状态
+// 特有的 UI，R5 的范围只是"显示行号、跟左侧逐行对齐"，不复制无关功能。
+function ovlRenderVisualGutterMirror(skipAlignSchedule) {
+    try {
+        const gutter = document.getElementById('ovlGutterMirror');
+        const pane = document.getElementById('ovlVisualPaneMirror');
+        if (!gutter || !pane) return;
+        if (OvlState.viewMode !== 'bilingual') return;
+        if (!pane.offsetParent) return; // 同 ovlRenderVisualGutter 的 P123（D4）不可见守卫
+        const blocks = Array.prototype.slice.call(pane.querySelectorAll('.ovl-visual-block[data-src-line]'));
+        gutter.style.paddingTop = '0px';
+        if (!blocks.length) {
+            gutter.innerHTML = '';
+            OvlVisualBlockRectsMirror = [];
+            OvlVisualGutterBlockOrderMirror = [];
+            OvlVisualGutterSpacerElMirror = null;
+            OvlVisualGutterLastSpacerTopMirror = -1;
+            return;
+        }
+        const paneRect = pane.getBoundingClientRect();
+        const sameOrder = ovlVisualGutterSameBlockOrderMirror(blocks);
+        gutter.innerHTML = '';
+        OvlVisualBlockRectsMirror = new Array(blocks.length);
+        const frag = document.createDocumentFragment();
+        for (let i = 0; i < blocks.length; i++) {
+            const blk = blocks[i];
+            const r = blk.getBoundingClientRect();
+            const top = Math.max(0, (r.top - paneRect.top) + pane.scrollTop);
+            const rawH = r.height;
+            const visible = rawH >= OVL_VISUAL_GUTTER_MIN_H;
+            const h = Math.max(rawH, 16);
+            const ln = parseInt(blk.getAttribute('data-src-line'), 10);
+            OvlVisualBlockRectsMirror[i] = { line: ln, el: blk, top: top, h: h, visible: visible };
+            if (visible) {
+                const cell = document.createElement('div');
+                cell.className = 'ovl-ln ovl-ln-visual';
+                cell.setAttribute('data-ln', String(ln));
+                cell.setAttribute('data-block', String(i));
+                cell.style.top = top + 'px';
+                cell.style.height = h + 'px';
+                cell.textContent = String(ln + 1);
+                frag.appendChild(cell);
+            }
+            ovlVisualGutterObserveBlockMirror(blk, h);
+        }
+        gutter.appendChild(frag);
+        OvlVisualGutterBlockOrderMirror = blocks;
+        ovlVisualGutterSyncSpacerMirror(gutter, pane);
+        gutter.scrollTop = pane.scrollTop;
+        ovlScheduleVisualGutterAfterFontsMirror(0);
+        void sameOrder; // 保留变量供以后若要加增量分支时复用判断，当前分支恒走全量重建
+    } catch (e) { console.error('[ovl] renderVisualGutterMirror failed', e); }
+    finally {
+        // 与 ovlRenderVisualGutter() 的 skipAlignSchedule 参数同一纪律：唯一传 true 的调用方
+        // 是 ovlBilingualRunAlignPass()（见该函数），避免"对齐 -> 重画两侧 gutter -> finally
+        // 又各排一轮对齐"的循环。
+        if (!skipAlignSchedule && OvlState.viewMode === 'bilingual' && typeof ovlBilingualScheduleAlign === 'function') {
             try { ovlBilingualScheduleAlign(); } catch (e2) {}
         }
     }
@@ -61738,6 +62258,15 @@ function ovlBoot() {
         OvlState.viewMode = savedView;
     }
     ovlSetViewMode(OvlState.viewMode, { skipSave: true });
+
+    // v2 Pass P169（R2）：交换开关的持久化状态，跟 ovl.viewMode 同一套扁平 key 约定。
+    // ovlBilingualApplySwapOrder() 只是给 #ovlBody 设/去掉一个属性，CSS 选择器本身用
+    // [data-view="bilingual"] 限定，不在双语视图时挂着这个属性没有任何可见效果，这里
+    // 不需要判断当前 viewMode 是不是 bilingual 才调用。
+    let savedSwapped = null;
+    try { savedSwapped = localStorage.getItem('ovl.bilingualSwapped'); } catch (e) {}
+    OvlState.bilingualSwapped = (savedSwapped === '1');
+    if (typeof ovlBilingualApplySwapOrder === 'function') ovlBilingualApplySwapOrder();
 
     let savedTree = null;
     try { savedTree = localStorage.getItem('ovl.treeOpen'); } catch (e) {}
