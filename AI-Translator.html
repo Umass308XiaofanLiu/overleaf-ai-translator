@@ -2564,6 +2564,16 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    data URL）替换掉图标那一格，文件名说明文字保持不变——跟旧占位框视觉上是"同一个盒子
    升级"，不是另起一套样式。 */
 .ovl-visual-fig-thumb { max-width: 100%; max-height: 260px; object-fit: contain; border-radius: 2px; }
+/* v2 Pass P172：\todo / \marginpar 同属 MACRO_TABLE 的 DELETE 名单，跟裸 \includegraphics
+   是同一类"作者本人写的可见内容被无声吃掉"缺陷，但内容本身是纯文本批注，没理由不直接
+   显示——用醒目的行内徽标（todo 黄底、marginpar 灰底，跟 LaTeX 编译效果的"显眼批注"直觉
+   一致）而不是灰色占位框（那是给"没法直接显示"的图片路径用的）。 */
+.ovl-visual-note-badge {
+    display: inline-block; padding: 1px 6px; margin: 0 2px; border-radius: 3px;
+    font-size: 0.92em; line-height: 1.5; white-space: pre-wrap; vertical-align: baseline;
+}
+.ovl-visual-note-todo { background: #fef3c7; border: 1px solid #f59e0b; color: #78350f; }
+.ovl-visual-note-margin { background: #e5e7eb; border: 1px solid #9ca3af; color: #374151; }
 .ovl-visual-float-fallback { white-space: pre-wrap; }
 /* v2 Pass P87：flalign/IEEEeqnarray 实测 KaTeX 0.16.9 真不认识这两个环境名（见
    renderFormattedText 里对应注释），不能强行喂给 KaTeX（会吐刺眼的红色 ParseError），
@@ -4856,7 +4866,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.33.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.34.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -33634,14 +33644,125 @@ function ovlUnwrapSingleParagraph(html) {
     return html.replace(/^\s*<p>([\s\S]*)<\/p>\s*$/, '$1');
 }
 
-// 普通正文块的渲染入口：保护 \textcolor -> LatexFilter -> 还原 \textcolor -> renderFormattedText。
-// 表格/算法/图片这三种 float 环境需要完全不同的解析方式（行列/伪代码缩进/占位图），不能
-// 走这条把整段当散文处理的通用路径——命中就直接分派给各自的渲染函数，不再往下走
-// LatexFilter（\hline/\STATE/\includegraphics 这些结构性标记不是"翻译用的散文"，用
-// LatexFilter 处理只会拆出乱码或被 DELETE 规则整段吃掉，比如 includegraphics 就在
-// MACRO_TABLE 的 DELETE 名单里）。
+// 普通正文块的渲染入口：保护 \textcolor / 裸 \includegraphics -> LatexFilter -> 还原两者
+// -> renderFormattedText。表格/算法/图片这三种 float 环境需要完全不同的解析方式（行列/
+// 伪代码缩进/占位图），不能走这条把整段当散文处理的通用路径——命中就直接分派给各自的
+// 渲染函数，不再往下走 LatexFilter（\hline/\STATE 这些结构性标记不是"翻译用的散文"，用
+// LatexFilter 处理只会拆出乱码）。
 // P64：longtable 单独列一项（不接 \*? ，这个环境没有星号变体），复用 table 的渲染路径。
 const OVL_VISUAL_FLOAT_DISPATCH_RE = /^\s*\\begin\{(table|algorithm|figure)\*?\}|^\s*\\begin\{(longtable)\}/;
+// v2 Pass P172（缺陷修复）：不在 \begin{figure}...\end{figure} 里的"裸" \includegraphics
+// ——用户合法、能编译出图的写法——此前会漏过上面的 float 分派，直接掉进下面的 LatexFilter
+// 散文路径；\includegraphics 在 MACRO_TABLE 的 DELETE 名单里（3840 行附近 del1），
+// processSegment 对 DELETE 类宏的处理就是整段吃掉、只留一个 MARK 占位（4554-4559 行），
+// 渲染结果里这行会无声消失——源码本身没被动过（写回路径是原始 textarea 的原文 splice，
+// 跟这条纯显示层路径完全无关，参见 .claude/tmp/p172_impl.md Phase 0 实测），但用户在预览
+// 里完全看不出这处图还在，容易误以为自己手滑删掉了。
+// 修法：复用跟 \begin{figure} 完全相同的占位框/异步缩略图机制（ovlRenderFigurePlaceholder
+// + data-fig-src，ovlVisualLoadFigureThumbnails 按这个属性异步补真缩略图，不需要新接线）：
+//   - 整块只是一条/几条裸 \includegraphics（前后只有空白）——原始 bug 报告的形态、也是绝大
+//     多数真实写法——直接整体渲染成占位框，完全不进 LatexFilter。
+//   - 裸 \includegraphics 夹在同一段落的散文文字中间（少见但同样不能无声消失）——用一个
+//     LatexFilter 从不认识的纯文本 token（私用区字符，跟 OVL_TC_TOKEN_MARK 用的
+//      不是同一个字符，不会撞）占位过 LatexFilter，渲染成 HTML 之后再把 token 换成
+//     占位框 HTML（不能像 \textcolor 那样提前换回源码文本，因为占位框本身就是一段 HTML，
+//     必须在 renderFormattedText 产出 HTML 之后才能安全拼进去）。
+const OVL_VISUAL_BARE_IMG_RE = /\\includegraphics\s*(?:\[[^\]]*\])?\s*\{[^{}]*\}/g;
+const OVL_FIG_TOKEN_MARK = '';
+function ovlVisualRenderBareIncludegraphics(tex) {
+    const stripped = ovlStripLatexCommentsForRender(tex).trim();
+    if (!stripped) return null;
+    OVL_VISUAL_BARE_IMG_RE.lastIndex = 0;
+    const boxes = [];
+    let lastEnd = 0;
+    let m;
+    while ((m = OVL_VISUAL_BARE_IMG_RE.exec(stripped))) {
+        if (stripped.slice(lastEnd, m.index).trim() !== '') return null;   // 图片前/间夹了别的文字，不算"整块只是图片"
+        boxes.push(ovlRenderFigurePlaceholder(ovlExtractIncludegraphicsPath(m[0]), ovlExtractIncludegraphicsWidthFrac(m[0])));
+        lastEnd = OVL_VISUAL_BARE_IMG_RE.lastIndex;
+    }
+    if (!boxes.length || stripped.slice(lastEnd).trim() !== '') return null;
+    return '<div class="ovl-visual-figure-wrap"><div class="ovl-visual-fig-row">' + boxes.join('') + '</div></div>';
+}
+function ovlProtectBareIncludegraphicsForFilter(tex) {
+    const tokens = [];
+    OVL_VISUAL_BARE_IMG_RE.lastIndex = 0;
+    const text = tex.replace(OVL_VISUAL_BARE_IMG_RE, function (whole) {
+        const idx = tokens.length;
+        tokens.push(whole);
+        return OVL_FIG_TOKEN_MARK + idx + OVL_FIG_TOKEN_MARK;
+    });
+    return { text: text, tokens: tokens };
+}
+function ovlRestoreBareIncludegraphicsAfterRender(html, tokens) {
+    let out = html;
+    for (let idx = 0; idx < tokens.length; idx++) {
+        const marker = OVL_FIG_TOKEN_MARK + idx + OVL_FIG_TOKEN_MARK;
+        if (out.indexOf(marker) === -1) continue;   // token 在 LatexFilter 里被套进了别的结构（极端情况）——宁可漏图标不吞字，原样跳过
+        const src = tokens[idx];
+        out = out.split(marker).join(ovlRenderFigurePlaceholder(ovlExtractIncludegraphicsPath(src), ovlExtractIncludegraphicsWidthFrac(src)));
+    }
+    return out;
+}
+// v2 Pass P172（缺陷修复，第二类）：MACRO_TABLE 的 DELETE 名单（3840 行附近 del1/todo）里
+// 还有两个同样带"作者本人写的可见内容"的宏——\todo{...}（todonotes 宏包，编译后是一块
+// 醒目的批注框）和 \marginpar{...}（原生 LaTeX，编译后是页边批注文字）。跟 \includegraphics
+// 是同一类缺陷（内容被整段吃掉、只留 MARK），但严重性判断和修法都不同：
+//   - 不复用 figure 占位框机制（那是给"文件路径"这种没法直接显示的东西用的）——todo/
+//     marginpar 的参数本身就是纯文本批注，没有理由不直接显示出来，反而应该原样露出。
+//   - 参数内容可能嵌套花括号（\todo{改成 \textbf{加粗}} 在 todonotes 真实用法里很常见），
+//     跟上面裸图片用的不配平正则（图片参数从来不嵌套）不是同一量级的风险，必须用花括号
+//     配平扫描（ovlFindMatchingBrace，9685 行，\textcolor 保护逻辑用的同一个工具函数）
+//     取参数，不能偷懒用 [^{}]*。
+//   - 不追求把参数内部的 LaTeX 格式化命令渲染出来（那需要递归喂回 renderFormattedText，
+//     工程量和 \textcolor 的颜色渲染是一个量级、超出本车道任务书"至少给占位符"这一档的
+//     授权范围）——转义成纯文本、包一层带样式的可见批注徽标，跟裸图片一样要在
+//     renderFormattedText 产出 HTML 之后才做最终替换（徽标本身也是一段 HTML）。
+//   - 已知边界情况：\todo{...} 内容里嵌套 \textcolor{...}{...} 时，先还原 textcolor 的
+//     token 再转义显示（下面 ovlRestoreNoteMacrosAfterRender 的 tcTokens 参数），避免徽标
+//     里露出哑元占位符；但内容里嵌套裸 \includegraphics 这种更极端的组合不特殊处理——
+//     跟 \textcolor 场景不是同一优先级，属于本轮明确不做的范围，注释存档以备之后追加。
+const OVL_NOTE_TOKEN_MARK = '';   // 私用区字符，跟 (textcolor)/(includegraphics) 均不同，经 python repr() 核对
+const OVL_NOTE_OPEN_RE = /\\(todo)\s*(?:\[[^\]]*\])?\{|\\(marginpar)\s*\{/g;
+function ovlProtectNoteMacrosForFilter(tex) {
+    const tokens = [];
+    let out = '';
+    let i = 0;
+    while (i < tex.length) {
+        OVL_NOTE_OPEN_RE.lastIndex = i;
+        const m = OVL_NOTE_OPEN_RE.exec(tex);
+        if (!m) { out += tex.slice(i); break; }
+        out += tex.slice(i, m.index);
+        const kind = m[1] || m[2];   // 'todo' | 'marginpar'
+        const openBrace = m.index + m[0].length - 1;
+        const closeBrace = ovlFindMatchingBrace(tex, openBrace);
+        if (closeBrace === -1) { out += tex.slice(m.index); i = tex.length; break; }
+        const content = tex.slice(openBrace + 1, closeBrace);
+        const idx = tokens.length;
+        tokens.push({ kind: kind, content: content });
+        out += OVL_NOTE_TOKEN_MARK + idx + OVL_NOTE_TOKEN_MARK;
+        i = closeBrace + 1;
+    }
+    return { text: out, tokens: tokens };
+}
+function ovlRenderNoteBadge(kind, content) {
+    const label = kind === 'marginpar' ? '边注 marginpar' : 'TODO';
+    const cls = kind === 'marginpar' ? 'ovl-visual-note-margin' : 'ovl-visual-note-todo';
+    return '<span class="ovl-visual-note-badge ' + cls + '" title="\\' + kind +
+        '{...}（原始内容已保留在源码中，未按 LaTeX 格式化，仅纯文本显示）">' +
+        '<b>[' + escapeHtml(label) + ']</b> ' + escapeHtml(content) + '</span>';
+}
+function ovlRestoreNoteMacrosAfterRender(html, tokens, tcTokens) {
+    let out = html;
+    for (let idx = 0; idx < tokens.length; idx++) {
+        const marker = OVL_NOTE_TOKEN_MARK + idx + OVL_NOTE_TOKEN_MARK;
+        if (out.indexOf(marker) === -1) continue;   // 同上：宁可漏徽标不吞字，原样跳过
+        let content = tokens[idx].content;
+        if (tcTokens && tcTokens.length) content = ovlRestoreTextColorAfterFilter(content, tcTokens);
+        out = out.split(marker).join(ovlRenderNoteBadge(tokens[idx].kind, content));
+    }
+    return out;
+}
 function ovlVisualRenderChunk(tex) {
     // v2 Pass P129：thebibliography 整段命中就分派给编号引用列表渲染器，跟下面 float 分派
     // 同一条"try/catch 退回原有散文渲染路径"纪律。两种 Visual 模式（Original/中文）都走
@@ -33661,7 +33782,20 @@ function ovlVisualRenderChunk(tex) {
             console.error('[ovl-visual] float 环境渲染失败，退回原有的散文渲染路径', e);
         }
     }
+    // v2 Pass P172：不在上面任何一种 float 环境里的裸 \includegraphics，先试"整块只是图片"
+    // 这条最常见形态的直接渲染；不满足再往下走 token 保护 + 散文渲染兜底，两条路径都不会
+    // 再把它交给 LatexFilter 的 DELETE 规则整段吃掉。
+    if (OVL_VISUAL_BARE_IMG_RE.test(tex)) {
+        try {
+            const soleFig = ovlVisualRenderBareIncludegraphics(tex);
+            if (soleFig !== null) return soleFig;
+        } catch (e) {
+            console.error('[ovl-visual] 裸 includegraphics 整块渲染失败，退回下面的 token 保护兜底', e);
+        }
+    }
     const protectedInput = ovlProtectTextColorForFilter(tex);
+    const protectedFig = ovlProtectBareIncludegraphicsForFilter(protectedInput.text);
+    const protectedNote = ovlProtectNoteMacrosForFilter(protectedFig.text);
     // P61：Visual 模式的输入必然来自已打开的 .tex 文件本体（不是聊天框里可能不是 tex 源码
     // 的自由文本），LatexFilter 的 'auto' 模式是为"不确定是不是真 tex 源码"的场景设计的
     // （靠 detectTexMode 在一个小窗口里数强信号，分数不够就不剥注释）——Visual 逐块渲染
@@ -33670,12 +33804,18 @@ function ovlVisualRenderChunk(tex) {
     // tex，是已经确定就是 tex，改成 'always' 跳过这层猜测，直接剥注释——不改 LatexFilter
     // 内部 'auto' 启发式本身（那是给聊天框粘贴文本这类真的需要猜测的场景用的，改了影响面
     // 太大），只改这一个调用点传的参数。
-    const filtered = LatexFilter.filterLatexForTranslation(protectedInput.text, { comments: 'always', structure: true });
+    const filtered = LatexFilter.filterLatexForTranslation(protectedNote.text, { comments: 'always', structure: true });
     const restored = ovlRestoreTextColorAfterFilter(filtered.text, protectedInput.tokens);
     // v2 Pass P158：Visual 渲染管线主路径，显式传入 OvlXrefState 启用引用编号解析
     // （真编号/过期/近似/查不到四档）。这是唯一的模块级单例，不需要逐层传参——
     // ovlVisualRender() 在渲染前已经按三重失效条件维护好它（§6.1）。
-    return renderFormattedText(restored, OvlXrefState);
+    const html = renderFormattedText(restored, OvlXrefState);
+    // v2 Pass P172：跟 \textcolor 不同，裸图片/todo/marginpar 的 token 都必须在
+    // renderFormattedText 产出 HTML 之后才能还原——换回的是一段占位框/徽标 HTML，不是能
+    // 再喂给渲染器的 LaTeX 源码。
+    let out = protectedFig.tokens.length ? ovlRestoreBareIncludegraphicsAfterRender(html, protectedFig.tokens) : html;
+    if (protectedNote.tokens.length) out = ovlRestoreNoteMacrosAfterRender(out, protectedNote.tokens, protectedInput.tokens);
+    return out;
 }
 
 // ---- v2 Overleaf 预览 Pass：表格 / 算法 / 图片近似渲染 ----
