@@ -3173,11 +3173,20 @@ body.ovl-translator-open #ovlTransWin { display: block; }
    在渲染后检测重叠并挪开（贴顶/贴底），见该函数头部注释；这里的 left/top/transform 是
    "没有重叠时"的默认落点，挪开时由 JS 写内联样式覆盖 top/bottom/transform 三个值。
    z-index 参考既有 .ovl-p2t-pill/.ovl-p2tb-panel（1085）：卡片属于"用户主动要处理的事项"，
-   理应盖在那些装饰性小面板之上，所以取 1092。 */
+   理应盖在那些装饰性小面板之上，所以取 1092。
+   v2 Pass P171：修"居中卡片遮挡无关段落"——根因不是 pointer-events（那早在 P166 就已经
+   是"容器 none / 卡片 auto"，此前误诊过一轮，见本 Pass 任务书），而是卡片栈自身矩形太大：
+   旧上限 calc(100vh - 32px) 几乎等于整个视口高度，多张卡片一摞经常被这个上限直接封顶，
+   这时 ovlBtrCardStackAvoidOverlap() 的贴顶/贴底两个候选矩形跟"仍在居中"的默认矩形几乎
+   重合（候选矩形本身也是这么高），根本挪不出真正空出来的区域，于是必然压住屏幕中间一整
+   片无关段落。这里把上限从"几乎整屏"收紧到 min(46vh, 460px)，同时把之前完全不限高的
+   "你的中文输入"回显区（见下方 .ovl-btr-card-zhtext）也纳入内部滚动——单张卡片经此实测
+   可以从约 480px 压到约 300px 出头，两张卡片摞起来也不再顶到上限附近。函数本身一行未动，
+   只是给它腾出了以前被"上限跟视口一样高"吃掉的可用空间。 */
 .ovl-btr-card-stack {
     position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); z-index: 1092;
-    display: flex; flex-direction: column-reverse; gap: 10px;
-    max-height: calc(100vh - 32px); overflow-y: auto;
+    display: flex; flex-direction: column-reverse; gap: 8px;
+    max-height: min(46vh, 460px); overflow-y: auto;
     width: 380px; max-width: calc(100vw - 32px);
     pointer-events: none;
 }
@@ -3186,14 +3195,19 @@ body.ovl-translator-open #ovlTransWin { display: block; }
     pointer-events: auto;
     background: #1B222C; color: #F4F5F6; border: 1px solid #333B49; border-radius: 8px;
     box-shadow: 0 12px 32px -8px rgba(0,0,0,0.55);
-    padding: 10px 12px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    padding: 8px 10px; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
 }
 .ovl-btr-card-failed { border-color: #F87171; }
-.ovl-btr-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px; }
+.ovl-btr-card-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 5px; }
 .ovl-btr-card-title { font-size: 12px; font-weight: 700; }
 .ovl-btr-card-failed .ovl-btr-card-title { color: #F87171; }
-.ovl-btr-card-reason { font-size: 12px; line-height: 1.6; color: #FCA5A5; margin-bottom: 8px; }
-.ovl-btr-card .ovl-backtrans-diff { max-width: none; max-height: 220px; }
+.ovl-btr-card-reason { font-size: 12px; line-height: 1.5; color: #FCA5A5; margin-bottom: 6px; }
+.ovl-btr-card .ovl-backtrans-diff { max-width: none; max-height: 130px; }
+/* v2 Pass P171：卡片里"你的中文输入"回显区此前没有任何高度上限——用户实际输入越长，
+   卡片本身（进而整个居中卡片栈）就越高，这是压住无关段落的主要原因之一（比 diff 区更大，
+   diff 区早已有 max-height）。给它跟 diff 同一档处理：封顶 + 内部滚动，完整内容仍然可以
+   滚动看到，不是截断丢信息。 */
+.ovl-btr-card-zhtext { max-height: 84px; overflow-y: auto; }
 .ovl-btr-card-copytext {
     width: 100%; box-sizing: border-box; font-size: 12px; line-height: 1.5; color: #E7E9EE;
     background: #1B2029; border: 1px solid #333B49; border-radius: 4px; padding: 6px 8px;
@@ -4842,7 +4856,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.33.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.33.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -59537,7 +59551,9 @@ function ovlVisualBtrConfirmCardCopy(id) {
 }
 
 function ovlVisualBtrConfirmCardHtml(rec) {
-    const zhHtml = '<div class="ovl-backtrans-label">你的中文输入</div><div class="ovl-backtrans-text">' + escapeHtml(rec.newZhText || '') + '</div>';
+    // v2 Pass P171：zh 回显区加 ovl-btr-card-zhtext（见同名 CSS 规则头部注释）——封顶高度+
+    // 内部滚动，不再随用户输入长度无限撑高卡片本身。
+    const zhHtml = '<div class="ovl-backtrans-label">你的中文输入</div><div class="ovl-backtrans-text ovl-btr-card-zhtext">' + escapeHtml(rec.newZhText || '') + '</div>';
     if (rec.status === 'failed') {
         return '<div class="ovl-btr-card ovl-btr-card-failed" data-card-id="' + rec.id + '">'
             + '<div class="ovl-btr-card-head"><span class="ovl-btr-card-title">未能写入</span>'
