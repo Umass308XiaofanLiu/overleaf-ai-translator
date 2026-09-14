@@ -2612,6 +2612,11 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 }
 .ovl-visual-note-todo { background: #fef3c7; border: 1px solid #f59e0b; color: #78350f; }
 .ovl-visual-note-margin { background: #e5e7eb; border: 1px solid #9ca3af; color: #374151; }
+/* v2 Pass P176：\pdfcomment 是 MACRO_TABLE DELETE 名单里第三个同类宏（3871 行），配色跟
+   已有的 todo(琥珀)/marginpar(灰) 都要能一眼区分——选蓝色：pdfcomment 包的实际渲染效果是
+   PDF 阅读器里的黄色/蓝色对话气泡批注图标，蓝色比琥珀/灰更贴近该宏本身的语义（"批注"而非
+   "待办"），同时在这三色里视觉区分度最高。 */
+.ovl-visual-note-pdfcomment { background: #dbeafe; border: 1px solid #3b82f6; color: #1e3a8a; }
 .ovl-visual-float-fallback { white-space: pre-wrap; }
 /* v2 Pass P87：flalign/IEEEeqnarray 实测 KaTeX 0.16.9 真不认识这两个环境名（见
    renderFormattedText 里对应注释），不能强行喂给 KaTeX（会吐刺眼的红色 ParseError），
@@ -4904,7 +4909,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.36.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.36.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -33835,10 +33840,24 @@ function ovlRestoreBareIncludegraphicsAfterRender(html, tokens) {
 //     renderFormattedText 产出 HTML 之后才做最终替换（徽标本身也是一段 HTML）。
 //   - 已知边界情况：\todo{...} 内容里嵌套 \textcolor{...}{...} 时，先还原 textcolor 的
 //     token 再转义显示（下面 ovlRestoreNoteMacrosAfterRender 的 tcTokens 参数），避免徽标
-//     里露出哑元占位符；但内容里嵌套裸 \includegraphics 这种更极端的组合不特殊处理——
-//     跟 \textcolor 场景不是同一优先级，属于本轮明确不做的范围，注释存档以备之后追加。
+//     里露出哑元占位符。
+// v2 Pass P176（清 P172 两条遗留，缺陷定性同上不重新定性）：
+//   1) \pdfcomment{...}（pdfcomment 宏包，3871 行同样是 DELETE 名单）是第三个同类宏，接进
+//      同一套 OVL_NOTE_OPEN_RE / ovlProtectNoteMacrosForFilter / ovlRenderNoteBadge 机制，
+//      不另起第二套——跟 todo/marginpar 一样可能带 [选项]，语法形状完全一致。配色见 CSS 里
+//      的 .ovl-visual-note-pdfcomment（蓝色，2609 行附近，与已有琥珀/灰可区分）。
+//   2) 上面"内容里嵌套裸 \includegraphics 这种更极端的组合不特殊处理"这条遗留在本 Pass 补上：
+//      协议改成先抠 note 宏（本函数）、再抠裸图片 token（ovlVisualRenderChunk 里两行调用
+//      顺序对调）——嵌套在 todo/marginpar/pdfcomment 参数里的裸 \includegraphics 因此永远
+//      不会被外层的 OVL_VISUAL_BARE_IMG_RE token 保护提前吃掉，content 字段里存的还是原始
+//      \includegraphics{...} 源码文本。渲染徽标时（新增的 ovlRenderNoteContentHtml）对
+//      content 再跑一遍同一条 OVL_VISUAL_BARE_IMG_RE，命中的图片段落直接渲染成跟顶层裸图片
+//      同款的 .ovl-visual-fig-box 占位框（复用 ovlRenderFigurePlaceholder，零新接线），非
+//      图片的文字段落照常 escapeHtml——是"外层徽标正常显示 + 内部图片也能看见真实占位框"的
+//      完整方案，不是退而求其次的纯文本兜底：内容已是纯文本，一次线性扫描即可，不需要
+//      token 往返，也不是递归喂回 renderFormattedText 那个工程量级，没有超出授权范围。
 const OVL_NOTE_TOKEN_MARK = '';   // 私用区字符，跟 (textcolor)/(includegraphics) 均不同，经 python repr() 核对
-const OVL_NOTE_OPEN_RE = /\\(todo)\s*(?:\[[^\]]*\])?\{|\\(marginpar)\s*\{/g;
+const OVL_NOTE_OPEN_RE = /\\(todo)\s*(?:\[[^\]]*\])?\{|\\(marginpar)\s*\{|\\(pdfcomment)\s*(?:\[[^\]]*\])?\{/g;
 function ovlProtectNoteMacrosForFilter(tex) {
     const tokens = [];
     let out = '';
@@ -33848,7 +33867,7 @@ function ovlProtectNoteMacrosForFilter(tex) {
         const m = OVL_NOTE_OPEN_RE.exec(tex);
         if (!m) { out += tex.slice(i); break; }
         out += tex.slice(i, m.index);
-        const kind = m[1] || m[2];   // 'todo' | 'marginpar'
+        const kind = m[1] || m[2] || m[3];   // 'todo' | 'marginpar' | 'pdfcomment'
         const openBrace = m.index + m[0].length - 1;
         const closeBrace = ovlFindMatchingBrace(tex, openBrace);
         if (closeBrace === -1) { out += tex.slice(m.index); i = tex.length; break; }
@@ -33860,12 +33879,29 @@ function ovlProtectNoteMacrosForFilter(tex) {
     }
     return { text: out, tokens: tokens };
 }
+// v2 Pass P176：note 徽标内容里嵌套的裸 \includegraphics 渲染成真实占位框，不是纯文字、
+// 更不能静默消失——跟顶层裸图片用同一条 OVL_VISUAL_BARE_IMG_RE + ovlRenderFigurePlaceholder，
+// 只是这里 content 已经是纯文本（不需要再过 LatexFilter），不需要 token 往返，直接一次
+// 线性扫描切段落：图片段落渲染占位框 HTML，非图片段落照常 escapeHtml 转义。
+function ovlRenderNoteContentHtml(content) {
+    OVL_VISUAL_BARE_IMG_RE.lastIndex = 0;
+    let html = '';
+    let last = 0;
+    let m;
+    while ((m = OVL_VISUAL_BARE_IMG_RE.exec(content))) {
+        html += escapeHtml(content.slice(last, m.index));
+        html += ovlRenderFigurePlaceholder(ovlExtractIncludegraphicsPath(m[0]), ovlExtractIncludegraphicsWidthFrac(m[0]));
+        last = OVL_VISUAL_BARE_IMG_RE.lastIndex;
+    }
+    html += escapeHtml(content.slice(last));
+    return html;
+}
 function ovlRenderNoteBadge(kind, content) {
-    const label = kind === 'marginpar' ? '边注 marginpar' : 'TODO';
-    const cls = kind === 'marginpar' ? 'ovl-visual-note-margin' : 'ovl-visual-note-todo';
+    const label = kind === 'marginpar' ? '边注 marginpar' : (kind === 'pdfcomment' ? 'PDF批注 pdfcomment' : 'TODO');
+    const cls = kind === 'marginpar' ? 'ovl-visual-note-margin' : (kind === 'pdfcomment' ? 'ovl-visual-note-pdfcomment' : 'ovl-visual-note-todo');
     return '<span class="ovl-visual-note-badge ' + cls + '" title="\\' + kind +
         '{...}（原始内容已保留在源码中，未按 LaTeX 格式化，仅纯文本显示）">' +
-        '<b>[' + escapeHtml(label) + ']</b> ' + escapeHtml(content) + '</span>';
+        '<b>[' + escapeHtml(label) + ']</b> ' + ovlRenderNoteContentHtml(content) + '</span>';
 }
 function ovlRestoreNoteMacrosAfterRender(html, tokens, tcTokens) {
     let out = html;
@@ -33909,8 +33945,15 @@ function ovlVisualRenderChunk(tex) {
         }
     }
     const protectedInput = ovlProtectTextColorForFilter(tex);
-    const protectedFig = ovlProtectBareIncludegraphicsForFilter(protectedInput.text);
-    const protectedNote = ovlProtectNoteMacrosForFilter(protectedFig.text);
+    // v2 Pass P176：note 宏（todo/marginpar/pdfcomment）保护必须先于裸图片 token 保护跑——
+    // 否则嵌套在 note 参数里的裸 \includegraphics 会被下面这行提前抠成 OVL_FIG_TOKEN_MARK
+    // token，note 的 content 字段里存的就不再是原始源码而是一个孤零零的 token 数字，
+    // ovlRenderNoteContentHtml 在纯文本 content 里找不到真正的 \includegraphics 宏样式，
+    // 徽标里就会露出裸 token 字符（旧行为，已用 mutation 测试撤掉此顺序验证会翻红）。调换
+    // 顺序后，note 参数整体被本函数先一步整段抠走，图片 token 保护看到的是"抠完 note 之后
+    // 剩下"的文本，nested 场景天然不会撞上。
+    const protectedNote = ovlProtectNoteMacrosForFilter(protectedInput.text);
+    const protectedFig = ovlProtectBareIncludegraphicsForFilter(protectedNote.text);
     // P61：Visual 模式的输入必然来自已打开的 .tex 文件本体（不是聊天框里可能不是 tex 源码
     // 的自由文本），LatexFilter 的 'auto' 模式是为"不确定是不是真 tex 源码"的场景设计的
     // （靠 detectTexMode 在一个小窗口里数强信号，分数不够就不剥注释）——Visual 逐块渲染
@@ -33919,7 +33962,7 @@ function ovlVisualRenderChunk(tex) {
     // tex，是已经确定就是 tex，改成 'always' 跳过这层猜测，直接剥注释——不改 LatexFilter
     // 内部 'auto' 启发式本身（那是给聊天框粘贴文本这类真的需要猜测的场景用的，改了影响面
     // 太大），只改这一个调用点传的参数。
-    const filtered = LatexFilter.filterLatexForTranslation(protectedNote.text, { comments: 'always', structure: true });
+    const filtered = LatexFilter.filterLatexForTranslation(protectedFig.text, { comments: 'always', structure: true });
     const restored = ovlRestoreTextColorAfterFilter(filtered.text, protectedInput.tokens);
     // v2 Pass P158：Visual 渲染管线主路径，显式传入 OvlXrefState 启用引用编号解析
     // （真编号/过期/近似/查不到四档）。这是唯一的模块级单例，不需要逐层传参——
