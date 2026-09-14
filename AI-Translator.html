@@ -2327,6 +2327,44 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    这两个颜色在这个面板能出现的唯一背景下始终生效，不需要（也没有意义）另写一份深色覆盖值。 */
 .ovl-compare-en { color: #1f2937; }
 .ovl-compare-zh { color: #4b5563; margin-top: 0.25em; }
+/* v2 Pass P173（F1）：compare 模式下每个 .ovl-visual-block（一对英中内容——断行开关打开时
+   就是逐行切出来的"一行"，关掉/原子块时是整段）套一层浅灰色高透明度的框，让相邻块之间
+   "一眼可分"。用户原话："为每个中英文的一行内容用一个浅灰色填充的高透明度的框包裹一下么？
+   用于区分句子与句子之间的分别。"只在 compare 模式生效（JS 侧只在 lang==='compare' 时才
+   给块多挂一个 .ovl-visual-compare class，见 ovlVisualRenderBodyWithLines），original/zh
+   两种既有模式的块逐字节不受影响。背景取 rgba(0,0,0,0.05)——Visual 面板背景写死 #ffffff
+   （见上方约 2326 行注释，这个面板没有深色皮肤，透明度叠加后的等效底色只有这一种，不需要
+   另写深色变体），叠加后等效底色 #f2f2f2，重算 WCAG 对比度：英文 #1f2937 ≈13.11:1、中文
+   #4b5563 ≈6.75:1，均仍远高于 4.5:1 门槛（Python colorsys 相对亮度公式实测，压根没有被这层
+   极淡灰色背景拖累到危险区）。加一圈更淡的描边（rgba(0,0,0,0.08)）保证哪怕两个框贴在一起
+   （data-para-start="0" 续行块，基础间距是 0）也能靠边框分出两个独立矩形，不完全依赖 margin
+   撑开的缝隙；续行块额外补一点 margin-top 防止相邻描边直接贴合看成一个框。 */
+.ovl-visual-block.ovl-visual-compare {
+    background-color: rgba(0, 0, 0, 0.05);
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    border-radius: 6px;
+    padding: 0.3em 0.55em;
+}
+.ovl-visual-block.ovl-visual-compare[data-para-start="0"] { margin-top: 0.22em; }
+/* v2 Pass P173（F2）：original/chinese/compare 三种 Visual 模式下，把源码里分段用的空行
+   渲染成一个真正可见的空行——用户原话："我希望你将分段的时候的那个空一行给渲染出来。空的
+   那一行在三种visual下是显示的，内容就是空着的内容，方便我们识别分段的情况。" 纯渲染层的
+   间隔条，JS 侧（ovlVisualRenderBodyWithLines）只在检测到两个相邻 .ovl-visual-block 之间
+   源码行号有真实缺口（即源码里确有空行，不是标题/数学/float/参考文献这类"无空行也会分块"
+   的人工边界）时才插入一个，绝不携带 data-src-line/data-src-line-end、不带 ovl-visual-block
+   class——【红线】它必须对写回/翻译队列/gutter 完全透明：
+     - ovlGutterLineRangeToChars 的调用方一律先读块的 data-src-line/-line-end 再换算字符区间，
+       这个元素没有这两个属性，天然进不了任何写回路径；
+     - 点击/双击就地编辑走 hitEl.closest('.ovl-visual-block[data-src-line]')，这个元素两个
+       条件都不满足，closest 恒返回 null，点它不会打开任何编辑器；
+     - 翻译队列走 pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-pending="1"]')，这
+       个元素没有 ovl-visual-block class，恒不会被选中，不进队列；
+     - gutter 走 pane.querySelectorAll('.ovl-visual-block[data-src-line]') 量高度画行号格，
+       同样恒选不中这个元素——它只是让后面的真实块在页面上被继续往下推，gutter cell 的定位
+       用的是各真实块自己当时的 getBoundingClientRect()，天然跟着挪，不需要专门再处理。
+   高度给 1 个 line-height（跟 .ovl-visual-body 的 1.7 行高一致），不给背景色/边框——就是一段
+   空白，视觉上等价于"这里原样空了一行"，不是又一个需要用户注意的 UI 元素。 */
+.ovl-visual-blankline { display: block; height: 1.7em; pointer-events: none; }
 /* v2 Pass P113：翻译失败/被回显守卫拒绝的块——以前 DOM 上只有属性、样式表零覆盖，用户
    肉眼完全看不出哪些块翻译失败了（诊断 .claude/tmp/p113_diag.md 机制②）。这里补一个最小
    可见标记：块右上角小角标，点击直接重新翻译这一块（ovlVisualBlockRetryClick）。 */
@@ -4856,7 +4894,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.33.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.34.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -38003,10 +38041,25 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
     if (!blocks.length) return ovlVisualRenderChunk(body);
     let html = '';
     const numState = { sec: 0, sub: 0, subsub: 0, appendix: false };
+    // v2 Pass P173（F1）：compare 模式下每块套浅灰高透明度框（详见 CSS 里 .ovl-visual-compare
+    // 头部大注释，约 2330 行附近）——lang 在本函数整个调用期间不会变，出循环外算一次即可。
+    const ovlCompareClassAttr = (OvlVisualLangState.lang === 'compare') ? ' ovl-visual-compare' : '';
+    // v2 Pass P173（F2）：追踪上一个真实渲染出来的顶层块覆盖到的最后一行——跟当前块的起始行
+    // 一比，中间缺的行号就是源码里的真实空行（缺口，不是"没有空行也会分块"的标题/数学/float/
+    // 参考文献人工边界，那些边界前后行号天然连续，永远不会触发这个缺口判定）。只在顶层块之间
+    // 比较：同一个顶层块内部按行细分出来的子块（ovlSplitVisualLines 产出）彼此行号天然连续
+    // （ovlSplitVisualBlocks 已经把源码里的空行从块文本里剔除，见该函数头部注释），不会有缺口。
+    let ovlPrevBlockLineEnd = null;
     for (let i = 0; i < blocks.length; i++) {
         const b = blocks[i];
         const blockLineCount = b.text.split('\n').length;
         const blockLineEnd = b.line + blockLineCount - 1;
+        if (ovlPrevBlockLineEnd != null && b.line > ovlPrevBlockLineEnd + 1) {
+            // 纯渲染层占位——没有 data-src-line/data-src-line-end、没有 ovl-visual-block
+            // class，见 CSS 里的红线说明；contenteditable="false" 双保险（即使将来有代码不慎
+            // 对 pane 整体开可编辑态，这一格自己也不会被误编辑）。
+            html += '<div class="ovl-visual-blankline" contenteditable="false" aria-hidden="true"></div>';
+        }
         // 每块只算一次（整份 blocks[] 单次线性扫描的一部分，不是每块重新扫全文），标题块
         // 保证只产出一个子块（ovlSplitVisualBlocks 里 isHeading 命中就立即 flush，块内只有
         // 这一行），下面按 j===0 只贴到第一个子块上，不会重复。
@@ -38035,7 +38088,7 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
             // data-ovl-eqnum-start 起点防重复计数，见 ovlVisualRenderBlockContentCompare
             // 头部注释），其余两种模式（original/zh）逐字节保持改动前的单遍渲染调用。
             const rc = (OvlVisualLangState.lang === 'compare') ? ovlVisualRenderBlockContentCompare(b.text, eqStartB) : ovlVisualRenderBlockContent(b.text);
-            html += '<div class="ovl-visual-block" data-src-line="' + b.line + '" data-src-line-end="' + blockLineEnd
+            html += '<div class="ovl-visual-block' + ovlCompareClassAttr + '" data-src-line="' + b.line + '" data-src-line-end="' + blockLineEnd
                 + '" data-para-start="1"' + numAttrHtml + ' data-ovl-eqnum-start="' + eqStartB + '"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
                 + (rc.skipped ? ' data-ovl-trans-skipped="1" title="' + escapeAttr(OVL_VISUAL_SKIPPED_TITLE) + '"' : '') + (rc.forced ? ' data-ovl-trans-forced="1"' : '')
                 + (rc.noprose ? ' data-ovl-trans-noprose="1" title="' + escapeAttr(OVL_VISUAL_NOPROSE_TITLE) + '"' : '') // v2 Pass P128e（B3-1）：分块阶段判定"无可译文本"，不入队、不计分母
@@ -38044,6 +38097,7 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
                 + ovlVisualLadderAttrHtml(rc.ladderLevel) // v2 Pass P128b（N-4）：缓存命中回填"经兜底档译出"标记
                 + (rc.notrans ? ' data-ovl-trans-notrans="1" title="参考文献列表按原文显示，不做翻译"' : '') // v2 Pass P129（P128c 合流：与 failed/ladderLevel 互斥共存，bib 块不会同时命中 failed）
                 + '>' + rc.html + '</div>'; // v2 Pass P113 返修（问题2）；forced 见 v2 Pass P122（C6）
+            ovlPrevBlockLineEnd = blockLineEnd; // v2 Pass P173（F2）：atomic/未细分路径在这里就 continue 了，得在跳走前记账
             continue;
         }
         for (let j = 0; j < subs.length; j++) {
@@ -38054,7 +38108,7 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
             const eqStartSb = OvlEqNumCounter ? OvlEqNumCounter.n : 0;
             // v2 Pass P170：同上——compare 模式走专用双渲染入口。
             const rc = (OvlVisualLangState.lang === 'compare') ? ovlVisualRenderBlockContentCompare(sb.text, eqStartSb) : ovlVisualRenderBlockContent(sb.text);
-            html += '<div class="ovl-visual-block" data-src-line="' + sb.line + '" data-src-line-end="' + sb.lineEnd
+            html += '<div class="ovl-visual-block' + ovlCompareClassAttr + '" data-src-line="' + sb.line + '" data-src-line-end="' + sb.lineEnd
                 + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '"' + (j === 0 ? numAttrHtml : '') + ' data-ovl-eqnum-start="' + eqStartSb + '"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
                 + (rc.skipped ? ' data-ovl-trans-skipped="1" title="' + escapeAttr(OVL_VISUAL_SKIPPED_TITLE) + '"' : '') + (rc.forced ? ' data-ovl-trans-forced="1"' : '')
                 + (rc.noprose ? ' data-ovl-trans-noprose="1" title="' + escapeAttr(OVL_VISUAL_NOPROSE_TITLE) + '"' : '') // v2 Pass P128e（B3-1）：分块阶段判定"无可译文本"，不入队、不计分母
@@ -38063,6 +38117,7 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
                 + ovlVisualLadderAttrHtml(rc.ladderLevel) // v2 Pass P128b（N-4）：缓存命中回填"经兜底档译出"标记
                 + (rc.notrans ? ' data-ovl-trans-notrans="1" title="参考文献列表按原文显示，不做翻译"' : '') // v2 Pass P129（P128c 合流：与 failed/ladderLevel 互斥共存，bib 块不会同时命中 failed）
                 + '>' + rc.html + '</div>'; // v2 Pass P113 返修（问题2）；forced 见 v2 Pass P122（C6）
+            ovlPrevBlockLineEnd = sb.lineEnd; // v2 Pass P173（F2）：细分路径逐子块前移，最后一次循环落下的值就是这个顶层块的真实末行
         }
     }
     return html;
