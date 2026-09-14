@@ -4830,8 +4830,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.32.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-13';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.32.01';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -38885,6 +38885,14 @@ function ovlBilingualBindScrollSync() {
         const a = document.getElementById('ovlVisualPane');
         const b = document.getElementById('ovlVisualPaneMirror');
         if (!a || !b) return;
+        // v2 Pass P169 收尾（R5 修复）：只绑监听器不够——如果用户在切进双语视图之前已经在
+        // 单栏 Visual 里滚动过，#ovlVisualPane（a）带着旧的 scrollTop 进来，而 #ovlVisualPaneMirror
+        // （b）是刚渲染出来的新节点，scrollTop 天生是 0。监听器只在下一次真实 'scroll' 事件
+        // 触发时才会互相拉齐，所以切进去的那一屏两侧是错位的（最多测得偏差 37px），要等用户
+        // 自己滚一下才会自愈。这里在绑定监听器的同时先补一次单向同步（a 是切换前就存在、
+        // 保留了用户滚动位置的那一侧，b 是新绘制、需要被拉齐的一侧），闸门跟 link() 内部
+        // 用的是同一个 0.5px 容差，避免没有必要时也写一次 scrollTop。
+        if (Math.abs(b.scrollTop - a.scrollTop) >= 0.5) b.scrollTop = a.scrollTop;
         const link = function (from, to) {
             return function () {
                 if (Math.abs(to.scrollTop - from.scrollTop) < 0.5) return; // 容差同 bindPaneScrollSync，防止亚像素抖动来回触发
