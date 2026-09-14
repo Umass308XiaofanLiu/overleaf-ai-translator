@@ -2315,6 +2315,18 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 .ovl-visual-block > *:last-child { margin-bottom: 0; }
 .ovl-visual-block[data-para-start="1"] { margin-top: 0.6em; }
 .ovl-visual-block[data-para-start="0"] { margin-top: 0; }
+/* v2 Pass P170：'compare' 英中对照模式——同一个 .ovl-visual-block 内纵向堆两行，英文在上、
+   中文译文在下，共享同一个外层块（同一对 data-src-line/-line-end），因此天然共享同一格
+   gutter 行号（N4，ovlRenderVisualGutter 按元素实际渲染高度取值，对内部堆几行完全无感，见
+   .claude/tmp/p170_design.md §6）。颜色取舍见该设计文档（WCAG 2.1 相对亮度公式实测）：英文
+   沿用 Visual 面板正文既有的 #1f2937（相对白底 ≈14.7:1），不改用纯黑 #000000，跟文件其余
+   正文颜色保持视觉一致；中文译文用 Tailwind gray-600 #4b5563（相对白底 ≈7.56:1，远高于
+   WCAG AA 正文文字门槛 4.5:1，比 gray-500 #6b7280（≈4.83:1，余量太薄）更稳）——比英文浅
+   一档、肉眼可辨，但本身依然清晰可读，满足 N3"英文纯黑、中文稍浅灰但清晰可辨、正文对比度
+   ≥4.5:1"。.ovl-visual-pane 目前没有深色皮肤（背景写死 #ffffff，见上方约 2241 行注释），
+   这两个颜色在这个面板能出现的唯一背景下始终生效，不需要（也没有意义）另写一份深色覆盖值。 */
+.ovl-compare-en { color: #1f2937; }
+.ovl-compare-zh { color: #4b5563; margin-top: 0.25em; }
 /* v2 Pass P113：翻译失败/被回显守卫拒绝的块——以前 DOM 上只有属性、样式表零覆盖，用户
    肉眼完全看不出哪些块翻译失败了（诊断 .claude/tmp/p113_diag.md 机制②）。这里补一个最小
    可见标记：块右上角小角标，点击直接重新翻译这一块（ovlVisualBlockRetryClick）。 */
@@ -4830,7 +4842,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.32.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.33.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -31756,6 +31768,9 @@ function ovlPortalHtml() {
         +   '<div class="ovl-layout-menu-title">Visual 显示语言</div>'
         +   '<div class="ovl-layout-menu-item ovl-active" data-lang="original">Original</div>'
         +   '<div class="ovl-layout-menu-item" data-lang="zh">Chinese</div>'
+        // v2 Pass P170：第三个 Visual 显示语言子模式——英中交错对照。跟前两项走同一套
+        // ovlBindVisualLangMenu() 委派（读 data-lang，天然兼容新值），不新起绑定逻辑。
+        +   '<div class="ovl-layout-menu-item" data-lang="compare">Compare 对照</div>'
         + '</div>'
         // 项目菜单（§2.6.1 项目标题 ▾）：内容固定，ovlBindProjectMenu 绑定。
         // 项目历史已挪到文件树头部「打开项目文件夹…」下面的独立按钮（#ovlProjectHistoryBtn），
@@ -37748,15 +37763,22 @@ function ovlSplitVisualLines(blockText, blockStartLine) {
 // 从翻译分母里扣掉。只在 lang==='zh' 时才需要这条短路——Original 模式本来就直接返回
 // ovlVisualRenderChunk(text)，thebibliography 分派本身已经对两种模式都生效，不用重复判断。
 const OVL_VISUAL_BIB_BLOCK_RE = /\\begin\{thebibliography\}/;
-function ovlVisualRenderBlockContent(text) {
+// v2 Pass P170：新增可选第二参数 langOverride——'compare'（英中交错对照）模式要对同一段
+// source text 分别按"原文"和"中文"两套语义各渲染一次（一次拿英文 html，一次拿中文
+// html），不能再假设"这一次调用只会是全局 OvlVisualLangState.lang 那一种"。不传
+// langOverride 时（既有 'original'/'zh' 两种模式的全部调用点，改动前的调用形状）逐字节
+// 回退成读全局状态，不改变这两种既有模式的行为。全文件里目前只有两处调用点（都在
+// ovlVisualRenderBodyWithLines 内），已用 Grep 核实，改动波及面很小。
+function ovlVisualRenderBlockContent(text, langOverride) {
+    const effLang = langOverride || OvlVisualLangState.lang;
     // v2 Pass P129：参考文献块整段短路——不查缓存、不进队列、不算失败，直接渲染成编号引用
     // 列表；notrans:true 供 ovlVisualRenderBodyWithLines 打 data-ovl-trans-notrans、供
     // ovlVisualLangSyncAfterRender 从翻译分母里扣掉。跟 P128 的 failed/ladderLevel 字段
     // 合流（P128c）：这条短路路径永远不失败、永远不经阶梯，两个字段固定给中性值。
-    if (OvlVisualLangState.lang === 'zh' && OVL_VISUAL_BIB_BLOCK_RE.test(text)) {
+    if (effLang === 'zh' && OVL_VISUAL_BIB_BLOCK_RE.test(text)) {
         return { html: ovlVisualRenderChunk(text), pending: false, skipped: false, forced: false, partial: false, partialReason: null, failed: false, ladderLevel: null, notrans: true, noprose: false };
     }
-    if (OvlVisualLangState.lang !== 'zh') return { html: ovlVisualRenderChunk(text), pending: false, skipped: false, forced: false, partial: false, partialReason: null, failed: false, ladderLevel: null, notrans: false, noprose: false };
+    if (effLang !== 'zh') return { html: ovlVisualRenderChunk(text), pending: false, skipped: false, forced: false, partial: false, partialReason: null, failed: false, ladderLevel: null, notrans: false, noprose: false };
     try {
         const cfg = (typeof getApiConfig === 'function') ? getApiConfig() : null;
         const meta = cfg ? ovlVisualTransCacheGetMeta(text, cfg) : null;
@@ -37816,6 +37838,56 @@ function ovlVisualRenderBlockContent(text) {
         }
     } catch (e) {}
     return { html: ovlVisualRenderChunk(text), pending: true, skipped: false, forced: false, partial: false, partialReason: null, failed: false, ladderLevel: null, notrans: false, noprose: false };
+}
+
+// v2 Pass P170：'compare'（英中交错对照）模式专用——对同一段 source text 分别渲染出英文
+// 版本和中文版本，纵向拼进同一个外层 .ovl-visual-block（跟既有 gutter 逐块量高度、
+// data-src-line/-line-end/-para-start 共用同一对行号的机制零改动即可满足 N4"英中共享同一
+// 行号"——ovlRenderVisualGutter 按 DOM 元素实际渲染高度取值，对元素内部有几种语言完全无感，
+// 见 .claude/tmp/p170_design.md §6）。
+//
+// 【OvlEqNumCounter 防重复计数，R170 开放风险，已用代码证据核实、非推测】：
+// ovlVisualRenderChunk() 无条件委派给 renderFormattedText()（33652 行），renderFormattedText
+// 内部只要模块级单例 OvlEqNumCounter 非 null 就会对匹配到的编号环境调用 ovlEqNumAssign()
+// 做 counterState.n++（9742/9860-9874/9891-9896 行）——这个自增判据只看"这次调用自己看到的
+// content/body 里有没有已存在的 \tag"，跟"这段源文本此前是否已经在另一次独立调用里被编过
+// 号"完全无关。如果对同一份 text 不做任何隔离直接各调一次 ovlVisualRenderBlockContent
+// （英文一次、中文一次），且两次调用共享同一个仍处于打开状态的真实 OvlEqNumCounter，会被
+// 计成两条不同编号的公式——同一条公式在英文侧显示 (N)、中文侧显示 (N+1)，且全篇后续块的
+// 编号整体多跳一位。修法仿照既有 ovlVisualRenderChunkWithEqNum（38010 行）的"局部快照顶一个
+// 临时计数器"手法：英文遍用真实的模块级 OvlEqNumCounter 正常消耗（对外层序号推进一次，跟
+// 改动前单语言模式的推进量逐字节一致）；中文遍换成一个从同一个 eqStart 起点重新起算的临时
+// 计数器对象，中文遍全程不触碰真实计数器，结束后把真实计数器原样换回来（此时它仍停在英文遍
+// 推进后的值，不会被中文遍二次推进）。效果：中英两侧同一条公式显示相同的 \tag{N}（本来就是
+// 同一条公式，理应显示同一个号，不是"先来后到各给一个新号"），且全篇后续块的编号不会因为
+// compare 模式对每块多渲染一遍而整体错位/跳号。
+function ovlVisualRenderBlockContentCompare(text, eqStart) {
+    const rcEn = ovlVisualRenderBlockContent(text, 'original');
+    const prevCounter = OvlEqNumCounter;
+    let rcZh;
+    OvlEqNumCounter = { n: eqStart };
+    try {
+        rcZh = ovlVisualRenderBlockContent(text, 'zh');
+    } finally {
+        OvlEqNumCounter = prevCounter;
+    }
+    // notrans（参考文献，P129）/ noprose（纯公式代码，P128e）两类块从不真正翻译——中文遍
+    // 走的是跟英文遍完全相同的短路分支（同一份 text 原样渲染），结果逐字节相同，拆成左右
+    // 两份只是视觉上白白重复一遍参考文献列表/纯公式代码块，对用户没有实际信息增量，这两类
+    // 块在 compare 模式下退化成单份渲染（跟 original/zh 单语言模式观感一致），不强行拆分。
+    if (rcZh.notrans || rcZh.noprose) {
+        return { html: rcEn.html, pending: rcZh.pending, skipped: rcZh.skipped, forced: rcZh.forced, partial: rcZh.partial, partialReason: rcZh.partialReason, failed: rcZh.failed, reason: rcZh.reason, attempts: rcZh.attempts, detail: rcZh.detail, echoCandidate: rcZh.echoCandidate, ladderLevel: rcZh.ladderLevel, notrans: rcZh.notrans, noprose: rcZh.noprose };
+    }
+    return {
+        // 下面这些状态标记（进度条分母/分子、失败角标、跳过/强制/部分翻译提示）全部取中文遍
+        // 的结果——英文内容来自源码本身，渲染永远"立即可用"、不会 pending/failed；compare
+        // 模式下需要被翻译队列/进度行/重试角标追踪的只有中文那一侧，跟既有 'zh' 单语言模式
+        // 语义完全一致（队列三处判据改动同一条纪律，见 ovlVisualLangProgressUpdate 等）。
+        html: '<div class="ovl-compare-en">' + rcEn.html + '</div><div class="ovl-compare-zh">' + rcZh.html + '</div>',
+        pending: rcZh.pending, skipped: rcZh.skipped, forced: rcZh.forced, partial: rcZh.partial, partialReason: rcZh.partialReason,
+        failed: rcZh.failed, reason: rcZh.reason, attempts: rcZh.attempts, detail: rcZh.detail, echoCandidate: rcZh.echoCandidate,
+        ladderLevel: rcZh.ladderLevel, notrans: rcZh.notrans, noprose: rcZh.noprose
+    };
 }
 
 // ==================== v2 Pass P116：Visual 章节 IEEE 编号 ====================
@@ -37945,7 +38017,10 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
             // 复算同一批编号（见 ovlVisualLangRunQueue 里的调用点），因为翻译只换块内散文、
             // 受保护的公式环境本身逐字节不动，起点相同就能重算出完全相同的编号序列。
             const eqStartB = OvlEqNumCounter ? OvlEqNumCounter.n : 0;
-            const rc = ovlVisualRenderBlockContent(b.text);
+            // v2 Pass P170：compare 模式走专用双渲染入口（英中各渲染一次、共享同一个
+            // data-ovl-eqnum-start 起点防重复计数，见 ovlVisualRenderBlockContentCompare
+            // 头部注释），其余两种模式（original/zh）逐字节保持改动前的单遍渲染调用。
+            const rc = (OvlVisualLangState.lang === 'compare') ? ovlVisualRenderBlockContentCompare(b.text, eqStartB) : ovlVisualRenderBlockContent(b.text);
             html += '<div class="ovl-visual-block" data-src-line="' + b.line + '" data-src-line-end="' + blockLineEnd
                 + '" data-para-start="1"' + numAttrHtml + ' data-ovl-eqnum-start="' + eqStartB + '"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
                 + (rc.skipped ? ' data-ovl-trans-skipped="1" title="' + escapeAttr(OVL_VISUAL_SKIPPED_TITLE) + '"' : '') + (rc.forced ? ' data-ovl-trans-forced="1"' : '')
@@ -37963,7 +38038,8 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
             // data-ovl-eqnum-start，不能只挂一次整块共用的起点（子块可能各自含独立的编号
             // 环境，起点逐块前移）。
             const eqStartSb = OvlEqNumCounter ? OvlEqNumCounter.n : 0;
-            const rc = ovlVisualRenderBlockContent(sb.text);
+            // v2 Pass P170：同上——compare 模式走专用双渲染入口。
+            const rc = (OvlVisualLangState.lang === 'compare') ? ovlVisualRenderBlockContentCompare(sb.text, eqStartSb) : ovlVisualRenderBlockContent(sb.text);
             html += '<div class="ovl-visual-block" data-src-line="' + sb.line + '" data-src-line-end="' + sb.lineEnd
                 + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '"' + (j === 0 ? numAttrHtml : '') + ' data-ovl-eqnum-start="' + eqStartSb + '"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
                 + (rc.skipped ? ' data-ovl-trans-skipped="1" title="' + escapeAttr(OVL_VISUAL_SKIPPED_TITLE) + '"' : '') + (rc.forced ? ' data-ovl-trans-forced="1"' : '')
@@ -38009,6 +38085,21 @@ function ovlVisualRenderChunkWithEqNum(el, tex) {
     } finally {
         OvlEqNumCounter = prevCounter;
     }
+}
+
+// v2 Pass P170：上面三处异步单块补丁点（worker() / ovlVisualBlockRetryClick /
+// ovlVisualBlockForceTranslateClick）在 compare（英中交错对照）模式下不能再直接
+// `el.innerHTML = ovlVisualRenderChunkWithEqNum(el, tgt)`——compare 模式的 el 是外层拼接
+// 容器，同时装着 ovlVisualRenderBlockContentCompare() 产出的 .ovl-compare-en/.ovl-compare-zh
+// 两个子节点；译文落地只应该替换中文那一侧，直接整体覆盖 el.innerHTML 会把已经渲染好的
+// 英文那一半一起冲掉，且下一次点击/查找/gutter 逻辑会因为 DOM 结构被换回单语言形状而找不到
+// 这两个子节点（R-a 的点击分发正是靠 closest('.ovl-compare-en'/'.ovl-compare-zh') 判断，见
+// ovlVisualBlockEditOpenAtPoint）。original/zh 两种既有单语言模式下 el 本身就是内容容器，
+// 沿用整体覆盖，逐字节不变。
+function ovlVisualApplyTranslatedHtml(el, tgt) {
+    const html = ovlVisualRenderChunkWithEqNum(el, tgt);
+    const zhSlot = (OvlVisualLangState.lang === 'compare' && el && el.querySelector) ? el.querySelector('.ovl-compare-zh') : null;
+    if (zhSlot) zhSlot.innerHTML = html; else if (el) el.innerHTML = html;
 }
 
 // ==================== v2 Pass P128（不变量自检）：无标记英文块审计 ====================
@@ -39131,7 +39222,9 @@ function ovlVisualLadderAttrHtml(ladderLevel) {
 function ovlVisualLangProgressUpdate() {
     const el = document.getElementById('ovlVisualLangProgress');
     if (!el) return;
-    if (OvlVisualLangState.lang !== 'zh' || OvlVisualLangState.total <= 0) {
+    // v2 Pass P170：'compare' 模式的英中交错同样需要中文译文，进度条判据跟 'zh' 一视同仁——
+    // 否则切到 compare 后进度行会一直被这里隐藏，用户看不到翻译还在跑。
+    if ((OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare') || OvlVisualLangState.total <= 0) {
         el.setAttribute('hidden', '');
         el.textContent = '';
         el.onclick = null;
@@ -39312,7 +39405,9 @@ function ovlVisualLangCollectPending(pane) {
 // 之间没有 await，不会有两个 worker 抢同一块的竞态。
 const OVL_VISUAL_LANG_CONCURRENCY = 3;
 async function ovlVisualLangRunQueue() {
-    if (OvlVisualLangState.running || OvlVisualLangState.lang !== 'zh') return;
+    // v2 Pass P170：'compare' 模式的中文半屏一样要真正跑翻译——否则整个后台 worker 池在
+    // compare 模式下永远不启动，中文侧永久停在 pending。
+    if (OvlVisualLangState.running || (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare')) return;
     const pane0 = document.getElementById('ovlVisualPane');
     if (!pane0) return;
     OvlVisualLangState.running = true;
@@ -39393,7 +39488,7 @@ async function ovlVisualLangRunQueue() {
                 try { ovlVisualTransCachePut(text, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel); } catch (e) {} // v2 Pass P113 返修（问题2）：跟着译文一起落盘 skipped 标记；partial 见 P122c BV2-2；ladderLevel 见 P128b N-4
                 if (typeof ovlVisualFailLogDelete === 'function') ovlVisualFailLogDelete(text, cfg); // v2 Pass P128（C1，清除点）：这一块这次成功了，清掉旧的失败记录
                 if (document.body.contains(el)) {
-                    el.innerHTML = ovlVisualRenderChunkWithEqNum(el, tgt); // v2 Pass P168：异步单块补丁路径也要复算编号，见 ovlVisualRenderChunkWithEqNum 头部注释
+                    ovlVisualApplyTranslatedHtml(el, tgt); // v2 Pass P168：异步单块补丁路径也要复算编号，见 ovlVisualRenderChunkWithEqNum 头部注释；v2 Pass P170：compare 模式只替换中文侧，见 ovlVisualApplyTranslatedHtml 头部注释
                     el.removeAttribute('data-ovl-trans-failed'); // v2 Pass P128（C1）：failLog 回填过的失败标记，成功后清掉
                     el.removeAttribute('data-ovl-trans-fail-reason');
                     el.removeAttribute('data-ovl-trans-fail-detail');
@@ -39505,7 +39600,10 @@ async function ovlVisualLangRunQueue() {
 // 刷新进度条，中文模式下且有待翻块时把调度器踢起来（ovlVisualLangRunQueue 内部有
 // running 守卫，不会因为多处调用而并发起两组 worker）。
 function ovlVisualLangSyncAfterRender() {
-    if (OvlVisualLangState.lang !== 'zh') { ovlVisualLangProgressUpdate(); return; }
+    // v2 Pass P170：这是渲染后真正把调度器踢起来的触发点——'compare' 模式同样需要中文译文，
+    // 判据跟上面两处（ovlVisualLangProgressUpdate / ovlVisualLangRunQueue）保持一致，否则
+    // compare 模式下 pending 块永远不会被送进翻译队列。
+    if (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare') { ovlVisualLangProgressUpdate(); return; }
     const pane = document.getElementById('ovlVisualPane');
     if (!pane) return;
     // v2 Pass P129：参考文献块（data-ovl-trans-notrans）不入翻译分母——它们从不会有
@@ -39564,14 +39662,18 @@ function ovlVisualLangUpdateMenuUI() {
         }
     }
     const btn = document.getElementById('ovlVisualLangBtn');
-    if (btn) btn.classList.toggle('ovl-visual-lang-active', OvlVisualLangState.lang === 'zh');
+    // v2 Pass P170：'compare' 模式也显示中文译文（半屏），按钮高亮沿用跟 'zh' 一样的判据。
+    if (btn) btn.classList.toggle('ovl-visual-lang-active', OvlVisualLangState.lang === 'zh' || OvlVisualLangState.lang === 'compare');
 }
 
 // 唯一入口：切换 Visual 显示语言。切回 Original 是纯同步的重渲染（ovlVisualRenderBlockContent
 // 在 lang!=='zh' 时从不查缓存也不调模型），瞬时生效；切到 Chinese 会先用缓存把能命中的块
 // 立刻渲出来，未命中的留占位 + 触发后台懒翻译。
 function ovlVisualLangSetMode(lang) {
-    if (lang !== 'original' && lang !== 'zh') return;
+    // v2 Pass P170：新增第三个子模式 'compare'（英中交错对照），跟既有 'original'/'zh' 走
+    // 同一条切换路径——下面的并发矩阵阻断、渲染触发对任意合法 lang 值都是通用的，不需要
+    // 为 'compare' 单独分支。
+    if (lang !== 'original' && lang !== 'zh' && lang !== 'compare') return;
     ovlCloseVisualLangMenu();
     if (OvlVisualLangState.lang === lang) return;
     // v2 Pass P159（并发矩阵）：有单块回译正在后台跑——语言模式切换会触发整篇 ovlVisualRender()，
@@ -39862,7 +39964,7 @@ async function ovlVisualBlockRetryClick(el) {
             // v2 Pass P122b（B1）：打/清 partial 标记 + 悬停说明，见 ovlVisualApplyPartialMark。
             if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta); else if (meta.partial) el.setAttribute('data-ovl-trans-partial', '1'); else el.removeAttribute('data-ovl-trans-partial');
             if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta); // v2 Pass P128b（N-4）：打/清"经兜底档译出"标记
-            el.innerHTML = ovlVisualRenderChunkWithEqNum(el, tgt); // 整个块子节点被冲掉，角标自然一并消失；v2 Pass P168：手动重试同样要复算编号
+            ovlVisualApplyTranslatedHtml(el, tgt); // 整个块子节点被冲掉，角标自然一并消失；v2 Pass P168：手动重试同样要复算编号；v2 Pass P170：compare 模式只替换中文侧
             if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; } // title 见 v2 Pass P128（C2）
             if (typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(el);
             if (typeof ovlRenderVisualGutter === 'function' && OvlState.editorMode === 'visual') ovlRenderVisualGutter();
@@ -39959,7 +40061,7 @@ async function ovlVisualBlockForceTranslateClick(el) {
             el.removeAttribute('data-ovl-trans-noprose');
             if (el.getAttribute('title')) el.removeAttribute('title');
             if (badge) badge.remove();
-            el.innerHTML = ovlVisualRenderChunkWithEqNum(el, tgt); // v2 Pass P168：强制翻译落地同样要复算编号
+            ovlVisualApplyTranslatedHtml(el, tgt); // v2 Pass P168：强制翻译落地同样要复算编号；v2 Pass P170：compare 模式只替换中文侧
             if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; }
             if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta);
             if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta);
@@ -59564,6 +59666,36 @@ function ovlBtrCardStackAvoidOverlap() {
     } catch (e) {}
 }
 
+// v2 Pass P170（R-c）：compare 模式跨语言选区探测——original/zh 单语言模式下整个 #ovlVisualPane
+// 只可能有一种语言，选区无论怎么拖都不存在"这段该按哪种语言编辑"的歧义；compare 模式把
+// 英文（.ovl-compare-en）和中文（.ovl-compare-zh）两个子节点摆在同一个 .ovl-visual-block
+// 里紧挨着渲染，用户的一次拖选完全可能物理上同时经过两侧（比如从英文段末尾拖到下一段的
+// 中文译文），这是 compare 模式独有的新风险，旧代码（original/zh 两态时代）从未处理过。
+// 这里不去猜"用户到底想改哪一侧"，而是显式探测：range 有没有触及任意 .ovl-compare-en 节点、
+// 有没有触及任意 .ovl-compare-zh 节点，两者都命中就是跨界，交给调用方决定拒绝。
+// 返回值：'en' | 'zh' | 'cross'。lang !== 'compare' 时不调用本函数（无意义）。
+function ovlVisualCompareSelKind(range, pane) {
+    let hitEn = false, hitZh = false;
+    try {
+        const ens = pane.querySelectorAll('.ovl-compare-en');
+        for (let i = 0; i < ens.length; i++) {
+            if (range.intersectsNode(ens[i])) { hitEn = true; break; }
+        }
+    } catch (e) {}
+    try {
+        const zhs = pane.querySelectorAll('.ovl-compare-zh');
+        for (let i = 0; i < zhs.length; i++) {
+            if (range.intersectsNode(zhs[i])) { hitZh = true; break; }
+        }
+    } catch (e) {}
+    if (hitEn && hitZh) return 'cross';
+    if (hitZh) return 'zh';
+    // 两者都没命中（notrans/noprose 块在 compare 模式下退化成单渲染，见
+    // ovlVisualRenderBlockContentCompare 头部注释，不产出 .ovl-compare-en/.ovl-compare-zh 包装）
+    // 或只命中英文——都当英文块处理，走既有源码编辑路径。
+    return 'en';
+}
+
 // 入口：跟 ovlEditorSynonymOpen(mode, source) 同一个调用形状。source: 'code' | 'visual'。
 // Code 来源选中的本来就是可编辑源码原文，没有"渲染态 -> 源码"这层转换要做——「编辑」在
 // 这里退化成把焦点带回文本框，不新开任何东西（这就是六颗按钮之外唯一改动行为的按钮，但
@@ -59603,6 +59735,26 @@ function ovlInlineSrcEditOpen(source) {
         if (!pane.contains(range.commonAncestorContainer)) return;
         const rawSelText = String(sel);
         if (!rawSelText.trim()) return;
+
+        // v2 Pass P170（R-a/R-c）：compare 模式下这个函数不能再无条件当"英文编辑入口"用——
+        // 屏幕上英文/中文两侧都在同一个 pane 里，选区可能落在中文那一侧，也可能跨了边界。
+        // 全局 OvlVisualLangState.lang 在 compare 模式下恒为 'compare'，区分不出选区到底在哪
+        // 一侧，必须用 ovlVisualCompareSelKind 看选区实际触及的 DOM 节点（跟 R-a 的另一处修复
+        // ovlVisualBlockEditOpenAtPoint 里 hitZh 判定同一个思路：以实际点击/选中的子节点为准，
+        // 不看全局语言状态）。
+        if (OvlVisualLangState.lang === 'compare') {
+            const kind = ovlVisualCompareSelKind(range, pane);
+            if (kind === 'cross') {
+                try { showToast('选区同时选中了英文和中文两侧，无法判断按哪一侧编辑，请分两次选择（只选英文段或只选中文段）。', 'warning'); } catch (e2) {}
+                return;
+            }
+            if (kind === 'zh') {
+                // 选区其实落在中文译文那一侧——转给中文/回译编辑内核，不能在这个函数里继续往
+                // 下走（那条路只会把中文选区错当英文源码处理，写回位置和内容全都对不上）。
+                ovlInlineZhEditOpen();
+                return;
+            }
+        }
 
         // 找出选区触及的所有 .ovl-visual-block——跟 focusOvlSelectionRange（P13"关注"功能）
         // 读 Visual 选区块区间同一个算法：range.intersectsNode 逐块判定，first/last 之间的
@@ -59721,7 +59873,13 @@ function ovlInlineZhEditOpen() {
             try { showToast('已经有一处在就地编辑，请先保存（Ctrl+Enter）或取消（Esc）。', 'warning'); } catch (e) {}
             return;
         }
-        if (OvlState.editorMode !== 'visual' || OvlVisualLangState.lang !== 'zh') return;
+        // v2 Pass P170（R-a）：这道硬闸原本只认 'zh'——一旦 'compare' 模式存在，这里会让中文
+        // 编辑入口彻底不可达（compare 模式下 lang 恒为 'compare'，永远不等于 'zh'，函数在这一行
+        // 直接 return，后面的内核调用代码全部拿不到执行机会）。加上 'compare' 分支：既允许
+        // ovlInlineSrcEditOpen 检测到中文侧选区后转调本函数，也允许 word.edit 六颗按钮那条老
+        // 路径（lang === 'zh' 时的既有分支）继续不受影响地工作。
+        if (OvlState.editorMode !== 'visual'
+            || (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare')) return;
         if (OvlState.compiling) {
             try { showToast('正在编译，请等编译结束后再编辑。', 'warning'); } catch (e) {}
             return;
@@ -59740,6 +59898,21 @@ function ovlInlineZhEditOpen() {
         if (!pane.contains(range.commonAncestorContainer)) return;
         const rawSelText = String(sel);
         if (!rawSelText.trim()) return;
+
+        // v2 Pass P170（R-c）：防御性对称检查——本函数目前只有一处调用方会在 compare 模式下
+        // 触发它（ovlInlineSrcEditOpen 检测到 kind==='zh' 时的转调），那处调用方已经做过同一次
+        // 判定；这里重新算一遍不是因为不信任调用方，而是本函数本来就是可以被直接调用的公开入口
+        // （word.edit 六颗按钮 lang==='zh' 分支就是直接调用），一旦将来有新调用路径在 compare
+        // 模式下直接调用本函数、却没有先判定选区落在哪一侧，这里仍然要兜住"跨界选区"和"选区其实
+        // 在英文侧"两种情况，不能把英文文本硬当中文译文送进回译流程。
+        if (OvlVisualLangState.lang === 'compare') {
+            const kind = ovlVisualCompareSelKind(range, pane);
+            if (kind === 'cross') {
+                try { showToast('选区同时选中了英文和中文两侧，无法判断按哪一侧编辑，请分两次选择（只选英文段或只选中文段）。', 'warning'); } catch (e2) {}
+                return;
+            }
+            if (kind !== 'zh') return; // 选区其实在英文侧——本函数不是英文编辑入口，静默退出，不重复 toast（调用方已经做过一次这个判断）。
+        }
 
         const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
         if (!blocks.length) return;
@@ -59906,7 +60079,17 @@ function ovlVisualBlockEditOpenAtPoint(clientX, clientY) {
     if (!blockEl) return;
 
     // 分流：跟 word.edit 按钮的既有分流逻辑一致（ovlBindQuickActions 内 'word.edit' 分支）。
-    if (OvlState.editorMode === 'visual' && OvlVisualLangState.lang === 'zh') {
+    // v2 Pass P170（R-a，已用代码证据核实、非推测）：compare 模式下同一个 blockEl 内部同时
+    // 挂着 .ovl-compare-en/.ovl-compare-zh 两个子节点（notrans/noprose 那类不拆分的块除外，
+    // 见 ovlVisualRenderBlockContentCompare 头部注释）——不能再只看全局
+    // OvlVisualLangState.lang 判断"这次点击该进中文编辑器还是英文编辑器"：compare 模式下
+    // lang 恒等于 'compare'，原判据（只认 lang==='zh'）会让 compare 模式下不管点在哪一半
+    // 都恒定落进下面的 else 分支（英文/源码编辑器）——中文那一半的编辑入口在 compare 模式下
+    // 变得完全打不开，是一个真实存在的静默失效，不是假设风险。改成按被点中的具体子节点
+    // （hitEl.closest('.ovl-compare-zh')）分流；其余两种既有单语言模式下这两个 class 根本
+    // 不存在于 DOM 里，closest 恒返回 null，判据逐字节保持改动前的行为。
+    const hitZh = (OvlVisualLangState.lang === 'compare') && !!hitEl.closest('.ovl-compare-zh');
+    if (OvlState.editorMode === 'visual' && (OvlVisualLangState.lang === 'zh' || hitZh)) {
         ovlInlineZhEditOpenForBlocks([blockEl]);
     } else {
         ovlInlineSrcEditOpenForBlocks([blockEl]);
@@ -60080,6 +60263,27 @@ function ovlBindQuickActions() {
             && (id === 'word.replace' || id === 'word.simplify' || id === 'word.grammar')) {
             try { showToast('中文预览模式下译文与源码不再逐字对应，无法自动定位替换。请切回 Original 或到 Code 模式操作。', 'warning'); } catch (e2) {}
             return;
+        }
+        // v2 Pass P170（R-c 附带修复）：compare 模式下选区如果落在中文那一侧（或跨了中英文
+        // 边界），是跟上面 zh 模式完全同一个病根——中文译文跟源码不再逐字对应。不加这道判断
+        // 也不会误替换（ovlLocateVisualPick 只认"源码里唯一命中"，中文文本在英文源码里天然
+        // 零命中，会被 ovlApplySynonymEditorGuard 安全拒绝），但错误提示会说"没找到"，容易让
+        // 人误以为是别的原因（比如以为源码被改过）。这里用跟 R-a/R-c 编辑分流同一把尺子
+        // ovlVisualCompareSelKind 提前识别，给出和 zh 模式一致、更准确的提示。
+        if (src === 'visual' && OvlVisualLangState.lang === 'compare'
+            && (id === 'word.replace' || id === 'word.simplify' || id === 'word.grammar')) {
+            try {
+                const cmpPane = document.getElementById('ovlVisualPane');
+                const cmpWin = cmpPane ? ovlWinOf(cmpPane) : window;
+                const cmpSel = cmpWin.getSelection();
+                if (cmpSel && cmpSel.rangeCount > 0 && !cmpSel.isCollapsed && cmpPane) {
+                    const cmpKind = ovlVisualCompareSelKind(cmpSel.getRangeAt(0), cmpPane);
+                    if (cmpKind === 'zh' || cmpKind === 'cross') {
+                        try { showToast('选中的是中文译文（或跨了中英文边界），译文与源码不再逐字对应，无法自动定位替换。请只选英文段，或到 Code 模式操作。', 'warning'); } catch (e3) {}
+                        return;
+                    }
+                }
+            } catch (e2) {}
         }
         // v2 Pass P7（§2.8）：置灰守卫纳入既有的 disabled 检查，不另起一套。
         if (btn.disabled || btn.classList.contains('ovl-qa-off')) return;
