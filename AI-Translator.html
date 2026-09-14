@@ -4909,7 +4909,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.36.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.37.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -9821,25 +9821,32 @@ let OvlEqNumCounter = null;
 // 一个号，标在最后一行末尾；equation 当成单行处理；align/gather/alignat 按顶层 \\ 逐行拆分、
 // 逐行占号（flalign/eqnarray 走 KaTeX 不认识这两个环境的兜底路径，只借这个函数算号，不借它
 // 拼 \tag，见下方 flalign/IEEEeqnarray 兜底分支）。
+// v2 Pass P177：数字本身的格式化改走 ovlEqNumFormatDisplay(counterState)——counterState 未挂
+// \numberwithin{equation}{section}（.withinSection 为假）时逐字节回退成裸数字 String(n)，跟
+// 改动前的 \tag{N} 输出完全一样，不影响 P168 既有 41/41 用例；挂了 numberwithin 才会变成
+// "2.1" 这种带节号形式（见该函数与 ovlEqNumSyncSection 头部注释）。hasOwnTag 判据改用
+// ovlEqNumLineHasOwnTag 共用函数——跟 ovlXrefApproxScan 里 ovlXrefEachCountableLine 判断
+// "这行占不占计数器"用的是同一个函数、同一条正则，不允许两处各自维护一份可能分叉的判据。
 function ovlEqNumAssign(env, body, counterState) {
-    const hasOwnTag = (line) => /\\tag\*?\s*\{/.test(line);
     const numbers = [];
     if (env === 'multline') {
-        if (ovlXrefLineHasNoNumber(body) || hasOwnTag(body)) return { numbers: numbers, taggedBody: body };
+        if (ovlXrefLineHasNoNumber(body) || ovlEqNumLineHasOwnTag(body)) return { numbers: numbers, taggedBody: body };
         counterState.n++;
-        numbers.push(counterState.n);
+        const disp = ovlEqNumFormatDisplay(counterState);
+        numbers.push(disp);
         const mlLines = body.split(/\\\\/);
-        mlLines[mlLines.length - 1] = mlLines[mlLines.length - 1] + '\\tag{' + counterState.n + '}';
+        mlLines[mlLines.length - 1] = mlLines[mlLines.length - 1] + '\\tag{' + disp + '}';
         return { numbers: numbers, taggedBody: mlLines.join('\\\\') };
     }
     const rowLines = (env === 'equation') ? [body] : body.split(/\\\\/);
     for (let ri = 0; ri < rowLines.length; ri++) {
         const line = rowLines[ri];
         if (!line.trim()) continue;
-        if (ovlXrefLineHasNoNumber(line) || hasOwnTag(line)) continue;
+        if (ovlXrefLineHasNoNumber(line) || ovlEqNumLineHasOwnTag(line)) continue;
         counterState.n++;
-        numbers.push(counterState.n);
-        rowLines[ri] = line + '\\tag{' + counterState.n + '}';
+        const disp = ovlEqNumFormatDisplay(counterState);
+        numbers.push(disp);
+        rowLines[ri] = line + '\\tag{' + disp + '}';
     }
     return { numbers: numbers, taggedBody: (env === 'equation') ? rowLines[0] : rowLines.join('\\\\') };
 }
@@ -9906,7 +9913,12 @@ function renderFormattedText(text, xrefCtx) {
                     throwOnError: false,
                     trust: true,
                     strict: false,
-                    fleqn: false
+                    fleqn: false,
+                    // v2 Pass P177（尽力项5）：leqno 从 OvlXrefState 桥接读取，跟 eqCounter 的
+                    // withinSection 是同一种"渲染路径读不到导言区，靠模块级单例桥接"模式；
+                    // 未调用过 ovlXrefBuild 的既有调用点（未传 xrefCtx 的聊天气泡等）读到的是
+                    // OvlXrefState 初始值 false，逐字节维持改动前行为。
+                    leqno: (typeof OvlXrefState !== 'undefined' && OvlXrefState && OvlXrefState.leqno) || false
                 });
                 placeholders.push({ id, html: rendered });
             } catch (e) {
@@ -34988,12 +35000,27 @@ let OvlXrefState = {
     cites: null,            // Map<key,{ordinal,year,author,isNested}>  来自 .aux \bibcite
     approxLabels: null,     // Map<key,{display,anchorType}>            前端自计数兜底
     approxCites: null,      // Map<key,{display}>                       \bibitem 出现顺序兜底
-    auxDataRef: null        // 上次建表时看到的 lastCompile.xrefAux 引用（含 undefined/null）——
+    auxDataRef: null,       // 上次建表时看到的 lastCompile.xrefAux 引用（含 undefined/null）——
                              // ovlDoRecompile 里 aux 解析是 await 出来的，跟 PDF 拉取之间隔着
                              // 一次真正的网络往返，这期间完全可能已经有一次"compileId 没变但
                              // xrefAux 还没到"的中间渲染发生过；只比较 compileId 会让这次
                              // 渲染把"没数据"缓存住，之后 aux 真的到了也不会重建。单独比较
                              // 这个引用，保证 aux 到达后下一次渲染一定能重建。
+    // v2 Pass P177：\numberwithin{equation}{section|chapter} / \counterwithin(*) 同款检测结果——
+    // 从整份 src（含导言区）扫一次，供 ovlVisualRenderBodyWithLines 的 eqCounter 起算时读取
+    // （render 路径拿不到导言区，只能靠这个模块级单例桥接），跟 ovlXrefApproxScan 内部再次
+    // 调用同一个 ovlEqNumDetectNumberWithin() 时用的是完全相同的检测函数，两条路径不可能
+    // 对"要不要挂节号"这件事本身产生分歧。withinChapter 目前只探测、不接入计数格式化——
+    // report/book 的 \chapter 计数基础设施本轮未实现（明确推迟，见任务书尽力项4）。
+    withinSection: false,
+    withinChapter: false,
+    withinNoReset: false,   // \counterwithin*（星号变体）：只挂显示格式，不挂"父计数器进位时清零"
+    // v2 Pass P177（尽力项5）：\documentclass[leqno]{...} 或 \usepackage[leqno]{amsmath}——
+    // 编号显示在公式左侧而不是右侧。这跟上面三个字段不影响"编号是几"，只影响 KaTeX 渲染时
+    // 传给 renderToString 的 leqno 选项（真实 amsmath 语义就是纯排版位置，不改变计数值本身），
+    // 检测函数见 ovlXrefDetectLeqno；桥接读取点在 renderFormattedText 内 katex.renderToString
+    // 调用处，跟 withinSection 桥接同一种模式（渲染路径拿不到导言区，靠这个模块级单例读一次）。
+    leqno: false
 };
 
 // ---- §4A/4B 共用：从一段 blob（形如 "{1}{1}{Intro}{equation.1}{}"）里依次切出配平的
@@ -35119,7 +35146,7 @@ function ovlXrefParseAuxAndBibcite(auxText) {
 //      \nonumber 的 align 这种组合场景。
 //   5. 只覆盖"当前打开文件"的文本，不跨 \input/\include 到未打开的文件（继承既有边界，
 //      ovlVisualRender 本来就只读 #ovlCodeArea 一份文件）。
-const OVL_XREF_MATH_ENV_RE = /\\begin\{(equation|align|gather|multline|eqnarray)(\*?)\}([\s\S]*?)\\end\{\1\2\}/g;
+const OVL_XREF_MATH_ENV_RE = /\\begin\{(equation|align|gather|multline|eqnarray|alignat|flalign)(\*?)\}(\{[^{}]*\})?([\s\S]*?)\\end\{\1\2\}/g;
 const OVL_XREF_SUBEQ_RE = /\\begin\{subequations\}([\s\S]*?)\\end\{subequations\}/g;
 const OVL_XREF_FLOAT_RE = /\\begin\{(figure|table|algorithm)(\*?)\}([\s\S]*?)\\end\{\1\2\}/g;
 
@@ -35130,14 +35157,115 @@ function ovlXrefFirstLabel(text) {
     const m = /\\label\s*\{([^{}]*)\}/.exec(String(text == null ? '' : text));
     return m ? m[1] : null;
 }
+// v2 Pass P177：跟 String.prototype.split(re) 产出完全相同的分段文本，额外带每段在原字符串
+// 里的起始偏移——原生 split 不返回偏移量，公式扫描要按 match.index 查"这个位置属于第几段"
+// （见下面 ovlXrefApproxScan 里的 sectionEvents），手写一份等价的。
+function ovlXrefSplitParasWithOffsets(text) {
+    const s = String(text == null ? '' : text);
+    const re = /\n\s*\n/g;
+    const parts = [];
+    let last = 0, m;
+    while ((m = re.exec(s))) {
+        parts.push({ text: s.slice(last, m.index), offset: last });
+        last = m.index + m[0].length;
+    }
+    parts.push({ text: s.slice(last), offset: last });
+    return parts;
+}
+
+// ==================== v2 Pass P177：\numberwithin/\setcounter 共用纯函数 ====================
+// 四个函数是"渲染路径"（ovlVisualRenderBodyWithLines 的 OvlEqNumCounter，真实生成 \tag{N}）
+// 和"近似查找路径"（ovlXrefApproxScan 的 approxLabels，\eqref 未编译时显示的号）唯一共用的
+// 计数/格式化逻辑，禁止两边各自维护一份可能悄悄分叉的实现——P177 实现前用真实读码核实过，
+// 改动前两边确实已经分叉：这条近似环境白名单原来缺 alignat/flalign（渲染路径会数、近似
+// 路径不会数），且近似路径原来没有跳过用户自带 \tag 的行（渲染路径会跳、近似路径会多计），
+// 这正是"公式自己显示的编号"和"\eqref 查到的编号"能对不上的两个真实根因，不是假设的风险。
+
+// 用户自己写了 \tag{X}/\tag*{X} 的行不占计数器——跟 ovlEqNumAssign 顶部注释、§4F 规则同一条
+// 判据，两处只认这一个函数，不允许各自重复写一遍正则。
+function ovlEqNumLineHasOwnTag(line) {
+    return /\\tag\*?\s*\{/.test(String(line == null ? '' : line));
+}
+// counterState 形状：{ n, withinSection, withinNoReset, sectionNum, sectionIsAppendix }。
+// withinSection 为假、或 sectionNum 还是 0（第一个 \section 之前，真实 LaTeX 里 \thesection
+// 本来就未定义）时，逐字节回退成裸数字——P168 原始行为，未声明 \numberwithin 的绝大多数
+// 文档完全不受本次改动影响。
+function ovlEqNumFormatDisplay(counterState) {
+    if (!counterState || !counterState.withinSection || !counterState.sectionNum) {
+        return String(counterState ? counterState.n : '');
+    }
+    const secLabel = (counterState.sectionIsAppendix && typeof ovlNumToLetter === 'function')
+        ? ovlNumToLetter(counterState.sectionNum) : String(counterState.sectionNum);
+    return secLabel + '.' + counterState.n;
+}
+// 处理到新的"当前 section 位置"时调用——withinSection 且非 noReset（\counterwithin* 星号
+// 变体只挂显示格式、不挂清零）时，section 号变了就把 equation 计数器清零（真实 \numberwithin
+// "父计数器进位时清零"语义）。newSec/counterState.sectionNum 初始都是 0，第一次调用（还没
+// 出过 \section）不会触发误清零。
+function ovlEqNumSyncSection(counterState, newSec, newAppendix) {
+    if (!counterState) return;
+    if (counterState.withinSection && !counterState.withinNoReset && counterState.sectionNum !== newSec) {
+        counterState.n = 0;
+    }
+    counterState.sectionNum = newSec;
+    counterState.sectionIsAppendix = !!newAppendix;
+}
+// 扫描一段文本里的 \setcounter{equation}{N} / \addtocounter{equation}{N}，按出现顺序依次
+// 应用到 counterState.n——只认 equation 这一个计数器名，\setcounter{section}{...} 等其它
+// 计数器名不归这个函数管（那是 P116 的地盘）。LaTeX 语义：\setcounter 把计数器钉死成 N，
+// \addtocounter 在当前值上累加，两者本身都不产出可见编号，下一条被编号的公式才会看到效果。
+function ovlEqNumApplyCounterCmds(text, counterState) {
+    if (!counterState) return;
+    const re = /\\(setcounter|addtocounter)\s*\{\s*equation\s*\}\s*\{\s*(-?\d+)\s*\}/g;
+    const s = String(text == null ? '' : text);
+    let m;
+    while ((m = re.exec(s))) {
+        const val = parseInt(m[2], 10);
+        if (!Number.isFinite(val)) continue;
+        if (m[1] === 'setcounter') counterState.n = val; else counterState.n += val;
+    }
+}
+// \numberwithin{equation}{section|chapter} / \counterwithin(*){equation}{section|chapter} 检测——
+// ovlXrefBuild（渲染路径经 OvlXrefState 桥接）和 ovlXrefApproxScan（近似路径）各自独立调用
+// 同一个函数、传入同一份原始 src，不允许出现"渲染路径认为开了、近似路径认为没开"这种分歧。
+// chapter 目前只探测出来存着（withinChapter），不接入格式化——report/book 的 \chapter 计数
+// 基础设施本轮未实现，明确推迟（任务书尽力项4）。
+function ovlEqNumDetectNumberWithin(fullSrc) {
+    const s = String(fullSrc == null ? '' : fullSrc);
+    const m = /\\(numberwithin|counterwithin)(\*?)\s*\{\s*equation\s*\}\s*\{\s*(section|chapter)\s*\}/.exec(s);
+    if (!m) return { withinSection: false, withinChapter: false, noReset: false };
+    return {
+        withinSection: m[3] === 'section',
+        withinChapter: m[3] === 'chapter',
+        noReset: (m[1] === 'counterwithin' && m[2] === '*')
+    };
+}
+// leqno 检测（任务书尽力项5）：\documentclass[...,leqno,...]{...} 或
+// \usepackage[...,leqno,...]{amsmath}（amsmath 允许把它当包选项直接传，不一定非得走
+// documentclass）。只影响 KaTeX renderToString 的 leqno 排版选项，不改变编号计数值本身，
+// 所以不需要接入 counterState，只在 OvlXrefState 上单独挂一个布尔桥接字段。
+function ovlXrefDetectLeqno(fullSrc) {
+    const s = String(fullSrc == null ? '' : fullSrc);
+    const docM = /\\documentclass\s*\[([^\]]*)\]/.exec(s);
+    if (docM && /\bleqno\b/.test(docM[1])) return true;
+    const pkgRe = /\\usepackage\s*\[([^\]]*)\]\s*\{([^{}]*)\}/g;
+    let pm, guard = 0;
+    while ((pm = pkgRe.exec(s)) && ++guard < 2000) {
+        if (/\bleqno\b/.test(pm[1]) && /\bamsmath\b/.test(pm[2])) return true;
+    }
+    return false;
+}
 // align/gather/multline/eqnarray 内部按顶层 \\ 切物理行，逐行判断是否计数/取 label；
 // 供顶层普通环境和 subequations 内部共用（区别只在显示串怎么拼，由各自调用方处理）。
+// v2 Pass P177：新增用户自带 \tag 的行跳过——之前只跳 \nonumber/\notag，漏了 ovlEqNumAssign
+// （真实渲染路径）本来就有的"自带 \tag 不占计数器"规则，是近似档号跟真实 \tag{N} 分叉的
+// 真实根因之一（见本节顶部大注释）。
 function ovlXrefEachCountableLine(body, cb) {
     const lines = String(body == null ? '' : body).split(/\\\\/);
     for (let li = 0; li < lines.length; li++) {
         const line = lines[li];
         if (!line.trim()) continue;
-        if (ovlXrefLineHasNoNumber(line)) continue; // §4F 第1点：跳过，不计数、不取 label
+        if (ovlXrefLineHasNoNumber(line) || ovlEqNumLineHasOwnTag(line)) continue; // §4F 第1点 + P177
         cb(line);
     }
 }
@@ -35149,15 +35277,19 @@ function ovlXrefApproxScan(srcRaw) {
         ? ovlStripLatexCommentsForRender(srcRaw) : String(srcRaw == null ? '' : srcRaw);
 
     // ---- section/subsection/subsubsection：复用 P116 的同一套计数器函数，保证近似档跟
-    // 既有 Visual 章节编号（.ovl-visual-block[data-ovl-num]）不打架（§7.1 要求）。----
+    // 既有 Visual 章节编号（.ovl-visual-block[data-ovl-num]）不打架（§7.1 要求）。同时记录
+    // sectionEvents（P177 新增）——每段处理完之后的 {offset,sec,appendix} 快照，供下面的公式
+    // 扫描按 match.index 查"这个位置当前是第几节"，不用重新跑一遍章节计数逻辑。----
+    const sectionEvents = [];
     try {
         const numState = { sec: 0, sub: 0, subsub: 0, appendix: false };
-        const paras = cleaned.split(/\n\s*\n/);
+        const paras = ovlXrefSplitParasWithOffsets(cleaned);
         for (let pi = 0; pi < paras.length; pi++) {
             let numLabel = null;
-            try { numLabel = ovlNumComputeForBlock(paras[pi], numState); } catch (e) { numLabel = null; }
+            try { numLabel = ovlNumComputeForBlock(paras[pi].text, numState); } catch (e) { numLabel = null; }
+            sectionEvents.push({ offset: paras[pi].offset, sec: numState.sec, appendix: numState.appendix });
             if (numLabel == null) continue;
-            const key = ovlXrefFirstLabel(paras[pi]);
+            const key = ovlXrefFirstLabel(paras[pi].text);
             if (key) labels.set(key, { display: numLabel.replace(/\.$/, ''), anchorType: 'section' });
         }
     } catch (e) { /* 章节近似失败不影响其它类别 */ }
@@ -35175,56 +35307,68 @@ function ovlXrefApproxScan(srcRaw) {
         }
     } catch (e) { /* float 近似失败不影响其它类别 */ }
 
-    // ---- equation 家族：先挖出 subequations 块各自独立编号（父计数器冻结+字母后缀），
-    // 剩余文本里的普通数学环境正常递增顶层计数器。----
+    // ---- equation 家族：P177 改写为单遍按源码顺序扫描——subequations / 顶层编号环境 /
+    // \setcounter\addtocounter{equation} 三类事件按 match.index 严格交替处理，配合上面的
+    // sectionEvents 查"当前第几节"，与渲染路径 ovlVisualRenderBodyWithLines 逐块处理的
+    // 顺序语义对齐；计数/格式化改走 ovlEqNumFormatDisplay/ovlEqNumSyncSection 共用函数
+    // （§4F 局限 1-5 照旧保留，未新增）。----
     try {
-        const state = { eq: 0 };
-        let subOut = '';
-        let lastIdx = 0;
-        OVL_XREF_SUBEQ_RE.lastIndex = 0;
-        let sm, guard1 = 0;
-        while ((sm = OVL_XREF_SUBEQ_RE.exec(cleaned)) && ++guard1 < 20000) {
-            subOut += cleaned.slice(lastIdx, sm.index);
-            state.eq++;
-            const parentNum = state.eq;
-            let subCounter = 0;
-            OVL_XREF_MATH_ENV_RE.lastIndex = 0;
-            let im, guard2 = 0;
-            while ((im = OVL_XREF_MATH_ENV_RE.exec(sm[1])) && ++guard2 < 20000) {
-                if (im[2] === '*') continue;
-                if (im[1] === 'equation') {
-                    if (ovlXrefLineHasNoNumber(im[3])) continue;
-                    subCounter++;
-                    const suf = String.fromCharCode(96 + subCounter);
-                    const key = ovlXrefFirstLabel(im[3]);
-                    if (key) labels.set(key, { display: parentNum + suf, anchorType: 'equation' });
-                } else {
-                    ovlXrefEachCountableLine(im[3], function (line) {
+        const withinInfo = ovlEqNumDetectNumberWithin(srcRaw);
+        const counterState = { n: 0, withinSection: withinInfo.withinSection, withinNoReset: withinInfo.noReset, sectionNum: 0, sectionIsAppendix: false };
+        let secPtr = 0;
+        const secAt = function (offset) {
+            while (secPtr + 1 < sectionEvents.length && sectionEvents[secPtr + 1].offset <= offset) secPtr++;
+            return sectionEvents[secPtr] || { sec: 0, appendix: false };
+        };
+        const eventRe = /\\begin\{subequations\}([\s\S]*?)\\end\{subequations\}|\\begin\{(equation|align|gather|multline|eqnarray|alignat|flalign)(\*?)\}(\{[^{}]*\})?([\s\S]*?)\\end\{\2\3\}|\\(setcounter|addtocounter)\s*\{\s*equation\s*\}\s*\{\s*(-?\d+)\s*\}/g;
+        let cm, guard1 = 0;
+        while ((cm = eventRe.exec(cleaned)) && ++guard1 < 20000) {
+            const ev = secAt(cm.index);
+            ovlEqNumSyncSection(counterState, ev.sec, ev.appendix);
+            if (cm[1] !== undefined) {
+                // subequations：父计数器进一位、冻结成父号，内部逐条按出现顺序取字母后缀。
+                counterState.n++;
+                const parentDisp = ovlEqNumFormatDisplay(counterState);
+                let subCounter = 0;
+                OVL_XREF_MATH_ENV_RE.lastIndex = 0;
+                let im, guard2 = 0;
+                while ((im = OVL_XREF_MATH_ENV_RE.exec(cm[1])) && ++guard2 < 20000) {
+                    if (im[2] === '*') continue;
+                    if (im[1] === 'equation') {
+                        if (ovlXrefLineHasNoNumber(im[4]) || ovlEqNumLineHasOwnTag(im[4])) continue;
                         subCounter++;
                         const suf = String.fromCharCode(96 + subCounter);
+                        const key = ovlXrefFirstLabel(im[4]);
+                        if (key) labels.set(key, { display: parentDisp + suf, anchorType: 'equation' });
+                    } else {
+                        const innerBody = (im[3] || '') + im[4];
+                        ovlXrefEachCountableLine(innerBody, function (line) {
+                            subCounter++;
+                            const suf = String.fromCharCode(96 + subCounter);
+                            const key = ovlXrefFirstLabel(line);
+                            if (key) labels.set(key, { display: parentDisp + suf, anchorType: 'equation' });
+                        });
+                    }
+                }
+            } else if (cm[2] !== undefined) {
+                const envName = cm[2], star = cm[3], colSpec = cm[4], body = cm[5];
+                if (star === '*') { /* 星号变体不计数，§4F 第3点 */ }
+                else if (envName === 'equation') {
+                    if (!ovlXrefLineHasNoNumber(body) && !ovlEqNumLineHasOwnTag(body)) {
+                        counterState.n++;
+                        const key = ovlXrefFirstLabel(body);
+                        if (key) labels.set(key, { display: ovlEqNumFormatDisplay(counterState), anchorType: 'equation' });
+                    }
+                } else {
+                    ovlXrefEachCountableLine((colSpec || '') + body, function (line) {
+                        counterState.n++;
                         const key = ovlXrefFirstLabel(line);
-                        if (key) labels.set(key, { display: parentNum + suf, anchorType: 'equation' });
+                        if (key) labels.set(key, { display: ovlEqNumFormatDisplay(counterState), anchorType: 'equation' });
                     });
                 }
-            }
-            lastIdx = sm.index + sm[0].length;
-        }
-        subOut += cleaned.slice(lastIdx);
-        OVL_XREF_MATH_ENV_RE.lastIndex = 0;
-        let m2, guard3 = 0;
-        while ((m2 = OVL_XREF_MATH_ENV_RE.exec(subOut)) && ++guard3 < 20000) {
-            if (m2[2] === '*') continue; // §4F 第3点：星号变体不计数
-            if (m2[1] === 'equation') {
-                if (ovlXrefLineHasNoNumber(m2[3])) continue; // §4F 第2点：不冒充编号
-                state.eq++;
-                const key = ovlXrefFirstLabel(m2[3]);
-                if (key) labels.set(key, { display: String(state.eq), anchorType: 'equation' });
-            } else {
-                ovlXrefEachCountableLine(m2[3], function (line) {
-                    state.eq++;
-                    const key = ovlXrefFirstLabel(line);
-                    if (key) labels.set(key, { display: String(state.eq), anchorType: 'equation' });
-                });
+            } else if (cm[6] !== undefined) {
+                const val = parseInt(cm[7], 10);
+                if (Number.isFinite(val)) { if (cm[6] === 'setcounter') counterState.n = val; else counterState.n += val; }
             }
         }
     } catch (e) { /* 公式近似失败不影响其它类别 */ }
@@ -35296,6 +35440,16 @@ function ovlXrefBuild(src) {
         // biblatex：明确不支持，未实测验证（§4B 第5点，如实标注"未确认"）。检测到就让 cite
         // 查找直接跳过 aux 分支，全部走近似/查不到——套错 natbib 规则比不套更危险。
         OvlXrefState.biblatexDetected = /\\usepackage(?:\[[^\]]*\])?\{\s*biblatex\s*\}/.test(src);
+
+        // v2 Pass P177：\numberwithin{equation}{section|chapter} 探测——跟 natbib 同款扫描口径
+        // （对象是整篇 src，不剥注释；已知的、跟 natbib 检测同源的粗糙点：被注释掉的
+        // \numberwithin 也会被误判成生效，未修，见报告"已知局限"）。
+        const withinInfo = ovlEqNumDetectNumberWithin(src);
+        OvlXrefState.withinSection = withinInfo.withinSection;
+        OvlXrefState.withinChapter = withinInfo.withinChapter;
+        OvlXrefState.withinNoReset = withinInfo.noReset;
+        // v2 Pass P177（尽力项5）：leqno 同款粗糙扫描口径——跟上面 numberwithin 一样不剥注释。
+        OvlXrefState.leqno = ovlXrefDetectLeqno(src);
 
         // 近似兜底：全文档一次预扫描（§6.2：跟 LatexFilter 全文转换、P116 按块扫描同一数量级）。
         const approx = ovlXrefApproxScan(src);
@@ -35378,7 +35532,11 @@ function ovlXrefLookupRef(key, cmdName, ctx) {
         const display = ovlXrefFormatRef(cmdName, ap.display, ovlXrefTypeWordFor(key, ctx));
         return ovlXrefSpan('approx', display, key, OVL_XREF_TIER_TIP.approx);
     }
-    return ovlXrefSpan('unknown', '??', key, OVL_XREF_TIER_TIP.unknown);
+    // v2 Pass P177：查不到时也要走 ovlXrefFormatRef——真实 LaTeX 里 \eqref{X} 的定义是
+    // "(\ref{X})"，undefined 时 \ref 本身出 "??"，但 \eqref 自己的外层括号仍然在
+    // （最终 PDF 显示 "(??)"，不是裸 "??"）；ref/pageref/autoref/cref/Cref 這幾個命令本身
+    // 没有外层括号，ovlXrefFormatRef 对它们是恒等/无类型词兜底，逐字节不变。
+    return ovlXrefSpan('unknown', ovlXrefFormatRef(cmdName, '??', null), key, OVL_XREF_TIER_TIP.unknown);
 }
 function ovlXrefLookupCite(key, ctx) {
     if (!key) return ovlXrefSpan('unknown', '??', '', '找不到对应编号 · cite key 为空');
@@ -35512,7 +35670,10 @@ function ovlXrefFormulaPlainText(cmdName, key, ctx) {
         const ap = ctx.approxLabels && ctx.approxLabels.get(key);
         if (ap) return ovlXrefFormatRef(cmdName, ap.display, ovlXrefTypeWordFor(key, ctx));
     }
-    return '??';
+    // v2 Pass P177：跟 ovlXrefLookupRef 的 unknown 分支同一条理由——公式内 \eqref{X} 查不到
+    // 时也要带外层括号显示 "(??)"，不能是裸 "??"（真实 LaTeX \eqref 语义如此，见该函数旁
+    // 大注释）；wantPage 分支（pageref 查不到）在上面已经直接 return，不会走到这里。
+    return ovlXrefFormatRef(cmdName, '??', null);
 }
 // 把公式文本里的 \eqref{}/\autoref{}/\ref{} 换成纯文本编号（外面包一层 \text{}，避免破坏
 // 公式本身的数学模式语义）；ctx 缺省（未启用 xref）时逐字回退到旧的 stripCommand 行为。
@@ -38177,7 +38338,18 @@ function ovlVisualRenderBlockContentCompare(text, eqStart) {
     const rcEn = ovlVisualRenderBlockContent(text, 'original');
     const prevCounter = OvlEqNumCounter;
     let rcZh;
-    OvlEqNumCounter = { n: eqStart };
+    // v2 Pass P177：临时计数器不能只带裸的 n——挂了 \numberwithin{equation}{section} 时，
+    // withinSection/sectionNum/sectionIsAppendix/withinNoReset 这几个字段全部从 prevCounter
+    // （真实计数器，上面英文遍刚用它推进过 .n，但 .sectionNum 等字段本身在本块渲染期间是
+    // 常量、不受推进影响）原样继承，否则中文遍会退化成裸数字、跟英文遍显示的 "sec.n" 前缀
+    // 对不上——这正是"英中两侧编号必须一致"这条不变量在 compare 模式下最容易被打破的地方。
+    OvlEqNumCounter = {
+        n: eqStart,
+        withinSection: prevCounter ? prevCounter.withinSection : false,
+        withinNoReset: prevCounter ? prevCounter.withinNoReset : false,
+        sectionNum: prevCounter ? prevCounter.sectionNum : 0,
+        sectionIsAppendix: prevCounter ? prevCounter.sectionIsAppendix : false
+    };
     try {
         rcZh = ovlVisualRenderBlockContent(text, 'zh');
     } finally {
@@ -38295,7 +38467,17 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
     // 保证不含编号环境），所以两种情况下从 0 起算都是对的，不需要跨调用记忆真实进度。
     // try/finally 确保哪怕中途抛异常，也一定会把模块级开关清回 null，不留给后续无关调用
     // （聊天气泡、选区翻译弹窗等）误吃一个"半开着"的计数器。
-    const eqCounter = { n: 0 };
+    // v2 Pass P177：withinSection/withinNoReset 从 OvlXrefState 桥接——本函数只拿得到
+    // body（\begin{document} 之后），\numberwithin/\counterwithin 通常写在导言区，读不到；
+    // OvlXrefState 是对整份 src（含导言区）建的表，调用方（ovlVisualRender 等）已经在渲染
+    // body 之前调过 ovlXrefBuild(src)，这里直接读缓存结果，不重新扫一遍、不新增参数穿透。
+    const eqCounter = {
+        n: 0,
+        withinSection: (typeof OvlXrefState !== 'undefined' && OvlXrefState && OvlXrefState.withinSection) || false,
+        withinNoReset: (typeof OvlXrefState !== 'undefined' && OvlXrefState && OvlXrefState.withinNoReset) || false,
+        sectionNum: 0,
+        sectionIsAppendix: false
+    };
     OvlEqNumCounter = eqCounter;
     try {
     if (!blocks.length) return ovlVisualRenderChunk(body);
@@ -38324,6 +38506,12 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
         // 保证只产出一个子块（ovlSplitVisualBlocks 里 isHeading 命中就立即 flush，块内只有
         // 这一行），下面按 j===0 只贴到第一个子块上，不会重复。
         const numLabel = ovlNumComputeForBlock(b.text, numState);
+        // v2 Pass P177：标题块把 numState.sec/appendix 更新到最新之后，立刻同步给 eqCounter——
+        // 挂了 \numberwithin{equation}{section} 时，这一步既负责"section 号变了就把公式计数器
+        // 清零"，也负责把最新 section 号交给 ovlEqNumFormatDisplay 拼前缀；未挂 numberwithin
+        // 时 ovlEqNumSyncSection 只更新 sectionNum/sectionIsAppendix 两个字段，不影响 n，
+        // 逐字节不改变 P168 原有行为。
+        ovlEqNumSyncSection(eqCounter, numState.sec, numState.appendix);
         const numAttrHtml = numLabel ? ' data-ovl-num="' + escapeAttr(numLabel) + '"' : '';
         const splitEnabled = !b.atomic && OvlSettings.ovlVisualLineBreaks !== false;
         const subs = splitEnabled ? ovlSplitVisualLines(b.text, b.line) : null;
@@ -38343,13 +38531,23 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
             // 开始渲染前的计数器起点存下来，worker() 落地译文前用这个起点现开一个临时计数器
             // 复算同一批编号（见 ovlVisualLangRunQueue 里的调用点），因为翻译只换块内散文、
             // 受保护的公式环境本身逐字节不动，起点相同就能重算出完全相同的编号序列。
+            // v2 Pass P177：取快照之前，先扫这一整块原文里的 \setcounter{equation}{N}/
+            // \addtocounter{equation}{N} 并应用到 eqCounter.n——这两条命令本身不出现在
+            // KaTeX 数学模式里，是普通正文命令，出现在"整块只有它自己、前后带空行"的
+            // 独立块里最常见（用户拆行写法），跟这里的块粒度天然吻合。
+            ovlEqNumApplyCounterCmds(b.text, eqCounter);
             const eqStartB = OvlEqNumCounter ? OvlEqNumCounter.n : 0;
             // v2 Pass P170：compare 模式走专用双渲染入口（英中各渲染一次、共享同一个
             // data-ovl-eqnum-start 起点防重复计数，见 ovlVisualRenderBlockContentCompare
             // 头部注释），其余两种模式（original/zh）逐字节保持改动前的单遍渲染调用。
             const rc = (OvlVisualLangState.lang === 'compare') ? ovlVisualRenderBlockContentCompare(b.text, eqStartB) : ovlVisualRenderBlockContent(b.text);
             html += '<div class="ovl-visual-block' + ovlCompareClassAttr + '" data-src-line="' + b.line + '" data-src-line-end="' + blockLineEnd
-                + '" data-para-start="1"' + numAttrHtml + ' data-ovl-eqnum-start="' + eqStartB + '"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
+                + '" data-para-start="1"' + numAttrHtml + ' data-ovl-eqnum-start="' + eqStartB + '"'
+                // v2 Pass P177：连同当前 section 号一起快照——ovlVisualRenderChunkWithEqNum
+                // 异步复算时只有 data-ovl-eqnum-start（裸数字 n）不够，挂了 \numberwithin 时
+                // 还需要这块所在的 section 号才能拼出跟同步渲染一致的 "sec.n" 前缀。
+                + ' data-ovl-eqnum-sec="' + eqCounter.sectionNum + '"' + (eqCounter.sectionIsAppendix ? ' data-ovl-eqnum-sec-appx="1"' : '')
+                + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
                 + (rc.skipped ? ' data-ovl-trans-skipped="1" title="' + escapeAttr(OVL_VISUAL_SKIPPED_TITLE) + '"' : '') + (rc.forced ? ' data-ovl-trans-forced="1"' : '')
                 + (rc.noprose ? ' data-ovl-trans-noprose="1" title="' + escapeAttr(OVL_VISUAL_NOPROSE_TITLE) + '"' : '') // v2 Pass P128e（B3-1）：分块阶段判定"无可译文本"，不入队、不计分母
                 + (rc.partial ? ovlVisualPartialAttrHtml(rc.partialReason) : '') // v2 Pass P122c（BV2-2）：缓存命中回填 partial
@@ -38365,11 +38563,18 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
             // v2 Pass P168（异步单块补丁路径补丁）：同上——按子块各自的渲染前快照分别挂
             // data-ovl-eqnum-start，不能只挂一次整块共用的起点（子块可能各自含独立的编号
             // 环境，起点逐块前移）。
+            // v2 Pass P177：同上——按子块各自的文本扫 \setcounter/\addtocounter{equation}
+            // 并应用，粒度跟子块一致（子块本来就是按行细分出来的，标准写法里
+            // \setcounter{equation}{N} 独占一行，天然落在自己的子块里）。
+            ovlEqNumApplyCounterCmds(sb.text, eqCounter);
             const eqStartSb = OvlEqNumCounter ? OvlEqNumCounter.n : 0;
             // v2 Pass P170：同上——compare 模式走专用双渲染入口。
             const rc = (OvlVisualLangState.lang === 'compare') ? ovlVisualRenderBlockContentCompare(sb.text, eqStartSb) : ovlVisualRenderBlockContent(sb.text);
             html += '<div class="ovl-visual-block' + ovlCompareClassAttr + '" data-src-line="' + sb.line + '" data-src-line-end="' + sb.lineEnd
-                + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '"' + (j === 0 ? numAttrHtml : '') + ' data-ovl-eqnum-start="' + eqStartSb + '"' + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
+                + '" data-para-start="' + (sb.paraStart ? '1' : '0') + '"' + (j === 0 ? numAttrHtml : '') + ' data-ovl-eqnum-start="' + eqStartSb + '"'
+                // v2 Pass P177：同上——子块也要带 section 号快照。
+                + ' data-ovl-eqnum-sec="' + eqCounter.sectionNum + '"' + (eqCounter.sectionIsAppendix ? ' data-ovl-eqnum-sec-appx="1"' : '')
+                + (rc.pending ? ' data-ovl-trans-pending="1"' : '')
                 + (rc.skipped ? ' data-ovl-trans-skipped="1" title="' + escapeAttr(OVL_VISUAL_SKIPPED_TITLE) + '"' : '') + (rc.forced ? ' data-ovl-trans-forced="1"' : '')
                 + (rc.noprose ? ' data-ovl-trans-noprose="1" title="' + escapeAttr(OVL_VISUAL_NOPROSE_TITLE) + '"' : '') // v2 Pass P128e（B3-1）：分块阶段判定"无可译文本"，不入队、不计分母
                 + (rc.partial ? ovlVisualPartialAttrHtml(rc.partialReason) : '') // v2 Pass P122c（BV2-2）：缓存命中回填 partial
@@ -38408,7 +38613,21 @@ function ovlVisualRenderChunkWithEqNum(el, tex) {
     const start = parseInt(raw, 10);
     if (!(start >= 0)) return ovlVisualRenderChunk(tex);
     const prevCounter = OvlEqNumCounter;
-    OvlEqNumCounter = { n: start };
+    // v2 Pass P177：连同 section 号快照一起复原（data-ovl-eqnum-sec/-sec-appx，见
+    // ovlVisualRenderBodyWithLines 里写这两个属性的地方）；withinSection/withinNoReset
+    // 是整份文档级别的常量、不随块变化，重新从 OvlXrefState 读一次即可（跟整篇渲染时
+    // eqCounter 的起始种子读的是同一个桥接字段，不会跟同步渲染路径产生分歧）。没有这两个
+    // 快照属性（老版本 DOM）时按"未挂 numberwithin"退化，逐字节维持改动前的裸数字行为。
+    const secRaw = el && el.getAttribute ? el.getAttribute('data-ovl-eqnum-sec') : null;
+    const sectionNum = secRaw == null ? 0 : (parseInt(secRaw, 10) || 0);
+    const sectionIsAppendix = !!(el && el.getAttribute && el.getAttribute('data-ovl-eqnum-sec-appx'));
+    OvlEqNumCounter = {
+        n: start,
+        withinSection: (typeof OvlXrefState !== 'undefined' && OvlXrefState && OvlXrefState.withinSection) || false,
+        withinNoReset: (typeof OvlXrefState !== 'undefined' && OvlXrefState && OvlXrefState.withinNoReset) || false,
+        sectionNum: sectionNum,
+        sectionIsAppendix: sectionIsAppendix
+    };
     try {
         return ovlVisualRenderChunk(tex);
     } finally {
@@ -38952,6 +39171,11 @@ function ovlBilingualRefreshMirror() {
             if (typeof ovlBilingualScheduleAlign === 'function') ovlBilingualScheduleAlign();
             return;
         }
+        // v2 Pass P177：防御性重建——镜像面板通常在主 ovlVisualRender() 已经调过
+        // ovlXrefBuild(src) 之后触发，三重失效条件命中缓存时这里零开销；万一某条调用路径
+        // 先到这里（比如未来新增的调用点），补这一下保证 eqCounter.withinSection 等字段
+        // 不会读到陈旧/空值。
+        if (typeof ovlXrefBuild === 'function') { try { ovlXrefBuild(src); } catch (e) { console.error('[ovl-xref] 镜像面板建表失败，本次渲染引用编号全部退到查不到档', e); } }
         const splitDoc = ovlSplitDocumentPreambleBody(src);
         const preamble = splitDoc.preamble, body = splitDoc.body, tail = splitDoc.tail, bodyStartLine = splitDoc.bodyStartLine;
         const savedLang = OvlVisualLangState.lang;
@@ -59034,7 +59258,11 @@ function ovlInlineSrcRerenderLocal(st, newText) {
         // 现开的 {n:0} 计数器（ovlVisualRenderBodyWithLines）算不出正确的起始值——退化到
         // 整篇 ovlVisualRender()，让计数器从文档最前面重新数一遍，跟标题/appendix 那条
         // 是同一个道理、同一条退化路径。
-        const headingOrAppendixTest = /\\appendix\b|\\(?:subsubsection|subsection|section)\*?(?:\[[^\]]*\])?\{|\\begin\{(?:equation|align|gather|multline|eqnarray|alignat|flalign)\*?\}/;
+        // v2 Pass P177：同一条兜底再加 \setcounter{equation}/\addtocounter{equation}/
+        // \numberwithin{equation}/\counterwithin{equation}——这四条命令若出现在被编辑片段里
+        // （增/删/改任一侧），同样会让之后所有公式的编号挪位或改变前缀格式，局部 patch 没有
+        // 能力重算，必须退化到整篇重渲染，跟数学环境本身同一条理由。
+        const headingOrAppendixTest = /\\appendix\b|\\(?:subsubsection|subsection|section)\*?(?:\[[^\]]*\])?\{|\\begin\{(?:equation|align|gather|multline|eqnarray|alignat|flalign)\*?\}|\\(?:setcounter|addtocounter)\s*\{\s*equation\s*\}|\\(?:numberwithin|counterwithin)\*?\s*\{\s*equation\s*\}/;
         const oldEnText = (st && st.origEnText != null) ? st.origEnText : ((st && st.origText != null) ? st.origText : '');
         // v2 Pass P169（R3 方向 2 修复）：局部 patch 的假设是"被编辑的块就活在
         // #ovlVisualPane 自己的 DOM 子树里"——但双语模式下从右侧镜像面板发起的编辑，
