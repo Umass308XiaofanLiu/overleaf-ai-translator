@@ -4904,7 +4904,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.35.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.36.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -5894,7 +5894,9 @@ const AppState = {
 
     // 哨兵传输协议总开关（详见 translateViaSentinel 上方的大段注释）。
     // 持久化到 localStorage['sentinelTransport']；关掉 = 逐字回到旧的 JSON 协议。
-    // 只对 local / gemini 两条**已实测**链路生效，OpenAI / Claude 永远走旧协议。
+    // v2 Pass P174：接入 openai/claude 后，五家 provider 全部纳入哨兵协议（xportActive 的
+    // 判定见其函数头）；claude/openai 额外有"哨兵路径异常就回退 legacy"的安全网（见
+    // translateBulk 里那两家的分支），不会因为新接入的边角问题彻底翻不动。
     sentinelTransport: true,
     // 上一次翻译里有几段落进了失败标记。>0 时 handleTranslate / handleRegenerateAll
     // 会弹一次 toast 明确告知；本字段留着给排查用（失败的那几行自己也带可见标记）。
@@ -9331,6 +9333,19 @@ function parseCrossFragments(raw) {
 // temperature/maxTokens/…，见其函数头），这里只是把它们真正接上；openai/claude/gemini 三条
 // 调用点原样不动（尤其是 claude 这一支——禁止改动 callClaudeAPI 函数体与调用参数），meta
 // 对它们始终是 undefined，不影响现有行为。
+// v2 Pass P174（补 meta 真空）：上面那句"三条调用点原样不动"过时了——它是本函数一直没做
+// 完的一半：Visual 模式 L4 级"命中截断信号就提高 max_tokens 重跑"（见
+// ovlVisualTranslateBlockWithLadder 上方注释）对 openai/claude/gemini 三家永远打不着，
+// 因为 meta.finish/meta.truncated 永远是 undefined。现在把能转发的都转发，转发不了的
+// 如实留空、不假装修好：
+//   · openai：callOpenAIAPI 的第 6 个形参就是 meta 出参、第 3 个形参 config.max_tokens 是
+//     入参口子（getMaxTokensForModel 早支持 configMax 覆盖），两条都能接，函数体不用动。
+//   · claude：callClaudeAPI 的签名里压根没有 meta 形参（这个函数是改动禁区，不能加），
+//     所以 meta.finish/truncated 对 claude 永远拿不到——这是这个 provider 的架构性限制，
+//     不是本次遗漏；maxTokens 能转（同样走 config.max_tokens 口子），先接上。
+//   · gemini：callGeminiAPI 的第 6 个形参是 meta 出参，转发；但它的函数体（改动禁区）
+//     从未读过任何 max tokens 字段，maxTokens 转了也没有落点——L4 对 gemini 能拿到截断
+//     信号、但拿不到"调高预算重跑"的把手，同样是架构性限制，如实记录，不强行塞进去。
 async function callModelPlainText(prompt, config, signal, meta, opts) {
     if (config.provider === 'local') {
         return await callLocalLLM(config.localBaseUrl, config.model, [{ role: 'user', content: prompt }], false, signal, meta || null, opts || null);
@@ -9340,13 +9355,17 @@ async function callModelPlainText(prompt, config, signal, meta, opts) {
         const qwenOpts = Object.assign({}, opts || null, { apiKey: config.qwenApiKey });
         return await callLocalLLM(config.qwenBaseUrl, config.model, [{ role: 'user', content: prompt }], false, signal, meta || null, qwenOpts);
     }
+    const oMax = (opts && typeof opts.maxTokens === 'number' && isFinite(opts.maxTokens) && opts.maxTokens > 0)
+        ? Math.round(opts.maxTokens) : null;
     if (config.provider === 'openai') {
-        return await callOpenAIAPI(config.model, [{ role: 'user', content: prompt }], {}, config.openaiApiKey, signal) || '';
+        const oaConfig = oMax ? { max_tokens: oMax } : {};
+        return await callOpenAIAPI(config.model, [{ role: 'user', content: prompt }], oaConfig, config.openaiApiKey, signal, meta || null) || '';
     }
     if (config.provider === 'claude') {
-        return await callClaudeAPI(config.model, [{ role: 'user', content: prompt }], {}, config.claudeApiKey, signal, config.claudeProxyUrl) || '';
+        const clConfig = oMax ? { max_tokens: oMax } : {};
+        return await callClaudeAPI(config.model, [{ role: 'user', content: prompt }], clConfig, config.claudeApiKey, signal, config.claudeProxyUrl) || '';
     }
-    return await callGeminiAPI(config.model, prompt, {}, config.geminiApiKey, signal) || '';
+    return await callGeminiAPI(config.model, prompt, {}, config.geminiApiKey, signal, meta || null) || '';
 }
 
 // ============= 跨栏高亮：调度 =============
@@ -12584,6 +12603,14 @@ const XPORT_CTX_USE = 0.35;       // 只用加载期上下文的 35%：批次之
 // 分别是 96.4% / 100% / 96.4%，总耗时几乎相同（13.7s / 13.0s / 13.1s）；35B 三档全 100%。
 // 8 是唯一两个模型都不掉块的档位，且请求数只有 4 段档的一半。
 const XPORT_SEGS_PER_BATCH = 8;
+// v2 Pass P174：claude/openai 接入哨兵协议后，每批往 xportRequest 送的是「一批译文，
+// 不回显原文」——比 legacy 协议的「原文+译文都要」省一半输出预算，但这两家云端 provider
+// 的出厂默认（getMaxTokensForModel 的 4096 / getMaxTokensForClaudeModel 的 4096-8192）
+// 是按 legacy 协议的整篇一次发标定的，对哨兵的 8 段/批×5000 字符预算依然偏紧。
+// 16384 对齐 local 在 callLocalLLM 里的出厂默认（同一个数量级，不是拍脑袋）；云端 provider
+// 上下文远大于任何一批，加大这个数字唯一的代价是"预算给多了但没用完"，不像本地模型有
+// 加载期上下文上限那道硬闸。
+const XPORT_ONLINE_MAX_TOKENS = 16384;
 async function xportLimits(config) {
     if (config.provider !== 'local') {
         // 在线模型上下文远大于任何一批，真正的约束是「一次让模型编号多少段还不出错」
@@ -12635,6 +12662,21 @@ async function xportRequest(items, srcName, tgtName, config, signal, outMeta) {
         // v2 Pass P134：复用同一条 callLocalLLM 传输，只是换 baseUrl 并带 apiKey。
         raw = await callLocalLLM(config.qwenBaseUrl, config.model,
             [{ role: 'system', content: sys }, { role: 'user', content: user }], false, signal, meta, { apiKey: config.qwenApiKey });
+    } else if (config.provider === 'openai') {
+        // v2 Pass P174：claude/openai 接入哨兵协议——复用现成的 callOpenAIAPI，一个字不改
+        // 它的函数体，只在这个调用点把 max_tokens 覆盖成哨兵批次专用的预算
+        // （XPORT_ONLINE_MAX_TOKENS，getMaxTokensForModel 早就支持 configMax 覆盖）。
+        raw = await callOpenAIAPI(config.model,
+            [{ role: 'system', content: sys }, { role: 'user', content: user }],
+            { max_tokens: XPORT_ONLINE_MAX_TOKENS }, config.openaiApiKey, signal, meta);
+    } else if (config.provider === 'claude') {
+        // callClaudeAPI 函数体是改动禁区，这里只是调用点——传更大的 max_tokens（同样走
+        // getMaxTokensForClaudeModel 现成的 configMax 覆盖口子）。这个函数没有 meta 形参
+        // （签名里压根没有这个位置），所以 meta.truncated 对 claude 恒为 false——不是遗漏，
+        // 是这个函数签名本身的限制（见 xportActive 上方注释、callModelPlainText 上方 P174 注释）。
+        raw = await callClaudeAPI(config.model,
+            [{ role: 'system', content: sys }, { role: 'user', content: user }],
+            { max_tokens: XPORT_ONLINE_MAX_TOKENS, temperature: 0.3 }, config.claudeApiKey, signal, config.claudeProxyUrl);
     } else {
         raw = await callGeminiAPI(config.model, user,
             { systemInstruction: sys, temperature: 0.3 }, config.geminiApiKey, signal, meta);
@@ -12670,6 +12712,24 @@ async function xportLegacyOne(seg, srcName, tgtName, config, signal, taskUsage) 
             [{ role: 'system', content: systemPrompt }, { role: 'user', content: seg }], false, signal, meta, { apiKey: config.qwenApiKey });
         if (taskUsage) usageAccum(taskUsage, meta);
         data = parseLocalJson(r, meta);
+    } else if (config.provider === 'openai') {
+        // v2 Pass P174：阶梯末级也要跟着 claude/openai 接进哨兵协议——不加这两个分支，
+        // 一旦某个 openai/claude 段落降到级 3，会落进下面 else 的 callGeminiAPI，用错误
+        // 的 provider 直接炸。跟 translateBulk 的 OpenAI Path 用同一套「回显式旧 JSON 协议」
+        // system prompt（这一级本来就是回退到旧协议，回显是旧协议本身的行为，不是新缺陷）。
+        const meta = {};
+        const r = await callOpenAIAPI(config.model,
+            [{ role: 'system', content: systemPrompt }, { role: 'user', content: seg }],
+            { jsonMode: true }, config.openaiApiKey, signal, meta);
+        if (taskUsage) usageAccum(taskUsage, meta);
+        data = parseJsonResponse(r);
+    } else if (config.provider === 'claude') {
+        // callClaudeAPI 函数体禁止改动、也没有 meta 出参——跟 translateBulk 的 Claude Path
+        // 同一条纪律：usage 这一级不追加（taskUsage 保持不变，不是遗漏）。
+        const r = await callClaudeAPI(config.model,
+            [{ role: 'system', content: systemPrompt }, { role: 'user', content: seg }],
+            { temperature: 0.3 }, config.claudeApiKey, signal, config.claudeProxyUrl);
+        data = parseJsonResponse(r);
     } else {
         const r = await callGeminiAPI(config.model, seg, {
             systemInstruction: systemPrompt,
@@ -12806,15 +12866,20 @@ async function xportRecoverSegment(mm, rawSeg, wasBatched, srcName, tgtName, con
     return null;
 }
 
-// 哨兵协议只对**本次实测过**的两条链路生效：本地 LM Studio 与 Gemini。
-// OpenAI / Claude 保持今天一模一样的行为 —— 上一版正是因为「代码写了但没测」被否，
-// 这里不重复那个错误。开关关掉则全部回到现行协议。
+// v2 Pass P174：五家 provider 全部纳入哨兵协议。上一版只接了 local/gemini/qwen 三家——
+// OpenAI/Claude 被排除，正是因为再上一版「代码写了但没测」被否，那次不敢重复那个错误。
+// 这次把 openai/claude 接进 xportRequest/xportLegacyOne（各自的分支见其函数体），并用
+// jump 上的 LM Studio :1235（OpenAI 兼容端点）实测了完整的分块/多次请求/无回显/写回链路
+// （tools/e2e/test_p174_sentinel_bulk.js）——claude 分支复用同一条 xportRequest/
+// xportLegacyOne 代码路径，函数体是改动禁区，没有做真实 Claude 调用，靠"同路径证明 +
+// 回放夹具"。开关关掉则全部回到现行（legacy）协议。
 function xportActive(config) {
     try {
         if (!AppState.sentinelTransport) return false;
         // v2 Pass P134：Qwen 复用与 local 相同的 OpenAI 兼容传输，同样纳入哨兵协议（更稳），
         // 而不是退回旧版 JSON 协议。
-        return config.provider === 'local' || config.provider === 'gemini' || config.provider === 'qwen';
+        return config.provider === 'local' || config.provider === 'gemini' || config.provider === 'qwen'
+            || config.provider === 'openai' || config.provider === 'claude';
     } catch (e) { return false; }
 }
 
@@ -12992,13 +13057,25 @@ async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
     const pristine = typeof text === 'string' ? text : String(text == null ? '' : text);
     text = stripTextColorForModel(text);
 
-    // 哨兵传输协议（详见上方大段注释）。开关关掉、或 provider 不在实测范围内时，
-    // 下面一行之后的代码与改动前逐字一致。
+    // 哨兵传输协议（详见上方大段注释）。开关关掉时，下面一行之后的代码与改动前逐字一致。
     if (xportActive(config)) {
-        const r = await translateViaSentinel(text, srcLang, tgtLang, config, signal);
-        // 每一行**剥离之前**的那份原文，逐行挂回去（见 xportAttachRawSrc）。
-        xportAttachRawSrc(r && r.translations, pristine, text);
-        return r;
+        try {
+            const r = await translateViaSentinel(text, srcLang, tgtLang, config, signal);
+            // 每一行**剥离之前**的那份原文，逐行挂回去（见 xportAttachRawSrc）。
+            xportAttachRawSrc(r && r.translations, pristine, text);
+            return r;
+        } catch (err) {
+            if (err && err.name === 'AbortError') throw err;
+            // v2 Pass P174：local/gemini/qwen 是已经用了近一年、有专属回归套件的哨兵链路——
+            // 保持它们原有的"哨兵异常就直接上抛"行为不变，不在这里额外兜底（兜底了反而会让
+            // 已知的哨兵失败信息被 legacy 的另一种失败信息覆盖，破坏既有回归断言）。
+            if (config.provider !== 'claude' && config.provider !== 'openai') throw err;
+            // claude/openai 是这次新接入哨兵协议的两家，先例（xportActive 上方注释）就是
+            // 因为"代码写了但没测"被否——这次做了真实端到端测试，但仍然不能让 Claude 这条
+            // 用户主力链路因为新接入的任何一个边角问题就彻底翻不动，必须有个看得见的退路。
+            console.warn('[P174] 哨兵协议对 provider=' + config.provider + ' 异常，回退到 legacy 协议：', err);
+            // 不 return——往下掉进下面的 legacy 协议（openai/claude 各自的 Path，逐字未改）。
+        }
     }
 
     const srcName = srcLang === 'zh' ? 'Chinese' : 'English';
@@ -18698,7 +18775,7 @@ function renderSettingsEditingExtraSections() {
                             </div>
                             <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">翻译传输协议</span>
                         </div>
-                        <p class="text-[10px] text-slate-400 mb-3">${escapeHtml('旧协议要求模型把原文和译文一起塞进 JSON 字符串里回来，而反斜杠在 JSON 里必须转义 —— 模型做不到一致，\\ref 会变成「回车+ef」、\\begin 会变成「退格+egin」，而且这些都是合法转义，界面上不报错。哨兵协议改成纯文本往返：公式/引用/交叉引用先换成 [[1]] 这样的占位符，回来逐个核对，占位符少一个就自动重试，实在不行那一行会标出来。核对范围仅限占位符：\\emph / \\textbf / \\caption 这类花括号里装的是正文、必须让模型看见的命令没有占位符保护，模型漏抄了也查不出来。只对「本地模型」和「Gemini」生效，OpenAI / Claude 不受影响。')}</p>
+                        <p class="text-[10px] text-slate-400 mb-3">${escapeHtml('旧协议要求模型把原文和译文一起塞进 JSON 字符串里回来，而反斜杠在 JSON 里必须转义 —— 模型做不到一致，\\ref 会变成「回车+ef」、\\begin 会变成「退格+egin」，而且这些都是合法转义，界面上不报错。哨兵协议改成纯文本往返：公式/引用/交叉引用先换成 [[1]] 这样的占位符，回来逐个核对，占位符少一个就自动重试，实在不行那一行会标出来。核对范围仅限占位符：\\emph / \\textbf / \\caption 这类花括号里装的是正文、必须让模型看见的命令没有占位符保护，模型漏抄了也查不出来。对全部五家 provider（本地模型、Gemini、Qwen、OpenAI、Claude）都生效；OpenAI/Claude 这两家是后接入的，哨兵协议出问题时会自动回退旧协议，不会因此彻底翻不动。')}</p>
                         <label class="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all ${AppState.sentinelTransport ? 'bg-rose-50' : ''}" data-tip="${escapeAttr('关掉后逐字回到旧的 JSON 协议（也就是这次改动之前的行为）。只在怀疑新协议出问题时才需要关。')}" data-tip-pos="bottom-start">
                             <input type="checkbox" ${AppState.sentinelTransport ? 'checked' : ''} onchange="setSentinelTransport(this.checked)" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-rose-600 focus:ring-rose-500 shrink-0">
                             <span class="text-xs font-medium text-slate-700 leading-snug min-w-0 flex-1">
@@ -55102,7 +55179,7 @@ function ovlSettingsTranslatorHtml() {
     html += ovlSetRow('跨栏对应高亮', '<input type="checkbox" id="ovlCrossHighlightToggle"' + (AppState.crossHighlightEnabled ? ' checked' : '') + ' onchange="setCrossHighlightEnabled(this.checked)">',
         '在原文或译文里选中一段文字时，另一侧对应的内容自动跟着高亮，方便逐句核对。公式、引用、数字这类能在本地直接找到对应关系，不花钱；其余情况会多问模型一次。关掉可以省下这次额外调用，默认开启。');
     html += ovlSetRow('翻译传输协议（哨兵协议）', '<input type="checkbox" id="ovlSentinelToggle"' + (AppState.sentinelTransport ? ' checked' : '') + ' onchange="setSentinelTransport(this.checked)">',
-        '决定原文用什么形式发给模型。默认开启：公式、引用这些内容先换成占位符再传输，模型抄错的概率大幅降低，长文本也更快；关掉会退回旧的做法，把原文和译文都塞进一段文字里来回传。只影响本地模型和 Gemini，OpenAI / Claude 不受影响。');
+        '决定原文用什么形式发给模型。默认开启：公式、引用这些内容先换成占位符再传输，模型抄错的概率大幅降低，长文本也更快；关掉会退回旧的做法，把原文和译文都塞进一段文字里来回传。对全部五家 provider 都生效；OpenAI/Claude 出问题时会自动回退旧协议。');
     (function () {
         const curMode = normalizeSynonymMode(AppState.synonymDefaultMode);
         const modeBtns = SYNONYM_MODES.map(function (m) {
