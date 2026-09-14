@@ -2216,6 +2216,22 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    文字颜色不跟着变，只关掉背景色这一项。 */
 #ovlVisualPane::selection, #ovlVisualPane *::selection { background: transparent; color: inherit; }
 #ovlVisualPane::-moz-selection, #ovlVisualPane *::-moz-selection { background: transparent; color: inherit; }
+/* v2 Pass P178（必做1，真因已用截图实测核实——不是推测）：上面两条"关掉原生高亮"规则的
+   作用域是 #ovlVisualPane 的全部后代，而就地编辑器的 <textarea class="ovl-inline-src"> 是
+   ovlInlineSrcEditOpenForBlocks/ovlInlineZhEditOpenForBlocks 把 wrap 直接插回原块所在的
+   #ovlVisualPane 子树里（没有另起 portal），也落在这两条规则的选择范围内——但 <textarea> 这
+   类表单控件没有 Pass Sel-Outline 那层自绘描边叠加层（.ovl-sel-box 只画给只读渲染内容用），
+   于是编辑框里的原生选区背景被 transparent 吃掉、文字颜色 color:inherit 又跟未选中文字完全
+   一样，选中的一段字肉眼看不出任何差别（截图实测：programmatic setSelectionRange(0,11) 后
+   textarea 画面里连一点高亮痕迹都没有）——这就是用户反馈"编辑框里的文字无法选中"的真因：
+   浏览器的选区状态其实立起来了（ta.selectionStart/End 正常变化，Ctrl+C/输入替换/Delete 整段
+   删这些原生行为都不受影响），只是完全不可见，导致用户以为选不中、只能用方向键一个字一个字挪。
+   这里必须保留 #ovlVisualPane 这个 ID 前缀再叠加 .ovl-inline-src 类选择器——CSS 特异度里 ID
+   永远压类选择器一头，光写 .ovl-inline-src::selection（不带 ID）specificity 是 (0,1,1)，仍然
+   打不过上面 (1,0,1) 的 #ovlVisualPane *::selection，实测踩过这个坑（改之后截图仍然什么都没
+   显示，加回 ID 前缀才生效）。只影响 .ovl-inline-src 这一个元素，不碰只读渲染内容那条规则本身。 */
+#ovlVisualPane .ovl-inline-src::selection { background: #b4d7ff; color: #0f172a; }
+#ovlVisualPane .ovl-inline-src::-moz-selection { background: #b4d7ff; color: #0f172a; }
 /* 叠加层本身：top/left:0 对齐 #ovlVisualPane 的 padding box 原点，自身不设宽高（out-of-flow
    的 .ovl-sel-box 子节点不会撑开它，父节点保持 0x0 也不影响子节点照样能画到任何位置——
    overflow 默认 visible，不裁切）。挂在滚动内容内部，容器一起滚它就跟着走，不用监听 scroll
@@ -4909,7 +4925,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.36.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.37.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -39339,11 +39355,11 @@ function ovlBilingualBindScrollSync() {
 //      选区操作面板，双语对照场景的编辑需求只是"点哪段改哪段"，接完整工具条会让镜像栏
 //      多出一堆在这个场景下没意义的按钮（比如"在 PDF 中定位"对镜像栏也成立但不是本次
 //      任务范围，克制不做，避免范围蔓延）。
-//   3. 双击选词的坑跟左侧一样存在（第一次 mouseup 也是 collapsed 选区），沿用同一个
-//      OVL_VISUAL_CLICK_EDIT_DELAY_MS 延迟 + OvlVisualClickEditPending 判断——两侧共用
-//      同一个模块级 pending 状态即可，同一时刻用户只可能在其中一侧产生手势，不会撞车。
+//   3. v2 Pass P178（必做2）起：单击不再触发编辑（连定时器都不排，见下面 onMouseup），
+//      双击才触发——跟左侧 visualPane 的 dblclick 监听器同一套判断结构（编辑框内部 return
+//      给原生选词，编辑框外部用双击原生展开的词当 caretAnchorText）。
 let OvlBilingualMirrorClickBound = null;
-function ovlBilingualMirrorBlockEditOpenAtPoint(clientX, clientY) {
+function ovlBilingualMirrorBlockEditOpenAtPoint(clientX, clientY, caretAnchorText) {
     // 三条闸门跟 ovlInlineSrcEditOpen/ovlVisualBlockEditOpenAtPoint 头部完全一致，直接照抄。
     if (OvlInlineSrcEdit) {
         try { showToast('已经有一处在就地编辑，请先保存（Ctrl+Enter）或取消（Esc）。', 'warning'); } catch (e) {}
@@ -39369,7 +39385,7 @@ function ovlBilingualMirrorBlockEditOpenAtPoint(clientX, clientY) {
     const blockEl = hitEl.closest('.ovl-visual-block[data-src-line]');
     if (!blockEl) return;
     // 镜像面板固定是 Original——直接走源码编辑内核，没有 zh 分流。
-    ovlInlineSrcEditOpenForBlocks([blockEl]);
+    ovlInlineSrcEditOpenForBlocks([blockEl], { caretAnchorText: caretAnchorText });
 }
 function ovlBilingualBindMirrorClick() {
     // 跟 ovlBilingualBindScrollSync 同一条纪律：先解绑旧的，再按条件重绑，避免重复
@@ -39385,34 +39401,23 @@ function ovlBilingualBindMirrorClick() {
     try {
         const pane = document.getElementById('ovlVisualPaneMirror');
         if (!pane) return;
-        const onMouseup = function (e) {
+        // v2 Pass P178（必做2）：单击不再打开编辑器（镜像面板本来就没有工具条，单击在这里
+        // 原来就是纯空手势，现在真的什么都不做，连计时器都不用排）——彻底移除 P159/P169 那套
+        // "无拖动单击排延迟定时器、被双击取消"的机制，理由见左侧 ovlBindQuickActions 同一处
+        // 注释：改成双击专属触发，不再需要用定时器去猜"这是单击还是双击的第一下"。
+        const onMouseup = function () {};
+        // 双击：目标落在当前正打开的编辑器内部（正在编辑同一个块）——什么都不做，交给
+        // <textarea> 的原生双击选词，不能再调用下面的 open 函数（会撞见"已经有一处在就地编辑"
+        // 的 toast，把用户正在做的选词动作打断）。目标在编辑器外部——用原生双击已经展开好的
+        // 那个词当 caretAnchorText，透传给 ovlBilingualMirrorBlockEditOpenAtPoint，让光标精确
+        // 落在双击命中的词上（不是退化成"编辑框末尾"）。
+        const onDblclick = function (e) {
             try {
+                if (e.target && e.target.closest && e.target.closest('.ovl-inline-src-wrap')) return;
                 const sel = ovlWinOf(pane).getSelection();
-                if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
-                    // 无拖动的单击——同左侧 P159 §2.2 的双击防抖延迟逻辑，逐字节照搬判断结构。
-                    if (e.detail && e.detail > 1) return;
-                    if (OvlVisualClickEditPending) { clearTimeout(OvlVisualClickEditPending.timer); OvlVisualClickEditPending = null; }
-                    const pendClientX = e.clientX, pendClientY = e.clientY;
-                    const timer = setTimeout(function () {
-                        OvlVisualClickEditPending = null;
-                        try {
-                            const sel2 = ovlWinOf(pane).getSelection();
-                            if (sel2 && sel2.rangeCount > 0 && !sel2.isCollapsed) return;
-                        } catch (eSel) {}
-                        ovlBilingualMirrorBlockEditOpenAtPoint(pendClientX, pendClientY);
-                    }, OVL_VISUAL_CLICK_EDIT_DELAY_MS);
-                    OvlVisualClickEditPending = { timer: timer };
-                }
-                // 非 collapsed 选区（拖选/双击选词展开的选区）——镜像面板没有六颗按钮工具条，
-                // 什么都不做，让用户正常复制文本；只需要在这里也取消掉待打开的编辑定时器。
-                else if (OvlVisualClickEditPending) {
-                    clearTimeout(OvlVisualClickEditPending.timer);
-                    OvlVisualClickEditPending = null;
-                }
+                const anchorText = (sel && !sel.isCollapsed) ? String(sel) : '';
+                ovlBilingualMirrorBlockEditOpenAtPoint(e.clientX, e.clientY, anchorText);
             } catch (err) {}
-        };
-        const onDblclick = function () {
-            if (OvlVisualClickEditPending) { clearTimeout(OvlVisualClickEditPending.timer); OvlVisualClickEditPending = null; }
         };
         pane.addEventListener('mouseup', onMouseup);
         pane.addEventListener('dblclick', onDblclick);
@@ -58752,9 +58757,10 @@ function ovlVisualBtrInFlightActive() {
 // 什么额外代码都不用做：那次赋值经过下面装好的实例访问器，自动触发 ovlLiveAnchorObserve()，
 // 单一 hunk 覆盖全文档，天然杀死所有相交的在途锚点。见交付报告"设计 3→设计 4 迁移"一节。
 // v2 Pass P159（独立验证阶段发现并修复的一个真实竞态，设计文档没有覆盖）：单击/双击消歧计时器
-// 状态——见 ovlBindQuickActions 内 visualPane 的 mouseup/dblclick 监听器头部大注释。
-let OvlVisualClickEditPending = null;
-const OVL_VISUAL_CLICK_EDIT_DELAY_MS = 260; // 略短于常见浏览器双击判定窗口（约 300-500ms）
+// 状态——原来在这里（OvlVisualClickEditPending / OVL_VISUAL_CLICK_EDIT_DELAY_MS），v2 Pass
+// P178（必做2）把"单击排延迟定时器、被双击取消"这套消歧机制整个拆掉（单击不再触发编辑，不需要
+// 猜"这是单击还是双击的第一下"），两个模块级状态量随之一起删除——见 ovlBindQuickActions 内
+// visualPane 的 mouseup/dblclick 监听器头部大注释。
 // v2 Pass P159-fix（FIX-1/FIX-2 共用定位锚，见 .claude/tmp/p159_fix.md）：给"编辑打开
 // 那一刻"拍一张位置身份快照——文件/项目身份（复用既有 ovlFileTextCacheKey 的
 // epoch|projectKey|relPath 范式，跟 OvlFileTextCache 同一套哲学，不新发明一套）+ 源文档里
@@ -58967,6 +58973,27 @@ function ovlInlineSrcOnKeydown(e) {
         if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); ovlInlineSrcSave(); return; }
         if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); ovlInlineSrcCancel(); }
     } catch (err) { console.error('[ovl] inlineSrcOnKeydown failed', err); }
+}
+
+// v2 Pass P178（必做3）：编辑框里装的是 LaTeX 源码，从 PDF/Word/网页粘过来的富文本如果带着
+// text/html 进来会污染源码——<textarea> 本身就没有"HTML 值"这个概念，浏览器默认粘贴行为本来
+// 就只会取纯文本，但这里不依赖这条隐含平台保证，显式接管、只认 clipboardData 的 text/plain、
+// 明确丢弃 text/html，理由跟硬约束同一条：不能让格式化内容悄悄混进论文源码。
+// execCommand('insertText')（跟 ovlInlineSrcSave 落回 #ovlCodeArea 用的是同一个 API，不新发明
+// 一套写入方式）天然带三条免费的好处：①替换当前选区而不是插在选区旁边——原生语义就是这样；
+// ②落在原生撤销栈上，粘贴后 Ctrl+Z 能撤销；③换行原样保留，不做"转空格"降级——多行粘贴改变
+// 这个块的总行数不是这里的风险点：ovlInlineSrcSave 保存时用 st.lineFrom/lineTo（编辑打开那一刻
+// 在 #ovlCodeArea 里定死的字符区间）做精确替换，跟粘贴进来的内容有几行无关，行数一变就整篇
+// 重渲染（见该函数 newLineCount !== oldLineCount 分支），不会把相邻块的字节带歪。
+function ovlInlineSrcOnPaste(e) {
+    try {
+        if (!e.clipboardData) return; // 没有 clipboardData（理论上不会发生）——退回浏览器默认粘贴行为，对 <textarea> 仍然是纯文本安全的
+        e.preventDefault();
+        const text = e.clipboardData.getData('text/plain');
+        document.execCommand('insertText', false, text);
+    } catch (err) {
+        console.error('[ovl] inlineSrcOnPaste failed', err);
+    }
 }
 
 // 失焦即保存（§3 明文要求）。closing 是防重入闸门：save/cancel 一开始就把它摆成 true，
@@ -60170,12 +60197,14 @@ function ovlInlineSrcEditOpenForBlocks(touchedBlocks, opts) {
         ta.addEventListener('input', ovlInlineSrcOnInput);
         ta.addEventListener('keydown', ovlInlineSrcOnKeydown);
         ta.addEventListener('blur', ovlInlineSrcOnBlur);
+        ta.addEventListener('paste', ovlInlineSrcOnPaste);
 
         ovlInlineSrcAutoGrow(ta);
         ta.focus();
         // 尽量把光标落在用户原来选中的那段附近——找不到（渲染文字跟源码原文不是逐字节
-        // 对应，比如公式/引用命令）就退到编辑框末尾，不是硬性要求，纯体验加分项。单击进入
-        // （没有 caretAnchorText）直接落在末尾。
+        // 对应，比如公式/引用命令）就退到编辑框末尾，不是硬性要求，纯体验加分项。P178 起
+        // 双击进编辑（caretAnchorText = 双击原生选出来的那个词）也走这同一条路径，落点变成
+        // 双击命中的那个词而不再是"编辑框末尾"。
         const rawSelText = opts && opts.caretAnchorText;
         try {
             const idx = rawSelText ? text.indexOf(rawSelText) : -1;
@@ -60273,7 +60302,7 @@ function ovlInlineZhEditOpen() {
 //      不是自动弹回原来那个 textarea（那个已经被立刻收尾拆掉了，见
 //      ovlInlineZhSaveAsyncSingleBlock），而是保证用户重新点开时看到的是他刚打的那版中文，
 //      不是缓存里那份过时的旧译文。
-function ovlInlineZhEditOpenForBlocks(touchedBlocks) {
+function ovlInlineZhEditOpenForBlocks(touchedBlocks, opts) {
     try {
         const touched = touchedBlocks;
         if (!touched || !touched.length) return;
@@ -60352,10 +60381,20 @@ function ovlInlineZhEditOpenForBlocks(touchedBlocks) {
         ta.addEventListener('input', ovlInlineSrcOnInput);
         ta.addEventListener('keydown', ovlInlineSrcOnKeydown);
         ta.addEventListener('blur', ovlInlineSrcOnBlur);
+        ta.addEventListener('paste', ovlInlineSrcOnPaste);
 
         ovlInlineSrcAutoGrow(ta);
         ta.focus();
-        ta.setSelectionRange(zhText.length, zhText.length);
+        // v2 Pass P178（必做2）：双击进编辑要求"光标落在双击点"——跟下面 ovlInlineSrcEditOpenForBlocks
+        // 的同名字段逐字节同一套算法，caretAnchorText 是双击那一刻原生选出来的那个词（褪码前的
+        // 中文译文渲染文字，跟这里的 zhText 是同一份文字，能直接 indexOf 命中）；没传（比如旧的
+        // 选中片段->工具条->编辑按钮路径）就退回原来的"落在末尾"。
+        const zhAnchorText = opts && opts.caretAnchorText;
+        try {
+            const zIdx = zhAnchorText ? zhText.indexOf(zhAnchorText) : -1;
+            if (zIdx !== -1) ta.setSelectionRange(zIdx, zIdx + zhAnchorText.length);
+            else ta.setSelectionRange(zhText.length, zhText.length);
+        } catch (e) { ta.setSelectionRange(zhText.length, zhText.length); }
 
         if (typeof ovlHideQuickActions === 'function') ovlHideQuickActions();
     } catch (e) {
@@ -60371,7 +60410,7 @@ function ovlInlineZhEditOpenForBlocks(touchedBlocks) {
 // 对 collapsed 选区（无拖动的单击）本来什么都不做，这里给这个"空手势"赋予行为，不抢占任何
 // 现有手势（拖选/双击选词天然产生非 collapsed 选区，走既有分支；点击行号栏在 #ovlGutter
 // 这个完全不同的 DOM 子树，两套监听器互不相交）。
-function ovlVisualBlockEditOpenAtPoint(clientX, clientY) {
+function ovlVisualBlockEditOpenAtPoint(clientX, clientY, caretAnchorText) {
     // v2 Pass P160：原本这里同上两个函数头部——双语对照模式左侧只读，这条新入口也堵过。
     // v2 Pass P169（R1）：去掉这道闸，理由同 ovlInlineSrcEditOpen 头部新注释。
     // 三条闸门跟 ovlInlineSrcEditOpen/ovlInlineZhEditOpen 头部完全一致，直接照抄。
@@ -60420,10 +60459,14 @@ function ovlVisualBlockEditOpenAtPoint(clientX, clientY) {
     // （hitEl.closest('.ovl-compare-zh')）分流；其余两种既有单语言模式下这两个 class 根本
     // 不存在于 DOM 里，closest 恒返回 null，判据逐字节保持改动前的行为。
     const hitZh = (OvlVisualLangState.lang === 'compare') && !!hitEl.closest('.ovl-compare-zh');
+    // v2 Pass P178（必做2）：caretAnchorText 透传给两条编辑内核——双击进编辑时由调用方（
+    // ovlBindQuickActions 的 dblclick 监听器）传入"双击那一刻原生选出来的那个词"，落点因此变成
+    // 双击命中的位置；不传（旧的单块跳转路径，目前没有别的调用方在用）就退回各自内核原有的
+    // "落在编辑框末尾"默认值，不改变旧行为。
     if (OvlState.editorMode === 'visual' && (OvlVisualLangState.lang === 'zh' || hitZh)) {
-        ovlInlineZhEditOpenForBlocks([blockEl]);
+        ovlInlineZhEditOpenForBlocks([blockEl], { caretAnchorText: caretAnchorText });
     } else {
-        ovlInlineSrcEditOpenForBlocks([blockEl]);
+        ovlInlineSrcEditOpenForBlocks([blockEl], { caretAnchorText: caretAnchorText });
     }
 }
 
@@ -60532,52 +60575,42 @@ function ovlBindQuickActions() {
             try {
                 const sel = ovlWinOf(visualPane).getSelection();
                 if (!sel || sel.rangeCount === 0 || sel.isCollapsed) {
+                    // v2 Pass P178（必做2，用户原话："改为两下连击进入编辑模式更好，因为1下有
+                    // 时候会和翻译或者选词翻译或者其他弹窗操作冲突"）：单击（collapsed 选区）不
+                    // 再排"260ms 后打开编辑器"的定时器——P159 那版定时器到点就无条件把目标块换
+                    // 成 <textarea>，哪怕用户这一下单击其实是在跟别的弹窗/功能交互，260ms 后编辑
+                    // 器仍会突然冒出来把那个交互打断，这正是用户反馈的冲突根源。这里退回 P159 之
+                    // 前的基线：单击在 Visual 面板里只关掉工具条，不做别的、不留尾巴，不影响单击
+                    // 触发的其它既有功能（选词翻译/弹窗等）。真正的"进入编辑"手势见下面新增的
+                    // dblclick 监听器。
                     ovlHideQuickActions();
-                    // v2 Pass P159（§2.2）：无拖动的单击（collapsed 选区）——现状这里本来什么都
-                    // 不做，是一个纯粹空转的手势。阶段一新入口：命中哪个 .ovl-visual-block 就
-                    // 原地打开那个块的编辑器。
-                    //
-                    // 实测踩到的坑（本设计文档没有覆盖，独立验证阶段发现）：双击选词的【第一次】
-                    // 点击，在它自己的 mouseup 触发的这一刻，选区同样是 collapsed（浏览器要到
-                    // 第二次 mousedown 才会把选区展开成整个单词）——如果在这里立刻同步打开编辑器，
-                    // 会把目标块换成 <textarea>，导致双击的第二次点击落空、"双击选词"这个手势被
-                    // 从中打断。跟真正的编辑器（Word/Overleaf 等）同一套标准解法：单击先不立刻
-                    // 生效，延迟一小段（略短于浏览器双击判定窗口）等一等——这段时间内如果确实
-                    // 收到了 dblclick（说明这是一次双击的第一下），就取消这次"打开编辑器"，交给
-                    // 双击的原生选词语义；没等到 dblclick 才是真正的单击，到时候再打开。
-                    if (e.detail && e.detail > 1) return; // 双击/三连击的后续 mouseup——不是新单击，交给 dblclick 监听器判断要不要取消已排的定时器
-                    if (OvlVisualClickEditPending) { clearTimeout(OvlVisualClickEditPending.timer); OvlVisualClickEditPending = null; }
-                    const pendClientX = e.clientX, pendClientY = e.clientY;
-                    const timer = setTimeout(function () {
-                        OvlVisualClickEditPending = null;
-                        // 防御性复核：延迟窗口这段时间里，选区完全有可能被别的手势（比如"单击落
-                        // caret + Shift 单击延伸"——两次都是真实单击，不触发 dblclick，下面
-                        // 非-collapsed 分支虽然也会取消这个定时器，但这里再核一遍不依赖那条路径
-                        // 一定先跑到）变成非 collapsed；这种情况下用户明显是在做选区，不是简单点击，
-                        // 不应该再打开编辑器。
-                        try {
-                            const sel2 = ovlWinOf(visualPane).getSelection();
-                            if (sel2 && sel2.rangeCount > 0 && !sel2.isCollapsed) return;
-                        } catch (eSel) {}
-                        if (typeof ovlVisualBlockEditOpenAtPoint === 'function') ovlVisualBlockEditOpenAtPoint(pendClientX, pendClientY);
-                    }, OVL_VISUAL_CLICK_EDIT_DELAY_MS);
-                    OvlVisualClickEditPending = { timer: timer };
                     return;
                 }
-                // 非 collapsed 选区——不管是拖选、双击选词，还是"单击落 caret + Shift 单击延伸"
-                // 这种由两次独立单击拼成、不会触发原生 dblclick 的选区展开手势，都说明用户是在
-                // 做选区而不是想打开编辑器：取消上一次单击可能排下的"延迟打开编辑器"定时器。
-                if (OvlVisualClickEditPending) { clearTimeout(OvlVisualClickEditPending.timer); OvlVisualClickEditPending = null; }
+                // 非 collapsed 选区——拖选，或"单击落 caret + Shift 单击延伸"——正常显示工具条，
+                // 逐字节不变。双击选词这一刻（第二次 mousedown 已经把选区展开成整个单词，早于
+                // mouseup(detail===2) 本身）也会先落进这个分支、工具条会短暂弹出，随后被下面新增
+                // 的 dblclick 监听器换成打开编辑器——跟旧行为（双击=选词+停在工具条）相比是一次
+                // 需求方明确要的语义变化（双击专职"进编辑"），不是遗漏。
                 const range = sel.getRangeAt(0);
                 if (!visualPane.contains(range.commonAncestorContainer)) { ovlHideQuickActions(); return; }
                 ovlShowQuickActionsAt(e.clientX, e.clientY, 'visual');
             } catch (err) { ovlHideQuickActions(); }
         });
-        // 双击选词命中这里——取消掉刚才那次单击排的"打开编辑器"定时器。选区本身在这一刻已经
-        // 被浏览器原生展开成整个单词（非 collapsed），后续 mouseup(detail>=2) 天然不会再触碰
-        // 上面那段逻辑，双击的既有效果（下面 mouseup 分支走 ovlShowQuickActionsAt）不受影响。
-        visualPane.addEventListener('dblclick', function () {
-            if (OvlVisualClickEditPending) { clearTimeout(OvlVisualClickEditPending.timer); OvlVisualClickEditPending = null; }
+        // v2 Pass P178（必做2）：双击进入就地编辑，取代 P159 时代的单击。
+        //   · 编辑框外（命中 .ovl-visual-block）：原生双击这一刻选区已经是双击选出来的那个词
+        //     （非 collapsed）——把这个词的文本当 caretAnchorText 透传给
+        //     ovlVisualBlockEditOpenAtPoint，光标精确落在双击点，不退化成"编辑框末尾"。
+        //   · 编辑框内（目标落在当前 .ovl-inline-src-wrap 内部，即正在编辑同一个块）：直接
+        //     return，什么都不做，原样交给 <textarea> 的原生双击选词——否则会撞上
+        //     ovlVisualBlockEditOpenAtPoint 头部"已经有一处在就地编辑"那道闸，弹一个多余的
+        //     toast 把用户正在做的选词动作打断，必做1刚修好的"编辑框内可以选词"又被间接抢走。
+        visualPane.addEventListener('dblclick', function (e) {
+            try {
+                if (e.target && e.target.closest && e.target.closest('.ovl-inline-src-wrap')) return;
+                const sel = ovlWinOf(visualPane).getSelection();
+                const anchorText = (sel && !sel.isCollapsed) ? String(sel) : '';
+                if (typeof ovlVisualBlockEditOpenAtPoint === 'function') ovlVisualBlockEditOpenAtPoint(e.clientX, e.clientY, anchorText);
+            } catch (err) {}
         });
         // Pass P31：滚动不再直接关掉工具条——选区随滚动移动时，重新算一次落点跟上去
         // （规格 §3：Visual 面板滚动是重新布局的触发点之一，rAF 合并见 ovlScheduleFloatRelayout）。
