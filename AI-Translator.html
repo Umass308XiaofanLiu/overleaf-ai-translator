@@ -2618,6 +2618,19 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    data URL）替换掉图标那一格，文件名说明文字保持不变——跟旧占位框视觉上是"同一个盒子
    升级"，不是另起一套样式。 */
 .ovl-visual-fig-thumb { max-width: 100%; max-height: 260px; object-fit: contain; border-radius: 2px; }
+/* v2 Pass P185（缺陷修复：note 徽标内嵌图片时框体视觉裂开）：ovlRenderFigurePlaceholder
+   inline=true 时用 <span> 三层代替 <div> 三层（避开 HTML5 解析期"块级元素关闭祖先 <p>、
+   连带截断徽标 <span>"问题，见该函数头部注释）；这条规则把默认继承来的
+   .ovl-visual-fig-box 大块 flex-column 占位框样式（220px 起跳、90px 最小高度）覆盖成
+   贴合"嵌在一小段批注文字里"的小号 inline-flex 行内徽标——选择器比基础类更具体
+   （.ovl-visual-fig-box.ovl-visual-fig-box-inline），不依赖源码顺序也能稳定覆盖。 */
+.ovl-visual-fig-box.ovl-visual-fig-box-inline {
+    display: inline-flex; flex: 0 0 auto; flex-direction: row; align-items: center;
+    min-height: 0; min-width: 0; width: auto; max-width: 100%;
+    padding: 1px 6px; margin: 0 2px; vertical-align: middle; gap: 4px;
+}
+.ovl-visual-fig-box-inline .ovl-visual-fig-icon { font-size: 14px; opacity: 0.6; }
+.ovl-visual-fig-box-inline .ovl-visual-fig-name { margin-top: 0; font-size: 11px; }
 /* v2 Pass P172：\todo / \marginpar 同属 MACRO_TABLE 的 DELETE 名单，跟裸 \includegraphics
    是同一类"作者本人写的可见内容被无声吃掉"缺陷，但内容本身是纯文本批注，没理由不直接
    显示——用醒目的行内徽标（todo 黄底、marginpar 灰底，跟 LaTeX 编译效果的"显眼批注"直觉
@@ -4925,7 +4938,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.38.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.38.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -33925,6 +33938,11 @@ function ovlProtectNoteMacrosForFilter(tex) {
 // 更不能静默消失——跟顶层裸图片用同一条 OVL_VISUAL_BARE_IMG_RE + ovlRenderFigurePlaceholder，
 // 只是这里 content 已经是纯文本（不需要再过 LatexFilter），不需要 token 往返，直接一次
 // 线性扫描切段落：图片段落渲染占位框 HTML，非图片段落照常 escapeHtml 转义。
+// v2 Pass P185：这里是唯一一处在"最终会被塞进行内 <span> 徽标内部"的语境下调用
+// ovlRenderFigurePlaceholder 的地方，第三形参传 true——占位框改用 <span> 三层，避开
+// P185 诊断实测到的 HTML5 解析期"块级元素触发关闭祖先 <p>、连带截断徽标 <span>"问题（见
+// ovlRenderFigurePlaceholder 头部注释与 .claude/tmp/p185_diagnosis.md）。其余全部调用点
+// （figure/minipage/table/algorithm caption 等顶层图片）不传第三参，行为不变。
 function ovlRenderNoteContentHtml(content) {
     OVL_VISUAL_BARE_IMG_RE.lastIndex = 0;
     let html = '';
@@ -33932,7 +33950,7 @@ function ovlRenderNoteContentHtml(content) {
     let m;
     while ((m = OVL_VISUAL_BARE_IMG_RE.exec(content))) {
         html += escapeHtml(content.slice(last, m.index));
-        html += ovlRenderFigurePlaceholder(ovlExtractIncludegraphicsPath(m[0]), ovlExtractIncludegraphicsWidthFrac(m[0]));
+        html += ovlRenderFigurePlaceholder(ovlExtractIncludegraphicsPath(m[0]), ovlExtractIncludegraphicsWidthFrac(m[0]), true);
         last = OVL_VISUAL_BARE_IMG_RE.lastIndex;
     }
     html += escapeHtml(content.slice(last));
@@ -34575,14 +34593,33 @@ function ovlExtractIncludegraphicsWidthFrac(str) {
 // ovlVisualLoadFigureThumbnails 天然跳过它。widthFrac：上面解析出的 width= 系数，undefined/
 // null/非正数一律不带 data-fig-width 属性——ovlApplyFigureThumb 读不到这个属性时维持 P18
 // 原有的 CSS 固定尺寸展示，是本 Pass 显式要求的"无 width= 时维持现状"。
-function ovlRenderFigurePlaceholder(relPath, widthFrac) {
+// v2 Pass P185（缺陷修复：note 徽标内嵌图片时框体视觉裂开）：新增第三个可选形参 inline——
+// 未传/falsy 时（现状全部既有调用点：figure 环境、minipage 子图、表格/算法 caption 等）
+// 逐字节回到原来的 <div> 三层结构，零行为变化。真机 headless Chrome 实测揪出的根因（见
+// .claude/tmp/p185_diagnosis.md）：ovlRenderNoteContentHtml（下面）把本函数的返回值嵌进
+// note 徽标（ovlRenderNoteBadge 产出的 <span class="ovl-visual-note-badge">...）内部时，
+// marked.parse() 会把徽标所在的独立段落包一层 <p>，最终整段 HTML 字符串经
+// el.innerHTML = ... 真实解析——HTML5 树构造算法规则："<div>"（block 类元素）开始标签
+// 出现时，若栈里有处于 button scope 的 <p>，触发"close a p element"：该步骤持续弹栈直到
+// 弹出 <p> 为止，中途途经的 <span>（徽标）被一并强制弹出（没有匹配的 </span>，纯解析
+// 副作用）——结果是徽标 <span> 在真实 DOM 里被截断在图片开始处，图片被提升成徽标的
+// 兄弟节点（不再是子节点），截断点之后的文字变成脱离 span/p 包裹的游离文本节点、丢失
+// 徽标底色/边框（内容字节本身没丢，是纯样式包裹丢失）。inline=true 时改用 <span> 三层
+// （容器/图标/文件名，都不在 HTML5 的"遇到就关闭 <p>"名单里），彻底避开这条解析规则，
+// class 名不变（ovlApplyFigureThumb/ovlApplyFigureUnsupportedNote 靠 class 选择器找
+// 元素，不认 tagName，天然兼容）；额外挂一个 ovl-visual-fig-box-inline 修饰类，CSS 侧
+// 把默认的 flex-column 大块占位框样式覆盖成小号 inline-flex 行内徽标，视觉上贴合"嵌在
+// note 批注文字里的小图标"而不是大块 figure 占位框。
+function ovlRenderFigurePlaceholder(relPath, widthFrac, inline) {
     const basename = relPath ? (relPath.split(/[\\/]/).pop() || relPath) : null;
     const srcAttr = relPath ? (' data-fig-src="' + escapeHtml(relPath) + '"') : '';
     const widthAttr = (typeof widthFrac === 'number' && isFinite(widthFrac) && widthFrac > 0) ? (' data-fig-width="' + widthFrac + '"') : '';
-    return '<div class="ovl-visual-fig-box"' + srcAttr + widthAttr + '>'
-        + '<div class="ovl-visual-fig-icon">' + Icons.ImageIcon + '</div>'
-        + '<div class="ovl-visual-fig-name">' + (basename ? escapeHtml(basename) : '(no image)') + '</div>'
-        + '</div>';
+    const tag = inline ? 'span' : 'div';
+    const boxClass = inline ? 'ovl-visual-fig-box ovl-visual-fig-box-inline' : 'ovl-visual-fig-box';
+    return '<' + tag + ' class="' + boxClass + '"' + srcAttr + widthAttr + '>'
+        + '<' + tag + ' class="ovl-visual-fig-icon">' + Icons.ImageIcon + '</' + tag + '>'
+        + '<' + tag + ' class="ovl-visual-fig-name">' + (basename ? escapeHtml(basename) : '(no image)') + '</' + tag + '>'
+        + '</' + tag + '>';
 }
 function ovlRenderVisualFigure(tex) {
     tex = ovlStripLatexCommentsForRender(tex);
@@ -36024,13 +36061,21 @@ function ovlApplyFigureThumb(box, result) {
     // max-height:260px 固定尺寸展示——即"无 width= 时维持现状"，不是额外新增的判断分支。
     const p109Px = ovlP109FigureThumbTargetPx(box);
     if (p109Px !== null) {
+        // v2 Pass P185：note 徽标内嵌的占位框（ovl-visual-fig-box-inline，见
+        // ovlRenderFigurePlaceholder 头部注释）活在 <span> 徽标里面，真缩略图异步落地这一刻
+        // 若沿用下面 'block' 会重新在 DOM 已解析完成后、靠 JS 强行把一个块级盒子塞进行内
+        // 祖先链——不会重现解析期截断（那只发生在 HTML 字符串被解析的那一刻），但会触发 CSS
+        // 的 block-in-inline 视觉分裂（跟本 Pass 要修的症状是同一大类），所以这里按
+        // inline 变体改用 inline-block，维持整条链路行内流动。
+        const isInlineFig = box.classList.contains('ovl-visual-fig-box-inline');
         box.style.padding = '0';
         box.style.border = 'none';
         box.style.background = 'transparent';
         box.style.minHeight = '0';
         box.style.flex = '0 0 auto';
-        box.style.display = 'block';
-        img.style.display = 'block';
+        box.style.display = isInlineFig ? 'inline-block' : 'block';
+        img.style.display = isInlineFig ? 'inline-block' : 'block';
+        if (isInlineFig) img.style.verticalAlign = 'middle';
         img.style.width = p109Px + 'px';
         img.style.maxWidth = '100%';
         img.style.height = 'auto';
@@ -36067,7 +36112,9 @@ function ovlApplyFigureUnsupportedNote(box) {
     if (box.querySelector('.ovl-visual-fig-thumb') || box.querySelector('.ovl-visual-fig-unsupported-note')) return;
     const icon = box.querySelector('.ovl-visual-fig-icon');
     if (!icon) return;
-    const note = document.createElement('div');
+    // v2 Pass P185：同上——note 徽标内嵌的 inline 变体用 <span> 而不是 <div>，避免异步换上这段
+    // 提示文字时又把一个块级元素插回行内祖先链。
+    const note = document.createElement(box.classList.contains('ovl-visual-fig-box-inline') ? 'span' : 'div');
     note.className = 'ovl-visual-fig-unsupported-note';
     note.textContent = 'EPS 无法在 Visual 中预览，编译后可见';
     icon.replaceWith(note);
