@@ -3807,6 +3807,17 @@ const server = http.createServer(async (req, res) => {
             if (!token || typeof token !== 'string') { sendJson(res, 400, { ok: false, error: '缺少 Overleaf token' }); return; }
             const parentDir = (typeof body.parentDir === 'string' && body.parentDir) ? body.parentDir : null;
             const folderName = (typeof body.folderName === 'string' && body.folderName) ? body.folderName : null;
+            // v2 Pass P182：parentDir 是调用方显式指定的绝对路径（"存放位置"），在真正 mkdir+git
+            // clone 落盘之前必须先过跟 projectDir 完全同一套 LATEX_BRIDGE_ALLOWED_ROOTS 白名单
+            // 校验——修复前这里完全没有这道闸，parentDir 能把写入引到白名单之外的任意路径。不传
+            // parentDir（走服务端自己算的默认位置）不受影响，那不是调用方可控的路径。非绝对路径
+            // 也不在这里拦：那种情况 computeOverleafCloneTargetDir 自己会在任何文件系统访问之前
+            // 先用 isAbsolute 拒绝，不会碰到白名单判断，两层校验不重叠也没有缺口。空白名单（未
+            // 设置 LATEX_BRIDGE_ALLOWED_ROOTS）时 checkProjectDirAllowed 恒放行——跟 projectDir
+            // 用的是同一个函数、同一条既定策略（P154 定的硬要求），不是本 Pass 新引的例外：
+            // test_p53_clone_location.js / test_p133_bridge_serve.js 都有既有、当前通过的用例在
+            // 未设置白名单时依赖自定义 parentDir 正常工作，见 test_p182_bridge_path_guard.js 头注。
+            if (parentDir && path.isAbsolute(parentDir) && rejectIfProjectDirNotAllowed(res, parentDir)) return;
             const result = await doOverleafClone(projectId, token, parentDir, folderName);
             sendJson(res, 200, result);
             return;
@@ -3827,6 +3838,14 @@ const server = http.createServer(async (req, res) => {
                 sendJson(res, 400, { ok: false, error: 'invalid JSON body' });
                 return;
             }
+            // v2 Pass P182：跟 /overleaf/clone 同一道闸——parentDir 是调用方指定的绝对路径，这个
+            // 端点虽然全程只读探测、不落盘，但同样会真碰文件系统（fs.statSync/accessSync/
+            // readdirSync），泄露"这个路径存不存在/能不能写/里面是否已经有东西"这类信息，修复前
+            // 完全没有白名单校验，等于把白名单之外的任意路径变成一个可探测的信息泄露点。非绝对
+            // 路径不在这里拦——doOverleafCheckTarget 自己的 isAbsolute 检查会在任何 fs 访问之前
+            // 先返回 parentStatus:'not-absolute'，两层校验不重叠。
+            if (typeof body.parentDir === 'string' && body.parentDir && path.isAbsolute(body.parentDir)
+                && rejectIfProjectDirNotAllowed(res, body.parentDir)) return;
             const result = await doOverleafCheckTarget(body.parentDir, body.folderName);
             sendJson(res, 200, result);
             return;
