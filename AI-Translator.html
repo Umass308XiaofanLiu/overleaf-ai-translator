@@ -4925,7 +4925,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.38.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.38.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -35347,7 +35347,12 @@ function ovlXrefApproxScan(srcRaw) {
     // 顺序语义对齐；计数/格式化改走 ovlEqNumFormatDisplay/ovlEqNumSyncSection 共用函数
     // （§4F 局限 1-5 照旧保留，未新增）。----
     try {
-        const withinInfo = ovlEqNumDetectNumberWithin(srcRaw);
+        // v2 Pass P184（缺陷修复）：扫描对象从 srcRaw（原始，未剥注释）换成本函数顶部已经算好
+        // 的 cleaned——否则注释掉的 \numberwithin{equation}{section} 依然会让这里的近似档
+        // （未编译时显示给用户的公式编号）带上节号前缀，跟 ovlXrefBuild 顶层同款检测点
+        // （L35491 附近）是同一个 bug 的两个独立调用点，必须分别改；直接复用已算好的 cleaned，
+        // 不新增一次全文 stripping。
+        const withinInfo = ovlEqNumDetectNumberWithin(cleaned);
         const counterState = { n: 0, withinSection: withinInfo.withinSection, withinNoReset: withinInfo.noReset, sectionNum: 0, sectionIsAppendix: false };
         let secPtr = 0;
         const secAt = function (offset) {
@@ -35461,20 +35466,23 @@ function ovlXrefBuild(src) {
         OvlXrefState.auxDataRef = auxRefNow;
         OvlXrefState.ready = true;
 
-        // natbib 选项探测——跟 aux 新鲜度无关，只影响"该显示数字还是作者-年份"这个判定
-        // （§4B 第3点），扫描对象是当前整篇文本（含导言区），不是只读正文。
-        // v2 Pass P181（缺陷修复）：扫描前先剥 % 注释，用跟本函数往下 12 行 ovlXrefApproxScan
-        // 同一个既有函数（ovlStripLatexCommentsForRender，P61 引入，正确处理 \% 转义/
-        // verbatim 环境/\url 等逐字宏），不然整行被注释掉的 \usepackage[numbers]{natbib}
-        // 依然会被这两条正则在原文里命中，natbibFound/natbibNumeric 被错误置 true——不是
-        // tooltip 级别的小瑕疵：natbibNumeric 误判会直接让 authoryear 档 cite 显示成错误的
-        // 数字档 "[1]"。范围明确只覆盖 natbib 这两条，biblatexDetected/\numberwithin/leqno
-        // 检测（下面几行）不在本次修复范围内，其中 numberwithin/leqno 的同款局限已在 P177
-        // 注释里明确记录为"已知、未修"，不顺手扩大改动面。
-        const natbibScanSrc = (typeof ovlStripLatexCommentsForRender === 'function')
+        // 导言区文档级特性探测（natbib/biblatex/numberwithin/leqno）——跟 aux 新鲜度无关，
+        // 扫描对象都是当前整篇文本（含导言区），不是只读正文。
+        // v2 Pass P181（缺陷修复）：natbib 探测扫描前先剥 % 注释，用 ovlStripLatexCommentsForRender
+        // （P61 引入，正确处理 \% 转义/verbatim 环境/\url 等逐字宏），不然整行被注释掉的
+        // \usepackage[numbers]{natbib} 依然会被正则在原文里命中，natbibFound/natbibNumeric 被
+        // 错误置 true——不是 tooltip 级别的小瑕疵：natbibNumeric 误判会直接让 authoryear 档 cite
+        // 显示成错误的数字档 "[1]"。
+        // v2 Pass P184（缺陷修复，扩大范围）：P181 当时只改了 natbib 这两条，biblatexDetected/
+        // \numberwithin/leqno 三处仍在扫原始 src，P177 注释里承认是"已知、未修"的同源粗糙点——
+        // 真实后果：\numberwithin{equation}{section} 被注释掉后 Visual 公式编号仍按被注释掉的
+        // 规则显示（错误编号，不是 tooltip 级小瑕疵）；biblatexDetected 误判会让本该走真实 aux
+        // 编号的 cite 被错误降级成近似/查不到。四处统一复用同一份剥注释结果（一次 stripping，
+        // 零额外全文扫描开销），下面 ovlXrefApproxScan 内部同款调用点另行处理（见该函数内注释）。
+        const preambleScanSrc = (typeof ovlStripLatexCommentsForRender === 'function')
             ? ovlStripLatexCommentsForRender(src) : src;
-        const natbibM = /\\usepackage\s*\[([^\]]*)\]\s*\{\s*natbib\s*\}/.exec(natbibScanSrc);
-        const natbibBare = /\\usepackage\s*\{\s*natbib\s*\}/.test(natbibScanSrc);
+        const natbibM = /\\usepackage\s*\[([^\]]*)\]\s*\{\s*natbib\s*\}/.exec(preambleScanSrc);
+        const natbibBare = /\\usepackage\s*\{\s*natbib\s*\}/.test(preambleScanSrc);
         OvlXrefState.natbibFound = !!(natbibM || natbibBare);
         OvlXrefState.natbibNumeric = false;
         if (natbibM) {
@@ -35483,17 +35491,20 @@ function ovlXrefBuild(src) {
         }
         // biblatex：明确不支持，未实测验证（§4B 第5点，如实标注"未确认"）。检测到就让 cite
         // 查找直接跳过 aux 分支，全部走近似/查不到——套错 natbib 规则比不套更危险。
-        OvlXrefState.biblatexDetected = /\\usepackage(?:\[[^\]]*\])?\{\s*biblatex\s*\}/.test(src);
+        // v2 Pass P184：扫描对象换成 preambleScanSrc（同上，剥过注释），不然被注释掉的
+        // \usepackage{biblatex} 仍会命中，把本该走真实编号的 cite 错误降级。
+        OvlXrefState.biblatexDetected = /\\usepackage(?:\[[^\]]*\])?\{\s*biblatex\s*\}/.test(preambleScanSrc);
 
-        // v2 Pass P177：\numberwithin{equation}{section|chapter} 探测——跟 natbib 同款扫描口径
-        // （对象是整篇 src，不剥注释；已知的、跟 natbib 检测同源的粗糙点：被注释掉的
-        // \numberwithin 也会被误判成生效，未修，见报告"已知局限"）。
-        const withinInfo = ovlEqNumDetectNumberWithin(src);
+        // v2 Pass P177：\numberwithin{equation}{section|chapter} 探测。
+        // v2 Pass P184：扫描对象换成 preambleScanSrc（剥过注释），修复"注释掉的 \numberwithin
+        // 仍被判定生效"（见本函数顶部大注释——真实后果是 Visual 公式编号显示错误）。
+        const withinInfo = ovlEqNumDetectNumberWithin(preambleScanSrc);
         OvlXrefState.withinSection = withinInfo.withinSection;
         OvlXrefState.withinChapter = withinInfo.withinChapter;
         OvlXrefState.withinNoReset = withinInfo.noReset;
-        // v2 Pass P177（尽力项5）：leqno 同款粗糙扫描口径——跟上面 numberwithin 一样不剥注释。
-        OvlXrefState.leqno = ovlXrefDetectLeqno(src);
+        // v2 Pass P177（尽力项5）：leqno 探测。
+        // v2 Pass P184：扫描对象换成 preambleScanSrc（剥过注释），跟上面 numberwithin 同款修法。
+        OvlXrefState.leqno = ovlXrefDetectLeqno(preambleScanSrc);
 
         // 近似兜底：全文档一次预扫描（§6.2：跟 LatexFilter 全文转换、P116 按块扫描同一数量级）。
         const approx = ovlXrefApproxScan(src);
