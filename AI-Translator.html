@@ -4938,7 +4938,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.38.03';        // APP_VERSION_STAMP
+const APP_VERSION = '03.38.04';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -33869,13 +33869,24 @@ function ovlProtectBareIncludegraphicsForFilter(tex) {
     });
     return { text: text, tokens: tokens };
 }
+// v2 Pass P189（缺陷修复，与 P185 同根同族）：这里的 token 替换点位于 renderFormattedText/
+// marked.parse() 产出的 HTML 字符串内部——本函数唯一调用点 ovlVisualRenderChunk 只有在
+// ovlVisualRenderBareIncludegraphics 先判定"整块并非纯图片"（夹了真实散文）之后才会走到
+// 这里，意味着 marker 几乎总是落在 marked.parse() 生成的 <p>...</p> 段落内部。若仍用默认
+// <div> 三层（inline 参数缺省），字符串形如 "<p>BEFORE <div>...</div> AFTER</p>"，真实
+// el.innerHTML 解析时命中 HTML5 树构造"close a p element"规则：遇到块级 <div> 开始标签，
+// 当前处于 button scope 的 <p> 被强制弹出，图片占位框连同其后的 AFTER 文字一起被提升成
+// <p> 的兄弟节点（不再是子节点），AFTER 部分脱离 <p> 包裹丢失样式。实测复现见
+// tools/e2e/test_p189_bareimg_midparagraph.js。传 inline=true 复用 P185 已建立的机制，
+// 产出 <span> 三层，彻底规避这条解析规则（class 名不变，ovlApplyFigureThumb 等基于 class
+// 选择器的逻辑不受影响）。
 function ovlRestoreBareIncludegraphicsAfterRender(html, tokens) {
     let out = html;
     for (let idx = 0; idx < tokens.length; idx++) {
         const marker = OVL_FIG_TOKEN_MARK + idx + OVL_FIG_TOKEN_MARK;
         if (out.indexOf(marker) === -1) continue;   // token 在 LatexFilter 里被套进了别的结构（极端情况）——宁可漏图标不吞字，原样跳过
         const src = tokens[idx];
-        out = out.split(marker).join(ovlRenderFigurePlaceholder(ovlExtractIncludegraphicsPath(src), ovlExtractIncludegraphicsWidthFrac(src)));
+        out = out.split(marker).join(ovlRenderFigurePlaceholder(ovlExtractIncludegraphicsPath(src), ovlExtractIncludegraphicsWidthFrac(src), true));
     }
     return out;
 }
@@ -33938,11 +33949,14 @@ function ovlProtectNoteMacrosForFilter(tex) {
 // 更不能静默消失——跟顶层裸图片用同一条 OVL_VISUAL_BARE_IMG_RE + ovlRenderFigurePlaceholder，
 // 只是这里 content 已经是纯文本（不需要再过 LatexFilter），不需要 token 往返，直接一次
 // 线性扫描切段落：图片段落渲染占位框 HTML，非图片段落照常 escapeHtml 转义。
-// v2 Pass P185：这里是唯一一处在"最终会被塞进行内 <span> 徽标内部"的语境下调用
+// v2 Pass P185：这里是最先发现的一处在"最终会被塞进行内容器"的语境下调用
 // ovlRenderFigurePlaceholder 的地方，第三形参传 true——占位框改用 <span> 三层，避开
 // P185 诊断实测到的 HTML5 解析期"块级元素触发关闭祖先 <p>、连带截断徽标 <span>"问题（见
-// ovlRenderFigurePlaceholder 头部注释）。其余全部调用点
-// （figure/minipage/table/algorithm caption 等顶层图片）不传第三参，行为不变。
+// ovlRenderFigurePlaceholder 头部注释）。v2 Pass P189 审计追加确认了第二处同构语境
+// （ovlRestoreBareIncludegraphicsAfterRender：裸 \includegraphics 夹在段落散文中间，
+// 落进 marked.parse() 产出的 <p> 内部），同样传 true。其余全部调用点
+// （figure/minipage/table/algorithm caption 等顶层图片、以及"整段仅有图片"的
+// ovlVisualRenderBareIncludegraphics 短路路径）不传第三参，行为不变。
 function ovlRenderNoteContentHtml(content) {
     OVL_VISUAL_BARE_IMG_RE.lastIndex = 0;
     let html = '';
@@ -34610,6 +34624,9 @@ function ovlExtractIncludegraphicsWidthFrac(str) {
 // 元素，不认 tagName，天然兼容）；额外挂一个 ovl-visual-fig-box-inline 修饰类，CSS 侧
 // 把默认的 flex-column 大块占位框样式覆盖成小号 inline-flex 行内徽标，视觉上贴合"嵌在
 // note 批注文字里的小图标"而不是大块 figure 占位框。
+// v2 Pass P189：第二处 inline=true 调用点（ovlRestoreBareIncludegraphicsAfterRender，
+// 裸图片夹在段落散文中间、落进 marked.parse() 产出的 <p> 内部）复用同一套机制，无需改动
+// 本函数本体，见该调用点上方注释。
 function ovlRenderFigurePlaceholder(relPath, widthFrac, inline) {
     const basename = relPath ? (relPath.split(/[\\/]/).pop() || relPath) : null;
     const srcAttr = relPath ? (' data-fig-src="' + escapeHtml(relPath) + '"') : '';
