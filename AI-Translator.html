@@ -1756,15 +1756,23 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 .ovl-body[data-view="bilingual"][data-tree="collapsed"] { grid-template-columns: 40px 0px var(--ovl-bilingual-left-fr, 1fr) 6px var(--ovl-bilingual-right-fr, 1fr); }
 .ovl-body[data-view="bilingual"] .ovl-col-splitter { display: none; }
 .ovl-body[data-view="bilingual"] #ovlPdfPanel { display: none; }
-/* v2 Pass P169（R2）：一键左右交换——照抄约 1738 行 [data-pdfleft="1"] 那三条 CSS order
-   规则的同一个思路（不碰 DOM 结构，只用 order 换 3 个 grid 子项的视觉顺序）。
-   #ovlEditorPanel/.ovl-bilingual-splitter/#ovlBilingualMirrorPanel 在双语视图下都是靠
-   DOM 源码顺序自动落位（无显式 grid-column，见约 1750 行大注释），跟 order 机制天然兼容。
-   分栏手柄必须显式卡在中间（order:1），理由跟 P82 那组规则完全一样——不然会用默认
-   order:0 跟排最前的面板打平局，按源码顺序排到它前面，变成手柄跑到最左边。 */
+/* v2 Pass P169（R2，已被 P190 停用）：一键左右交换最初的实现——照抄约 1738 行
+   [data-pdfleft="1"] 那三条 CSS order 规则的同一个思路（不碰 DOM 结构，只用 order 换 3 个
+   grid 子项的视觉顺序）。#ovlEditorPanel/.ovl-bilingual-splitter/#ovlBilingualMirrorPanel
+   在双语视图下都是靠 DOM 源码顺序自动落位（无显式 grid-column，见约 1750 行大注释），跟
+   order 机制天然兼容。分栏手柄必须显式卡在中间（order:1），理由跟 P82 那组规则完全一样
+   ——不然会用默认 order:0 跟排最前的面板打平局，按源码顺序排到它前面，变成手柄跑到最左边。
+   v2 Pass P190：交换按钮改为"内容交换"——#ovlEditorPanel 永远留在左边（保留完整编辑能力），
+   #ovlBilingualMirrorPanel 永远留在右边，交换只改变每个面板渲染哪种语言的内容
+   （见 ovlBilingualEffectiveLang()）。data-bilingual-swapped 属性、OvlState.bilingualSwapped
+   和 localStorage 持久化（ovl.bilingualSwapped）三样全部原样保留（内容交换逻辑仍然要读这个
+   状态位），只是不再用它来改变面板的视觉 order 了。整段规则原样注释保留、不删除，方便对照
+   历史实现，也方便万一要临时回退核对视觉差异。 */
+/*
 .ovl-body[data-view="bilingual"][data-bilingual-swapped="1"] #ovlBilingualMirrorPanel { order: 0; }
 .ovl-body[data-view="bilingual"][data-bilingual-swapped="1"] .ovl-bilingual-splitter { order: 1; }
 .ovl-body[data-view="bilingual"][data-bilingual-swapped="1"] #ovlEditorPanel { order: 2; }
+*/
 /* 独立于 .ovl-col-splitter 的一套样式（故意不复用那个类）——.ovl-col-splitter 有一条
    `.ovl-body[data-view="split"] .ovl-col-splitter { display:flex; }` 规则，如果这颗新手柄
    也挂 .ovl-col-splitter 类，会在 split 视图下被那条规则一起点亮，变成网格里第 6 个可见
@@ -4938,7 +4946,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.38.04';        // APP_VERSION_STAMP
+const APP_VERSION = '03.38.05';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -31635,11 +31643,16 @@ const OvlState = {
     // 为 'visual'（左侧必须是 Visual 渲染），退出时原样恢复，不让"进去看一眼双语对照"
     // 意外把用户原本在 Code 模式的状态改没了。
     bilingualPrevEditorMode: null,
-    // v2 Pass P169（R2）：左右两栏是否已交换显示位置——true 表示 #ovlBilingualMirrorPanel
-    // （原文）排在 #ovlEditorPanel（左栏原本固定的中文栏）左边。这是纯 DOM 顺序/展示层面
-    // 的状态，不改变哪个面板"负责"哪种语言内容（左栏渲染逻辑仍固定中文、镜像栏固定原文，
-    // 见 ovlBilingualApplySwapOrder 头部注释），跨刷新持久化到 localStorage
-    // 'ovl.bilingualSwapped'，跟既有 'ovl.viewMode' 同一套扁平 key 约定。
+    // v2 Pass P169（R2，语义已被 P190 改写）：左右两栏是否已交换。P169 最初的含义是
+    // "纯 DOM 顺序/展示层面的位置交换"（true 表示 #ovlBilingualMirrorPanel 排到左边）。
+    // v2 Pass P190 起改为"内容交换"：两个面板永远各自固定在左/右（#ovlEditorPanel 永远左、
+    // #ovlBilingualMirrorPanel 永远右，CSS order 机制已停用，见约 1759 行 CSS 注释），这个
+    // 布尔位改成决定"每个面板该渲染哪种语言"的唯一判据——具体换算见
+    // ovlBilingualEffectiveLang()，本文件任何地方都不允许绕开这个函数另起判断逻辑。
+    // false（默认）：editor=中文译文（可编辑）、mirror=原文（可编辑）——跟 P160/P169 原有
+    // 默认行为字节级相同。true：editor=原文（可编辑）、mirror=中文。
+    // 跨刷新持久化到 localStorage 'ovl.bilingualSwapped'，跟既有 'ovl.viewMode' 同一套扁平
+    // key 约定（key 名不变，仍然是同一个开关状态，只是它现在驱动的效果换成了内容交换）。
     bilingualSwapped: false
 };
 
@@ -31733,7 +31746,12 @@ function ovlShellHtml() {
         +   '<div class="ovl-editor-panel" id="ovlEditorPanel">'
         // M2：脏点/保存状态由 ovlUpdateTabUI() / ovlFlashSaveStatus() 驱动，都是 CSS class + textContent
         // 的纯 DOM 写，不走 renderApp（工具条区域从来不进 renderAppCore）。
-        +     '<div class="ovl-editor-tabbar"><span class="ovl-editor-tab" id="ovlEditorTabName">未打开文件</span><span class="ovl-save-status" id="ovlSaveStatus"></span></div>'
+        // v2 Pass P190：双语对照模式下，左侧（编辑器）tabbar 也要挂一个语言标签，跟右侧镜像
+        // 面板的 #ovlBilingualMirrorLabel 成对，由 ovlBilingualUpdateLabels() 统一驱动文案；
+        // 默认带 hidden 属性——非双语视图下这颗 span 不该露面，进入/离开双语视图时由
+        // ovlBilingualUpdateLabels() 显式切换 hidden，字节级不影响 split/editor/pdf 三种
+        // 既有视图的既有渲染。
+        +     '<div class="ovl-editor-tabbar"><span class="ovl-editor-tab" id="ovlEditorTabName">未打开文件</span><span class="ovl-bilingual-mirror-label" id="ovlBilingualEditorLabel" hidden></span><span class="ovl-save-status" id="ovlSaveStatus"></span></div>'
         // v2 Pass P131：外部改动冲突横幅——脏时的唯一出口，绝不静默覆盖编辑器内容。
         +     '<div class="ovl-extbanner" id="ovlExtChangeBanner" hidden></div>'
         // M7 Editor 分类「Breadcrumbs」：光标所在的 \section/\subsection 路径，默认关（Overleaf 默认也关）。
@@ -31922,7 +31940,9 @@ function ovlShellHtml() {
         // 绑定/解绑，跟 ovlBilingualBindScrollSync 同一套生命周期纪律）负责挂载。
         +   '<div class="ovl-bilingual-mirror-panel" id="ovlBilingualMirrorPanel">'
         +     '<div class="ovl-editor-tabbar">'
-        +       '<span class="ovl-bilingual-mirror-label">Original</span>'
+        // v2 Pass P190：id 化，改由 ovlBilingualUpdateLabels() 按 ovlBilingualEffectiveLang('mirror')
+        // 动态写 textContent；初始文案仍是 'Original'，跟交换前的既有默认行为字节级相同。
+        +       '<span class="ovl-bilingual-mirror-label" id="ovlBilingualMirrorLabel">Original</span>'
         // v2 Pass P169（R2）：一键左右交换按钮——点击调用 ovlBilingualToggleSwap()，
         // 交换 #ovlEditorPanel/#ovlBilingualMirrorPanel 两个面板在 DOM 里的顺序（CSS Grid
         // 按源码顺序隐式落位，见约 1670 行注释），选择持久化到 localStorage 的
@@ -32534,31 +32554,101 @@ function ovlBilingualSplitterBeginDrag(ev) {
 // 而不是"某个面板"的宽度（见 ovlBilingualSplitterApplyRatio 注释）——交换后谁的 order 小
 // 谁就落进第 3 轨道，如果用户之前拖出过不对称比例，两个面板会互换宽度，导致换行结果变化、
 // 块高度变化，两侧 gutter 的行号位置、P160 对齐都要在新宽度下重新算一遍。
+// v2 Pass P190：交换按钮从"CSS order 挪面板视觉位置"改成"内容交换"——#ovlEditorPanel 永远
+// 留在左边（保留完整编辑能力），#ovlBilingualMirrorPanel 永远留在右边（约 1759 行 CSS 里
+// 三条 order 规则已整段注释停用，原样保留不删）。交换只改变"哪个面板渲染哪种语言的内容"。
+//
+// ovlBilingualEffectiveLang(which) 是唯一判据——本文件里任何需要判断"编辑器面板/镜像
+// 面板这一刻该显示中文译文还是英文原文"的代码路径（编辑器渲染、镜像渲染、两个面板各自
+// 的点击编辑路由、tabbar 语言标签），一律调用这个函数取值，禁止另起一套等价判断逻辑，
+// 否则某个遗漏的分支会在交换后显示错语言、或者在不该显示的一侧允许编辑——这类 bug 很
+// 隐蔽，只有真交换之后才会暴露。
+//
+// 未交换（OvlState.bilingualSwapped===false）：editor='zh'（中文译文，可编辑）、
+// mirror='original'（英文原文，可编辑）——这是 P160/P169 原有默认行为，字节级不变。
+// 交换（true）：editor='original'、mirror='zh'。
+//
+// 关键约束：这个函数只回答"这一刻该渲染什么"，绝不能被用来改写全局单例
+// OvlVisualLangState.lang——那是懒翻译调度器/进度条/角标记账用的状态，必须在整个双语
+// 会话期间保持 'zh' 不变（不然会话中途的翻译进度统计会被交换动作污染）。渲染时用
+// "翻转渲染复原"技巧：临时把 OvlVisualLangState.lang 改成 ovlBilingualEffectiveLang() 的
+// 结果、调共享渲染管线、finally 里原样复原，见 ovlVisualRender()/ovlBilingualRefreshMirror()
+// 内部注释。
+function ovlBilingualEffectiveLang(which) {
+    const swapped = !!OvlState.bilingualSwapped;
+    if (which === 'editor') return swapped ? 'original' : 'zh';
+    if (which === 'mirror') return swapped ? 'zh' : 'original';
+    return 'zh';
+}
+
+// 双语视图下两侧 tabbar 的语言标签文案跟 ovlBilingualEffectiveLang() 联动——非双语视图下
+// 两个 label 的 textContent 都清空（不残留"中文译文"/"Original"这类在其他视图下没有
+// 意义的文字，也不需要额外的 hidden 属性切换，空字符串天然不占版面）。
+function ovlBilingualUpdateLabels() {
+    try {
+        const leftLabel = document.getElementById('ovlBilingualEditorLabel');
+        const rightLabel = document.getElementById('ovlBilingualMirrorLabel');
+        const inBilingual = (OvlState.viewMode === 'bilingual');
+        const textFor = (lang) => (lang === 'zh' ? '中文译文' : 'Original');
+        // 左侧（编辑器面板）标签默认带 hidden 属性（HTML 模板里写死，见 ovlShellHtml）——
+        // 非双语视图下这颗 span 在 split/editor/pdf 三种视图里从来不该露面，跟"文案清空"
+        // 双保险；hidden 属性由这里在真正进入/离开双语视图时显式切换。右侧标签沿用旧有
+        // 约定（不挂 hidden，靠 .ovl-bilingual-mirror-panel 整块 display:none 隐藏，见 CSS）。
+        if (leftLabel) {
+            leftLabel.hidden = !inBilingual;
+            leftLabel.textContent = inBilingual ? textFor(ovlBilingualEffectiveLang('editor')) : '';
+        }
+        if (rightLabel) rightLabel.textContent = inBilingual ? textFor(ovlBilingualEffectiveLang('mirror')) : 'Original';
+    } catch (e) {
+        console.error('[ovl] bilingual update labels failed', e);
+    }
+}
+
 function ovlBilingualApplySwapOrder() {
     const body = document.getElementById('ovlBody');
     if (!body) return;
+    // v2 Pass P190：data-bilingual-swapped 属性、OvlState.bilingualSwapped 字段本身和
+    // localStorage 持久化三样原样保留——只是不再被约 1759 行那三条已停用的 CSS order 规则
+    // 读取了。属性仍然写在 body 上，纯粹是为了给样式/测试保留一个可查询的 DOM 锚点，不影响
+    // 任何布局。
     if (OvlState.bilingualSwapped) body.setAttribute('data-bilingual-swapped', '1');
     else body.removeAttribute('data-bilingual-swapped');
     // 按钮态跟当前状态同步——aria-pressed 供辅助技术识别开关态，不影响任何既有测试断言
     // （data-tip 提示文案不用跟着变，"交换左右两侧显示位置"这句在两种状态下都成立）。
     const btn = document.getElementById('ovlBilingualSwapBtn');
     if (btn) btn.setAttribute('aria-pressed', OvlState.bilingualSwapped ? 'true' : 'false');
+    ovlBilingualUpdateLabels();
 }
 
 function ovlBilingualToggleSwap() {
     try {
+        // v2 Pass P190：交换现在会调用 ovlVisualRender() 整块重写两侧 .innerHTML（见下面
+        // 注释）——如果这一刻正好有一处就地编辑开着（左侧中文/原文编辑框或右侧原文编辑框），
+        // 直接交换会把那个编辑框连同用户还没保存的草稿一起冲掉，是一次真实的数据丢失风险。
+        // 复用跟 ovlVisualBlockEditOpenAtPoint/ovlBilingualMirrorBlockEditOpenAtPoint 完全
+        // 相同的既有闸门（OvlInlineSrcEdit，见约 59215 行声明），交换前先堵一道，让用户自己
+        // 先保存/取消再交换，不静默丢内容。
+        if (OvlInlineSrcEdit) {
+            try { showToast('已经有一处在就地编辑，请先保存（Ctrl+Enter）或取消（Esc）再交换左右。', 'warning'); } catch (e) {}
+            return;
+        }
         OvlState.bilingualSwapped = !OvlState.bilingualSwapped;
         try { localStorage.setItem('ovl.bilingualSwapped', OvlState.bilingualSwapped ? '1' : '0'); } catch (e) {}
         ovlBilingualApplySwapOrder();
-        // data-bilingual-swapped 属性刚改完就读布局，浏览器会同步补一次样式/布局重算——跟
-        // ovlSetViewMode 改 data-view 后立刻调 ovlRenderVisualGutter() 同一条既有纪律（约
-        // 1975 行注释），不需要额外等一帧。只在真正处于双语模式时才有意义（按钮本身也只在
-        // 这个视图下可见可点，这层判断是防御性的）。两个 gutter 全量重排 + 各自 finally 里
-        // 会顺带各排一次对齐（不传 skipAlignSchedule，走既有默认路径），覆盖"拖过不对称比例
-        // 再交换，宽度互换导致换行变化"这个场景。
+        // v2 Pass P190：交换现在改变的是"内容"而不是视觉 order（约 1759 行 CSS 注释），只重排
+        // 两侧 gutter 已经不够——两侧 .ovl-visual-block 的渲染正文（中文译文 vs 原文）也要
+        // 跟着重新生成。改调 ovlVisualRender()：它内部会按新的 OvlState.bilingualSwapped
+        // 状态，用"翻转渲染复原"技巧重渲染编辑器面板正文，再调用 ovlBilingualRefreshMirror()
+        // 同样的技巧重渲染镜像面板正文；两者各自的收尾步骤已经带着重排 gutter（
+        // ovlRenderVisualGutter/ovlRenderVisualGutterMirror）+ 触发 P160 对齐
+        // （ovlBilingualScheduleAlign，覆盖"拖过不对称比例再交换，宽度互换导致换行变化"这个
+        // 场景）+ 刷新 tabbar 语言标签（ovlBilingualUpdateLabels）——比在这里手动分别调四个
+        // 函数更不容易漏一步，也是本文件里唯一负责"重画双语模式两侧内容"的入口，跟其余所有
+        // 触发重渲染的调用点（切文件/折叠导言区/懒翻译落地……）走同一条路径，不新开一条
+        // 平行的重渲染逻辑。只在真正处于双语模式时才有意义（按钮本身也只在这个视图下可见
+        // 可点，这层判断是防御性的）。
         if (OvlState.viewMode === 'bilingual') {
-            if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
-            if (typeof ovlRenderVisualGutterMirror === 'function') ovlRenderVisualGutterMirror();
+            if (typeof ovlVisualRender === 'function') ovlVisualRender();
         }
     } catch (e) {
         console.error('[ovl] bilingual toggle swap failed', e);
@@ -38886,6 +38976,19 @@ const OVL_VISUAL_AUDIT_RATE_WINDOW_MS = 60000;
 function ovlVisualLangIdleAudit() {
     try {
         if (OvlVisualLangState.lang !== 'zh' || OvlVisualLangState.running) return;
+        // v2 Pass P190（自检误伤修复，测试中真实发现的 bug，不是任务书原有范围）：这条自检的
+        // 前提是"全局 OvlVisualLangState.lang==='zh' 时，#ovlVisualPane 里任何看起来像原文
+        // 英语的可见文字都是漏网的 bug（漏翻/翻译失败没标记）"——双语对照模式的交换功能引入
+        // 之前，这条前提恒成立（lang==='zh' 时左侧编辑器面板必然在渲染中文）。P190 交换之后
+        // 不再成立：交换态下编辑器面板正在合法显示原文（ovlBilingualEffectiveLang('editor')
+        // === 'original'），这时 #ovlVisualPane 整面板都是"看起来像原文"的英语——不是 bug，
+        // 是设计如此。不加这道短路的话，每次点"交换"进入交换态，这条自检都会把全部块误判成
+        // 漏译、自动重新入队触发真实翻译请求，产生真实网络调用 + 页面上出现"可能漏译"失败
+        // 角标，是一个会在真实使用中稳定复现的功能性 bug（已用 CDP 实测复现+修复验证）。
+        // 用唯一判据函数 ovlBilingualEffectiveLang 复用同一条真值源（§3.2 强制要求，不新增
+        // 判断逻辑）。非双语视图/双语未交换时 ovlBilingualEffectiveLang('editor') 恒为 'zh'，
+        // 这里的短路条件恒为 false，逐字节不影响改动前的既有行为。
+        if (OvlState.viewMode === 'bilingual' && typeof ovlBilingualEffectiveLang === 'function' && ovlBilingualEffectiveLang('editor') !== 'zh') return;
         const pane = document.getElementById('ovlVisualPane');
         if (!pane) return;
         const hits = ovlVisualAuditUnmarkedEnglish(pane);
@@ -39212,7 +39315,30 @@ function ovlVisualRender() {
             // （拿 LatexFilter 处理导言区没有意义，那套表是给正文散文用的）。
             if (OvlVisualState.preambleOpen) html += '<pre class="ovl-visual-preamble"></pre>';
         }
-        html += '<div class="ovl-visual-body">' + ovlVisualRenderBodyWithLines(body, bodyStartLine) + '</div>';
+        // v2 Pass P190：双语对照模式下，编辑器面板（本函数负责渲染的 #ovlVisualPane）按
+        // ovlBilingualEffectiveLang('editor') 决定这一刻该显示中文译文还是英文原文——跟
+        // ovlBilingualRefreshMirror() 完全同款的"翻转渲染复原"技巧：临时把全局单例
+        // OvlVisualLangState.lang 拨到目标语言、调同一条纯函数渲染管线、finally 里原样复原，
+        // 绝不永久改写这个全局状态（懒翻译调度器/进度条/角标记账全靠它在双语会话期间保持
+        // 'zh' 不变，见约 32540 行 ovlBilingualEffectiveLang 头部注释）。整条调用链
+        // （ovlVisualRenderBodyWithLines → ... → LatexFilter/KaTeX/marked）里没有 await，
+        // 从"拨状态"到 finally"拨回状态"之间不会被任何微任务/宏任务打断，不存在竞态
+        // （与 ovlBilingualRefreshMirror 头部注释里对同一条调用链的分析完全相同）。
+        // 非双语视图下这段直接退化成原来的写法（effLang 分支不生效），字节级不改变既有行为。
+        let bodyHtml;
+        if (OvlState.viewMode === 'bilingual' && typeof ovlBilingualEffectiveLang === 'function') {
+            const savedLangForEditor = OvlVisualLangState.lang;
+            const effLangForEditor = ovlBilingualEffectiveLang('editor');
+            try {
+                OvlVisualLangState.lang = effLangForEditor;
+                bodyHtml = ovlVisualRenderBodyWithLines(body, bodyStartLine);
+            } finally {
+                OvlVisualLangState.lang = savedLangForEditor;
+            }
+        } else {
+            bodyHtml = ovlVisualRenderBodyWithLines(body, bodyStartLine);
+        }
+        html += '<div class="ovl-visual-body">' + bodyHtml + '</div>';
         if (tail.trim()) {
             html += '<div class="ovl-visual-bar" id="ovlVisualTailBar">'
                 + (OvlVisualState.tailOpen ? '▾ Hide content after \\end{document}' : '▸ End of document — show remaining content') + '</div>';
@@ -39239,6 +39365,10 @@ function ovlVisualRender() {
         // （切模式/换文件/折叠导言区/懒翻译落地……），每一个都理应让双语模式下的右侧跟着刷新，
         // 集中在这一个函数的 4 个 return/结束点上钩子，比在每个调用方各自记得调用可靠得多。
         if (OvlState.viewMode === 'bilingual' && typeof ovlBilingualRefreshMirror === 'function') ovlBilingualRefreshMirror();
+        // v2 Pass P190：两侧 tabbar 语言标签跟这次渲染同步刷新（§3.4）——放在 gutter/镜像面板
+        // 都落地之后，避免读到旧的 OvlState.bilingualSwapped/viewMode 组合。非双语视图下
+        // ovlBilingualUpdateLabels() 内部会把两个 label 清空，零副作用。
+        if (typeof ovlBilingualUpdateLabels === 'function') { try { ovlBilingualUpdateLabels(); } catch (eLbl) {} }
     } catch (e) {
         console.error('[ovl] visualRender failed', e);
         const pane = document.getElementById('ovlVisualPane');
@@ -39300,10 +39430,14 @@ function ovlBilingualRefreshMirror() {
         if (typeof ovlXrefBuild === 'function') { try { ovlXrefBuild(src); } catch (e) { console.error('[ovl-xref] 镜像面板建表失败，本次渲染引用编号全部退到查不到档', e); } }
         const splitDoc = ovlSplitDocumentPreambleBody(src);
         const preamble = splitDoc.preamble, body = splitDoc.body, tail = splitDoc.tail, bodyStartLine = splitDoc.bodyStartLine;
+        // v2 Pass P190：镜像面板原本硬编码只显示 'original'——现在改用
+        // ovlBilingualEffectiveLang('mirror') 取值（未交换时结果仍是 'original'，字节级
+        // 不改变既有默认行为；交换后变成 'zh'，跟编辑器面板的内容互换）。
         const savedLang = OvlVisualLangState.lang;
+        const effLangForMirror = (typeof ovlBilingualEffectiveLang === 'function') ? ovlBilingualEffectiveLang('mirror') : 'original';
         let bodyHtml = '';
         try {
-            OvlVisualLangState.lang = 'original';
+            OvlVisualLangState.lang = effLangForMirror;
             bodyHtml = ovlVisualRenderBodyWithLines(body, bodyStartLine);
         } finally {
             OvlVisualLangState.lang = savedLang;
@@ -39339,6 +39473,11 @@ function ovlBilingualRefreshMirror() {
         const pane = document.getElementById('ovlVisualPaneMirror');
         if (pane) pane.innerHTML = '<div class="ovl-visual-empty">Original 预览渲染失败。</div>';
         if (typeof ovlRenderVisualGutterMirror === 'function') { try { ovlRenderVisualGutterMirror(); } catch (eG) {} }
+    } finally {
+        // v2 Pass P190：不管走哪条 return/catch 路径，两侧 tabbar 语言标签都要跟这次镜像
+        // 渲染同步刷新（§3.4）——放 finally 里一次性覆盖全部出口，比在每个 return 前面各自
+        // 补一行可靠（本函数原有 4 个出口，漏补一处就会出现标签跟内容不同步的窗口）。
+        if (typeof ovlBilingualUpdateLabels === 'function') { try { ovlBilingualUpdateLabels(); } catch (eLbl) {} }
     }
 }
 
@@ -39714,7 +39853,30 @@ function ovlBilingualMirrorBlockEditOpenAtPoint(clientX, clientY, caretAnchorTex
     } catch (e) {}
     const blockEl = hitEl.closest('.ovl-visual-block[data-src-line]');
     if (!blockEl) return;
-    // 镜像面板固定是 Original——直接走源码编辑内核，没有 zh 分流。
+    // v2 Pass P190：镜像面板不再恒定显示 Original——交换之后它会显示中文译文
+    // （ovlBilingualEffectiveLang('mirror') === 'zh'）。这里在 Option A（复用
+    // ovlInlineZhEditOpenForBlocks/回译编辑器，让镜像面板也能编辑中文）和 Option B（交换后
+    // 镜像面板显示中文时，直接禁用这一侧的编辑、toast 引导去左侧）之间选了 Option B，
+    // 有代码级证据支撑，不是拍脑袋：
+    //   ovlVisualBtrCommitWrite()（约 60132 行，回译落盘）在内部调用
+    //   ovlVisualBlockAtCharRange()（约 40164 行）反查"这段字符区间对应哪个块"——该函数
+    //   第 40168 行硬编码 `document.getElementById('ovlVisualPane')`，只在左侧主面板里找
+    //   块，完全不认识 #ovlVisualPaneMirror。要让 Option A 成立，必须把这个函数（以及它在
+    //   回译落盘链路上的调用方）改成能接收"从哪个 pane 查"的参数，这已经不是"给镜像面板
+    //   接一个现成机制"，而是要改回译落盘这条共享内部实现本身——会牵连非双语视图下的既有
+    //   回译路径，风险和改动面都跟本车道"不新增机制、不改共享内部实现"的边界冲突，因此
+    //   放弃 Option A。
+    // Option B：交换后镜像面板显示中文译文时，双击不打开任何编辑器，只 toast 提示去左侧
+    // 编辑器面板操作——左侧交换后正渲染同一份可编辑的中文译文（§3.2/§3.3），功能没有缺失，
+    // 只是编辑入口收敛成唯一一个，跟"#ovlEditorPanel 永远保留完整编辑能力"这条硬要求完全
+    // 一致。未交换（镜像面板仍是 Original）时这段判断恒为 false，直接走原有源码编辑内核，
+    // 逐字节不改变既有行为。
+    const mirrorTargetsZh = (typeof ovlBilingualEffectiveLang === 'function') && (ovlBilingualEffectiveLang('mirror') === 'zh');
+    if (mirrorTargetsZh) {
+        try { showToast('这一侧当前显示的是中文译文，暂不支持在这里直接编辑，请到左侧编辑器面板编辑（交换后左侧显示的正是可编辑的中文译文）。', 'warning'); } catch (e) {}
+        return;
+    }
+    // 镜像面板显示 Original 时——直接走源码编辑内核，没有 zh 分流。
     ovlInlineSrcEditOpenForBlocks([blockEl], { caretAnchorText: caretAnchorText });
 }
 function ovlBilingualBindMirrorClick() {
@@ -60989,7 +61151,18 @@ function ovlVisualBlockEditOpenAtPoint(clientX, clientY, caretAnchorText) {
     // ovlBindQuickActions 的 dblclick 监听器）传入"双击那一刻原生选出来的那个词"，落点因此变成
     // 双击命中的位置；不传（旧的单块跳转路径，目前没有别的调用方在用）就退回各自内核原有的
     // "落在编辑框末尾"默认值，不改变旧行为。
-    if (OvlState.editorMode === 'visual' && (OvlVisualLangState.lang === 'zh' || hitZh)) {
+    // v2 Pass P190：双语对照模式下，编辑器面板（本函数只服务 #ovlVisualPane，即左侧固定
+    // 面板）这一刻显示的语言不再等于全局单例 OvlVisualLangState.lang——该全局态在整个双语
+    // 会话期间恒为 'zh'（懒翻译调度器/进度条/角标记账靠它保持不变，见
+    // ovlBilingualEffectiveLang 头部注释），但交换后编辑器面板实际渲染的是原文。继续用
+    // OvlVisualLangState.lang==='zh' 当判据，会在交换后把点击误路由进
+    // ovlInlineZhEditOpenForBlocks（译文/回译编辑器），打开一个跟屏幕上文字完全对不上的
+    // 编辑框——因此双语视图下改用唯一判据 ovlBilingualEffectiveLang('editor') 判断这一次
+    // 点击落在的是中文译文块还是原文块。非双语视图下短路回原判据，逐字节不改变既有行为。
+    const editorTargetsZh = (OvlState.viewMode === 'bilingual' && typeof ovlBilingualEffectiveLang === 'function')
+        ? (ovlBilingualEffectiveLang('editor') === 'zh')
+        : (OvlVisualLangState.lang === 'zh');
+    if (OvlState.editorMode === 'visual' && (editorTargetsZh || hitZh)) {
         ovlInlineZhEditOpenForBlocks([blockEl], { caretAnchorText: caretAnchorText });
     } else {
         ovlInlineSrcEditOpenForBlocks([blockEl], { caretAnchorText: caretAnchorText });
