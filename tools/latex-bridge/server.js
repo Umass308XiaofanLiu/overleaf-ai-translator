@@ -1584,6 +1584,22 @@ const GIT_SAFE_DIRECTORY_ARGS = ['-c', 'safe.directory=*'];
 // 会卡在交互式终端输入等待），这里不重复设置。
 const GIT_NO_CREDENTIAL_HELPER_ARGS = ['-c', 'credential.helper='];
 
+// v2 Pass P191 —— Overleaf 远程仓库里的文件名（论文标题当文件名）经常导致克隆目标的
+// 完整路径超过 Windows MAX_PATH（260 字符），即使单个路径组件本身没超 NTFS 的 255 字节
+// 上限，git for Windows 也会报 "Filename too long" 直接失败（诊断见
+// .claude/tmp/p191_clone_longpath_diag.md：三条实测失败路径分别 268/336/307 字符，最长
+// 单组件仅 84/118/105 字节，本机三级 git config 均未设置 core.longpaths）。
+// 修法：给这次 spawn 加 `-c core.longpaths=true`，让 Git for Windows 内部用 `\\?\` 前缀
+// 绕开整体路径长度上限（只要求单组件 ≤255 字节，本例三条都满足）。放在 runGitCommand()
+// 里意味着 clone/pull/push/status 等所有调用点统一受益，不需要逐个路由各改一次——克隆
+// 成功后如果远程又加了新的超长文件名，后续 pull 会复现同一个坑，这里一次性堵上。
+// 注入方式与上面两个 `-c` 完全同构：只作为这一次 spawn 的参数（args 数组里，不进 shell
+// 字符串），绝不写 `git config --global/--system`；对短路径场景零副作用，只是放宽了 git
+// 自己对超长路径的内部限制。持久化到具体仓库（供用户之后手敲 git 用）由
+// doOverleafClone() 在克隆成功后单独调用 `git config core.longpaths true` 完成，见那里
+// 的注释。
+const GIT_LONGPATHS_ARGS = ['-c', 'core.longpaths=true'];
+
 // 仅供 e2e 测试使用（tools/e2e/test_p121_safedir.js）：设置环境变量 OVL_TEST_GIT_ARGV_LOG
 // 为一个文件路径时，每次 spawn 前把最终 argv（含上面注入的 safe.directory）追加写一行 JSON
 // 到该文件——用于断言"确实注入了"，而不是仅凭链路跑通就推测注入生效。不设置该环境变量时
@@ -1603,7 +1619,7 @@ function logGitArgvForTest(finalArgs) {
 // 变量把 git 操作限制在一个临时索引/工作树上，绝不触碰真实的 .git/index。
 function runGitCommand(args, cwd, token, timeoutMs, extraEnv) {
     return new Promise((resolve) => {
-        const finalArgs = GIT_SAFE_DIRECTORY_ARGS.concat(GIT_NO_CREDENTIAL_HELPER_ARGS, args);
+        const finalArgs = GIT_SAFE_DIRECTORY_ARGS.concat(GIT_NO_CREDENTIAL_HELPER_ARGS, GIT_LONGPATHS_ARGS, args);
         logGitArgvForTest(finalArgs);
         let child;
         try {
@@ -2305,6 +2321,21 @@ async function doOverleafClone(projectId, token, parentDir, folderName) {
                     await fsRemoveTree(targetDir, { force: true });
                 }
                 return { ok: false, error: redactToken(cloneResult.stderr || cloneResult.stdout || 'git clone 失败', token) };
+            }
+            // v2 Pass P191：runGitCommand() 里注入的 `-c core.longpaths=true`（见该常量
+            // GIT_LONGPATHS_ARGS 处的注释）只对这一次 spawn 生效，不写进任何 .git/config。
+            // 克隆成功后在新仓库里单独持久化一次，否则用户自己在这个目录里手敲 git
+            // （比如以后 pull）会因为宿主机三级 git config 都没设 core.longpaths 而重新
+            // 撞上同一个 "Filename too long"。best-effort：这一步失败不影响本次克隆的
+            // 成功结果，只记日志（不抛异常、不改变返回值），避免"持久化这种锦上添花的
+            // 收尾步骤"反而拖垮"克隆本体已经成功"这个更重要的结果。
+            try {
+                const persistResult = await runGitCommand(['config', 'core.longpaths', 'true'], targetDir, null);
+                if (!persistResult.ok) {
+                    console.error('[P191] 克隆成功但持久化 core.longpaths 失败（不影响本次克隆结果）：', persistResult.stderr || persistResult.stdout);
+                }
+            } catch (e) {
+                console.error('[P191] 克隆成功但持久化 core.longpaths 时抛出异常（不影响本次克隆结果）：', e && e.message);
             }
             return { ok: true, action: 'cloned', dir: targetDir, suggestedName: extractSuggestedProjectName(targetDir) };
         }
