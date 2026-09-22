@@ -2078,6 +2078,11 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
    行选用半透明叠加而不是纯色块，浅色/深色两套 gutter 主题（ovlApplySettings）下都看得清，
    不需要在 JS 里再开一处主题分支。 */
 .ovl-ln.ovl-ln-sel { background: rgba(37, 99, 235, 0.22); }
+/* v2 Pass P193：双语对照模式左右 gutter 联动高亮，专用类名，跟 .ovl-ln-sel 视觉逐字节相同
+   （D3 硬要求"两侧同一套样式,不做次级淡化"）——不复用 .ovl-ln-sel 本身，理由见
+   ovlBilingualGutterSyncPaintLeft() 头部注释：那个类在 #ovlGutter 上由既有 ovlPaintGutterMarks()
+   整列重算，同名复用会被无关重绘冲掉，也会反过来污染既有选区语义。 */
+.ovl-ln.ovl-ln-bisel { background: rgba(37, 99, 235, 0.22); }
 /* 关注（P8 用）预留在这里一起声明：inset box-shadow 而不是 border-left —— 后者会把行号
    往右挤 3px，和正文错位（.ovl-ln 没有 box-sizing:border-box）。P7 阶段不会有任何元素
    拿到这个 class（ovlPaintGutterMarks 里 foc 数组固定为空），纯声明不影响行为。 */
@@ -4946,8 +4951,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.38.05';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-15';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.39.00';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-22';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -32258,6 +32263,9 @@ function ovlSetViewMode(mode, opts) {
             // 又退出去"场景（进入前后 editorMode/lang 都没变）两行各自都会判断成 no-op 直接
             // 跳过。显式调用清理函数，不依赖这个偶然成立的副作用。
             if (typeof ovlBilingualClearRowAlignment === 'function') ovlBilingualClearRowAlignment();
+            // v2 Pass P193：跟上一行同一处收尾——清掉跨面板联动高亮的陈旧状态，见
+            // ovlBilingualGutterSyncReset() 头部注释（避免下次重新进入双语模式时幽灵重绘）。
+            if (typeof ovlBilingualGutterSyncReset === 'function') ovlBilingualGutterSyncReset();
             if (prevEditorMode && prevEditorMode !== OvlState.editorMode) ovlSetEditorMode(prevEditorMode);
             if (prevLang && prevLang !== OvlVisualLangState.lang) ovlVisualLangSetMode(prevLang);
             // 离开双语模式——解绑滚动联动，不留悬空监听器（跟上面 ovlColSplitterEndActive/
@@ -61883,6 +61891,10 @@ function ovlRenderVisualGutter(skipAlignSchedule) {
             OvlVisualGutterBlockOrder = [];
             OvlVisualGutterSpacerEl = null;
             OvlVisualGutterLastSpacerTop = -1;
+            // v2 Pass P193：块集合清空了（换文件/空文档）——如果双语跨面板高亮还挂着，这里
+            // 没有 cell 可画，交给 ovlBilingualGutterSyncRepaint() 自己按 active 状态清空
+            // 双侧 bisel；非双语视图下这个调用内部直接短路，零副作用（D5）。
+            if (OvlState.viewMode === 'bilingual' && typeof ovlBilingualGutterSyncRepaint === 'function') { try { ovlBilingualGutterSyncRepaint(); } catch (eSync) {} }
             return;
         }
         // gutter 和 pane 是同一个 flex 行里的两个兄弟节点，边框盒的顶边天然对齐（同一个 Y）。
@@ -61990,6 +62002,11 @@ function ovlRenderVisualGutter(skipAlignSchedule) {
 
         gutter.scrollTop = pane.scrollTop;
         ovlPaintGutterMarks();
+        // v2 Pass P193：块 DOM 每次整篇重渲染都是全新节点（本函数头部注释），任何挂在旧 cell
+        // 上的跨面板高亮 class 都会随之消失——这里按 OvlBilingualGutterSync 存的 lo/hi 值
+        // （不是 DOM 引用）重新找 cell 补画一遍，覆盖"双语模式下左侧任何一次重渲染"。只在
+        // 双语视图下才调用，非双语模式（普通 Visual 单栏）这个 if 直接短路，D5 零回归。
+        if (OvlState.viewMode === 'bilingual' && typeof ovlBilingualGutterSyncRepaint === 'function') { try { ovlBilingualGutterSyncRepaint(); } catch (eSync) {} }
         ovlScheduleVisualGutterAfterFonts(0);
         // v2 Pass P37：OvlVisualBlockRects 刚刷新完，是重画黄色标记高亮的正确时机——覆盖
         // "切模式进 Visual / 换文件 / 折叠导言区" 等所有会重跑 ovlRenderVisualGutter 的路径，
@@ -62144,6 +62161,9 @@ function ovlRenderVisualGutterMirror(skipAlignSchedule) {
             OvlVisualGutterBlockOrderMirror = [];
             OvlVisualGutterSpacerElMirror = null;
             OvlVisualGutterLastSpacerTopMirror = -1;
+            // v2 Pass P193：同 ovlRenderVisualGutter() 的对称补丁——镜像块集合清空了，没有
+            // cell 可画，交给 ovlBilingualGutterSyncRepaint() 按 active 状态清掉双侧 bisel。
+            if (typeof ovlBilingualGutterSyncRepaint === 'function') { try { ovlBilingualGutterSyncRepaint(); } catch (eSync) {} }
             return;
         }
         const paneRect = pane.getBoundingClientRect();
@@ -62176,6 +62196,10 @@ function ovlRenderVisualGutterMirror(skipAlignSchedule) {
         OvlVisualGutterBlockOrderMirror = blocks;
         ovlVisualGutterSyncSpacerMirror(gutter, pane);
         gutter.scrollTop = pane.scrollTop;
+        // v2 Pass P193：镜像块每次都是全新 DOM（函数组头部注释），跨面板高亮同样要按值
+        // 重新找 cell 补画——这里已经确认 OvlState.viewMode==='bilingual'（函数顶部早退
+        // 守卫），不需要再重复判断一次。
+        if (typeof ovlBilingualGutterSyncRepaint === 'function') { try { ovlBilingualGutterSyncRepaint(); } catch (eSync) {} }
         ovlScheduleVisualGutterAfterFontsMirror(0);
         void sameOrder; // 保留变量供以后若要加增量分支时复用判断，当前分支恒走全量重建
     } catch (e) { console.error('[ovl] renderVisualGutterMirror failed', e); }
@@ -62390,6 +62414,330 @@ function ovlBindVisualGutterSelect() {
     gutter.addEventListener('pointerup', endDrag);
     gutter.addEventListener('pointercancel', endDrag);
     gutter.addEventListener('lostpointercapture', endDrag);
+}
+
+// ==================== v2 Pass P193：双语对照模式左右 gutter 点击行号 -> 同步高亮 ====================
+// 用户诉求：点左侧行号，左侧高亮的同时右侧对应行也要高亮；点右侧行号（此前完全点不出任何
+// 高亮——#ovlGutterMirror 全文件没有一个事件监听器，见 P193 侦察报告 p193_gutter_sync_recon.md
+// §B3/§D3），同样要左右都亮。
+//
+// 设计（任务书 D1-D7，本组注释只记录实现落地时的关键取舍，设计原文见任务书/侦察报告）：
+//   映射策略——块锚点，按值匹配，不是按下标 parity 匹配。ovlBilingualCollectRows()（39535）
+//   证明左右块在"正常情况"下下标天然对齐，但那是在两侧都已经渲染到最新这个前提下成立的——
+//   本组新函数改成直接按 data-src-line 的值在目标 pane 自己的块列表里查找（
+//   ovlBilingualBlockRangeForLine/ovlBilingualBlockRangeForStart），不假设下标同步，对"某一侧
+//   还没刷新完"的异步窗口更稳健，找不到就不高亮（不猜），这正是任务书 C5"会错的情况"那条
+//   防御性校验的加强版——直接把它当主判据用，而不是事后二次校验。
+//
+//   D2 vs D2-例外的实测结论（详见 P193 实现报告 p193_impl_report.md §1）：ovlSetEditorMode()
+//   第 33753 行 `if (mode === 'code' && OvlState.viewMode === 'bilingual') return;` +
+//   ovlSetViewMode() 进入双语模式那段第 32241 行 `if (OvlState.editorMode !== 'visual')
+//   ovlSetEditorMode('visual');` 两条一起，构成一个双保险闸门：只要 OvlState.viewMode===
+//   'bilingual'，OvlState.editorMode 恒为 'visual'，全文件唯一改写 editorMode 的地方
+//   （33774）没有任何旁路。也就是说 D4 设想的"左侧 Code 模式 + 镜像面板可见"这个组合在当前
+//   UI 下不可达——不是"没测到"，是结构上到不了。Visual gutter 的 data-ln 恒等于块自己的
+//   data-src-line（ovlRenderVisualGutter/ovlRenderVisualGutterMirror 的 cell 生成代码逐行比对
+//   过，两侧写法一致），所以在唯一可达的状态空间里，"按数字直接比对"（D2-例外）和"按块查找
+//   再取整块区间"（D2）算出来的高亮范围是同一个值——不是两条路线里选一条更精细，是同一件事
+//   的两种算法，选哪个不影响结果。下面的实现统一走"按值查块"（一条路径同时覆盖两种描述），
+//   Code 分支保留纯防御性——万一这条闸门未来被放开，不会直接抛异常/高亮到错误范围，但当前
+//   点不到、也测不到（不可达代码不写测试，见实现报告"已知限制"一节）。
+//
+//   D5 零回归：新增的所有监听器/重绘调用都在最前面判 OvlState.viewMode !== 'bilingual' 就
+//   直接短路，不触碰 #ovlGutter 上由 ovlPaintGutterMarks() 管理的 .ovl-ln-sel（另建
+//   .ovl-ln-bisel 类，见 ~2080 行 CSS 注释），不改 ovlBindGutterSelect/ovlBindVisualGutterSelect/
+//   ovlPaintGutterMarks/ovlVisualBlockAtCharRange 内部一个字符（D7）。
+//
+//   D6 交换左右：跨面板高亮状态存的是源码行号值（lo/hi），不是 DOM 引用，块的
+//   data-src-line/data-src-line-end 不随交换变化（语言无关，C1/C2）——交换触发的
+//   ovlVisualRender()/ovlBilingualRefreshMirror() 重渲染会各自调用下面新增的
+//   ovlBilingualGutterSyncRepaint() 钩子重新按值找 cell 补画，实测（见实现报告 §3 测试 8）
+//   高亮在交换后原样保留，不需要退化成"交换时清空"那条备选方案。
+//
+//   两侧样式统一（D3）："点击方自身"用 .ovl-ln-sel（左侧是既有机制原样复用；右侧是本组新增
+//   的 OvlGutterSelMirror + ovlPaintGutterMarksMirror()，字面复用同一个类名——这个类此前从未
+//   被任何代码在 #ovlGutterMirror 上使用过，复用安全）。"因为对侧被点击而联动亮起"的一侧用
+//   .ovl-ln-bisel（新类，CSS 跟 .ovl-ln-sel 逐字节相同）。origin 字段记录这次高亮由哪一侧
+//   触发，两个 paint 函数只在"我是非 origin 侧"时才画 bisel——避免同一个 cell 同时叠
+//   .ovl-ln-sel 和 .ovl-ln-bisel（视觉上看不出但语义冗余，也避免调试时误判成两条高亮）。
+
+// 右侧（镜像）自身的点选状态——跟左侧 OvlVisualGutterSel（61622）同构，但镜像只有 Visual 一种
+// 粒度（右侧从设计上没有 Code 视图），不需要 Code 模式那一半。
+let OvlGutterSelMirror = { anchorBlock: -1, headBlock: -1, dragging: false, pointerId: null };
+
+// 跨面板高亮状态：存值（源码行号区间 + 触发侧），不存 DOM 引用——块节点每次整篇重渲染都是
+// 全新的（ovlRenderVisualGutterMirror 头部注释），存引用活不过下一次渲染。
+let OvlBilingualGutterSync = { active: false, lo: -1, hi: -1, origin: '' }; // origin: 'left' | 'right'
+
+// 给定 pane 和一个源码物理行号，返回该行落在这个 pane 自己块列表里的哪个块
+// {index, lo, hi, el}，找不到返回 null。仅在（当前不可达的）Code 分支使用——见上面大注释
+// D2 小节。不复用/不改 ovlVisualBlockAtCharRange()（40223，硬编码左侧，P190 已评估参数化
+// 风险并放弃，见其头部注释），这是独立的新函数。
+function ovlBilingualBlockRangeForLine(pane, line) {
+    if (!pane || line < 0 || !isFinite(line)) return null;
+    const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+    for (let i = 0; i < blocks.length; i++) {
+        const lo = parseInt(blocks[i].getAttribute('data-src-line'), 10);
+        const hi = parseInt(blocks[i].getAttribute('data-src-line-end'), 10);
+        if (isFinite(lo) && isFinite(hi) && line >= lo && line <= hi) return { index: i, lo: lo, hi: hi, el: blocks[i] };
+    }
+    return null;
+}
+
+// 给定 pane 和一个块起始行号（某侧块的 data-src-line 原样传入），按值在这个 pane 自己的块
+// 列表里找 data-src-line 恰好相等的块——不假设两侧下标天然同步（那是 ovlBilingualCollectRows
+// 的前提，仅在两侧都已渲染到最新时成立），按值匹配对"对侧还没刷新完"的异步窗口更稳健，找
+// 不到就返回 null（调用方据此不高亮，不瞎猜）。
+function ovlBilingualBlockRangeForStart(pane, startLine) {
+    if (!pane || startLine < 0 || !isFinite(startLine)) return null;
+    const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+    for (let i = 0; i < blocks.length; i++) {
+        const lo = parseInt(blocks[i].getAttribute('data-src-line'), 10);
+        if (lo === startLine) {
+            const hiRaw = parseInt(blocks[i].getAttribute('data-src-line-end'), 10);
+            return { index: i, lo: lo, hi: isFinite(hiRaw) ? hiRaw : lo, el: blocks[i] };
+        }
+    }
+    return null;
+}
+
+// 把 OvlBilingualGutterSync 的当前值画到 #ovlGutter 上——只在 origin==='right'（联动来自
+// 右侧点击）时才画，origin==='left' 时这一侧的高亮完全交给既有 ovlBindGutterSelect/
+// ovlBindVisualGutterSelect + ovlPaintGutterMarks() 的 .ovl-ln-sel，不重复画。
+function ovlBilingualGutterSyncPaintLeft() {
+    const gutter = document.getElementById('ovlGutter');
+    if (!gutter) return;
+    const on = OvlBilingualGutterSync.active && OvlState.viewMode === 'bilingual' && OvlBilingualGutterSync.origin === 'right';
+    const lo = OvlBilingualGutterSync.lo, hi = OvlBilingualGutterSync.hi;
+    const visual = OvlState.editorMode === 'visual';
+    const cells = gutter.querySelectorAll('.ovl-ln');
+    for (let i = 0; i < cells.length; i++) {
+        const c = cells[i];
+        const ln = parseInt(c.getAttribute('data-ln'), 10);
+        let hit = false;
+        if (on && isFinite(ln)) {
+            // Visual gutter 每格对应整块（data-ln 就是块起始行）——命中判据是"等于块起始行"；
+            // Code 分支（当前不可达，见上面大注释）按区间命中，保留是防御性写法。
+            hit = visual ? (ln === lo) : (ln >= lo && ln <= hi);
+        }
+        c.classList.toggle('ovl-ln-bisel', hit);
+    }
+}
+
+// 对称版本，画到 #ovlGutterMirror 上——只在 origin==='left' 时才画；origin==='right' 时右侧
+// 高亮交给下面新增的 ovlPaintGutterMarksMirror() 的 .ovl-ln-sel。镜像 gutter 恒为 Visual
+// 粒度（右侧没有 Code 视图），不需要区间分支。
+function ovlBilingualGutterSyncPaintRight() {
+    const gutter = document.getElementById('ovlGutterMirror');
+    if (!gutter) return;
+    const on = OvlBilingualGutterSync.active && OvlState.viewMode === 'bilingual' && OvlBilingualGutterSync.origin === 'left';
+    const lo = OvlBilingualGutterSync.lo;
+    const cells = gutter.querySelectorAll('.ovl-ln');
+    for (let i = 0; i < cells.length; i++) {
+        const c = cells[i];
+        const ln = parseInt(c.getAttribute('data-ln'), 10);
+        c.classList.toggle('ovl-ln-bisel', on && isFinite(ln) && ln === lo);
+    }
+}
+
+// 两侧重渲染后都要调一次——块 DOM 每次整篇重渲染都是全新节点，不能假设旧 cell 还在，必须
+// 按 OvlBilingualGutterSync 存的值重新找 cell 补画（D1）。调用点：ovlRenderVisualGutter()/
+// ovlRenderVisualGutterMirror() 的每个 return 出口（新增的调用见各自函数体内的 P193 注释）。
+function ovlBilingualGutterSyncRepaint() {
+    ovlBilingualGutterSyncPaintLeft();
+    ovlBilingualGutterSyncPaintRight();
+}
+
+// v2 Pass P193（离开双语视图清理）：ovlSetViewMode() 的 leavingBilingual 分支（32256 附近，
+// 跟 ovlBilingualClearRowAlignment()/ovlBilingualBindScrollSync() 等既有清理调用同一处、
+// 同一条纪律）会调用这个函数。不清理的话 OvlBilingualGutterSync.active 会带着上一次点击
+// 留下的 lo/hi 停留在内存里，两个 paint 函数虽然全部有 OvlState.viewMode==='bilingual' 门禁、
+// 在单栏视图下不会画出任何东西（D5 已验证零回归），但下一次重新进入双语视图时如果用户还没
+// 点过新的行号，stale 的 active=true 会被 ovlRenderVisualGutter()/ovlRenderVisualGutterMirror()
+// 的重绘钩子按旧值原样画出来，出现一条跟这次会话完全无关的"幽灵高亮"——不是视觉泄漏到单栏
+// 模式（D5 覆盖的场景），而是双语模式内部跨会话的状态泄漏，同样需要堵上。只清状态 + 触发一次
+// 按值重绘（这次会短路成空），不改 OvlGutterSel/OvlVisualGutterSel 等既有点选状态。
+function ovlBilingualGutterSyncReset() {
+    OvlBilingualGutterSync.active = false;
+    OvlBilingualGutterSync.lo = -1;
+    OvlBilingualGutterSync.hi = -1;
+    OvlBilingualGutterSync.origin = '';
+    ovlBilingualGutterSyncRepaint();
+}
+
+// 镜像 gutter 自身的点选高亮——画法仿 ovlPaintGutterMarks() 的 Visual 分支（61505），但这是
+// 独立的新函数，不改那个函数本身一个字符（D7）。字面复用 .ovl-ln-sel 类名（D3：两侧同一套
+// 视觉），这个类此前从未被任何代码施加在 #ovlGutterMirror 的 cell 上，复用安全。
+function ovlPaintGutterMarksMirror() {
+    try {
+        const gutter = document.getElementById('ovlGutterMirror');
+        if (!gutter) return;
+        const anchor = OvlGutterSelMirror.anchorBlock, head = OvlGutterSelMirror.headBlock;
+        const has = anchor >= 0;
+        const lo = has ? Math.min(anchor, head) : -1;
+        const hi = has ? Math.max(anchor, head) : -2;
+        const cells = gutter.querySelectorAll('.ovl-ln');
+        for (let i = 0; i < cells.length; i++) {
+            const c = cells[i];
+            const idx = parseInt(c.getAttribute('data-block'), 10);
+            c.classList.toggle('ovl-ln-sel', isFinite(idx) && idx >= lo && idx <= hi);
+        }
+    } catch (e) { /* 装饰性：坏了当没有，绝不把异常带回渲染路径——跟 ovlPaintGutterMarks 同一条纪律 */ }
+}
+
+function ovlGutterClearSelectionMirror() {
+    OvlGutterSelMirror.anchorBlock = -1; OvlGutterSelMirror.headBlock = -1;
+    OvlGutterSelMirror.dragging = false; OvlGutterSelMirror.pointerId = null;
+    ovlPaintGutterMarksMirror();
+}
+
+// clientY -> 镜像 gutter 的块序号，逐字节照抄 ovlVisualBlockAtClientY（62303）的套路，只是
+// 硬编码目标换成 #ovlGutterMirror——不参数化改造那个现成函数（D7 风格：左右各一份独立函数）。
+function ovlVisualBlockAtClientYMirror(clientY) {
+    const gutter = document.getElementById('ovlGutterMirror');
+    if (!gutter) return -1;
+    const gr = gutter.getBoundingClientRect();
+    const px = gr.left + gr.width / 2;
+    const py = Math.max(gr.top + 1, Math.min(gr.bottom - 1, clientY));
+    const el = document.elementFromPoint(px, py);
+    const cell = (el && el.closest) ? el.closest('.ovl-ln-visual') : null;
+    if (!cell) return -1;
+    const n = parseInt(cell.getAttribute('data-block'), 10);
+    return isFinite(n) ? n : -1;
+}
+
+// 右侧点击 -> 算出对应左侧块的 lo/hi，写进 OvlBilingualGutterSync，触发两侧重绘。用
+// headBlock（手势当前/最终落点）而不是 anchorBlock 一段区间——D2 只要求"点击侧高亮你点的
+// 那一行"，联动锚点用单点，拖拽时跟随当前指针位置连续更新，不牵扯"拖出一段区间该联动到
+// 对侧哪个范围"这种没有明确产品定义的问题（不新增机制，保持最小化，见任务书边界）。
+function ovlBilingualGutterSyncFromMirrorCommit() {
+    if (OvlState.viewMode !== 'bilingual') return;
+    const b = OvlGutterSelMirror.headBlock;
+    const rightPane = document.getElementById('ovlVisualPaneMirror');
+    const leftPane = document.getElementById('ovlVisualPane');
+    if (!rightPane || !leftPane) return;
+    // 点击方（右侧）自身的高亮已经由 ovlPaintGutterMarksMirror() 在调用方（
+    // ovlBindGutterSelectMirror）里画过了；这里无条件先清左侧的既有点选状态（覆盖下面全部
+    // 早退分支）——避免"上一次点了左边留下的 .ovl-ln-sel"和"这一次因为点右边而画出来的
+    // .ovl-ln-bisel"同屏叠两条高亮，看起来像 bug。ovlGutterClearSelection() 是既有未改动的
+    // 工具函数，调用它不违反 D7（D7 禁止改的是 ovlPaintGutterMarks/ovlVisualBlockAtCharRange
+    // 的签名/内部，不禁止调用别的既有未改动函数）。
+    if (typeof ovlGutterClearSelection === 'function') ovlGutterClearSelection();
+    if (b < 0) {
+        OvlBilingualGutterSync.active = false;
+        ovlBilingualGutterSyncRepaint();
+        return;
+    }
+    const rightBlocks = rightPane.querySelectorAll('.ovl-visual-block[data-src-line]');
+    const blockEl = rightBlocks[b];
+    if (!blockEl) {
+        OvlBilingualGutterSync.active = false;
+        ovlBilingualGutterSyncRepaint();
+        return;
+    }
+    const lo = parseInt(blockEl.getAttribute('data-src-line'), 10);
+    const hiRaw = parseInt(blockEl.getAttribute('data-src-line-end'), 10);
+    const hi = isFinite(hiRaw) ? hiRaw : lo;
+    const foundLeft = ovlBilingualBlockRangeForStart(leftPane, lo);
+    if (!foundLeft) {
+        OvlBilingualGutterSync.active = false;
+        ovlBilingualGutterSyncRepaint();
+        return;
+    }
+    OvlBilingualGutterSync.active = true;
+    OvlBilingualGutterSync.lo = lo;
+    OvlBilingualGutterSync.hi = hi;
+    OvlBilingualGutterSync.origin = 'right';
+    ovlBilingualGutterSyncRepaint();
+}
+
+// 右侧 gutter 点选绑定——右侧此前完全没有任何事件监听器（用户反馈"点右侧无法高亮"的确切
+// 根因，见 P193 侦察报告 p193_gutter_sync_recon.md §B3/§D3），照抄 ovlBindGutterSelect（61570）
+// 的骨架（pointer capture、零 document 监听器），但只保留 Visual 单一粒度（镜像没有 Code
+// 视图），并且额外在每次手势更新时驱动 ovlBilingualGutterSyncFromMirrorCommit() 联动左侧。
+function ovlBindGutterSelectMirror() {
+    const gutter = document.getElementById('ovlGutterMirror');
+    if (!gutter) return;
+
+    gutter.addEventListener('pointerdown', function (e) {
+        if (e.button !== 0 || OvlState.viewMode !== 'bilingual') return;
+        const b = ovlVisualBlockAtClientYMirror(e.clientY);
+        if (b < 0) return;
+        e.preventDefault();
+        if (!(e.shiftKey && OvlGutterSelMirror.anchorBlock >= 0)) OvlGutterSelMirror.anchorBlock = b;
+        OvlGutterSelMirror.headBlock = b;
+        OvlGutterSelMirror.dragging = true;
+        OvlGutterSelMirror.pointerId = e.pointerId;
+        try { gutter.setPointerCapture(e.pointerId); } catch (err) {}
+        ovlPaintGutterMarksMirror();
+        ovlBilingualGutterSyncFromMirrorCommit();
+    });
+
+    gutter.addEventListener('pointermove', function (e) {
+        if (!OvlGutterSelMirror.dragging || e.pointerId !== OvlGutterSelMirror.pointerId || OvlState.viewMode !== 'bilingual') return;
+        const b = ovlVisualBlockAtClientYMirror(e.clientY);
+        if (b < 0 || b === OvlGutterSelMirror.headBlock) return;
+        OvlGutterSelMirror.headBlock = b;
+        ovlPaintGutterMarksMirror();
+        ovlBilingualGutterSyncFromMirrorCommit();
+    });
+
+    function endDrag(e) {
+        if (!OvlGutterSelMirror.dragging) return;
+        OvlGutterSelMirror.dragging = false;
+        OvlGutterSelMirror.pointerId = null;
+        try { gutter.releasePointerCapture(e.pointerId); } catch (err) {}
+    }
+    gutter.addEventListener('pointerup', endDrag);
+    gutter.addEventListener('pointercancel', endDrag);
+    gutter.addEventListener('lostpointercapture', endDrag);
+}
+
+// 左侧 gutter 点击 -> 联动右侧。独立的新监听器，跟 ovlBindGutterSelect/ovlBindVisualGutterSelect
+// 各自的监听器并列挂在同一个 #ovlGutter 上（互不相交的第三个监听器，同 D7 风格：不改前两个
+// 一个字符），只在双语模式下才做任何事——非双语视图/镜像面板隐藏时这个 pointerdown 处理器
+// 第一行直接短路返回，D5 硬要求的"完全惰性"。
+function ovlBindBilingualGutterSync() {
+    const gutter = document.getElementById('ovlGutter');
+    if (!gutter) return;
+
+    gutter.addEventListener('pointerdown', function (e) {
+        if (e.button !== 0 || OvlState.viewMode !== 'bilingual') return;
+        const leftPane = document.getElementById('ovlVisualPane');
+        const rightPane = document.getElementById('ovlVisualPaneMirror');
+        if (!leftPane || !rightPane) return;
+        // 联动前先清掉右侧自身的既有点选状态——理由跟 ovlBilingualGutterSyncFromMirrorCommit()
+        // 里清左侧同一条纪律，避免"上一次点右边留下的 .ovl-ln-sel"和"这一次因为点左边而画出来
+        // 的 .ovl-ln-bisel"同屏叠两条高亮。放在最前面、无条件执行，覆盖下面所有早退分支
+        // （不管这次点击最终算不算数，右侧自身的旧选中态都该先清掉）。
+        if (typeof ovlGutterClearSelectionMirror === 'function') ovlGutterClearSelectionMirror();
+        let lo = -1, hi = -1;
+        // D4 实测结论（见本组头部大注释）：viewMode==='bilingual' 时 editorMode 恒为
+        // 'visual'，下面的 else 分支在当前 UI 下不可达，保留是防御性写法。
+        if (OvlState.editorMode === 'visual') {
+            const b = ovlVisualBlockAtClientY(e.clientY);
+            if (b < 0) { OvlBilingualGutterSync.active = false; ovlBilingualGutterSyncRepaint(); return; }
+            const blocks = leftPane.querySelectorAll('.ovl-visual-block[data-src-line]');
+            const blockEl = blocks[b];
+            if (!blockEl) { OvlBilingualGutterSync.active = false; ovlBilingualGutterSyncRepaint(); return; }
+            lo = parseInt(blockEl.getAttribute('data-src-line'), 10);
+            const hiRaw = parseInt(blockEl.getAttribute('data-src-line-end'), 10);
+            hi = isFinite(hiRaw) ? hiRaw : lo;
+        } else {
+            const line = ovlGutterLineAtClientY(e.clientY);
+            if (line < 0) { OvlBilingualGutterSync.active = false; ovlBilingualGutterSyncRepaint(); return; }
+            const found = ovlBilingualBlockRangeForLine(leftPane, line);
+            if (!found) { OvlBilingualGutterSync.active = false; ovlBilingualGutterSyncRepaint(); return; }
+            lo = found.lo; hi = found.hi;
+        }
+        const matched = ovlBilingualBlockRangeForStart(rightPane, lo);
+        if (!matched) { OvlBilingualGutterSync.active = false; ovlBilingualGutterSyncRepaint(); return; }
+        OvlBilingualGutterSync.active = true;
+        OvlBilingualGutterSync.lo = lo;
+        OvlBilingualGutterSync.hi = hi;
+        OvlBilingualGutterSync.origin = 'left';
+        ovlBilingualGutterSyncRepaint();
+    });
 }
 
 // Code 模式：把 textarea 里某个字符位置换算成屏幕像素坐标。复用既有的 .ovl-code-mirror +
@@ -63540,6 +63888,8 @@ function ovlBindPassD() {
         ovlBindFloatRelayout(); // Pass P31：工具条/翻译框统一避让布局器的重新布局触发器
         ovlBindGutterSelect(); // v2 Pass P7：gutter 行号点选 + 拖拽扩选
         ovlBindVisualGutterSelect(); // v2 Pass P11：同一根 gutter，Visual 模式那一半点选
+        ovlBindGutterSelectMirror(); // v2 Pass P193：镜像 gutter 行号点选（此前右侧一个监听器都没有）
+        ovlBindBilingualGutterSync(); // v2 Pass P193：左侧 gutter 点击 -> 驱动右侧跨面板高亮联动
         const visPane = document.getElementById('ovlVisualPane');
         if (visPane) visPane.addEventListener('scroll', ovlSyncVisualGutterScroll);
         // v2 Pass P175 修复：跟上面同一条绑定纪律，补上双语对照模式右侧镜像面板缺失的
