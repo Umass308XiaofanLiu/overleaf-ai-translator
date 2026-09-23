@@ -4951,7 +4951,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.39.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.39.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-22';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -8399,10 +8399,10 @@ function focusCheckboxHtml(idx, side, variant) {
             + '想只关注一个词或短语，就在编辑框里选中它，弹窗里也有同一颗复选框。';
         const cls = 'focus-chip' + (variant === 'row' ? ' focus-row-chip' : '') + (on ? ' is-on' : '');
         return '<label data-focus-cb data-focus-key="' + idx + '|' + side + '" class="' + cls + '"'
-            + ' onclick="event.stopPropagation();"'
+            + ' data-ovl-onclick="event.stopPropagation();"'
             + ' data-tip="' + escapeAttr(tip) + '" data-tip-pos="' + (variant === 'row' ? 'left' : 'bottom-start') + '">'
             + '<input type="checkbox"' + (on ? ' checked' : '')
-            + ' onclick="event.stopPropagation();focusToggleRow(' + idx + ',\'' + side + '\',this);">'
+            + ' data-ovl-onclick="event.stopPropagation();focusToggleRow(' + idx + ',\'' + side + '\',this);">'
             + '<span class="focus-chip-t">关注</span>'
             + '</label>';
     } catch (e) {
@@ -14157,7 +14157,18 @@ async function handleTranslate(opts) {
             }
             let go = false;
             try {
-                go = window.confirm('第 ' + (AppState.activeIndex + 1) + ' 行还有没保存的修改。\n\n'
+                // P196：不能直接用裸 window.confirm——handleTranslate 这段脚本永远跑在主窗口，
+                // 而 window 在这里恒定指主窗口。面板弹出到独立窗口之后，裸 window.confirm 会把
+                // 原生确认框弹在用户看不见的主窗口里（用户正盯着弹出的子窗口），而不是他实际在
+                // 看的那个窗口——这条本来就该走 ovlConfirmDialog（见文件顶部规则），但这里改成
+                // 异步弹窗需要重排这一段的控制流，改动面明显超出本次弹出修复的范围，所以只做
+                // 最小修正：用 #root 当前实际所在的那个 window（ovlDocOf/ovlWinOf，弹出/对话窗
+                // 等其它跨文档场景已经在用同一对工具函数）弹这个原生 confirm，保证它出现在用户
+                // 正在看的那扇窗口里；native confirm 本身是否该换成 ovlConfirmDialog 留作已知
+                // 限制单独上报。
+                const __p196RootEl = document.getElementById('root');
+                const __p196ConfirmWin = (typeof ovlWinOf === 'function' && __p196RootEl) ? ovlWinOf(__p196RootEl) : window;
+                go = __p196ConfirmWin.confirm('第 ' + (AppState.activeIndex + 1) + ' 行还有没保存的修改。\n\n'
                     + 'TRANSLATE 会把整篇译文换成新的一版，这处修改会被丢掉，而且找不回来。\n\n'
                     + '确定 = 丢弃它并继续；取消 = 先回去点 Update 保存。');
             } catch (e) { go = false; }
@@ -16736,7 +16747,12 @@ async function handleRegenerateAll() {
         if (dirty) {
             let go = false;
             try {
-                go = window.confirm('第 ' + (AppState.activeIndex + 1) + ' 行还有没保存的修改。\n\n'
+                // P196：同 handleTranslate 那处一样，弹在 #root 当前实际所在的 window，
+                // 见那边的注释——原生 confirm 永远跑在调用脚本所在的主窗口，不改的话弹出
+                // 期间这个确认框会出现在用户看不见的那扇窗口里。
+                const __p196RootEl = document.getElementById('root');
+                const __p196ConfirmWin = (typeof ovlWinOf === 'function' && __p196RootEl) ? ovlWinOf(__p196RootEl) : window;
+                go = __p196ConfirmWin.confirm('第 ' + (AppState.activeIndex + 1) + ' 行还有没保存的修改。\n\n'
                     + '「重新生成所有翻译」会把整篇译文换成新的一版，这处修改会被丢掉，而且找不回来。\n\n'
                     + '确定 = 丢弃它并继续；取消 = 先回去点 Update 保存。');
             } catch (e) { go = false; }
@@ -16790,7 +16806,9 @@ async function handleRegenerateAll() {
     if (onScreenHead && regenHead.slice(0, onScreenHead.length) !== onScreenHead) {
         let go = false;
         try {
-            go = window.confirm('「重新生成所有翻译」将用另一份文档的内容替换当前这份译文。\n\n'
+            const __p196RootEl2 = document.getElementById('root');
+            const __p196ConfirmWin2 = (typeof ovlWinOf === 'function' && __p196RootEl2) ? ovlWinOf(__p196RootEl2) : window;
+            go = __p196ConfirmWin2.confirm('「重新生成所有翻译」将用另一份文档的内容替换当前这份译文。\n\n'
                 + '当前第一句：' + String(AppState.translationPairs[0].src).slice(0, 60) + '\n'
                 + '将要翻译的：' + String(regenSource).slice(0, 60) + '\n\n'
                 + '确定要继续吗？（当前这份会先存进历史记录，可从「历史」菜单找回）');
@@ -18621,7 +18639,7 @@ function renderErrorBanner() {
         <div class="fixed top-4 left-1/2 -translate-x-1/2 z-[100] bg-rose-50 border border-rose-200 text-rose-700 px-4 py-3 rounded-xl shadow-2xl flex items-center gap-3 animate-in fade-in slide-in-from-top-4 max-w-lg">
             ${Icons.AlertCircle}
             <span class="text-xs font-medium">${escapeHtml(AppState.error)}</span>
-            <button onclick="setState({error:null})" class="ml-2 hover:bg-rose-100 p-1 rounded-full">${Icons.XSmall}</button>
+            <button data-ovl-onclick="setState({error:null})" class="ml-2 hover:bg-rose-100 p-1 rounded-full">${Icons.XSmall}</button>
         </div>
     `;
 }
@@ -18637,7 +18655,7 @@ function renderToast() {
     }[AppState.toast.type] || 'bg-slate-50 border-slate-200 text-slate-700';
 
     return `
-        <div class="fixed top-16 left-1/2 -translate-x-1/2 z-[100] ${bgColor} border px-5 py-3 rounded-xl shadow-xl flex items-center gap-3 backdrop-blur-sm bg-opacity-95 transition-all duration-300" onclick="setState({toast:null})">
+        <div class="fixed top-16 left-1/2 -translate-x-1/2 z-[100] ${bgColor} border px-5 py-3 rounded-xl shadow-xl flex items-center gap-3 backdrop-blur-sm bg-opacity-95 transition-all duration-300" data-ovl-onclick="setState({toast:null})">
             <span class="text-sm font-medium">${escapeHtml(AppState.toast.message)}</span>
         </div>
     `;
@@ -18671,7 +18689,7 @@ function renderModelRefreshChip(group) {
             <span class="w-1.5 h-1.5 rounded-full shrink-0 ${dotClass}"></span>
             <span class="font-semibold text-slate-600">${group.label}</span>
             <span class="truncate max-w-[150px]">${escapeHtml(text)}</span>
-            <button onclick="refreshOnlineModelsClick('${group.provider}')" ${st.status === 'loading' ? 'disabled' : ''} class="text-slate-400 hover:text-violet-600 disabled:opacity-40" title="只更新这一家">${Icons.RefreshCw}</button>
+            <button data-ovl-onclick="refreshOnlineModelsClick('${group.provider}')" ${st.status === 'loading' ? 'disabled' : ''} class="text-slate-400 hover:text-violet-600 disabled:opacity-40" title="只更新这一家">${Icons.RefreshCw}</button>
         </span>
     `;
 }
@@ -18710,7 +18728,7 @@ function renderOnlineModelCheckbox(m) {
     return `
         <div class="rounded-lg ${bg}">
         <label class="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all" title="${escapeHtml(m.id)}">
-            <input type="checkbox" ${visible ? 'checked' : ''} ${locked ? 'disabled' : ''} onchange="toggleModelVisibility('${escapeHtml(m.id)}')" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 shrink-0">
+            <input type="checkbox" ${visible ? 'checked' : ''} ${locked ? 'disabled' : ''} data-ovl-onchange="toggleModelVisibility('${escapeHtml(m.id)}')" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-indigo-600 focus:ring-indigo-500 shrink-0">
             <span class="flex flex-col min-w-0 flex-1 gap-0.5">
                 <span class="flex items-start gap-1 min-w-0">
                     <span class="text-xs font-medium ${m.iconClass} break-words leading-snug min-w-0 flex-1">${escapeHtml(m.name)}</span>
@@ -18735,7 +18753,7 @@ function renderSettingsTabBar(activeTab) {
                 <div class="px-5 pt-2 border-b border-slate-100 bg-slate-50 shrink-0">
                     <div id="settingsTabBar" class="flex items-end gap-1 flex-wrap">
                         ${SETTINGS_TABS.map(t => `
-                        <button type="button" data-settings-tab="${t.id}" onclick="setSettingsTab('${t.id}')" class="settings-tab-btn${activeTab === t.id ? ' is-active' : ''}" data-tip="${escapeAttr(t.tip)}" data-tip-pos="bottom-start">${escapeHtml(t.label)}</button>
+                        <button type="button" data-settings-tab="${t.id}" data-ovl-onclick="setSettingsTab('${t.id}')" class="settings-tab-btn${activeTab === t.id ? ' is-active' : ''}" data-tip="${escapeAttr(t.tip)}" data-tip-pos="bottom-start">${escapeHtml(t.label)}</button>
                         `).join('')}
                     </div>
                 </div>`;
@@ -18764,12 +18782,12 @@ function renderSettingsDisplaySections() {
                             <div class="flex-grow flex items-center gap-3" data-tip="向左更紧凑、向右更宽松（${ROW_GAP_MIN}–${ROW_GAP_MAX}px）。松开鼠标即保存，刷新后仍然生效。" data-tip-pos="bottom">
                                 <span class="text-[10px] text-slate-400 shrink-0 whitespace-nowrap">紧凑</span>
                                 <input type="range" id="rowGapSlider" min="${ROW_GAP_MIN}" max="${ROW_GAP_MAX}" step="1" value="${gap}"
-                                    oninput="handleRowGapInput(this.value)" onchange="commitRowGap(this.value)"
+                                    data-ovl-oninput="handleRowGapInput(this.value)" data-ovl-onchange="commitRowGap(this.value)"
                                     class="flex-grow accent-indigo-600 cursor-pointer h-1.5">
                                 <span class="text-[10px] text-slate-400 shrink-0 whitespace-nowrap">宽松</span>
                             </div>
                             <span id="rowGapValue" class="text-[10px] font-mono font-bold text-indigo-600 w-10 text-right shrink-0">${gap}px</span>
-                            <button onclick="resetRowGap()" class="px-2 py-1 text-[10px] font-bold text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors shrink-0" data-tip="把行距恢复成默认的 ${ROW_GAP_DEFAULT}px。" data-tip-pos="left">恢复默认</button>
+                            <button data-ovl-onclick="resetRowGap()" class="px-2 py-1 text-[10px] font-bold text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors shrink-0" data-tip="把行距恢复成默认的 ${ROW_GAP_DEFAULT}px。" data-tip-pos="left">恢复默认</button>
                         </div>
                     </div>
 
@@ -18788,7 +18806,7 @@ function renderSettingsDisplaySections() {
                              实测 left 时气泡 240px 里有 224px 在裁剪框外，只剩贴着左边缘的一道黑条。
                              同一页两个分节标题用的就是 bottom-start，整只气泡都在裁剪框内。 -->
                         <label id="crossHighlightToggleRow" class="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all ${AppState.crossHighlightEnabled ? 'bg-teal-50' : ''}" data-tip="${escapeAttr('关掉后，选中文字时不再向模型多发一次请求，另一侧也不再高亮。默认开启。')}" data-tip-pos="bottom-start">
-                            <input type="checkbox" ${AppState.crossHighlightEnabled ? 'checked' : ''} onchange="setCrossHighlightEnabled(this.checked)" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-teal-600 focus:ring-teal-500 shrink-0">
+                            <input type="checkbox" ${AppState.crossHighlightEnabled ? 'checked' : ''} data-ovl-onchange="setCrossHighlightEnabled(this.checked)" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-teal-600 focus:ring-teal-500 shrink-0">
                             <span class="text-xs font-medium text-slate-700 leading-snug min-w-0 flex-1">
                                 启用跨栏对应高亮
                                 <span class="block text-[10px] text-slate-400 font-normal mt-0.5">${escapeHtml('关掉它可以省下这一次额外的模型调用（同义词/语法那几个功能不受影响）。')}</span>
@@ -18807,7 +18825,7 @@ function renderSettingsDisplaySections() {
                         <p class="text-[10px] text-slate-400 mb-3">拖动本窗口<b>右边缘</b>那条竖线即可改宽（双击它直接恢复默认）。可用范围 ${SETTINGS_MODAL_MIN_WIDTH}–${SETTINGS_MODAL_MAX_WIDTH}px，实际还会被屏幕宽度的 95% 兜住。</p>
                         <div class="flex items-center gap-3">
                             <span class="text-[10px] text-slate-500">当前：<b class="font-mono text-indigo-600">${width}px</b></span>
-                            <button onclick="resetSettingsModalWidthFromPanel()" class="px-2 py-1 text-[10px] font-bold text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors" data-tip="把窗口宽度恢复成默认的 ${SETTINGS_MODAL_DEFAULT_WIDTH}px（等同于双击右边缘那条竖线）。" data-tip-pos="right">恢复默认宽度</button>
+                            <button data-ovl-onclick="resetSettingsModalWidthFromPanel()" class="px-2 py-1 text-[10px] font-bold text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors" data-tip="把窗口宽度恢复成默认的 ${SETTINGS_MODAL_DEFAULT_WIDTH}px（等同于双击右边缘那条竖线）。" data-tip-pos="right">恢复默认宽度</button>
                         </div>
                     </div>`;
 }
@@ -18834,8 +18852,8 @@ function renderSettingsEditingExtraSections() {
                                 <textarea id="settingsCustomPrompt_${type}" rows="3" class="w-full text-xs p-2 border border-slate-200 rounded-lg bg-slate-50 focus:bg-white focus:ring-1 focus:ring-${colorClass}-400 outline-none resize-none custom-scrollbar" placeholder="${escapeHtml(defaultPrompt)}">${escapeHtml(currentPrompt)}</textarea>
                             </div>
                             <div class="flex items-center justify-end gap-2 mt-1.5">
-                                <button onclick="resetSettingsCustomPrompt('${type}')" class="px-2 py-1 text-[10px] font-bold text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded transition-colors" data-tip="清空这段自定义提示词，回到内置版本。" data-tip-pos="top-end">重置</button>
-                                <button onclick="saveSettingsCustomPrompt('${type}')" class="px-2.5 py-1 text-[10px] font-bold text-white bg-${colorClass}-600 hover:bg-${colorClass}-700 rounded transition-colors" data-tip="保存这段提示词（写进浏览器本地存储，刷新后仍然生效）。" data-tip-pos="top-end">保存</button>
+                                <button data-ovl-onclick="resetSettingsCustomPrompt('${type}')" class="px-2 py-1 text-[10px] font-bold text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded transition-colors" data-tip="清空这段自定义提示词，回到内置版本。" data-tip-pos="top-end">重置</button>
+                                <button data-ovl-onclick="saveSettingsCustomPrompt('${type}')" class="px-2.5 py-1 text-[10px] font-bold text-white bg-${colorClass}-600 hover:bg-${colorClass}-700 rounded transition-colors" data-tip="保存这段提示词（写进浏览器本地存储，刷新后仍然生效）。" data-tip-pos="top-end">保存</button>
                             </div>
                         </div>`;
     };
@@ -18850,7 +18868,7 @@ function renderSettingsEditingExtraSections() {
                         </div>
                         <p class="text-[10px] text-slate-400 mb-3">${escapeHtml('旧协议要求模型把原文和译文一起塞进 JSON 字符串里回来，而反斜杠在 JSON 里必须转义 —— 模型做不到一致，\\ref 会变成「回车+ef」、\\begin 会变成「退格+egin」，而且这些都是合法转义，界面上不报错。哨兵协议改成纯文本往返：公式/引用/交叉引用先换成 [[1]] 这样的占位符，回来逐个核对，占位符少一个就自动重试，实在不行那一行会标出来。核对范围仅限占位符：\\emph / \\textbf / \\caption 这类花括号里装的是正文、必须让模型看见的命令没有占位符保护，模型漏抄了也查不出来。对全部五家 provider（本地模型、Gemini、Qwen、OpenAI、Claude）都生效；OpenAI/Claude 这两家是后接入的，哨兵协议出问题时会自动回退旧协议，不会因此彻底翻不动。')}</p>
                         <label class="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all ${AppState.sentinelTransport ? 'bg-rose-50' : ''}" data-tip="${escapeAttr('关掉后逐字回到旧的 JSON 协议（也就是这次改动之前的行为）。只在怀疑新协议出问题时才需要关。')}" data-tip-pos="bottom-start">
-                            <input type="checkbox" ${AppState.sentinelTransport ? 'checked' : ''} onchange="setSentinelTransport(this.checked)" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-rose-600 focus:ring-rose-500 shrink-0">
+                            <input type="checkbox" ${AppState.sentinelTransport ? 'checked' : ''} data-ovl-onchange="setSentinelTransport(this.checked)" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-rose-600 focus:ring-rose-500 shrink-0">
                             <span class="text-xs font-medium text-slate-700 leading-snug min-w-0 flex-1">
                                 使用哨兵传输协议（推荐）
                                 <span class="block text-[10px] text-slate-400 font-normal mt-0.5">${escapeHtml('实测：\\cite / \\ref / $…$ / equation 环境这些被占位符保护的部分零丢失；\\emph / \\textbf 这类未保护命令仍有约 0.2%–2% 的漏抄率（三条链路都测到过），既不会重试也不会标记 —— 需要逐字精确的稿子请自己复核。长文本比旧协议快 2–4 倍（不再要求模型把原文抄一遍）。')}</span>
@@ -18883,12 +18901,12 @@ function renderSettingsEditingExtraSections() {
                             <div class="flex items-center gap-2">
                                 <div class="flex items-center bg-slate-100 rounded-lg p-0.5">
                                     ${[1, 3, 5, 10].map(min => `
-                                    <button onclick="setAutoSaveInterval(${min * 60 * 1000})" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${AppState.autoSaveInterval === min * 60 * 1000 ? 'bg-white text-emerald-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}" data-tip="每 ${min} 分钟自动存一次。" data-tip-pos="top">${min} 分钟</button>
+                                    <button data-ovl-onclick="setAutoSaveInterval(${min * 60 * 1000})" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${AppState.autoSaveInterval === min * 60 * 1000 ? 'bg-white text-emerald-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}" data-tip="每 ${min} 分钟自动存一次。" data-tip-pos="top">${min} 分钟</button>
                                     `).join('')}
                                 </div>
                                 <div class="flex items-center gap-1" data-tip="想要 1/3/5/10 之外的间隔就填这里（单位：分钟），填完点 OK。" data-tip-pos="left">
                                     <input type="number" id="settingsAutoSaveInput" min="1" class="w-12 text-xs p-1 border border-slate-200 rounded text-center bg-slate-50" placeholder="${autoSaveMin}">
-                                    <button onclick="applySettingsAutoSave()" class="px-2 py-1 bg-emerald-500 hover:bg-emerald-600 text-white text-[10px] font-bold rounded transition-colors">OK</button>
+                                    <button data-ovl-onclick="applySettingsAutoSave()" class="px-2 py-1 bg-emerald-500 hover:bg-emerald-600 text-white text-[10px] font-bold rounded transition-colors">OK</button>
                                 </div>
                             </div>
                         </div>
@@ -18906,11 +18924,11 @@ function renderSettingsEditingExtraSections() {
                             <span class="text-xs text-slate-600 font-medium">最多保留最近</span>
                             <div class="flex items-center bg-slate-100 rounded-lg p-0.5">
                                 ${[5, 10, 20].map(limit => `
-                                <button onclick="setHistoryLimit(${limit})" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all ${AppState.historyLimit === limit ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}" data-tip="只保留最近 ${limit} 次会话快照。" data-tip-pos="top">${limit}</button>
+                                <button data-ovl-onclick="setHistoryLimit(${limit})" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all ${AppState.historyLimit === limit ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}" data-tip="只保留最近 ${limit} 次会话快照。" data-tip-pos="top">${limit}</button>
                                 `).join('')}
                                 <div class="w-px h-3 bg-slate-200 mx-1"></div>
                                 <span data-tip="要别的条数就直接在这里改（≥1），失焦即生效。" data-tip-pos="left">
-                                    <input type="number" id="settingsHistoryLimitInput" min="1" value="${AppState.historyLimit}" class="w-8 bg-transparent text-[10px] font-bold text-center outline-none text-slate-600 border-none" onchange="setHistoryLimitCustom(this.value)">
+                                    <input type="number" id="settingsHistoryLimitInput" min="1" value="${AppState.historyLimit}" class="w-8 bg-transparent text-[10px] font-bold text-center outline-none text-slate-600 border-none" data-ovl-onchange="setHistoryLimitCustom(this.value)">
                                 </span>
                             </div>
                         </div>
@@ -18979,7 +18997,7 @@ function xportReasoningControlHtml(id, caps) {
     if (ctl.kind === 'toggle') {
         const btn = function (val, label) {
             const active = (val === 'off') ? !on : on;
-            return '<button onclick="setModelReasoning(\'' + id + '\',\'' + val + '\')" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all '
+            return '<button data-ovl-onclick="setModelReasoning(\'' + id + '\',\'' + val + '\')" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all '
                 + (active ? 'bg-white text-purple-600 shadow-sm' : 'text-slate-400 hover:text-slate-600') + '">' + label + '</button>';
         };
         return '<span class="flex items-center gap-1.5" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top-end">'
@@ -18994,7 +19012,7 @@ function xportReasoningControlHtml(id, caps) {
     }).join('');
     return '<span class="flex items-center gap-1.5" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top-end">'
         + '<span class="text-[10px] text-slate-500 font-medium">推理</span>'
-        + '<select onchange="setModelReasoning(\'' + id + '\', this.value)" class="text-[10px] font-bold text-purple-600 bg-slate-100 border-none rounded-lg py-0.5 pl-2 pr-6 outline-none cursor-pointer">'
+        + '<select data-ovl-onchange="setModelReasoning(\'' + id + '\', this.value)" class="text-[10px] font-bold text-purple-600 bg-slate-100 border-none rounded-lg py-0.5 pl-2 pr-6 outline-none cursor-pointer">'
         + opts + '</select></span>';
 }
 
@@ -19036,10 +19054,19 @@ function xportCapsRowHtml(modelId) {
 // reasoning_effort 语义天生按场景取舍；DashScope 的 thinking_budget 更像模型固有属性）。
 // 规则（T0 拍板）：hybrid 正常可调；always（qwq-plus）只读常开；none/未知置灰禁用 + tooltip 说明
 // 原因（不隐藏——用户明确抱怨过"不可调"看不出为什么）。
-function qwenThinkingControlHtml(id) {
+function qwenThinkingControlHtml(id, useDelegatedAttr) {
     try {
         const sid = sanitizeModelId(id);
         if (!sid) return '';
+        // P196：这个函数被两处共用——Settings 弹窗里的调用（qwenCapsRowHtml，#root 子树，
+        // 弹出后要靠事件委托才能继续响应）和对话窗参数条的调用（chatReasoningBarHtml，
+        // #aiChatRoot，永远待在主文档、从不搬迁）。P196 D1 改名时误把这个共享函数的
+        // onchange 一并改成了 data-ovl-onchange，而委托只绑在 #root 上——#aiChatRoot 是
+        // 同级节点不是它的后代，原生 onchange 属性名一变就再也没有任何监听会响应，
+        // 「思考」勾选框看起来点得动、状态却永远不落地（P196 回归测试 A3b/A4 实测抓到）。
+        // 用调用方显式传入的第二个参数区分：省略/非 false=Settings 那条路径（用委托属性名），
+        // 显式传 false=对话窗那条路径（用原生 onchange，靠主文档从不搬迁这条事实直接生效）。
+        const onchangeAttr = (useDelegatedAttr === false) ? 'onchange' : 'data-ovl-onchange';
         const caps = getModelCaps('qwen', sid);
         const kind = (caps && caps.thinking) || 'none';
         if (kind === 'none') {
@@ -19064,11 +19091,11 @@ function qwenThinkingControlHtml(id) {
             + '默认不勾选=完全不发送这两个字段，与改动前行为逐字节一致。勾选后发 enable_thinking:true；'
             + '预算留空=不发 thinking_budget（用模型自己的固有上限），填了则夹在 1–' + budgetMax + '（官方参数合法区间）内发送。';
         let html = '<span class="inline-flex items-center gap-1 flex-wrap" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top">'
-            + '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' onchange="setQwenThinkingEnabled(\'' + escapeAttr(sid) + '\', this.checked)" class="w-3.5 h-3.5 rounded border-slate-300 text-purple-600 focus:ring-purple-500">'
+            + '<input type="checkbox" ' + (enabled ? 'checked' : '') + ' ' + onchangeAttr + '="setQwenThinkingEnabled(\'' + escapeAttr(sid) + '\', this.checked)" class="w-3.5 h-3.5 rounded border-slate-300 text-purple-600 focus:ring-purple-500">'
             + '<span class="text-[10px] text-slate-500 font-medium">思考</span>';
         if (enabled) {
             html += '<input type="number" min="1" max="' + budgetMax + '" step="1" placeholder="预算(留空=模型默认)" value="' + escapeAttr(String(budget))
-                + '" onchange="setQwenThinkingBudget(\'' + escapeAttr(sid) + '\', this.value)" class="w-24 text-[10px] border border-slate-200 rounded px-1 py-0.5">';
+                + '" ' + onchangeAttr + '="setQwenThinkingBudget(\'' + escapeAttr(sid) + '\', this.value)" class="w-24 text-[10px] border border-slate-200 rounded px-1 py-0.5">';
         }
         html += '</span>';
         return html;
@@ -19092,7 +19119,7 @@ function qwenMaxOutputControlHtml(id) {
         return '<span class="inline-flex items-center gap-1" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top">'
             + '<span class="text-[10px] text-slate-500 font-medium">最大输出</span>'
             + '<input type="number" min="1"' + (capMax ? (' max="' + capMax + '"') : '') + ' placeholder="' + escapeAttr(placeholder)
-            + '" value="' + (saved !== null ? escapeAttr(String(saved)) : '') + '" onchange="setQwenMaxOutput(\'' + escapeAttr(sid) + '\', this.value)"'
+            + '" value="' + (saved !== null ? escapeAttr(String(saved)) : '') + '" data-ovl-onchange="setQwenMaxOutput(\'' + escapeAttr(sid) + '\', this.value)"'
             + ' class="w-20 text-[10px] border border-slate-200 rounded px-1 py-0.5"></span>';
     } catch (e) { return ''; }
 }
@@ -19252,7 +19279,7 @@ function surfaceReasoningHtml(surface, provider, model, cur) {
             // 多档模型点「开」时落到 medium（它一定在 allowed 里，否则不会被列出来）。
             const target = (pair[0] === 'on' && ctl.kind === 'select')
                 ? (ctl.levels.indexOf('medium') !== -1 ? 'medium' : ctl.levels[0]) : pair[0];
-            html += '<button onclick="' + fn + '(' + arg + '\'' + escapeAttr(target) + '\')"'
+            html += '<button data-ovl-onclick="' + fn + '(' + arg + '\'' + escapeAttr(target) + '\')"'
                 + ' class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all '
                 + (active ? 'bg-white text-purple-600 shadow-sm' : 'text-slate-400 hover:text-slate-600') + '">'
                 + escapeHtml(pair[1]) + '</button>';
@@ -19263,7 +19290,7 @@ function surfaceReasoningHtml(surface, provider, model, cur) {
                 return '<option value="' + escapeAttr(v) + '"' + (v === cur ? ' selected' : '') + '>'
                     + escapeHtml(XPORT_EFFORT_LABEL[v] || v) + '</option>';
             }).join('');
-            html += '<select onchange="' + fn + '(' + arg + ' this.value)"'
+            html += '<select data-ovl-onchange="' + fn + '(' + arg + ' this.value)"'
                 + ' class="text-[10px] font-bold text-purple-600 bg-slate-100 border-none rounded-lg py-0.5 pl-2 pr-5 outline-none cursor-pointer shrink-0">'
                 + opts + '</select>';
         }
@@ -19288,7 +19315,7 @@ function surfaceDefaultRowHtml(surface) {
         let html = '<div class="flex items-center gap-2 flex-wrap py-1.5" data-surface-default="' + escapeAttr(surface) + '">'
             + '<span class="text-[11px] font-bold text-slate-600 w-10 shrink-0">' + (isChat ? '对话' : '翻译') + '</span>'
             + '<span data-tip="' + escapeAttr(modelTip) + '" data-tip-pos="top-start">'
-            + '<select onchange="' + (isChat ? 'setChatDefaultModel' : 'setTranslateDefaultModel') + '(this.value)"'
+            + '<select data-ovl-onchange="' + (isChat ? 'setChatDefaultModel' : 'setTranslateDefaultModel') + '(this.value)"'
             + ' class="text-[10px] font-semibold text-slate-600 bg-slate-100 border-none rounded-lg py-1 pl-2 pr-6 outline-none cursor-pointer max-w-[200px]">'
             + surfaceModelOptionsHtml(cur.provider, cur.model) + '</select></span>'
             + surfaceReasoningHtml(surface, cur.provider, cur.model, curReason);
@@ -19301,9 +19328,9 @@ function surfaceDefaultRowHtml(surface) {
                 + '" data-tip-pos="top-end">'
                 + '<span class="text-[10px] text-slate-500 font-medium shrink-0">显示思考过程</span>'
                 + '<span class="flex items-center bg-slate-100 rounded-lg p-0.5 shrink-0">'
-                + '<button onclick="setChatShowThinking(false)" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all '
+                + '<button data-ovl-onclick="setChatShowThinking(false)" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all '
                 + (ChatDefaults.showThinking ? 'text-slate-400 hover:text-slate-600' : 'bg-white text-purple-600 shadow-sm') + '">关</button>'
-                + '<button onclick="setChatShowThinking(true)" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all '
+                + '<button data-ovl-onclick="setChatShowThinking(true)" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all '
                 + (ChatDefaults.showThinking ? 'bg-white text-purple-600 shadow-sm' : 'text-slate-400 hover:text-slate-600') + '">开</button>'
                 + '</span></span>';
 
@@ -19315,9 +19342,9 @@ function surfaceDefaultRowHtml(surface) {
                 + '" data-tip-pos="top-end">'
                 + '<span class="text-[10px] text-slate-500 font-medium shrink-0">跳过审批</span>'
                 + '<span class="flex items-center bg-slate-100 rounded-lg p-0.5 shrink-0">'
-                + '<button onclick="setChatAutoApprove(false)" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all '
+                + '<button data-ovl-onclick="setChatAutoApprove(false)" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all '
                 + (ChatDefaults.autoApprove ? 'text-slate-400 hover:text-slate-600' : 'bg-white text-purple-600 shadow-sm') + '">关</button>'
-                + '<button onclick="setChatAutoApprove(true)" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all '
+                + '<button data-ovl-onclick="setChatAutoApprove(true)" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all '
                 + (ChatDefaults.autoApprove ? 'bg-white text-purple-600 shadow-sm' : 'text-slate-400 hover:text-slate-600') + '">开</button>'
                 + '</span></span>';
         }
@@ -19330,7 +19357,7 @@ function surfaceDefaultRowHtml(surface) {
         } catch (e) { has = false; }
         const already = (cur.provider === rec.provider && cur.model === rec.model);
         if (has && !already) {
-            html += '<button onclick="applyRecommendedDefault(\'' + escapeAttr(surface) + '\')"'
+            html += '<button data-ovl-onclick="applyRecommendedDefault(\'' + escapeAttr(surface) + '\')"'
                 + ' class="text-[10px] font-bold text-indigo-500 hover:text-indigo-700 underline decoration-dotted shrink-0"'
                 + ' data-tip="' + escapeAttr('切到推荐值 ' + rec.model + '（推理设为「'
                     + (XPORT_EFFORT_LABEL[rec.reasoning] || rec.reasoning) + '」）。依据：' + rec.why
@@ -19514,7 +19541,7 @@ function renderSettingsModal() {
                     <h3 class="text-sm font-bold text-slate-700 flex items-center gap-2">
                         ${Icons.SettingsGear} Settings
                     </h3>
-                    <button onclick="closeSettings()" class="text-slate-400 hover:text-slate-600" data-tip="关闭设置。已点过「保存」的内容都已生效；没点保存的输入框会丢弃。" data-tip-pos="left">${Icons.X}</button>
+                    <button data-ovl-onclick="closeSettings()" class="text-slate-400 hover:text-slate-600" data-tip="关闭设置。已点过「保存」的内容都已生效；没点保存的输入框会丢弃。" data-tip-pos="left">${Icons.X}</button>
                 </div>
 ${renderSettingsTabBar(activeTab)}
                 <!-- mr-2.5 = 拖拽手柄的 w-2.5：把整个滚动容器（连同它右内缘那条 6px 的 custom-scrollbar）
@@ -19534,7 +19561,7 @@ ${renderSettingsTabBar(activeTab)}
                                 </div>
                                 <span class="text-xs font-bold text-slate-600 uppercase tracking-wide">Online Models Visibility</span>
                             </div>
-                            <button onclick="refreshOnlineModelsClick('all')" ${anyRefreshing ? 'disabled' : ''} class="flex items-center gap-1.5 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-lg font-bold text-[10px] shadow-md shadow-violet-200 active:scale-95 transition-all disabled:opacity-50 shrink-0" data-tip="向三家 API 各要一次最新模型列表（要先填好对应的 Key）。新发现的模型默认不勾选，需要自己勾上。" data-tip-pos="bottom-end">
+                            <button data-ovl-onclick="refreshOnlineModelsClick('all')" ${anyRefreshing ? 'disabled' : ''} class="flex items-center gap-1.5 px-3 py-1.5 bg-violet-600 hover:bg-violet-700 text-white rounded-lg font-bold text-[10px] shadow-md shadow-violet-200 active:scale-95 transition-all disabled:opacity-50 shrink-0" data-tip="向三家 API 各要一次最新模型列表（要先填好对应的 Key）。新发现的模型默认不勾选，需要自己勾上。" data-tip-pos="bottom-end">
                                 ${anyRefreshing ? Icons.LoaderSmall : Icons.RefreshCw}
                                 ${anyRefreshing ? '更新中...' : '更新 / Refresh'}
                             </button>
@@ -19549,15 +19576,15 @@ ${renderSettingsTabBar(activeTab)}
                         <!-- 搜索 + 日期快照开关 -->
                         <div class="flex items-center gap-2 mb-3">
                             <div class="flex-grow flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 focus-within:ring-2 focus-within:ring-violet-100 transition-all" data-tip="只搜索本页这三组在线模型的 id 和名称（不搜本地模型、也不搜界面上的其它内容）。搜索时会临时把折叠起来的模型也显示出来。" data-tip-pos="bottom-start">
-                                <input type="text" id="modelSearchInput" oninput="setSettingsModelQuery(this.value)" value="${escapeAttr(AppState.settingsModelQuery)}" placeholder="搜索模型 id / 名称..." class="flex-grow bg-transparent border-none text-xs focus:ring-0 p-0 text-slate-700 outline-none">
-                                ${AppState.settingsModelQuery ? `<button onclick="setSettingsModelQuery('')" class="text-slate-400 hover:text-slate-600 ml-2">${Icons.XSmall}</button>` : ''}
+                                <input type="text" id="modelSearchInput" data-ovl-oninput="setSettingsModelQuery(this.value)" value="${escapeAttr(AppState.settingsModelQuery)}" placeholder="搜索模型 id / 名称..." class="flex-grow bg-transparent border-none text-xs focus:ring-0 p-0 text-slate-700 outline-none">
+                                ${AppState.settingsModelQuery ? `<button data-ovl-onclick="setSettingsModelQuery('')" class="text-slate-400 hover:text-slate-600 ml-2">${Icons.XSmall}</button>` : ''}
                             </div>
                             <label class="flex items-center gap-1.5 text-[10px] text-slate-500 cursor-pointer whitespace-nowrap" data-tip="OpenAI 的 gpt-x-2026-03-17 这类固定日期快照，默认过滤掉（太多且大多重复）。勾上后要再点一次「更新」才会拉进来。" data-tip-pos="left">
-                                <input type="checkbox" ${AppState.showDatedSnapshots ? 'checked' : ''} onchange="toggleDatedSnapshots()" class="w-3.5 h-3.5 rounded border-slate-300 text-violet-600 focus:ring-violet-500">
+                                <input type="checkbox" ${AppState.showDatedSnapshots ? 'checked' : ''} data-ovl-onchange="toggleDatedSnapshots()" class="w-3.5 h-3.5 rounded border-slate-300 text-violet-600 focus:ring-violet-500">
                                 日期快照
                             </label>
                             <label class="flex items-center gap-1.5 text-[10px] text-slate-500 cursor-pointer whitespace-nowrap" data-tip="Qwen(DashScope) /v1/models 原样吐出全量模型广场，默认只保留对话/视觉相关的（过滤掉图像/语音/向量/重排/OCR/omni/qwen-mt 翻译专用模型等）。勾上后要再点一次「更新」才会把被过滤的模型拉回来。" data-tip-pos="left">
-                                <input type="checkbox" ${AppState.qwenShowAllModels ? 'checked' : ''} onchange="toggleQwenShowAllModels()" class="w-3.5 h-3.5 rounded border-slate-300 text-purple-600 focus:ring-purple-500">
+                                <input type="checkbox" ${AppState.qwenShowAllModels ? 'checked' : ''} data-ovl-onchange="toggleQwenShowAllModels()" class="w-3.5 h-3.5 rounded border-slate-300 text-purple-600 focus:ring-purple-500">
                                 显示全部 Qwen 模型
                             </label>
                         </div>
@@ -19565,7 +19592,7 @@ ${renderSettingsTabBar(activeTab)}
                         ${AppState.newlyFoundIds.length > 0 ? `
                             <div class="flex items-center justify-between gap-2 mb-3 px-3 py-2 bg-violet-50 border border-violet-100 rounded-xl">
                                 <span class="text-[10px] text-violet-700 font-semibold">本次新发现 ${AppState.newlyFoundIds.length} 个模型（默认隐藏）</span>
-                                <button onclick="showAllNewlyFoundModels()" class="text-[10px] font-bold text-violet-600 hover:text-violet-800 underline shrink-0">全部显示</button>
+                                <button data-ovl-onclick="showAllNewlyFoundModels()" class="text-[10px] font-bold text-violet-600 hover:text-violet-800 underline shrink-0">全部显示</button>
                             </div>
                         ` : ''}
 
@@ -19618,21 +19645,21 @@ ${renderSettingsTabBar(activeTab)}
                                     <span class="flex items-center gap-1.5 min-w-0">
                                         <span class="text-[10px] font-bold text-slate-500 uppercase tracking-wide">${g.label} ${hasQuery ? `（搜索命中 ${g.models.length} · 已勾选 ${fullCheckedCount}/${fullTotal}）` : `(${checkedCount}/${g.models.length})`}</span>
                                         ${(g.models.length > 0 || hasQuery) ? `
-                                        <button onclick="${chevronAction}" class="flex items-center gap-1 text-slate-400 hover:text-violet-600 transition-colors shrink-0" title="${escapeAttr(chevronTitle)}">
+                                        <button data-ovl-onclick="${chevronAction}" class="flex items-center gap-1 text-slate-400 hover:text-violet-600 transition-colors shrink-0" title="${escapeAttr(chevronTitle)}">
                                             <span class="inline-flex transition-transform duration-200 ${(expanded || hasQuery) ? 'rotate-180' : ''}">${Icons.ChevronDown}</span>
                                             ${!hasQuery && !expanded && hiddenCount > 0 ? `<span class="text-[9px] font-semibold text-slate-400">还有 ${hiddenCount} 个</span>` : ''}
                                         </button>
                                         ` : ''}
                                     </span>
                                     <span class="flex items-center gap-2 shrink-0">
-                                        <button onclick="setModelVisibilityBulk('${g.provider}', true)" class="text-[10px] text-slate-400 hover:text-violet-600" data-tip="把 ${escapeAttr(g.label)} 的全部模型都勾上（含搜索框里没显示出来的）。" data-tip-pos="left">全选</button>
-                                        <button onclick="setModelVisibilityBulk('${g.provider}', false)" class="text-[10px] text-slate-400 hover:text-violet-600" data-tip="把 ${escapeAttr(g.label)} 的模型全部取消勾选，只有「正在使用中」的那个会被保留。" data-tip-pos="left">全不选</button>
+                                        <button data-ovl-onclick="setModelVisibilityBulk('${g.provider}', true)" class="text-[10px] text-slate-400 hover:text-violet-600" data-tip="把 ${escapeAttr(g.label)} 的全部模型都勾上（含搜索框里没显示出来的）。" data-tip-pos="left">全选</button>
+                                        <button data-ovl-onclick="setModelVisibilityBulk('${g.provider}', false)" class="text-[10px] text-slate-400 hover:text-violet-600" data-tip="把 ${escapeAttr(g.label)} 的模型全部取消勾选，只有「正在使用中」的那个会被保留。" data-tip-pos="left">全不选</button>
                                     </span>
                                 </div>
                                 ${g.models.length === 0 ? `
                                     <p class="text-[10px] text-slate-400 italic px-1">${modelQuery ? '没有匹配的模型。' : '暂无模型。'}</p>
                                 ` : rows.length === 0 ? `
-                                    <p class="text-[10px] text-slate-400 italic px-1 cursor-pointer hover:text-violet-600" onclick="toggleModelGroup('${g.provider}')">未勾选任何模型 · 点击展开选择</p>
+                                    <p class="text-[10px] text-slate-400 italic px-1 cursor-pointer hover:text-violet-600" data-ovl-onclick="toggleModelGroup('${g.provider}')">未勾选任何模型 · 点击展开选择</p>
                                 ` : `
                                     ${searchRevealedCount > 0 ? `<p class="text-[9px] text-violet-500 italic px-1 mb-1">搜索已临时显示 ${searchRevealedCount} 个折叠中的模型</p>` : ''}
                                     <div class="grid grid-cols-2 gap-2 ${rows.length > 8 ? 'max-h-80 overflow-y-auto custom-scrollbar pr-1' : ''}">
@@ -19642,7 +19669,7 @@ ${renderSettingsTabBar(activeTab)}
                             </div>
                         `; }).join('')}
 
-                        <button onclick="hideRetiredModels()" class="w-full mt-1 py-2 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-xl font-bold text-[10px] transition-all" data-tip="一键取消勾选所有带「未在列表」标记的模型（上次更新时 API 没返回它们，多半已下线）。只是取消勾选，随时可以再勾回来。" data-tip-pos="top">
+                        <button data-ovl-onclick="hideRetiredModels()" class="w-full mt-1 py-2 bg-slate-100 hover:bg-slate-200 text-slate-500 rounded-xl font-bold text-[10px] transition-all" data-tip="一键取消勾选所有带「未在列表」标记的模型（上次更新时 API 没返回它们，多半已下线）。只是取消勾选，随时可以再勾回来。" data-tip-pos="top">
                             隐藏所有「未在 API 列表中」的模型
                         </button>
 
@@ -19669,7 +19696,7 @@ ${renderSettingsTabBar(activeTab)}
                                 ${AppState.localModels.map(lm => `
                                     <div class="rounded-lg ${AppState.modelVisibility[lm.id] !== false ? 'bg-purple-50' : ''}">
                                     <label class="flex items-start gap-2 p-2 rounded-lg hover:bg-slate-50 cursor-pointer transition-all" title="${escapeHtml(lm.id)}">
-                                        <input type="checkbox" ${AppState.modelVisibility[lm.id] !== false ? 'checked' : ''} onchange="toggleModelVisibility('${escapeHtml(lm.id)}')" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-purple-600 focus:ring-purple-500 shrink-0">
+                                        <input type="checkbox" ${AppState.modelVisibility[lm.id] !== false ? 'checked' : ''} data-ovl-onchange="toggleModelVisibility('${escapeHtml(lm.id)}')" class="w-4 h-4 mt-0.5 rounded border-slate-300 text-purple-600 focus:ring-purple-500 shrink-0">
                                         <span class="text-xs font-medium text-purple-600 break-words leading-snug min-w-0 flex-1">${escapeHtml(lm.id)}</span>
                                     </label>
                                     <!-- B1/B2：能力芯片 + 唯一那个推理控件。刻意放在 <label> **外面** ——
@@ -19702,7 +19729,7 @@ ${renderSettingsDisplaySections()}
                             <span class="text-xs text-slate-600 font-medium">选中文本后弹窗默认打开的模式</span>
                             <div class="flex items-center bg-slate-100 rounded-lg p-0.5">
                                 ${SYNONYM_MODES.map(m => `
-                                <button onclick="setSynonymDefaultMode('${m}')" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${normalizeSynonymMode(AppState.synonymDefaultMode) === m ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr(SYNONYM_MODE_TIP[m] || '')}" data-tip-pos="bottom-end">${m === 'replace' ? '替换（默认）' : SYNONYM_MODE_LABEL[m]}</button>
+                                <button data-ovl-onclick="setSynonymDefaultMode('${m}')" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all whitespace-nowrap ${normalizeSynonymMode(AppState.synonymDefaultMode) === m ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr(SYNONYM_MODE_TIP[m] || '')}" data-tip-pos="bottom-end">${m === 'replace' ? '替换（默认）' : SYNONYM_MODE_LABEL[m]}</button>
                                 `).join('')}
                             </div>
                         </div>
@@ -19723,14 +19750,14 @@ ${renderSettingsEditingExtraSections()}
                         <div class="flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 focus-within:ring-2 focus-within:ring-indigo-100 transition-all">
                             <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>
                             <input type="password" id="geminiApiKeyInput" class="flex-grow bg-transparent border-none text-xs focus:ring-0 p-0 ml-2 text-slate-700 outline-none font-mono" value="${escapeHtml(AppState.geminiApiKey)}" placeholder="AIzaSy...">
-                            <button onclick="toggleApiKeyVisibility('geminiApiKeyInput')" class="text-slate-400 hover:text-slate-600 ml-2" title="Toggle visibility">
+                            <button data-ovl-onclick="toggleApiKeyVisibility('geminiApiKeyInput')" class="text-slate-400 hover:text-slate-600 ml-2" title="Toggle visibility">
                                 ${Icons.Eye}
                             </button>
                         </div>
                         <p class="text-[10px] text-slate-400 mt-2 px-1">
                             Get your API key from <a href="https://aistudio.google.com/apikey" target="_blank" class="text-indigo-500 hover:underline">Google AI Studio</a>
                         </p>
-                        <button onclick="saveGeminiApiKey()" class="w-full mt-3 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-indigo-200 active:scale-95 transition-all flex items-center justify-center gap-2" data-tip="保存上面这串 Key（只写进本浏览器的本地存储，不会上传到任何地方）。不点保存，刷新后就没了。" data-tip-pos="top">
+                        <button data-ovl-onclick="saveGeminiApiKey()" class="w-full mt-3 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-indigo-200 active:scale-95 transition-all flex items-center justify-center gap-2" data-tip="保存上面这串 Key（只写进本浏览器的本地存储，不会上传到任何地方）。不点保存，刷新后就没了。" data-tip-pos="top">
                             ${Icons.Save} Save API Key
                         </button>
                     </div>
@@ -19746,14 +19773,14 @@ ${renderSettingsEditingExtraSections()}
                         <div class="flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 focus-within:ring-2 focus-within:ring-teal-100 transition-all">
                             <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>
                             <input type="password" id="openaiApiKeyInput" class="flex-grow bg-transparent border-none text-xs focus:ring-0 p-0 ml-2 text-slate-700 outline-none font-mono" value="${escapeHtml(AppState.openaiApiKey)}" placeholder="sk-...">
-                            <button onclick="toggleApiKeyVisibility('openaiApiKeyInput')" class="text-slate-400 hover:text-slate-600 ml-2" title="Toggle visibility">
+                            <button data-ovl-onclick="toggleApiKeyVisibility('openaiApiKeyInput')" class="text-slate-400 hover:text-slate-600 ml-2" title="Toggle visibility">
                                 ${Icons.Eye}
                             </button>
                         </div>
                         <p class="text-[10px] text-slate-400 mt-2 px-1">
                             Get your API key from <a href="https://platform.openai.com/api-keys" target="_blank" class="text-teal-500 hover:underline">OpenAI Platform</a>
                         </p>
-                        <button onclick="saveOpenaiApiKey()" class="w-full mt-3 py-2.5 bg-teal-600 hover:bg-teal-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-teal-200 active:scale-95 transition-all flex items-center justify-center gap-2" data-tip="保存上面这串 Key（只写进本浏览器的本地存储）。不点保存，刷新后就没了。" data-tip-pos="top">
+                        <button data-ovl-onclick="saveOpenaiApiKey()" class="w-full mt-3 py-2.5 bg-teal-600 hover:bg-teal-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-teal-200 active:scale-95 transition-all flex items-center justify-center gap-2" data-tip="保存上面这串 Key（只写进本浏览器的本地存储）。不点保存，刷新后就没了。" data-tip-pos="top">
                             ${Icons.Save} Save API Key
                         </button>
                     </div>
@@ -19769,7 +19796,7 @@ ${renderSettingsEditingExtraSections()}
                         <div class="flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 focus-within:ring-2 focus-within:ring-orange-100 transition-all">
                             <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>
                             <input type="password" id="claudeApiKeyInput" class="flex-grow bg-transparent border-none text-xs focus:ring-0 p-0 ml-2 text-slate-700 outline-none font-mono" value="${escapeHtml(AppState.claudeApiKey)}" placeholder="sk-ant-...">
-                            <button onclick="toggleApiKeyVisibility('claudeApiKeyInput')" class="text-slate-400 hover:text-slate-600 ml-2" title="Toggle visibility">
+                            <button data-ovl-onclick="toggleApiKeyVisibility('claudeApiKeyInput')" class="text-slate-400 hover:text-slate-600 ml-2" title="Toggle visibility">
                                 ${Icons.Eye}
                             </button>
                         </div>
@@ -19789,7 +19816,7 @@ ${renderSettingsEditingExtraSections()}
                             </p>
                         </div>
 
-                        <button onclick="saveClaudeSettings()" class="w-full mt-3 py-2.5 bg-orange-600 hover:bg-orange-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-orange-200 active:scale-95 transition-all flex items-center justify-center gap-2">
+                        <button data-ovl-onclick="saveClaudeSettings()" class="w-full mt-3 py-2.5 bg-orange-600 hover:bg-orange-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-orange-200 active:scale-95 transition-all flex items-center justify-center gap-2">
                             ${Icons.Save} Save Claude Settings
                         </button>
                     </div>
@@ -19805,7 +19832,7 @@ ${renderSettingsEditingExtraSections()}
                         <div class="flex items-center bg-slate-50 border border-slate-200 rounded-xl px-3 py-2.5 focus-within:ring-2 focus-within:ring-purple-100 transition-all">
                             <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 7a2 2 0 012 2m4 0a6 6 0 01-7.743 5.743L11 17H9v2H7v2H4a1 1 0 01-1-1v-2.586a1 1 0 01.293-.707l5.964-5.964A6 6 0 1121 9z"/></svg>
                             <input type="password" id="qwenApiKeyInput" class="flex-grow bg-transparent border-none text-xs focus:ring-0 p-0 ml-2 text-slate-700 outline-none font-mono" value="${escapeHtml(AppState.qwenApiKey)}" placeholder="sk-...">
-                            <button onclick="toggleApiKeyVisibility('qwenApiKeyInput')" class="text-slate-400 hover:text-slate-600 ml-2" title="Toggle visibility">
+                            <button data-ovl-onclick="toggleApiKeyVisibility('qwenApiKeyInput')" class="text-slate-400 hover:text-slate-600 ml-2" title="Toggle visibility">
                                 ${Icons.Eye}
                             </button>
                         </div>
@@ -19816,7 +19843,7 @@ ${renderSettingsEditingExtraSections()}
                         <!-- Qwen Base URL：下拉选国际/国内站预设，或直接改下面文本框自定义覆盖 -->
                         <div class="mt-4 mb-3" data-tip="国际站与国内站均已实测支持浏览器直连（CORS 放行）；选一个预设，或直接改下面的地址框自定义覆盖。" data-tip-pos="bottom-start">
                             <label class="text-[10px] font-semibold text-slate-500 uppercase tracking-wide mb-2 block">服务地址（Base URL）</label>
-                            <select id="qwenBaseUrlPreset" onchange="applyQwenBaseUrlPreset(this.value)" class="w-full mb-2 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-700 outline-none focus:ring-2 focus:ring-purple-100">
+                            <select id="qwenBaseUrlPreset" data-ovl-onchange="applyQwenBaseUrlPreset(this.value)" class="w-full mb-2 bg-slate-50 border border-slate-200 rounded-xl px-3 py-2 text-xs text-slate-700 outline-none focus:ring-2 focus:ring-purple-100">
                                 <option value="https://dashscope-intl.aliyuncs.com/compatible-mode/v1" ${AppState.qwenBaseUrl === 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1' ? 'selected' : ''}>国际站（默认，dashscope-intl.aliyuncs.com）</option>
                                 <option value="https://dashscope.aliyuncs.com/compatible-mode/v1" ${AppState.qwenBaseUrl === 'https://dashscope.aliyuncs.com/compatible-mode/v1' ? 'selected' : ''}>国内站（dashscope.aliyuncs.com）</option>
                                 <option value="" ${(AppState.qwenBaseUrl !== 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1' && AppState.qwenBaseUrl !== 'https://dashscope.aliyuncs.com/compatible-mode/v1') ? 'selected' : ''}>自定义（直接编辑下面的地址框）</option>
@@ -19827,7 +19854,7 @@ ${renderSettingsEditingExtraSections()}
                             </div>
                         </div>
 
-                        <button onclick="saveQwenSettings()" class="w-full mt-3 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-purple-200 active:scale-95 transition-all flex items-center justify-center gap-2">
+                        <button data-ovl-onclick="saveQwenSettings()" class="w-full mt-3 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-purple-200 active:scale-95 transition-all flex items-center justify-center gap-2">
                             ${Icons.Save} Save Qwen Settings
                         </button>
                     </div>
@@ -19845,14 +19872,14 @@ ${renderSettingsEditingExtraSections()}
                             <input type="text" id="localUrlInput" class="flex-grow bg-transparent border-none text-xs focus:ring-0 p-0 ml-2 text-slate-700 outline-none" value="${escapeHtml(AppState.localBaseUrl)}" placeholder="http://localhost:1234">
                         </div>
                         <p class="text-[10px] text-slate-400 mt-2 px-1">Ensure your local server (e.g., LM Studio) is running and CORS is enabled.</p>
-                        <button onclick="handleConnectLocalClick()" ${AppState.isConnectingLocal ? 'disabled' : ''} class="w-full mt-3 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-purple-200 active:scale-95 transition-all flex items-center justify-center gap-2 disabled:opacity-50" data-tip="连上面这个地址并把它的模型列表拉下来，拉到的模型会出现在顶栏下拉的 Local LM Studio 分组里。" data-tip-pos="top">
+                        <button data-ovl-onclick="handleConnectLocalClick()" ${AppState.isConnectingLocal ? 'disabled' : ''} class="w-full mt-3 py-2.5 bg-purple-600 hover:bg-purple-700 text-white rounded-xl font-bold text-xs shadow-lg shadow-purple-200 active:scale-95 transition-all flex items-center justify-center gap-2 disabled:opacity-50" data-tip="连上面这个地址并把它的模型列表拉下来，拉到的模型会出现在顶栏下拉的 Local LM Studio 分组里。" data-tip-pos="top">
                             ${AppState.isConnectingLocal ? Icons.Loader2 : Icons.Plug}
                             ${AppState.isConnectingLocal ? 'Connecting...' : 'Connect & Fetch Models'}
                         </button>
                     </div>
                     </div><!-- /panel: api -->
                 </div>
-                <div class="settings-resize-handle absolute top-0 right-0 h-full w-2.5 cursor-ew-resize z-20" onmousedown="startSettingsModalResize(event)" ondblclick="resetSettingsModalWidth()" title="拖拽调整宽度（双击恢复默认）"></div>
+                <div class="settings-resize-handle absolute top-0 right-0 h-full w-2.5 cursor-ew-resize z-20" data-ovl-onmousedown="startSettingsModalResize(event)" data-ovl-ondblclick="resetSettingsModalWidth()" title="拖拽调整宽度（双击恢复默认）"></div>
             </div>
         </div>
     `;
@@ -19901,16 +19928,16 @@ function renderHeader() {
                      按钮删了、没删同步逻辑，这里重新挂上等于白捡一份现成的开关态同步，不用
                      再写一遍。故意放在 .ovl-t-actions 而不是 .ovl-t-tools——后者简化模式下
                      除 .ovl-t-langbar 外整组隐藏，AI 对话入口不该跟着消失。 -->
-                <button type="button" id="chatToggleBtn" onclick="chatToggle()" aria-pressed="${ChatState.open ? 'true' : 'false'}" class="${ChatState.open ? 'is-chat-open ' : ''}p-2.5 rounded-2xl border border-slate-200 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-all active:scale-95 flex items-center justify-center" data-tip="打开／关闭 AI 对话窗。" data-tip-pos="bottom-start">
+                <button type="button" id="chatToggleBtn" data-ovl-onclick="chatToggle()" aria-pressed="${ChatState.open ? 'true' : 'false'}" class="${ChatState.open ? 'is-chat-open ' : ''}p-2.5 rounded-2xl border border-slate-200 text-slate-500 hover:text-indigo-600 hover:bg-indigo-50 transition-all active:scale-95 flex items-center justify-center" data-tip="打开／关闭 AI 对话窗。" data-tip-pos="bottom-start">
                     ${Icons.MessageSquare}
                 </button>
                 <!-- id 是给 syncTranslateButtonState() 用的：handleInputChange 刻意不重渲染
                      （避免焦点丢失），所以这颗按钮的 disabled 必须由那边直接改到 DOM 上，
                      否则它会一直停在「输入框还是空的」那一刻算出来的值上。 -->
-                <button id="translateBtn" onclick="handleTranslate()" ${!AppState.inputText && !AppState.isLoading ? 'disabled' : ''} class="px-10 py-2.5 rounded-2xl font-black text-sm tracking-wider transition-all shadow-xl active:scale-95 flex items-center gap-2 ${!AppState.inputText && !AppState.isLoading ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isLoading ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isLoading ? '正在翻译，点一下立即中断（已翻好的部分保留）。' : '把左边输入框的全文按句拆开翻译，结果逐句出现在右栏。会覆盖当前译文。'}" data-tip-pos="bottom-end">
+                <button id="translateBtn" data-ovl-onclick="handleTranslate()" ${!AppState.inputText && !AppState.isLoading ? 'disabled' : ''} class="px-10 py-2.5 rounded-2xl font-black text-sm tracking-wider transition-all shadow-xl active:scale-95 flex items-center gap-2 ${!AppState.inputText && !AppState.isLoading ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isLoading ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isLoading ? '正在翻译，点一下立即中断（已翻好的部分保留）。' : '把左边输入框的全文按句拆开翻译，结果逐句出现在右栏。会覆盖当前译文。'}" data-tip-pos="bottom-end">
                     ${AppState.isLoading ? `<span class="animate-pulse">${Icons.StopCircle}</span> STOP` : 'TRANSLATE'}
                 </button>
-                <button onclick="handleRegenerateAll()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="ovl-t-regen p-2.5 rounded-2xl transition-all shadow-xl active:scale-95 flex items-center justify-center ${AppState.translationPairs.length === 0 ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isRegeneratingAll ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isRegeneratingAll ? '正在逐句重译，点一下停下来。' : '用当前模型把每一句重新翻一遍（原文不动）。换了模型、或对整体译文不满意时用它；再点一次可中断。'}" data-tip-pos="bottom-end">
+                <button data-ovl-onclick="handleRegenerateAll()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="ovl-t-regen p-2.5 rounded-2xl transition-all shadow-xl active:scale-95 flex items-center justify-center ${AppState.translationPairs.length === 0 ? 'bg-slate-200 text-slate-400 cursor-not-allowed' : AppState.isRegeneratingAll ? 'bg-rose-500 text-white hover:bg-rose-600 shadow-rose-200' : 'bg-indigo-600 text-white hover:bg-indigo-700 shadow-indigo-200'}" data-tip="${AppState.isRegeneratingAll ? '正在逐句重译，点一下停下来。' : '用当前模型把每一句重新翻一遍（原文不动）。换了模型、或对整体译文不满意时用它；再点一次可中断。'}" data-tip-pos="bottom-end">
                     ${AppState.isRegeneratingAll ? `<span class="animate-pulse">${Icons.StopCircle}</span>` : Icons.RefreshCw}
                 </button>
                 <!-- v2 Pass P36：真正的「一键清除全部内容」（清输入框 + 左右两栏，见 handleClear()）
@@ -19920,7 +19947,7 @@ function renderHeader() {
                      按钮要保留。配色沿用它原本的次要/危险语义（灰底、悬停变红），不跟 regen 一样抢眼。
                      上一轮（P35）曾误把这个位置留给 focusClearAllBtn（取消关注，另一个按钮），已改正
                      —— 那个按钮已还原回 AI 对话窗 footer 的 focusRenderChip() 里。 -->
-                <button type="button" onclick="handleClear()" class="p-2.5 rounded-2xl border border-slate-200 text-slate-400 hover:text-rose-500 hover:bg-rose-50 transition-all active:scale-95 flex items-center justify-center" data-tip="清空输入框和左右两栏的全部内容，重新开始。已保存过的历史快照不受影响。" data-tip-pos="bottom-end">
+                <button type="button" data-ovl-onclick="handleClear()" class="p-2.5 rounded-2xl border border-slate-200 text-slate-400 hover:text-rose-500 hover:bg-rose-50 transition-all active:scale-95 flex items-center justify-center" data-tip="清空输入框和左右两栏的全部内容，重新开始。已保存过的历史快照不受影响。" data-tip-pos="bottom-end">
                     ${Icons.Trash2}
                 </button>
             </div>
@@ -19930,17 +19957,17 @@ function renderHeader() {
 
 // v2 P5：renderSettingsButton()（翻译器窗口自己的设置齿轮）整个删除——调用点已从
 // renderHeader 的 .ovl-t-tools 里摘掉，v1 设置弹窗改由 v2 主设置弹窗 Translator 分类
-// 里的入口按钮打开（ovlSettingsTranslatorHtml，onclick="openSettings()"，同一个函数，
+// 里的入口按钮打开（ovlSettingsTranslatorHtml，data-ovl-onclick="openSettings()"，同一个函数，
 // 只是换了个按钮触发）。
 
 // ============= 保存按钮组 =============
 function renderSaveButtonGroup() {
     return `
         <div class="relative flex items-center bg-slate-100 rounded-full border border-slate-200">
-            <button onclick="handleManualSave()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="pl-3 pr-2 py-2 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-l-full transition-all disabled:opacity-30 flex items-center gap-1 border-r border-slate-200" data-tip="立刻把当前全部原文+译文存一份快照进历史记录，之后可以从右边的时钟图标里恢复。" data-tip-pos="bottom-start">
+            <button data-ovl-onclick="handleManualSave()" ${AppState.translationPairs.length === 0 ? 'disabled' : ''} class="pl-3 pr-2 py-2 text-slate-400 hover:text-emerald-600 hover:bg-emerald-50 rounded-l-full transition-all disabled:opacity-30 flex items-center gap-1 border-r border-slate-200" data-tip="立刻把当前全部原文+译文存一份快照进历史记录，之后可以从右边的时钟图标里恢复。" data-tip-pos="bottom-start">
                 ${Icons.Save}
             </button>
-            <button onclick="toggleSaveMenu()" class="pl-1 pr-2 py-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-r-full transition-all" data-tip="设置自动保存的间隔（每隔几分钟自动存一次快照）。" data-tip-pos="bottom-start">
+            <button data-ovl-onclick="toggleSaveMenu()" class="pl-1 pr-2 py-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-r-full transition-all" data-tip="设置自动保存的间隔（每隔几分钟自动存一次快照）。" data-tip-pos="bottom-start">
                 ${Icons.MoreVertical}
             </button>
             ${AppState.showSaveMenu ? `
@@ -19948,7 +19975,7 @@ function renderSaveButtonGroup() {
                     <div class="text-[10px] font-bold text-slate-400 uppercase tracking-widest mb-2 px-1">Auto-Save Interval</div>
                     <div class="space-y-1">
                         ${[1, 3, 5, 10].map(min => `
-                            <button onclick="setAutoSaveInterval(${min * 60 * 1000})" class="w-full text-left px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${AppState.autoSaveInterval === min * 60 * 1000 ? 'bg-emerald-50 text-emerald-600' : 'hover:bg-slate-50 text-slate-600'}">
+                            <button data-ovl-onclick="setAutoSaveInterval(${min * 60 * 1000})" class="w-full text-left px-3 py-1.5 rounded-lg text-xs font-medium transition-colors ${AppState.autoSaveInterval === min * 60 * 1000 ? 'bg-emerald-50 text-emerald-600' : 'hover:bg-slate-50 text-slate-600'}">
                                 ${min} Minutes
                             </button>
                         `).join('')}
@@ -19957,7 +19984,7 @@ function renderSaveButtonGroup() {
                         <div class="flex items-center gap-2">
                             <span class="text-xs text-slate-500">Custom (min):</span>
                             <input type="number" id="customAutoSaveInput" min="1" class="w-12 text-xs p-1 border border-slate-200 rounded text-center bg-slate-50" placeholder="${Math.floor(AppState.autoSaveInterval / 60000)}">
-                            <button onclick="applyCustomAutoSave()" class="px-2 py-1 bg-emerald-500 hover:bg-emerald-600 text-white text-[10px] font-bold rounded transition-colors">OK</button>
+                            <button data-ovl-onclick="applyCustomAutoSave()" class="px-2 py-1 bg-emerald-500 hover:bg-emerald-600 text-white text-[10px] font-bold rounded transition-colors">OK</button>
                         </div>
                     </div>
                 </div>
@@ -19970,7 +19997,7 @@ function renderSaveButtonGroup() {
 function renderHistoryMenu() {
     return `
         <div class="relative">
-            <button onclick="toggleHistoryMenu()" class="relative p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-all" data-tip="最近保存过的会话快照，点其中一条即可把当时的原文和译文整体恢复回来（会覆盖当前内容）。角标「未存」= 这一刻屏幕上的内容还没写进本地存档；写入失败（配额满、隐私模式、被别的标签页占住）时它会一直亮着，点开菜单看红字说明。" data-tip-pos="bottom-start">
+            <button data-ovl-onclick="toggleHistoryMenu()" class="relative p-2 text-slate-400 hover:text-indigo-600 hover:bg-indigo-50 rounded-full transition-all" data-tip="最近保存过的会话快照，点其中一条即可把当时的原文和译文整体恢复回来（会覆盖当前内容）。角标「未存」= 这一刻屏幕上的内容还没写进本地存档；写入失败（配额满、隐私模式、被别的标签页占住）时它会一直亮着，点开菜单看红字说明。" data-tip-pos="bottom-start">
                 ${Icons.History}
                 <!-- 落盘状态角标。防抖窗口里关标签/刷新会丢这一次改动（见 xportPersistUnsaved
                      上面那段），所以「还没存」这件事必须在顶栏一直看得见，而不是藏在这个
@@ -19990,12 +20017,12 @@ function renderHistoryMenu() {
                             <span class="text-xs text-slate-600 font-medium">Keep Last:</span>
                             <div class="flex items-center bg-slate-100 rounded-lg p-0.5">
                                 ${[5, 10, 20].map(limit => `
-                                    <button onclick="setHistoryLimit(${limit})" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all ${AppState.historyLimit === limit ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">
+                                    <button data-ovl-onclick="setHistoryLimit(${limit})" class="px-2 py-0.5 rounded-md text-[10px] font-bold transition-all ${AppState.historyLimit === limit ? 'bg-white text-indigo-600 shadow-sm' : 'text-slate-400 hover:text-slate-600'}">
                                         ${limit}
                                     </button>
                                 `).join('')}
                                 <div class="w-px h-3 bg-slate-200 mx-1"></div>
-                                <input type="number" id="customHistoryLimitInput" min="1" value="${AppState.historyLimit}" class="w-8 bg-transparent text-[10px] font-bold text-center outline-none text-slate-600 border-none" onchange="setHistoryLimitCustom(this.value)">
+                                <input type="number" id="customHistoryLimitInput" min="1" value="${AppState.historyLimit}" class="w-8 bg-transparent text-[10px] font-bold text-center outline-none text-slate-600 border-none" data-ovl-onchange="setHistoryLimitCustom(this.value)">
                             </div>
                         </div>
                     </div>
@@ -20030,7 +20057,7 @@ function renderHistoryMenu() {
                     ` : `
                         <div class="space-y-2 max-h-[300px] overflow-y-auto custom-scrollbar pr-1">
                             ${AppState.globalHistory.map((item, idx) => `
-                                <button onclick="restoreHistoryItem(${idx})" class="w-full text-left p-3 rounded-xl border transition-all group ${item.id === AppState.sessionId ? 'bg-indigo-50 border-indigo-200' : 'bg-slate-50 border-slate-100 hover:bg-white hover:border-indigo-100'}">
+                                <button data-ovl-onclick="restoreHistoryItem(${idx})" class="w-full text-left p-3 rounded-xl border transition-all group ${item.id === AppState.sessionId ? 'bg-indigo-50 border-indigo-200' : 'bg-slate-50 border-slate-100 hover:bg-white hover:border-indigo-100'}">
                                     <div class="flex items-center justify-between mb-1">
                                         <span class="text-[10px] font-bold ${item.id === AppState.sessionId ? 'text-indigo-600' : 'text-slate-400 group-hover:text-indigo-400'}">
                                             ${new Date(item.timestamp).toLocaleTimeString()}${item.id === AppState.sessionId ? ' (Current)' : ''}
@@ -20081,7 +20108,7 @@ function renderModelSelector() {
 
     return `
         <div class="relative">
-            <button onclick="toggleModelMenu()" class="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-2xl border border-slate-200 transition-all text-xs font-bold text-slate-700 active:scale-95" data-tip="当前用来翻译的模型。点开可在 Gemini / OpenAI / Claude / 本地 LM Studio 之间切换；列表里没有的模型去「设置 → 模型」勾选。" data-tip-pos="bottom-start">
+            <button data-ovl-onclick="toggleModelMenu()" class="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-2xl border border-slate-200 transition-all text-xs font-bold text-slate-700 active:scale-95" data-tip="当前用来翻译的模型。点开可在 Gemini / OpenAI / Claude / 本地 LM Studio 之间切换；列表里没有的模型去「设置 → 模型」勾选。" data-tip-pos="bottom-start">
                 <span class="${currentIconClass}">${currentIcon}</span>
                 <!-- id 是给「设置 → 模型 → 默认模型」的翻译行用的：那里改了模型不能走 renderApp
                      （会冲掉还没点保存的 API Key 输入框），所以它定点改这一个文字节点。
@@ -20094,7 +20121,7 @@ function renderModelSelector() {
                     <div class="p-2 space-y-1 bg-slate-50/50 border-b border-slate-100">
                         <div class="text-[10px] font-bold text-slate-400 px-2 py-1 uppercase">Google Cloud (Gemini)</div>
                         ${geminiModels.map(m => `
-                            <button onclick="selectModel('gemini','${escapeHtml(m.id)}')" title="${escapeAttr(formatPriceTitle(m.price))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'gemini' && AppState.selectedModel === m.id ? 'bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
+                            <button data-ovl-onclick="selectModel('gemini','${escapeHtml(m.id)}')" title="${escapeAttr(formatPriceTitle(m.price))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'gemini' && AppState.selectedModel === m.id ? 'bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
                                 <div class="flex flex-col items-start overflow-hidden">
                                     <span class="text-xs font-bold uppercase tracking-wide truncate max-w-[190px]">${escapeHtml(m.name)}</span>
                                     <span class="text-[9px] opacity-70 truncate max-w-[190px]">${escapeHtml(m.sub || '')} · ${escapeHtml(formatPriceCompact(m.price))}</span>
@@ -20109,7 +20136,7 @@ function renderModelSelector() {
                             OpenAI
                         </div>
                         ${openaiModels.map(m => `
-                            <button onclick="selectModel('openai','${escapeHtml(m.id)}')" title="${escapeAttr(formatPriceTitle(m.price))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'openai' && AppState.selectedModel === m.id ? 'bg-sky-50 text-sky-700 ring-1 ring-sky-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
+                            <button data-ovl-onclick="selectModel('openai','${escapeHtml(m.id)}')" title="${escapeAttr(formatPriceTitle(m.price))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'openai' && AppState.selectedModel === m.id ? 'bg-sky-50 text-sky-700 ring-1 ring-sky-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
                                 <div class="flex flex-col items-start overflow-hidden">
                                     <span class="text-xs font-bold uppercase tracking-wide truncate max-w-[190px]">${escapeHtml(m.name)}</span>
                                     <span class="text-[9px] opacity-70 truncate max-w-[190px]">${escapeHtml(m.sub || '')} · ${escapeHtml(formatPriceCompact(m.price))}</span>
@@ -20124,7 +20151,7 @@ function renderModelSelector() {
                             Anthropic Claude
                         </div>
                         ${claudeModels.map(m => `
-                            <button onclick="selectModel('claude','${escapeHtml(m.id)}')" title="${escapeAttr(formatPriceTitle(m.price))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'claude' && AppState.selectedModel === m.id ? 'bg-orange-50 text-orange-700 ring-1 ring-orange-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
+                            <button data-ovl-onclick="selectModel('claude','${escapeHtml(m.id)}')" title="${escapeAttr(formatPriceTitle(m.price))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'claude' && AppState.selectedModel === m.id ? 'bg-orange-50 text-orange-700 ring-1 ring-orange-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
                                 <div class="flex flex-col items-start overflow-hidden">
                                     <span class="text-xs font-bold uppercase tracking-wide truncate max-w-[190px]">${escapeHtml(m.name)}</span>
                                     <span class="text-[9px] opacity-70 truncate max-w-[190px]">${escapeHtml(m.sub || '')} · ${escapeHtml(formatPriceCompact(m.price))}</span>
@@ -20139,7 +20166,7 @@ function renderModelSelector() {
                             阿里云百炼 Qwen
                         </div>
                         ${qwenModels.map(m => `
-                            <button onclick="selectModel('qwen','${escapeHtml(m.id)}')" title="${escapeAttr(formatQwenPriceTitle(m.id))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'qwen' && AppState.selectedModel === m.id ? 'bg-purple-50 text-purple-700 ring-1 ring-purple-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
+                            <button data-ovl-onclick="selectModel('qwen','${escapeHtml(m.id)}')" title="${escapeAttr(formatQwenPriceTitle(m.id))}" class="w-full flex items-center justify-between p-2.5 rounded-xl transition-all ${AppState.apiProvider === 'qwen' && AppState.selectedModel === m.id ? 'bg-purple-50 text-purple-700 ring-1 ring-purple-200' : 'hover:bg-white hover:shadow-sm text-slate-600'}">
                                 <div class="flex flex-col items-start overflow-hidden">
                                     <span class="text-xs font-bold uppercase tracking-wide truncate max-w-[190px]">${escapeHtml(m.name)}</span>
                                     <span class="text-[9px] opacity-70 truncate max-w-[190px]">${escapeHtml(m.sub || '')} · ${escapeHtml(formatQwenPriceCompact(m.id))}</span>
@@ -20158,7 +20185,7 @@ function renderModelSelector() {
                             return visibleLocalModels.length > 0 ? `
                                 <div class="max-h-40 overflow-y-auto custom-scrollbar my-1">
                                     ${visibleLocalModels.map(lm => `
-                                        <button onclick="selectModel('local','${escapeHtml(lm.id)}')" class="w-full flex items-center justify-between p-2 rounded-xl transition-all mb-1 ${AppState.apiProvider === 'local' && AppState.selectedModel === lm.id ? 'bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200' : 'hover:bg-slate-50 text-slate-600'}">
+                                        <button data-ovl-onclick="selectModel('local','${escapeHtml(lm.id)}')" class="w-full flex items-center justify-between p-2 rounded-xl transition-all mb-1 ${AppState.apiProvider === 'local' && AppState.selectedModel === lm.id ? 'bg-indigo-50 text-indigo-700 ring-1 ring-indigo-200' : 'hover:bg-slate-50 text-slate-600'}">
                                             <div class="flex flex-col items-start w-full overflow-hidden">
                                                 <span class="text-xs font-bold truncate w-full text-left">${escapeHtml(lm.id)}</span>
                                             </div>
@@ -20172,7 +20199,7 @@ function renderModelSelector() {
                                 <div class="text-[10px] text-slate-400 italic text-center py-2 bg-slate-50 rounded-lg mb-2">No models fetched yet.</div>
                             `;
                         })()}
-                        <button onclick="openSettings()" class="w-full flex items-center justify-center gap-2 p-2 mt-1 rounded-xl bg-slate-100 hover:bg-indigo-50 text-slate-600 hover:text-indigo-600 text-xs font-bold transition-all border border-transparent hover:border-indigo-100">
+                        <button data-ovl-onclick="openSettings()" class="w-full flex items-center justify-center gap-2 p-2 mt-1 rounded-xl bg-slate-100 hover:bg-indigo-50 text-slate-600 hover:text-indigo-600 text-xs font-bold transition-all border border-transparent hover:border-indigo-100">
                             ${Icons.SettingsGear} Settings
                         </button>
                         <p class="text-[9px] text-slate-400 leading-snug px-1 pt-2 mt-2 border-t border-slate-100">
@@ -20189,14 +20216,14 @@ function renderModelSelector() {
 function renderControlButtons() {
     return `
         <div class="ovl-t-langbar flex items-center gap-2 bg-slate-100 p-1.5 rounded-full border border-slate-200 shadow-inner">
-            <button onclick="toggleAutoTranslate()" class="ovl-t-syncdetect px-4 py-1.5 rounded-full text-[10px] font-bold flex items-center gap-2 transition-all ${AppState.isAutoTranslate ? 'bg-orange-500 text-white shadow-md' : 'text-slate-500'}" data-tip="${AppState.isAutoTranslate ? '已开：在左边输入框停手 1.5 秒就自动翻一次。粘贴长文时会自动开跑，关掉它可以改成只按 TRANSLATE 才翻。' : '已关：只有点 TRANSLATE 才翻译。打开后，停止输入 1.5 秒会自动翻一次。（跟左右两栏的滚动联动无关）'}" data-tip-pos="bottom">
+            <button data-ovl-onclick="toggleAutoTranslate()" class="ovl-t-syncdetect px-4 py-1.5 rounded-full text-[10px] font-bold flex items-center gap-2 transition-all ${AppState.isAutoTranslate ? 'bg-orange-500 text-white shadow-md' : 'text-slate-500'}" data-tip="${AppState.isAutoTranslate ? '已开：在左边输入框停手 1.5 秒就自动翻一次。粘贴长文时会自动开跑，关掉它可以改成只按 TRANSLATE 才翻。' : '已关：只有点 TRANSLATE 才翻译。打开后，停止输入 1.5 秒会自动翻一次。（跟左右两栏的滚动联动无关）'}" data-tip-pos="bottom">
                 ${AppState.isAutoTranslate ? Icons.ZapFilled : Icons.Zap} AUTO SYNC
             </button>
-            <button onclick="toggleAutoDetect()" class="ovl-t-syncdetect px-4 py-1.5 rounded-full text-[10px] font-bold transition-all ${AppState.isAutoDetect ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-500'}" data-tip="${AppState.isAutoDetect ? '已开：自动判断输入是中文还是英文并决定翻译方向。手动点右边的 ZH / EN 会自动关掉它。' : '已关：翻译方向锁定为右边 ZH / EN 的选择。点开可恢复自动判断语种。'}" data-tip-pos="bottom">DETECT</button>
+            <button data-ovl-onclick="toggleAutoDetect()" class="ovl-t-syncdetect px-4 py-1.5 rounded-full text-[10px] font-bold transition-all ${AppState.isAutoDetect ? 'bg-indigo-600 text-white shadow-md' : 'text-slate-500'}" data-tip="${AppState.isAutoDetect ? '已开：自动判断输入是中文还是英文并决定翻译方向。手动点右边的 ZH / EN 会自动关掉它。' : '已关：翻译方向锁定为右边 ZH / EN 的选择。点开可恢复自动判断语种。'}" data-tip-pos="bottom">DETECT</button>
             <div class="ovl-t-syncdetect h-4 w-px bg-slate-300 mx-1"></div>
-            <button onclick="setLanguage('zh','en')" class="px-5 py-2 rounded-full text-xs font-bold transition-all ${AppState.sourceLang === 'zh' ? 'bg-white shadow-sm text-indigo-700' : 'text-slate-500 hover:text-indigo-600'}" data-tip="源语言设为中文，译成英文（中 → 英）。点它会关掉自动判断语种。" data-tip-pos="bottom">ZH</button>
-            <button onclick="swapLanguages()" class="p-2 text-slate-400 hover:bg-white rounded-full transition-colors" data-tip="对调翻译方向（中→英 ⇄ 英→中）。只换方向，不动已有的原文和译文。" data-tip-pos="bottom">${Icons.ArrowRightLeft}</button>
-            <button onclick="setLanguage('en','zh')" class="px-5 py-2 rounded-full text-xs font-bold transition-all ${AppState.sourceLang === 'en' ? 'bg-white shadow-sm text-indigo-700' : 'text-slate-500 hover:text-indigo-600'}" data-tip="源语言设为英文，译成中文（英 → 中）。点它会关掉自动判断语种。" data-tip-pos="bottom-end">EN</button>
+            <button data-ovl-onclick="setLanguage('zh','en')" class="px-5 py-2 rounded-full text-xs font-bold transition-all ${AppState.sourceLang === 'zh' ? 'bg-white shadow-sm text-indigo-700' : 'text-slate-500 hover:text-indigo-600'}" data-tip="源语言设为中文，译成英文（中 → 英）。点它会关掉自动判断语种。" data-tip-pos="bottom">ZH</button>
+            <button data-ovl-onclick="swapLanguages()" class="p-2 text-slate-400 hover:bg-white rounded-full transition-colors" data-tip="对调翻译方向（中→英 ⇄ 英→中）。只换方向，不动已有的原文和译文。" data-tip-pos="bottom">${Icons.ArrowRightLeft}</button>
+            <button data-ovl-onclick="setLanguage('en','zh')" class="px-5 py-2 rounded-full text-xs font-bold transition-all ${AppState.sourceLang === 'en' ? 'bg-white shadow-sm text-indigo-700' : 'text-slate-500 hover:text-indigo-600'}" data-tip="源语言设为英文，译成中文（英 → 中）。点它会关掉自动判断语种。" data-tip-pos="bottom-end">EN</button>
         </div>
     `;
 }
@@ -20224,22 +20251,22 @@ function renderSourcePanel() {
                 </h3>
                 <div class="flex items-center gap-3">
                     ${AppState.translationPairs.length > 0 ? `
-                        <button onclick="copySourceText()" class="p-2 text-slate-400 hover:text-indigo-600 transition-colors" data-tip="把左栏所有原文按顺序拼起来复制到剪贴板（不含译文）。" data-tip-pos="bottom">
+                        <button data-ovl-onclick="copySourceText()" class="p-2 text-slate-400 hover:text-indigo-600 transition-colors" data-tip="把左栏所有原文按顺序拼起来复制到剪贴板（不含译文）。" data-tip-pos="bottom">
                             ${Icons.Copy}
                         </button>
                         <div class="flex items-center bg-slate-100 rounded-xl p-0.5 border border-slate-200">
-                            <button onclick="setViewMode('edit')" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${AppState.viewMode === 'edit' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}" data-tip="回到大输入框，整篇原文可以直接改、直接粘贴新内容。此时左栏不再逐句显示。" data-tip-pos="bottom">
+                            <button data-ovl-onclick="setViewMode('edit')" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${AppState.viewMode === 'edit' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}" data-tip="回到大输入框，整篇原文可以直接改、直接粘贴新内容。此时左栏不再逐句显示。" data-tip-pos="bottom">
                                 ${Icons.PenLine} Edit
                             </button>
-                            <button onclick="setViewMode('preview')" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${AppState.viewMode === 'preview' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}" data-tip="左栏按句排开、与右栏译文逐行对齐，LaTeX 公式渲染成成品样子。想逐句对照校对就用这个。" data-tip-pos="bottom">
+                            <button data-ovl-onclick="setViewMode('preview')" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${AppState.viewMode === 'preview' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}" data-tip="左栏按句排开、与右栏译文逐行对齐，LaTeX 公式渲染成成品样子。想逐句对照校对就用这个。" data-tip-pos="bottom">
                                 ${Icons.Eye} Preview
                             </button>
-                            <button onclick="setViewMode('original')" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${AppState.viewMode === 'original' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}" data-tip="显示最初粘贴进来的那份原始文本（未拆句、未被逐句编辑修改过），只读，用于核对。" data-tip-pos="bottom-end">
+                            <button data-ovl-onclick="setViewMode('original')" class="px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${AppState.viewMode === 'original' ? 'bg-white text-indigo-700 shadow-sm' : 'text-slate-500 hover:text-slate-700'}" data-tip="显示最初粘贴进来的那份原始文本（未拆句、未被逐句编辑修改过），只读，用于核对。" data-tip-pos="bottom-end">
                                 ${Icons.History} Original
                             </button>
                         </div>
                         ${AppState.viewMode === 'preview' ? `
-                        <button id="bilingualAlignToggleBtn" onclick="setBilingualAlignEnabled(!AppState.bilingualAlignEnabled)" class="p-2 rounded-lg transition-colors ${AppState.bilingualAlignEnabled ? 'text-indigo-600 bg-indigo-50' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr('切换左右两栏的分行对齐。开：逐句配对、等高显示、滚动联动。关：不再分块——两栏各自变成一整篇连续文本，保留原有段落/换行格式（像 Google 翻译那样贴一段出一段），公式等照常渲染，各自独立滚动。')}" data-tip-pos="bottom-end">
+                        <button id="bilingualAlignToggleBtn" data-ovl-onclick="setBilingualAlignEnabled(!AppState.bilingualAlignEnabled)" class="p-2 rounded-lg transition-colors ${AppState.bilingualAlignEnabled ? 'text-indigo-600 bg-indigo-50' : 'text-slate-400 hover:text-slate-600'}" data-tip="${escapeAttr('切换左右两栏的分行对齐。开：逐句配对、等高显示、滚动联动。关：不再分块——两栏各自变成一整篇连续文本，保留原有段落/换行格式（像 Google 翻译那样贴一段出一段），公式等照常渲染，各自独立滚动。')}" data-tip-pos="bottom-end">
                             ${Icons.AlignRows}
                         </button>
                         ` : ''}
@@ -20248,7 +20275,7 @@ function renderSourcePanel() {
             </div>
             <div class="flex-grow flex flex-col overflow-hidden bg-slate-50/20">
                 ${AppState.translationPairs.length > 0 && AppState.viewMode === 'preview' ? (AppState.bilingualAlignEnabled ? `
-                    <div class="overflow-y-auto h-full custom-scrollbar p-4" data-align-scroll="src" onclick="handleBlankAreaClick(event)">
+                    <div class="overflow-y-auto h-full custom-scrollbar p-4" data-align-scroll="src" data-ovl-onclick="handleBlankAreaClick(event)">
                         <!-- 行距不再来自 space-y-2：改由 :root 上的 --pair-gap 统一驱动
                              （[data-align-content] > * + * { margin-top: var(--pair-gap) }），
                              左右两栏共用同一个变量，物理上不可能只改一边而破坏逐行对齐。 -->
@@ -20268,7 +20295,7 @@ function renderSourcePanel() {
                          （syncBilingualAlignment / bindPaneScrollSync / alignSyncKeepingScroll）
                          在这里查不到任何节点、按自身既有的 try/catch 或早退逻辑安全跳过，
                          不需要为「关闭态」额外改这几个函数。 -->
-                    <div class="overflow-y-auto h-full custom-scrollbar p-4" data-flow-scroll="src" onclick="handleBlankAreaClick(event)">
+                    <div class="overflow-y-auto h-full custom-scrollbar p-4" data-flow-scroll="src" data-ovl-onclick="handleBlankAreaClick(event)">
                         <div class="prose prose-slate prose-sm max-w-none text-slate-700 leading-relaxed pb-24" data-flow-content="src">${renderFlowPane('src', AppState.translationPairs)}</div>
                     </div>
                 `) : AppState.translationPairs.length > 0 && AppState.viewMode === 'original' ? `
@@ -20293,9 +20320,9 @@ function renderTargetPanel() {
             <!-- 高度必须和 SOURCE PANEL 表头逐像素一致，见那边的注释 -->
             <div class="ovl-t-panelhead px-6 py-4 min-h-[70px] shrink-0 border-b border-slate-100 flex items-center justify-between bg-slate-50/50">
                 <h3 class="text-xs font-black text-slate-400 uppercase tracking-[0.2em] whitespace-nowrap">Target Panel</h3>
-                <button onclick="copyTargetText()" class="p-2 text-slate-400 hover:text-indigo-600 transition-colors" data-tip="把右栏所有译文按顺序拼起来复制到剪贴板（不含原文）。" data-tip-pos="bottom-end">${Icons.Copy}</button>
+                <button data-ovl-onclick="copyTargetText()" class="p-2 text-slate-400 hover:text-indigo-600 transition-colors" data-tip="把右栏所有译文按顺序拼起来复制到剪贴板（不含原文）。" data-tip-pos="bottom-end">${Icons.Copy}</button>
             </div>
-            <div class="flex-grow p-4 overflow-y-auto custom-scrollbar bg-slate-50/20" ${AppState.bilingualAlignEnabled ? 'data-align-scroll="tgt"' : 'data-flow-scroll="tgt"'} onclick="handleBlankAreaClick(event)">
+            <div class="flex-grow p-4 overflow-y-auto custom-scrollbar bg-slate-50/20" ${AppState.bilingualAlignEnabled ? 'data-align-scroll="tgt"' : 'data-flow-scroll="tgt"'} data-ovl-onclick="handleBlankAreaClick(event)">
                 ${AppState.isLoading && AppState.translationPairs.length === 0 ? `
                     <div class="h-full flex flex-col items-center justify-center text-slate-400 animate-pulse">
                         <span class="text-indigo-300 mb-6">${Icons.LoaderLarge}</span>
@@ -20308,7 +20335,7 @@ function renderTargetPanel() {
                     </div>
                 ` : AppState.bilingualAlignEnabled ? `
                     <!-- 行距同源栏：--pair-gap，见 renderSourcePanel 里的注释 -->
-                    <div class="pb-24" data-align-content="tgt" onclick="handleBlankAreaClick(event)">
+                    <div class="pb-24" data-align-content="tgt" data-ovl-onclick="handleBlankAreaClick(event)">
                         ${AppState.translationPairs.map((pair, idx) => renderPairRow('tgt', pair, idx)).join('')}
                     </div>
                 ` : `
@@ -20356,16 +20383,16 @@ function renderPairRow(side, pair, idx) {
                 </div>
                 <div class="relative flex flex-col gap-3">
                     <div class="absolute -top-10 right-0 z-40 flex items-center gap-2">
-                        <button onclick="event.stopPropagation();triggerSaveRowUpdate(${idx});" ${rowLocked ? 'disabled' : ''} class="flex items-center gap-2 px-3 py-1.5 rounded-lg text-white text-xs font-bold shadow-lg transition-all ${rowLocked ? 'bg-slate-300 cursor-not-allowed' : pair.isUpdating ? 'bg-rose-500 hover:bg-rose-600' : 'bg-indigo-600 hover:bg-indigo-700'}" data-tip="${rowLocked ? lockTip : pair.isUpdating ? '正在更新这一句，点一下停下来。' : '保存你刚才手改的内容，并让模型把另一侧那句同步改过来（改原文→重译，改译文→回译校对）。'}" data-tip-pos="left">
+                        <button data-ovl-onclick="event.stopPropagation();triggerSaveRowUpdate(${idx});" ${rowLocked ? 'disabled' : ''} class="flex items-center gap-2 px-3 py-1.5 rounded-lg text-white text-xs font-bold shadow-lg transition-all ${rowLocked ? 'bg-slate-300 cursor-not-allowed' : pair.isUpdating ? 'bg-rose-500 hover:bg-rose-600' : 'bg-indigo-600 hover:bg-indigo-700'}" data-tip="${rowLocked ? lockTip : pair.isUpdating ? '正在更新这一句，点一下停下来。' : '保存你刚才手改的内容，并让模型把另一侧那句同步改过来（改原文→重译，改译文→回译校对）。'}" data-tip-pos="left">
                             ${pair.isUpdating ? `<span class="animate-pulse">${Icons.StopCircle}</span> Stop` : `${Icons.PenLineSmall} Update`}
                         </button>
-                        <button onclick="event.stopPropagation();handleRegenerateTranslation(${idx});" ${rowLocked ? 'disabled' : ''} class="flex items-center justify-center p-1.5 rounded-lg text-white shadow-lg transition-all ${rowLocked ? 'bg-slate-300 cursor-not-allowed' : pair.isRegenerating ? 'bg-rose-500 hover:bg-rose-600' : 'bg-indigo-600 hover:bg-indigo-700'}" data-tip="${rowLocked ? lockTip : pair.isRegenerating ? '正在重新翻译这一句，点一下停下来。' : '只把这一句重新翻一遍（原文不动）。对这句译文不满意时用它，不影响其它句子。'}" data-tip-pos="left">
+                        <button data-ovl-onclick="event.stopPropagation();handleRegenerateTranslation(${idx});" ${rowLocked ? 'disabled' : ''} class="flex items-center justify-center p-1.5 rounded-lg text-white shadow-lg transition-all ${rowLocked ? 'bg-slate-300 cursor-not-allowed' : pair.isRegenerating ? 'bg-rose-500 hover:bg-rose-600' : 'bg-indigo-600 hover:bg-indigo-700'}" data-tip="${rowLocked ? lockTip : pair.isRegenerating ? '正在重新翻译这一句，点一下停下来。' : '只把这一句重新翻一遍（原文不动）。对这句译文不满意时用它，不影响其它句子。'}" data-tip-pos="left">
                             ${pair.isRegenerating ? `<span class="animate-pulse">${Icons.StopCircle}</span>` : Icons.RefreshCw}
                         </button>
                     </div>
                     <div class="relative">
                         ${renderSelectionHighlightLayer(side, idx)}
-                        <textarea id="editTextarea_${side}_${idx}" ${rowLocked ? 'readonly' : ''} class="relative block w-full bg-transparent border-none focus:ring-0 p-0 ${rowLocked ? 'text-slate-500 cursor-not-allowed' : 'text-slate-800'} leading-relaxed resize-none overflow-hidden min-h-[40px]" placeholder="Edit ${side === 'src' ? 'source' : 'target'}..." onclick="event.stopPropagation();">${escapeHtml(editValue)}</textarea>
+                        <textarea id="editTextarea_${side}_${idx}" ${rowLocked ? 'readonly' : ''} class="relative block w-full bg-transparent border-none focus:ring-0 p-0 ${rowLocked ? 'text-slate-500 cursor-not-allowed' : 'text-slate-800'} leading-relaxed resize-none overflow-hidden min-h-[40px]" placeholder="Edit ${side === 'src' ? 'source' : 'target'}..." data-ovl-onclick="event.stopPropagation();">${escapeHtml(editValue)}</textarea>
                     </div>
                     ${renderAiToolbar(side, idx)}
                 </div>
@@ -20373,7 +20400,7 @@ function renderPairRow(side, pair, idx) {
         `;
     } else {
         return `
-            <div class="group relative p-4 rounded-xl transition-all border border-transparent ${rowLocked ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:bg-white/80 hover:shadow-md'}" onclick="handleRowClick(${idx},'${side}')" data-idx="${idx}" data-side="${side}"${rowLocked ? ` data-tip="${lockTip}" data-tip-pos="top"` : ''}>
+            <div class="group relative p-4 rounded-xl transition-all border border-transparent ${rowLocked ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:bg-white/80 hover:shadow-md'}" data-ovl-onclick="handleRowClick(${idx},'${side}')" data-idx="${idx}" data-side="${side}"${rowLocked ? ` data-tip="${lockTip}" data-tip-pos="top"` : ''}>
                 <!-- 「关注」复选框 —— 取代了原来那颗「附到对话」按钮。
                      附加曾经是「让模型看得见这一句」的唯一通道；文档现在每一轮整篇发过去，
                      那个用途没有了，剩下的需求是「这几处请多留意」，那是一个**多选**的状态，
@@ -20523,7 +20550,7 @@ function renderFlowPairInline(side, pair, idx) {
     // 悬停显隐完全交给下面这层 .ovl-flow-handle 自己的 CSS（display:none ->
     // :hover/:focus-within 时 inline-flex），两套机制不再打架。
     const cbHtml = focusCheckboxHtml(idx, side, 'toolbar');
-    const handleWrap = cbHtml ? `<span class="ovl-flow-handle" onclick="event.stopPropagation();">${cbHtml}</span>` : '';
+    const handleWrap = cbHtml ? `<span class="ovl-flow-handle" data-ovl-onclick="event.stopPropagation();">${cbHtml}</span>` : '';
 
     const allP = nodes.length > 0 && nodes.every((n) => n.tagName === 'P');
     let segments;
@@ -20543,7 +20570,7 @@ function renderFlowPairInline(side, pair, idx) {
         const innerTag = seg.isBlock ? 'div' : 'span';
         const cls = 'ovl-flow-pair' + (seg.isBlock ? ' ovl-flow-block' : '') + (rowLocked ? ' cursor-not-allowed opacity-60' : ' cursor-pointer');
         const trail = isLast ? (warnBadge + handleWrap) : '';
-        return `<${outerTag} class="${cls}" data-idx="${idx}" data-side="${side}" onclick="handleRowClick(${idx},'${side}')"${rowLocked ? ` data-tip="${lockTip}" data-tip-pos="top"` : ''}><${innerTag} class="ovl-flow-text">${seg.inner}</${innerTag}>${trail}</${outerTag}>`;
+        return `<${outerTag} class="${cls}" data-idx="${idx}" data-side="${side}" data-ovl-onclick="handleRowClick(${idx},'${side}')"${rowLocked ? ` data-tip="${lockTip}" data-tip-pos="top"` : ''}><${innerTag} class="ovl-flow-text">${seg.inner}</${innerTag}>${trail}</${outerTag}>`;
     }).join('');
     const isBlock = segments.some((s) => s.isBlock);
     return { html, isBlock };
@@ -20591,13 +20618,13 @@ function renderFlowPane(side, pairs) {
 function renderHistoryControls(pair, idx) {
     return `
         <div class="flex gap-1 bg-white shadow-sm border border-slate-200 rounded-full p-0.5 z-20 transition-all">
-            <button onclick="event.stopPropagation();handleHistoryNav(${idx},-1);" ${pair.historyIndex <= 0 ? 'disabled' : ''} class="p-1 hover:bg-slate-100 rounded-full disabled:opacity-30 text-slate-600 transition-colors" data-tip="撤销：回到这一句的上一个版本（中间的数字就是第几版 / 共几版）。只影响这一句。" data-tip-pos="left">
+            <button data-ovl-onclick="event.stopPropagation();handleHistoryNav(${idx},-1);" ${pair.historyIndex <= 0 ? 'disabled' : ''} class="p-1 hover:bg-slate-100 rounded-full disabled:opacity-30 text-slate-600 transition-colors" data-tip="撤销：回到这一句的上一个版本（中间的数字就是第几版 / 共几版）。只影响这一句。" data-tip-pos="left">
                 ${Icons.Undo2}
             </button>
             <span class="text-[9px] px-1 text-slate-400 font-mono flex items-center select-none">
                 ${pair.historyIndex + 1}/${pair.history.length}
             </span>
-            <button onclick="event.stopPropagation();handleHistoryNav(${idx},1);" ${pair.historyIndex >= pair.history.length - 1 ? 'disabled' : ''} class="p-1 hover:bg-slate-100 rounded-full disabled:opacity-30 text-slate-600 transition-colors" data-tip="重做：回到这一句更新的那个版本。只影响这一句。" data-tip-pos="right">
+            <button data-ovl-onclick="event.stopPropagation();handleHistoryNav(${idx},1);" ${pair.historyIndex >= pair.history.length - 1 ? 'disabled' : ''} class="p-1 hover:bg-slate-100 rounded-full disabled:opacity-30 text-slate-600 transition-colors" data-tip="重做：回到这一句更新的那个版本。只影响这一句。" data-tip-pos="right">
                 ${Icons.Redo2}
             </button>
         </div>
@@ -20610,18 +20637,18 @@ function renderAiToolbar(side, idx) {
     const isSimplifySettingsOpen = AppState.activeSettingsPopup === 'simplify' && AppState.activeSettingsIndex === idx && AppState.activeSettingsSide === side;
 
     return `
-        <div class="mt-2 pt-2 border-t border-indigo-50 flex flex-wrap items-center gap-2 relative" onclick="event.stopPropagation();">
+        <div class="mt-2 pt-2 border-t border-indigo-50 flex flex-wrap items-center gap-2 relative" data-ovl-onclick="event.stopPropagation();">
             <div class="text-[10px] font-bold text-indigo-400 uppercase tracking-wider mr-1 flex items-center gap-1 select-none">
                 ${Icons.SparklesSmall} ${side === 'src' ? 'Source AI' : 'Target AI'}
             </div>
 
             <!-- Grammar Button Group -->
             <div class="flex items-stretch rounded-lg bg-indigo-50 border border-indigo-100 relative">
-                <button onclick="handleAiRefine(${idx},'${side}','grammar')" ${AppState.isRefining ? 'disabled' : ''} class="flex items-center gap-1.5 px-2 py-1 hover:bg-indigo-100 text-indigo-700 rounded-l-lg text-xs transition-colors disabled:opacity-50" data-tip="让模型检查并订正这一整句的语法，直接改写进上面的编辑框。用的提示词可在右边 ⋮ 或「设置 → 编辑与历史」里改。" data-tip-pos="bottom-start">
+                <button data-ovl-onclick="handleAiRefine(${idx},'${side}','grammar')" ${AppState.isRefining ? 'disabled' : ''} class="flex items-center gap-1.5 px-2 py-1 hover:bg-indigo-100 text-indigo-700 rounded-l-lg text-xs transition-colors disabled:opacity-50" data-tip="让模型检查并订正这一整句的语法，直接改写进上面的编辑框。用的提示词可在右边 ⋮ 或「设置 → 编辑与历史」里改。" data-tip-pos="bottom-start">
                     ${Icons.CheckCheck} Grammar
                 </button>
                 <div class="w-px bg-indigo-200 my-1"></div>
-                <button onclick="toggleSettingsPopup('grammar',${idx},'${side}')" class="px-1 hover:bg-indigo-200 text-indigo-400 hover:text-indigo-700 rounded-r-lg transition-colors" data-tip="自定义 Grammar 按钮发给模型的指令（例如「只改语法，别动术语和 LaTeX」）。留空则用内置提示词。" data-tip-pos="bottom">
+                <button data-ovl-onclick="toggleSettingsPopup('grammar',${idx},'${side}')" class="px-1 hover:bg-indigo-200 text-indigo-400 hover:text-indigo-700 rounded-r-lg transition-colors" data-tip="自定义 Grammar 按钮发给模型的指令（例如「只改语法，别动术语和 LaTeX」）。留空则用内置提示词。" data-tip-pos="bottom">
                     ${Icons.MoreVertical}
                 </button>
                 ${isGrammarSettingsOpen ? renderSettingsPopover('grammar') : ''}
@@ -20629,11 +20656,11 @@ function renderAiToolbar(side, idx) {
 
             <!-- Simplify Button Group -->
             <div class="flex items-stretch rounded-lg bg-emerald-50 border border-emerald-100 relative">
-                <button onclick="handleAiRefine(${idx},'${side}','simplify')" ${AppState.isRefining ? 'disabled' : ''} class="flex items-center gap-1.5 px-2 py-1 hover:bg-emerald-100 text-emerald-700 rounded-l-lg text-xs transition-colors disabled:opacity-50" data-tip="把这一整句改写得更直白简短，意思和 LaTeX 公式保持不变。句子太绕、太长时用它。" data-tip-pos="bottom-start">
+                <button data-ovl-onclick="handleAiRefine(${idx},'${side}','simplify')" ${AppState.isRefining ? 'disabled' : ''} class="flex items-center gap-1.5 px-2 py-1 hover:bg-emerald-100 text-emerald-700 rounded-l-lg text-xs transition-colors disabled:opacity-50" data-tip="把这一整句改写得更直白简短，意思和 LaTeX 公式保持不变。句子太绕、太长时用它。" data-tip-pos="bottom-start">
                     ${Icons.Feather} Simplify
                 </button>
                 <div class="w-px bg-emerald-200 my-1"></div>
-                <button onclick="toggleSettingsPopup('simplify',${idx},'${side}')" class="px-1 hover:bg-emerald-200 text-emerald-400 hover:text-emerald-700 rounded-r-lg transition-colors" data-tip="自定义 Simplify 按钮发给模型的指令。留空则用内置提示词。" data-tip-pos="bottom">
+                <button data-ovl-onclick="toggleSettingsPopup('simplify',${idx},'${side}')" class="px-1 hover:bg-emerald-200 text-emerald-400 hover:text-emerald-700 rounded-r-lg transition-colors" data-tip="自定义 Simplify 按钮发给模型的指令。留空则用内置提示词。" data-tip-pos="bottom">
                     ${Icons.MoreVertical}
                 </button>
                 ${isSimplifySettingsOpen ? renderSettingsPopover('simplify') : ''}
@@ -20643,7 +20670,7 @@ function renderAiToolbar(side, idx) {
                  这一颗管的是**整行**（且只对左栏/原文渲染，见 focusCheckboxHtml 的 C7 收窄）；
                  只想关注一个词或短语的话，在上面的编辑框里选中它，选词弹窗里有同一颗复选框，
                  而且那一条会连所在句、句内偏移一起发过去。
-                 ⚠️ C2：这一整条工具栏的容器已经带 onclick="event.stopPropagation()"，
+                 ⚠️ C2：这一整条工具栏的容器已经带 data-ovl-onclick="event.stopPropagation()"，
                  复选框自己再带一层 —— 行处于编辑态时勾它，AppState.activeIndex 一动不动。 -->
             ${focusCheckboxHtml(idx, side, 'toolbar')}
 
@@ -20651,7 +20678,7 @@ function renderAiToolbar(side, idx) {
             <div class="flex-grow flex items-center gap-2 bg-indigo-50/50 rounded border border-indigo-100 px-2 py-0.5 focus-within:ring-1 focus-within:ring-indigo-200 transition-all" data-tip="用自己的话指挥模型改写这一句，例如「更正式一些」「把被动改成主动」。输完按回车或点右边的魔杖。" data-tip-pos="bottom-end">
                 <span class="text-indigo-300">${Icons.MessageSquare}</span>
                 <input type="text" id="refineInput_${side}_${idx}" class="bg-transparent border-none text-xs w-full focus:ring-0 p-0 text-slate-700 placeholder-indigo-200" placeholder="${side === 'src' ? 'e.g. Make it formal...' : 'e.g. More concise...'}" value="${escapeHtml(AppState.refinePrompt)}">
-                <button onclick="triggerCustomRefine(${idx},'${side}')" ${AppState.isRefining || !AppState.refinePrompt.trim() ? 'disabled' : ''} class="text-indigo-600 hover:text-indigo-800 disabled:opacity-30 transition-colors">
+                <button data-ovl-onclick="triggerCustomRefine(${idx},'${side}')" ${AppState.isRefining || !AppState.refinePrompt.trim() ? 'disabled' : ''} class="text-indigo-600 hover:text-indigo-800 disabled:opacity-30 transition-colors">
                     ${AppState.isRefining ? Icons.LoaderSmall : Icons.Wand2}
                 </button>
             </div>
@@ -20667,12 +20694,12 @@ function renderSettingsPopover(type) {
     const colorClass = type === 'grammar' ? 'indigo' : 'emerald';
     
     return `
-        <div class="absolute top-full left-0 mt-2 w-72 bg-white border border-slate-200 shadow-xl rounded-xl p-3 z-50" onclick="event.stopPropagation();">
+        <div class="absolute top-full left-0 mt-2 w-72 bg-white border border-slate-200 shadow-xl rounded-xl p-3 z-50" data-ovl-onclick="event.stopPropagation();">
             <div class="flex items-center justify-between gap-2 text-xs font-bold text-slate-700 mb-2 border-b border-slate-100 pb-2">
                 <span class="flex items-center gap-2">
                     ${Icons.Settings2} Customize ${type === 'grammar' ? 'Grammar' : 'Simplify'} Prompt
                 </span>
-                <button onclick="closeSettingsPopup()" class="text-slate-400 hover:text-slate-600">${Icons.XSmall}</button>
+                <button data-ovl-onclick="closeSettingsPopup()" class="text-slate-400 hover:text-slate-600">${Icons.XSmall}</button>
             </div>
             <div>
                 <textarea 
@@ -20680,17 +20707,17 @@ function renderSettingsPopover(type) {
                     class="w-full text-xs p-2 border border-slate-200 rounded-lg bg-slate-50 focus:bg-white focus:ring-1 focus:ring-${colorClass}-500 outline-none resize-none"
                     rows="4"
                     placeholder="${escapeHtml(defaultPrompt)}"
-                    onclick="event.stopPropagation();"
+                    data-ovl-onclick="event.stopPropagation();"
                 >${escapeHtml(currentPrompt)}</textarea>
                 <div class="mt-2 flex items-center justify-between">
                     <span class="text-[9px] text-slate-400 italic">
                         ${isUsingCustom ? 'Using custom prompt' : 'Using default prompt'}
                     </span>
                     <div class="flex items-center gap-2">
-                        <button onclick="resetPromptToDefault('${type}')" class="px-2 py-1 text-[10px] font-bold text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded transition-colors">
+                        <button data-ovl-onclick="resetPromptToDefault('${type}')" class="px-2 py-1 text-[10px] font-bold text-slate-500 hover:text-slate-700 hover:bg-slate-100 rounded transition-colors">
                             Reset
                         </button>
-                        <button onclick="saveCustomPrompt('${type}')" class="px-2 py-1 text-[10px] font-bold text-white bg-${colorClass}-600 hover:bg-${colorClass}-700 rounded transition-colors">
+                        <button data-ovl-onclick="saveCustomPrompt('${type}')" class="px-2 py-1 text-[10px] font-bold text-white bg-${colorClass}-600 hover:bg-${colorClass}-700 rounded transition-colors">
                             Save
                         </button>
                     </div>
@@ -20706,12 +20733,82 @@ function renderSettingsPopover(type) {
 // 迁过去（见 renderHeader 顶部注释 + ovlSettingsTranslatorHtml），页脚其余内容按明确
 // 指示直接删，不留仅存在于历史记录里的"信息展示"。
 
+// ============= P196：#root 内联事件属性跨文档失效的通用修复 =============
+// 根因（实测坐实，记录在本次改动附带的踏勘笔记 tmp/p196_popout_recon.md）：翻译器"弹出到独立窗口"是真实 DOM 节点
+// 搬家（ovlPopOutMoveNodes 把 #root 整个摘下来挂到弹出窗口自己的空白 Document 上），但那份
+// 4MB 脚本从未在弹出窗口里执行过。#root 模板里原来大量用内联 onclick="fn()" 这类 HTML 事件
+// 属性——浏览器把这类属性编译成函数时，绑定的全局作用域是"节点**当前**所在文档的
+// defaultView"，节点搬进弹出窗口后就是那个空文档，找不到 handleTranslate/handleClear 等
+// 全局函数名，直接 ReferenceError，点击等于完全没反应（file:// 和 http:// 表现一致，与
+// window.opener 无关）。#mainInput 用的是 addEventListener——JS 闭包不受节点搬家影响，弹出后
+// 照常触发，这是本节要推广的写法。
+//
+// #root 里~113 处会被一起搬走的内联事件属性（onclick/onchange/oninput/ondblclick/
+// onmousedown，完整清单见本次改动附带的实现报告 tmp/p196_impl_report.md）模板层已经**只改了属性名**，改成
+// data-ovl-onXxx——属性值（真正的调用代码/参数/转义）一字未动，不引入任何转写风险。本函数
+// 在 #root 这个节点自己身上挂**一次**委托监听器：
+//   · #root 这个 DOM 节点本身只在首次解析 HTML 时创建一次，root.innerHTML = ... 只替换它的
+//     子树，从不重建/替换 #root 自己，弹出/收回也只是把这同一个节点搬来搬去——监听器是挂在
+//     节点上的闭包，天然跟着节点走，不需要每次渲染或每次弹出/收回都重绑（否则弹出→收回→
+//     再弹出几轮之后点一下会连续触发好几次）。attachEventListeners 本身仍然每次渲染都会
+//     被调用（子节点全新，见下方原有注释），所以这里用一个模块级布尔量单独把"只绑一次"这件
+//     事钉死，不依赖调用方只调一次。
+//   · 触发时用**本函数所在的主窗口全局作用域**（new Function 的隐式作用域恒定是定义它的那份
+//     脚本的全局对象，不随触发它的节点当前挂在哪个文档而改变）重新编译并执行那段属性文本，
+//     `this` 绑定成携带该属性的元素、`event` 就是原生事件对象，和浏览器原生编译内联属性时
+//     给的两个隐式名字逐一对应。
+//   · 从触发点向上走到 #root 为止，按"离触发点最近的先执行"的顺序逐个执行（原生内联事件
+//     属性冒泡就是这个顺序），且真的检查属性文本里自带的 event.stopPropagation()
+//     （event.cancelBubble 就是它的可读投影）——本仓库有不少行内按钮就是靠这个阻止外层整行
+//     的点击处理器也跟着触发的（例如逐句编辑区的「Update」/「重新生成」按钮），委托本身
+//     **不主动调用** stopPropagation，原生事件照常继续冒泡到 document——不弹出、没有任何
+//     内联属性匹配时，行为和改动前逐字节相同（见 D5 回归要求）。
+//   · 范围只到 #root：synonymPopup（document.body.insertAdjacentHTML 直接挂主文档 body，
+//     :6321 附近）、xport-thinking-banner（:12562 附近）、ovlPortal 里的设置弹窗/选区工具条
+//     这些本来就不随 #root 一起搬走，继续用浏览器原生内联属性机制，未改动，不在这次迁移范围
+//     （已知限制见本次改动附带的实现报告 tmp/p196_impl_report.md）。
+const OVL_ROOT_DELEGATED_EVENTS = ['click', 'change', 'input', 'dblclick', 'mousedown'];
+let __ovlRootDelegationBound = false;
+function ovlBindRootInlineEventDelegation(root) {
+    if (!root) return;
+    OVL_ROOT_DELEGATED_EVENTS.forEach(function (type) {
+        const attr = 'data-ovl-on' + type;
+        root.addEventListener(type, function (e) {
+            let el = e.target;
+            if (el && el.nodeType !== 1) el = el.parentNode;
+            const chain = [];
+            while (el && el.nodeType === 1) {
+                if (el.hasAttribute(attr)) chain.push(el);
+                if (el === root) break;
+                el = el.parentNode;
+            }
+            for (let i = 0; i < chain.length; i++) {
+                const node = chain[i];
+                const code = node.getAttribute(attr);
+                try {
+                    (new Function('event', code)).call(node, e);
+                } catch (err) {
+                    try { console.error('[ovl-popout-delegate] ' + attr + ' 执行失败：', err, code); } catch (e2) {}
+                }
+                if (e.cancelBubble) break;
+            }
+        });
+    });
+}
+
 // ============= 事件绑定 =============
 function attachEventListeners() {
     // 主输入框
     const mainInput = document.getElementById('mainInput');
     if (mainInput) {
         mainInput.addEventListener('input', (e) => handleInputChange(e.target.value));
+    }
+
+    // P196：见上方大段注释——只在整个页面生命周期里绑一次，绑的是 #root 这个从不被重建的
+    // 节点本身，不受"这里每次渲染都会重新跑一遍"影响，也不需要在弹出/收回时特地重绑。
+    if (!__ovlRootDelegationBound) {
+        __ovlRootDelegationBound = true;
+        ovlBindRootInlineEventDelegation(document.getElementById('root'));
     }
 
     // 编辑文本框
@@ -28132,7 +28229,9 @@ function chatReasoningBarHtml(choice) {
     // —— Qwen(DashScope)：数据驱动自 MODEL_CAPS.qwen，复用 Settings→模型 tab 同一份渲染 +
     // 同一份 AppState.qwenReasoningByModel 持久化（v2 Pass P135，见 qwenThinkingControlHtml 定义处）。
     if (choice.provider === 'qwen') {
-        return '<span class="aichat-pgroup">' + qwenThinkingControlHtml(choice.model) + '</span>';
+        // useDelegatedAttr=false：#aiChatRoot 不在 #root 弹出子树内、从不搬迁文档，原生
+        // onchange 天然有效，且委托监听没有覆盖这里（见 qwenThinkingControlHtml 定义处注释）。
+        return '<span class="aichat-pgroup">' + qwenThinkingControlHtml(choice.model, false) + '</span>';
     }
 
     // —— OpenAI / Claude：没有任何已接线的推理发现 ⇒ 一个控件都不画 ——
