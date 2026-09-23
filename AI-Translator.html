@@ -1443,6 +1443,56 @@ body.ovl-popout-child #root {
     width: calc(100% - 12px) !important;
     height: calc(100vh - 46px) !important;
 }
+
+/* ==================== v2 Pass P195（F1）====================
+   renderMainWorkspace() 里的 <main> 原来用 Tailwind lg:grid-cols-2（视口宽 media query）
+   决定一栏/两栏——跟浮动翻译器窗口（#ovlTransWin）自身宽度是两个独立的量：浏览器视口
+   1920px 宽、窗口被拖到接近 OVL_TRANS_MIN_W(640px) 时，两栏依旧硬撑，导致工具条按钮被
+   挤出卡片边缘、内部出现横向滚动条（侦察报告 p195_resize_recon.md 缺陷#1，
+   截图 p195/screens/main__narrowpopup__640w_at_1920viewport.png 实测复现）。
+   改成由 #root 自身的渲染宽度决定：#root 是 renderApp() 反复重建 innerHTML 时**不会被
+   替换掉**的稳定节点（唯一变的是它的子树），且它的宽度就是翻译器窗口内容区的真实宽度
+   （ovlTransApplyGeom() 写的同一份内联宽度）——挂类的目标选在 #root 自己身上，不需要在
+   每次 renderApp() 之后重新找 <main> 补类，天然幂等。阈值/观察器实现见 JS 里
+   OVL_TRANS_WIDE_THRESHOLD 一节（约 32900 行附近，ovlTransApplyGeom 之后）。
+   非翻译器悬浮窗场景（#root 就是整页应用本身）下，#root 宽度约等于视口宽度，这条规则是
+   旧 lg: 断点的行为超集，不是收窄。 */
+#root.ovl-tr-wide main {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+/* v2 Pass P195 返工：新阈值(1090，见上面 JS 里 OVL_TRANS_WIDE_THRESHOLD 的完整测量记录)
+   按"常见状态"（不在并发编辑）校准，不再兼顾"最坏并发状态"（同时显示对齐切换按钮和
+   Editing 徽标）——两栏、窗口偏窄、又恰好处在这个并发状态时，.ov-t-panelhead 默认
+   flex 不让子项收缩（min-width:auto），标题和按钮组挤不下会横向溢出/裁切。这里让它能
+   换行代替裁切：按钮组整体掉到第二行，不影响常见（单行够放）状态下的视觉，只在真的
+   放不下时才生效。只改这一条纯 CSS 规则，不碰面板 HTML 标记本身。 */
+.ovl-t-panelhead {
+    flex-wrap: wrap;
+    row-gap: 0.375rem;
+}
+
+/* v2 Pass P195 返工2：上面这条 flex-wrap 规则单独存在时会"提前换行"——flex 换行判定用的是
+   每个子项的假想主尺寸（flex-basis:auto 时等于内容的 max-content 宽度，是收缩生效*之前*
+   算的），标题 <h3> 按满宽参与这次求和，即使它自己稍后会被压缩显示。实测（见报告"F1 返工2"
+   一节）：最坏表头状态下换行点 rootW≈1291，而真实零溢出边界只需要 rootW≈1239——52px 的
+   纯算法误差，且这类像素边界本身还会随用户真实字体/DPI/缩放整体平移，不能再靠往上堆一个
+   新阈值去补。根治办法是让标题不再用它的"完整文字宽度"参与换行判定：flex-basis 归零，
+   宽度收缩判定改用行内 min-width:0（覆盖默认的"自动最小宽度=内容宽度"下限，标题允许被压到
+   比文字还窄）；同时给它 overflow:hidden + text-overflow:ellipsis，压缩时省略号截断而不是
+   文字溢出到卡片外。按钮组（第二个子项）没有加这条规则，继续保留 flex-basis:auto —— 按钮组
+   是"不能再收缩"的功能性内容，换行判定理应以它的真实宽度为准；这样换行点约等于"按钮组自己
+   还放不放得下"，和"整行还放不放得下"重新逼近同一个数（标题反正会自己截断，不会成为真正
+   卡住单行布局的那一项）。只改这一条选择器覆盖到的 <h3>，不碰面板 HTML 标记、不碰任何
+   事件属性；Target Panel 的 <h3>（文字更短、从不参与并发编辑徽标）同样命中这条规则，
+   无副作用（它从未需要收缩）。 */
+.ovl-t-panelhead > h3 {
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 /* #aiChatRoot 自己就是一整棵完整的窗口（标题栏+内容+手柄都在一个节点里，不像翻译器
    拆成 #ovlTransWin/#root 两个独立节点），填满子窗口不需要额外的内缩计算。 */
 #aiChatRoot.ovl-popped .aichat-resize { display: none !important; }
@@ -4951,7 +5001,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.39.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.39.03';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-23';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -18493,6 +18543,32 @@ function renderAppCore(preserveScroll = true) {
 
     attachEventListeners();
 
+    // 挂载点②（v2 Pass P195 返工2）：表头等高（ovlPanelheadEqualize，定义见 ovlTransApplyWideClass
+    // 上方的大注释）。挂载点①只覆盖"宽度变化"驱动的场景，覆盖不到"宽度没变、但内容驱动表头
+    // 高度变化"——比如 viewMode 在 edit/preview/original 之间切换导致按钮组增减、或
+    // activeIndex 从 null 变为非 null 触发"Editing"徽标出现/消失，这两种都只改表头内容不改
+    // #root 宽度，两个 ResizeObserver 都不会触发。必须在这里、就在新表头 DOM 写进
+    // innerHTML（本函数开头那次赋值）之后同步补一次，不能等下一次宽度变化才顺带修正——
+    // 否则用户会在"内容驱动"和"宽度驱动"两次事件之间的这一帧里看到表头错位。
+    // 放在这里（attachEventListeners 之后、syncBilingualAlignment 之前）而不是更靠后：
+    // 表头高度变化会影响所在 <section> 的可用高度，进而影响下面 syncBilingualAlignment
+    // 和"恢复滚动位置"这两步的度量基准——必须先把表头高度定下来，再做依赖它的后续计算，
+    // 跟同一段注释后面"必须在恢复滚动位置之前同步跑完"是同一条纪律。
+    // 返工2 复测发现的坑：这里不能只调 ovlPanelheadEqualize()——它内部靠读 #root 现有的
+    // .ovl-tr-wide 类判断"当前是不是两栏"，但 renderAppCore 只是重画表头/内容，从不主动
+    // 校正这个类；如果上一次真正改宽度是在别的时机（比如弹出窗口收回 popIn 之后、或窗口
+    // 曾经缩到比两栏阈值还窄），类可能带着"上一次"的值一路带进这次内容驱动的重渲染，等高
+    // 就会拿一个过期的 wide 状态去量、去写 min-height，产生新的错位而不是修掉它（实测：
+    // popIn 后 rootW 已经小于 OVL_TRANS_WIDE_THRESHOLD，但类仍残留 true，等高把两栏都按
+    // 「两栏」逻辑量，其中一侧因两栏宽度过窄真被挤到换行，min-height 写死在 93px，之后即使
+    // 宽度改回正常两栏区间也甩不掉这段旧值）。改调 ovlTransSyncWideClassNow()——它内部先按
+    // #root 当前真实宽度重新 toggle 一次 .ovl-tr-wide（零多余开销，就是一次
+    // getBoundingClientRect + classList.toggle），再调 ovlTransApplyWideClass 里已经
+    // piggyback 好的 ovlPanelheadEqualize()，保证等高永远基于"这一刻真实宽度"而不是"上一次
+    // 宽度变化事件时残留的类"，与挂载点①用的是同一个函数、同一份 realm 正确性，不需要
+    // 另外判断挂哪个文档。
+    try { ovlTransSyncWideClassNow(); } catch (e) {}
+
     // 左右双栏逐行对齐（内部自带 try/catch，绝不会把异常带回渲染路径）。
     // ⚠️ 必须在恢复滚动位置**之前**同步跑完，不能排进 rAF/定时器等下一轮：
     // 刚 innerHTML 出来的右栏是自然高度，比左栏矮一大截（实测 2915 vs 3669），
@@ -20231,7 +20307,7 @@ function renderControlButtons() {
 // ============= 主工作区 =============
 function renderMainWorkspace() {
     return `
-        <main class="grid grid-cols-1 lg:grid-cols-2 gap-4 flex-grow relative overflow-hidden" style="height: calc(100vh - 220px);">
+        <main class="grid grid-cols-1 gap-4 flex-grow relative overflow-hidden" style="height: calc(100vh - 220px);">
             ${renderSourcePanel()}
             ${renderTargetPanel()}
         </main>
@@ -31355,6 +31431,13 @@ document.addEventListener('DOMContentLoaded', function() {
     // 窗口尺寸变化会让文本重新折行，行高全变 —— 必须重测，不能只在启动时对一次
     window.addEventListener('resize', scheduleAlignSync);
 
+    // v2 Pass P195（F1）：主 realm 的"翻译器窗口内容宽度"观察器只建一次——#root 是静态
+    // HTML 里就有的稳定节点（见 CODE 顶部 <div id="root"></div>），这里挂上去之后不管翻译器
+    // 窗口开不开、renderApp() 重渲染多少次都不用再管它。同一句也顺带把首次加载这一帧的类
+    // 同步对一次（ovlTransEnsureWideRO 内部不做首次同步，这里补一行，跟 ovlTransApplyGeom
+    // 结尾那句是同一份逻辑，不依赖 RO 的异步首次回调）。
+    try { ovlTransEnsureWideRO(); ovlTransSyncWideClassNow(); } catch (e) { console.error('[ovl-trans] initWideObserver failed', e); }
+
     // 自动保存定时器
     setInterval(function() {
         if (AppState.autoSaveInterval > 0 && AppState.translationPairs.length > 0) {
@@ -32998,6 +33081,139 @@ function ovlTransApplyGeom() {
     root.style.top = Math.round(g.y + TB) + 'px';
     root.style.width = Math.round(g.w - 2 * B) + 'px';
     root.style.height = Math.round(g.h - TB - B) + 'px';
+    // v2 Pass P195（F1）：几何一变，#root.ovl-tr-wide 类要立刻跟着同步（不等 ResizeObserver
+    // 的下一帧回调）——ovlTransApplyGeom() 是全部"JS 主动改宽度"路径（挂载/打开/拖拽缩放/
+    // 最大化/viewport resize/弹出收回）唯一的公共出口，这里补一行调用就覆盖了它们全部，
+    // 不需要逐个调用点分别打补丁。详见 ovlTransSyncWideClassNow 定义处的完整说明。
+    try { ovlTransSyncWideClassNow(); } catch (e) {}
+}
+
+// ==================== v2 Pass P195（F1）：翻译器窗口内容按自身宽度切一栏/两栏 ====================
+// 背景/CSS 选择器见样式表里 #root.ovl-tr-wide main 那条规则上方的大注释（约 1446 行附近），
+// 这里只放 JS 实现。两条独立路径，互不依赖、互为补充：
+//   ① ovlTransApplyGeom() 结尾那一行同步调用——覆盖"JS 自己知道宽度变了"的全部场景，
+//      同步执行（不等一帧），第一次挂载/打开窗口那一刻就能拿到正确的类，不依赖
+//      ResizeObserver 的异步回调时机（§F1"初次渲染"要求）。
+//   ② 下面的 ResizeObserver——覆盖"JS 完全不知道宽度变了"的场景，目前唯一已知的例子是
+//      弹出到独立 OS 窗口后，用户直接拖拽那个 OS 窗口本身的边框：那条路径只改变子窗口的
+//      视口，从不经过 ovlTransApplyGeom（弹出期间 #root 的宽度由 .ovl-popped 那组 CSS
+//      "width:100% !important" 接管，JS 侧的几何 state 根本不知道 OS 窗口被拖成了多宽）。
+// 阈值实测过程（v2 Pass P195 返工，替换初版）：初版按"表头最坏并发状态"（viewMode===
+// 'preview' 显示对齐切换按钮 + activeIndex!==null 显示"Editing"徽标）零溢出宽度校准，
+// 定为 rootW=1280。但默认自动打开宽度（ovlTransAutoGeom 外层封顶 1280，root 两侧各减
+// OVL_TRANS_BORDER=6px 边框后 rootW≈1268）本来就低于这个阈值——默认打开从两栏变一栏，
+// 是用户没要求的可见行为变化；而常见状态（不在并发编辑）下旧版两栏在默认宽度本不溢出，
+// 不该被这次改动连带改掉。返工改按"常见状态"（无并发编辑）零溢出宽度重新校准：实测最小
+// 零溢出 rootW=1053（binary search，见 d 组），取整留约 37px 余量定为 1090——默认宽度
+// 1268 重新落在两栏区间。最坏并发状态需要 rootW>=1239 才零溢出（e 组实测，量级同初版），
+// 新阈值到 1239px 之间会两栏但表头仍会被最坏状态挤——不再靠拉高这个阈值去兼顾它，改由
+// 下面 CSS 里 .ovl-t-panelhead 的 flex-wrap 规则接住（允许换行，不裁切）。完整 (a)-(e)
+// 五个测量数字见实施报告 p195_impl_report.md「F1 返工」一节。
+const OVL_TRANS_WIDE_THRESHOLD = 1090;
+
+// v2 Pass P195 返工2：两栏模式下左右表头（.ovl-t-panelhead）必须逐像素等高，否则两栏内容区
+// 的起点就差出表头高度差那么多像素（源栏换行、译栏不换行时最直观）——这正是这一轮要堵的
+// "新造一处错位"。不采用纯 CSS 方案（比如让两个表头共享同一条 subgrid 行）：两个表头分别嵌在
+// 各自 <section class="flex flex-col">（源/译两栏）里，要让它们共享网格行需要把每个 <section>
+// 从 flex 布局整体改造成 grid + subgrid，牵连内容区 `flex-grow` 撑满剩余高度、`overflow-y-auto`
+// 滚动容器的可用高度计算——这两块正是上面"Fixed-descendant audit"和 syncBilingualAlignment
+// 头顶大注释里两处已经趟过雷的敏感区，牵一发动全身，风险和验证成本都远高于一个纯增量、不碰
+// 面板标记的 ResizeObserver 方案。改用 JS 测两个表头的自然高度、取较大值写回两者的
+// min-height：只加东西、不改现有 flex 布局，且能直接复用 F1 已验证的 realm 正确性——见下面
+// 挂载点①②的注释。
+//
+// 反馈循环防护：每次调用先把两个表头的 min-height 清空再重新量"自然高度"（不清空的话，上一轮
+// 写的下限会把这一轮的量测污染成"上一轮的目标值"，内容变矮后测不出真实变化）；只有当某个
+// 表头的自然高度比目标矮超过 EPS 才写回，已经达标的一侧维持 auto、不做多余写入。这样收敛
+// 最多两轮（第一轮把矮的那侧撑到目标高度，若这改变了 #root 自身高度触发 ResizeObserver 再来
+// 一轮，第二轮量出来的目标和上一轮相同、不再产生净高度变化，不会继续触发第三轮）。
+//
+// 单栏模式（#root 没有 .ovl-tr-wide 类）下两个面板改为上下堆叠，不存在"左右对齐"的问题，
+// 此时清掉可能残留的 min-height，不留一个视觉上莫名其妙偏高的表头。
+function ovlPanelheadEqualize() {
+    try {
+        const root = document.getElementById('root');
+        const wide = !!(root && root.classList.contains('ovl-tr-wide'));
+        const heads = document.querySelectorAll('.ovl-t-panelhead');
+        if (!heads || heads.length < 2) return;
+        const a = heads[0], b = heads[1];
+        if (a.style.minHeight) a.style.minHeight = '';
+        if (b.style.minHeight) b.style.minHeight = '';
+        if (!wide) return; // 单栏：保持 auto（.ovl-t-panelhead 自身 CSS 的 min-h-[70px] 仍然生效）
+        const ha = a.getBoundingClientRect().height;
+        const hb = b.getBoundingClientRect().height;
+        const target = Math.max(ha, hb);
+        const EPS = 0.5;
+        if (target - ha > EPS) a.style.minHeight = target + 'px';
+        if (target - hb > EPS) b.style.minHeight = target + 'px';
+    } catch (e) { console.error('[ovl-trans] panelheadEqualize failed', e); }
+}
+
+function ovlTransApplyWideClass(root) {
+    if (!root) return;
+    let w = 0;
+    try { w = root.getBoundingClientRect().width; } catch (e) { return; }
+    if (!(w > 0)) return; // 还没量出真实宽度（比如 display:none 期间）——维持现状，不误判成"窄"
+    try { root.classList.toggle('ovl-tr-wide', w >= OVL_TRANS_WIDE_THRESHOLD); } catch (e) {}
+    // 挂载点①：宽度一变，表头等高就要跟着重算——覆盖"因为宽度变化导致换行/不换行"的全部
+    // 场景。这个函数本来就是 ovlTransApplyGeom()（同步）和两个 ResizeObserver（异步，含弹出
+    // 到独立 OS 窗口后用户直接拖窗口边框那条路径）唯一的共同出口，见上面 v2 Pass P195（F1）
+    // 那段大注释——挂在这里等于零额外配管就自动获得和宽度断点完全相同的 realm 正确性
+    // （弹出态下 root 参数本来就是调用方在正确 realm 里解出来的那一个，ovlPanelheadEqualize
+    // 内部再用 document.querySelectorAll 找表头也天然正确：§3.6.2 的 getElementById/
+    // querySelector/querySelectorAll 补丁已经把"主文档查不到就去已弹出的子文档里找"这件事
+    // 处理掉了，不需要在这里重新判断挂哪个文档）。
+    try { ovlPanelheadEqualize(); } catch (e) {}
+}
+
+function ovlTransSyncWideClassNow() {
+    try { ovlTransApplyWideClass(document.getElementById('root')); }
+    catch (e) { console.error('[ovl-trans] syncWideClassNow failed', e); }
+}
+
+// realmWin：应该用哪个 window 的 ResizeObserver 构造函数——默认主窗口；弹出到独立 OS 窗口
+// 后改用弹出窗口自己的（见下面 ovlTransRewireWideRO），保证跨文档场景下观察器一定是在
+// 正确的渲染 realm 里创建的，不依赖"父窗口创建的 RO 能不能观察到被搬进另一个 Document 的
+// 节点"这条未经规范强制保证的浏览器行为（实测记录同样见实施报告 p195_impl_report.md）。
+function ovlTransCreateWideRO(realmWin, root) {
+    try {
+        const RO = realmWin && realmWin.ResizeObserver;
+        if (typeof RO === 'undefined') return null;
+        const ro = new RO(function () { ovlTransApplyWideClass(root); });
+        ro.observe(root);
+        return ro;
+    } catch (e) { return null; }
+}
+
+let OvlTransWideRO = null; // 主窗口 realm——非弹出态全程只建一次，观察 #root 这个稳定节点
+function ovlTransEnsureWideRO() {
+    if (OvlTransWideRO) return OvlTransWideRO;
+    const root = document.getElementById('root');
+    if (!root) return null;
+    OvlTransWideRO = ovlTransCreateWideRO(window, root);
+    return OvlTransWideRO;
+}
+
+let OvlTransPopoutWideRO = null; // 弹出态：在弹出窗口自己的 realm 里新建的那一份
+// 弹出/收回时调用（ovlPopOutFinish / ovlPopIn 里各一行，见那两个函数内部的调用点）：
+// 弹出——断开主 realm 的观察（子文档节点即使还能被父 realm 的 RO 观察到，也不能保证跨
+// 文档语义正确，见上方大注释），改在弹出窗口 win 的 realm 里新建一个；
+// 收回——反过来，断开弹出 realm 的观察器，把主 realm 的观察器重新挂回 #root（此时 #root
+// 已经被搬回主文档）。两个方向都做"先断后连"，不留悬空观察器。
+function ovlTransRewireWideRO(direction, popWin) {
+    try {
+        const root = document.getElementById('root');
+        if (direction === 'popout') {
+            if (OvlTransWideRO && root) { try { OvlTransWideRO.disconnect(); } catch (e) {} }
+            if (popWin && root) OvlTransPopoutWideRO = ovlTransCreateWideRO(popWin, root);
+        } else { // 'popin'
+            if (OvlTransPopoutWideRO) { try { OvlTransPopoutWideRO.disconnect(); } catch (e) {} OvlTransPopoutWideRO = null; }
+            if (root) {
+                OvlTransWideRO = ovlTransCreateWideRO(window, root);
+            }
+        }
+        ovlTransSyncWideClassNow(); // 搬完立刻同步一次类，不等 RO 的异步首次回调
+    } catch (e) { console.error('[ovl-trans] rewireWideRO failed', e); }
 }
 
 function ovlTransSaveGeom() {
@@ -33730,6 +33946,11 @@ function ovlPopOutFinish(kind, doc, win, mode) {
     // 找到节点并重写内联几何（虽然显示上早被 .ovl-popped 那组 !important 接管了，这一步
     // 主要是保证 root.style 上留着的仍然是"收回页面"时要用的那份，不被别的代码路径写歪）。
     try { if (kind === 'trans') ovlTransApplyGeom(); else chatApplyGeom(); } catch (e) {}
+    // v2 Pass P195（F1）：#root 这会儿已经被搬进 win 自己的文档了——把"宽度观察器"也重新
+    // 挂到 win 的 realm 里，不能继续指望主窗口那个观察器还能正确跟踪一个已经不在它自己
+    // 文档里的节点（见 ovlTransRewireWideRO 定义处的完整说明）。只对 trans 有意义，chat
+    // 窗口没有这套宽度断点机制。
+    if (kind === 'trans') { try { ovlTransRewireWideRO('popout', win); } catch (e) {} }
 }
 
 function ovlPopOutViaPip(kind) {
@@ -33830,6 +34051,10 @@ function ovlPopIn(kind) {
 
         ovlPopoutSyncButtons(kind, false);
         try { if (kind === 'trans') ovlTransApplyGeom(); else chatApplyGeom(); } catch (e) {}
+        // v2 Pass P195（F1）：#root 已经搬回主文档了，把宽度观察器也从弹出 realm 收回主
+        // realm（见 ovlTransRewireWideRO 定义处）。放在 ovlTransApplyGeom() 之后——那一行
+        // 内部已经同步过一次类，这里只是把"以后谁来观察"这件事收尾，不重复触发布局抖动。
+        if (kind === 'trans') { try { ovlTransRewireWideRO('popin'); } catch (e) {} }
     } catch (e) {
         console.error('[ovl-popout] popIn(' + kind + ') failed', e);
     }
@@ -62185,6 +62410,12 @@ function ovlVisualGutterSyncSpacerMirror(gutter, pane) {
 let OvlVisualBlockROMirror = null;
 const OvlVisualObservedBlocksMirror = (typeof WeakSet !== 'undefined') ? new WeakSet() : null;
 const OvlVisualBlockLastHMirror = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+// v2 Pass P195（F2）：跟左侧 OvlVisualBlockLastW（约 61825 行附近）同一份职责——记上次汇报
+// 的宽度，width 真的变了（不是 observe() 首次投递）才去重算图片宽度。侦察缺陷#2确认过：
+// 这份镜像回调此前只查 height，从没查过 width、也从没调用过 ovlP109RecalcFigureWidthsIn，
+// 面板缩放后镜像栏图片宽度靠 CSS max-width 兜底夹出一个不是 0.6×容器宽的值，且容器变宽后
+// 也不会主动拉回正确值（详见侦察报告 p195_resize_recon.md 缺陷#2）。
+const OvlVisualBlockLastWMirror = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
 let OvlVisualGutterMirrorImageRaf = null;
 function ovlScheduleVisualGutterAfterImageMirror() {
     if (OvlVisualGutterMirrorImageRaf !== null) return;
@@ -62203,22 +62434,36 @@ function ovlEnsureVisualBlockResizeObserverMirror() {
                 const t = entries[i].target;
                 let rect;
                 try { rect = t.getBoundingClientRect(); } catch (e2) { continue; }
-                const h = rect.height;
+                const h = rect.height, w = rect.width;
                 const lastH = OvlVisualBlockLastHMirror ? OvlVisualBlockLastHMirror.get(t) : undefined;
+                const lastW = OvlVisualBlockLastWMirror ? OvlVisualBlockLastWMirror.get(t) : undefined;
+                const hChanged = lastH === undefined || Math.abs(h - lastH) > 0.5;
+                const wChanged = lastW === undefined || Math.abs(w - lastW) > 0.5;
                 if (OvlVisualBlockLastHMirror) OvlVisualBlockLastHMirror.set(t, h);
-                if (lastH === undefined || Math.abs(h - lastH) > 0.5) changed = true;
+                if (OvlVisualBlockLastWMirror) OvlVisualBlockLastWMirror.set(t, w);
+                if (hChanged) changed = true;
+                // v2 Pass P195（F2）：width 真的变了才重算——ovlP109RecalcFigureWidthsIn 本身就是
+                // 通用函数（按 scopeEl.closest('.ovl-visual-body') 找容器宽度，不写死左侧 pane
+                // id，见该函数定义处注释），镜像面板的块同样落在一个 class="ovl-visual-body"
+                // 的容器里（ovlBilingualRefreshMirror() 拼 HTML 时用的是同一个类名），原样调用
+                // 即可，不需要另写一份"镜像版"计算逻辑。
+                if (wChanged) {
+                    changed = true;
+                    if (typeof ovlP109RecalcFigureWidthsIn === 'function') ovlP109RecalcFigureWidthsIn(t);
+                }
             }
             if (changed) ovlScheduleVisualGutterAfterImageMirror();
         });
     } catch (e) { OvlVisualBlockROMirror = null; }
     return OvlVisualBlockROMirror;
 }
-function ovlVisualGutterObserveBlockMirror(blk, h) {
+function ovlVisualGutterObserveBlockMirror(blk, h, w) {
     if (!OvlVisualObservedBlocksMirror || OvlVisualObservedBlocksMirror.has(blk)) return;
     const ro = ovlEnsureVisualBlockResizeObserverMirror();
     if (!ro) return;
     OvlVisualObservedBlocksMirror.add(blk);
     if (OvlVisualBlockLastHMirror) OvlVisualBlockLastHMirror.set(blk, h);
+    if (OvlVisualBlockLastWMirror) OvlVisualBlockLastWMirror.set(blk, w);
     try { ro.observe(blk); } catch (e3) {}
 }
 
@@ -62289,7 +62534,7 @@ function ovlRenderVisualGutterMirror(skipAlignSchedule) {
                 cell.textContent = String(ln + 1);
                 frag.appendChild(cell);
             }
-            ovlVisualGutterObserveBlockMirror(blk, h);
+            ovlVisualGutterObserveBlockMirror(blk, h, r.width);
         }
         gutter.appendChild(frag);
         OvlVisualGutterBlockOrderMirror = blocks;
