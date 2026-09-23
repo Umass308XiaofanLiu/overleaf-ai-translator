@@ -1472,6 +1472,27 @@ body.ovl-popout-child #root {
     row-gap: 0.375rem;
 }
 
+/* v2 Pass P195 返工2：上面这条 flex-wrap 规则单独存在时会"提前换行"——flex 换行判定用的是
+   每个子项的假想主尺寸（flex-basis:auto 时等于内容的 max-content 宽度，是收缩生效*之前*
+   算的），标题 <h3> 按满宽参与这次求和，即使它自己稍后会被压缩显示。实测（见报告"F1 返工2"
+   一节）：最坏表头状态下换行点 rootW≈1291，而真实零溢出边界只需要 rootW≈1239——52px 的
+   纯算法误差，且这类像素边界本身还会随用户真实字体/DPI/缩放整体平移，不能再靠往上堆一个
+   新阈值去补。根治办法是让标题不再用它的"完整文字宽度"参与换行判定：flex-basis 归零，
+   宽度收缩判定改用行内 min-width:0（覆盖默认的"自动最小宽度=内容宽度"下限，标题允许被压到
+   比文字还窄）；同时给它 overflow:hidden + text-overflow:ellipsis，压缩时省略号截断而不是
+   文字溢出到卡片外。按钮组（第二个子项）没有加这条规则，继续保留 flex-basis:auto —— 按钮组
+   是"不能再收缩"的功能性内容，换行判定理应以它的真实宽度为准；这样换行点约等于"按钮组自己
+   还放不放得下"，和"整行还放不放得下"重新逼近同一个数（标题反正会自己截断，不会成为真正
+   卡住单行布局的那一项）。只改这一条选择器覆盖到的 <h3>，不碰面板 HTML 标记、不碰任何
+   事件属性；Target Panel 的 <h3>（文字更短、从不参与并发编辑徽标）同样命中这条规则，
+   无副作用（它从未需要收缩）。 */
+.ovl-t-panelhead > h3 {
+    flex: 1 1 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 /* #aiChatRoot 自己就是一整棵完整的窗口（标题栏+内容+手柄都在一个节点里，不像翻译器
    拆成 #ovlTransWin/#root 两个独立节点），填满子窗口不需要额外的内缩计算。 */
 #aiChatRoot.ovl-popped .aichat-resize { display: none !important; }
@@ -4980,7 +5001,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.39.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.39.03';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-23';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -18503,6 +18524,32 @@ function renderAppCore(preserveScroll = true) {
     renderSynonymPopupOnly();
 
     attachEventListeners();
+
+    // 挂载点②（v2 Pass P195 返工2）：表头等高（ovlPanelheadEqualize，定义见 ovlTransApplyWideClass
+    // 上方的大注释）。挂载点①只覆盖"宽度变化"驱动的场景，覆盖不到"宽度没变、但内容驱动表头
+    // 高度变化"——比如 viewMode 在 edit/preview/original 之间切换导致按钮组增减、或
+    // activeIndex 从 null 变为非 null 触发"Editing"徽标出现/消失，这两种都只改表头内容不改
+    // #root 宽度，两个 ResizeObserver 都不会触发。必须在这里、就在新表头 DOM 写进
+    // innerHTML（本函数开头那次赋值）之后同步补一次，不能等下一次宽度变化才顺带修正——
+    // 否则用户会在"内容驱动"和"宽度驱动"两次事件之间的这一帧里看到表头错位。
+    // 放在这里（attachEventListeners 之后、syncBilingualAlignment 之前）而不是更靠后：
+    // 表头高度变化会影响所在 <section> 的可用高度，进而影响下面 syncBilingualAlignment
+    // 和"恢复滚动位置"这两步的度量基准——必须先把表头高度定下来，再做依赖它的后续计算，
+    // 跟同一段注释后面"必须在恢复滚动位置之前同步跑完"是同一条纪律。
+    // 返工2 复测发现的坑：这里不能只调 ovlPanelheadEqualize()——它内部靠读 #root 现有的
+    // .ovl-tr-wide 类判断"当前是不是两栏"，但 renderAppCore 只是重画表头/内容，从不主动
+    // 校正这个类；如果上一次真正改宽度是在别的时机（比如弹出窗口收回 popIn 之后、或窗口
+    // 曾经缩到比两栏阈值还窄），类可能带着"上一次"的值一路带进这次内容驱动的重渲染，等高
+    // 就会拿一个过期的 wide 状态去量、去写 min-height，产生新的错位而不是修掉它（实测：
+    // popIn 后 rootW 已经小于 OVL_TRANS_WIDE_THRESHOLD，但类仍残留 true，等高把两栏都按
+    // 「两栏」逻辑量，其中一侧因两栏宽度过窄真被挤到换行，min-height 写死在 93px，之后即使
+    // 宽度改回正常两栏区间也甩不掉这段旧值）。改调 ovlTransSyncWideClassNow()——它内部先按
+    // #root 当前真实宽度重新 toggle 一次 .ovl-tr-wide（零多余开销，就是一次
+    // getBoundingClientRect + classList.toggle），再调 ovlTransApplyWideClass 里已经
+    // piggyback 好的 ovlPanelheadEqualize()，保证等高永远基于"这一刻真实宽度"而不是"上一次
+    // 宽度变化事件时残留的类"，与挂载点①用的是同一个函数、同一份 realm 正确性，不需要
+    // 另外判断挂哪个文档。
+    try { ovlTransSyncWideClassNow(); } catch (e) {}
 
     // 左右双栏逐行对齐（内部自带 try/catch，绝不会把异常带回渲染路径）。
     // ⚠️ 必须在恢复滚动位置**之前**同步跑完，不能排进 rAF/定时器等下一轮：
@@ -32965,12 +33012,59 @@ function ovlTransApplyGeom() {
 // 五个测量数字见实施报告 p195_impl_report.md「F1 返工」一节。
 const OVL_TRANS_WIDE_THRESHOLD = 1090;
 
+// v2 Pass P195 返工2：两栏模式下左右表头（.ovl-t-panelhead）必须逐像素等高，否则两栏内容区
+// 的起点就差出表头高度差那么多像素（源栏换行、译栏不换行时最直观）——这正是这一轮要堵的
+// "新造一处错位"。不采用纯 CSS 方案（比如让两个表头共享同一条 subgrid 行）：两个表头分别嵌在
+// 各自 <section class="flex flex-col">（源/译两栏）里，要让它们共享网格行需要把每个 <section>
+// 从 flex 布局整体改造成 grid + subgrid，牵连内容区 `flex-grow` 撑满剩余高度、`overflow-y-auto`
+// 滚动容器的可用高度计算——这两块正是上面"Fixed-descendant audit"和 syncBilingualAlignment
+// 头顶大注释里两处已经趟过雷的敏感区，牵一发动全身，风险和验证成本都远高于一个纯增量、不碰
+// 面板标记的 ResizeObserver 方案。改用 JS 测两个表头的自然高度、取较大值写回两者的
+// min-height：只加东西、不改现有 flex 布局，且能直接复用 F1 已验证的 realm 正确性——见下面
+// 挂载点①②的注释。
+//
+// 反馈循环防护：每次调用先把两个表头的 min-height 清空再重新量"自然高度"（不清空的话，上一轮
+// 写的下限会把这一轮的量测污染成"上一轮的目标值"，内容变矮后测不出真实变化）；只有当某个
+// 表头的自然高度比目标矮超过 EPS 才写回，已经达标的一侧维持 auto、不做多余写入。这样收敛
+// 最多两轮（第一轮把矮的那侧撑到目标高度，若这改变了 #root 自身高度触发 ResizeObserver 再来
+// 一轮，第二轮量出来的目标和上一轮相同、不再产生净高度变化，不会继续触发第三轮）。
+//
+// 单栏模式（#root 没有 .ovl-tr-wide 类）下两个面板改为上下堆叠，不存在"左右对齐"的问题，
+// 此时清掉可能残留的 min-height，不留一个视觉上莫名其妙偏高的表头。
+function ovlPanelheadEqualize() {
+    try {
+        const root = document.getElementById('root');
+        const wide = !!(root && root.classList.contains('ovl-tr-wide'));
+        const heads = document.querySelectorAll('.ovl-t-panelhead');
+        if (!heads || heads.length < 2) return;
+        const a = heads[0], b = heads[1];
+        if (a.style.minHeight) a.style.minHeight = '';
+        if (b.style.minHeight) b.style.minHeight = '';
+        if (!wide) return; // 单栏：保持 auto（.ovl-t-panelhead 自身 CSS 的 min-h-[70px] 仍然生效）
+        const ha = a.getBoundingClientRect().height;
+        const hb = b.getBoundingClientRect().height;
+        const target = Math.max(ha, hb);
+        const EPS = 0.5;
+        if (target - ha > EPS) a.style.minHeight = target + 'px';
+        if (target - hb > EPS) b.style.minHeight = target + 'px';
+    } catch (e) { console.error('[ovl-trans] panelheadEqualize failed', e); }
+}
+
 function ovlTransApplyWideClass(root) {
     if (!root) return;
     let w = 0;
     try { w = root.getBoundingClientRect().width; } catch (e) { return; }
     if (!(w > 0)) return; // 还没量出真实宽度（比如 display:none 期间）——维持现状，不误判成"窄"
     try { root.classList.toggle('ovl-tr-wide', w >= OVL_TRANS_WIDE_THRESHOLD); } catch (e) {}
+    // 挂载点①：宽度一变，表头等高就要跟着重算——覆盖"因为宽度变化导致换行/不换行"的全部
+    // 场景。这个函数本来就是 ovlTransApplyGeom()（同步）和两个 ResizeObserver（异步，含弹出
+    // 到独立 OS 窗口后用户直接拖窗口边框那条路径）唯一的共同出口，见上面 v2 Pass P195（F1）
+    // 那段大注释——挂在这里等于零额外配管就自动获得和宽度断点完全相同的 realm 正确性
+    // （弹出态下 root 参数本来就是调用方在正确 realm 里解出来的那一个，ovlPanelheadEqualize
+    // 内部再用 document.querySelectorAll 找表头也天然正确：§3.6.2 的 getElementById/
+    // querySelector/querySelectorAll 补丁已经把"主文档查不到就去已弹出的子文档里找"这件事
+    // 处理掉了，不需要在这里重新判断挂哪个文档）。
+    try { ovlPanelheadEqualize(); } catch (e) {}
 }
 
 function ovlTransSyncWideClassNow() {
