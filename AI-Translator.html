@@ -1461,6 +1461,17 @@ body.ovl-popout-child #root {
     grid-template-columns: repeat(2, minmax(0, 1fr));
 }
 
+/* v2 Pass P195 返工：新阈值(1090，见上面 JS 里 OVL_TRANS_WIDE_THRESHOLD 的完整测量记录)
+   按"常见状态"（不在并发编辑）校准，不再兼顾"最坏并发状态"（同时显示对齐切换按钮和
+   Editing 徽标）——两栏、窗口偏窄、又恰好处在这个并发状态时，.ov-t-panelhead 默认
+   flex 不让子项收缩（min-width:auto），标题和按钮组挤不下会横向溢出/裁切。这里让它能
+   换行代替裁切：按钮组整体掉到第二行，不影响常见（单行够放）状态下的视觉，只在真的
+   放不下时才生效。只改这一条纯 CSS 规则，不碰面板 HTML 标记本身。 */
+.ovl-t-panelhead {
+    flex-wrap: wrap;
+    row-gap: 0.375rem;
+}
+
 /* #aiChatRoot 自己就是一整棵完整的窗口（标题栏+内容+手柄都在一个节点里，不像翻译器
    拆成 #ovlTransWin/#root 两个独立节点），填满子窗口不需要额外的内缩计算。 */
 #aiChatRoot.ovl-popped .aichat-resize { display: none !important; }
@@ -4969,8 +4980,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.39.01';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-22';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.39.02';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-23';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -32941,15 +32952,18 @@ function ovlTransApplyGeom() {
 //      弹出到独立 OS 窗口后，用户直接拖拽那个 OS 窗口本身的边框：那条路径只改变子窗口的
 //      视口，从不经过 ovlTransApplyGeom（弹出期间 #root 的宽度由 .ovl-popped 那组 CSS
 //      "width:100% !important" 接管，JS 侧的几何 state 根本不知道 OS 窗口被拖成了多宽）。
-// 阈值实测过程：用 scratch CDP 探针对 #root 自身宽度（root.getBoundingClientRect().width，
-// 即本判断实际比较的量，不是外层窗口宽 OvlTransState.geom.w——两者相差约 12px 的窗体边框/
-// padding）做过扫描，测的是 Source Panel 表头行（.ovl-t-panelhead，flex 默认 min-width:auto
-// 不让子项收缩）在其真实"最大内容宽度"状态下（viewMode==='preview' 显示对齐切换按钮 +
-// activeIndex!==null 显示"Editing"徽标——这是逐句编辑时的常见并发状态，不是边角场景）的
-// scrollWidth。实测该状态下最小零溢出 rootW=1243（1238 时还溢出 2px），取整数留约 37px
-// 余量定为 1280。完整扫描表格/命令记录见实施报告 p195_impl_report.md 的 F1 一节，
-// 不在这里复述一遍防止以后改阈值忘了同步改注释。
-const OVL_TRANS_WIDE_THRESHOLD = 1280;
+// 阈值实测过程（v2 Pass P195 返工，替换初版）：初版按"表头最坏并发状态"（viewMode===
+// 'preview' 显示对齐切换按钮 + activeIndex!==null 显示"Editing"徽标）零溢出宽度校准，
+// 定为 rootW=1280。但默认自动打开宽度（ovlTransAutoGeom 外层封顶 1280，root 两侧各减
+// OVL_TRANS_BORDER=6px 边框后 rootW≈1268）本来就低于这个阈值——默认打开从两栏变一栏，
+// 是用户没要求的可见行为变化；而常见状态（不在并发编辑）下旧版两栏在默认宽度本不溢出，
+// 不该被这次改动连带改掉。返工改按"常见状态"（无并发编辑）零溢出宽度重新校准：实测最小
+// 零溢出 rootW=1053（binary search，见 d 组），取整留约 37px 余量定为 1090——默认宽度
+// 1268 重新落在两栏区间。最坏并发状态需要 rootW>=1239 才零溢出（e 组实测，量级同初版），
+// 新阈值到 1239px 之间会两栏但表头仍会被最坏状态挤——不再靠拉高这个阈值去兼顾它，改由
+// 下面 CSS 里 .ovl-t-panelhead 的 flex-wrap 规则接住（允许换行，不裁切）。完整 (a)-(e)
+// 五个测量数字见实施报告 p195_impl_report.md「F1 返工」一节。
+const OVL_TRANS_WIDE_THRESHOLD = 1090;
 
 function ovlTransApplyWideClass(root) {
     if (!root) return;
