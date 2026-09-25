@@ -5001,8 +5001,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.40.01';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-24';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.40.02';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-25';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -37029,7 +37029,9 @@ function ovlVisualTransCacheLegacyLoad() {
 // 拆分、占位符规则文字、领域提示/术语表注入方式，任何一处改了都必须手动把这个常量 +1，
 // 逼所有旧缓存条目在下次读取时天然 key 不匹配、自动当成未命中——不需要另外维护一张
 // "这次改动应该让哪些条目失效"的清单，版本号进 key 本身是最不容易漏改的做法。
-const OVL_VISUAL_TRANS_PROMPT_VERSION = 2;
+// v2 Pass P200：新增 sysRules 里的 LaTeX 格式化命令保留规则（见上方 isLocalProvider 分支），
+// 2 -> 3。
+const OVL_VISUAL_TRANS_PROMPT_VERSION = 3;
 // 领域提示 + 项目术语表的指纹——两者任一变化都应该让同一段源文重新翻译一次（比如刚给
 // 术语表加了一条新词条，此后应该用新术语表重翻，不能继续吐旧缓存）。复用跟源文一样的
 // 轻量哈希，不追求密码学强度，只要"内容变了指纹大概率跟着变"就够。
@@ -38153,6 +38155,23 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
             const glossaryBlock = ovlGlossaryBuildPromptBlock();
             const domainHintLine = ovlDomainHintPromptLine();
             const sysRules = rules.slice();
+            // v2 Pass P200（回归修复，诊断见 .claude/tmp/p200_*）：\textcolor{..}{..}、\emph{..}、
+            // \textbf{..} 这类"透明"格式化命令从未被 xportMask/xportProtectedSpan 遮罩——
+            // XPORT_OPAQUE_RE 故意不收它们（该表上方注释原话："花括号里装的是人话，遮起来会
+            // 让那段话永远不被翻译"），模型看到的就是裸露的 \textcolor{black}{...}，过去完全
+            // 靠模型自己的常识把命令保留、只译花括号里的文字——这份 rules 数组里从来没有一条
+            // 把这件事写成明文规则，00af7ba 和 d05446a 两版这里的文字（含 rules 共享数组）
+            // 逐字相同。真实论文段落回归评测（p03，三次真实调用）实测：00af7ba 单段
+            // prompt（规则紧邻"原文：\n"+正文，同一条 user 消息）3/3 保留 \textcolor；P197
+            // 改成 system/user 两段式后，system 末尾又新插入了英文领域提示 + 术语表两段新
+            // 内容，user 消息变成只有裸文本——同一颗本地小模型 3/3 把 \textcolor{black}{...}
+            // 整体剥掉、只留花括号里译文。masked.text 本身逐字节相同（xportMask 未改），说明
+            // 不是掩码变了，是"模型自己的常识"这条隐性约定在新的 prompt 结构下不再可靠。改成
+            // 一条显式规则，不再依赖约定；只加进 sysRules（仅 local provider 私有副本），不碰
+            // 共享的 rules 数组，Claude/OpenAI/Gemini 的 prompt 字节不受影响。
+            sysRules.push('译文中若仍保留着未被占位符替换的 LaTeX 格式化命令（如 \\textcolor{..}{..}、'
+                + '\\emph{..}、\\textbf{..}、\\underline{..}），必须把命令名和花括号原样保留，只翻译'
+                + '命令最后一个花括号参数里的文字，不得删除、拆散或吞掉命令本身。');
             // v2 Pass P197（C 新规则，修正）：最初把这条新规则只挂在 citeMasked.map（OVLCITE，
             // 只覆盖散文里已经写成字面 [N] 的引用）上——但用户报告的坏例子源文本是
             // `~\cite{leyva2021,...}`，这种 \cite{} 命令走的是 xportMask 这条通用掩码
