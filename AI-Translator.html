@@ -3757,6 +3757,14 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-quickactions {
     position: fixed; z-index: 1086; display: none; background: #1B222C; border-radius: 6px;
     box-shadow: 0 8px 20px rgba(0,0,0,0.4); padding: 3px; gap: 2px;
+    /* v2 Pass P207：显式 shrink-to-fit（不是 flex 的默认行为兜底，是明确声明这条工具条永远
+       跟内容走，不被任何遗留的 inline style="width:...px" 顶住——ovlPlaceFloating 在重叠规避
+       分支会写一个具体 px 宽度进 style.width 压缩显示，但那条分支只在候选位置全部跟别的浮层
+       重叠时才触发，跟这里"按钮本身该多宽"完全是两回事；max-content 只影响没有 inline style
+       覆盖时的默认求值，两者不冲突）。flex-wrap:nowrap 是默认值，这里写出来避免以后有人在这
+       改成按钮换行——这是个单行工具条，换行会破坏 ovlPlaceFloating 用 offsetWidth/offsetHeight
+       算的矩形碰撞检测假设。 */
+    width: max-content; flex-wrap: nowrap;
 }
 .ovl-quickactions.ovl-open { display: flex; }
 .ovl-quickactions button {
@@ -3801,7 +3809,7 @@ body.ovl-translator-open #ovlTransWin { display: block; }
    非"已正常译完"的状态时才出现（见 ovlQaRenderVisualState）；默认 hidden，不出现时对弹窗
    宽度零影响。用 :not([hidden]) 而不是直接 display:flex——避免跟 HTML `hidden` 属性的默认
    UA 样式打架（同优先级下 author 样式会赢，必须显式排除隐藏态）。 */
-.ovl-qa-state { margin-left: 4px; padding-left: 6px; border-left: 1px solid #2F3A4C; gap: 4px; align-items: center; }
+.ovl-qa-state { margin-left: 4px; padding-left: 6px; border-left: 1px solid #2F3A4C; gap: 4px; align-items: center; flex-shrink: 0; }
 .ovl-qa-state:not([hidden]) { display: flex; }
 .ovl-qa-state-label { font-size: 11px; line-height: 1.3; color: #9AA4B2; white-space: nowrap; }
 .ovl-qa-state-btn {
@@ -3810,6 +3818,15 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 }
 .ovl-qa-state-btn:hover { background: #2F3A4C; }
 .ovl-qa-state-btn:disabled { opacity: .5; cursor: not-allowed; }
+/* v2 Pass P207 根因修复：这几颗按钮（重译/重试/强制翻译/详情/撤销……）复用 .ovl-qa-state-btn，
+   但顶上 .ovl-quickactions button { width:26px; height:26px; } 那条通用规则是给「替/简/语/译」
+   那 4 颗单字按钮设计的，选择器特异性（0,1,1）比 .ovl-qa-state-btn 的（0,1,0）更高，会无条件
+   压过 .ovl-qa-state-btn 自己没设的 width——多字文案（如原来的「重新翻译」）因此被摁进 26px
+   的固定盒子，`white-space: nowrap` 只保证"不在盒子内部折行"，box 本身的可视宽度依然是 26px，
+   文字在布局意义上被挤到跨行渲染。这里用两个类叠加把特异性提到（0,2,1），显式把 width 改回
+   auto，让按钮宽度真正跟着文案走；flex-shrink:0 防止外层 quickactions 在被迫压缩宽度时
+   （ovlPlaceFloating 的重叠规避分支）反过来把这一整组状态按钮压扁。 */
+.ovl-quickactions button.ovl-qa-state-btn { width: auto; height: 22px; flex-shrink: 0; }
 .ovl-breadcrumb {
     font-size: 10.5px; color: #9AA4B2; padding: 2px 10px; background: #1B222C;
     border-bottom: 1px solid #2F3A4C; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: none;
@@ -5001,7 +5018,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.42.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.42.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-25';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -43161,8 +43178,12 @@ function ovlQaRenderRetranslate() {
     if (state === 'busy') {
         box.innerHTML = '<span class="ovl-qa-state-label">重新翻译中…</span>';
     } else {
+        // v2 Pass P207：「重新翻译」（4 字）在 .ovl-qa-state-btn 上顶出过窄的 26px 定宽盒子导致
+        // 跨行渲染（根因见上方 CSS 里 .ovl-quickactions button.ovl-qa-state-btn 那条覆盖规则的
+        // 注释，已单独修）；这里再把按钮文案缩成「重译」，跟「复制」「编辑」「定位」同样两字，
+        // 双重保险，说明性文字挪进 tooltip，不丢信息。
         box.innerHTML = '<button type="button" class="ovl-qa-state-btn" data-qar="retranslate" data-tip="'
-            + escapeAttr('丢弃这一块目前的缓存译文，重新调用模型翻译一次') + '" data-tip-pos="top">重新翻译</button>';
+            + escapeAttr('重新翻译本段') + '" data-tip-pos="top">重译</button>';
     }
 }
 
