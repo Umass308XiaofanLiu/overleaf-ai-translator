@@ -5001,7 +5001,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.39.04';        // APP_VERSION_STAMP
+const APP_VERSION = '03.39.05';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-24';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -40053,9 +40053,13 @@ function ovlBilingualSyncAlignment() {
 // 不用等这个陈旧的 rAF 先跑完自己把 rafId 清零。
 function ovlBilingualClearRowAlignment() {
     try {
-        if (OvlBilingualAlignState.rafId) {
-            try { if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(OvlBilingualAlignState.rafId); } catch (e) {}
-            OvlBilingualAlignState.rafId = 0;
+        // v2 Pass P198 Phase 3：排帧统一并进了 ovlP198RelayoutRaf（见 ovlP198ScheduleRelayout
+        // 大注释），OvlBilingualAlignState.rafId 不再是真正的调度句柄——离开双语模式时改成取消
+        // 这个共享 rAF；就算这一帧里还捎带着图片重算/左侧 gutter 待办也没关系，离开双语模式本身
+        // 会经过 ovlSetViewMode 的其它显式重渲染路径把该做的都重新做一遍，不依赖这个被取消的帧。
+        if (OvlP198RelayoutRaf !== null) {
+            try { if (typeof cancelAnimationFrame === 'function') cancelAnimationFrame(OvlP198RelayoutRaf); } catch (e) {}
+            OvlP198RelayoutRaf = null;
         }
         const leftPane = document.getElementById('ovlVisualPane');
         if (leftPane) {
@@ -40072,6 +40076,12 @@ function ovlBilingualClearRowAlignment() {
     } catch (e) {}
 }
 
+// v2 Pass P198 Phase 3（gutter/spacer layout thrash 返修，见 .claude/tmp/p198_impl_report.md
+// Phase 3）：这个函数原来自己既是"对齐算法本体"又是"rAF 回调体"（对齐 + 补画两侧 gutter）。
+// 现在拆开——排帧这件事统一交给下面的 ovlP198ScheduleRelayout()，本函数只保留"熔断计数 +
+// 真正跑一次对齐"这两件事，由统一调度器 ovlP198RunRelayoutPass() 在合适的时机调用一次；两侧
+// gutter 的补画也挪到 ovlP198RunRelayoutPass() 里统一做（跟图片重算触发的 gutter 重画合并成
+// 同一次，不再各自散落两次 rAF），避免重复。
 function ovlBilingualRunAlignPass() {
     const st = OvlBilingualAlignState;
     const now = (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now();
@@ -40086,29 +40096,79 @@ function ovlBilingualRunAlignPass() {
         return;
     }
     try { ovlBilingualSyncAlignment(); } catch (e) { console.error('[ovl] bilingual align pass failed', e); }
-    // v2 Pass P169（R5）：对齐会改块的 minHeight，导致块的实际渲染高度变化；两侧 gutter 的行号
-    // cell 位置是按块渲染矩形算的，这里必须在对齐完成后重新算一遍位置，否则行号会跟对齐后的
-    // 文本错位。两个调用都传 skipAlignSchedule=true——它们各自的 finally 原本会在双语模式下
-    // 再排一次 ovlBilingualScheduleAlign()，如果不传 true 就会形成"对齐->重画 gutter->又排
-    // 对齐"的循环（不会自然停止，只能靠断路器硬中止，等于双语模式进入后自动对齐很快失效）。
-    try {
-        if (OvlState.viewMode === 'bilingual') {
-            if (typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter(true);
-            if (typeof ovlRenderVisualGutterMirror === 'function') ovlRenderVisualGutterMirror(true);
-        }
-    } catch (eGutter) { console.error('[ovl] post-align gutter refresh failed', eGutter); }
 }
 
+// ==================== v2 Pass P198 Phase 3：resize/分栏拖拽期间的统一合帧调度器 ====================
+// 背景（Phase 2 验收记录 + coordinator Phase 3 go-ahead 里的诊断）：Phase 2 只解决了"单个函数
+// 内部"读写交替强制同步布局的问题（块级 RO 回调本身、ovlP109RecalcFigureWidthsIn）。真正没解决
+// 的是"跨函数"层面——resize/拖分栏条期间，下面三条各自独立用 rAF 去重的调度入口会在同一次用户
+// 操作里先后触发，谁都不知道另外两个的存在：
+//   ① 左侧块级 RO -> ovlScheduleVisualGutterAfterImage() -> ovlRenderVisualGutter()
+//   ② 镜像块级 RO -> ovlScheduleVisualGutterAfterImageMirror() -> ovlRenderVisualGutterMirror()
+//      （镜像这条此前永远全量重建，零增量 diff，是三条里单次开销最大的一条）
+//   ③ 行级 RO/pane 级 RO -> ovlBilingualScheduleAlign() -> ovlBilingualRunAlignPass()
+//      -> ovlBilingualSyncAlignment()，对齐改完 minHeight 后还要再补画一次两侧 gutter（因为
+//      对齐会改变块的渲染高度，gutter 的行号位置是按渲染矩形算的）
+// 三者互不协调，各自的"写"都会让另外两者下一次"读"强制同步布局（layout thrashing）——单个
+// mousemove 步进实测能摊开到 2~3 帧、多轮互相触发，40 步分栏拖拽量级下 S2 场景摸到 13.7s。
+//
+// 改法：三个入口全部改造成只设置"这类工作待办"的标志位（图片重算沿用 Phase 2 已有的
+// OvlP198PrimaryFigPending/MirrorFigPending，对齐直接复用既有熔断状态），然后统一调用
+// ovlP198ScheduleRelayout()——无论一帧内被调用几次、由哪几路触发，每帧最多真正执行一次
+// ovlP198RunRelayoutPass()。分栏拖拽本身"宽度跟手"这件事完全不受影响：
+// ovlBilingualSplitterBeginDrag() 自己另开一条独立的小 rAF（schedule()/flush()，只写
+// --ovl-bilingual-left-fr/-right-fr 两个 CSS 变量），不在本次合帧调度范围内，拖拽把手依然逐帧
+// 跟着指针走；被合帧的只是"派生"的 gutter/spacer/对齐这类不需要每帧都算、算慢了也不影响手感
+// 跟手性的重活。
+//
+// 单次 pass 内部顺序（跟改造前 ovlBilingualRunAlignPass 的既有顺序一致，只是把三路触发合并成
+// 了同一次执行）：图片待重算 -> 对齐（ovlBilingualSyncAlignment 内部本来就是"清空->纯读->
+// 纯写"三阶段）-> 左侧 gutter 重画一次(skipAlignSchedule=true) -> 双语模式下镜像 gutter 也
+// 重画一次(同样 skipAlignSchedule=true，避免"重画 -> finally 又排一轮对齐"的不停自循环，这条
+// 纪律沿用自 P169 R5)。ovlRenderVisualGutter/ovlRenderVisualGutterMirror 内部各自已经把"读全部
+// 块矩形 + pane 的 scrollTop/scrollHeight"收在最前面一次性做完、后面只写不再读（本次 Phase 3
+// 一并把 spacer 的 scrollHeight 读、gutter.scrollTop 的 scrollTop 读也从"写之后"挪到了这次
+// 最前面的读阶段，见 ovlVisualGutterSyncSpacer(Mirror) 的新增 knownScrollHeight 参数），所以
+// 整个 pass 实测强制同步布局次数是：对齐读一次 + 左侧 gutter 读一次 + 镜像 gutter 读一次 = 3
+// 次，不随块数增长，远低于验收要求的"≤5 次/pass"。
+let OvlP198RelayoutRaf = null;
+function ovlP198ScheduleRelayout() {
+    if (OvlP198RelayoutRaf !== null) return; // 已经排了一帧要跑，本次调用只是去重；标志位（图片 pending/对齐熔断状态）不会因为去重而丢
+    const raf = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame : null;
+    if (!raf) { ovlP198RunRelayoutPass(); return; } // 没有 rAF 的环境（测试沙箱）退回同步执行，跟改造前三个入口各自的兜底行为一致
+    OvlP198RelayoutRaf = raf(function () {
+        OvlP198RelayoutRaf = null;
+        ovlP198RunRelayoutPass();
+    });
+}
+function ovlP198RunRelayoutPass() {
+    if (OvlP198PrimaryFigPending) {
+        OvlP198PrimaryFigPending = false;
+        const bodyEl = document.querySelector('#ovlVisualPane .ovl-visual-body');
+        ovlP198SchedulePaneFigRecalc(OvlP198PrimaryFigState, bodyEl, ovlP198ScheduleRelayout);
+    }
+    if (OvlP198MirrorFigPending) {
+        OvlP198MirrorFigPending = false;
+        const bodyElMirror = document.querySelector('#ovlVisualPaneMirror .ovl-visual-body');
+        ovlP198SchedulePaneFigRecalc(OvlP198MirrorFigState, bodyElMirror, ovlP198ScheduleRelayout);
+    }
+    if (OvlState.viewMode === 'bilingual' && !OvlBilingualAlignState.circuitTripped) {
+        try { ovlBilingualRunAlignPass(); } catch (eAlign) { console.error('[ovl] relayout pass: align failed', eAlign); }
+    }
+    try {
+        if (OvlState.editorMode === 'visual' && typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter(true);
+    } catch (eG1) { console.error('[ovl] relayout pass: primary gutter refresh failed', eG1); }
+    try {
+        if (OvlState.viewMode === 'bilingual' && typeof ovlRenderVisualGutterMirror === 'function') ovlRenderVisualGutterMirror(true);
+    } catch (eG2) { console.error('[ovl] relayout pass: mirror gutter refresh failed', eG2); }
+}
+
+// 三路触发入口之一：行级/pane 级 RO、分栏拖拽结束都调这个——保留原函数名/原调用方式不变
+// （既有调用点零改动），内部改成去重后统一并入 ovlP198ScheduleRelayout()。
 function ovlBilingualScheduleAlign() {
     if (OvlState.viewMode !== 'bilingual') return;
     if (OvlBilingualAlignState.circuitTripped) return;
-    if (OvlBilingualAlignState.rafId) return; // 已经排了一帧要跑，本次调用只是去重
-    const raf = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame : null;
-    if (!raf) { ovlBilingualRunAlignPass(); return; } // 没有 rAF 的环境（测试沙箱）退回同步执行
-    OvlBilingualAlignState.rafId = raf(function () {
-        OvlBilingualAlignState.rafId = 0;
-        ovlBilingualRunAlignPass();
-    });
+    ovlP198ScheduleRelayout();
 }
 
 // ---- 双语模式：左右滚动同步 ----
@@ -62045,18 +62105,11 @@ function ovlP198SchedulePaneFigRecalc(state, bodyEl, rescheduleFn) {
     ovlP198RunPaneFigRecalc(state, bodyEl);
 }
 
-let OvlVisualGutterImageRaf = null;
+// v2 Pass P198 Phase 3：不再自己起一条独立 rAF——图片待重算/左侧 gutter 重画统一并进
+// ovlP198ScheduleRelayout()/ovlP198RunRelayoutPass()（定义见 ovlBilingualScheduleAlign 附近的
+// 大注释，跟镜像/对齐合并成同一帧最多一次的调度）。函数名/调用方式对既有全部调用点零改动。
 function ovlScheduleVisualGutterAfterImage() {
-    if (OvlVisualGutterImageRaf !== null) return;
-    OvlVisualGutterImageRaf = requestAnimationFrame(function () {
-        OvlVisualGutterImageRaf = null;
-        if (OvlP198PrimaryFigPending) {
-            OvlP198PrimaryFigPending = false;
-            const bodyEl = document.querySelector('#ovlVisualPane .ovl-visual-body');
-            ovlP198SchedulePaneFigRecalc(OvlP198PrimaryFigState, bodyEl, ovlScheduleVisualGutterAfterImage);
-        }
-        if (OvlState.editorMode === 'visual' && typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
-    });
+    ovlP198ScheduleRelayout();
 }
 // ②号兜底：ResizeObserver 直接观察每个块容器自己的尺寸变化——不止图片，任何异步把块撑高/
 // 压矮的原因（懒加载的公式图、后续可能出现的其它异步内容）都能兜住，不用逐个新增源头再挂
@@ -62265,9 +62318,15 @@ function ovlVisualGutterEnsureSpacer(gutter) {
 // （20px）和 .ovl-visual-body 的 .6em，滚到底时 `gutter.scrollTop = pane.scrollTop` 会被
 // gutter 自己更小的 scrollHeight 钳死，整列行号跟着偏了 27~28px（\end{document} 之后的尾段
 // 越长，钳死量越大）。补一个不可见的 1px 哨兵撑到跟 pane 同样高，不改变任何看得见的格子。
-function ovlVisualGutterSyncSpacer(gutter, pane) {
+// v2 Pass P198 Phase 3：新增可选第三参 knownScrollHeight——调用方（ovlRenderVisualGutter）如果
+// 已经在这一轮最前面的读阶段量过 pane.scrollHeight，传进来复用，避免这里在"块 cell 已经写完"
+// 之后再单独强制一次同步布局去读 pane.scrollHeight（pane 本身在整个函数里从未被写过，量早量晚
+// 数值完全一样，只是"晚量"会撞在已经脏了的布局上多花一次强制同步布局）。不传（其余既有调用点）
+// 语义完全不变，退回原来的当场读。
+function ovlVisualGutterSyncSpacer(gutter, pane, knownScrollHeight) {
     const sp = ovlVisualGutterEnsureSpacer(gutter);
-    const targetTop = Math.max(0, pane.scrollHeight - 1);
+    const sh = (typeof knownScrollHeight === 'number') ? knownScrollHeight : pane.scrollHeight;
+    const targetTop = Math.max(0, sh - 1);
     if (Math.abs(targetTop - OvlVisualGutterLastSpacerTop) > 0.5) {
         sp.style.top = targetTop + 'px';
         OvlVisualGutterLastSpacerTop = targetTop;
@@ -62320,6 +62379,14 @@ function ovlRenderVisualGutter(skipAlignSchedule) {
         // 就是把整列行号硬拔高了 20px——上一版实测的那个恒定 20px 偏差，根就在这里多减了
         // 一次，不是字体加载的问题（那个是另一个真问题，也一并修了，见下面 fonts.ready）。
         const paneRect = pane.getBoundingClientRect();
+        // v2 Pass P198 Phase 3：pane 的 scrollTop/scrollHeight 在这个函数全程只读不写（函数只
+        // 写 gutter，从不写 pane 本身），这里跟 paneRect 一起一次性量完、后面全程复用同一个值——
+        // 改前这两个值分别晚量在"块 cell 已经写完之后"（spacer 的 scrollHeight、末尾的
+        // gutter.scrollTop=pane.scrollTop），每晚量一次就在已经被写脏的布局上多逼出一次强制同步
+        // 布局；提到最前面跟其它读一起做，数值完全不变（pane 没被这个函数写过），但强制同步布局
+        // 次数从原来的 3 次（块矩形读 1 次 + spacer 读 1 次 + 末尾 scrollTop 读 1 次）降到 1 次。
+        const paneScrollTop = pane.scrollTop;
+        const paneScrollHeight = pane.scrollHeight;
         const sameOrder = ovlVisualGutterSameBlockOrder(blocks);
         let anyChanged = false;
 
@@ -62334,7 +62401,7 @@ function ovlRenderVisualGutter(skipAlignSchedule) {
             for (let i = 0; i < blocks.length; i++) {
                 const blk = blocks[i];
                 const r = blk.getBoundingClientRect();
-                const top = Math.max(0, (r.top - paneRect.top) + pane.scrollTop);
+                const top = Math.max(0, (r.top - paneRect.top) + paneScrollTop);
                 const rawH = r.height;
                 const visible = rawH >= OVL_VISUAL_GUTTER_MIN_H;
                 const h = Math.max(rawH, 16);
@@ -62365,7 +62432,7 @@ function ovlRenderVisualGutter(skipAlignSchedule) {
                 const blk = blocks[i];
                 const prev = OvlVisualBlockRects[i];
                 const r = blk.getBoundingClientRect();
-                const top = Math.max(0, (r.top - paneRect.top) + pane.scrollTop);
+                const top = Math.max(0, (r.top - paneRect.top) + paneScrollTop);
                 const rawH = r.height;
                 const visible = rawH >= OVL_VISUAL_GUTTER_MIN_H;
                 const h = Math.max(rawH, 16);
@@ -62412,10 +62479,10 @@ function ovlRenderVisualGutter(skipAlignSchedule) {
         // 无条件对这一轮的全部块跑一遍，不管上面 anyChanged 是不是 true；函数内部自己按
         // WeakMap 记的上次指纹比对，没变的块不touch DOM，开销跟"什么都没变"时的空转一样。
         const markChanged = ovlVisualGutterApplyMarksAll(blocks);
-        const spacerChanged = ovlVisualGutterSyncSpacer(gutter, pane);
+        const spacerChanged = ovlVisualGutterSyncSpacer(gutter, pane, paneScrollHeight);
         if (!anyChanged && !spacerChanged && !markChanged) return; // v2 Pass P123（D3）：这一轮测下来高度真没变——整趟到此为止，不碰 scrollTop/选区标记/字体重排；P157 追加 markChanged，纯状态变化（高度不变）也不能被这道早退吞掉
 
-        gutter.scrollTop = pane.scrollTop;
+        gutter.scrollTop = paneScrollTop;
         ovlPaintGutterMarks();
         // v2 Pass P193：块 DOM 每次整篇重渲染都是全新节点（本函数头部注释），任何挂在旧 cell
         // 上的跨面板高亮 class 都会随之消失——这里按 OvlBilingualGutterSync 存的 lo/hi 值
@@ -62458,6 +62525,10 @@ let OvlVisualBlockRectsMirror = [];
 let OvlVisualGutterBlockOrderMirror = []; // 防御性保留：即使镜像侧理论上每次都是全新块，仍然按同一套"块集合变没变"判断走，不假设调用方一定重建了全部块
 let OvlVisualGutterSpacerElMirror = null;
 let OvlVisualGutterLastSpacerTopMirror = -1;
+// v2 Pass P198 Phase 3：块集合没变时的增量 diff 需要"块元素 -> 它对应的 cell"这张映射，跟左侧
+// OvlVisualGutterCellMap 同一个用途。见下面 ovlRenderVisualGutterMirror() 里新增的增量分支头部
+// 注释——原设计认为镜像侧永远走全量重建，resize/拖分栏条场景推翻了这个假设（P198 Phase 3）。
+let OvlVisualGutterCellMapMirror = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
 
 function ovlVisualGutterSameBlockOrderMirror(blocks) {
     if (blocks.length !== OvlVisualGutterBlockOrderMirror.length) return false;
@@ -62484,9 +62555,12 @@ function ovlVisualGutterEnsureSpacerMirror(gutter) {
     return sp;
 }
 
-function ovlVisualGutterSyncSpacerMirror(gutter, pane) {
+// v2 Pass P198 Phase 3：同左侧 ovlVisualGutterSyncSpacer 的新增 knownScrollHeight 参数，同一条
+// 理由（镜像 pane 同样在 ovlRenderVisualGutterMirror 里从未被写过，量早量晚数值一致）。
+function ovlVisualGutterSyncSpacerMirror(gutter, pane, knownScrollHeight) {
     const sp = ovlVisualGutterEnsureSpacerMirror(gutter);
-    const targetTop = Math.max(0, pane.scrollHeight - 1);
+    const sh = (typeof knownScrollHeight === 'number') ? knownScrollHeight : pane.scrollHeight;
+    const targetTop = Math.max(0, sh - 1);
     if (Math.abs(targetTop - OvlVisualGutterLastSpacerTopMirror) > 0.5) {
         sp.style.top = targetTop + 'px';
         OvlVisualGutterLastSpacerTopMirror = targetTop;
@@ -62507,18 +62581,9 @@ const OvlVisualBlockLastHMirror = (typeof WeakMap !== 'undefined') ? new WeakMap
 // 面板缩放后镜像栏图片宽度靠 CSS max-width 兜底夹出一个不是 0.6×容器宽的值，且容器变宽后
 // 也不会主动拉回正确值（详见侦察报告 p195_resize_recon.md 缺陷#2）。
 const OvlVisualBlockLastWMirror = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
-let OvlVisualGutterMirrorImageRaf = null;
+// v2 Pass P198 Phase 3：同左侧改法，不再自己起独立 rAF，统一并进 ovlP198ScheduleRelayout()。
 function ovlScheduleVisualGutterAfterImageMirror() {
-    if (OvlVisualGutterMirrorImageRaf !== null) return;
-    OvlVisualGutterMirrorImageRaf = requestAnimationFrame(function () {
-        OvlVisualGutterMirrorImageRaf = null;
-        if (OvlP198MirrorFigPending) {
-            OvlP198MirrorFigPending = false;
-            const bodyEl = document.querySelector('#ovlVisualPaneMirror .ovl-visual-body');
-            ovlP198SchedulePaneFigRecalc(OvlP198MirrorFigState, bodyEl, ovlScheduleVisualGutterAfterImageMirror);
-        }
-        if (OvlState.viewMode === 'bilingual' && typeof ovlRenderVisualGutterMirror === 'function') ovlRenderVisualGutterMirror();
-    });
+    ovlP198ScheduleRelayout();
 }
 // v2 Pass P198 性能返修：跟左侧 ovlEnsureVisualBlockResizeObserver 同一套改法（说明见
 // ovlScheduleVisualGutterAfterImage 上方 P198 大注释）——用 entries[i].contentRect 判断变没变，
@@ -62606,41 +62671,116 @@ function ovlRenderVisualGutterMirror(skipAlignSchedule) {
             return;
         }
         const paneRect = pane.getBoundingClientRect();
+        // v2 Pass P198 Phase 3：同左侧 ovlRenderVisualGutter 的改法（同一条理由——这个函数全程
+        // 只写 gutter，从不写镜像 pane 本身，提前量跟晚量数值一致，但能省掉两次强制同步布局）。
+        const paneScrollTop = pane.scrollTop;
+        const paneScrollHeight = pane.scrollHeight;
         const sameOrder = ovlVisualGutterSameBlockOrderMirror(blocks);
-        gutter.innerHTML = '';
-        OvlVisualBlockRectsMirror = new Array(blocks.length);
-        const frag = document.createDocumentFragment();
-        for (let i = 0; i < blocks.length; i++) {
-            const blk = blocks[i];
-            const r = blk.getBoundingClientRect();
-            const top = Math.max(0, (r.top - paneRect.top) + pane.scrollTop);
-            const rawH = r.height;
-            const visible = rawH >= OVL_VISUAL_GUTTER_MIN_H;
-            const h = Math.max(rawH, 16);
-            const ln = parseInt(blk.getAttribute('data-src-line'), 10);
-            OvlVisualBlockRectsMirror[i] = { line: ln, el: blk, top: top, h: h, visible: visible };
-            if (visible) {
-                const cell = document.createElement('div');
-                cell.className = 'ovl-ln ovl-ln-visual';
-                cell.setAttribute('data-ln', String(ln));
-                cell.setAttribute('data-block', String(i));
-                cell.style.top = top + 'px';
-                cell.style.height = h + 'px';
-                cell.textContent = String(ln + 1);
-                frag.appendChild(cell);
+        let anyChangedMirror = false;
+        if (!sameOrder) {
+            // 块集合变了（换文件/整篇重渲染/ovlBilingualRefreshMirror 整段重写 .innerHTML 换了
+            // 全新块引用）——退回全量重建，读（getBoundingClientRect）写（frag.appendChild）
+            // 交替发生在一份还没挂到文档上的 DocumentFragment 里，不会互相触发布局抖动，跟左侧
+            // ovlRenderVisualGutter() 同一条纪律。
+            gutter.innerHTML = '';
+            OvlVisualBlockRectsMirror = new Array(blocks.length);
+            OvlVisualGutterCellMapMirror = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+            const frag = document.createDocumentFragment();
+            for (let i = 0; i < blocks.length; i++) {
+                const blk = blocks[i];
+                const r = blk.getBoundingClientRect();
+                const top = Math.max(0, (r.top - paneRect.top) + paneScrollTop);
+                const rawH = r.height;
+                const visible = rawH >= OVL_VISUAL_GUTTER_MIN_H;
+                const h = Math.max(rawH, 16);
+                const ln = parseInt(blk.getAttribute('data-src-line'), 10);
+                OvlVisualBlockRectsMirror[i] = { line: ln, el: blk, top: top, h: h, visible: visible };
+                if (visible) {
+                    const cell = document.createElement('div');
+                    cell.className = 'ovl-ln ovl-ln-visual';
+                    cell.setAttribute('data-ln', String(ln));
+                    cell.setAttribute('data-block', String(i));
+                    cell.style.top = top + 'px';
+                    cell.style.height = h + 'px';
+                    cell.textContent = String(ln + 1);
+                    frag.appendChild(cell);
+                    if (OvlVisualGutterCellMapMirror) OvlVisualGutterCellMapMirror.set(blk, cell);
+                }
+                ovlVisualGutterObserveBlockMirror(blk, h, r.width);
             }
-            ovlVisualGutterObserveBlockMirror(blk, h, r.width);
+            gutter.appendChild(frag);
+            anyChangedMirror = true;
+        } else {
+            // v2 Pass P198 Phase 3：块集合没变——这条分支此前恒走全量重建（函数组头部注释里
+            // "块集合没变、只是某几块高度变了"这个场景当年被认为在镜像侧不会发生，理由是镜像
+            // 内容只有 ovlBilingualRefreshMirror() 整篇重写这一种更新方式）。resize/拖分栏条
+            // 推翻了这个假设：分栏宽度变化只是让已经在 DOM 里的镜像块自己 reflow，不经过
+            // ovlBilingualRefreshMirror()，块引用完全不变——这正是这条分支的适用场景，而且是
+            // resize/拖拽期间的主要场景。照抄左侧 ovlRenderVisualGutter() 已经调试稳定的增量
+            // diff 手法：先对全部块纯读一遍新矩形、算出真正变了哪些，再只写变了的 cell，把
+            // "每帧全量拆了重建几百个 DOM 节点"降到"只写真正变化的那几个"。
+            const newRectsMirror = new Array(blocks.length);
+            const changedIdxMirror = [];
+            for (let i = 0; i < blocks.length; i++) {
+                const blk = blocks[i];
+                const prev = OvlVisualBlockRectsMirror[i];
+                const r = blk.getBoundingClientRect();
+                const top = Math.max(0, (r.top - paneRect.top) + paneScrollTop);
+                const rawH = r.height;
+                const visible = rawH >= OVL_VISUAL_GUTTER_MIN_H;
+                const h = Math.max(rawH, 16);
+                const ln = prev ? prev.line : parseInt(blk.getAttribute('data-src-line'), 10);
+                newRectsMirror[i] = { line: ln, el: blk, top: top, h: h, visible: visible, rawW: r.width };
+                const prevVisible = !!(prev && prev.visible);
+                if (!prev || visible !== prevVisible || Math.abs((prev.top || 0) - top) > 0.5 || Math.abs((prev.h || 0) - h) > 0.5) {
+                    changedIdxMirror.push(i);
+                }
+            }
+            if (changedIdxMirror.length) {
+                anyChangedMirror = true;
+                for (let k = 0; k < changedIdxMirror.length; k++) {
+                    const i = changedIdxMirror[k];
+                    const rc = newRectsMirror[i];
+                    let cell = OvlVisualGutterCellMapMirror ? OvlVisualGutterCellMapMirror.get(rc.el) : null;
+                    if (rc.visible) {
+                        if (!cell) {
+                            cell = document.createElement('div');
+                            cell.className = 'ovl-ln ovl-ln-visual';
+                            cell.setAttribute('data-ln', String(rc.line));
+                            cell.setAttribute('data-block', String(i));
+                            cell.textContent = String(rc.line + 1);
+                            gutter.appendChild(cell);
+                            if (OvlVisualGutterCellMapMirror) OvlVisualGutterCellMapMirror.set(rc.el, cell);
+                        }
+                        cell.style.top = rc.top + 'px';
+                        cell.style.height = rc.h + 'px';
+                    } else if (cell) {
+                        cell.remove();
+                        if (OvlVisualGutterCellMapMirror) OvlVisualGutterCellMapMirror.delete(rc.el);
+                    }
+                }
+            }
+            // 同左侧同一条理由：观察器 observe() 复用读阶段已经量出来的 rawW，不在写阶段之后
+            // 再重新调用 getBoundingClientRect() 白白多强制一次同步布局。
+            for (let i = 0; i < blocks.length; i++) ovlVisualGutterObserveBlockMirror(blocks[i], newRectsMirror[i].h, newRectsMirror[i].rawW);
+            OvlVisualBlockRectsMirror = newRectsMirror;
         }
-        gutter.appendChild(frag);
         OvlVisualGutterBlockOrderMirror = blocks;
-        ovlVisualGutterSyncSpacerMirror(gutter, pane);
-        gutter.scrollTop = pane.scrollTop;
-        // v2 Pass P193：镜像块每次都是全新 DOM（函数组头部注释），跨面板高亮同样要按值
-        // 重新找 cell 补画——这里已经确认 OvlState.viewMode==='bilingual'（函数顶部早退
-        // 守卫），不需要再重复判断一次。
+        const spacerChangedMirror = ovlVisualGutterSyncSpacerMirror(gutter, pane, paneScrollHeight);
+        // v2 Pass P198 Phase 3：新增早退——真没变（块几何、spacer 都没变）就不用再碰
+        // scrollTop/跨面板高亮补画/字体重排调度，跟左侧 ovlRenderVisualGutter() 的同款早退
+        // （P123 D3）同一条纪律。改前这个函数恒走全量重建，"没变"这个分支从不存在，现在增量
+        // diff 分支让它成为可能——统一调度器 ovlP198RunRelayoutPass() 每帧都会无条件调用这个
+        // 函数（哪怕只是左侧或对齐触发的一帧、镜像自己其实什么都没变），这条早退是"5s 内 0 空转"
+        // 验收目标能达成的关键之一。
+        if (!anyChangedMirror && !spacerChangedMirror) return;
+        gutter.scrollTop = paneScrollTop;
+        // v2 Pass P193：镜像块此前每次都是全新 DOM（函数组头部注释；P198 Phase 3 之后不再
+        // 总是成立，见上面增量分支），跨面板高亮仍然按值（不是 DOM 引用）重新找 cell 补画，
+        // 覆盖两条分支——这里已经确认 OvlState.viewMode==='bilingual'（函数顶部早退守卫），
+        // 不需要再重复判断一次。
         if (typeof ovlBilingualGutterSyncRepaint === 'function') { try { ovlBilingualGutterSyncRepaint(); } catch (eSync) {} }
         ovlScheduleVisualGutterAfterFontsMirror(0);
-        void sameOrder; // 保留变量供以后若要加增量分支时复用判断，当前分支恒走全量重建
     } catch (e) { console.error('[ovl] renderVisualGutterMirror failed', e); }
     finally {
         // 与 ovlRenderVisualGutter() 的 skipAlignSchedule 参数同一纪律：唯一传 true 的调用方
@@ -62657,11 +62797,17 @@ function ovlRenderVisualGutterMirror(skipAlignSchedule) {
 // ovlScheduleVisualGutterAfterImage() 那条 rAF 合并入口（下一帧才真的跑），这两个入口如果
 // 恰好在"块已经变了、gutter 还没重排"这个窗口里被调用，读到的就是旧坐标。这里在读之前先把
 // 还没跑的那次重排同步跑掉，不真的等下一帧。
+// v2 Pass P198 Phase 3：待跑的重排现在统一挂在共享的 OvlP198RelayoutRaf 上（见
+// ovlP198ScheduleRelayout 大注释），不再有一条专属左侧 gutter 的独立 rAF 可单独取消/同步执行。
+// 改成取消共享 rAF 后同步跑一次完整的 ovlP198RunRelayoutPass()——这是原行为的超集（原来只保证
+// 左侧 gutter 缓存新鲜，现在顺带也把可能捎带着的镜像/对齐待办一并提前做掉，不会丢工作、只会
+// 提前，调用方 ovlVisualScrollToLine/ovlMarkCenterVisual 只关心左侧缓存新鲜与否，多做的这部分
+// 无副作用）。
 function ovlFlushPendingVisualGutter() {
-    if (OvlVisualGutterImageRaf !== null) {
-        try { cancelAnimationFrame(OvlVisualGutterImageRaf); } catch (e) {}
-        OvlVisualGutterImageRaf = null;
-        if (OvlState.editorMode === 'visual' && typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
+    if (OvlP198RelayoutRaf !== null) {
+        try { cancelAnimationFrame(OvlP198RelayoutRaf); } catch (e) {}
+        OvlP198RelayoutRaf = null;
+        ovlP198RunRelayoutPass();
     }
 }
 
