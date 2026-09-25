@@ -5001,7 +5001,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.41.04';        // APP_VERSION_STAMP
+const APP_VERSION = '03.42.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-25';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -27343,8 +27343,120 @@ async function ovlTermDbUiScan() {
     if (typeof showToast === 'function') showToast('扫描完成：候选 ' + merged.length + ' 条，新增/更新 ' + changed + ' 条' + (state.capped ? '（已达扫描安全上限，结果可能不完整）' : ''), 'success');
 }
 
-// ---- AI 补全 / AI 生成背景卡：都走当前选中 provider 的既有传输层 callModelPlainText，
+// ---- AI 补全 / AI 生成背景卡：都走既有传输层 callModelPlainText，
 // 输入只取 title/abstract/intro 前 6000 字符（去注释）+ 待补全条目列表，从不发送全文 ----
+//
+// ---- v2 Pass P206：术语库/背景卡生成模型可与当前翻译模型分开选择 ----
+// BuilderModelState.provider === '' 表示"跟随当前翻译模型"（默认）。这是"默认请求体与
+// cbc8ff7 逐字节一致"这条硬约束的唯一落地点——builderApiConfig() 的跟随分支与 getApiConfig()
+// 逐字段同形，改这块之前先看 lane brief 里那条规则。一旦用户在术语库面板的下拉里选了别的
+// provider，只影响 AI 补全（含补充术语）与 AI 生成背景卡这两条路径；翻译路径 1/2/3 完全
+// 不读这个状态，和 P135 的 ChatState.provider/model 是同一种"独立选择、默认回落"模式。
+const BUILDER_MODEL_LS_KEY = 'ovl.builderModel';
+const BuilderModelState = { provider: '', model: '' };
+const BUILDER_MODEL_SHORT_LABEL = { gemini: 'Gemini', openai: 'OpenAI', claude: 'Claude', qwen: 'Qwen', local: '本地' };
+function builderModelShortLabel(provider) { return BUILDER_MODEL_SHORT_LABEL[provider] || String(provider || ''); }
+
+// 某 provider 当前是否有可用的已保存配置（下拉框过滤 + 缺密钥前置校验共用）。本地没有密钥
+// 概念、baseUrl 有默认值，视为恒可用——连不上是运行时错误，不是"配置缺失"；在线四家看
+// 对应 key 字段是否非空，和各 call*API 函数内部真正发请求前的判断同一条纪律。
+function builderProviderUsable(provider) {
+    if (provider === 'local') return true;
+    if (provider === 'gemini') return !!String(AppState.geminiApiKey || '').trim();
+    if (provider === 'openai') return !!String(AppState.openaiApiKey || '').trim();
+    if (provider === 'claude') return !!String(AppState.claudeApiKey || '').trim();
+    if (provider === 'qwen') return !!String(AppState.qwenApiKey || '').trim();
+    return false;
+}
+// 某 provider 被选为 builder 时默认展示/采用的模型：翻译正好也用这家就直接借用翻译那边已选
+// 好的型号；否则回落到该 provider 内置目录里 tier 'pro'（建库/背景卡是"发一次、用很久"，
+// 质量优先，不像翻译按段计费）的第一条，再退化到该 provider 目录第一条。本地不进内置目录，
+// 借用 AppState.localModels 第一项。
+function builderProviderDefaultModel(provider) {
+    if (provider === 'local') {
+        if (AppState.apiProvider === 'local' && sanitizeModelId(AppState.selectedModel)) return AppState.selectedModel;
+        const lm = (AppState.localModels || [])[0];
+        return (lm && sanitizeModelId(lm.id)) || '';
+    }
+    if (AppState.apiProvider === provider && sanitizeModelId(AppState.selectedModel)) return AppState.selectedModel;
+    const list = DEFAULT_MODEL_CATALOG.filter(function (m) { return m.provider === provider; });
+    const pro = list.filter(function (m) { return m.tier === 'pro'; })[0];
+    return (pro || list[0] || { id: '' }).id;
+}
+// 下拉框可选项：跟随 + 每个有可用配置的 provider（含本地）。
+function builderModelOptions() {
+    const opts = [{ provider: '', model: '' }];
+    ['gemini', 'claude', 'openai', 'qwen', 'local'].forEach(function (p) {
+        if (builderProviderUsable(p)) opts.push({ provider: p, model: builderProviderDefaultModel(p) });
+    });
+    return opts;
+}
+function builderModelSave() {
+    try { localStorage.setItem(BUILDER_MODEL_LS_KEY, JSON.stringify({ provider: BuilderModelState.provider, model: BuilderModelState.model })); } catch (e) {}
+}
+// 逐键校验，脏值一律不收、不回落成别的值——和 chatParamsLoad 同一条纪律。
+function builderModelLoad() {
+    try {
+        const raw = localStorage.getItem(BUILDER_MODEL_LS_KEY);
+        if (!raw) return;
+        const p = JSON.parse(raw);
+        if (!p || typeof p !== 'object' || Array.isArray(p)) return;
+        const prov = String(p.provider || '');
+        if (prov === '') { BuilderModelState.provider = ''; BuilderModelState.model = ''; return; }
+        if (prov !== 'local' && MODEL_PROVIDERS.indexOf(prov) === -1) return;
+        const mid = sanitizeModelId(p.model);
+        if (!mid) return;
+        BuilderModelState.provider = prov;
+        BuilderModelState.model = mid;
+    } catch (e) {}
+}
+function builderModelChoice() {
+    if (!BuilderModelState.provider) return { provider: AppState.apiProvider, model: AppState.selectedModel, follow: true };
+    return { provider: BuilderModelState.provider, model: BuilderModelState.model, follow: false };
+}
+// 【跟随分支必须与 getApiConfig() 逐字段同形】——默认请求体逐字节不变的唯一落地点。
+function builderApiConfig() {
+    const c = builderModelChoice();
+    return {
+        provider: c.provider,
+        model: c.model,
+        localBaseUrl: AppState.localBaseUrl,
+        geminiApiKey: AppState.geminiApiKey,
+        openaiApiKey: AppState.openaiApiKey,
+        claudeApiKey: AppState.claudeApiKey,
+        claudeProxyUrl: AppState.claudeProxyUrl,
+        qwenApiKey: AppState.qwenApiKey,
+        qwenBaseUrl: AppState.qwenBaseUrl
+    };
+}
+// 显式选了 builder（非跟随）时，发起真正调用前的缺配置前置校验。跟随分支刻意不经过这个
+// 函数——保持和 P204 之前完全相同的"直接调用、缺密钥的错误来自传输层自身"的行为，
+// 默认路径逐字节不变。
+function builderModelReady(cfg) {
+    return !!(cfg && cfg.provider && builderProviderUsable(cfg.provider));
+}
+// 非跟随时用于把 provider+model 缝进 toast 文案；跟随分支返回空串，默认 toast 文案不变。
+function builderModelToastTag(cfg) {
+    if (!BuilderModelState.provider || !cfg) return '';
+    return '（' + builderModelShortLabel(cfg.provider) + (cfg.model ? (' ' + cfg.model) : '') + '）';
+}
+function ovlBuilderModelUiChange(provider) {
+    const p = String(provider || '');
+    if (p !== '' && p !== 'local' && MODEL_PROVIDERS.indexOf(p) === -1) return;
+    if (p === '') { BuilderModelState.provider = ''; BuilderModelState.model = ''; }
+    else { BuilderModelState.provider = p; BuilderModelState.model = builderProviderDefaultModel(p); }
+    builderModelSave();
+    if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
+}
+function ovlBuilderModelUiOverride(v) {
+    if (!BuilderModelState.provider) return; // 跟随分支没有覆盖框，onchange 理论上够不到这里
+    const id = sanitizeModelId(v);
+    if (!id) return; // 非法/清空：不接受，保留原值
+    BuilderModelState.model = id;
+    builderModelSave();
+    if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
+}
+
 function ovlTermDbExtractPaperContext() {
     const ta = document.getElementById('ovlCodeArea');
     const raw = ta ? ta.value : '';
@@ -27452,8 +27564,15 @@ let OvlTermDbAiBusy = false;
 async function ovlTermDbUiAiComplete() {
     if (OvlTermDbAiBusy) return;
     let cfg = null;
-    try { cfg = getApiConfig(); } catch (e) {}
+    try { cfg = builderApiConfig(); } catch (e) {}
     if (!cfg || !cfg.provider) { if (typeof showToast === 'function') showToast('AI 补全失败：没有配置好的 provider', 'error'); return; }
+    // v2 Pass P206：只有显式选了 builder（BuilderModelState.provider 非空）才做这层前置校验——
+    // 跟随分支保持默认路径逐字节不变（缺密钥的错误照旧来自传输层自身，见 builderModelReady 注释）。
+    if (BuilderModelState.provider && !builderModelReady(cfg)) {
+        if (typeof showToast === 'function') showToast('AI 补全失败：' + builderModelShortLabel(cfg.provider) + ' 未配置密钥，未发送请求', 'error');
+        return;
+    }
+    const tag = builderModelToastTag(cfg);
     OvlTermDbAiBusy = true;
     try {
         const ctx = ovlTermDbExtractPaperContext();
@@ -27465,7 +27584,7 @@ async function ovlTermDbUiAiComplete() {
         let filled = 0, added = 0, dropped = 0, anyCallOk = false, lastError = null;
 
         for (let b = 0; b < batches.length; b++) {
-            if (typeof showToast === 'function') showToast('AI 补全中…（' + (b + 1) + '/' + batches.length + '）', 'info');
+            if (typeof showToast === 'function') showToast('AI 补全' + tag + '中…（' + (b + 1) + '/' + batches.length + '）', 'info');
             const batch = batches[b];
             const batchEnSet = Object.create(null);
             batch.forEach(function (e) { batchEnSet[e.en] = true; });
@@ -27493,7 +27612,7 @@ async function ovlTermDbUiAiComplete() {
         // Separate, optional "extra terms" call. Anti-hallucination filter: accept an
         // extra only if its en literally occurs in the project .tex text (case-sensitive
         // for acronyms, case-insensitive for terms).
-        if (typeof showToast === 'function') showToast('AI 补全中…（补充术语）', 'info');
+        if (typeof showToast === 'function') showToast('AI 补全' + tag + '中…（补充术语）', 'info');
         const texRaw = (function () { const ta = document.getElementById('ovlCodeArea'); return ta ? (ta.value || '') : ''; })();
         const texLower = texRaw.toLowerCase();
         const existingEnLower = Object.create(null);
@@ -27524,22 +27643,28 @@ async function ovlTermDbUiAiComplete() {
         if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
         if (!anyCallOk) {
             const reason = lastError === 'timeout' ? '请求超时' : (lastError === 'unparseable' ? '返回内容无法解析' : (lastError || '没有可用条目'));
-            if (typeof showToast === 'function') showToast('AI 补全失败：' + reason, 'error');
+            if (typeof showToast === 'function') showToast('AI 补全' + tag + '失败：' + reason, 'error');
         } else {
-            if (typeof showToast === 'function') showToast('AI 补全：填入 ' + filled + ' 条中文，新增 ' + added + ' 条，丢弃 ' + dropped + ' 条（不在论文中/格式错误）', 'success');
+            if (typeof showToast === 'function') showToast('AI 补全' + tag + '：填入 ' + filled + ' 条中文，新增 ' + added + ' 条，丢弃 ' + dropped + ' 条（不在论文中/格式错误）', 'success');
         }
     } catch (e) {
-        if (typeof showToast === 'function') showToast('AI 补全出错：' + ((e && e.message) || String(e)), 'error');
+        if (typeof showToast === 'function') showToast('AI 补全' + tag + '出错：' + ((e && e.message) || String(e)), 'error');
     } finally { OvlTermDbAiBusy = false; }
 }
 let OvlPaperCardAiBusy = false;
 async function ovlTermDbUiAiCard() {
     if (OvlPaperCardAiBusy) return;
     let cfg = null;
-    try { cfg = getApiConfig(); } catch (e) {}
+    try { cfg = builderApiConfig(); } catch (e) {}
     if (!cfg || !cfg.provider) { if (typeof showToast === 'function') showToast('生成背景卡失败：没有配置好的 provider', 'error'); return; }
+    // v2 Pass P206：同 ovlTermDbUiAiComplete，只有显式选了 builder 才做这层前置校验。
+    if (BuilderModelState.provider && !builderModelReady(cfg)) {
+        if (typeof showToast === 'function') showToast('生成背景卡失败：' + builderModelShortLabel(cfg.provider) + ' 未配置密钥，未发送请求', 'error');
+        return;
+    }
+    const tag = builderModelToastTag(cfg);
     OvlPaperCardAiBusy = true;
-    if (typeof showToast === 'function') showToast('正在生成背景卡…', 'info');
+    if (typeof showToast === 'function') showToast('正在生成背景卡' + tag + '…', 'info');
     const controller = new AbortController();
     const timer = setTimeout(function () { controller.abort(); }, 60000);
     try {
@@ -27554,13 +27679,13 @@ async function ovlTermDbUiAiCard() {
             + 'its system model, and the key acronyms a translator needs to know. No markdown, no headings, plain prose only.';
         const raw = await callModelPlainText(prompt, cfg, controller.signal, {}, { maxTokens: 600 });
         const text = String(raw || '').trim();
-        if (!text) { if (typeof showToast === 'function') showToast('生成背景卡失败：返回为空', 'error'); return; }
+        if (!text) { if (typeof showToast === 'function') showToast('生成背景卡失败' + tag + '：返回为空', 'error'); return; }
         const clipped = text.slice(0, OVL_PAPER_CARD_MAX_CHARS);
         const ta = document.getElementById('ovlPaperCardTextarea');
         if (ta) { ta.value = clipped; ovlTermDbUiCardInput(clipped); }
-        if (typeof showToast === 'function') showToast('已生成背景卡草稿，请检查后保存', 'success');
+        if (typeof showToast === 'function') showToast('已生成背景卡草稿' + tag + '，请检查后保存', 'success');
     } catch (e) {
-        const msg = (e && e.name === 'AbortError') ? '生成背景卡超时' : ('生成背景卡出错：' + ((e && e.message) || String(e)));
+        const msg = (e && e.name === 'AbortError') ? ('生成背景卡超时' + tag) : ('生成背景卡出错' + tag + '：' + ((e && e.message) || String(e)));
         if (typeof showToast === 'function') showToast(msg, 'error');
     } finally { clearTimeout(timer); OvlPaperCardAiBusy = false; }
 }
@@ -27650,6 +27775,28 @@ function ovlTermDbPanelHtml() {
     html += '</tbody></table></div>';
 
     html += '<div class="ovl-set-category-title" style="margin-top:16px">论文背景卡</div>';
+    // v2 Pass P206：术语库/背景卡生成模型——独立于当前翻译模型的下拉选择，只影响 AI 补全
+    // （含补充术语）与 AI 生成背景卡这两条路径，见 builderModelChoice()/builderApiConfig()。
+    (function () {
+        const builderChoice = builderModelChoice();
+        const builderOnline = builderChoice.provider !== 'local';
+        const optsHtml = builderModelOptions().map(function (o) {
+            const label = (o.provider === '') ? '跟随当前翻译模型' : (builderModelShortLabel(o.provider) + (o.model ? (' ' + o.model) : ''));
+            const selected = (BuilderModelState.provider === o.provider) ? ' selected' : '';
+            return '<option value="' + escapeAttr(o.provider) + '"' + selected + '>' + escapeHtml(label) + '</option>';
+        }).join('');
+        html += '<div style="display:flex;align-items:center;gap:6px;margin:8px 0 2px;flex-wrap:wrap">'
+            + '<span style="font-size:10.5px;color:#666">术语库/背景卡生成模型：</span>'
+            + '<select id="ovlBuilderModelSelect" style="font-size:11px" onchange="ovlBuilderModelUiChange(this.value)">' + optsHtml + '</select>'
+            + (BuilderModelState.provider
+                ? ('<input type="text" id="ovlBuilderModelOverrideInput" value="' + escapeAttr(BuilderModelState.model || '') + '" placeholder="模型名（可选覆盖）" style="width:150px;font-size:11px" onchange="ovlBuilderModelUiOverride(this.value)">')
+                : '')
+            + '</div>';
+        if (builderOnline) {
+            html += '<div style="font-size:10px;color:#888;margin-bottom:6px">将发送：论文标题、摘要、引言前约 6000 字、术语列表 → '
+                + escapeHtml(builderModelShortLabel(builderChoice.provider)) + '</div>';
+        }
+    })();
     html += '<textarea id="ovlPaperCardTextarea" maxlength="' + OVL_PAPER_CARD_MAX_CHARS + '" style="width:100%;min-height:70px;font-size:11.5px" '
         + 'oninput="ovlTermDbUiCardInput(this.value)" onchange="ovlTermDbUiCardSave(this.value)" '
         + 'placeholder="topic / system model / key acronyms，留空则退回 title 自动提取">' + escapeHtml(card) + '</textarea>';
@@ -32652,6 +32799,9 @@ document.addEventListener('DOMContentLoaded', function() {
     // 窗口 resize、自动存档定时器都已经装好了，这一段无论怎么炸都带不走它们。
     // renderApp 本身一行都没动，这是这个功能的全部要点。
     try { chatBoot(); } catch (e) { console.error('[chat] boot threw', e); }
+
+    // v2 Pass P206：术语库/背景卡生成模型的持久化选择，独立小 try/catch，坏了不带走其它启动步骤。
+    try { builderModelLoad(); } catch (e) { console.error('[builder-model] load failed', e); }
 
     // v2 Overleaf 风格外壳：同样刻意放在最后、自带 try/catch。ovlBoot 内部把
     // body.ovl-shell-active 的挂载放在成功路径的最后一步，这里的 catch 兜的是
