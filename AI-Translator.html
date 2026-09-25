@@ -5001,8 +5001,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.39.03';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-23';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.39.04';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-24';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -36471,15 +36471,34 @@ function ovlP109FigureThumbTargetPx(box) {
 // 图片跟正文的相对大小就跟 PDF 里的不一样了（详见核验报告 #2）。缩略图还没异步换上去（img
 // 还不存在）的框直接跳过，首次挂载时 ovlApplyFigureThumb 自己会按当时最新的宽度算，不需要
 // 这里补一次。
-function ovlP109RecalcFigureWidthsIn(scopeEl) {
+// v2 Pass P198 性能返修（诊断见 .claude/tmp/p198_resize_perf_diag.md）：新增可选的第二个参数
+// knownContentW——调用方（RO 回调的 rAF 合并入口）已经在 pane 级别只读一次 .ovl-visual-body.
+// clientWidth，这里就不用再对每个 box 各自 .closest('.ovl-visual-body').clientWidth 重复读一遍
+// （省掉的正是原来"一读一写交替"里那部分读）。不传就照旧退回 ovlP109FigureThumbTargetPx 逐个
+// 现读，行为不变。不管走哪条分支，都先把这批 box 要设的目标像素宽全部算完存进 targets[]（只读
+// DOM），再统一在第二个循环里写 img.style.width（只写 DOM）——避免读写交替触发强制同步布局。
+function ovlP109RecalcFigureWidthsIn(scopeEl, knownContentW) {
     if (!scopeEl || !scopeEl.querySelectorAll) return;
     const boxes = scopeEl.querySelectorAll('.ovl-visual-fig-box[data-fig-width]');
+    if (!boxes.length) return;
+    const hasKnownW = typeof knownContentW === 'number' && isFinite(knownContentW) && knownContentW > 0;
+    const targets = new Array(boxes.length);
     for (let i = 0; i < boxes.length; i++) {
         const box = boxes[i];
-        const img = box.querySelector('.ovl-visual-fig-thumb');
+        if (hasKnownW) {
+            const raw = box.getAttribute('data-fig-width');
+            const frac = raw ? parseFloat(raw) : NaN;
+            targets[i] = (isFinite(frac) && frac > 0) ? Math.max(1, Math.round(Math.min(frac, 1) * knownContentW)) : null;
+        } else {
+            targets[i] = ovlP109FigureThumbTargetPx(box);
+        }
+    }
+    for (let i = 0; i < boxes.length; i++) {
+        const px = targets[i];
+        if (px === null) continue;
+        const img = boxes[i].querySelector('.ovl-visual-fig-thumb');
         if (!img) continue;
-        const px = ovlP109FigureThumbTargetPx(box);
-        if (px !== null) img.style.width = px + 'px';
+        img.style.width = px + 'px';
     }
 }
 function ovlApplyFigureThumb(box, result) {
@@ -61959,11 +61978,83 @@ let OvlVisualGutterSel = { anchorBlock: -1, headBlock: -1, dragging: false, poin
 // 画死了旧的 top/height，后面所有块整体错位（用户实测复现，图片越多越明显，根因跟 P68
 // 字体落地是同一类——量的时候资源还没到位）。药方也是同一个：资源落地后照原样重新量一遍，
 // 不新造一套。rAF 合并同一帧内连续到达的多张图/多次尺寸变化，最多重算一次。
+// v2 Pass P198 性能返修（诊断见 .claude/tmp/p198_resize_perf_diag.md）：原本左右两侧 RO 回调
+// 各自在 entries 循环里、每个宽度变了的块都同步调一次 getBoundingClientRect()+
+// ovlP109RecalcFigureWidthsIn(t)——读写交替触发强制同步布局（layout thrashing），大语料
+// （约 487 块/30 图）连续 resize 或拖分栏条时单次场景实测摸高 30s+ 量级、ΔLayoutCount 1600+。
+// 改法：RO 回调本身只用 entries[i].contentRect 判断"变没变"，不再在循环里重新查询 DOM，也不
+// 在循环里直接重算图片——只是把"这个 pane 可能要重算图片"标成一个待处理标志（下面两个
+// OvlP198*FigPending），真正的重算挪到已有的 rAF 合并入口（ovlScheduleVisualGutterAfterImage/
+// Mirror）里做：每帧最多进一次，pane 级别只读一次 .ovl-visual-body.clientWidth，真的变了
+// （EPS 0.5px）才批量重算一次（读全部目标宽度、再统一写，不再一读一写交替）——见
+// ovlP109RecalcFigureWidthsIn 的 knownContentW 分支。
+//
+// 分栏拖拽（body[data-ovl-splitdrag]）期间如果单次重算仍然超过约 50ms（图片特别多的极端
+// 语料），不再每帧都做一次重活，改成 120ms 去抖：拖拽还在继续就不断顺延，停顿下来（或下一次
+// 判定已经不在拖）才真正收敛一次，把最终尺寸补上——不去抖会导致重活反而拖慢每一帧、越卡越
+// 拖不动；不收敛又会导致拖完之后图片宽度停在拖拽中途的旧值。state 对象按 pane 独立一份，
+// 避免两侧互相踩。
+const OvlP198PrimaryFigState = { lastBodyW: -1, slow: false, timer: null };
+const OvlP198MirrorFigState = { lastBodyW: -1, slow: false, timer: null };
+let OvlP198PrimaryFigPending = false;
+let OvlP198MirrorFigPending = false;
+
+function ovlP198Now() {
+    try { if (typeof performance !== 'undefined' && performance.now) return performance.now(); } catch (e) {}
+    return Date.now();
+}
+
+function ovlP198IsSplitDragging() {
+    try { return document.body.hasAttribute('data-ovl-splitdrag'); } catch (e) { return false; }
+}
+
+// 实际执行一次"这个 pane 的图片按当前宽度重算"——只有 body 宽度真的变了（EPS 0.5px）才会
+// 真的进 ovlP109RecalcFigureWidthsIn，否则直接跳过（0 工作量）。返回是否真的重算了一次，
+// 供调用方判断要不要在重算完之后再补一次 gutter 重渲染（去抖路径专用，见下面
+// ovlP198SchedulePaneFigRecalc）。
+function ovlP198RunPaneFigRecalc(state, bodyEl) {
+    if (!bodyEl) return false;
+    const contentW = bodyEl.clientWidth;
+    if (!(contentW > 0)) return false;
+    if (state.lastBodyW >= 0 && Math.abs(contentW - state.lastBodyW) <= 0.5) return false;
+    state.lastBodyW = contentW;
+    const t0 = ovlP198Now();
+    try { if (typeof ovlP109RecalcFigureWidthsIn === 'function') ovlP109RecalcFigureWidthsIn(bodyEl, contentW); } catch (e) {}
+    const dt = ovlP198Now() - t0;
+    state.slow = ovlP198IsSplitDragging() && dt > 50;
+    return true;
+}
+
+// 决定"现在就算"还是"去抖到拖拽停顿"。rescheduleFn 只在去抖路径里、定时器真正触发重算之后
+// 才会被调用一次，用来补一次 gutter 重渲染（rAF 合并入口自己会在当前这帧结束前调
+// ovlRenderVisualGutter 一次，但去抖路径的重算发生在未来某一帧之外的 setTimeout 回调里，
+// 不补这一下 gutter 会停在图片重算前的旧几何上）。
+function ovlP198SchedulePaneFigRecalc(state, bodyEl, rescheduleFn) {
+    if (!bodyEl) return;
+    const dragging = ovlP198IsSplitDragging();
+    if (!dragging) state.slow = false;
+    if (dragging && state.slow) {
+        if (state.timer) { try { clearTimeout(state.timer); } catch (e) {} }
+        state.timer = setTimeout(function () {
+            state.timer = null;
+            const didRecalc = ovlP198RunPaneFigRecalc(state, bodyEl);
+            if (didRecalc && typeof rescheduleFn === 'function') rescheduleFn();
+        }, 120);
+        return;
+    }
+    ovlP198RunPaneFigRecalc(state, bodyEl);
+}
+
 let OvlVisualGutterImageRaf = null;
 function ovlScheduleVisualGutterAfterImage() {
     if (OvlVisualGutterImageRaf !== null) return;
     OvlVisualGutterImageRaf = requestAnimationFrame(function () {
         OvlVisualGutterImageRaf = null;
+        if (OvlP198PrimaryFigPending) {
+            OvlP198PrimaryFigPending = false;
+            const bodyEl = document.querySelector('#ovlVisualPane .ovl-visual-body');
+            ovlP198SchedulePaneFigRecalc(OvlP198PrimaryFigState, bodyEl, ovlScheduleVisualGutterAfterImage);
+        }
         if (OvlState.editorMode === 'visual' && typeof ovlRenderVisualGutter === 'function') ovlRenderVisualGutter();
     });
 }
@@ -61994,9 +62085,9 @@ function ovlEnsureVisualBlockResizeObserver() {
             let changed = false;
             for (let i = 0; i < entries.length; i++) {
                 const t = entries[i].target;
-                let rect;
-                try { rect = t.getBoundingClientRect(); } catch (e2) { continue; }
-                const h = rect.height, w = rect.width;
+                const cr = entries[i].contentRect;
+                if (!cr) continue;
+                const h = cr.height, w = cr.width;
                 const lastH = OvlVisualBlockLastH ? OvlVisualBlockLastH.get(t) : undefined;
                 const lastW = OvlVisualBlockLastW ? OvlVisualBlockLastW.get(t) : undefined;
                 const hChanged = lastH === undefined || Math.abs(h - lastH) > 0.5;
@@ -62006,7 +62097,7 @@ function ovlEnsureVisualBlockResizeObserver() {
                 if (hChanged) changed = true;
                 if (wChanged) {
                     changed = true;
-                    if (typeof ovlP109RecalcFigureWidthsIn === 'function') ovlP109RecalcFigureWidthsIn(t);
+                    OvlP198PrimaryFigPending = true;
                 }
             }
             if (changed) ovlScheduleVisualGutterAfterImage();
@@ -62421,9 +62512,18 @@ function ovlScheduleVisualGutterAfterImageMirror() {
     if (OvlVisualGutterMirrorImageRaf !== null) return;
     OvlVisualGutterMirrorImageRaf = requestAnimationFrame(function () {
         OvlVisualGutterMirrorImageRaf = null;
+        if (OvlP198MirrorFigPending) {
+            OvlP198MirrorFigPending = false;
+            const bodyEl = document.querySelector('#ovlVisualPaneMirror .ovl-visual-body');
+            ovlP198SchedulePaneFigRecalc(OvlP198MirrorFigState, bodyEl, ovlScheduleVisualGutterAfterImageMirror);
+        }
         if (OvlState.viewMode === 'bilingual' && typeof ovlRenderVisualGutterMirror === 'function') ovlRenderVisualGutterMirror();
     });
 }
+// v2 Pass P198 性能返修：跟左侧 ovlEnsureVisualBlockResizeObserver 同一套改法（说明见
+// ovlScheduleVisualGutterAfterImage 上方 P198 大注释）——用 entries[i].contentRect 判断变没变，
+// 不再在循环里逐块同步 getBoundingClientRect()+重算，只标 OvlP198MirrorFigPending，真正的
+// pane 级批量重算挪到 ovlScheduleVisualGutterAfterImageMirror 的 rAF 合并入口里做。
 function ovlEnsureVisualBlockResizeObserverMirror() {
     if (OvlVisualBlockROMirror) return OvlVisualBlockROMirror;
     if (typeof ResizeObserver === 'undefined') return null;
@@ -62432,9 +62532,9 @@ function ovlEnsureVisualBlockResizeObserverMirror() {
             let changed = false;
             for (let i = 0; i < entries.length; i++) {
                 const t = entries[i].target;
-                let rect;
-                try { rect = t.getBoundingClientRect(); } catch (e2) { continue; }
-                const h = rect.height, w = rect.width;
+                const cr = entries[i].contentRect;
+                if (!cr) continue;
+                const h = cr.height, w = cr.width;
                 const lastH = OvlVisualBlockLastHMirror ? OvlVisualBlockLastHMirror.get(t) : undefined;
                 const lastW = OvlVisualBlockLastWMirror ? OvlVisualBlockLastWMirror.get(t) : undefined;
                 const hChanged = lastH === undefined || Math.abs(h - lastH) > 0.5;
@@ -62442,14 +62542,9 @@ function ovlEnsureVisualBlockResizeObserverMirror() {
                 if (OvlVisualBlockLastHMirror) OvlVisualBlockLastHMirror.set(t, h);
                 if (OvlVisualBlockLastWMirror) OvlVisualBlockLastWMirror.set(t, w);
                 if (hChanged) changed = true;
-                // v2 Pass P195（F2）：width 真的变了才重算——ovlP109RecalcFigureWidthsIn 本身就是
-                // 通用函数（按 scopeEl.closest('.ovl-visual-body') 找容器宽度，不写死左侧 pane
-                // id，见该函数定义处注释），镜像面板的块同样落在一个 class="ovl-visual-body"
-                // 的容器里（ovlBilingualRefreshMirror() 拼 HTML 时用的是同一个类名），原样调用
-                // 即可，不需要另写一份"镜像版"计算逻辑。
                 if (wChanged) {
                     changed = true;
-                    if (typeof ovlP109RecalcFigureWidthsIn === 'function') ovlP109RecalcFigureWidthsIn(t);
+                    OvlP198MirrorFigPending = true;
                 }
             }
             if (changed) ovlScheduleVisualGutterAfterImageMirror();
