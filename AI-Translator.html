@@ -5001,7 +5001,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.41.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.41.03';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-25';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -26643,18 +26643,36 @@ function ovlTermDbMapLoad() {
 }
 function ovlTermDbMapSave(map) { try { localStorage.setItem(ovlTermDbLsKey(), JSON.stringify(map)); } catch (e) {} }
 function ovlTermDbProjectKey() { try { return ovlNormalizeProjectPath(chatAgentProjectDir()); } catch (e) { return ''; } }
+// P202c 加固：entries 数组本身已经靠上面的 Array.isArray 检查兜底，但数组*里*的单个元素
+// 仍可能是 null/非对象（人工改坏 localStorage、未来某个写入路径的 bug）。这里额外过滤掉
+// 这类元素——渲染层（ovlTermDbPanelHtml 等）此前对 null 元素调用 e.en 会直接抛 TypeError，
+// 而 renderApp 沿途没有 try/catch，会把整个页面冻住。过滤后即便存了坏数据，最多是这一条
+// 术语"看不见"，不会导致整个设置面板打不开。
+function ovlTermDbSanitizeEntries(arr) {
+    return (Array.isArray(arr) ? arr : []).filter(function (e) { return e && typeof e === 'object'; });
+}
 function ovlTermDbBucketGet(projectKey) {
     const map = ovlTermDbMapLoad();
     const b = map[projectKey];
-    return (b && typeof b === 'object' && Array.isArray(b.entries)) ? b : { entries: [], updatedAt: 0 };
+    return (b && typeof b === 'object' && Array.isArray(b.entries))
+        ? { entries: ovlTermDbSanitizeEntries(b.entries), updatedAt: b.updatedAt }
+        : { entries: [], updatedAt: 0 };
 }
+// P202c 加固：AI 补全/导入的字段长度上限——此前只限了条目"个数"（500/合并批次 100 条），
+// 单个字段（尤其 zh/note）可以被模型或恶意导入文件塞进任意长度的字符串。这类条目一旦写入，
+// 会被 ovlTermDbBuildPromptBlock 原样拼进*之后每一次*翻译请求的 system prompt 里，等于给
+// 请求体开了一个不受控的放大口子（token 成本、甚至提示注入面）。参考同类既有上限
+// （OVL_PAPER_CARD_MAX_CHARS=1200 卡片、术语条目单条本来就该比整篇背景卡短得多）选取。
+const OVL_TERMDB_FIELD_MAX_EN = 200;
+const OVL_TERMDB_FIELD_MAX_ZH = 400;
+const OVL_TERMDB_FIELD_MAX_NOTE = 400;
 function ovlTermDbEntryDefaults(partial) {
     partial = partial || {};
     return {
-        en: String(partial.en == null ? '' : partial.en).trim(),
-        zh: String(partial.zh == null ? '' : partial.zh).trim(),
+        en: String(partial.en == null ? '' : partial.en).trim().slice(0, OVL_TERMDB_FIELD_MAX_EN),
+        zh: String(partial.zh == null ? '' : partial.zh).trim().slice(0, OVL_TERMDB_FIELD_MAX_ZH),
         kind: (partial.kind === 'acronym' || partial.kind === 'keep') ? partial.kind : 'term',
-        note: (typeof partial.note === 'string') ? partial.note : '',
+        note: (typeof partial.note === 'string') ? partial.note.slice(0, OVL_TERMDB_FIELD_MAX_NOTE) : '',
         source: (partial.source === 'regex' || partial.source === 'llm') ? partial.source : 'user',
         enabled: (partial.enabled === false) ? false : true,
         updatedAt: Date.now()
@@ -26758,7 +26776,9 @@ function ovlTermDbGlobalLoad() {
     try {
         const raw = localStorage.getItem('ovl.termDbGlobal');
         const obj = raw ? JSON.parse(raw) : null;
-        return (obj && typeof obj === 'object' && Array.isArray(obj.entries)) ? obj : { entries: [], updatedAt: 0 };
+        return (obj && typeof obj === 'object' && Array.isArray(obj.entries))
+            ? { entries: ovlTermDbSanitizeEntries(obj.entries), updatedAt: obj.updatedAt }
+            : { entries: [], updatedAt: 0 };
     } catch (e) { return { entries: [], updatedAt: 0 }; }
 }
 function ovlTermDbGlobalSave(bucket) { try { localStorage.setItem('ovl.termDbGlobal', JSON.stringify(bucket)); } catch (e) {} }
@@ -27148,12 +27168,20 @@ function ovlTermDbUiImportFile(input) {
             if (bad) {
                 if (typeof showToast === 'function') showToast('导入失败：存在缺少合法 en 字段的条目', 'error'); input.value = ''; return;
             }
+            // P202c 修复（adversarial review 发现的确认真实缺陷）：这个弹窗此前的文案承诺了
+            // "合并"/"替换"两个选项，但 ovlConfirmDialog 当时只有一个确认按钮——"替换"完全
+            // 没有任何触发路径，是个说了做不到的死承诺（不是"会静默清空"，是反过来"永远清不
+            // 掉"，用户想清空重导都做不到）。现在用 altLabel/onAlt 把"替换"接成真正可点的
+            // 第二个按钮，danger 配色跟其它破坏性操作一致。
             ovlConfirmDialog({
                 title: '导入术语库',
                 message: '共 ' + entries.length + ' 条。「合并」按 en 逐条更新/新增（不影响未出现的条目）；'
                     + '「替换」会先清空当前' + (OvlTermDbUiState.scope === 'global' ? '全局' : '本项目') + '术语库再写入，取消则不导入。',
                 confirmLabel: '合并',
+                altLabel: '替换',
+                altDanger: true,
                 onConfirm: function () { ovlTermDbUiImportApply(entries, 'merge'); input.value = ''; },
+                onAlt: function () { ovlTermDbUiImportApply(entries, 'replace'); input.value = ''; },
                 onCancel: function () { input.value = ''; }
             });
         };
@@ -47518,7 +47546,17 @@ function ovlConfirmDialog(opts) {
     okBtn.className = 'ovl-modal-btn ' + (opts.danger ? 'ovl-modal-btn-danger' : 'ovl-modal-btn-primary');
     okBtn.textContent = opts.confirmLabel || '确定';
     if (opts.requireTyped) okBtn.disabled = true;
-    btnRow.appendChild(cancelBtn); btnRow.appendChild(okBtn);
+    btnRow.appendChild(cancelBtn);
+    // P202c 新增：opts.altLabel/opts.onAlt（可选，第三个按钮，用于"合并 vs 替换"这类三选一
+    // 场景——不传就不渲染这个按钮，既有调用方（单一"确定/取消"二选一）逐字节不受影响。
+    let altBtn = null;
+    if (opts.altLabel && typeof opts.onAlt === 'function') {
+        altBtn = document.createElement('button'); altBtn.type = 'button';
+        altBtn.className = 'ovl-modal-btn' + (opts.altDanger ? ' ovl-modal-btn-danger' : '');
+        altBtn.textContent = opts.altLabel;
+        btnRow.appendChild(altBtn);
+    }
+    btnRow.appendChild(okBtn);
     box.appendChild(btnRow);
     overlay.appendChild(box);
 
@@ -47534,6 +47572,11 @@ function ovlConfirmDialog(opts) {
         close();
         try { opts.onConfirm(); } catch (e) { console.error('[ovl] confirm onConfirm failed', e); }
     }
+    function doAlt() {
+        settled = true;
+        close();
+        try { opts.onAlt(); } catch (e) { console.error('[ovl] confirm onAlt failed', e); }
+    }
     // v2 Pass P74 修复 BUG-2（.claude/tmp/recon_ui_bugs.md）：这里原来只处理 Escape，跟同一套
     // 弹窗体系里的姊妹弹窗 ovlPromptDialog（重命名/新建文件/新建文件夹）行为不一致——两者视觉
     // 上完全同构（同一套 .ovl-modal 样式），用户几乎不可能靠外观意识到键盘行为不一样，实测复现：
@@ -47548,6 +47591,7 @@ function ovlConfirmDialog(opts) {
     if (input) input.addEventListener('input', function () { okBtn.disabled = (input.value !== opts.requireTyped); });
     cancelBtn.addEventListener('click', function () { close(); fireCancelOnce(); });
     okBtn.addEventListener('click', doConfirm);
+    if (altBtn) altBtn.addEventListener('click', doAlt);
     overlay.addEventListener('click', function (e) { if (e.target === overlay) { close(); fireCancelOnce(); } });
     document.addEventListener('keydown', onKey);
     __ovlActiveModalDismiss = dismissSelf;
@@ -57579,7 +57623,11 @@ function ovlSettingsTranslatorHtml() {
     // v2 Pass P202b：术语库/论文卡片界面，紧挨着上面的「翻译领域提示」——brief §8 要求
     // 放在既有 glossary/domain-hint 设置旁边。面板自身状态（scope/touched）在
     // OvlTermDbUiState 里，跟这个函数的返回值本身无关，重渲不会丢。
-    if (typeof ovlTermDbPanelHtml === 'function') html += ovlTermDbPanelHtml();
+    // P202c 加固：renderApp 沿途没有 try/catch，ovlTermDbPanelHtml() 里任何一处对损坏条目
+    // 的意外抛出（即便上面 ovlTermDbSanitizeEntries 已经挡掉了 null/非对象元素，仍保留这道
+    // 防御性第二闸）都会把整个设置面板、乃至打开这个面板的那次点击冻死。捕获后至少退化成
+    // "术语库面板缺失"而不是"整页冻住"。
+    if (typeof ovlTermDbPanelHtml === 'function') { try { html += ovlTermDbPanelHtml(); } catch (e) { console.error('[ovl] ovlTermDbPanelHtml failed', e); } }
     html += ovlSetRow('Visual 模式按源码行断行', '<input type="checkbox" data-setpath="settings.ovlVisualLineBreaks"' + (s.ovlVisualLineBreaks ? ' checked' : '') + '>',
         '开启后 Visual 预览里每个源码行单独渲染一行（跟 Code 模式的行号对得上，方便切模式时对照）；关闭则退回按段落整段渲染。');
     html += ovlSetRow('Visual 模式用方框标示选区', '<input type="checkbox" data-setpath="settings.ovlVisualOutlineSelection"' + (s.ovlVisualOutlineSelection ? ' checked' : '') + '>',
