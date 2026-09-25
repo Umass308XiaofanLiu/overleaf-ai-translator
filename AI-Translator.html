@@ -5001,7 +5001,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.40.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.41.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-25';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -9447,9 +9447,16 @@ function parseCrossFragments(raw) {
 // 用来拼出 system+user 两条消息；省略（undefined）时跟 P197 之前逐字节相同（单条 user
 // 消息）。qwen/openai/claude/gemini 四个分支完全不读这个参数，字节不变，callClaudeAPI
 // 调用点这一行也没有改动。
+// v2 Pass P202a：systemPrompt 现在对所有 provider 都生效（不再只有 local）——调用方新增了
+// "卡片 + 命中术语"这类 online provider 也该看到的上下文，需要一条真正的 system 消息（不是
+// 塞进同一条 user 消息里）。只改这里（调用点组装的 messages 数组形状），callClaudeAPI/
+// callOpenAIAPI/callGeminiAPI 函数体一行不动——它们本来就支持 system 角色/systemInstruction
+// （xportRequest 早就在用，见该函数）。systemPrompt 为空/非字符串时，messages 形状跟
+// P202a 之前逐字节相同。
 async function callModelPlainText(prompt, config, signal, meta, opts, systemPrompt) {
+    const hasSys = (typeof systemPrompt === 'string' && !!systemPrompt);
     if (config.provider === 'local') {
-        const localMessages = (typeof systemPrompt === 'string' && systemPrompt)
+        const localMessages = hasSys
             ? [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }]
             : [{ role: 'user', content: prompt }];
         return await callLocalLLM(config.localBaseUrl, config.model, localMessages, false, signal, meta || null, opts || null);
@@ -9457,19 +9464,29 @@ async function callModelPlainText(prompt, config, signal, meta, opts, systemProm
     // v2 Pass P134：Qwen(DashScope) 复用 callLocalLLM 传输层，只是换 baseUrl 并带上 apiKey。
     if (config.provider === 'qwen') {
         const qwenOpts = Object.assign({}, opts || null, { apiKey: config.qwenApiKey });
-        return await callLocalLLM(config.qwenBaseUrl, config.model, [{ role: 'user', content: prompt }], false, signal, meta || null, qwenOpts);
+        const qwenMessages = hasSys
+            ? [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }]
+            : [{ role: 'user', content: prompt }];
+        return await callLocalLLM(config.qwenBaseUrl, config.model, qwenMessages, false, signal, meta || null, qwenOpts);
     }
     const oMax = (opts && typeof opts.maxTokens === 'number' && isFinite(opts.maxTokens) && opts.maxTokens > 0)
         ? Math.round(opts.maxTokens) : null;
     if (config.provider === 'openai') {
         const oaConfig = oMax ? { max_tokens: oMax } : {};
-        return await callOpenAIAPI(config.model, [{ role: 'user', content: prompt }], oaConfig, config.openaiApiKey, signal, meta || null) || '';
+        const oaMessages = hasSys
+            ? [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }]
+            : [{ role: 'user', content: prompt }];
+        return await callOpenAIAPI(config.model, oaMessages, oaConfig, config.openaiApiKey, signal, meta || null) || '';
     }
     if (config.provider === 'claude') {
         const clConfig = oMax ? { max_tokens: oMax } : {};
-        return await callClaudeAPI(config.model, [{ role: 'user', content: prompt }], clConfig, config.claudeApiKey, signal, config.claudeProxyUrl) || '';
+        const clMessages = hasSys
+            ? [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }]
+            : [{ role: 'user', content: prompt }];
+        return await callClaudeAPI(config.model, clMessages, clConfig, config.claudeApiKey, signal, config.claudeProxyUrl) || '';
     }
-    return await callGeminiAPI(config.model, prompt, {}, config.geminiApiKey, signal, meta || null) || '';
+    const geminiConfig = hasSys ? { systemInstruction: systemPrompt } : {};
+    return await callGeminiAPI(config.model, prompt, geminiConfig, config.geminiApiKey, signal, meta || null) || '';
 }
 
 // ============= 跨栏高亮：调度 =============
@@ -12221,7 +12238,7 @@ function xportSplitSegment(seg) {
 }
 
 // provider 保留在签名里（调用方都在传），但已经不再影响提示词内容 —— 见下方注释。
-function xportSystemPrompt(srcName, tgtName, provider) {
+function xportSystemPrompt(srcName, tgtName, provider, matchText) {
     // 【删掉了什么，为什么】这里曾经给 local 加过 `/no_think\n` 前缀。**实测是空操作**：
     // enable_thinking、chat_template_kwargs.{enable_thinking,thinking}、/think、/no_think
     // 在这版 LM Studio 上全部被静默忽略（6 组对照请求字节一致，reasoning_tokens 恒为 0）；
@@ -12242,17 +12259,23 @@ Rules:
    Never delete, translate, renumber, zero-pad or duplicate a placeholder.
 4. Copy any remaining LaTeX command verbatim.
 5. Do not merge, split, reorder or skip segments. No commentary, no code fences.`;
-    // v2 Pass P197（A/B）：领域提示 + 项目术语表，只在 provider==='local' 时追加——`provider`
-    // 这个入参以前只在上面已删除的 /no_think 实验里被读过（见本函数最上方大注释），其它
-    // 分支（qwen/openai/claude/gemini）传进来的 provider !== 'local'，原样返回 base，逐
-    // 字节跟 P197 之前相同；只有本地模型这一支的 system prompt 会变长。
-    if (provider !== 'local') return base;
-    const domainHintLine = ovlDomainHintPromptLine();
-    const glossaryBlock = ovlGlossaryBuildPromptBlock();
-    let extra = '';
-    if (domainHintLine) extra += '\n\n' + domainHintLine;
-    if (glossaryBlock) extra += '\n\n' + glossaryBlock;
-    return base + extra;
+    // v2 Pass P202a（T0 review 绑定决定 2/3）：论文卡片 + 命中术语现在对所有 provider 生效
+    // （原先"只在 provider==='local' 时追加"的早退已删掉）；`\title{}` 自动领域提示仍然
+    // 只在 local 且没有卡片时才追加——online provider 从来没有过这条提示，不新增。matchText
+    // 是这一批（多个 @@n@@ 段）待译文本，由 xportRequest 传入，用来做按段/按批命中匹配。
+    // 卡片+命中术语都为空时：base 逐字节不变（非 local 原样返回 a9523c9 的 base；local 在
+    // 没有领域提示/命中术语时也退回纯 base），满足"空 ⇒ 请求体字节不变"这条硬约束。
+    const card = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+    let sys = base;
+    if (provider === 'local') {
+        const domainHintLine = (!card && typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
+        if (domainHintLine) sys += '\n\n' + domainHintLine;
+    }
+    const matched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(matchText || '', { cap: 60 }) : [];
+    const termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(matched) : '';
+    sys += termsBlock;
+    if (card) sys = card + '\n\n' + sys;
+    return sys;
 }
 
 // LM Studio 报的**加载期**上下文（不是配置上限）。拿不到就返回 0，调用方回落默认值。
@@ -12792,7 +12815,10 @@ function xportPack(masked, limits) {
 // 而不必再开第二套「上一次响应」的全局状态（见 spec §6.5）。
 async function xportRequest(items, srcName, tgtName, config, signal, outMeta) {
     const user = items.map((it, i) => '@@' + (i + 1) + '@@\n' + it.text).join('\n\n');
-    const sys = xportSystemPrompt(srcName, tgtName, config.provider);
+    // v2 Pass P202a：术语命中要匹配"这一批实际要发的文本"，复用下面马上要拼进 user 的同一份
+    // it.text 拼接（用 \n 连接即可，不需要跟 user 变量的 @@n@@ 编号格式逐字节一致——匹配只
+    // 关心字面文本里有没有出现术语，不关心分隔符），避免重复算一遍。
+    const sys = xportSystemPrompt(srcName, tgtName, config.provider, items.map(function (it) { return it.text; }).join('\n'));
     // 出参：finish_reason === 'length' / 'MAX_TOKENS' 时 meta.truncated = true
     const meta = (outMeta && typeof outMeta === 'object') ? outMeta : {};
     let raw;
@@ -24025,8 +24051,8 @@ function chatAgentBuildOpenAIToolsSchema() {
     let glossaryReady = false;
     try { glossaryReady = chatAgentGlossaryReadiness().ready; } catch (e) {}
     if (glossaryReady) {
-        def('glossary_list', '只读：列出当前项目持久化的英中术语对照表（最多 50 条）。', { type: 'object', properties: {}, additionalProperties: false });
-        def('glossary_set', '新增或更正项目术语表里的一条英中对照。登记后，之后本项目翻译请求会自动带上这条对照要求模型必须遵守。执行前用户会看到确认弹窗；已满 50 条时新增会被拒绝（更正已有术语不受限）。', {
+        def('glossary_list', '只读：列出当前项目持久化的英中术语对照表（最多 500 条）。', { type: 'object', properties: {}, additionalProperties: false });
+        def('glossary_set', '新增或更正项目术语表里的一条英中对照。登记后，之后本项目翻译请求命中这个词时会自动带上这条对照要求模型必须遵守（对所有 provider 生效）。执行前用户会看到确认弹窗；已满 500 条时新增会被拒绝（更正已有术语不受限）。', {
             type: 'object',
             properties: {
                 en: { type: 'string', description: '英文术语。' },
@@ -26379,7 +26405,9 @@ async function chatAgentExecTranslationQaScan(args) {
         if (ratio !== null && ratio > OVL_QA_LATIN_RATIO_THRESHOLD) suspiciousBlocks.push({ index: i, ratio: ratio });
     }
 
-    const glossary = ovlGlossaryList();
+    const glossary = (typeof ovlTermDbEffectiveList === 'function')
+        ? ovlTermDbEffectiveList().filter(function (e) { return e && e.enabled !== false && e.zh; })
+        : [];
     const termIssues = [];
     glossary.forEach(function (term) {
         let enRe;
@@ -26594,6 +26622,364 @@ function ovlDomainHintPromptLine() {
     } catch (e) { return ''; }
 }
 
+// ============================================================================
+// v2 Pass P202a：统一术语库（term DB）+ 论文卡片（paper card）—— T0 review 的绑定决定：
+// 新术语库**取代** P103 项目术语表（ovlGlossary* 那一套）作为持久化，glossary_set/
+// glossary_remove 聊天工具从这里开始改写这份新存储；P197 旧 glossary map 只做一次性、
+// 非破坏性迁移的只读来源（ovlGlossaryMapLoad 等旧函数保留，供迁移读取，不再是任何写入
+// 路径的目标）。持久化范式跟 ovlGlossary*/ovlDomainHint* 一致：单个 JSON 映射表，key 是
+// ovlNormalizeProjectPath 规范化的项目绝对路径，本地/远程分两个 localStorage key。
+// ============================================================================
+const OVL_TERMDB_PROJECT_MAX = 500;
+const OVL_TERMDB_GLOBAL_MAX = 500;
+function ovlTermDbLsKey() { return ovlIsRemoteBridge() ? 'ovl.termDbByPathRemote' : 'ovl.termDbByPath'; }
+function ovlTermDbMapLoad() {
+    try {
+        const raw = localStorage.getItem(ovlTermDbLsKey());
+        if (!raw) return {};
+        const obj = JSON.parse(raw);
+        return (obj && typeof obj === 'object' && !Array.isArray(obj)) ? obj : {};
+    } catch (e) { return {}; }
+}
+function ovlTermDbMapSave(map) { try { localStorage.setItem(ovlTermDbLsKey(), JSON.stringify(map)); } catch (e) {} }
+function ovlTermDbProjectKey() { try { return ovlNormalizeProjectPath(chatAgentProjectDir()); } catch (e) { return ''; } }
+function ovlTermDbBucketGet(projectKey) {
+    const map = ovlTermDbMapLoad();
+    const b = map[projectKey];
+    return (b && typeof b === 'object' && Array.isArray(b.entries)) ? b : { entries: [], updatedAt: 0 };
+}
+function ovlTermDbEntryDefaults(partial) {
+    partial = partial || {};
+    return {
+        en: String(partial.en == null ? '' : partial.en).trim(),
+        zh: String(partial.zh == null ? '' : partial.zh).trim(),
+        kind: (partial.kind === 'acronym' || partial.kind === 'keep') ? partial.kind : 'term',
+        note: (typeof partial.note === 'string') ? partial.note : '',
+        source: (partial.source === 'regex' || partial.source === 'llm') ? partial.source : 'user',
+        enabled: (partial.enabled === false) ? false : true,
+        updatedAt: Date.now()
+    };
+}
+// 一次性、非破坏性地把 P197 旧术语表（ovl.glossaryByPath[Remote]，{en: zh} 桶）并入新
+// 术语库，source 一律标 'user'（旧术语表条目都是用户通过 glossary_set 主动登记的）。
+// 旧存储本身不删除、不清空——只读迁移，允许日后需要回溯核对。用独立的迁移标记 key（不是
+// 术语库 map 里的哨兵项目路径），避免跟真实项目路径字符串冲突。已迁移过的条目（en 已存在
+// 于目标项目桶）跳过，不覆盖用户之后可能已经改过的译法。
+function ovlTermDbGlossaryMigratedLsKey() { return ovlIsRemoteBridge() ? 'ovl.termDbGlossaryMigratedRemote' : 'ovl.termDbGlossaryMigrated'; }
+let OvlTermDbMigratedOnce = false;
+function ovlTermDbMigrateGlossaryOnce() {
+    if (OvlTermDbMigratedOnce) return;
+    OvlTermDbMigratedOnce = true;
+    try {
+        if (localStorage.getItem(ovlTermDbGlossaryMigratedLsKey()) === '1') return;
+        const glossaryMap = (typeof ovlGlossaryMapLoad === 'function') ? ovlGlossaryMapLoad() : {};
+        const termMap = ovlTermDbMapLoad();
+        Object.keys(glossaryMap).forEach(function (projectKey) {
+            const bucket = glossaryMap[projectKey];
+            if (!bucket || typeof bucket !== 'object') return;
+            const termBucket = (termMap[projectKey] && Array.isArray(termMap[projectKey].entries)) ? termMap[projectKey] : { entries: [], updatedAt: 0 };
+            Object.keys(bucket).forEach(function (en) {
+                const zh = bucket[en];
+                if (typeof zh !== 'string' || !zh) return;
+                const exists = termBucket.entries.some(function (e) { return e.en === en; });
+                if (exists) return;
+                if (termBucket.entries.length >= OVL_TERMDB_PROJECT_MAX) return;
+                termBucket.entries.push(ovlTermDbEntryDefaults({ en: en, zh: zh, kind: 'term', source: 'user', enabled: true }));
+            });
+            termBucket.updatedAt = Date.now();
+            termMap[projectKey] = termBucket;
+        });
+        ovlTermDbMapSave(termMap);
+        localStorage.setItem(ovlTermDbGlossaryMigratedLsKey(), '1');
+    } catch (e) {}
+}
+function ovlTermDbList(projectKeyOverride) {
+    ovlTermDbMigrateGlossaryOnce();
+    const key = (typeof projectKeyOverride === 'string' && projectKeyOverride) ? projectKeyOverride : ovlTermDbProjectKey();
+    if (!key) return [];
+    return ovlTermDbBucketGet(key).entries.slice();
+}
+// 返回 false：拿不到项目 key，或（新增且）已达每项目上限。更正已有条目不受上限约束。
+function ovlTermDbSet(projectKey, entryPartial) {
+    try {
+        const key = projectKey || ovlTermDbProjectKey();
+        if (!key || !entryPartial || !entryPartial.en) return false;
+        ovlTermDbMigrateGlossaryOnce();
+        const en = String(entryPartial.en).trim();
+        if (!en) return false;
+        const map = ovlTermDbMapLoad();
+        const bucket = ovlTermDbBucketGet(key);
+        const idx = bucket.entries.findIndex(function (e) { return e.en === en; });
+        const isNew = idx === -1;
+        if (isNew && bucket.entries.length >= OVL_TERMDB_PROJECT_MAX) return false;
+        const entry = ovlTermDbEntryDefaults(Object.assign({}, entryPartial, { en: en }));
+        if (isNew) bucket.entries.push(entry); else bucket.entries[idx] = entry;
+        bucket.updatedAt = Date.now();
+        map[key] = bucket;
+        ovlTermDbMapSave(map);
+        return true;
+    } catch (e) { return false; }
+}
+function ovlTermDbRemove(projectKey, en) {
+    try {
+        const key = projectKey || ovlTermDbProjectKey();
+        if (!key) return false;
+        ovlTermDbMigrateGlossaryOnce();
+        const map = ovlTermDbMapLoad();
+        const bucket = ovlTermDbBucketGet(key);
+        const idx = bucket.entries.findIndex(function (e) { return e.en === en; });
+        if (idx === -1) return false;
+        bucket.entries.splice(idx, 1);
+        bucket.updatedAt = Date.now();
+        map[key] = bucket;
+        ovlTermDbMapSave(map);
+        return true;
+    } catch (e) { return false; }
+}
+function ovlTermDbSetEnabled(projectKey, en, enabled) {
+    try {
+        const key = projectKey || ovlTermDbProjectKey();
+        if (!key) return false;
+        ovlTermDbMigrateGlossaryOnce();
+        const map = ovlTermDbMapLoad();
+        const bucket = ovlTermDbBucketGet(key);
+        const idx = bucket.entries.findIndex(function (e) { return e.en === en; });
+        if (idx === -1) return false;
+        bucket.entries[idx].enabled = !!enabled;
+        bucket.entries[idx].updatedAt = Date.now();
+        bucket.updatedAt = Date.now();
+        map[key] = bucket;
+        ovlTermDbMapSave(map);
+        return true;
+    } catch (e) { return false; }
+}
+// 全局术语库——不分项目，跟项目库合并时项目条目在 en 冲突时优先（见 ovlTermDbEffectiveList）。
+function ovlTermDbGlobalLoad() {
+    try {
+        const raw = localStorage.getItem('ovl.termDbGlobal');
+        const obj = raw ? JSON.parse(raw) : null;
+        return (obj && typeof obj === 'object' && Array.isArray(obj.entries)) ? obj : { entries: [], updatedAt: 0 };
+    } catch (e) { return { entries: [], updatedAt: 0 }; }
+}
+function ovlTermDbGlobalSave(bucket) { try { localStorage.setItem('ovl.termDbGlobal', JSON.stringify(bucket)); } catch (e) {} }
+function ovlTermDbGlobalSet(entryPartial) {
+    try {
+        if (!entryPartial || !entryPartial.en) return false;
+        const en = String(entryPartial.en).trim();
+        if (!en) return false;
+        const bucket = ovlTermDbGlobalLoad();
+        const idx = bucket.entries.findIndex(function (e) { return e.en === en; });
+        const isNew = idx === -1;
+        if (isNew && bucket.entries.length >= OVL_TERMDB_GLOBAL_MAX) return false;
+        const entry = ovlTermDbEntryDefaults(Object.assign({}, entryPartial, { en: en }));
+        if (isNew) bucket.entries.push(entry); else bucket.entries[idx] = entry;
+        bucket.updatedAt = Date.now();
+        ovlTermDbGlobalSave(bucket);
+        return true;
+    } catch (e) { return false; }
+}
+function ovlTermDbGlobalRemove(en) {
+    try {
+        const bucket = ovlTermDbGlobalLoad();
+        const idx = bucket.entries.findIndex(function (e) { return e.en === en; });
+        if (idx === -1) return false;
+        bucket.entries.splice(idx, 1);
+        bucket.updatedAt = Date.now();
+        ovlTermDbGlobalSave(bucket);
+        return true;
+    } catch (e) { return false; }
+}
+// 项目条目 + 全局条目合并视图，en 冲突时项目条目赢——这是匹配/注入的唯一入口，UI（P202b）
+// 和聊天工具都应该经这个函数读取"当前对当前项目生效"的术语集合。
+function ovlTermDbEffectiveList(projectKeyOverride) {
+    try {
+        const projectEntries = ovlTermDbList(projectKeyOverride);
+        const globalEntries = ovlTermDbGlobalLoad().entries;
+        const byEn = {};
+        globalEntries.forEach(function (e) { if (e && e.en) byEn[e.en] = e; });
+        projectEntries.forEach(function (e) { if (e && e.en) byEn[e.en] = e; });
+        return Object.keys(byEn).map(function (k) { return byEn[k]; });
+    } catch (e) { return []; }
+}
+// 自动构建（正则扫描/AI 补全）合并——绝不覆盖 source:'user' 的条目，这是"用户主动维护的
+// 知识不能被自动流程悄悄改写"这条纪律（跟 ovlGlossarySet 满 50/500 条拒绝新增同一条精神）
+// 在合并语义上的体现。返回本次实际新增/更新的条目数。
+function ovlTermDbMergeAuto(entries, source) {
+    try {
+        const key = ovlTermDbProjectKey();
+        if (!key || !Array.isArray(entries)) return 0;
+        ovlTermDbMigrateGlossaryOnce();
+        const map = ovlTermDbMapLoad();
+        const bucket = ovlTermDbBucketGet(key);
+        const src = (source === 'regex' || source === 'llm') ? source : 'regex';
+        let changed = 0;
+        entries.forEach(function (raw) {
+            if (!raw || !raw.en) return;
+            const en = String(raw.en).trim();
+            if (!en) return;
+            const idx = bucket.entries.findIndex(function (e) { return e.en === en; });
+            if (idx !== -1 && bucket.entries[idx].source === 'user') return; // 绝不覆盖用户条目
+            const isNew = idx === -1;
+            if (isNew && bucket.entries.length >= OVL_TERMDB_PROJECT_MAX) return;
+            const entry = ovlTermDbEntryDefaults({
+                en: en,
+                zh: (typeof raw.zh === 'string') ? raw.zh : (idx !== -1 ? bucket.entries[idx].zh : ''),
+                kind: raw.kind || (idx !== -1 ? bucket.entries[idx].kind : 'term'),
+                note: raw.note || '',
+                source: src,
+                enabled: (idx !== -1) ? bucket.entries[idx].enabled : true
+            });
+            if (isNew) bucket.entries.push(entry); else bucket.entries[idx] = entry;
+            changed++;
+        });
+        if (changed) { bucket.updatedAt = Date.now(); map[key] = bucket; ovlTermDbMapSave(map); }
+        return changed;
+    } catch (e) { return 0; }
+}
+function ovlTermDbExport(projectKeyOverride) {
+    try { return JSON.stringify({ entries: ovlTermDbList(projectKeyOverride) }, null, 2); }
+    catch (e) { return '{"entries":[]}'; }
+}
+// mode:'merge'（默认，逐条 upsert）|'replace'（先清空项目桶再写入）。导入的条目除非自带
+// source 字段，否则一律标 'user'——跟"导入=用户主动引入的数据"这条语义对应。
+function ovlTermDbImport(json, opts) {
+    try {
+        const parsed = JSON.parse(json);
+        const entries = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.entries) ? parsed.entries : null);
+        if (!entries) return false;
+        const key = ovlTermDbProjectKey();
+        if (!key) return false;
+        ovlTermDbMigrateGlossaryOnce();
+        const mode = (opts && opts.mode === 'replace') ? 'replace' : 'merge';
+        const map = ovlTermDbMapLoad();
+        let bucket = (mode === 'replace') ? { entries: [], updatedAt: 0 } : ovlTermDbBucketGet(key);
+        entries.forEach(function (raw) {
+            if (!raw || !raw.en) return;
+            const en = String(raw.en).trim();
+            if (!en) return;
+            const entry = ovlTermDbEntryDefaults(Object.assign({}, raw, { en: en, source: raw.source || 'user' }));
+            const idx = bucket.entries.findIndex(function (e) { return e.en === en; });
+            if (idx === -1) { if (bucket.entries.length < OVL_TERMDB_PROJECT_MAX) bucket.entries.push(entry); }
+            else bucket.entries[idx] = entry;
+        });
+        bucket.updatedAt = Date.now();
+        map[key] = bucket;
+        ovlTermDbMapSave(map);
+        return true;
+    } catch (e) { return false; }
+}
+
+// ============================================================================
+// v2 Pass P202a：论文卡片——取代 P197 的 \title{} 自动提示作为"更完整"的领域上下文来源。
+// 只存用户覆盖值（override），没有覆盖值时各注入点自行决定是否退回旧的 \title{} 自动提取
+// （见 T0 review 绑定决定 2：card 只在 local 上取代 title-hint；online provider 本来就没有
+// title-hint，不存在"退回"一说）。
+// ============================================================================
+const OVL_PAPER_CARD_MAX_CHARS = 1200;
+function ovlPaperCardLsKey() { return ovlIsRemoteBridge() ? 'ovl.paperCardByPathRemote' : 'ovl.paperCardByPath'; }
+function ovlPaperCardMapLoad() {
+    try {
+        const raw = localStorage.getItem(ovlPaperCardLsKey());
+        if (!raw) return {};
+        const obj = JSON.parse(raw);
+        return (obj && typeof obj === 'object' && !Array.isArray(obj)) ? obj : {};
+    } catch (e) { return {}; }
+}
+function ovlPaperCardMapSave(map) { try { localStorage.setItem(ovlPaperCardLsKey(), JSON.stringify(map)); } catch (e) {} }
+function ovlPaperCardGet(projectKeyOverride) {
+    try {
+        const key = (typeof projectKeyOverride === 'string' && projectKeyOverride) ? projectKeyOverride : ovlTermDbProjectKey();
+        if (!key) return '';
+        const map = ovlPaperCardMapLoad();
+        const v = map[key];
+        return (typeof v === 'string') ? v : '';
+    } catch (e) { return ''; }
+}
+// 传空字符串/纯空白 = 清掉卡片（回落到今天的 \title{} 自动提取行为），跟 ovlDomainHintSetOverride
+// 同一条纪律。
+function ovlPaperCardSet(projectKey, text) {
+    try {
+        const key = projectKey || ovlTermDbProjectKey();
+        if (!key) return false;
+        const trimmed = String(text == null ? '' : text).trim().slice(0, OVL_PAPER_CARD_MAX_CHARS);
+        const map = ovlPaperCardMapLoad();
+        if (trimmed) map[key] = trimmed; else delete map[key];
+        ovlPaperCardMapSave(map);
+        return true;
+    } catch (e) { return false; }
+}
+
+// ============================================================================
+// v2 Pass P202a：按段命中匹配 + 统一的 prompt 注入片段构建——Path1/Path2/Path3 三条路径
+// 共用这一个匹配函数和一个渲染函数（T0 review 绑定决定 4）。匹配前用简单本地正则挡掉
+// \cite{}/\ref{}/\eqref{}/\label{}/$...$/\(...\)/\[...\] 这几类"术语字面量可能凑巧出现在
+// 里面但不该被当命中"的区域——不触碰、不依赖 xportMask 内部实现（那是改动禁区），只是在
+// matchText 的一份本地拷贝上做字符串层面的挡字符处理，处理完这份拷贝直接丢弃。
+// ============================================================================
+const OVL_TERMDB_PROTECT_RES = [
+    /\\cite[a-zA-Z]*\s*(?:\[[^\]]*\])?\s*\{[^{}]*\}/g,
+    /\\ref\s*\{[^{}]*\}/g,
+    /\\eqref\s*\{[^{}]*\}/g,
+    /\\label\s*\{[^{}]*\}/g,
+    /\$[^$]*\$/g,
+    /\\\([\s\S]*?\\\)/g,
+    /\\\[[\s\S]*?\\\]/g
+];
+function ovlTermDbBlankProtected(rawText) {
+    let s = String(rawText == null ? '' : rawText);
+    OVL_TERMDB_PROTECT_RES.forEach(function (re) {
+        try { s = s.replace(re, function (m) { return new Array(m.length + 1).join(' '); }); } catch (e) {}
+    });
+    return s;
+}
+function ovlTermDbEscapeRegex(s) { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+// 字母数字边界（不是 \b，\b 在 ISL 前面挡不住数字/下划线以外的场景语义不完全对齐）——跟
+// 任务书给的判据逐字对应：(?:^|[^A-Za-z0-9])term(?:$|[^A-Za-z0-9])。缩写（kind:'acronym'）
+// 区分大小写，其它 kind 不区分；两者都额外接受一个复数后缀（缩写只接受 s，其它接受 s/es）。
+function ovlTermDbBuildEntryRegex(entry) {
+    const esc = ovlTermDbEscapeRegex(entry.en);
+    const isAcronym = entry.kind === 'acronym';
+    const pluralSuffix = isAcronym ? 's?' : '(?:es|s)?';
+    const flags = isAcronym ? '' : 'i';
+    return new RegExp('(?:^|[^A-Za-z0-9])(?:' + esc + pluralSuffix + ')(?:$|[^A-Za-z0-9])', flags);
+}
+// 返回按 en 长度从长到短排序、命中当前段落/批次文本的启用条目（含全局库，项目条目 en
+// 冲突时已经在 ovlTermDbEffectiveList 里赢了）。只考虑 enabled!==false 且（kind==='keep' 或
+// zh 非空）的条目——keep 类哪怕没填 zh 也要能命中（渲染成"保留英文"），其它 kind 空 zh
+// 意味着还没人翻译这个词，不该被注入进 prompt。cap 缺省 30（Path1/2 的口径），Path3 调用
+// 时显式传 60（按批次）。
+function ovlTermDbMatch(rawText, opts) {
+    try {
+        const cap = (opts && typeof opts.cap === 'number' && opts.cap > 0) ? Math.floor(opts.cap) : 30;
+        const text = ovlTermDbBlankProtected(rawText);
+        const all = (typeof ovlTermDbEffectiveList === 'function') ? ovlTermDbEffectiveList() : [];
+        const candidates = all.filter(function (e) {
+            return e && e.en && e.enabled !== false && (e.kind === 'keep' || (typeof e.zh === 'string' && e.zh.trim()));
+        });
+        candidates.sort(function (a, b) { return b.en.length - a.en.length; });
+        const matched = [];
+        for (let i = 0; i < candidates.length && matched.length < cap; i++) {
+            const entry = candidates[i];
+            let re;
+            try { re = ovlTermDbBuildEntryRegex(entry); } catch (e) { continue; }
+            if (re.test(text)) matched.push(entry);
+        }
+        return matched;
+    } catch (e) { return []; }
+}
+// 统一的注入片段渲染——三条路径共用同一个格式（T0 review 绑定决定 3）："Terminology (use
+// exactly):\n" + 每行 "en → zh"；kind==='keep' 渲染成 "en → en (keep in English)"。空数组
+// 返回空串（调用方按需拼装，不喂模型一句空话）。
+function ovlTermDbBuildPromptBlock(entries) {
+    try {
+        if (!entries || !entries.length) return '';
+        const lines = entries.map(function (e) {
+            return (e.kind === 'keep') ? (e.en + ' → ' + e.en + ' (keep in English)') : (e.en + ' → ' + e.zh);
+        });
+        return '\n\n' + 'Terminology (use exactly):\n' + lines.join('\n');
+    } catch (e) { return ''; }
+}
+
 function chatAgentGlossaryReadiness() {
     if (!chatAgentProjectDir()) return { ready: false, reason: 'no-projectdir' };
     return { ready: true, reason: '' };
@@ -26608,11 +26994,11 @@ function chatAgentGlossaryToolsSystemBlock() {
             ? ('\n【项目术语表工具】这一轮不可用（还没有填写项目绝对路径）。不要调用 glossary_list/glossary_set/glossary_remove。\n')
             : ('\n【项目术语表工具】这一轮不可用（还没有填写项目绝对路径）。不要输出这几个工具的 ==TOOL== 块。\n');
     }
-    return '\n【项目术语表工具】按项目路径持久化的英中术语对照表——登记后，之后本项目的翻译请求会'
-        + '自动把这份术语表注入给翻译模型，要求"必须遵守"（目前只对本地模型翻译路径生效）：\n'
-        + '  · glossary_list —— 只读，列出当前项目的术语表（最多 50 条）。参数是空对象 {}。\n'
+    return '\n【项目术语表工具】按项目路径持久化的英中术语对照表——登记后，之后本项目的翻译请求命中'
+        + '这个词时会自动把对应条目注入给翻译模型，要求"必须遵守"（现在对所有 provider 生效）：\n'
+        + '  · glossary_list —— 只读，列出当前项目的术语表（最多 500 条）。参数是空对象 {}。\n'
         + '  · glossary_set —— 新增或更正一条术语。参数：{"en":"英文术语","zh":"标准中文译法"}。'
-        + '执行前用户会看到确认弹窗。已满 50 条时新增会被拒绝（更正已有术语不受此限制）。\n'
+        + '执行前用户会看到确认弹窗。已满 500 条时新增会被拒绝（更正已有术语不受此限制）。\n'
         + '  · glossary_remove —— 删除一条术语。参数：{"en":"英文术语"}。执行前用户会看到确认弹窗。\n'
         + (native ? '' : '调用格式：\n==TOOL name=glossary_set==\n{"en":"...","zh":"..."}\n==TOOLEND==\n');
 }
@@ -26623,7 +27009,7 @@ async function chatAgentExecGlossaryList(args) {
         const msg = '无法读取项目术语表：还没有填写项目绝对路径。';
         return { ok: false, uiSummary: '读取术语表失败', uiDetail: msg, textForModel: msg, bytes: 0 };
     }
-    const list = ovlGlossaryList();
+    const list = ovlTermDbList().filter(function (t) { return t && t.zh; });
     const text = list.length
         ? ('当前项目术语表共 ' + list.length + ' 条：\n' + list.map(function (t) { return '  · ' + t.en + ' → ' + t.zh; }).join('\n'))
         : '当前项目术语表是空的。';
@@ -26643,23 +27029,24 @@ async function chatAgentExecGlossarySet(args, signal, pending) {
         const msg = 'glossary_set 缺少必填的 en/zh 参数。';
         return { ok: false, uiSummary: '登记术语失败', uiDetail: msg, textForModel: msg, bytes: 0 };
     }
-    const projectKey = ovlGlossaryProjectKey();
-    const existing = ovlGlossaryBucketGet(projectKey);
-    const isNew = !Object.prototype.hasOwnProperty.call(existing, en);
+    const projectKey = ovlTermDbProjectKey();
+    const existingList = ovlTermDbList(projectKey);
+    const existingEntry = existingList.find(function (e) { return e.en === en; });
+    const isNew = !existingEntry;
     setLabel('等待你确认登记术语「' + en + '」…');
     const confirmMsg = '操作：' + (isNew ? '新增' : '更正') + '项目术语表条目。\n英文：' + en + '\n中文译法：' + zh
-        + (isNew ? '' : ('\n（原译法：' + existing[en] + '）'))
-        + '\n\n登记后，之后本项目的翻译请求会自动带上这条对照，要求模型必须遵守（目前只对本地模型'
-        + '翻译路径生效）。';
+        + (isNew ? '' : ('\n（原译法：' + existingEntry.zh + '）'))
+        + '\n\n登记后，之后本项目的翻译请求命中这个词时会自动带上这条对照，要求模型必须遵守（现在对所有'
+        + 'provider 都生效，不再只限本地模型）。';
     const confirmed = await chatAgentConfirm({ title: (isNew ? '新增' : '更正') + '术语？', message: confirmMsg, confirmLabel: '确认' + (isNew ? '新增' : '更正') }, signal);
     if (!confirmed) {
         const msg = '用户拒绝了该操作。';
         chatAppendToolRow('🔧 glossary_set（' + en + '）· 已被用户取消', confirmMsg);
         return { ok: false, refused: true, uiSummary: '用户取消', uiDetail: msg, textForModel: msg, bytes: 0 };
     }
-    const ok = ovlGlossarySet(projectKey, en, zh);
+    const ok = ovlTermDbSet(projectKey, { en: en, zh: zh, kind: 'term', source: 'user', enabled: true });
     if (!ok) {
-        const msg = '登记失败：项目术语表已达到 ' + OVL_GLOSSARY_MAX + ' 条上限，请先删除几条不需要的术语再新增。';
+        const msg = '登记失败：项目术语表已达到 ' + OVL_TERMDB_PROJECT_MAX + ' 条上限，请先删除几条不需要的术语再新增。';
         chatAppendToolRow('🔧 glossary_set（' + en + '）· 失败', msg);
         return { ok: false, uiSummary: '登记术语失败（已满）', uiDetail: msg, textForModel: msg, bytes: 0 };
     }
@@ -26680,21 +27067,22 @@ async function chatAgentExecGlossaryRemove(args, signal, pending) {
         const msg = 'glossary_remove 缺少必填的 en 参数。';
         return { ok: false, uiSummary: '删除术语失败', uiDetail: msg, textForModel: msg, bytes: 0 };
     }
-    const projectKey = ovlGlossaryProjectKey();
-    const existing = ovlGlossaryBucketGet(projectKey);
-    if (!Object.prototype.hasOwnProperty.call(existing, en)) {
+    const projectKey = ovlTermDbProjectKey();
+    const existingList = ovlTermDbList(projectKey);
+    const existingEntry = existingList.find(function (e) { return e.en === en; });
+    if (!existingEntry) {
         const msg = '术语表里没有「' + en + '」这一条，无需删除。';
         return { ok: false, uiSummary: '删除术语失败', uiDetail: msg, textForModel: msg, bytes: 0 };
     }
     setLabel('等待你确认删除术语「' + en + '」…');
-    const confirmMsg = '操作：从项目术语表删除一条。\n英文：' + en + '\n当前中文译法：' + existing[en];
+    const confirmMsg = '操作：从项目术语表删除一条。\n英文：' + en + '\n当前中文译法：' + existingEntry.zh;
     const confirmed = await chatAgentConfirm({ title: '删除术语？', message: confirmMsg, confirmLabel: '确认删除', danger: true }, signal);
     if (!confirmed) {
         const msg = '用户拒绝了该操作。';
         chatAppendToolRow('🔧 glossary_remove（' + en + '）· 已被用户取消', confirmMsg);
         return { ok: false, refused: true, uiSummary: '用户取消', uiDetail: msg, textForModel: msg, bytes: 0 };
     }
-    ovlGlossaryRemove(projectKey, en);
+    ovlTermDbRemove(projectKey, en);
     const text = '已删除术语：' + en + '。';
     chatAppendToolRow('🔧 glossary_remove（' + en + '）· 完成', text);
     return { ok: true, uiSummary: text, uiDetail: text, textForModel: text, bytes: text.length };
@@ -37031,25 +37419,41 @@ function ovlVisualTransCacheLegacyLoad() {
 // "这次改动应该让哪些条目失效"的清单，版本号进 key 本身是最不容易漏改的做法。
 // v2 Pass P200：新增 sysRules 里的 LaTeX 格式化命令保留规则（见上方 isLocalProvider 分支），
 // 2 -> 3。
+// v2 Pass P202a（T0 review 绑定决定 5）：卡片 + 按段命中术语取代旧的"整表拼进指纹"，
+// 版本号本身不涨——指纹已经把"这次会不会拼出不一样的东西"这件事算进去了，不需要再靠
+// 版本号硬性失效所有旧条目（详见下面两个函数）。
 const OVL_VISUAL_TRANS_PROMPT_VERSION = 3;
-// 领域提示 + 项目术语表的指纹——两者任一变化都应该让同一段源文重新翻译一次（比如刚给
-// 术语表加了一条新词条，此后应该用新术语表重翻，不能继续吐旧缓存）。复用跟源文一样的
-// 轻量哈希，不追求密码学强度，只要"内容变了指纹大概率跟着变"就够。
-function ovlVisualTransCacheContextFingerprint() {
+// 领域提示（仅 local）+ 论文卡片 + 按段命中术语的指纹——任一变化都应该让同一段源文重新
+// 翻译一次。复用跟源文一样的轻量哈希，不追求密码学强度，只要"内容变了指纹大概率跟着变"
+// 就够。text 参数用来做按段命中匹配（ovlTermDbMatch 需要原文）。
+function ovlVisualTransCacheContextFingerprint(text, config) {
     try {
-        const domainHintLine = (typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
-        const glossaryBlock = (typeof ovlGlossaryBuildPromptBlock === 'function') ? ovlGlossaryBuildPromptBlock() : '';
-        return ovlVisualHashSrc(domainHintLine + '\u0001' + glossaryBlock);
+        const provider = (config && config.provider) ? String(config.provider) : '';
+        const domainHintLine = (provider === 'local' && typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
+        const card = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+        const matched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(text, { cap: 30 }) : [];
+        const matchedPart = matched.length ? ('\u0001' + JSON.stringify(matched)) : '';
+        return ovlVisualHashSrc(domainHintLine + '\u0001' + card + matchedPart);
     } catch (e) { return '0'; }
 }
 function ovlVisualTransCacheKey(text, config) {
     const provider = (config && config.provider) ? String(config.provider) : '';
     const model = (config && config.model) ? String(config.model) : '';
-    // v2 Pass P197（D）：只有 local provider 才会真的把领域提示/术语表拼进 prompt（见
-    // ovlVisualTranslateBlockText 里的 isLocalProvider 分支），非 local 的 key 不需要带这个
-    // 指纹——带了也不算错（指纹恒定时形同没加），但没必要让 Claude/OpenAI/Gemini 的缓存
-    // key 无谓变长、或者在术语表变化时对根本用不到术语表的这些 provider 也触发重翻。
-    const ctxFp = (provider === 'local') ? ('|' + ovlVisualTransCacheContextFingerprint()) : '';
+    // v2 Pass P202a（T0 review 绑定决定 5）："空卡片 + 空命中术语 ⇒ key 逐字节等于 a9523c9"
+    // 对 local 和非 local 都必须成立：
+    // - local 分支跟 P197 时一样无条件带上这段指纹（哪怕指纹内容为空，指纹哈希本身仍是个
+    //   非空常量，跟 a9523c9 上 local 的 key 逐字节相同——那时候 domainHintLine/glossaryBlock
+    //   为空时算出来的也是同一个常量输入 '\u0001'）。
+    // - 非 local 分支只在卡片或命中术语至少有一项非空时才带上这段指纹；两者都空时维持
+    //   P197 之前"非 local 完全不带 ctxFp"的形状，不引入任何新字节。
+    let ctxFp = '';
+    if (provider === 'local') {
+        ctxFp = '|' + ovlVisualTransCacheContextFingerprint(text, config);
+    } else {
+        const card = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+        const matched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(text, { cap: 30 }) : [];
+        if (card || matched.length) ctxFp = '|' + ovlVisualTransCacheContextFingerprint(text, config);
+    }
     return ovlVisualHashSrc(text) + '|zh|' + provider + '|' + model + '|v' + OVL_VISUAL_TRANS_PROMPT_VERSION + ctxFp;
 }
 // key 是不是当前版本格式——用来识别 P197 之前（完全没有 '|v<N>' 这一段）或更早版本号的
@@ -38152,8 +38556,14 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
             // 改成标准的 system（角色+规则+领域提示+术语表）/user（只放原文本身）两段式，
             // 不改变任何占位符规则的文字或触发条件（上面 rules 数组原样复用），只是搬家
             // 到 system 里，外加一条新规则（引用占位符位置）和两段新的上下文注入。
-            const glossaryBlock = ovlGlossaryBuildPromptBlock();
-            const domainHintLine = ovlDomainHintPromptLine();
+            // v2 Pass P202a（T0 review 绑定决定 2/3）：论文卡片取代 \title{} 自动领域提示——
+            // 卡片存在时不再追加 domainHintLine（"supersede"）；卡片放在 system 内容最前面，
+            // 命中术语块放在最后。两者都空时 sys 逐字节等于 P202a 之前（domainHintLine 的
+            // 求值/拼接方式不变，只是把 glossaryBlock 换成按段命中的 termsBlock）。
+            const card = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+            const domainHintLine = (!card && typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
+            const matchedTerms = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(src, { cap: 30 }) : [];
+            const termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(matchedTerms) : '';
             const sysRules = rules.slice();
             // v2 Pass P200（回归修复，诊断见 .claude/tmp/p200_*）：\textcolor{..}{..}、\emph{..}、
             // \textbf{..} 这类"透明"格式化命令从未被 xportMask/xportProtectedSpan 遮罩——
@@ -38194,19 +38604,30 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
                 sysRules.push('引用占位符（' + citeTokenNames.join('、') + '）必须放在它所属分句的末尾、紧挨着那个分句的中文标点（逗号/句号/分号等）之前，'
                     + '不要把它移到分句中间或另起位置，也不要在它和标点之间插入其它文字。');
             }
-            const sys = '你是学术论文翻译助手。接下来的用户消息只包含一段待翻译的 LaTeX 片段本身，不包含任何其它内容——'
+            let sys = '你是学术论文翻译助手。接下来的用户消息只包含一段待翻译的 LaTeX 片段本身，不包含任何其它内容——'
                 + '请把它翻译成简体中文学术书面语，直接给出译文，不要复述或添加任何前后缀。硬性规则：\n'
                 + sysRules.map(function (r, idx) { return (idx + 1) + ') ' + r; }).join('\n') + '\n\n'
                 + correctionBlock
                 + (domainHintLine ? (domainHintLine + '\n\n') : '')
-                + glossaryBlock;
+                + termsBlock;
+            if (card) sys = card + '\n\n' + sys;
             raw = await callModelPlainText(masked.text, config, signal, callMeta, callOpts, sys);
         } else {
             const prompt = '你是学术论文翻译助手，把下面的 LaTeX 片段翻译成简体中文学术书面语。硬性规则：\n'
                 + rules.map(function (r, idx) { return (idx + 1) + ') ' + r; }).join('\n') + '\n\n'
                 + correctionBlock
                 + '原文：\n' + masked.text;
-            raw = await callModelPlainText(prompt, config, signal, callMeta, callOpts);
+            // v2 Pass P202a（T0 review 绑定决定 3）：非 local provider 只有在卡片/命中术语
+            // 至少有一项非空时才升级成 system+user 两段式；都为空时保持 P202a 之前的单条
+            // user 消息形状，逐字节不变（callModelPlainText 在 systemPrompt 为空/非字符串时
+            // 走的还是老的 messages 形状，见该函数上方注释）。
+            const nlCard = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+            const nlMatched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(src, { cap: 30 }) : [];
+            const nlTermsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(nlMatched) : '';
+            const preamble = (nlCard ? nlCard + '\n\n' : '') + nlTermsBlock;
+            raw = preamble
+                ? await callModelPlainText(prompt, config, signal, callMeta, callOpts, preamble)
+                : await callModelPlainText(prompt, config, signal, callMeta, callOpts);
         }
         if (meta && callMeta) { meta.finish = callMeta.finish; meta.truncated = callMeta.truncated; }
         // v2 Pass P122（诊断 A10 缺口根治）：块内没有任何占位符时（masked.map/codeMasked.map
@@ -64208,7 +64629,11 @@ async function ovlVisTransRequest(text, selRows, promptKind) {
 
     // 缓存键加前缀：tex/vis 两路各算各的，不会互相命中对方的缓存（纯内存 LRU 50，
     // 没有持久化，不存在迁移问题）。
-    const key = (promptKind === 'tex' ? 'tex ' : 'vis ') + text;
+    const p202aCard = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+    const p202aMatched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(text, { cap: 30 }) : [];
+    const p202aCtxFp = (typeof ovlVisualHashSrc === 'function')
+        ? ovlVisualHashSrc(p202aCard + '\u0001' + JSON.stringify(p202aMatched)) : '';
+    const key = (promptKind === 'tex' ? 'tex ' : 'vis ') + text + '|' + p202aCtxFp;
 
     const cached = ovlVisTransCacheGet(key);
     if (cached !== undefined) {
@@ -64231,25 +64656,24 @@ async function ovlVisTransRequest(text, selRows, promptKind) {
     try {
         const base = getApiConfig();
         const cfg = ovlVisTransConfig(base);
-        // v2 Pass P197（A/B）：领域提示 + 项目术语表，只在 provider==='local' 时拼进 prompt——
-        // 跟 Path1（ovlVisualTranslateBlockText）同一条纪律，Claude/OpenAI/Gemini 收到的
-        // prompt 逐字节不变（localExtra 求值成空串，下面的 '\n\n' + localExtra + text 等价于
-        // 原来的 '\n\n' + text）。
-        const localExtra = (cfg && cfg.provider === 'local') ? (function () {
-            const domainHintLine = ovlDomainHintPromptLine();
-            const glossaryBlock = ovlGlossaryBuildPromptBlock();
-            let s = '';
-            if (domainHintLine) s += domainHintLine + '\n\n';
-            if (glossaryBlock) s += glossaryBlock;
-            return s;
-        })() : '';
+        // v2 Pass P197（A/B）→ P202a（T0 review 绑定决定 3）：\title{} 领域提示仍然只在
+        // provider==='local' 时拼进 prompt（跟 Path1 同一条纪律）；卡片 + 命中术语现在对
+        // 所有 provider 生效（复用函数顶部已经为缓存键算过的 p202aCard/p202aMatched，不重算）。
+        // 卡片放在整条 prompt 最前面，领域提示/命中术语块仍然紧挨在 text 之前（跟 P197 时
+        // localExtra 的位置一致）。两者都空时 prompt 逐字节等于 P202a 之前。
+        const domainHintLine = (cfg && cfg.provider === 'local' && typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
+        const termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(p202aMatched) : '';
+        let contextExtra = '';
+        if (domainHintLine) contextExtra += domainHintLine + '\n\n';
+        contextExtra += termsBlock;
+        const cardPrefix = p202aCard ? (p202aCard + '\n\n') : '';
         // else 那一支必须与原来逐字节相同——Visual 路径不许变。
-        const prompt = (promptKind === 'tex')
+        const prompt = cardPrefix + ((promptKind === 'tex')
             ? '把下面这段 LaTeX 源码里的正文翻译成中文。只输出译文本身，不要解释，不要重复原文。'
               + '所有 LaTeX 命令、环境、数学公式（\\cite{}、\\ref{}、$...$、\\begin{}…\\end{} 等）'
-              + '一律原样保留，不要翻译也不要改写；以 % 开头的注释行原样保留。\n\n' + localExtra + text
+              + '一律原样保留，不要翻译也不要改写；以 % 开头的注释行原样保留。\n\n' + contextExtra + text
             : '把下面这段学术英文翻译成中文。只输出译文本身，不要解释，不要重复原文。'
-              + '保留其中的 LaTeX 数学公式（$...$）原样不译。\n\n' + localExtra + text;
+              + '保留其中的 LaTeX 数学公式（$...$）原样不译。\n\n' + contextExtra + text);
         const out = await callModelPlainText(prompt, cfg, ctl ? ctl.signal : null);
         if (mySeq !== OvlVisTransSeq) return; // 选区早就换了/框已经关了，陈旧响应一个字节都不写
         const result = (typeof out === 'string' && out.trim()) ? out.trim() : '（模型未返回可用译文）';
