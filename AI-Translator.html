@@ -5001,8 +5001,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.39.03';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-23';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.40.00';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-09-24';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -9443,9 +9443,16 @@ function parseCrossFragments(raw) {
 //   · gemini：callGeminiAPI 的第 6 个形参是 meta 出参，转发；但它的函数体（改动禁区）
 //     从未读过任何 max tokens 字段，maxTokens 转了也没有落点——L4 对 gemini 能拿到截断
 //     信号、但拿不到"调高预算重跑"的把手，同样是架构性限制，如实记录，不强行塞进去。
-async function callModelPlainText(prompt, config, signal, meta, opts) {
+// v2 Pass P197：新增可选第 6 参 systemPrompt——只有 config.provider==='local' 时才会被
+// 用来拼出 system+user 两条消息；省略（undefined）时跟 P197 之前逐字节相同（单条 user
+// 消息）。qwen/openai/claude/gemini 四个分支完全不读这个参数，字节不变，callClaudeAPI
+// 调用点这一行也没有改动。
+async function callModelPlainText(prompt, config, signal, meta, opts, systemPrompt) {
     if (config.provider === 'local') {
-        return await callLocalLLM(config.localBaseUrl, config.model, [{ role: 'user', content: prompt }], false, signal, meta || null, opts || null);
+        const localMessages = (typeof systemPrompt === 'string' && systemPrompt)
+            ? [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }]
+            : [{ role: 'user', content: prompt }];
+        return await callLocalLLM(config.localBaseUrl, config.model, localMessages, false, signal, meta || null, opts || null);
     }
     // v2 Pass P134：Qwen(DashScope) 复用 callLocalLLM 传输层，只是换 baseUrl 并带上 apiKey。
     if (config.provider === 'qwen') {
@@ -12221,7 +12228,7 @@ function xportSystemPrompt(srcName, tgtName, provider) {
     // 唯一真正起作用的参数是 reasoning_effort。留着它除了白花 3–4 个提示词 token，
     // 更糟的是让人以为有一层根本不存在的保护 —— 这个文件里的**虚假安全感本身就是缺陷**。
     // 真正的办法是察觉推理开着并告诉用户，见 xportNoteThinking / xportThinkingBanner。
-    return `You are a professional academic translator. Translate ${srcName} into ${tgtName}.
+    const base = `You are a professional academic translator. Translate ${srcName} into ${tgtName}.
 
 The user message contains numbered segments. Each segment starts with a line @@n@@.
 Tokens like [[1]] and [[2]] are protected placeholders standing for formulas,
@@ -12235,6 +12242,17 @@ Rules:
    Never delete, translate, renumber, zero-pad or duplicate a placeholder.
 4. Copy any remaining LaTeX command verbatim.
 5. Do not merge, split, reorder or skip segments. No commentary, no code fences.`;
+    // v2 Pass P197（A/B）：领域提示 + 项目术语表，只在 provider==='local' 时追加——`provider`
+    // 这个入参以前只在上面已删除的 /no_think 实验里被读过（见本函数最上方大注释），其它
+    // 分支（qwen/openai/claude/gemini）传进来的 provider !== 'local'，原样返回 base，逐
+    // 字节跟 P197 之前相同；只有本地模型这一支的 system prompt 会变长。
+    if (provider !== 'local') return base;
+    const domainHintLine = ovlDomainHintPromptLine();
+    const glossaryBlock = ovlGlossaryBuildPromptBlock();
+    let extra = '';
+    if (domainHintLine) extra += '\n\n' + domainHintLine;
+    if (glossaryBlock) extra += '\n\n' + glossaryBlock;
+    return base + extra;
 }
 
 // LM Studio 报的**加载期**上下文（不是配置上限）。拿不到就返回 0，调用方回落默认值。
@@ -26467,6 +26485,115 @@ function ovlGlossaryBuildPromptBlock() {
     } catch (e) { return ''; }
 }
 
+// ============================================================================
+// v2 Pass P197（A）：项目领域提示——三条翻译路径共同的结构性空白是"完全没有领域上下文
+// 注入机制"（.claude/tmp/p197_translate_quality_recon.md §4），导致"operator"这类多义词
+// 三条路径无一例外统一译成数学"算子"，即使这篇论文明显是电信/卫星网络领域、应该译成
+// "运营商"。这里补一条最小的领域提示：默认从当前项目 main.tex 的 \title{...} 自动提取，
+// 用户可以在设置面板手动覆盖（覆盖值按项目持久化，留空退回自动提取）。
+//
+// 范围收窄（任务书原话"local provider = LM Studio only；Claude 和 Gemini 的请求体必须跟
+// base 逐字节相同"）：本节这些函数只是纯计算/存取，本身不发任何请求，不区分 provider；
+// 真正的"只在 provider==='local' 时才拼进 prompt"这条纪律，落在三个调用点各自的判断上
+// （ovlVisualTranslateBlockText / ovlVisTransRequest / xportRequest），不是这里。
+// ============================================================================
+// 持久化范式跟 P103 项目术语表（ovlGlossaryMapLoad 上方注释）、P66 Overleaf 地址一致：
+// 单个 JSON 映射表，key 是 ovlNormalizeProjectPath 规范化的项目绝对路径，本地/远程分两个
+// localStorage key，避免同一份浏览器缓存里本地桥和远程桥的项目路径撞在一起串桶。
+function ovlDomainHintLsKey() { return ovlIsRemoteBridge() ? 'ovl.projectDomainHintByPathRemote' : 'ovl.projectDomainHintByPath'; }
+function ovlDomainHintMapLoad() {
+    try {
+        const raw = localStorage.getItem(ovlDomainHintLsKey());
+        if (!raw) return {};
+        const obj = JSON.parse(raw);
+        return (obj && typeof obj === 'object' && !Array.isArray(obj)) ? obj : {};
+    } catch (e) { return {}; }
+}
+function ovlDomainHintMapSave(map) { try { localStorage.setItem(ovlDomainHintLsKey(), JSON.stringify(map)); } catch (e) {} }
+function ovlDomainHintProjectKey() { try { return ovlNormalizeProjectPath(chatAgentProjectDir()); } catch (e) { return ''; } }
+const OVL_DOMAIN_HINT_MAX_CHARS = 200;
+function ovlDomainHintGetOverride(projectKeyOverride) {
+    try {
+        const key = (typeof projectKeyOverride === 'string' && projectKeyOverride) ? projectKeyOverride : ovlDomainHintProjectKey();
+        if (!key) return '';
+        const map = ovlDomainHintMapLoad();
+        const v = map[key];
+        return (typeof v === 'string') ? v : '';
+    } catch (e) { return ''; }
+}
+// 返回 false 只在拿不到项目 key 时发生（没打开项目）——跟 ovlGlossarySet 同一条纪律。
+// 传空字符串/纯空白 = 清掉覆盖值（回落到自动提取），不是"把覆盖值设成空字符串"这种半态。
+function ovlDomainHintSetOverride(projectKey, text) {
+    try {
+        const key = projectKey || ovlDomainHintProjectKey();
+        if (!key) return false;
+        const map = ovlDomainHintMapLoad();
+        const trimmed = String(text == null ? '' : text).trim().slice(0, OVL_DOMAIN_HINT_MAX_CHARS);
+        if (trimmed) map[key] = trimmed; else delete map[key];
+        ovlDomainHintMapSave(map);
+        return true;
+    } catch (e) { return false; }
+}
+// 独立的括号配平扫描器——只用于从整篇源码里摘出 \title{...} 的参数，允许嵌套花括号
+// （\title{A \textbf{Study} of X} 这类），跟 xportMask/LatexFilter 内部那一套是两回事
+// （那两个是改动禁区），配平失败/找不到就返回空串，调用方一律有兜底，不会抛异常。
+function ovlDomainHintExtractTitleArg(fullText) {
+    try {
+        const s = String(fullText == null ? '' : fullText);
+        const m = /\\title\s*(?:\[[^\]]*\])?\{/.exec(s);
+        if (!m) return '';
+        let i = m.index + m[0].length;
+        let depth = 1;
+        const start = i;
+        while (i < s.length && depth > 0) {
+            const c = s[i];
+            if (c === '\\') { i += 2; continue; } // 跳过转义字符，不误判 \{ \} 这类
+            if (c === '{') depth++;
+            else if (c === '}') depth--;
+            i++;
+        }
+        if (depth !== 0) return ''; // 配平失败，不猜
+        return s.slice(start, i - 1);
+    } catch (e) { return ''; }
+}
+// 摘出的 \title{} 参数还是带 LaTeX 命令的源码（可能嵌 \textbf{}/\% 之类）——复用既有的
+// P106 搜索用剥离器（ovlP106StripMathAndCommands，约 57182 行）转成纯文本：命令名本身去掉，
+// 花括号内的文字保留（\textbf{Study} -> " Study "），数学公式整体去掉，这正是"论文标题"这个
+// 场景需要的粒度，没有必要为这一处单独再写一遍剥离逻辑。
+function ovlDomainHintAutoTitle(fullText) {
+    try {
+        const arg = ovlDomainHintExtractTitleArg(fullText);
+        if (!arg) return '';
+        let plain = (typeof ovlP106StripMathAndCommands === 'function') ? ovlP106StripMathAndCommands(arg) : arg;
+        plain = String(plain).replace(/\s+/g, ' ').trim();
+        if (plain.length > OVL_DOMAIN_HINT_MAX_CHARS) plain = plain.slice(0, OVL_DOMAIN_HINT_MAX_CHARS).trim();
+        return plain;
+    } catch (e) { return ''; }
+}
+function ovlDomainHintAutoFromCodeArea() {
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        return ta ? ovlDomainHintAutoTitle(ta.value) : '';
+    } catch (e) { return ''; }
+}
+// 有效值：用户手动覆盖优先，留空退回自动提取——跟任务书"empty override falls back to the
+// auto value"逐字对应。
+function ovlDomainHintEffective() {
+    try {
+        const override = ovlDomainHintGetOverride();
+        return override || ovlDomainHintAutoFromCodeArea();
+    } catch (e) { return ''; }
+}
+// 注入进 prompt 的那一行——拿不到任何领域提示时返回空串，调用点按需拼装（跟占位符规则
+// 按需拼装是同一条纪律：没有领域提示就不出现这一行，不喂模型一句空话）。
+function ovlDomainHintPromptLine() {
+    try {
+        const hint = ovlDomainHintEffective();
+        if (!hint) return '';
+        return 'Context: this text is from a research paper titled "' + hint + '". Use the standard terminology of that field.';
+    } catch (e) { return ''; }
+}
+
 function chatAgentGlossaryReadiness() {
     if (!chatAgentProjectDir()) return { ready: false, reason: 'no-projectdir' };
     return { ready: true, reason: '' };
@@ -32256,6 +32383,12 @@ function ovlPortalHtml() {
         // 那条"点任何 data-qa 都无条件 ovlHideQuickActions()"的委托匹配范围，点了不关弹窗，
         // 见 ovlBindQaVisualState（约 36940 行一带，跟着 ovlBindVisualPane 放在一起）。
         +   '<div class="ovl-qa-state" id="ovlQaVisualState" hidden></div>'
+        // v2 Pass P197（E）：兄弟元素——独立于上面 #ovlQaVisualState，只在块"干净、已成功
+        // 翻译、没有任何其它特殊状态"时出现，提供一个"重新翻译"入口（默认 hidden，由
+        // ovlQaRenderRetranslate 填内容/摘 hidden，见 ovlBindQaRetranslate，跟
+        // ovlBindQaVisualState 放在一起）。同样走独立的 data-qar 属性，不落进
+        // qa.addEventListener('click', ...) 那条无条件关弹窗的委托匹配范围。
+        +   '<div class="ovl-qa-state" id="ovlQaRetranslate" hidden></div>'
         + '</div>'
         // M7 Editor「Equation preview」：光标落在 $...$ 里时用既有 KaTeX 渲染一个悬浮预览。
         + '<div class="ovl-eqpreview" id="ovlEqPreview"></div>'
@@ -36128,6 +36261,14 @@ function ovlXrefTransformProse(content, ctx, placeholders) {
             const m = OVL_XREF_CITE_CMD_RE.exec(text);
             if (!m) { out += text.slice(i); i = text.length; break; }
             out += text.slice(i, m.index);
+            // v2 Pass P197（F）：LaTeX 里 `~\cite{...}` 的 `~` 是"不换行空格"习惯写法，不是
+            // 字面波浪号——上面这行把 `~` 原样带进 out，之后 renderFormattedText 的
+            // 波浪号保护（把 `~` 换成私用区码点绕开 markdown 删除线语法、渲染后再换回来）
+            // 会原样吐出这个字面 `~` 字形，用户看到引用前多一个游离的 ~。这里统一把
+            // 紧邻在被替换的引用命令前面的那个字面 `~` 吞掉、换成普通空格——纯展示层
+            // 收尾，不影响 xportMask/占位符/写回 .tex 的任何逻辑（本函数只服务
+            // renderFormattedText 这一条纯展示渲染路径，见函数上方调用点）。
+            if (out.slice(-1) === '~') out = out.slice(0, -1) + ' ';
             let p = m.index + m[0].length;
             for (let b = 0; b < 2; b++) {
                 let q = p;
@@ -36167,6 +36308,9 @@ function ovlXrefTransformProse(content, ctx, placeholders) {
             const m = OVL_XREF_REF_CMD_RE.exec(text);
             if (!m) { out += text.slice(i); i = text.length; break; }
             out += text.slice(i, m.index);
+            // v2 Pass P197（F）：同上（cite 家族那一遍的注释）——`~\ref{...}` 同样是不换行
+            // 空格习惯写法，吞掉紧邻的字面 `~`，换成普通空格。
+            if (out.slice(-1) === '~') out = out.slice(0, -1) + ' ';
             const openIdx = m.index + m[0].length - 1;
             const closeIdx = ovlFindMatchingBrace(text, openIdx);
             if (closeIdx === -1) { out += text.slice(m.index); i = text.length; break; } // 花括号不配平：整段放过
@@ -36862,10 +37006,71 @@ function ovlVisualTransCacheLegacyLoad() {
     } catch (e) { return {}; }
 }
 
+// v2 Pass P197（D）：prompt 版本号——Path1（ovlVisualTranslateBlockText）的 system/user
+// 拆分、占位符规则文字、领域提示/术语表注入方式，任何一处改了都必须手动把这个常量 +1，
+// 逼所有旧缓存条目在下次读取时天然 key 不匹配、自动当成未命中——不需要另外维护一张
+// "这次改动应该让哪些条目失效"的清单，版本号进 key 本身是最不容易漏改的做法。
+const OVL_VISUAL_TRANS_PROMPT_VERSION = 2;
+// 领域提示 + 项目术语表的指纹——两者任一变化都应该让同一段源文重新翻译一次（比如刚给
+// 术语表加了一条新词条，此后应该用新术语表重翻，不能继续吐旧缓存）。复用跟源文一样的
+// 轻量哈希，不追求密码学强度，只要"内容变了指纹大概率跟着变"就够。
+function ovlVisualTransCacheContextFingerprint() {
+    try {
+        const domainHintLine = (typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
+        const glossaryBlock = (typeof ovlGlossaryBuildPromptBlock === 'function') ? ovlGlossaryBuildPromptBlock() : '';
+        return ovlVisualHashSrc(domainHintLine + '\u0001' + glossaryBlock);
+    } catch (e) { return '0'; }
+}
 function ovlVisualTransCacheKey(text, config) {
     const provider = (config && config.provider) ? String(config.provider) : '';
     const model = (config && config.model) ? String(config.model) : '';
-    return ovlVisualHashSrc(text) + '|zh|' + provider + '|' + model;
+    // v2 Pass P197（D）：只有 local provider 才会真的把领域提示/术语表拼进 prompt（见
+    // ovlVisualTranslateBlockText 里的 isLocalProvider 分支），非 local 的 key 不需要带这个
+    // 指纹——带了也不算错（指纹恒定时形同没加），但没必要让 Claude/OpenAI/Gemini 的缓存
+    // key 无谓变长、或者在术语表变化时对根本用不到术语表的这些 provider 也触发重翻。
+    const ctxFp = (provider === 'local') ? ('|' + ovlVisualTransCacheContextFingerprint()) : '';
+    return ovlVisualHashSrc(text) + '|zh|' + provider + '|' + model + '|v' + OVL_VISUAL_TRANS_PROMPT_VERSION + ctxFp;
+}
+// key 是不是当前版本格式——用来识别 P197 之前（完全没有 '|v<N>' 这一段）或更早版本号的
+// 陈旧条目。用边界检查（后面紧跟字符串结尾或下一个 '|'）而不是单纯 indexOf，避免版本号
+// 1 误命中版本号 10 这类子串前缀问题。
+function ovlVisualTransCacheIsCurrentVersionKey(key) {
+    try {
+        const marker = '|v' + OVL_VISUAL_TRANS_PROMPT_VERSION;
+        const s = String(key);
+        const i = s.indexOf(marker);
+        if (i === -1) return false;
+        const after = s.charAt(i + marker.length);
+        return after === '' || after === '|';
+    } catch (e) { return false; }
+}
+let OvlVisualTransCachePurgedOnce = false;
+// v2 Pass P197（D）：一次性清理陈旧条目——旧 key 格式/旧版本号的条目不会再被上面新算法
+// 生成的 key 命中，永远白占位置。只在真的发现脏数据时才回写（没有脏数据的项目桶/索引
+// 一次 setItem 都不做，保持"没有变化就不碰 localStorage"的最小写入原则）。只读写
+// ovlVisualTransCacheBucketKey(...)（即 OVL_VISUAL_TRANS_CACHE_V2_PREFIX 开头的项目桶）和
+// OVL_VISUAL_TRANS_CACHE_INDEX_KEY 这两类 key，不触碰其它任何 localStorage 条目——旧版 v1
+// 全局缓存（OVL_VISUAL_TRANS_CACHE_KEY）本来就是只读兜底，不在这次清理范围内。用模块级
+// 标志保证一次页面加载内只真正扫描一次（后续每次 GetMeta 调用直接短路返回）。
+function ovlVisualTransCachePurgeStaleOnce() {
+    if (OvlVisualTransCachePurgedOnce) return;
+    OvlVisualTransCachePurgedOnce = true;
+    try {
+        const idx = ovlVisualTransCacheIndexLoad();
+        const ids = Object.keys(idx);
+        for (let i = 0; i < ids.length; i++) {
+            const projectId = ids[i];
+            const map = ovlVisualTransCacheBucketLoad(projectId);
+            const keys = Object.keys(map);
+            let changed = false;
+            for (let j = 0; j < keys.length; j++) {
+                if (!ovlVisualTransCacheIsCurrentVersionKey(keys[j])) { delete map[keys[j]]; changed = true; }
+            }
+            if (changed) {
+                if (ovlVisualTransCacheSaveBucket(projectId, map)) ovlVisualTransCacheIndexTouch(projectId);
+            }
+        }
+    } catch (e) {}
 }
 // 命中返回译文字符串，未命中返回 null。命中会顺手把 ts 刷新成"最近使用"，配合淘汰策略。
 // 只有 ts 距上次刷新超过 60s 才真的重写 localStorage（避免同一屏内反复渲染同一块时，每次
@@ -36922,6 +37127,9 @@ function ovlVisualTransCacheGateCheck(text, hit, map, key, projectId) {
     return null;
 }
 function ovlVisualTransCacheGetMeta(text, config, projectIdOverride) {
+    // v2 Pass P197（D）：缓存第一次被真正读取时顺手做一次性清理——内部有模块级标志短路，
+    // 同一次页面加载只会真正扫描一遍，这里每次调用只是多一次函数调用开销。
+    ovlVisualTransCachePurgeStaleOnce();
     try {
         const projectId = projectIdOverride || ovlVisualTransCacheProjectId();
         const key = ovlVisualTransCacheKey(text, config);
@@ -37864,13 +38072,12 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
         afterCodeUnmask = ovlVisualCodeUnmask(textProseMasked.text, codeMasked.map);
         if (meta) meta.partialTextProse = true; // 供进度文案跟"纯跳过"区分开，见调用方
     } else {
-        // v2 Pass P103：项目术语表注入（用户批准清单第 6 项）。这个 prompt 是 callModelPlainText
-        // 四家 provider 共用的同一份字符串（callModelPlainText 内部按 config.provider 分发到
-        // callLocalLLM/callOpenAIAPI/callClaudeAPI/callGeminiAPI），任务书原话"若 Claude 翻译
-        // 路径的 prompt 在禁区内，则术语注入只作用于本地路径并如实记录"——这里主动收窄成只在
-        // config.provider==='local' 时才拼这一段：Claude/OpenAI/Gemini 收到的 prompt 字节跟
-        // P103 之前逐字节相同（不引入行为变化），且绝不触碰 callClaudeAPI 函数体本身。
-        const glossaryBlock = (config && config.provider === 'local') ? ovlGlossaryBuildPromptBlock() : '';
+        // v2 Pass P197（C）：local provider 走精简的 system+user 两段式（见下方分支），
+        // 其它 provider 完全保留 P103 之前那套单字符串 prompt，逐字节不变——所以术语表/
+        // 领域提示这两段注入都只出现在 isLocalProvider 分支内部，不再有一个"非 local 时
+        // 求值成空串"的共享变量拼进非 local 的 prompt（那样虽然字节结果相同，但改一次容易
+        // 改错两次；分支彻底拆开更不容易把新东西泄漏进 Claude/OpenAI/Gemini 的请求体）。
+        const isLocalProvider = !!(config && config.provider === 'local');
         // v2 Pass P122（C0b）：占位符规则按"实际存在的占位符"按需拼装——三层掩码表都是空的
         // 就一条占位符规则都不出现（现状最大的坑就是"没有占位符还教模型认占位符"，真实模型
         // 观测到会顺手把无关的裸方括号也"规范化"成占位符形状）。
@@ -37879,6 +38086,8 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
         // 第一条完全可能不出现（比如只有 OVLCITE 一条规则，真实模型 3/3 调用里就发生过，见
         // §4）。"同样"这时没有前指，读着突兀。改成只在前面真的已经拼过至少一条占位符规则时
         // 才用"同样"，否则去掉这个词，读作独立的祈使句，逻辑上不依赖前面是否存在别的规则。
+        // 这份 rules 数组本身两个分支共用、逐字节相同——只有 local 分支会在它的私有副本上
+        // 追加一条 P197 新规则（见下），不会动这个共享数组本身。
         const rules = [];
         let priorPlaceholderRule = false;
         if (masked.map.length > 0) {
@@ -37906,11 +38115,6 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
         // v2 Pass P122（C2/L2）：重试阶梯换 prompt 重问时追加的纠正段——禁止原样重问，同
         // prompt 同模型必然同输出。
         const correctionBlock = (opts && typeof opts.correction === 'string' && opts.correction) ? (opts.correction + '\n\n') : '';
-        const prompt = '你是学术论文翻译助手，把下面的 LaTeX 片段翻译成简体中文学术书面语。硬性规则：\n'
-            + rules.map(function (r, idx) { return (idx + 1) + ') ' + r; }).join('\n') + '\n\n'
-            + correctionBlock
-            + glossaryBlock
-            + '原文：\n' + masked.text;
         // v2 Pass P122：callModelPlainText 新增可选 meta/callOpts 出参/入参，只在
         // config.provider==='local' 时真正生效（callLocalLLM 早就支持，callClaudeAPI/
         // callOpenAIAPI/callGeminiAPI 的调用点一行不改）。meta.finish/meta.truncated 供
@@ -37918,7 +38122,54 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
         const callMeta = meta ? {} : null;
         const callOpts = (opts && (typeof opts.temperature === 'number' || typeof opts.maxTokens === 'number'))
             ? { temperature: opts.temperature, maxTokens: opts.maxTokens } : null;
-        const raw = await callModelPlainText(prompt, config, signal, callMeta, callOpts);
+        let raw;
+        if (isLocalProvider) {
+            // v2 Pass P197（A/B/C）：local-only 精简重排——诊断报告
+            // （.claude/tmp/p197_translate_quality_recon.md）指出旧的单字符串 prompt 把
+            // "你是谁/规则/原文"全揉在一条 user 消息里，本地这颗小模型对长 user 消息里
+            // 混杂的指令遵从度明显更差（跟 Path2/Path3 的表现差距是这份诊断的出发点）。
+            // 改成标准的 system（角色+规则+领域提示+术语表）/user（只放原文本身）两段式，
+            // 不改变任何占位符规则的文字或触发条件（上面 rules 数组原样复用），只是搬家
+            // 到 system 里，外加一条新规则（引用占位符位置）和两段新的上下文注入。
+            const glossaryBlock = ovlGlossaryBuildPromptBlock();
+            const domainHintLine = ovlDomainHintPromptLine();
+            const sysRules = rules.slice();
+            // v2 Pass P197（C 新规则，修正）：最初把这条新规则只挂在 citeMasked.map（OVLCITE，
+            // 只覆盖散文里已经写成字面 [N] 的引用）上——但用户报告的坏例子源文本是
+            // `~\cite{leyva2021,...}`，这种 \cite{} 命令走的是 xportMask 这条通用掩码
+            // （连同它前面的 ~ 一起被 xportProtectedSpan 吞成一个整体，见该函数第 11768-
+            // 11806 行，受保护、不可改），产出的是 masked.map 里的 [[数字]] 占位符，根本不会
+            // 进 citeMasked.map——按最初的写法这条规则对用户报告的这个场景永远不会出现。
+            // 现在改成：只要 masked.map 里有任意一项看起来像引用命令（用跟显示层
+            // ovlXrefTransformProse 同一份 \cite 家族判定 OVL_XREF_CITE_CMD_RE 的正则源码，
+            // 取一份无 g 标志的独立拷贝以避免共享 lastIndex 状态），就把 [[数字]] 也纳入
+            // 这条位置规则；citeMasked.map 非空时依旧覆盖 OVLCITE 分支，两者不互斥、可以
+            // 同时触发（一段文字里既有 \cite{} 又有裸 [N] 引用的情况）。
+            const citeCmdRe = new RegExp(OVL_XREF_CITE_CMD_RE.source);
+            const generalMaskHasCite = masked.map.some(function (spanText) {
+                try { return citeCmdRe.test(String(spanText)); } catch (e) { return false; }
+            });
+            if (citeMasked.map.length > 0 || generalMaskHasCite) {
+                const citeTokenNames = [];
+                if (generalMaskHasCite) citeTokenNames.push('[[数字]]（对应 \\cite 等引用命令）');
+                if (citeMasked.map.length > 0) citeTokenNames.push('〘〘OVLCITEk〙〙');
+                sysRules.push('引用占位符（' + citeTokenNames.join('、') + '）必须放在它所属分句的末尾、紧挨着那个分句的中文标点（逗号/句号/分号等）之前，'
+                    + '不要把它移到分句中间或另起位置，也不要在它和标点之间插入其它文字。');
+            }
+            const sys = '你是学术论文翻译助手。接下来的用户消息只包含一段待翻译的 LaTeX 片段本身，不包含任何其它内容——'
+                + '请把它翻译成简体中文学术书面语，直接给出译文，不要复述或添加任何前后缀。硬性规则：\n'
+                + sysRules.map(function (r, idx) { return (idx + 1) + ') ' + r; }).join('\n') + '\n\n'
+                + correctionBlock
+                + (domainHintLine ? (domainHintLine + '\n\n') : '')
+                + glossaryBlock;
+            raw = await callModelPlainText(masked.text, config, signal, callMeta, callOpts, sys);
+        } else {
+            const prompt = '你是学术论文翻译助手，把下面的 LaTeX 片段翻译成简体中文学术书面语。硬性规则：\n'
+                + rules.map(function (r, idx) { return (idx + 1) + ') ' + r; }).join('\n') + '\n\n'
+                + correctionBlock
+                + '原文：\n' + masked.text;
+            raw = await callModelPlainText(prompt, config, signal, callMeta, callOpts);
+        }
         if (meta && callMeta) { meta.finish = callMeta.finish; meta.truncated = callMeta.truncated; }
         // v2 Pass P122（诊断 A10 缺口根治）：块内没有任何占位符时（masked.map/codeMasked.map
         // 都是空表），被截断的半句中文以前能通过全部校验——xportBlockOk 的"total===map.length"
@@ -41220,6 +41471,72 @@ async function ovlVisualBlockRetryClick(el) {
     }
 }
 
+// v2 Pass P197（E）："重新翻译"——跟上面 ovlVisualBlockRetryClick 几乎同一套手法（mySeq/
+// fixedProjectId 锁存、AbortController 挂进 adhocControllers、复用同一条重试阶梯
+// ovlVisualTranslateBlockWithLadder、同一个 ovlVisualTransCachePut 落盘、同一个
+// ovlVisualApplyTranslatedHtml 写回 DOM——后者本来就是 compare 模式感知的，只替换
+// .ovl-compare-zh 镜像，双语对照镜像因此"免费"支持，不需要在这里再判断一次模式），
+// 差别只是触发对象不是"失败角标"而是"已经干净成功翻译、没有任何其它特殊状态的块"：
+// 走到这条路径时不存在旧的 failed/fail-reason/attempts/skipped/forced 属性要清
+// （ovlQaRetranslateStateCompute 保证了这一点），用独立的 data-ovl-trans-retranslating
+// 忙态属性——不复用 data-ovl-trans-retrying，避免两条本来互斥的路径共享同一个属性名、
+// 互相踩踏彼此的忙态判断/重入守卫。任务书原话"bypasses the cache and overwrites the
+// entry"：翻译前先删旧缓存条目，成功后无条件用新结果覆盖写入。
+async function ovlVisualBlockRetranslateClick(el) {
+    if (!el || el.getAttribute('data-ovl-trans-retranslating') === '1' || el.getAttribute('data-ovl-trans-retrying') === '1') return;
+    const srcLatex = (typeof ovlVisualBlockSrcText === 'function') ? ovlVisualBlockSrcText(el) : null;
+    if (srcLatex == null || !srcLatex.trim()) return;
+    let cfg = null;
+    try { cfg = getApiConfig(); } catch (e) { cfg = null; }
+    const mySeq = OvlVisualLangState.seq;
+    let fixedProjectId;
+    try { fixedProjectId = ovlVisualTransCacheProjectId(); } catch (e) { fixedProjectId = null; }
+    try { ovlVisualTransCacheDelete(srcLatex, cfg); } catch (e) {}
+    const controller = new AbortController();
+    OvlVisualLangState.adhocControllers.push(controller);
+    el.setAttribute('data-ovl-trans-retranslating', '1');
+    let meta = {};
+    try {
+        const tgt = await ovlVisualTranslateBlockWithLadder(srcLatex, cfg, controller.signal, meta, { userForced: true });
+        if (mySeq !== OvlVisualLangState.seq) return; // 陈旧响应（语言已切走/已取消），丢弃不落地
+        try { ovlVisualTransCachePut(srcLatex, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel); } catch (e) {}
+        if (document.body.contains(el)) {
+            if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta); else if (meta.partial) el.setAttribute('data-ovl-trans-partial', '1'); else el.removeAttribute('data-ovl-trans-partial');
+            if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta);
+            ovlVisualApplyTranslatedHtml(el, tgt);
+            if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; }
+            if (typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(el);
+            if (typeof ovlRenderVisualGutter === 'function' && OvlState.editorMode === 'visual') ovlRenderVisualGutter();
+        }
+        if (typeof showToast === 'function') showToast('重新翻译成功', 'success');
+    } catch (err) {
+        if (err && err.name === 'AbortError') return;
+        if (mySeq !== OvlVisualLangState.seq) return;
+        if (document.body.contains(el)) {
+            el.setAttribute('data-ovl-trans-failed', '1');
+            const reason = meta.failReason || ovlVisualTransFailReason(err, meta);
+            el.setAttribute('data-ovl-trans-fail-reason', reason);
+            const totalAttempts = meta.attempts || 1;
+            el.setAttribute('data-ovl-trans-attempts', String(totalAttempts));
+            if (typeof ovlVisualFailLogSet === 'function') {
+                ovlVisualFailLogSet(srcLatex, cfg, { reason: reason, attempts: totalAttempts, detail: (err && err.message) || String(err), echoCandidate: meta.echoCandidate, ladderLevel: meta.ladderLevel });
+            }
+            if (typeof ovlVisualEnsureRetryBadge === 'function') {
+                ovlVisualEnsureRetryBadge(el, { reason: reason, attempts: totalAttempts, detail: (err && err.message) || String(err), echoCandidate: meta.echoCandidate });
+            }
+            if (typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') {
+                ovlScheduleVisualGutterAfterImage();
+            }
+        }
+        if (typeof showToast === 'function') showToast('重新翻译失败：' + ((err && err.message) || String(err)), 'error');
+    } finally {
+        const idx = OvlVisualLangState.adhocControllers.indexOf(controller);
+        if (idx !== -1) OvlVisualLangState.adhocControllers.splice(idx, 1);
+        el.removeAttribute('data-ovl-trans-retranslating');
+        try { if (typeof ovlVisualLangProgressUpdate === 'function') ovlVisualLangProgressUpdate(); } catch (e) {}
+    }
+}
+
 // v2 Pass P128e（B3-1 阻断收口，任务书第 1 条"强制翻译"）：点击"无可译文本"角标——用户不
 // 认同分块阶段的判断（判据是启发式的 ovlVisualBlockNoProse，真的可能漏判需要翻译的内容），
 // 强制走一遍真正的翻译流程。跟 ovlVisualBlockRetryClick 是同一套手法（mySeq/fixedProjectId
@@ -41372,10 +41689,33 @@ function ovlQaVisualStateCompute(el) {
     return null;
 }
 
+// v2 Pass P197（E）："重新翻译"入口该不该出现、出现成什么样——完全独立于
+// ovlQaVisualStateCompute，不新增分支、一个字节不改它、更不碰它的 `return null` 契约
+// （test_p156_badge_in_popup.js「K1) 已正常译完、无特殊状态：状态区不显示」的硬断言、以及
+// ovlVisualGutterApplyMarksAll 头部注释"正常已译完的段落 state 为 null，不产生任何标记
+// 元素"都依赖这个契约保持不变）。三态：
+//   'busy' —— 这次点击触发的重译还没跑完（data-ovl-trans-retranslating）；
+//   'idle' —— 块当前"干净、已成功翻译、没有任何其它特殊状态"（ovlQaVisualStateCompute
+//             返回 null）——只有这时才提供"重新翻译"入口；
+//   null   —— 让路：块有其它特殊状态（失败/待翻译/无可译文本/…），那些状态已经各自有
+//             自己的按钮（#ovlQaVisualState），这里不重复出现，避免同一个弹窗里同时出现
+//             两组互相矛盾的按钮。
+function ovlQaRetranslateStateCompute(el) {
+    if (!el || !document.body.contains(el)) return null;
+    if (el.getAttribute('data-ovl-trans-retranslating') === '1') return 'busy';
+    if (ovlQaVisualStateCompute(el) !== null) return null;
+    return 'idle';
+}
+
 // 把 ovlQaVisualStateCompute 算出的状态渲染进 #ovlQaVisualState。每次调用都现读 DOM 真值，
 // 不缓存——ovlShowQuickActionsAt 每次打开弹窗（含"关掉再打开同一行"）都会调一次，弹窗按钮
 // 点击完成后也会再调一次，天然保证显示的不是渲染时的死快照。
 function ovlQaRenderVisualState() {
+    // v2 Pass P197（E）：跟"重新翻译"盒子是两个独立的 DOM 元素、独立的可见性判断，但两者
+    // 描述的都是"这个块现在是什么状态"，理应一起刷新——本函数原有的全部 8 个调用点因此
+    // 不需要各自再补一行调用，这一行本身是这次新增唯一侵入 ovlQaRenderVisualState 函数体
+    // 的改动，函数原有逻辑和返回行为一个字节不变。
+    if (typeof ovlQaRenderRetranslate === 'function') ovlQaRenderRetranslate();
     const box = document.getElementById('ovlQaVisualState');
     if (!box) return;
     const el = OvlQaState.visualBlockEl;
@@ -41392,6 +41732,31 @@ function ovlQaRenderVisualState() {
             + escapeAttr(b.title || '') + '" data-tip-pos="top">' + escapeHtml(b.text) + '</button>';
     });
     box.innerHTML = html;
+}
+
+// v2 Pass P197（E）：渲染进独立的 #ovlQaRetranslate 盒子——跟 #ovlQaVisualState 是兄弟
+// 元素，不共享 DOM/隐藏状态，靠 ovlQaRetranslateStateCompute 自己的三态互斥逻辑保证不会
+// 跟另一个盒子同时显示矛盾的按钮组。P197（E）额外把"双语镜像（compare 模式）"也算作
+// eligible——ovlVisualApplyTranslatedHtml 本身已经是 compare 模式感知的（只替换
+// .ovl-compare-zh 镜像），data-ovl-trans-* 状态属性在 compare 模式下同样打在外层块上
+// （ovlVisualRenderBlockContentCompare 统一用中文侧 rcZh 的状态），所以这里只需要放宽
+// eligible 判据，不需要额外的模式分支。注意：没有放宽 ovlQaRenderVisualState 自己的
+// eligible（那属于既有功能，不在本次任务范围内，维持原样）。
+function ovlQaRenderRetranslate() {
+    const box = document.getElementById('ovlQaRetranslate');
+    if (!box) return;
+    const el = OvlQaState.visualBlockEl;
+    const eligible = (OvlQaState.source === 'visual'
+        && (OvlVisualLangState.lang === 'zh' || OvlVisualLangState.lang === 'compare') && !!el);
+    const state = eligible ? ovlQaRetranslateStateCompute(el) : null;
+    if (!state) { box.hidden = true; box.innerHTML = ''; return; }
+    box.hidden = false;
+    if (state === 'busy') {
+        box.innerHTML = '<span class="ovl-qa-state-label">重新翻译中…</span>';
+    } else {
+        box.innerHTML = '<button type="button" class="ovl-qa-state-btn" data-qar="retranslate" data-tip="'
+            + escapeAttr('丢弃这一块目前的缓存译文，重新调用模型翻译一次') + '" data-tip-pos="top">重新翻译</button>';
+    }
 }
 
 // 新按钮走独立的 data-qas（不是 data-qa）——ovlBindQuickActions 里 qa.addEventListener('click', ...)
@@ -41427,6 +41792,30 @@ function ovlBindQaVisualState() {
             // v2 Pass P159：跟其余四个分支同一种写法——逐字复用既有委托机制，没有新增事件监听器。
             ovlVisualBtrUndoClick(el);
             ovlQaRenderVisualState();
+        }
+    });
+}
+
+// v2 Pass P197（E）：独立事件委托，绑在兄弟元素 #ovlQaRetranslate 上，走独立的 data-qar
+// 属性（不是 data-qas）——跟上面 ovlBindQaVisualState 是两套互不干扰的委托，理由同 P150
+// 那条"新按钮走独立 data-qa* 前缀"的既有惯例（见 ovlBindQaVisualState 上方注释）。刷新
+// 用 ovlQaRenderVisualState（不是单独调 ovlQaRenderRetranslate）——它内部第一行已经会调
+// ovlQaRenderRetranslate，这样重译失败时 #ovlQaVisualState 那边也能同步刷出新的失败状态
+// 和"重试"按钮，不需要在这里重复两次调用。
+function ovlBindQaRetranslate() {
+    const box = document.getElementById('ovlQaRetranslate');
+    if (!box) return;
+    box.addEventListener('click', function (e) {
+        const btn = e.target.closest('[data-qar]');
+        if (!btn || btn.disabled) return;
+        e.stopPropagation();
+        const key = btn.getAttribute('data-qar');
+        const el = OvlQaState.visualBlockEl;
+        if (!el || !document.body.contains(el)) { ovlQaRenderVisualState(); return; }
+        if (key === 'retranslate' && typeof ovlVisualBlockRetranslateClick === 'function') {
+            const p = ovlVisualBlockRetranslateClick(el);
+            ovlQaRenderVisualState();
+            Promise.resolve(p).then(ovlQaRenderVisualState).catch(function () { ovlQaRenderVisualState(); });
         }
     });
 }
@@ -56114,6 +56503,21 @@ function ovlSettingsTranslatorHtml() {
         + (Array.isArray(AppState.localModels) ? AppState.localModels : []).map(function (lm) { return ovlOptTag(lm.id, lm.id, s.visualTransModel); }).join('')
         + '</select>',
         'Visual 或 Code 模式里选中文字后，用哪个模型翻译。留空就跟着翻译器上方选的模型走。');
+    // v2 Pass P197（A）：领域提示只影响本地模型（LM Studio）路径的 prompt 内容，不改变
+    // 任何 UI 控件的 data-setpath 通用绑定套路——因为这条不是全局设置，是按项目持久化的
+    // （跟项目术语表一样用单独的 localStorage 映射表），所以走专用的 onchange 处理函数，
+    // 不能用 ovlBindSettingsModal 的 data-setpath 委托（那条只认 OvlSettings 顶层字段）。
+    (function () {
+        const domainAuto = ovlDomainHintAutoFromCodeArea();
+        const domainOverride = ovlDomainHintGetOverride();
+        html += ovlSetRow('翻译领域提示',
+            '<input type="text" id="ovlDomainHintOverrideInput" maxlength="200" style="width:220px" '
+            + 'placeholder="' + escapeAttr(domainAuto || '（自动，从 title 提取；当前项目没找到）') + '" '
+            + 'value="' + escapeAttr(domainOverride) + '" '
+            + 'onchange="ovlDomainHintOverrideOnChange(this.value)">',
+            '给本地模型的一句话论文领域提示（例如 satellite networking），帮它选对多义词的专业译法（比如 operator 译成"运营商"而不是数学"算子"）。'
+            + '留空则自动从当前项目 title 提取；只在本地模型（LM Studio）翻译路径生效，不影响 Claude/Gemini 的请求内容。按项目路径持久化。');
+    })();
     html += ovlSetRow('Visual 模式按源码行断行', '<input type="checkbox" data-setpath="settings.ovlVisualLineBreaks"' + (s.ovlVisualLineBreaks ? ' checked' : '') + '>',
         '开启后 Visual 预览里每个源码行单独渲染一行（跟 Code 模式的行号对得上，方便切模式时对照）；关闭则退回按段落整段渲染。');
     html += ovlSetRow('Visual 模式用方框标示选区', '<input type="checkbox" data-setpath="settings.ovlVisualOutlineSelection"' + (s.ovlVisualOutlineSelection ? ' checked' : '') + '>',
@@ -56215,6 +56619,13 @@ function ovlApplyCustomAutoSave() {
 }
 function ovlSetHistoryLimitCustom(value) {
     setHistoryLimitCustom(value);
+    ovlRenderSettingsCategory('translator');
+}
+// v2 Pass P197（A）：领域提示覆盖值改动——不走 data-setpath 通用委托（见上方「翻译领域
+// 提示」行注释），改完立刻存盘；重渲一次是为了让 placeholder 里的自动提取值保持最新
+// （万一这次改动前用户刚切换了项目/改了 \title{}）。
+function ovlDomainHintOverrideOnChange(value) {
+    ovlDomainHintSetOverride(null, value);
     ovlRenderSettingsCategory('translator');
 }
 
@@ -61592,6 +62003,7 @@ function ovlBindQuickActions() {
     const visualPane = document.getElementById('ovlVisualPane');
     const qa = document.getElementById('ovlQuickActions');
     if (typeof ovlBindQaVisualState === 'function') ovlBindQaVisualState(); // v2 Pass P156
+    if (typeof ovlBindQaRetranslate === 'function') ovlBindQaRetranslate(); // v2 Pass P197（E）
 
     if (ta) {
         ta.addEventListener('mouseup', function (e) {
@@ -63503,13 +63915,25 @@ async function ovlVisTransRequest(text, selRows, promptKind) {
     try {
         const base = getApiConfig();
         const cfg = ovlVisTransConfig(base);
+        // v2 Pass P197（A/B）：领域提示 + 项目术语表，只在 provider==='local' 时拼进 prompt——
+        // 跟 Path1（ovlVisualTranslateBlockText）同一条纪律，Claude/OpenAI/Gemini 收到的
+        // prompt 逐字节不变（localExtra 求值成空串，下面的 '\n\n' + localExtra + text 等价于
+        // 原来的 '\n\n' + text）。
+        const localExtra = (cfg && cfg.provider === 'local') ? (function () {
+            const domainHintLine = ovlDomainHintPromptLine();
+            const glossaryBlock = ovlGlossaryBuildPromptBlock();
+            let s = '';
+            if (domainHintLine) s += domainHintLine + '\n\n';
+            if (glossaryBlock) s += glossaryBlock;
+            return s;
+        })() : '';
         // else 那一支必须与原来逐字节相同——Visual 路径不许变。
         const prompt = (promptKind === 'tex')
             ? '把下面这段 LaTeX 源码里的正文翻译成中文。只输出译文本身，不要解释，不要重复原文。'
               + '所有 LaTeX 命令、环境、数学公式（\\cite{}、\\ref{}、$...$、\\begin{}…\\end{} 等）'
-              + '一律原样保留，不要翻译也不要改写；以 % 开头的注释行原样保留。\n\n' + text
+              + '一律原样保留，不要翻译也不要改写；以 % 开头的注释行原样保留。\n\n' + localExtra + text
             : '把下面这段学术英文翻译成中文。只输出译文本身，不要解释，不要重复原文。'
-              + '保留其中的 LaTeX 数学公式（$...$）原样不译。\n\n' + text;
+              + '保留其中的 LaTeX 数学公式（$...$）原样不译。\n\n' + localExtra + text;
         const out = await callModelPlainText(prompt, cfg, ctl ? ctl.signal : null);
         if (mySeq !== OvlVisTransSeq) return; // 选区早就换了/框已经关了，陈旧响应一个字节都不写
         const result = (typeof out === 'string' && out.trim()) ? out.trim() : '（模型未返回可用译文）';
