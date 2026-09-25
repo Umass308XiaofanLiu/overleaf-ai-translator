@@ -5001,7 +5001,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.41.03';        // APP_VERSION_STAMP
+const APP_VERSION = '03.41.04';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-25';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -27238,11 +27238,57 @@ function ovlTermDbStripTexComments(text) {
         return out;
     }).join('\n');
 }
+// Schwartz-Hearst style long-form recovery for "<long form> (ACR)" spans. The prior
+// implementation used a single reluctant regex spanning up to 80 chars before the
+// parenthesis; when the nearest "(...)" before a real acronym wasn't itself an acronym
+// match (e.g. a citation "(2020)" or "(e.g. ...)"), the reluctant quantifier kept
+// expanding past it and could swallow an entire preceding clause/sentence as the
+// "long form". Fixed algorithm: locate each "(ACR)" independently, then look back at
+// most min(|ACR|+5, 2*|ACR|) words and pick the SHORTEST word suffix whose letters
+// cover the acronym's letters in order, with the first letter matching a word start.
+function ovlTermDbStripLatexCommandsForWords(s) {
+    return String(s || '').replace(/\\[a-zA-Z]+\*?/g, ' ').replace(/[{}$_^]/g, ' ');
+}
+function ovlTermDbWordsBeforeIdx(text, idx) {
+    const cleaned = ovlTermDbStripLatexCommandsForWords(text.slice(0, idx));
+    return cleaned.match(/[A-Za-z0-9][A-Za-z0-9\-]*/g) || []; // digits alone still count as a "word" (e.g. "version 6")
+}
+function ovlTermDbLongFormWordsMatch(acrLetters, words) {
+    if (!words.length) return false;
+    const firstWord = words[0];
+    if (!firstWord || firstWord[0].toLowerCase() !== acrLetters[0].toLowerCase()) return false;
+    const hay = words.join('').toLowerCase();
+    const needle = acrLetters.toLowerCase();
+    let pos = 0;
+    for (let i = 0; i < needle.length; i++) {
+        const found = hay.indexOf(needle[i], pos);
+        if (found === -1) return false;
+        pos = found + 1;
+    }
+    return true;
+}
+function ovlTermDbLongFormForAcr(acr, precedingText, idx) {
+    const acrLetters = String(acr || '').replace(/[^A-Za-z0-9]/g, '');
+    if (!acrLetters) return null;
+    const maxWords = Math.min(acrLetters.length + 5, acrLetters.length * 2);
+    const words = ovlTermDbWordsBeforeIdx(precedingText, idx);
+    const windowWords = words.slice(Math.max(0, words.length - maxWords));
+    for (let k = 1; k <= windowWords.length; k++) {
+        const cand = windowWords.slice(windowWords.length - k);
+        if (ovlTermDbLongFormWordsMatch(acrLetters, cand)) return cand.join(' ');
+    }
+    return null;
+}
 function ovlTermDbScanTexText(text, out) {
     const stripped = ovlTermDbStripTexComments(text);
     let m;
-    const reLongAcr = /([A-Za-z][A-Za-z0-9\- ]{2,80}?)\s*\(([A-Z][A-Za-z0-9]{1,15})\)/g;
-    while ((m = reLongAcr.exec(stripped))) out.push({ acr: m[2].trim(), long: m[1].trim() });
+    const reAcrParen = /\(([A-Z][A-Za-z0-9\-]{1,15})\)/g;
+    while ((m = reAcrParen.exec(stripped))) {
+        let acr = m[1];
+        if (/[A-Z0-9]s$/.test(acr) && acr.length > 2) acr = acr.slice(0, -1); // plural: (ISLs) -> ISL
+        const long = ovlTermDbLongFormForAcr(acr, stripped, m.index);
+        out.push({ acr: acr, long: long || '' });
+    }
     const reNew = /\\newacronym\{[^{}]*\}\{([^{}]+)\}\{([^{}]+)\}/g;
     while ((m = reNew.exec(stripped))) out.push({ acr: m[1].trim(), long: m[2].trim() });
     const reAcro = /\\acro\{([^{}]+)\}\{([^{}]+)\}/g;
@@ -27281,9 +27327,13 @@ async function ovlTermDbUiScan() {
     const seen = Object.create(null);
     const acrEntries = [], longEntries = [];
     state.out.forEach(function (hit) {
-        if (!hit.acr || !hit.long) return;
-        if (!seen['A:' + hit.acr]) { seen['A:' + hit.acr] = true; acrEntries.push({ en: hit.acr, kind: 'acronym', zh: '', note: hit.long }); }
-        if (!seen['L:' + hit.long]) { seen['L:' + hit.long] = true; longEntries.push({ en: hit.long, kind: 'term', zh: '' }); }
+        if (!hit.acr) return;
+        if (hit.long) {
+            if (!seen['A:' + hit.acr]) { seen['A:' + hit.acr] = true; acrEntries.push({ en: hit.acr, kind: 'acronym', zh: '', note: hit.long }); }
+            if (!seen['L:' + hit.long]) { seen['L:' + hit.long] = true; longEntries.push({ en: hit.long, kind: 'term', zh: '' }); }
+        } else if (!seen['A:' + hit.acr]) {
+            seen['A:' + hit.acr] = true; acrEntries.push({ en: hit.acr, kind: 'acronym', zh: '', note: '' });
+        }
     });
     const merged = acrEntries.concat(longEntries);
     if (!merged.length) { if (typeof showToast === 'function') showToast('没有在 .tex 里找到可识别的缩写定义', 'info'); return; }
@@ -27317,18 +27367,86 @@ function ovlTermDbParseJsonLenient(text) {
     try { const parsed = JSON.parse(s); return Array.isArray(parsed) ? parsed : null; }
     catch (e) { return null; }
 }
-function ovlTermDbAiCompletePrompt(entries, ctx) {
-    const emptyList = entries.filter(function (e) { return !e.zh || !String(e.zh).trim(); }).slice(0, 60);
-    const lines = emptyList.map(function (e) { return '- en:"' + e.en + '" kind:' + e.kind; });
+// ---- P204: batched AI 补全. The local qwen model, given one big "fill everything +
+// propose extras" prompt, answers the first few items correctly then runs away
+// inventing ~130 unrelated entries until it hits the output cap, truncating the JSON
+// mid-object; the whole response was silently discarded. Fix: fill zh in small batches
+// (<=25 requested entries/call, asking ONLY for those en values), a separate optional
+// "extra terms" call gated by presence in the actual .tex text (anti-hallucination),
+// and a salvage parser that recovers complete {en,zh} objects from truncated/garbled
+// output instead of discarding the whole batch. ----
+const OVL_AI_FILL_BATCH_SIZE = 25;
+const OVL_AI_EXTRAS_MAX = 15;
+const OVL_AI_FILL_TIMEOUT_MS = 45000;
+const OVL_AI_FILL_MAX_TOKENS = 1600;
+function ovlTermDbAiFillPrompt(batch, ctx) {
+    const lines = batch.map(function (e) { return '- en:"' + e.en + '" kind:' + e.kind; });
+    return 'You are filling in Chinese translations for an existing terminology list for an academic paper.\n'
+        + 'Paper title: ' + (ctx.title || '(none)') + '\n\n'
+        + 'Return the Chinese translation "zh" for EXACTLY these ' + batch.length + ' entries, and nothing else:\n'
+        + lines.join('\n') + '\n\n'
+        + 'Respond with STRICT JSON ONLY, an array of exactly these ' + batch.length + ' items, each '
+        + '{"en":"<must match one of the en values above exactly>","zh":"..."}. No prose, no markdown fence, no extra items.';
+}
+function ovlTermDbAiExtrasPrompt(ctx) {
     return 'You are helping build a bilingual (English-Chinese) terminology database for an academic paper.\n'
         + 'Paper title: ' + (ctx.title || '(none)') + '\n'
         + 'Abstract: ' + (ctx.abstract || '(none)') + '\n'
         + 'Introduction (may be truncated): ' + (ctx.intro || '(none)') + '\n\n'
-        + 'Existing entries needing a Chinese translation:\n' + (lines.length ? lines.join('\n') : '(none)') + '\n\n'
-        + 'Task: (1) fill "zh" for each of the entries above with its correct Chinese translation; '
-        + '(2) propose up to 40 ADDITIONAL field-specific terms/acronyms from the paper that a general '
-        + 'translator would likely get wrong, each with en/zh/kind.\n'
-        + 'Respond with STRICT JSON ONLY, an array: [{"en":"...","zh":"...","kind":"term"}, ...]. No prose, no markdown fence.';
+        + 'Task: propose up to ' + OVL_AI_EXTRAS_MAX + ' ADDITIONAL field-specific terms/acronyms (not already '
+        + 'covered) that a general translator would likely mistranslate, each with en/zh/kind ("term" or "acronym").\n'
+        + 'Respond with STRICT JSON ONLY, an array of at most ' + OVL_AI_EXTRAS_MAX + ' items: '
+        + '[{"en":"...","zh":"...","kind":"term"}]. No prose, no markdown fence.';
+}
+// Salvage parser: extract every complete, balanced {...} object with string en/zh from
+// a possibly truncated/garbled response. Tolerates code fences, leading prose, and a
+// dangling incomplete object at the end (simply not emitted).
+function ovlTermDbSalvageJsonObjects(text) {
+    let s = String(text || '');
+    const fence = /```(?:json)?\s*([\s\S]*?)```/.exec(s);
+    if (fence) s = fence[1];
+    const out = [];
+    let i = 0;
+    while (i < s.length) {
+        if (s[i] !== '{') { i++; continue; }
+        let depth = 0, j = i, inStr = false, esc = false, closed = false;
+        for (; j < s.length; j++) {
+            const c = s[j];
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c === '\\') esc = true;
+                else if (c === '"') inStr = false;
+                continue;
+            }
+            if (c === '"') { inStr = true; continue; }
+            if (c === '{') depth++;
+            else if (c === '}') { depth--; if (depth === 0) { j++; closed = true; break; } }
+        }
+        if (!closed) break; // truncated mid-object at the end: stop, drop the dangling tail
+        const chunk = s.slice(i, j);
+        try {
+            const obj = JSON.parse(chunk);
+            if (obj && typeof obj.en === 'string' && typeof obj.zh === 'string') out.push(obj);
+        } catch (e) {}
+        i = j;
+    }
+    return out;
+}
+function ovlTermDbAiParseItems(raw) {
+    let items = ovlTermDbParseJsonLenient(raw);
+    if (items) return items.filter(function (e) { return e && typeof e.en === 'string'; });
+    return ovlTermDbSalvageJsonObjects(raw);
+}
+async function ovlTermDbAiCallOnce(prompt, cfg) {
+    const controller = new AbortController();
+    const timer = setTimeout(function () { controller.abort(); }, OVL_AI_FILL_TIMEOUT_MS);
+    try {
+        const raw = await callModelPlainText(prompt, cfg, controller.signal, {}, { maxTokens: OVL_AI_FILL_MAX_TOKENS });
+        const items = ovlTermDbAiParseItems(raw);
+        return { items: items, error: items.length ? null : 'unparseable' };
+    } catch (e) {
+        return { items: [], error: (e && e.name === 'AbortError') ? 'timeout' : ((e && e.message) || String(e)) };
+    } finally { clearTimeout(timer); }
 }
 let OvlTermDbAiBusy = false;
 async function ovlTermDbUiAiComplete() {
@@ -27337,34 +27455,82 @@ async function ovlTermDbUiAiComplete() {
     try { cfg = getApiConfig(); } catch (e) {}
     if (!cfg || !cfg.provider) { if (typeof showToast === 'function') showToast('AI 补全失败：没有配置好的 provider', 'error'); return; }
     OvlTermDbAiBusy = true;
-    if (typeof showToast === 'function') showToast('AI 补全中…', 'info');
-    const controller = new AbortController();
-    const timer = setTimeout(function () { controller.abort(); }, 60000);
     try {
         const ctx = ovlTermDbExtractPaperContext();
         const entries = ovlTermDbUiCurrentList();
-        const prompt = ovlTermDbAiCompletePrompt(entries, ctx);
-        const raw = await callModelPlainText(prompt, cfg, controller.signal, {}, { maxTokens: 4096 });
-        const parsed = ovlTermDbParseJsonLenient(raw);
-        if (!parsed) { if (typeof showToast === 'function') showToast('AI 补全失败：返回内容不是合法 JSON', 'error'); return; }
-        const clean = parsed.filter(function (e) { return e && typeof e.en === 'string' && e.en.trim(); })
-            .slice(0, 100)
-            .map(function (e) {
-                return {
-                    en: e.en.trim(),
-                    zh: (typeof e.zh === 'string') ? e.zh.trim() : '',
-                    kind: (e.kind === 'acronym' || e.kind === 'keep') ? e.kind : 'term'
-                };
+        const targets = entries.filter(function (e) { return e.kind !== 'keep' && (!e.zh || !String(e.zh).trim()); });
+        const batches = [];
+        for (let i = 0; i < targets.length; i += OVL_AI_FILL_BATCH_SIZE) batches.push(targets.slice(i, i + OVL_AI_FILL_BATCH_SIZE));
+
+        let filled = 0, added = 0, dropped = 0, anyCallOk = false, lastError = null;
+
+        for (let b = 0; b < batches.length; b++) {
+            if (typeof showToast === 'function') showToast('AI 补全中…（' + (b + 1) + '/' + batches.length + '）', 'info');
+            const batch = batches[b];
+            const batchEnSet = Object.create(null);
+            batch.forEach(function (e) { batchEnSet[e.en] = true; });
+            const res = await ovlTermDbAiCallOnce(ovlTermDbAiFillPrompt(batch, ctx), cfg);
+            if (res.error) lastError = res.error;
+            if (!res.items.length) { dropped += batch.length; continue; }
+            anyCallOk = true;
+            const valid = [], returnedEn = Object.create(null);
+            res.items.forEach(function (it) {
+                if (!it || typeof it.en !== 'string' || !batchEnSet[it.en]) { dropped++; return; }
+                if (returnedEn[it.en]) { dropped++; return; } // duplicate for the same en
+                const zh = (typeof it.zh === 'string') ? it.zh.trim() : '';
+                if (!zh) { dropped++; return; }
+                returnedEn[it.en] = true;
+                const existing = batch.filter(function (e) { return e.en === it.en; })[0];
+                valid.push({ en: it.en, zh: zh, kind: existing ? existing.kind : 'term' });
             });
-        if (!clean.length) { if (typeof showToast === 'function') showToast('AI 补全失败：没有可用条目', 'error'); return; }
-        const changed = ovlTermDbMergeAuto(clean, 'llm');
-        clean.forEach(function (e) { ovlTermDbUiMarkTouched(e.en); });
+            batch.forEach(function (e) { if (!returnedEn[e.en]) dropped++; }); // requested but never came back
+            if (valid.length) {
+                filled += ovlTermDbMergeAuto(valid, 'llm');
+                valid.forEach(function (e) { ovlTermDbUiMarkTouched(e.en); });
+            }
+        }
+
+        // Separate, optional "extra terms" call. Anti-hallucination filter: accept an
+        // extra only if its en literally occurs in the project .tex text (case-sensitive
+        // for acronyms, case-insensitive for terms).
+        if (typeof showToast === 'function') showToast('AI 补全中…（补充术语）', 'info');
+        const texRaw = (function () { const ta = document.getElementById('ovlCodeArea'); return ta ? (ta.value || '') : ''; })();
+        const texLower = texRaw.toLowerCase();
+        const existingEnLower = Object.create(null);
+        entries.forEach(function (e) { existingEnLower[String(e.en).toLowerCase()] = true; });
+        const extrasRes = await ovlTermDbAiCallOnce(ovlTermDbAiExtrasPrompt(ctx), cfg);
+        if (extrasRes.error && !extrasRes.items.length) { lastError = extrasRes.error; }
+        else {
+            anyCallOk = true;
+            const acceptedExtras = [];
+            extrasRes.items.slice(0, OVL_AI_EXTRAS_MAX).forEach(function (it) {
+                if (!it || typeof it.en !== 'string' || !it.en.trim()) { dropped++; return; }
+                const en = it.en.trim();
+                const zh = (typeof it.zh === 'string') ? it.zh.trim() : '';
+                if (!zh) { dropped++; return; }
+                if (existingEnLower[en.toLowerCase()]) { dropped++; return; } // not new
+                const kind = (it.kind === 'acronym') ? 'acronym' : 'term';
+                const occurs = (kind === 'acronym') ? (texRaw.indexOf(en) !== -1) : (texLower.indexOf(en.toLowerCase()) !== -1);
+                if (!occurs) { dropped++; return; }
+                existingEnLower[en.toLowerCase()] = true;
+                acceptedExtras.push({ en: en, zh: zh, kind: kind });
+            });
+            if (acceptedExtras.length) {
+                added += ovlTermDbMergeAuto(acceptedExtras, 'llm');
+                acceptedExtras.forEach(function (e) { ovlTermDbUiMarkTouched(e.en); });
+            }
+        }
+
         if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
-        if (typeof showToast === 'function') showToast('AI 补全完成，更新 ' + changed + ' 条（用户条目不会被覆盖）', 'success');
+        if (!anyCallOk) {
+            const reason = lastError === 'timeout' ? '请求超时' : (lastError === 'unparseable' ? '返回内容无法解析' : (lastError || '没有可用条目'));
+            if (typeof showToast === 'function') showToast('AI 补全失败：' + reason, 'error');
+        } else {
+            if (typeof showToast === 'function') showToast('AI 补全：填入 ' + filled + ' 条中文，新增 ' + added + ' 条，丢弃 ' + dropped + ' 条（不在论文中/格式错误）', 'success');
+        }
     } catch (e) {
-        const msg = (e && e.name === 'AbortError') ? 'AI 补全超时' : ('AI 补全出错：' + ((e && e.message) || String(e)));
-        if (typeof showToast === 'function') showToast(msg, 'error');
-    } finally { clearTimeout(timer); OvlTermDbAiBusy = false; }
+        if (typeof showToast === 'function') showToast('AI 补全出错：' + ((e && e.message) || String(e)), 'error');
+    } finally { OvlTermDbAiBusy = false; }
 }
 let OvlPaperCardAiBusy = false;
 async function ovlTermDbUiAiCard() {
@@ -27442,6 +27608,7 @@ function ovlTermDbPanelHtml() {
     const list = ovlTermDbUiCurrentList().slice().sort(function (a, b) { return String(a.en).localeCompare(String(b.en)); });
     const card = ovlPaperCardGet();
     const scanReady = (typeof chatAgentSearchReadiness === 'function') ? chatAgentSearchReadiness().ready : false;
+    const missingZhCount = list.filter(function (e) { return e.kind !== 'keep' && (!e.zh || !String(e.zh).trim()); }).length;
     let html = '<div class="ovl-set-category-title" style="margin-top:18px">术语库</div>';
     html += '<div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap">'
         + '<button type="button" class="ovl-modal-btn' + (scope === 'project' ? ' ovl-modal-btn-primary' : '') + '" style="height:22px;padding:0 8px;font-size:10.5px" onclick="ovlTermDbUiScopeSet(\'project\')">本项目</button>'
@@ -27464,9 +27631,12 @@ function ovlTermDbPanelHtml() {
     } else {
         list.forEach(function (e) {
             const searchHay = (String(e.en) + ' ' + String(e.zh || '') + ' ' + String(e.note || '')).toLowerCase();
-            html += '<tr data-ovl-termdb-row data-en="' + escapeAttr(e.en) + '" data-search="' + escapeAttr(searchHay) + '">'
+            const missingZh = e.kind !== 'keep' && (!e.zh || !String(e.zh).trim());
+            html += '<tr data-ovl-termdb-row data-en="' + escapeAttr(e.en) + '" data-search="' + escapeAttr(searchHay) + '"'
+                + (missingZh ? ' data-ovl-missing-zh="1"' : '') + '>'
                 + '<td style="padding:2px 6px"><input type="text" value="' + escapeAttr(e.en) + '" style="width:100px;font-size:11px" onchange="ovlTermDbUiEditFieldFromEl(this,\'en\')"></td>'
-                + '<td style="padding:2px 6px"><input type="text" value="' + escapeAttr(e.zh) + '" style="width:100px;font-size:11px" onchange="ovlTermDbUiEditFieldFromEl(this,\'zh\')"></td>'
+                + '<td style="padding:2px 6px"><input type="text" value="' + escapeAttr(e.zh) + '" style="width:100px;font-size:11px" onchange="ovlTermDbUiEditFieldFromEl(this,\'zh\')">'
+                + (missingZh ? '<span data-ovl-missing-zh-label style="font-size:9.5px;color:#c0392b;white-space:nowrap">缺中文，未生效</span>' : '') + '</td>'
                 + '<td style="padding:2px 6px"><select style="font-size:11px" onchange="ovlTermDbUiEditFieldFromEl(this,\'kind\')">'
                 + ['term', 'acronym', 'keep'].map(function (k) { return '<option value="' + k + '"' + (e.kind === k ? ' selected' : '') + '>' + k + '</option>'; }).join('')
                 + '</select></td>'
@@ -27489,6 +27659,7 @@ function ovlTermDbPanelHtml() {
         + '<button type="button" class="ovl-modal-btn" style="height:22px;padding:0 8px;font-size:10.5px" onclick="ovlTermDbUiAiCard()">AI 生成背景卡</button>'
         + '<button type="button" class="ovl-modal-btn" style="height:22px;padding:0 8px;font-size:10.5px" onclick="ovlTermDbUiScan()"' + (scanReady ? '' : ' disabled title="没有已打开的项目目录（或降级只读模式）"') + '>从 .tex 扫描缩写</button>'
         + '<button type="button" class="ovl-modal-btn" style="height:22px;padding:0 8px;font-size:10.5px" onclick="ovlTermDbUiAiComplete()">AI 补全</button>'
+        + (missingZhCount ? ('<span id="ovlTermDbMissingZhCount" style="font-size:10px;color:#c0392b">缺中文 ' + missingZhCount + ' 条</span>') : '<span id="ovlTermDbMissingZhCount" style="display:none"></span>')
         + '<button type="button" class="ovl-modal-btn ovl-modal-btn-primary" style="height:22px;padding:0 8px;font-size:10.5px" onclick="ovlTermDbUiApplyClick()">应用</button>'
         + '</span></div>';
     return html;
