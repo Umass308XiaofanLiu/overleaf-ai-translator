@@ -5001,7 +5001,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.41.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.41.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-09-25';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -26979,6 +26979,493 @@ function ovlTermDbBuildPromptBlock(entries) {
         return '\n\n' + 'Terminology (use exactly):\n' + lines.join('\n');
     } catch (e) { return ''; }
 }
+
+// ============================================================================
+// v2 Pass P202b：术语库 / 论文背景卡设置面板 UI —— 表格视图、.tex 缩写扫描、"AI 补全"、
+// "AI 生成背景卡"、导入导出、关闭面板时按需重翻。
+//
+// 安全纪律（CLAUDE.md §1）：任何用户可控字符串（en/zh/note，含 XSS 样式的
+// `<img src=x onerror=...>`）只经 escapeHtml（渲染为文本）/escapeAttr（渲染进属性值）
+// 落地，绝不用字符串拼接把它塞进 onclick="...('+val+')" 这种内联 JS 源码里——因为
+// escapeAttr 只保证 HTML 解析安全，浏览器把属性值解码成字符串交给 JS 引擎之前那一步
+// 会把 &#39; 还原成 '，字符串拼接的写法在这里仍然能把值里的引号当成 JS 语法边界。改用
+// data-en 属性 + 事件里 this.closest('tr').getAttribute('data-en') 读取，彻底不把用户
+// 数据当代码解析。全部弹窗（新增/删除确认）走 ovlPromptDialog/ovlConfirmDialog，不用
+// window.alert/confirm/prompt。
+// ============================================================================
+const OvlTermDbUiState = { scope: 'project', touched: Object.create(null) };
+function ovlTermDbUiMarkTouched(en) { if (en) OvlTermDbUiState.touched[en] = true; }
+function ovlTermDbUiScopeSet(scope) {
+    OvlTermDbUiState.scope = (scope === 'global') ? 'global' : 'project';
+    if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
+}
+function ovlTermDbUiCurrentList() {
+    return (OvlTermDbUiState.scope === 'global')
+        ? ovlTermDbGlobalLoad().entries.slice()
+        : ovlTermDbList();
+}
+function ovlTermDbUiSourceLabel(source) {
+    return source === 'regex' ? '扫描' : (source === 'llm' ? 'AI' : '手动');
+}
+
+// ---- 搜索：纯 DOM 显隐过滤，不走整段 HTML 重渲染，避免每敲一个字符就丢输入框焦点 ----
+function ovlTermDbUiFilterInput(value) {
+    try {
+        const needle = String(value || '').trim().toLowerCase();
+        const rows = document.querySelectorAll('#ovlTermDbTableBody tr[data-ovl-termdb-row]');
+        rows.forEach(function (tr) {
+            const hay = tr.getAttribute('data-search') || '';
+            tr.style.display = (!needle || hay.indexOf(needle) !== -1) ? '' : 'none';
+        });
+    } catch (e) {}
+}
+
+function ovlTermDbUiRowEn(el) {
+    try {
+        const tr = el.closest('tr[data-ovl-termdb-row]');
+        return tr ? tr.getAttribute('data-en') : null;
+    } catch (e) { return null; }
+}
+
+function ovlTermDbUiAdd() {
+    ovlPromptDialog({
+        title: '新增术语条目',
+        label: '英文（en，作为唯一标识）',
+        placeholder: '例如 inter-satellite link',
+        validate: function (v) { return (v && v.trim()) ? null : '不能为空'; },
+        onConfirm: function (v) {
+            const en = v.trim();
+            const partial = { en: en, zh: '', kind: 'term', source: 'user', enabled: true };
+            const ok = (OvlTermDbUiState.scope === 'global') ? ovlTermDbGlobalSet(partial) : ovlTermDbSet(null, partial);
+            if (!ok) { if (typeof showToast === 'function') showToast('新增失败（可能已到上限，或没有打开项目）', 'error'); return; }
+            ovlTermDbUiMarkTouched(en);
+            if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
+            if (typeof showToast === 'function') showToast('已新增术语条目', 'success');
+        }
+    });
+}
+
+// field: 'en'|'zh'|'kind'|'note'。改任意字段都把 source 落成 'user'（brief 要求"编辑一行
+// 使其变成 source:'user'"）；改 en 相当于改主键，按删旧建新处理，避免撞键覆盖历史条目。
+function ovlTermDbUiEditField(en, field, value) {
+    try {
+        const list = ovlTermDbUiCurrentList();
+        const entry = list.find(function (e) { return e.en === en; });
+        if (!entry) return;
+        const isGlobal = OvlTermDbUiState.scope === 'global';
+        const patch = { en: entry.en, zh: entry.zh, kind: entry.kind, note: entry.note, enabled: entry.enabled, source: 'user' };
+        if (field === 'en') {
+            const newEn = String(value == null ? '' : value).trim();
+            if (!newEn || newEn === entry.en) { if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator'); return; }
+            if (isGlobal) { ovlTermDbGlobalRemove(entry.en); ovlTermDbGlobalSet(Object.assign({}, patch, { en: newEn })); }
+            else { ovlTermDbRemove(null, entry.en); ovlTermDbSet(null, Object.assign({}, patch, { en: newEn })); }
+            ovlTermDbUiMarkTouched(entry.en); ovlTermDbUiMarkTouched(newEn);
+            if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
+            return;
+        }
+        if (field === 'zh') patch.zh = String(value == null ? '' : value);
+        else if (field === 'note') patch.note = String(value == null ? '' : value);
+        else if (field === 'kind') patch.kind = (value === 'acronym' || value === 'keep') ? value : 'term';
+        else return;
+        const ok = isGlobal ? ovlTermDbGlobalSet(patch) : ovlTermDbSet(null, patch);
+        if (ok) ovlTermDbUiMarkTouched(entry.en);
+        if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
+    } catch (e) {}
+}
+function ovlTermDbUiEditFieldFromEl(el, field) {
+    const en = ovlTermDbUiRowEn(el);
+    if (en != null) ovlTermDbUiEditField(en, field, el.value);
+}
+
+function ovlTermDbUiToggle(en, enabled) {
+    try {
+        if (OvlTermDbUiState.scope === 'global') {
+            const bucket = ovlTermDbGlobalLoad();
+            const idx = bucket.entries.findIndex(function (e) { return e.en === en; });
+            if (idx !== -1) { bucket.entries[idx].enabled = !!enabled; bucket.entries[idx].updatedAt = Date.now(); bucket.updatedAt = Date.now(); ovlTermDbGlobalSave(bucket); }
+        } else {
+            ovlTermDbSetEnabled(null, en, enabled);
+        }
+        ovlTermDbUiMarkTouched(en);
+        if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
+    } catch (e) {}
+}
+function ovlTermDbUiToggleFromEl(el) {
+    const en = ovlTermDbUiRowEn(el);
+    if (en != null) ovlTermDbUiToggle(en, el.checked);
+}
+
+function ovlTermDbUiDelete(en) {
+    ovlConfirmDialog({
+        title: '删除术语条目？',
+        message: '删除「' + en + '」，这个操作不能撤销。',
+        confirmLabel: '删除',
+        danger: true,
+        onConfirm: function () {
+            if (OvlTermDbUiState.scope === 'global') ovlTermDbGlobalRemove(en); else ovlTermDbRemove(null, en);
+            ovlTermDbUiMarkTouched(en);
+            if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
+            if (typeof showToast === 'function') showToast('已删除', 'success');
+        }
+    });
+}
+function ovlTermDbUiDeleteFromEl(el) {
+    const en = ovlTermDbUiRowEn(el);
+    if (en != null) ovlTermDbUiDelete(en);
+}
+
+// ---- 导出 / 导入 ----
+function ovlTermDbUiExport() {
+    try {
+        const json = (OvlTermDbUiState.scope === 'global')
+            ? JSON.stringify({ entries: ovlTermDbGlobalLoad().entries }, null, 2)
+            : ovlTermDbExport();
+        const blob = new Blob([json], { type: 'application/json;charset=utf-8' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = 'termdb-' + OvlTermDbUiState.scope + '-' + Date.now() + '.json';
+        document.body.appendChild(a); a.click();
+        try { document.body.removeChild(a); } catch (e) {}
+        setTimeout(function () { try { URL.revokeObjectURL(url); } catch (e) {} }, 60000);
+    } catch (e) { if (typeof showToast === 'function') showToast('导出失败', 'error'); }
+}
+function ovlTermDbUiImportFile(input) {
+    try {
+        const file = input && input.files && input.files[0];
+        if (!file) return;
+        const reader = new FileReader();
+        reader.onload = function () {
+            const text = String(reader.result || '');
+            let parsed;
+            try { parsed = JSON.parse(text); } catch (e) {
+                if (typeof showToast === 'function') showToast('导入失败：不是合法 JSON', 'error'); input.value = ''; return;
+            }
+            const entries = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.entries) ? parsed.entries : null);
+            if (!entries) {
+                if (typeof showToast === 'function') showToast('导入失败：格式不对，需要数组或 {"entries":[...]}', 'error'); input.value = ''; return;
+            }
+            const bad = entries.some(function (e) { return !e || typeof e !== 'object' || typeof e.en !== 'string' || !e.en.trim(); });
+            if (bad) {
+                if (typeof showToast === 'function') showToast('导入失败：存在缺少合法 en 字段的条目', 'error'); input.value = ''; return;
+            }
+            ovlConfirmDialog({
+                title: '导入术语库',
+                message: '共 ' + entries.length + ' 条。「合并」按 en 逐条更新/新增（不影响未出现的条目）；'
+                    + '「替换」会先清空当前' + (OvlTermDbUiState.scope === 'global' ? '全局' : '本项目') + '术语库再写入，取消则不导入。',
+                confirmLabel: '合并',
+                onConfirm: function () { ovlTermDbUiImportApply(entries, 'merge'); input.value = ''; },
+                onCancel: function () { input.value = ''; }
+            });
+        };
+        reader.onerror = function () { if (typeof showToast === 'function') showToast('导入失败：文件读取出错', 'error'); input.value = ''; };
+        reader.readAsText(file);
+    } catch (e) { if (typeof showToast === 'function') showToast('导入失败', 'error'); }
+}
+function ovlTermDbUiImportApply(entries, mode) {
+    try {
+        let ok;
+        if (OvlTermDbUiState.scope === 'global') {
+            const bucket = (mode === 'replace') ? { entries: [], updatedAt: 0 } : ovlTermDbGlobalLoad();
+            entries.forEach(function (raw) {
+                if (!raw || !raw.en) return;
+                const en = String(raw.en).trim();
+                if (!en) return;
+                const idx = bucket.entries.findIndex(function (e) { return e.en === en; });
+                const entry = ovlTermDbEntryDefaults(Object.assign({}, raw, { en: en, source: raw.source || 'user' }));
+                if (idx === -1) { if (bucket.entries.length < OVL_TERMDB_GLOBAL_MAX) bucket.entries.push(entry); } else bucket.entries[idx] = entry;
+                ovlTermDbUiMarkTouched(en);
+            });
+            bucket.updatedAt = Date.now();
+            ovlTermDbGlobalSave(bucket);
+            ok = true;
+        } else {
+            ok = ovlTermDbImport(JSON.stringify({ entries: entries }), { mode: mode });
+            entries.forEach(function (raw) { if (raw && raw.en) ovlTermDbUiMarkTouched(String(raw.en).trim()); });
+        }
+        if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
+        if (typeof showToast === 'function') showToast(ok ? '导入完成' : '导入失败', ok ? 'success' : 'error');
+    } catch (e) { if (typeof showToast === 'function') showToast('导入失败', 'error'); }
+}
+
+// ---- 论文背景卡：文本框只改内存显示（字符计数），onchange 才真正落盘 ----
+function ovlTermDbUiCardInput(value) {
+    const counter = document.getElementById('ovlPaperCardCounter');
+    if (counter) counter.textContent = String(String(value || '').length) + '/' + OVL_PAPER_CARD_MAX_CHARS;
+}
+function ovlTermDbUiCardSave(value) {
+    ovlPaperCardSet(null, value);
+    ovlTermDbUiMarkTouched('__papercard__');
+    if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
+}
+
+// ---- .tex 缩写扫描（确定性正则，不调模型）：复用 §5 recon 指出的 OvlState.dirHandle 统一
+// 句柄 + chatAgentSearchReadiness() 同款可用性判据（无 dirHandle / 降级只读模式一律禁用）----
+function ovlTermDbStripTexComments(text) {
+    return String(text || '').split(/\r\n|\r|\n/).map(function (line) {
+        let out = '';
+        for (let i = 0; i < line.length; i++) {
+            if (line[i] === '%' && line[i - 1] !== '\\') break;
+            out += line[i];
+        }
+        return out;
+    }).join('\n');
+}
+function ovlTermDbScanTexText(text, out) {
+    const stripped = ovlTermDbStripTexComments(text);
+    let m;
+    const reLongAcr = /([A-Za-z][A-Za-z0-9\- ]{2,80}?)\s*\(([A-Z][A-Za-z0-9]{1,15})\)/g;
+    while ((m = reLongAcr.exec(stripped))) out.push({ acr: m[2].trim(), long: m[1].trim() });
+    const reNew = /\\newacronym\{[^{}]*\}\{([^{}]+)\}\{([^{}]+)\}/g;
+    while ((m = reNew.exec(stripped))) out.push({ acr: m[1].trim(), long: m[2].trim() });
+    const reAcro = /\\acro\{([^{}]+)\}\{([^{}]+)\}/g;
+    while ((m = reAcro.exec(stripped))) out.push({ acr: m[1].trim(), long: m[2].trim() });
+    const reAcrodef = /\\acrodef\{([^{}]+)\}\{([^{}]+)\}/g;
+    while ((m = reAcrodef.exec(stripped))) out.push({ acr: m[1].trim(), long: m[2].trim() });
+}
+async function ovlTermDbScanWalk(handle, relDir, state) {
+    let iter;
+    try { iter = handle.entries(); } catch (e) { return; }
+    for await (const pair of iter) {
+        if (state.filesScanned >= CHAT_AGENT_SEARCH_MAX_FILES || state.bytesRead >= CHAT_AGENT_SEARCH_MAX_BYTES) { state.capped = true; return; }
+        const name = pair[0], child = pair[1];
+        const childRel = relDir === '.' ? name : relDir + '/' + name;
+        if (child && child.kind === 'directory') {
+            if (CHAT_AGENT_SEARCH_SKIP_DIRS.indexOf(name) !== -1) continue;
+            await ovlTermDbScanWalk(child, childRel, state);
+            continue;
+        }
+        if (!/\.tex$/i.test(name || '')) continue;
+        state.filesScanned++;
+        try {
+            const file = await child.getFile();
+            state.bytesRead += file.size;
+            const text = await file.text();
+            ovlTermDbScanTexText(text, state.out);
+        } catch (e) {}
+    }
+}
+async function ovlTermDbUiScan() {
+    const readiness = (typeof chatAgentSearchReadiness === 'function') ? chatAgentSearchReadiness() : { ready: false };
+    if (!readiness.ready) { if (typeof showToast === 'function') showToast('没有已打开的项目目录（或处于降级只读模式），无法扫描 .tex', 'error'); return; }
+    const state = { out: [], filesScanned: 0, bytesRead: 0, capped: false };
+    try { await ovlTermDbScanWalk(OvlState.dirHandle, '.', state); }
+    catch (e) { if (typeof showToast === 'function') showToast('扫描出错：' + ((e && e.message) || String(e)), 'error'); return; }
+    const seen = Object.create(null);
+    const acrEntries = [], longEntries = [];
+    state.out.forEach(function (hit) {
+        if (!hit.acr || !hit.long) return;
+        if (!seen['A:' + hit.acr]) { seen['A:' + hit.acr] = true; acrEntries.push({ en: hit.acr, kind: 'acronym', zh: '', note: hit.long }); }
+        if (!seen['L:' + hit.long]) { seen['L:' + hit.long] = true; longEntries.push({ en: hit.long, kind: 'term', zh: '' }); }
+    });
+    const merged = acrEntries.concat(longEntries);
+    if (!merged.length) { if (typeof showToast === 'function') showToast('没有在 .tex 里找到可识别的缩写定义', 'info'); return; }
+    const changed = ovlTermDbMergeAuto(merged, 'regex');
+    merged.forEach(function (e) { ovlTermDbUiMarkTouched(e.en); });
+    if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
+    if (typeof showToast === 'function') showToast('扫描完成：候选 ' + merged.length + ' 条，新增/更新 ' + changed + ' 条' + (state.capped ? '（已达扫描安全上限，结果可能不完整）' : ''), 'success');
+}
+
+// ---- AI 补全 / AI 生成背景卡：都走当前选中 provider 的既有传输层 callModelPlainText，
+// 输入只取 title/abstract/intro 前 6000 字符（去注释）+ 待补全条目列表，从不发送全文 ----
+function ovlTermDbExtractPaperContext() {
+    const ta = document.getElementById('ovlCodeArea');
+    const raw = ta ? ta.value : '';
+    const stripped = ovlTermDbStripTexComments(raw);
+    const titleM = /\\title\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}/.exec(stripped);
+    const title = titleM ? titleM[1].trim() : '';
+    const absM = /\\begin\{abstract\}([\s\S]*?)\\end\{abstract\}/.exec(stripped);
+    const abstract = absM ? absM[1].trim() : '';
+    let intro = '';
+    const introM = /\\section\*?\{\s*[Ii]ntroduction\s*\}([\s\S]*?)(\\section|\\end\{document\}|$)/.exec(stripped);
+    if (introM) intro = introM[1].trim().slice(0, 6000);
+    return { title: title, abstract: abstract, intro: intro };
+}
+function ovlTermDbParseJsonLenient(text) {
+    let s = String(text || '').trim();
+    const fence = /```(?:json)?\s*([\s\S]*?)```/.exec(s);
+    if (fence) s = fence[1].trim();
+    const arrM = /\[[\s\S]*\]/.exec(s);
+    if (arrM) s = arrM[0];
+    try { const parsed = JSON.parse(s); return Array.isArray(parsed) ? parsed : null; }
+    catch (e) { return null; }
+}
+function ovlTermDbAiCompletePrompt(entries, ctx) {
+    const emptyList = entries.filter(function (e) { return !e.zh || !String(e.zh).trim(); }).slice(0, 60);
+    const lines = emptyList.map(function (e) { return '- en:"' + e.en + '" kind:' + e.kind; });
+    return 'You are helping build a bilingual (English-Chinese) terminology database for an academic paper.\n'
+        + 'Paper title: ' + (ctx.title || '(none)') + '\n'
+        + 'Abstract: ' + (ctx.abstract || '(none)') + '\n'
+        + 'Introduction (may be truncated): ' + (ctx.intro || '(none)') + '\n\n'
+        + 'Existing entries needing a Chinese translation:\n' + (lines.length ? lines.join('\n') : '(none)') + '\n\n'
+        + 'Task: (1) fill "zh" for each of the entries above with its correct Chinese translation; '
+        + '(2) propose up to 40 ADDITIONAL field-specific terms/acronyms from the paper that a general '
+        + 'translator would likely get wrong, each with en/zh/kind.\n'
+        + 'Respond with STRICT JSON ONLY, an array: [{"en":"...","zh":"...","kind":"term"}, ...]. No prose, no markdown fence.';
+}
+let OvlTermDbAiBusy = false;
+async function ovlTermDbUiAiComplete() {
+    if (OvlTermDbAiBusy) return;
+    let cfg = null;
+    try { cfg = getApiConfig(); } catch (e) {}
+    if (!cfg || !cfg.provider) { if (typeof showToast === 'function') showToast('AI 补全失败：没有配置好的 provider', 'error'); return; }
+    OvlTermDbAiBusy = true;
+    if (typeof showToast === 'function') showToast('AI 补全中…', 'info');
+    const controller = new AbortController();
+    const timer = setTimeout(function () { controller.abort(); }, 60000);
+    try {
+        const ctx = ovlTermDbExtractPaperContext();
+        const entries = ovlTermDbUiCurrentList();
+        const prompt = ovlTermDbAiCompletePrompt(entries, ctx);
+        const raw = await callModelPlainText(prompt, cfg, controller.signal, {}, { maxTokens: 4096 });
+        const parsed = ovlTermDbParseJsonLenient(raw);
+        if (!parsed) { if (typeof showToast === 'function') showToast('AI 补全失败：返回内容不是合法 JSON', 'error'); return; }
+        const clean = parsed.filter(function (e) { return e && typeof e.en === 'string' && e.en.trim(); })
+            .slice(0, 100)
+            .map(function (e) {
+                return {
+                    en: e.en.trim(),
+                    zh: (typeof e.zh === 'string') ? e.zh.trim() : '',
+                    kind: (e.kind === 'acronym' || e.kind === 'keep') ? e.kind : 'term'
+                };
+            });
+        if (!clean.length) { if (typeof showToast === 'function') showToast('AI 补全失败：没有可用条目', 'error'); return; }
+        const changed = ovlTermDbMergeAuto(clean, 'llm');
+        clean.forEach(function (e) { ovlTermDbUiMarkTouched(e.en); });
+        if (typeof ovlRenderSettingsCategory === 'function') ovlRenderSettingsCategory('translator');
+        if (typeof showToast === 'function') showToast('AI 补全完成，更新 ' + changed + ' 条（用户条目不会被覆盖）', 'success');
+    } catch (e) {
+        const msg = (e && e.name === 'AbortError') ? 'AI 补全超时' : ('AI 补全出错：' + ((e && e.message) || String(e)));
+        if (typeof showToast === 'function') showToast(msg, 'error');
+    } finally { clearTimeout(timer); OvlTermDbAiBusy = false; }
+}
+let OvlPaperCardAiBusy = false;
+async function ovlTermDbUiAiCard() {
+    if (OvlPaperCardAiBusy) return;
+    let cfg = null;
+    try { cfg = getApiConfig(); } catch (e) {}
+    if (!cfg || !cfg.provider) { if (typeof showToast === 'function') showToast('生成背景卡失败：没有配置好的 provider', 'error'); return; }
+    OvlPaperCardAiBusy = true;
+    if (typeof showToast === 'function') showToast('正在生成背景卡…', 'info');
+    const controller = new AbortController();
+    const timer = setTimeout(function () { controller.abort(); }, 60000);
+    try {
+        const ctx = ovlTermDbExtractPaperContext();
+        const entries = ovlTermDbUiCurrentList();
+        const acrLines = entries.filter(function (e) { return e.kind === 'acronym'; }).slice(0, 40)
+            .map(function (e) { return e.en + (e.note ? ' (' + e.note + ')' : ''); });
+        const prompt = 'Paper title: ' + (ctx.title || '(none)') + '\nAbstract: ' + (ctx.abstract || '(none)')
+            + '\nIntroduction (may be truncated): ' + (ctx.intro || '(none)')
+            + '\nKnown acronyms: ' + (acrLines.join(', ') || '(none)')
+            + '\n\nWrite a plain-text background card (<=150 words, English) covering: the paper\'s topic, '
+            + 'its system model, and the key acronyms a translator needs to know. No markdown, no headings, plain prose only.';
+        const raw = await callModelPlainText(prompt, cfg, controller.signal, {}, { maxTokens: 600 });
+        const text = String(raw || '').trim();
+        if (!text) { if (typeof showToast === 'function') showToast('生成背景卡失败：返回为空', 'error'); return; }
+        const clipped = text.slice(0, OVL_PAPER_CARD_MAX_CHARS);
+        const ta = document.getElementById('ovlPaperCardTextarea');
+        if (ta) { ta.value = clipped; ovlTermDbUiCardInput(clipped); }
+        if (typeof showToast === 'function') showToast('已生成背景卡草稿，请检查后保存', 'success');
+    } catch (e) {
+        const msg = (e && e.name === 'AbortError') ? '生成背景卡超时' : ('生成背景卡出错：' + ((e && e.message) || String(e)));
+        if (typeof showToast === 'function') showToast(msg, 'error');
+    } finally { clearTimeout(timer); OvlPaperCardAiBusy = false; }
+}
+
+// ---- 应用：面板关闭 / 点"应用"时，对当前可见的 Path-1 Visual 块按需重翻——只有块里含
+// 本次改动过的术语（或论文卡片被改过，此时视为全体可见块都要重翻）才重入队，未命中的块
+// 缓存键没变，直接沿用旧译文，不会每次开关面板就全篇重翻一遍。----
+function ovlTermDbUiRequeueVisible() {
+    try {
+        const touched = Object.keys(OvlTermDbUiState.touched);
+        if (!touched.length) return;
+        const cardTouched = !!OvlTermDbUiState.touched['__papercard__'];
+        const pane = document.getElementById('ovlVisualPane');
+        if (!pane || !document.body.contains(pane) || pane.style.display === 'none') return;
+        const paneRect = pane.getBoundingClientRect();
+        const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+        const touchedSet = Object.create(null);
+        touched.forEach(function (en) { touchedSet[en] = true; });
+        blocks.forEach(function (block) {
+            let rect;
+            try { rect = block.getBoundingClientRect(); } catch (e) { return; }
+            const visible = rect.height > 0 && rect.bottom > paneRect.top && rect.top < paneRect.bottom;
+            if (!visible) return;
+            const srcLatex = (typeof ovlVisualBlockSrcText === 'function') ? ovlVisualBlockSrcText(block) : null;
+            if (srcLatex == null || !srcLatex.trim()) return;
+            let hit = cardTouched;
+            if (!hit) {
+                let matched = [];
+                try { matched = ovlTermDbMatch(srcLatex, { cap: 30 }); } catch (e) { matched = []; }
+                hit = matched.some(function (m) { return touchedSet[m.en]; });
+            }
+            if (hit && typeof ovlVisualBlockRetranslateClick === 'function') ovlVisualBlockRetranslateClick(block);
+        });
+    } catch (e) {}
+}
+function ovlTermDbUiApplyClick() {
+    ovlTermDbUiRequeueVisible();
+    OvlTermDbUiState.touched = Object.create(null);
+    if (typeof showToast === 'function') showToast('已应用：可见段落里命中改动术语的部分正在重新翻译', 'success');
+}
+
+// ---- 面板 HTML ----
+function ovlTermDbPanelHtml() {
+    const scope = OvlTermDbUiState.scope;
+    const list = ovlTermDbUiCurrentList().slice().sort(function (a, b) { return String(a.en).localeCompare(String(b.en)); });
+    const card = ovlPaperCardGet();
+    const scanReady = (typeof chatAgentSearchReadiness === 'function') ? chatAgentSearchReadiness().ready : false;
+    let html = '<div class="ovl-set-category-title" style="margin-top:18px">术语库</div>';
+    html += '<div style="display:flex;gap:6px;align-items:center;margin-bottom:8px;flex-wrap:wrap">'
+        + '<button type="button" class="ovl-modal-btn' + (scope === 'project' ? ' ovl-modal-btn-primary' : '') + '" style="height:22px;padding:0 8px;font-size:10.5px" onclick="ovlTermDbUiScopeSet(\'project\')">本项目</button>'
+        + '<button type="button" class="ovl-modal-btn' + (scope === 'global' ? ' ovl-modal-btn-primary' : '') + '" style="height:22px;padding:0 8px;font-size:10.5px" onclick="ovlTermDbUiScopeSet(\'global\')">全局</button>'
+        + '<span style="font-size:11px;color:#888">共 ' + list.length + ' 条</span>'
+        + '<span style="flex:1"></span>'
+        + '<input type="text" id="ovlTermDbSearchInput" placeholder="搜索 en/zh/备注" style="width:140px;font-size:11px" oninput="ovlTermDbUiFilterInput(this.value)">'
+        + '<button type="button" class="ovl-modal-btn" style="height:22px;padding:0 8px;font-size:10.5px" onclick="ovlTermDbUiAdd()">+ 新增</button>'
+        + '<button type="button" class="ovl-modal-btn" style="height:22px;padding:0 8px;font-size:10.5px" onclick="ovlTermDbUiExport()">导出 JSON</button>'
+        + '<label class="ovl-modal-btn" style="height:22px;padding:0 8px;font-size:10.5px;display:inline-flex;align-items:center;cursor:pointer">导入 JSON<input type="file" accept="application/json,.json" style="display:none" onchange="ovlTermDbUiImportFile(this)"></label>'
+        + '</div>';
+    html += '<div style="max-height:260px;overflow:auto;border:1px solid #ddd;border-radius:6px">'
+        + '<table style="width:100%;border-collapse:collapse;font-size:11.5px"><thead><tr style="position:sticky;top:0;background:#fafafa">'
+        + '<th style="text-align:left;padding:4px 6px">En</th><th style="text-align:left;padding:4px 6px">Zh</th>'
+        + '<th style="text-align:left;padding:4px 6px">类型</th><th style="text-align:left;padding:4px 6px">备注</th>'
+        + '<th style="padding:4px 6px">来源</th><th style="padding:4px 6px">启用</th><th style="padding:4px 6px"></th>'
+        + '</tr></thead><tbody id="ovlTermDbTableBody">';
+    if (!list.length) {
+        html += '<tr><td colspan="7" style="padding:10px;text-align:center;color:#999">（还没有术语条目）</td></tr>';
+    } else {
+        list.forEach(function (e) {
+            const searchHay = (String(e.en) + ' ' + String(e.zh || '') + ' ' + String(e.note || '')).toLowerCase();
+            html += '<tr data-ovl-termdb-row data-en="' + escapeAttr(e.en) + '" data-search="' + escapeAttr(searchHay) + '">'
+                + '<td style="padding:2px 6px"><input type="text" value="' + escapeAttr(e.en) + '" style="width:100px;font-size:11px" onchange="ovlTermDbUiEditFieldFromEl(this,\'en\')"></td>'
+                + '<td style="padding:2px 6px"><input type="text" value="' + escapeAttr(e.zh) + '" style="width:100px;font-size:11px" onchange="ovlTermDbUiEditFieldFromEl(this,\'zh\')"></td>'
+                + '<td style="padding:2px 6px"><select style="font-size:11px" onchange="ovlTermDbUiEditFieldFromEl(this,\'kind\')">'
+                + ['term', 'acronym', 'keep'].map(function (k) { return '<option value="' + k + '"' + (e.kind === k ? ' selected' : '') + '>' + k + '</option>'; }).join('')
+                + '</select></td>'
+                + '<td style="padding:2px 6px"><input type="text" value="' + escapeAttr(e.note || '') + '" style="width:100px;font-size:11px" onchange="ovlTermDbUiEditFieldFromEl(this,\'note\')"></td>'
+                + '<td style="padding:2px 6px;text-align:center"><span style="font-size:10px;padding:1px 5px;border-radius:3px;background:#eee;color:#555">' + escapeHtml(ovlTermDbUiSourceLabel(e.source)) + '</span></td>'
+                + '<td style="padding:2px 6px;text-align:center"><input type="checkbox"' + (e.enabled !== false ? ' checked' : '') + ' onchange="ovlTermDbUiToggleFromEl(this)"></td>'
+                + '<td style="padding:2px 6px;text-align:center"><button type="button" class="ovl-modal-btn" style="height:20px;padding:0 6px;font-size:10px" onclick="ovlTermDbUiDeleteFromEl(this)">删除</button></td>'
+                + '</tr>';
+        });
+    }
+    html += '</tbody></table></div>';
+
+    html += '<div class="ovl-set-category-title" style="margin-top:16px">论文背景卡</div>';
+    html += '<textarea id="ovlPaperCardTextarea" maxlength="' + OVL_PAPER_CARD_MAX_CHARS + '" style="width:100%;min-height:70px;font-size:11.5px" '
+        + 'oninput="ovlTermDbUiCardInput(this.value)" onchange="ovlTermDbUiCardSave(this.value)" '
+        + 'placeholder="topic / system model / key acronyms，留空则退回 title 自动提取">' + escapeHtml(card) + '</textarea>';
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;flex-wrap:wrap;gap:6px">'
+        + '<span id="ovlPaperCardCounter" style="font-size:10.5px;color:#999">' + String(card.length) + '/' + OVL_PAPER_CARD_MAX_CHARS + '</span>'
+        + '<span style="display:flex;gap:6px;flex-wrap:wrap">'
+        + '<button type="button" class="ovl-modal-btn" style="height:22px;padding:0 8px;font-size:10.5px" onclick="ovlTermDbUiAiCard()">AI 生成背景卡</button>'
+        + '<button type="button" class="ovl-modal-btn" style="height:22px;padding:0 8px;font-size:10.5px" onclick="ovlTermDbUiScan()"' + (scanReady ? '' : ' disabled title="没有已打开的项目目录（或降级只读模式）"') + '>从 .tex 扫描缩写</button>'
+        + '<button type="button" class="ovl-modal-btn" style="height:22px;padding:0 8px;font-size:10.5px" onclick="ovlTermDbUiAiComplete()">AI 补全</button>'
+        + '<button type="button" class="ovl-modal-btn ovl-modal-btn-primary" style="height:22px;padding:0 8px;font-size:10.5px" onclick="ovlTermDbUiApplyClick()">应用</button>'
+        + '</span></div>';
+    return html;
+}
+
 
 function chatAgentGlossaryReadiness() {
     if (!chatAgentProjectDir()) return { ready: false, reason: 'no-projectdir' };
@@ -57089,6 +57576,10 @@ function ovlSettingsTranslatorHtml() {
             '给本地模型的一句话论文领域提示（例如 satellite networking），帮它选对多义词的专业译法（比如 operator 译成"运营商"而不是数学"算子"）。'
             + '留空则自动从当前项目 title 提取；只在本地模型（LM Studio）翻译路径生效，不影响 Claude/Gemini 的请求内容。按项目路径持久化。');
     })();
+    // v2 Pass P202b：术语库/论文卡片界面，紧挨着上面的「翻译领域提示」——brief §8 要求
+    // 放在既有 glossary/domain-hint 设置旁边。面板自身状态（scope/touched）在
+    // OvlTermDbUiState 里，跟这个函数的返回值本身无关，重渲不会丢。
+    if (typeof ovlTermDbPanelHtml === 'function') html += ovlTermDbPanelHtml();
     html += ovlSetRow('Visual 模式按源码行断行', '<input type="checkbox" data-setpath="settings.ovlVisualLineBreaks"' + (s.ovlVisualLineBreaks ? ' checked' : '') + '>',
         '开启后 Visual 预览里每个源码行单独渲染一行（跟 Code 模式的行号对得上，方便切模式时对照）；关闭则退回按段落整段渲染。');
     html += ovlSetRow('Visual 模式用方框标示选区', '<input type="checkbox" data-setpath="settings.ovlVisualOutlineSelection"' + (s.ovlVisualOutlineSelection ? ' checked' : '') + '>',
@@ -57430,6 +57921,10 @@ function ovlOpenSettings() {
     ovlRenderSettingsCategory(OvlSettingsState.cat);
 }
 function ovlCloseSettings() {
+    // v2 Pass P202b：面板关闭即按需重翻（brief §5「Apply」）——跟点「应用」按钮走同一个
+    // 函数，未点过「应用」就直接关面板/点遮罩也不会漏掉这一步。
+    if (typeof ovlTermDbUiRequeueVisible === 'function') { try { ovlTermDbUiRequeueVisible(); } catch (e) {} }
+    if (typeof OvlTermDbUiState !== 'undefined') OvlTermDbUiState.touched = Object.create(null);
     const overlay = document.getElementById('ovlSettingsOverlay');
     if (overlay) { overlay.hidden = true; overlay.innerHTML = ''; }
 }
