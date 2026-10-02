@@ -5018,7 +5018,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.42.03';        // APP_VERSION_STAMP
+const APP_VERSION = '03.42.04';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -42324,7 +42324,15 @@ function ovlVisualLangCollectPendingCached(pane) {
 // 不需要单独一条"重新入队"的代码路径。JS 单线程：从"取队列头"到"摘掉它的 pending 标记"
 // 之间没有 await，不会有两个 worker 抢同一块的竞态。
 const OVL_VISUAL_LANG_CONCURRENCY = 3;
-function ovlP208YieldToEventLoop() { return new Promise(function (r) { setTimeout(r, 0); }); }
+// 用 MessageChannel 而不是 setTimeout 让出：后台标签页里 setTimeout 会被节流（嵌套>=5 层、隐藏 5 分钟后每分钟
+// 才醒一次），一串连续 skipped 块会拖成几十分钟；MessageChannel 不受计时器节流（React scheduler 同款）。
+const OvlP208YieldChannel = (typeof MessageChannel !== 'undefined') ? new MessageChannel() : null;
+const OvlP208YieldWaiters = [];
+if (OvlP208YieldChannel) OvlP208YieldChannel.port1.onmessage = function () { const r = OvlP208YieldWaiters.shift(); if (r) r(); };
+function ovlP208YieldToEventLoop() {
+    if (!OvlP208YieldChannel) return new Promise(function (r) { setTimeout(r, 0); });
+    return new Promise(function (r) { OvlP208YieldWaiters.push(r); OvlP208YieldChannel.port2.postMessage(0); });
+}
 async function ovlVisualLangRunQueue() {
     // v2 Pass P170：'compare' 模式的中文半屏一样要真正跑翻译——否则整个后台 worker 池在
     // compare 模式下永远不启动，中文侧永久停在 pending。
