@@ -5018,7 +5018,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.42.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.42.03';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -42324,6 +42324,7 @@ function ovlVisualLangCollectPendingCached(pane) {
 // 不需要单独一条"重新入队"的代码路径。JS 单线程：从"取队列头"到"摘掉它的 pending 标记"
 // 之间没有 await，不会有两个 worker 抢同一块的竞态。
 const OVL_VISUAL_LANG_CONCURRENCY = 3;
+function ovlP208YieldToEventLoop() { return new Promise(function (r) { setTimeout(r, 0); }); }
 async function ovlVisualLangRunQueue() {
     // v2 Pass P170：'compare' 模式的中文半屏一样要真正跑翻译——否则整个后台 worker 池在
     // compare 模式下永远不启动，中文侧永久停在 pending。
@@ -42347,6 +42348,9 @@ async function ovlVisualLangRunQueue() {
 
     async function worker() {
         for (;;) {
+            // v2 Pass P208（C）：纯数学/取不到源码的块不走网络，同步 skipped/continue——连续一串这样的块会在
+            // 一个长任务里跑完（只有微任务，中间没有输入/渲染机会）。每轮开头真让出一次事件循环。
+            await ovlP208YieldToEventLoop();
             if (mySeq !== OvlVisualLangState.seq || controller.signal.aborted) return;
             const pane = document.getElementById('ovlVisualPane');
             if (!pane) return;
