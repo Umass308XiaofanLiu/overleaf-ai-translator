@@ -5018,8 +5018,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.42.01';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-09-25';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.42.02';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-10-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -41676,8 +41676,29 @@ function ovlBilingualRunAlignPass() {
 // 整个 pass 实测强制同步布局次数是：对齐读一次 + 左侧 gutter 读一次 + 镜像 gutter 读一次 = 3
 // 次，不随块数增长，远低于验收要求的"≤5 次/pass"。
 let OvlP198RelayoutRaf = null;
+// v2 Pass P208：懒翻译运行期间（OvlVisualLangState.running===true）每次落地都会触发一次完整 relayout
+// pass（对齐 + 主/镜像 gutter 重建），400 块文件上主线程被占满 93%。运行期间把 pass 限速成每
+// OVL_P208_RELAYOUT_MIN_INTERVAL_MS 至多一次：过早的调用只挂一个尾随 setTimeout，不丢请求。
+// running===false 时行为与旧版逐字节一致。
+const OVL_P208_RELAYOUT_MIN_INTERVAL_MS = 1000;
+let OvlP208LastRelayoutPassAt = 0;
+let OvlP208RelayoutThrottleTimer = null;
 function ovlP198ScheduleRelayout() {
     if (OvlP198RelayoutRaf !== null) return; // 已经排了一帧要跑，本次调用只是去重；标志位（图片 pending/对齐熔断状态）不会因为去重而丢
+    let p208Running = false;
+    try { p208Running = OvlVisualLangState.running === true; } catch (eP208) {}
+    if (p208Running) {
+        const wait = OVL_P208_RELAYOUT_MIN_INTERVAL_MS - (ovlP198Now() - OvlP208LastRelayoutPassAt);
+        if (wait > 0) {
+            if (OvlP208RelayoutThrottleTimer === null) {
+                OvlP208RelayoutThrottleTimer = setTimeout(function () {
+                    OvlP208RelayoutThrottleTimer = null;
+                    ovlP198ScheduleRelayout();
+                }, Math.ceil(wait) + 1);
+            }
+            return;
+        }
+    }
     const raf = (typeof requestAnimationFrame === 'function') ? requestAnimationFrame : null;
     if (!raf) { ovlP198RunRelayoutPass(); return; } // 没有 rAF 的环境（测试沙箱）退回同步执行，跟改造前三个入口各自的兜底行为一致
     OvlP198RelayoutRaf = raf(function () {
@@ -41738,6 +41759,7 @@ function ovlP198RunRelayoutPass() {
 // burst 结束后由上面的去抖收尾调用一次，非 burst 场景（普通单次 resize、非拖拽状态下的行级
 // RO 触发等）路径不变、依然每帧最多跑一次。
 function ovlP198RunRelayoutPassCore() {
+    OvlP208LastRelayoutPassAt = ovlP198Now();
     if (OvlP198PrimaryFigPending) {
         OvlP198PrimaryFigPending = false;
         const bodyEl = document.querySelector('#ovlVisualPane .ovl-visual-body');
@@ -42265,6 +42287,37 @@ function ovlVisualLangCollectPending(pane) {
     return inView.concat(outView);
 }
 
+// v2 Pass P208：仅供 worker 循环使用的带缓存取块。旧函数每轮都对每个待翻块调
+// getBoundingClientRect（刚落地的块弄脏了 DOM，每次都是一次整树强制布局）。这里只在缓存过期
+// （TTL）、pane 滚动过、pane 换了、或缓存里没有可用块时才重新走旧函数（几何排序），其余时候直接
+// 返回缓存列表过滤后的结果，零布局读取。ovlVisualLangCollectPending 本身及其它调用方不变。
+const OVL_P208_PENDING_ORDER_TTL_MS = 1000;
+const OVL_P208_PENDING_DIRTY_MIN_MS = 200;
+let OvlP208PendingCache = { pane: null, at: 0, list: null };
+let OvlP208PaneScrollDirty = true;
+const OvlP208ScrollBoundPanes = new WeakSet();
+function ovlVisualLangCollectPendingCached(pane) {
+    if (!OvlP208ScrollBoundPanes.has(pane)) {
+        OvlP208ScrollBoundPanes.add(pane);
+        try { pane.addEventListener('scroll', function () { OvlP208PaneScrollDirty = true; }, { passive: true }); } catch (eS) {}
+        OvlP208PaneScrollDirty = true;
+    }
+    const c = OvlP208PendingCache;
+    // 滚动脏标记只在距上次计算 >= OVL_P208_PENDING_DIRTY_MIN_MS 时才强制重算：视口上方的块译完变高时
+    // Chrome 滚动锚定会调 scrollTop 并触发 scroll 事件，若每次都重算就退回"每次落地一次强制布局"。
+    const age = ovlP198Now() - c.at;
+    if (c.pane === pane && c.list && age < OVL_P208_PENDING_ORDER_TTL_MS && !(OvlP208PaneScrollDirty && age >= OVL_P208_PENDING_DIRTY_MIN_MS)) {
+        const live = c.list.filter(function (el) {
+            return el.isConnected && pane.contains(el) && el.getAttribute('data-ovl-trans-pending') === '1';
+        });
+        if (live.length) { c.list = live; return live; }
+    }
+    const fresh = ovlVisualLangCollectPending(pane);
+    OvlP208PendingCache = { pane: pane, at: ovlP198Now(), list: fresh };
+    OvlP208PaneScrollDirty = false;
+    return fresh;
+}
+
 // 后台调度器：最多 OVL_VISUAL_LANG_CONCURRENCY 个请求同时在飞（"低并发"），每个 worker
 // 是一个自驱动循环——每轮都重新从 DOM 里现取"还没翻译"的块列表（不是一次性排好队），
 // 这样中途新增的待翻块（比如就地编辑改了某一块之后又被标成 pending）会被自动捡起来，
@@ -42297,7 +42350,7 @@ async function ovlVisualLangRunQueue() {
             if (mySeq !== OvlVisualLangState.seq || controller.signal.aborted) return;
             const pane = document.getElementById('ovlVisualPane');
             if (!pane) return;
-            const queue = ovlVisualLangCollectPending(pane);
+            const queue = ovlVisualLangCollectPendingCached(pane);
             if (!queue.length) return;
             const el = queue[0];
             el.removeAttribute('data-ovl-trans-pending');
@@ -42450,6 +42503,9 @@ async function ovlVisualLangRunQueue() {
     for (let i = 0; i < OVL_VISUAL_LANG_CONCURRENCY; i++) workers.push(worker());
     try { await Promise.all(workers); } finally {
         OvlVisualLangState.running = false;
+        // v2 Pass P208：运行结束——清掉限速尾随计时器并立刻补一次 relayout，最终状态必须马上对齐。
+        if (OvlP208RelayoutThrottleTimer !== null) { try { clearTimeout(OvlP208RelayoutThrottleTimer); } catch (eT) {} OvlP208RelayoutThrottleTimer = null; }
+        if (typeof ovlP198ScheduleRelayout === 'function') { try { ovlP198ScheduleRelayout(); } catch (eR) {} }
         if (OvlVisualLangState.controller === controller) OvlVisualLangState.controller = null;
         // v2 Pass P128（C3，进度行"点此继续"）：这一批 worker 全部退出（正常跑完，或者被
         // ovlVisualLangCancelInFlight() 取消）——running 刚变成 false，如果这一批没有跑完
