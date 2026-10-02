@@ -5018,7 +5018,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.42.04';        // APP_VERSION_STAMP
+const APP_VERSION = '03.42.05';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -26989,6 +26989,31 @@ function ovlTermDbMatch(rawText, opts) {
     try {
         const cap = (opts && typeof opts.cap === 'number' && opts.cap > 0) ? Math.floor(opts.cap) : 30;
         const text = ovlTermDbBlankProtected(rawText);
+        // v2 Pass P209：缓存作用域内（纯同步逐块循环）候选列表 + 预建正则每作用域只算一次；
+        // 正则无 g/y 标志，test 无 lastIndex 状态，结果与逐次重建完全一致。
+        const sc = (typeof OvlVisualTransCacheScope !== 'undefined') ? OvlVisualTransCacheScope : null;
+        if (sc) {
+            if (sc.terms === undefined) {
+                const list = (typeof ovlTermDbEffectiveList === 'function') ? ovlTermDbEffectiveList() : [];
+                const cand = list.filter(function (e) {
+                    return e && e.en && e.enabled !== false && (e.kind === 'keep' || (typeof e.zh === 'string' && e.zh.trim()));
+                });
+                cand.sort(function (a, b) { return b.en.length - a.en.length; });
+                sc.terms = cand.map(function (entry) {
+                    let re = null;
+                    try { re = ovlTermDbBuildEntryRegex(entry); } catch (e) { re = null; }
+                    return { entry: entry, re: re };
+                });
+            }
+            const out = [];
+            for (let i = 0; i < sc.terms.length && out.length < cap; i++) {
+                const t = sc.terms[i];
+                if (!t.re) continue;
+                t.re.lastIndex = 0;
+                if (t.re.test(text)) out.push(t.entry);
+            }
+            return out;
+        }
         const all = (typeof ovlTermDbEffectiveList === 'function') ? ovlTermDbEffectiveList() : [];
         const candidates = all.filter(function (e) {
             return e && e.en && e.enabled !== false && (e.kind === 'keep' || (typeof e.zh === 'string' && e.zh.trim()));
@@ -38152,6 +38177,7 @@ function ovlVisualTransCacheOldestProject(exceptId) {
     } catch (e) { return null; }
 }
 function ovlVisualTransCacheDropProject(projectId) {
+    if (OvlVisualTransCacheScope) { OvlVisualTransCacheScope.buckets.delete(projectId); OvlVisualTransCacheScope.dirty.delete(projectId); }
     try {
         localStorage.removeItem(ovlVisualTransCacheBucketKey(projectId));
         const idx = ovlVisualTransCacheIndexLoad();
@@ -38160,7 +38186,52 @@ function ovlVisualTransCacheDropProject(projectId) {
     } catch (e) {}
 }
 
+// v2 Pass P209：同步"缓存作用域"备忘——整篇渲染/回挂角标这类**纯同步**逐块循环里，每块都
+// 整桶 JSON.parse 一遍、命中且 ts 超过 60s 时还整桶 stringify+setItem 一遍，N 块 = N 次整桶
+// 解析 + 最多 N 次整桶写入（~250K 字符桶 × 400 块 = 主线程卡死数十秒）。作用域内：整桶每个
+// projectId 只解析一次、LRU ts 刷新只在内存里改并记脏、最外层 End 时每个脏桶只落盘一次；
+// 术语表/卡片/领域提示这些 key 指纹输入也每作用域只算一次。作用域外行为逐字节不变。
+// 铁律：Begin/End 必须在 try/finally 里成对；作用域绝不许跨 await，只包同步循环。
+let OvlVisualTransCacheScope = null; // { depth, buckets: Map, dirty: Set, card, hint, terms }
+function ovlVisualTransCacheScopeBegin() {
+    if (OvlVisualTransCacheScope) { OvlVisualTransCacheScope.depth++; return; }
+    OvlVisualTransCacheScope = { depth: 1, buckets: new Map(), dirty: new Set(), card: undefined, hint: undefined, terms: undefined };
+}
+function ovlVisualTransCacheScopeEnd() {
+    const sc = OvlVisualTransCacheScope;
+    if (!sc) return;
+    if (--sc.depth > 0) return;
+    OvlVisualTransCacheScope = null; // 先清再落盘：落盘路径里的 Load/Save 走作用域外的原始行为
+    try {
+        sc.dirty.forEach(function (pid) {
+            try {
+                const map = sc.buckets.get(pid);
+                if (map && ovlVisualTransCacheSaveBucket(pid, map)) ovlVisualTransCacheIndexTouch(pid);
+            } catch (e) {}
+        });
+    } catch (e) {}
+}
+function ovlVisualTransCacheScopeDepth() { return OvlVisualTransCacheScope ? OvlVisualTransCacheScope.depth : 0; }
+function ovlVisualTransCacheScopedCard() {
+    const sc = OvlVisualTransCacheScope;
+    if (!sc) return (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+    if (sc.card === undefined) sc.card = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+    return sc.card;
+}
+function ovlVisualTransCacheScopedHint() {
+    const sc = OvlVisualTransCacheScope;
+    if (!sc) return (typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
+    if (sc.hint === undefined) sc.hint = (typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
+    return sc.hint;
+}
 function ovlVisualTransCacheBucketLoad(projectId) {
+    const sc = OvlVisualTransCacheScope;
+    if (sc && sc.buckets.has(projectId)) return sc.buckets.get(projectId);
+    const loaded = ovlVisualTransCacheBucketLoadRaw(projectId);
+    if (sc) sc.buckets.set(projectId, loaded);
+    return loaded;
+}
+function ovlVisualTransCacheBucketLoadRaw(projectId) {
     try {
         const raw = localStorage.getItem(ovlVisualTransCacheBucketKey(projectId));
         const parsed = raw ? JSON.parse(raw) : null;
@@ -38184,6 +38255,7 @@ function ovlVisualTransCacheEvictToBudget(map, budgetChars) {
 // 配额耗尽（QuotaExceededError）时的优雅降级：先淘汰别的项目整桶腾地方（不动当前项目数据），
 // 还不够再砍当前项目桶自己最老的一半，两轮都不行就放弃并提示用户——绝不静默假装存成功。
 function ovlVisualTransCacheSaveBucket(projectId, map) {
+    if (OvlVisualTransCacheScope) OvlVisualTransCacheScope.buckets.set(projectId, map); // P209：后续作用域内 Load 看到的就是这份
     const bucketKey = ovlVisualTransCacheBucketKey(projectId);
     let payload;
     try { payload = JSON.stringify(map); } catch (e) { return false; }
@@ -38282,8 +38354,8 @@ const OVL_VISUAL_TRANS_PROMPT_VERSION = 3;
 function ovlVisualTransCacheContextFingerprint(text, config) {
     try {
         const provider = (config && config.provider) ? String(config.provider) : '';
-        const domainHintLine = (provider === 'local' && typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
-        const card = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+        const domainHintLine = (provider === 'local' && typeof ovlDomainHintPromptLine === 'function') ? ovlVisualTransCacheScopedHint() : '';
+        const card = (typeof ovlPaperCardGet === 'function') ? ovlVisualTransCacheScopedCard() : '';
         const matched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(text, { cap: 30 }) : [];
         const matchedPart = matched.length ? ('\u0001' + JSON.stringify(matched)) : '';
         return ovlVisualHashSrc(domainHintLine + '\u0001' + card + matchedPart);
@@ -38303,7 +38375,7 @@ function ovlVisualTransCacheKey(text, config) {
     if (provider === 'local') {
         ctxFp = '|' + ovlVisualTransCacheContextFingerprint(text, config);
     } else {
-        const card = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+        const card = (typeof ovlPaperCardGet === 'function') ? ovlVisualTransCacheScopedCard() : '';
         const matched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(text, { cap: 30 }) : [];
         if (card || matched.length) ctxFp = '|' + ovlVisualTransCacheContextFingerprint(text, config);
     }
@@ -38422,7 +38494,9 @@ function ovlVisualTransCacheGetMeta(text, config, projectIdOverride) {
             const now = Date.now();
             if (!hit.ts || now - hit.ts > 60000) {
                 hit.ts = now;
-                if (ovlVisualTransCacheSaveBucket(projectId, map)) ovlVisualTransCacheIndexTouch(projectId);
+                if (OvlVisualTransCacheScope) {
+                    OvlVisualTransCacheScope.dirty.add(projectId); // P209：作用域内只记脏，最外层 End 时整桶落盘一次
+                } else if (ovlVisualTransCacheSaveBucket(projectId, map)) ovlVisualTransCacheIndexTouch(projectId);
             }
             // v2 Pass P122（C6）：forced 字段跟 skipped 一样原样透传——ovlVisualTransCachePut
             // 早就在写，这里之前漏读了，调用方（进度行统计"用户强制采用"块数）读到的永远是
@@ -40583,6 +40657,7 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
         sectionIsAppendix: false
     };
     OvlEqNumCounter = eqCounter;
+    ovlVisualTransCacheScopeBegin(); // v2 Pass P209：整篇同步逐块循环共享一个缓存作用域，finally 里 End
     try {
     if (!blocks.length) return ovlVisualRenderChunk(body, true); // v2 Pass P180：这条退化路径产出的仍是整篇正文的最终落地内容，属于 Visual 主渲染路径
     let html = '';
@@ -40692,6 +40767,7 @@ function ovlVisualRenderBodyWithLines(body, baseLine) {
     return html;
     } finally {
         OvlEqNumCounter = null;
+        ovlVisualTransCacheScopeEnd();
     }
 }
 
@@ -40977,6 +41053,7 @@ function ovlVisualBadgeExcludeSelector() {
 // 逃生门才能在重渲染后继续可用。
 function ovlVisualRestoreFailBadges(pane) {
     if (!pane || typeof ovlVisualEnsureRetryBadge !== 'function') return;
+    ovlVisualTransCacheScopeBegin(); // v2 Pass P209：同步逐块查 failLog（key 指纹输入每作用域只算一次）
     try {
         const els = pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-failed="1"]');
         els.forEach(function (el) {
@@ -40992,7 +41069,7 @@ function ovlVisualRestoreFailBadges(pane) {
             } catch (e) {}
             ovlVisualEnsureRetryBadge(el, { reason: reason, attempts: attempts, detail: detail, echoCandidate: echoCandidate });
         });
-    } catch (e) {}
+    } catch (e) {} finally { ovlVisualTransCacheScopeEnd(); }
 }
 // v2 Pass P128e（B3-1 阻断收口）："无可译文本"角标（.ovl-visual-noprose-badge）是运行时插入
 // 的真实 DOM 节点——跟失败角标同一条纪律（ovlVisualRestoreFailBadges 头部注释），字符串
