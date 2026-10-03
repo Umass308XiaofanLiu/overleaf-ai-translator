@@ -564,19 +564,52 @@ function readBody(req) {
 // job id"精确匹配再杀一遍——job id 是 crypto.randomBytes 生成的唯一字符串，不含路径分隔符，
 // 天然不受正斜杠/反斜杠差异影响，也不会误杀别的编译任务或用户自己手跑的 TeX 进程。
 function killTree(pid, jobIdHint) {
-    if (!pid) return;
+    // v2 Pass P214 SERVER-5：返回 Promise，调用方可以不等；/admin/restart 与 SIGINT 要等它收尾再退出。
+    // taskkill 与二次扫荡都改用异步 spawn（各自带超时上限）：以前都是 execSync，会把整个事件循环
+    // （所有 HTTP/WS）卡住——扫荡最长 8 秒，taskkill 在被拒绝/卡住时也可达数秒。
+    if (!pid) return Promise.resolve();
     if (process.platform === 'win32') {
-        try { execSync('taskkill /pid ' + pid + ' /T /F', { stdio: 'ignore' }); } catch (e) {}
-        if (jobIdHint) {
-            try {
-                const escaped = String(jobIdHint).replace(/'/g, "''");
-                const psCmd = "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -like '*" + escaped + "*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
-                execSync('powershell -NoProfile -NonInteractive -Command "' + psCmd.replace(/"/g, '\\"') + '"', { stdio: 'ignore', timeout: 8000, windowsHide: true });
-            } catch (e) {}
-        }
+        return runTaskkillAsync(pid).then(() => (jobIdHint ? sweepJobIdProcessesAsync(jobIdHint) : undefined));
     } else {
         try { process.kill(-pid, 'SIGKILL'); } catch (e) { try { process.kill(pid, 'SIGKILL'); } catch (e2) {} }
+        return Promise.resolve();
     }
+}
+
+function runTaskkillAsync(pid) {
+    return new Promise((resolve) => {
+        let done = false;
+        const finishOnce = () => { if (!done) { done = true; resolve(); } };
+        try {
+            const tk = spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore', windowsHide: true });
+            const t = setTimeout(() => { try { tk.kill(); } catch (e) {} finishOnce(); }, 10000);
+            tk.on('error', () => { clearTimeout(t); finishOnce(); });
+            tk.on('close', () => { clearTimeout(t); finishOnce(); });
+        } catch (e) { finishOnce(); }
+    });
+}
+
+// 按命令行含 job id 精确扫荡（异步，永不 resolve 失败）。排除扫荡用的 powershell 自己
+// （它的命令行里也含这个 job id）。
+function sweepJobIdProcessesAsync(jobIdHint) {
+    return new Promise((resolve) => {
+        let done = false;
+        const finishOnce = () => { if (!done) { done = true; resolve(); } };
+        try {
+            const escaped = String(jobIdHint).replace(/'/g, "''");
+            const psCmd = "Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.ProcessId -ne $PID -and $_.CommandLine -like '*" + escaped + "*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+            const ps = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(psCmd, 'utf16le').toString('base64')], { stdio: 'ignore', windowsHide: true });
+            const t = setTimeout(() => { try { ps.kill(); } catch (e) {} finishOnce(); }, 8000);
+            const t0 = Date.now();
+            ps.on('error', () => { clearTimeout(t); finishOnce(); });
+            ps.on('close', (code) => {
+                clearTimeout(t);
+                // 诊断日志：二次扫荡到底有没有跑、花了多久（以前同步执行，全程零日志）。
+                try { console.log('[latex-bridge] job-id sweep ' + jobIdHint + ' -> exit ' + code + ' in ' + (Date.now() - t0) + 'ms'); } catch (e) {}
+                finishOnce();
+            });
+        } catch (e) { finishOnce(); }
+    });
 }
 
 const ID_RE = /^[a-zA-Z0-9_-]+$/;
@@ -584,6 +617,60 @@ const ID_RE = /^[a-zA-Z0-9_-]+$/;
 function safeOutdirForId(id) {
     if (typeof id !== 'string' || !ID_RE.test(id)) return null;
     return path.join(WORK_ROOT, id);
+}
+
+// v2 Pass P214 SERVER-8：WORK_ROOT 下的任务目录以前只有手动 /clear 才会删，长期运行的桥会无限涨。
+// 现在每次新建任务目录（compile / synctex/rehydrate）时顺带异步清理：超过 3 天、或不在最新 50 个之内的
+// 目录删掉；当前任务的目录（刚创建的 + 正在跑的编译）永不删；每小时最多跑一次，绝不阻塞请求。
+// 两个环境变量只给测试用，默认值就是上面的口径。
+function envIntOr(name, dflt) {
+    const v = process.env[name];
+    if (v === undefined || v === '') return dflt;
+    const n = parseInt(v, 10);
+    return isFinite(n) && n >= 0 ? n : dflt;
+}
+const WORK_PRUNE_MAX_AGE_MS = envIntOr('LATEX_BRIDGE_WORK_MAX_AGE_MS', 3 * 24 * 3600 * 1000);
+const WORK_PRUNE_KEEP = envIntOr('LATEX_BRIDGE_WORK_KEEP', 50);
+const WORK_PRUNE_INTERVAL_MS = 3600 * 1000;
+let lastWorkPruneAt = 0;
+let workPruneRunning = false;
+function scheduleWorkRootPrune(protectedId) {
+    const now = Date.now();
+    if (workPruneRunning || (lastWorkPruneAt && now - lastWorkPruneAt < WORK_PRUNE_INTERVAL_MS)) return;
+    lastWorkPruneAt = now;
+    workPruneRunning = true;
+    setImmediate(() => {
+        pruneWorkRoot(protectedId).then(() => {}, () => {}).then(() => { workPruneRunning = false; });
+    });
+}
+async function pruneWorkRoot(protectedId) {
+    let names;
+    try { names = await fs.promises.readdir(WORK_ROOT); } catch (e) { return; }
+    const items = [];
+    for (const n of names) {
+        if (!ID_RE.test(n)) continue;
+        try {
+            const st = await fs.promises.stat(path.join(WORK_ROOT, n));
+            if (st.isDirectory()) items.push({ name: n, mtimeMs: st.mtimeMs });
+        } catch (e) {}
+    }
+    items.sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const now = Date.now();
+    for (let i = 0; i < items.length; i++) {
+        const it = items[i];
+        if (it.name === protectedId || it.name === currentChildId) continue;
+        if (i >= WORK_PRUNE_KEEP || now - it.mtimeMs > WORK_PRUNE_MAX_AGE_MS) {
+            await fsRemoveTree(path.join(WORK_ROOT, it.name), { force: true });
+        }
+    }
+}
+
+// v2 Pass P214 S-C：mainFile 必须落在 projectDir 之内（含符号链接/junction 与 .git 校验，复用 resolveInProject）。
+// 以前 /compile、/wordcount、/synctex/forward 对绝对路径或带 .. 的 mainFile 照单全收，白名单只检查了 projectDir。
+function resolveMainFileInProject(projectDir, mainFile) {
+    if (typeof mainFile !== 'string' || !mainFile) return null;
+    const r = resolveInProject(projectDir, mainFile);
+    return r.ok ? r.resolved : null;
 }
 
 // -file-line-error 打开后，真正的 fatal error 是 "<file>:<line>: <message>" 这个形状。
@@ -612,7 +699,7 @@ function unwrapLogLines(rawLines) {
 function parseLog(logText) {
     const lines = unwrapLogLines(logText.split(/\r?\n/));
     const entries = [];
-    const fileLineRe = /^([^\s:][^:]*\.(?:tex|sty|cls|bbl)):(\d+):\s*(.+)$/;
+    const fileLineRe = /^((?:[A-Za-z]:)?[^\s:][^:]*\.(?:tex|sty|cls|bbl)):(\d+):\s*(.+)$/; // v2 Pass P214 SERVER-6：允许盘符前缀 C:/...
     const warnRe = /(LaTeX|Package \S+|Class \S+) Warning:\s*(.+)$/;
     const boxRe = /^(Overfull|Underfull) \\(hbox|vbox)\s*\(([^)]*)\)\s*(.*)$/;
     const lineNumRe = /(?:on input line|at lines?)\s+(\d+)/;
@@ -693,6 +780,21 @@ function contentTypeFor(name) {
 //   - 前缀比较用 "base + 分隔符" 而不是裸 base，防止 "C:\proj-evil" 这种同前缀但其实是
 //     兄弟目录的假阳性（"C:\proj" 是 "C:\proj-evil" 的字符串前缀，但不是同一个目录）。
 // ---------------------------------------------------------------------------
+// v2 Pass P214 SERVER-11/12：判断相对路径的某一段是否指向 .git。Windows 文件系统大小写不敏感，
+// 且会忽略段尾的点和空格、接受 NTFS 备用数据流后缀（.git::$DATA）与 8.3 短名（GIT~1），所以
+// win32 下要先规范化再比较；其他平台保持精确匹配。resolveInProject 与 safeProjectAssetPath 共用。
+function isGitPathSegment(seg) {
+    let t = String(seg);
+    if (process.platform === 'win32') {
+        t = t.split(':')[0].replace(/[. ]+$/, '').toLowerCase();
+        return t === '.git' || /^git~\d+$/.test(t);
+    }
+    return t === '.git';
+}
+function relSegmentsHaveGit(segments) {
+    return segments.some(isGitPathSegment);
+}
+
 function safeProjectAssetPath(projectDir, relPath) {
     if (typeof projectDir !== 'string' || !projectDir) return null;
     if (typeof relPath !== 'string' || !relPath) return null;
@@ -702,6 +804,8 @@ function safeProjectAssetPath(projectDir, relPath) {
     try { resolved = path.resolve(base, relPath); } catch (e) { return null; }
     const baseWithSep = base.endsWith(path.sep) ? base : base + path.sep;
     if (resolved !== base && resolved.indexOf(baseWithSep) !== 0) return null; // 跑出项目目录，一律拒绝
+    // v2 Pass P214 SERVER-12：同 resolveInProject，拒绝 .git 内部路径（.git/config 可能含带凭据的 remote URL）。
+    if (relSegmentsHaveGit(path.relative(base, resolved).split(path.sep).filter((x) => x.length > 0))) return null;
     return resolved;
 }
 
@@ -958,8 +1062,13 @@ function doCompile(projectDir, mainFile, opts) {
             resolve({ ok: false, error: 'mkdir outdir failed: ' + e.message });
             return;
         }
+        scheduleWorkRootPrune(id); // v2 Pass P214 SERVER-8
 
-        const mainAbs = path.isAbsolute(mainFile) ? mainFile : path.join(projectDir, mainFile);
+        const mainAbs = resolveMainFileInProject(projectDir, mainFile); // v2 Pass P214 S-C
+        if (!mainAbs) {
+            resolve({ ok: false, error: 'mainFile 必须位于项目目录内: ' + String(mainFile) });
+            return;
+        }
         if (!fs.existsSync(mainAbs)) {
             resolve({ ok: false, error: 'main file not found: ' + mainAbs });
             return;
@@ -1011,7 +1120,7 @@ function doCompile(projectDir, mainFile, opts) {
         // stdout 确认，不用再靠翻 WORK_ROOT 时间戳侧面推断。
         if (currentChild) {
             const preemptedJobId = currentChildId;
-            try { killTree(currentChild.pid); } catch (e) {}
+            try { killTree(currentChild.pid, preemptedJobId); } catch (e) {} // v2 Pass P214 SERVER-5：带 job id 触发二次扫荡
             logRequest({ method: 'POST', pathname: '/compile', jobId: preemptedJobId, outcome: 'preempted' });
             currentChild = null;
         }
@@ -1190,7 +1299,11 @@ function doWordCount(projectDir, mainFile) {
             resolve({ ok: false, error: 'texcount 未找到: ' + TEXCOUNT + '（检查 LATEX_BRIDGE_TEXBIN / TeX Live 是否安装）' });
             return;
         }
-        const mainAbs = path.isAbsolute(mainFile) ? mainFile : path.join(projectDir, mainFile);
+        const mainAbs = resolveMainFileInProject(projectDir, mainFile); // v2 Pass P214 S-C
+        if (!mainAbs) {
+            resolve({ ok: false, error: 'mainFile 必须位于项目目录内: ' + String(mainFile) });
+            return;
+        }
         if (!fs.existsSync(mainAbs)) {
             resolve({ ok: false, error: 'main file not found: ' + mainAbs });
             return;
@@ -1410,6 +1523,9 @@ function doPickFolder() {
         // 用一个隐藏但 TopMost 的宿主 Form 当 owner，不然对话框有时会开在其他窗口后面、
         // 用户以为没反应——实测（本机 Windows 10）不挂 owner 偶发这个问题。
         const psScript = [
+            // v2 Pass P214 SERVER-7：PowerShell 默认按控制台 OEM 代码页写 stdout（中文系统 CP936），
+            // 而下面是按 UTF-8 解码的，含中文的文件夹路径会变成乱码、随后 existsSync 失败。显式切 UTF-8（无 BOM）。
+            '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)',
             'Add-Type -AssemblyName System.Windows.Forms',
             '$owner = New-Object System.Windows.Forms.Form',
             '$owner.TopMost = $true',
@@ -1855,7 +1971,24 @@ const OVERLEAF_STASH_MESSAGE = 'AI-Translator 自动暂存';
 // 在这里提前挡），旧版裸 --porcelain 把未跟踪文件也算成"脏"是这一轮要修的根因 bug。
 // countUntrackedFiles() 单独用不带 -uno 的 --porcelain 去数 ?? 开头的未跟踪文件，两件事分开
 // 做，任何 strategy 都绝不碰未跟踪文件一根汗毛（不 stash、不 discard、更不会 clean/删除）。
-async function doOverleafPull(projectDir, gitUrl, token, strategy) {
+// v2 Pass P214 SERVER-10：同一个项目目录上的 Overleaf pull / push / fs restore 串行，
+// 避免 stash push/pop、add -u/commit 与 merge 互相交错（index.lock 报错、stash 被别的请求弹走）。
+const projectOpTails = new Map();
+function withProjectLock(projectDir, fn) {
+    let key = String(projectDir);
+    try { key = path.resolve(key); } catch (e) {}
+    if (process.platform === 'win32') key = key.toLowerCase();
+    const prev = projectOpTails.get(key) || Promise.resolve();
+    const run = prev.then(fn);
+    const tail = run.then(() => {}, () => {});
+    projectOpTails.set(key, tail);
+    tail.then(() => { if (projectOpTails.get(key) === tail) projectOpTails.delete(key); });
+    return run;
+}
+function doOverleafPull(projectDir, gitUrl, token, strategy) {
+    return withProjectLock(projectDir, () => doOverleafPullImpl(projectDir, gitUrl, token, strategy));
+}
+async function doOverleafPullImpl(projectDir, gitUrl, token, strategy) {
     if (strategy === undefined || strategy === null || strategy === '') strategy = 'abort';
     if (['abort', 'stash', 'discard'].indexOf(strategy) === -1) {
         return { ok: false, error: '非法的 strategy 参数: ' + strategy + '（只接受 abort/stash/discard）' };
@@ -1943,6 +2076,16 @@ async function doOverleafPull(projectDir, gitUrl, token, strategy) {
             // 打快照失败不阻断丢弃本身（那是既有的"丢弃"功能，不能因为新增的保障机制本身
             // 出故障就连累主流程），只是响应里 checkpointAvailable 会如实为 false。
             discardCp = await fsGitCheckpoint(projectDir, 'overleaf pull discard');
+            // v2 Pass P214 SERVER-2：没有成功生成回退检查点（git add 超时 / 自检失败 / 不是工作树）时，
+            // 绝不执行 git checkout -- .——否则未提交的已跟踪改动无任何恢复途径。客户端对 ok:false 的
+            // 拉取结果会原样 toast「拉取失败：<error>」。
+            if (!discardCp.checkpoint) {
+                return Object.assign({
+                    ok: false, action: 'discard-no-checkpoint',
+                    error: '无法在丢弃前创建回退检查点' + (discardCp.warning ? '（' + discardCp.warning + '）' : '') +
+                        '，为避免本地改动永久丢失，已取消「丢弃本地改动」，本地文件原样保留。请先手动提交或备份，或改用「暂存」后再拉取。'
+                }, checkpointFields(discardCp));
+            }
             // 只丢弃已跟踪文件的改动——绝不用 git clean，一个未跟踪文件都不许删。
             const discardResult = await runGitCommand(['checkout', '--', '.'], projectDir, token);
             if (!discardResult.ok) {
@@ -2062,7 +2205,10 @@ async function countUntrackedFiles(projectDir, token) {
     return statusResult.stdout.split(/\r?\n/).filter((line) => line.indexOf('??') === 0).length;
 }
 
-async function doOverleafPush(projectDir, gitUrl, token, message) {
+function doOverleafPush(projectDir, gitUrl, token, message) {
+    return withProjectLock(projectDir, () => doOverleafPushImpl(projectDir, gitUrl, token, message));
+}
+async function doOverleafPushImpl(projectDir, gitUrl, token, message) {
     try {
         const gitDir = path.join(projectDir, '.git');
         let hasGitDir = false;
@@ -2560,7 +2706,7 @@ function resolveInProject(projectDir, relPath) {
 
     const relForCheck = path.relative(base, resolved);
     const segments = relForCheck.split(path.sep).filter((s) => s.length > 0);
-    if (segments.indexOf('.git') !== -1) {
+    if (relSegmentsHaveGit(segments)) { // v2 Pass P214 SERVER-11：大小写/尾点空格不敏感
         return { ok: false, error: '拒绝访问 .git 内部路径' };
     }
 
@@ -2814,7 +2960,11 @@ async function doFsRead(projectDir, relPath) {
     if (looksBinary(buf)) {
         return { ok: true, path: relPath, size: st.size, binary: true, content: null, mtimeMs: st.mtimeMs };
     }
-    return { ok: true, path: relPath, size: st.size, binary: false, content: buf.toString('utf8'), mtimeMs: st.mtimeMs };
+    // v2 Pass P214 SERVER-3：内容往返不一致（Latin-1/GBK 等非 UTF-8 文件）时置 nonUtf8:true——
+    // content 里已经是 U+FFFD 替换字符，原样写回会永久丢字节。内容本身不改，交给客户端决定只读还是确认。
+    const textContent = buf.toString('utf8');
+    const nonUtf8 = !Buffer.from(textContent, 'utf8').equals(buf);
+    return { ok: true, path: relPath, size: st.size, binary: false, content: textContent, nonUtf8: nonUtf8, mtimeMs: st.mtimeMs };
 }
 
 // v2 Pass P50：expectedMtimeMs 是可选的乐观并发冲突检测——远程模式下浏览器读到的文件内容
@@ -2822,21 +2972,52 @@ async function doFsRead(projectDir, relPath) {
 // 自己另一个标签页）可能已经改过磁盘上的同一个文件；不检测直接写会把对方的修改静默覆盖掉。
 // 只在调用方明确传了这个数字时才检查（新建文件等场景不传，语义上"不关心冲突"）；文件此刻
 // 不存在时不算冲突（新建场景），只有"文件存在且 mtime 跟调用方读到时不一致"才判冲突。
+//
+// v2 Pass P214 SERVER-1：同一路径上的 write / write-binary / delete / move 串行（见 withPathLocks），
+// 且 mtime 在 fsGitCheckpoint（约 9 次 git 子进程，最长 30 秒）之后、真正落盘之前再核对一次——
+// 以前只在 checkpoint 之前核对，这段窗口里的外部改动会被静默覆盖，两个重叠的保存也会乱序落盘。
+// 刻意保留原地写（不改 temp+rename）：rename 会改变 fs.watch、OneDrive、杀软看到的事件形状。
+const pathWriteTails = new Map();
+function withPathLocks(paths, fn) {
+    const keys = Array.from(new Set(paths.map((p) => process.platform === 'win32' ? String(p).toLowerCase() : String(p)))).sort();
+    const step = (i) => {
+        if (i >= keys.length) return fn();
+        const key = keys[i];
+        const prev = pathWriteTails.get(key) || Promise.resolve();
+        const run = prev.then(() => step(i + 1));
+        const tail = run.then(() => {}, () => {});
+        pathWriteTails.set(key, tail);
+        tail.then(() => { if (pathWriteTails.get(key) === tail) pathWriteTails.delete(key); });
+        return run;
+    };
+    return step(0);
+}
+function fsMtimeConflict(absPath, expectedMtimeMs) {
+    if (typeof expectedMtimeMs !== 'number' || !isFinite(expectedMtimeMs)) return null;
+    let curStat = null;
+    try { curStat = fs.statSync(absPath); } catch (e) { curStat = null; }
+    if (curStat && curStat.mtimeMs !== expectedMtimeMs) {
+        return {
+            ok: false, conflict: true, currentMtimeMs: curStat.mtimeMs,
+            error: '文件已被外部修改（磁盘上的 mtime 跟你上次读取时不一致），为避免覆盖对方的修改，本次保存已取消。'
+        };
+    }
+    return null;
+}
 async function doFsWrite(projectDir, relPath, content, expectedMtimeMs) {
     const r = resolveInProject(projectDir, relPath);
     if (!r.ok) return { ok: false, error: r.error };
     if (typeof content !== 'string') return { ok: false, error: 'content 必须是字符串' };
-    if (typeof expectedMtimeMs === 'number' && isFinite(expectedMtimeMs)) {
-        let curStat = null;
-        try { curStat = fs.statSync(r.resolved); } catch (e) { curStat = null; }
-        if (curStat && curStat.mtimeMs !== expectedMtimeMs) {
-            return {
-                ok: false, conflict: true, currentMtimeMs: curStat.mtimeMs,
-                error: '文件已被外部修改（磁盘上的 mtime 跟你上次读取时不一致），为避免覆盖对方的修改，本次保存已取消。'
-            };
-        }
-    }
+    return withPathLocks([r.resolved], () => doFsWriteImpl(projectDir, relPath, content, expectedMtimeMs));
+}
+async function doFsWriteImpl(projectDir, relPath, content, expectedMtimeMs) {
+    const r = resolveInProject(projectDir, relPath);
+    if (!r.ok) return { ok: false, error: r.error };
+    const early = fsMtimeConflict(r.resolved, expectedMtimeMs);
+    if (early) return early;
     const cp = await fsGitCheckpoint(projectDir, 'write ' + relPath);
+    const late = fsMtimeConflict(r.resolved, expectedMtimeMs);
+    if (late) return Object.assign(late, checkpointFields(cp));
     try { fs.mkdirSync(path.dirname(r.resolved), { recursive: true }); }
     catch (e) { return Object.assign({ ok: false, error: '创建父目录失败: ' + e.message }, checkpointFields(cp)); }
     try { fs.writeFileSync(r.resolved, content, 'utf8'); }
@@ -2863,6 +3044,11 @@ async function doFsWrite(projectDir, relPath, content, expectedMtimeMs) {
 // 本端点走 base64 传输 + 服务端原样 Buffer 落盘，绕开这条坑；本地 FSA 句柄写二进制本来就没有
 // 这个问题（ovlPerformUpload 直接 write(arrayBuffer)），前端只在远程模式下才会调用这个端点。
 async function doFsWriteBinary(projectDir, relPath, contentBase64, opts) {
+    const r0 = resolveInProject(projectDir, relPath);
+    if (!r0.ok) return { ok: false, error: r0.error };
+    return withPathLocks([r0.resolved], () => doFsWriteBinaryImpl(projectDir, relPath, contentBase64, opts)); // v2 Pass P214 SERVER-1
+}
+async function doFsWriteBinaryImpl(projectDir, relPath, contentBase64, opts) {
     opts = opts || {};
     const skipCheckpoint = !!opts.skipCheckpoint;
     const r = resolveInProject(projectDir, relPath);
@@ -2919,6 +3105,13 @@ async function doFsMkdir(projectDir, relPath) {
 }
 
 async function doFsMove(projectDir, fromRel, toRel) {
+    const rf0 = resolveInProject(projectDir, fromRel);
+    if (!rf0.ok) return { ok: false, error: '来源路径: ' + rf0.error };
+    const rt0 = resolveInProject(projectDir, toRel);
+    if (!rt0.ok) return { ok: false, error: '目标路径: ' + rt0.error };
+    return withPathLocks([rf0.resolved, rt0.resolved], () => doFsMoveImpl(projectDir, fromRel, toRel)); // v2 Pass P214 SERVER-1
+}
+async function doFsMoveImpl(projectDir, fromRel, toRel) {
     const rf = resolveInProject(projectDir, fromRel);
     if (!rf.ok) return { ok: false, error: '来源路径: ' + rf.error };
     const rt = resolveInProject(projectDir, toRel);
@@ -2966,6 +3159,11 @@ async function doFsCopy(projectDir, fromRel, toRel) {
 }
 
 async function doFsDelete(projectDir, relPath) {
+    const r0 = resolveInProject(projectDir, relPath);
+    if (!r0.ok) return { ok: false, error: r0.error };
+    return withPathLocks([r0.resolved], () => doFsDeleteImpl(projectDir, relPath)); // v2 Pass P214 SERVER-1
+}
+async function doFsDeleteImpl(projectDir, relPath) {
     const r = resolveInProject(projectDir, relPath);
     if (!r.ok) return { ok: false, error: r.error };
     if (!fs.existsSync(r.resolved)) return { ok: false, error: '路径不存在: ' + relPath };
@@ -3038,7 +3236,10 @@ const FS_RESTORE_DELETE_CIRCUIT_BREAKER = 30;
 //   - 恢复后残留的空目录清理是尽力而为（pruneEmptyDirs 内部吞掉异常），极端情况下
 //     （比如某个空目录被占用无法删除）可能留下一个 git 本来就不追踪的空目录，不影响
 //     任何文件内容的正确性。
-async function doFsRestore(projectDir, checkpointRef, opts) {
+function doFsRestore(projectDir, checkpointRef, opts) {
+    return withProjectLock(projectDir, () => doFsRestoreImpl(projectDir, checkpointRef, opts));
+}
+async function doFsRestoreImpl(projectDir, checkpointRef, opts) {
     opts = opts || {};
     const dryRun = !!opts.dryRun;
     const force = !!opts.force;
@@ -3211,6 +3412,15 @@ function ovlOriginAllowed(req) {
     return /^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/i.test(origin);
 }
 
+// v2 Pass P214 S-B：以前只有 /fs/*、/overleaf/*、/admin/restart 过 ovlOriginAllowed；下面这些同样有
+// 副作用的 POST 端点没有——跨站页面用不触发预检的 text/plain POST 就能发起编译、清缓存、杀掉正在跑的
+// 编译、弹出文件夹选择框。统一在路由分发前挡一道。放行规则不变：无 Origin（curl）、"null"（file://
+// 打开的 App）、桥自己服务的页面（SELF_ORIGIN）、localhost/127.0.0.1。
+const ORIGIN_GATED_POST_PATHS = new Set([
+    '/pick-folder', '/compile', '/stop', '/wordcount', '/clear',
+    '/synctex/forward', '/synctex/edit', '/synctex/rehydrate'
+]);
+
 // ---------------------------------------------------------------------------
 // HTTP 路由
 // ---------------------------------------------------------------------------
@@ -3333,6 +3543,11 @@ const server = http.createServer(async (req, res) => {
         }
 
         // v2 Pass P17：原生文件夹选择框（POST，不带 body）——见 doPickFolder 头部注释。
+        if (req.method === 'POST' && ORIGIN_GATED_POST_PATHS.has(pathname) && !ovlOriginAllowed(req)) {
+            sendJson(res, 403, { ok: false, error: '拒绝来自外部网页的请求。这个接口只接受 AI-Translator 页面本身的调用。' });
+            return;
+        }
+
         if (req.method === 'POST' && pathname === '/pick-folder') {
             const result = await doPickFolder();
             sendJson(res, 200, result);
@@ -3381,7 +3596,7 @@ const server = http.createServer(async (req, res) => {
         // M4「Stop compilation」：杀掉当前正在跑的编译进程树（如果有）。
         if (req.method === 'POST' && pathname === '/stop') {
             if (currentChild) {
-                try { killTree(currentChild.pid); } catch (e) {}
+                try { killTree(currentChild.pid, currentChildId); } catch (e) {} // v2 Pass P214 SERVER-5
                 currentChild = null;
                 currentChildId = null;
                 sendJson(res, 200, { ok: true, stopped: true });
@@ -3436,7 +3651,8 @@ const server = http.createServer(async (req, res) => {
             // v2 Pass P154：根目录白名单，未设置环境变量时恒放行。
             if (rejectIfProjectDirNotAllowed(res, projectDir)) return;
             if (!line || line < 1) { sendJson(res, 400, { ok: false, error: 'line 必须是正整数' }); return; }
-            const mainAbs = path.isAbsolute(mainFile) ? mainFile : path.join(projectDir, mainFile);
+            const mainAbs = resolveMainFileInProject(projectDir, mainFile); // v2 Pass P214 S-C
+            if (!mainAbs) { sendJson(res, 400, { ok: false, error: 'mainFile 必须位于项目目录内' }); return; }
             const result = await doSyncTexForward(outdir, mainAbs, line, body.column || 0);
             sendJson(res, 200, result);
             return;
@@ -3507,6 +3723,7 @@ const server = http.createServer(async (req, res) => {
                 fs.mkdirSync(outdir, { recursive: true });
                 fs.copyFileSync(pdfAbs, path.join(outdir, 'output.pdf'));
                 if (synctexAbs) fs.copyFileSync(synctexAbs, path.join(outdir, 'output.synctex.gz'));
+                scheduleWorkRootPrune(id); // v2 Pass P214 SERVER-8
             } catch (e) {
                 // v2 Pass P154：OneDrive 占位符人话报错——两个候选源文件里，先看 output.pdf
                 // 是不是没落地（没落地说明是 pdfAbs 那次拷贝失败的），落地了就是 synctexAbs
@@ -3925,12 +4142,14 @@ const server = http.createServer(async (req, res) => {
                 // 这层 sh.exe 自己派生出的孙进程；/admin/restart 的定位是"干净收尾"，不能只做
                 // /stop 那种单纯 taskkill，必须带上二次扫荡这一环。
                 const jobIdHint = currentChildId;
-                try { killTree(currentChild && currentChild.pid, jobIdHint); } catch (e) {}
+                let sweep = Promise.resolve();
+                try { sweep = killTree(currentChild && currentChild.pid, jobIdHint) || sweep; } catch (e) {}
                 currentChild = null;
                 currentChildId = null;
                 // 非零退出码——外部计划任务据此判定"任务失败"才会触发它的 RestartCount 自愈，
                 // 退出码 0 不会。这不是错误，是故意的信号。
-                process.exit(1);
+                // v2 Pass P214：二次扫荡现在是异步的，先等它收尾（killTree 内部自带 8 秒上限）再退出。
+                sweep.then(() => process.exit(1), () => process.exit(1));
             }, 1000);
             return;
         }
@@ -4060,4 +4279,8 @@ server.listen(PORT, HOST, () => {
     }
 });
 
-process.on('SIGINT', () => { try { killTree(currentChild && currentChild.pid); } catch (e) {} process.exit(0); });
+process.on('SIGINT', () => {
+    let p = null;
+    try { p = killTree(currentChild && currentChild.pid); } catch (e) {}
+    Promise.resolve(p).then(() => process.exit(0), () => process.exit(0)); // v2 Pass P214：killTree 现在是异步的
+});
