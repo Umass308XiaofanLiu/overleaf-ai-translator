@@ -5018,7 +5018,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.42.09';        // APP_VERSION_STAMP
+const APP_VERSION = '03.42.10';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-03';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -41118,9 +41118,18 @@ function ovlVisualRestoreShortPartialBadges(pane) {
 // 明确、诚实披露的限制，不是遗漏。
 let OvlVisualBtrMarks = {};
 const OVL_VISUAL_BTR_MARKS_MAX = 500; // 会话内粗放上限，超了淘汰最老的，正常使用几乎碰不到
+// v2 Pass P213（WRITEBACK-10）：标记表的钥匙带上当前文件身份（fileKey +  + 内容哈希）。
+// 以前只用内容哈希：文件 A 回译后，文件 B（或 A 里的孪生段）里字节相同的段落也会亮出撤销角标，
+// 点下去会把那段换成 A 的旧文本。没有文件身份（fileKey 为 null）时钥匙以 '' 开头，
+// 只会在同样没有文件身份时命中——旧的"无 fileKey"记录不会误配到任何有身份的文件。
+function ovlVisualBtrMarkKey(text) {
+    let fk = null;
+    try { fk = (typeof ovlVisualBtrCurrentFileKey === 'function') ? ovlVisualBtrCurrentFileKey() : null; } catch (e) {}
+    return (fk == null ? '' : String(fk)) + '' + ovlVisualHashSrc(text);
+}
 function ovlVisualBtrMarkSet(newEnText, oldEnText) {
     try {
-        const key = ovlVisualHashSrc(newEnText);
+        const key = ovlVisualBtrMarkKey(newEnText);
         const keys = Object.keys(OvlVisualBtrMarks);
         if (keys.length >= OVL_VISUAL_BTR_MARKS_MAX) {
             keys.sort(function (a, b) { return (OvlVisualBtrMarks[a].ts || 0) - (OvlVisualBtrMarks[b].ts || 0); });
@@ -41131,14 +41140,37 @@ function ovlVisualBtrMarkSet(newEnText, oldEnText) {
 }
 // 挂进既有的"重建一批块 DOM 后统一补状态"聚合点（P128f 确立的扩展纪律：以后任何新的重建一批
 // 块 DOM 的路径只要记得调 ovlVisualRestoreAllBadges 就不会再漏，见下面的调用点）。
+// v2 Pass P213（WRITEBACK-8）：按行区间从已经算好的 lineStarts 里切源码——跟
+// ovlGutterLineRangeToChars 同一套夹取/不吞换行的规则，只是不再每块重建一遍全文的行首表。
+function ovlVisualSliceByLineStarts(val, starts, lo, hi) {
+    const n = starts.length;
+    lo = Math.max(0, Math.min(n - 1, lo));
+    hi = Math.max(0, Math.min(n - 1, hi));
+    const start = starts[lo];
+    let end = (hi + 1 < n) ? (starts[hi + 1] - 1) : val.length;
+    if (end < start) end = start;
+    return { start: start, end: end, text: val.slice(start, end) };
+}
 function ovlVisualRestoreBtrMarks(pane) {
     if (!pane) return;
     try {
+        // v2 Pass P213（WRITEBACK-8）：正常状态下标记表是空的——整篇渲染/局部 patch 每次都对每个块
+        // 重建全文行首表再哈希是纯浪费（O(块数×全文)）。空表直接早退，只顺手清掉残留角标。
+        if (!Object.keys(OvlVisualBtrMarks).length) {
+            pane.querySelectorAll('[data-ovl-btr]').forEach(function (el) { el.removeAttribute('data-ovl-btr'); });
+            return;
+        }
         const els = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta) return;
+        const val = ta.value;
+        const starts = ovlBuildLineStarts(val); // 每次调用只建一次
         els.forEach(function (el) {
-            const srcText = ovlVisualBlockSrcText(el);
-            if (srcText == null) return;
-            const key = ovlVisualHashSrc(srcText);
+            const lo = parseInt(el.getAttribute('data-src-line'), 10);
+            const hi = parseInt(el.getAttribute('data-src-line-end'), 10);
+            if (!isFinite(lo) || !isFinite(hi)) return;
+            const srcText = ovlVisualSliceByLineStarts(val, starts, lo, hi).text;
+            const key = ovlVisualBtrMarkKey(srcText);
             if (OvlVisualBtrMarks[key]) el.setAttribute('data-ovl-btr', '1');
             else el.removeAttribute('data-ovl-btr'); // 哈希对不上——原生 undo 撤了/别处又改了，标记天然消失
         });
@@ -41159,8 +41191,16 @@ function ovlVisualBtrLocateBlock(origEnText) {
         const pane = document.getElementById('ovlVisualPane');
         if (!pane) return null;
         const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+        // v2 Pass P213（WRITEBACK-8）：行首表整个循环只建一次。
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta) return null;
+        const val = ta.value;
+        const starts = ovlBuildLineStarts(val);
         for (let i = 0; i < blocks.length; i++) {
-            if (ovlVisualBlockSrcText(blocks[i]) === origEnText) return blocks[i];
+            const lo = parseInt(blocks[i].getAttribute('data-src-line'), 10);
+            const hi = parseInt(blocks[i].getAttribute('data-src-line-end'), 10);
+            if (!isFinite(lo) || !isFinite(hi)) continue;
+            if (ovlVisualSliceByLineStarts(val, starts, lo, hi).text === origEnText) return blocks[i];
         }
     } catch (e) {}
     return null;
@@ -41168,7 +41208,7 @@ function ovlVisualBtrLocateBlock(origEnText) {
 function ovlVisualBtrUndoClick(el) {
     const srcText = ovlVisualBlockSrcText(el);
     if (srcText == null) return;
-    const key = ovlVisualHashSrc(srcText);
+    const key = ovlVisualBtrMarkKey(srcText);
     const rec = OvlVisualBtrMarks[key];
     if (!rec) { try { showToast('这段内容已经变化，无法撤销。', 'warning'); } catch (e) {} return; } // 哈希已经对不上——安全网，见头部大注释
     const ta = document.getElementById('ovlCodeArea');
@@ -41317,6 +41357,8 @@ function ovlVisualRender() {
             if (OvlVisualState.tailOpen) html += '<pre class="ovl-visual-tail"></pre>';
         }
         pane.innerHTML = html;
+        // v2 Pass P213（WRITEBACK-5）：整篇重渲染把就地编辑器的 wrap 摘掉了——收掉这个陈旧的单例。
+        try { if (OvlInlineSrcEdit && !OvlInlineSrcEdit.closing && OvlInlineSrcEdit.wrap && !OvlInlineSrcEdit.wrap.isConnected) ovlInlineSrcCancelStale(); } catch (eStale) {}
         ovlVisualRestoreAllBadges(pane); // v2 Pass P128f（R-6）：重渲染落地后回挂失败/无可译文本/可能漏译三种角标，紧跟在 innerHTML 之后，收敛成单一函数（见该函数头部注释）
         ovlVisualSelOverlayReset(pane); // Pass Sel-Outline：innerHTML 冲掉了旧叠加层，重挂一个空的
         const preEl = pane.querySelector('.ovl-visual-preamble');
@@ -42333,11 +42375,14 @@ function ovlVisualBlockAtCharRange(startChar, endChar) {
         const pane = document.getElementById('ovlVisualPane');
         if (!ta || !pane) return null;
         const blocks = pane.querySelectorAll('.ovl-visual-block[data-src-line]');
+        // v2 Pass P213（WRITEBACK-8）：行首表整个循环只建一次（以前每块一次，O(块数×全文)）。
+        const val = ta.value;
+        const starts = ovlBuildLineStarts(val);
         for (let i = 0; i < blocks.length; i++) {
             const lo = parseInt(blocks[i].getAttribute('data-src-line'), 10);
             const hi = parseInt(blocks[i].getAttribute('data-src-line-end'), 10);
             if (!isFinite(lo) || !isFinite(hi)) continue;
-            const c = ovlGutterLineRangeToChars(ta, lo, hi);
+            const c = ovlVisualSliceByLineStarts(val, starts, lo, hi);
             if (c.start === startChar && c.end === endChar) return blocks[i];
         }
     } catch (e) {}
@@ -62595,8 +62640,47 @@ function ovlInlineSrcOnPaste(e) {
 // 失焦即保存（§3 明文要求）。closing 是防重入闸门：save/cancel 一开始就把它摆成 true，
 // 挪走焦点/整个把 <textarea> 从 DOM 里摘掉都会连带触发一次原生 blur，没有这道闸门会变成
 // "Esc 取消"又反过来触发"失焦保存"，把刚恢复的原块又悄悄存一遍。
+// v2 Pass P213（WRITEBACK-6）：后台回译落笔（ovlVisualBtrCommitWrite）需要临时 focus
+// #ovlCodeArea 才能 execCommand——这会让用户正在敲的就地编辑框失焦，触发"失焦即保存"，
+// 编辑框被提前存盘/拆掉。落笔期间置位这个标志，失焦不再触发保存，落笔完把焦点还给用户。
+let OvlInlineSrcBlurSuppress = false;
+
+// v2 Pass P213（WRITEBACK-5）：就地编辑的内容已经对不上现场（文件换了/这几行被别处改过）时，
+// 不能盲写。取消编辑，并把用户已经敲的文字放进一个只读文本框的对话框 + 提示 toast，
+// 用户可以一键复制回来，不会因为取消而丢掉输入。
+function ovlInlineSrcRecoverTypedText(text, why) {
+    try { showToast('就地编辑未写入：' + why + '。你输入的内容已放进对话框，可复制保存。', 'warning'); } catch (e) {}
+    // 延后一拍再开对话框：Ctrl+Enter 保存触发本函数时，同一个 keydown 还会冒泡到 document，
+    // 刚注册的对话框 Enter=确认 监听器会立刻接住它，对话框一闪而过。
+    setTimeout(function () { try {
+        ovlConfirmDialog({
+            title: '就地编辑未写入',
+            html: '<div style="margin-bottom:6px">' + escapeHtml(why) + '。下面是你刚才输入的内容，可以复制后重新编辑：</div>'
+                + '<textarea readonly id="ovlInlineSrcRecoverTa" style="width:100%;min-height:9em;box-sizing:border-box">'
+                + escapeHtml(String(text == null ? '' : text)) + '</textarea>',
+            confirmLabel: '复制到剪贴板',
+            onConfirm: function () { try { copyToClipboard(String(text == null ? '' : text)); } catch (e) {} }
+        });
+    } catch (e) { console.error('[ovl] inlineSrcRecoverTypedText failed', e); } }, 0);
+}
+
+// 重渲染把编辑器的 wrap 摘离 DOM 之后，OvlInlineSrcEdit 还留着：编辑单例被占住（后续所有
+// 编辑都 toast"已经有一处在就地编辑"，Overleaf 拉取/外部检查也被它拦）。这里把它收掉；
+// 用户已经敲过的内容不丢——放进可复制的对话框。
+function ovlInlineSrcCancelStale() {
+    try {
+        const st = OvlInlineSrcEdit;
+        if (!st || st.closing) return;
+        const typed = st.ta ? st.ta.value : '';
+        const changed = typed !== st.origText;
+        ovlInlineSrcCancel();
+        if (changed) ovlInlineSrcRecoverTypedText(typed, '预览已重新渲染，这处就地编辑已被取消');
+    } catch (e) { console.error('[ovl] inlineSrcCancelStale failed', e); OvlInlineSrcEdit = null; }
+}
+
 function ovlInlineSrcOnBlur() {
     try {
+        if (OvlInlineSrcBlurSuppress) return;
         if (!OvlInlineSrcEdit || OvlInlineSrcEdit.closing) return;
         ovlInlineSrcSave();
     } catch (e) { console.error('[ovl] inlineSrcOnBlur failed', e); }
@@ -62761,6 +62845,21 @@ function ovlInlineSrcSave() {
         if (!ta || ta.disabled) throw new Error('编辑器未就绪');
         const chars = ovlGutterLineRangeToChars(ta, st.lineFrom, st.lineTo);
         const newText = st.ta.value;
+        // v2 Pass P213（WRITEBACK-5）：落笔前核对"打开时记下的现场"——文件身份没变，且这几行此刻
+        // 仍然逐字节等于打开时的原文。对不上（切了文件、上方插入/删除了行、别处回译落笔改了行数）
+        // 就绝不按旧行号盲写：取消编辑，用户已敲的内容放进对话框供复制。
+        let staleWhy = null;
+        try {
+            const fkNow = (typeof ovlVisualBtrCurrentFileKey === 'function') ? ovlVisualBtrCurrentFileKey() : null;
+            if (fkNow !== st.fileKey) staleWhy = '编辑期间已切换到其他文件';
+            else if (ta.value.slice(chars.start, chars.end) !== st.origText) staleWhy = '这一段原文在编辑期间已被别处修改（行号已对不上）';
+        } catch (e) { staleWhy = '无法确认写入位置'; }
+        if (staleWhy) {
+            try { st.blocks.forEach(function (b) { b.style.display = ''; }); } catch (e) {}
+            try { if (st.wrap && st.wrap.parentNode) st.wrap.parentNode.removeChild(st.wrap); } catch (e) {}
+            ovlInlineSrcRecoverTypedText(newText, staleWhy);
+            return;
+        }
         const oldLineCount = st.lineTo - st.lineFrom + 1;
         const newLineCount = newText.split('\n').length;
 
@@ -62920,7 +63019,7 @@ async function ovlInlineZhSaveAsyncMultiBlockSync(st) {
     try {
         let newEnText = null;
         try {
-            newEnText = await ovlBacktranslateZhToEn(newZhText, st.cfg || getApiConfig(), null);
+            newEnText = await ovlVisualBtrBacktranslateGuarded(newZhText, st.cfg || getApiConfig(), null);
         } catch (e) {
             console.error('[ovl] inlineZhSave backtranslate failed', e);
             ovlInlineZhSaveFailRetain(st, newZhText,
@@ -63158,12 +63257,52 @@ function ovlVisualBtrHasNewTagLikeContent(origEnText, newEnText) {
     } catch (e) { return false; } // 判不出来就不拦——这道闸是"有额外可疑信号才拦"，不是默认拒绝
 }
 
+// v2 Pass P213（WRITEBACK-7）：回译调用的超时/取消包装。以前三处调用点都传 signal=null，
+// 本地 LLM/代理连接卡住时 fetch 永不返回，OvlVisualBtrInFlight 里的钥匙永远不删——
+// ovlVisualBtrInFlightActive() 因此永久拦住切文件/切项目/切模式并弹 beforeunload，且没有任何取消入口。
+// 这里在调用侧加 AbortController + 超时（默认 180 s），并用 Promise 竞速保证即便 provider
+// 不理 signal 也会按时返回失败（不碰 callModelPlainText/provider 函数本身，那是 p216 的范围）。
+// 超时/取消都当作失败抛出：调用方现成的失败分支会保留草稿并释放在途锁。
+// outerCtl（可选）：外部 AbortController，被它 abort 时本调用以 AbortError 结束。
+let OvlBtrTimeoutMs = 180000;
+function ovlVisualBtrBacktranslateGuarded(zhText, cfg, outerCtl) {
+    const ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+    let timer = null;
+    let onOuter = null;
+    return new Promise(function (resolve, reject) {
+        if (ctl) {
+            timer = setTimeout(function () {
+                const err = new Error('回译请求超时（超过 ' + Math.round(OvlBtrTimeoutMs / 1000) + ' 秒没有响应）');
+                err.name = 'TimeoutError';
+                try { ctl.abort(); } catch (e) {}
+                reject(err);
+            }, OvlBtrTimeoutMs);
+        }
+        if (outerCtl && outerCtl.signal) {
+            onOuter = function () {
+                const err = new Error('已取消');
+                err.name = 'AbortError';
+                try { if (ctl) ctl.abort(); } catch (e) {}
+                reject(err);
+            };
+            if (outerCtl.signal.aborted) { onOuter(); return; }
+            outerCtl.signal.addEventListener('abort', onOuter);
+        }
+        let p;
+        try { p = ovlBacktranslateZhToEn(zhText, cfg, ctl ? ctl.signal : null); } catch (e) { reject(e); return; }
+        Promise.resolve(p).then(resolve, reject);
+    }).finally(function () {
+        if (timer) clearTimeout(timer);
+        try { if (onOuter && outerCtl && outerCtl.signal) outerCtl.signal.removeEventListener('abort', onOuter); } catch (e) {}
+    });
+}
+
 async function ovlVisualBtrRunBackground(origEnText, cfg, newZhText, anchor, inflightKey) {
     const key = inflightKey || ((typeof ovlVisualHashSrc === 'function') ? ovlVisualHashSrc(origEnText) : origEnText);
     try {
         let newEnText = null;
         try {
-            newEnText = await ovlBacktranslateZhToEn(newZhText, cfg, null);
+            newEnText = await ovlVisualBtrBacktranslateGuarded(newZhText, cfg, null);
         } catch (e) {
             console.error('[ovl] btr background backtranslate failed', e);
             ovlVisualBtrOnFailure(origEnText, newZhText,
@@ -63324,17 +63463,36 @@ function ovlVisualBtrCommitWrite(origEnText, newEnText, newZhText, cfg, anchor) 
 
         const wasHidden = ta.style.display === 'none';
         if (wasHidden) ta.style.display = '';
-        ta.focus();
-        ta.setSelectionRange(range.start, range.end);
-        document.execCommand('insertText', false, newEnText);
-        if (wasHidden) ta.style.display = 'none';
+        // v2 Pass P213（WRITEBACK-6）：记下用户此刻的焦点，focus #ovlCodeArea 期间屏蔽"失焦即保存"，
+        // focus 之后（任何失焦副作用都已同步跑完）重新解析一次落笔区间并核对，落笔完把焦点还回去。
+        const prevActive = document.activeElement;
+        let prevSel = null;
+        try { if (prevActive && prevActive !== ta && typeof prevActive.selectionStart === 'number') prevSel = [prevActive.selectionStart, prevActive.selectionEnd]; } catch (e) {}
+        let range2 = null;
+        OvlInlineSrcBlurSuppress = true;
+        try {
+            ta.focus();
+            range2 = ovlVisualBtrResolveWriteRange(anchor, {});
+            if (!range2 || ta.value.slice(range2.start, range2.end) !== origEnText) throw new Error('目标内容已变化');
+            ta.setSelectionRange(range2.start, range2.end);
+            document.execCommand('insertText', false, newEnText);
+        } finally {
+            try {
+                if (wasHidden) ta.style.display = 'none';
+                if (prevActive && prevActive !== ta && prevActive !== document.body && prevActive.isConnected && typeof prevActive.focus === 'function') {
+                    prevActive.focus();
+                    if (prevSel) { try { prevActive.setSelectionRange(prevSel[0], prevSel[1]); } catch (e) {} }
+                }
+            } catch (e) {}
+            OvlInlineSrcBlurSuppress = false;
+        }
         spliced = true;
         if (typeof focusNoteTexChanged === 'function') { try { focusNoteTexChanged(); } catch (e) {} }
 
         try { ovlVisualTransCachePut(newEnText, cfg, newZhText, null, false, true); } catch (e) { console.error('[ovl] btr cache put failed', e); }
         if (typeof ovlVisualBtrMarkSet === 'function') { try { ovlVisualBtrMarkSet(newEnText, origEnText); } catch (e) {} }
 
-        if (blkForRerender && oldLineCount != null && newLineCount === oldLineCount && typeof ovlInlineSrcRerenderLocal === 'function') {
+        if (blkForRerender && oldLineCount != null && newLineCount === oldLineCount && range2 && range2.start === range.start && range2.end === range.end && typeof ovlInlineSrcRerenderLocal === 'function') {
             const synthSt = {
                 blocks: [blkForRerender], parent: parent, wrap: null, lineFrom: lineFrom, lineTo: lineTo,
                 firstParaStart: firstParaStart, origEnText: origEnText, origText: origEnText
@@ -63791,7 +63949,9 @@ function ovlInlineSrcEditOpenForBlocks(touchedBlocks, opts) {
         OvlInlineSrcEdit = {
             wrap: wrap, ta: ta, blocks: touched, parent: parent,
             lineFrom: lineFrom, lineTo: lineTo, firstParaStart: firstParaStart,
-            origText: text, closing: false
+            origText: text, closing: false,
+            // v2 Pass P213（WRITEBACK-5）：保存时核对"还是同一个文件、这几行还是这段原文"。
+            fileKey: (typeof ovlVisualBtrCurrentFileKey === 'function') ? ovlVisualBtrCurrentFileKey() : null
         };
 
         ta.addEventListener('input', ovlInlineSrcOnInput);
@@ -63903,6 +64063,10 @@ function ovlInlineZhEditOpen() {
 //      ovlInlineZhSaveAsyncSingleBlock），而是保证用户重新点开时看到的是他刚打的那版中文，
 //      不是缓存里那份过时的旧译文。
 function ovlInlineZhEditOpenForBlocks(touchedBlocks, opts) {
+    // v2 Pass P213（WRITEBACK-9）：下面中途 return（没有译文/没有父节点/抛错）时锚点此前不释放，
+    // 访问器和 OvlLiveAnchors 会泄漏一整个会话。只有真正交给 OvlInlineSrcEdit 的才保留。
+    let zhOpenAnchor = null;
+    let zhOpenAnchorKept = false;
     try {
         const touched = touchedBlocks;
         if (!touched || !touched.length) return;
@@ -63935,6 +64099,7 @@ function ovlInlineZhEditOpenForBlocks(touchedBlocks, opts) {
         const anchor = (typeof ovlVisualBtrMakeAnchor === 'function')
             ? ovlVisualBtrMakeAnchor(chars.start, chars.end, enText)
             : { charStart: chars.start, charEnd: chars.end, origText: enText, fileKey: null };
+        zhOpenAnchor = anchor;
 
         let cfg;
         try { cfg = getApiConfig(); } catch (e) { cfg = null; }
@@ -63977,6 +64142,7 @@ function ovlInlineZhEditOpenForBlocks(touchedBlocks, opts) {
             // -> ovlVisualBtrRunBackground -> ovlVisualBtrOnSuccess/onFailure。
             btrAnchor: anchor
         };
+        zhOpenAnchorKept = true;
 
         ta.addEventListener('input', ovlInlineSrcOnInput);
         ta.addEventListener('keydown', ovlInlineSrcOnKeydown);
@@ -64000,6 +64166,10 @@ function ovlInlineZhEditOpenForBlocks(touchedBlocks, opts) {
     } catch (e) {
         console.error('[ovl] inlineZhEditOpenForBlocks failed', e);
         try { showToast('打开就地编辑失败：' + (e && e.message ? e.message : String(e)), 'error'); } catch (e2) {}
+    } finally {
+        if (zhOpenAnchor && !zhOpenAnchorKept) {
+            try { if (typeof ovlLiveAnchorRelease === 'function') ovlLiveAnchorRelease(zhOpenAnchor); } catch (e3) {}
+        }
     }
 }
 
@@ -66320,6 +66490,34 @@ let OvlVisTransDebounceTimer = null;
 //                                                               （跟 ovlInlineSrcEditOpen
 //                                                               同一把尺子，不做文本匹配）。
 let OvlVisTransOrigin = null;
+// v2 Pass P213（WRITEBACK-1/2/4）：
+//   OvlVisTransRawResult  当前浮框译文的【原始字符串】（模型返回值）；编辑框用它起种，不再读
+//                         body.textContent（那是 KaTeX 的 MathML+annotation+字形混合体，会把公式弄成乱码）。
+//   OvlVisTransEditCtx    编辑会话：{ anchor, fileKey, confirmOpen }——anchor 是 EditStart 时登记的活锚点。
+//   OvlVisTransSaveBusy   「回译并保存」正在跑的互斥标志（防止双击叠加两次写入）。
+//   OvlVisTransSaveAbort  本次保存的回译请求的取消句柄，Esc/关闭浮框时被 abort。
+let OvlVisTransRawResult = null;
+let OvlVisTransEditCtx = null;
+let OvlVisTransSaveBusy = false;
+let OvlVisTransSaveAbort = null;
+const OVL_VISTRANS_VIS_EDIT_HINT = 'Visual 模式里选中的是渲染后的文字，直接回译写回会丢掉 \\cite、公式等命令。请切到 Code 模式选中源码后再编辑，或双击段落使用就地编辑。';
+function ovlVisTransEditRelease() {
+    const ctx = OvlVisTransEditCtx;
+    OvlVisTransEditCtx = null;
+    if (ctx && ctx.anchor && typeof ovlLiveAnchorRelease === 'function') { try { ovlLiveAnchorRelease(ctx.anchor); } catch (e) {} }
+}
+// 「编辑」按钮在 Visual 来源的选区上置灰并给出中文提示（不用 disabled 属性：disabled 的按钮
+// 收不到点击，用户点了没有任何反馈；这里仍响应点击，由 ovlVisTransEditStart 弹同一句提示）。
+function ovlVisTransSyncEditBtn(origin) {
+    try {
+        const btn = document.getElementById('ovlVisTransEditBtn');
+        if (!btn) return;
+        const blocked = !!(origin && origin.kind === 'vis-block');
+        btn.setAttribute('aria-disabled', blocked ? 'true' : 'false');
+        btn.style.opacity = blocked ? '0.45' : '';
+        btn.title = blocked ? OVL_VISTRANS_VIS_EDIT_HINT : '';
+    } catch (e) {}
+}
 
 function ovlVisTransCacheGet(key) {
     if (!OvlVisTransCache.has(key)) return undefined;
@@ -66372,6 +66570,13 @@ function ovlVisTransHide() {
     OvlVisTransAbort = null;
     ++OvlVisTransSeq; // 让任何还在飞的响应变成陈旧响应，回来时一个字节都不会写
     OvlVisTransOrigin = null; // 框关了，写回目标一并作废——防止过期 origin 被下一次编辑误用
+    // v2 Pass P213（WRITEBACK-2）：Esc/点外面/换选区都会走到这里——正在跑的「回译并保存」
+    // 一并取消（回译请求 abort，已弹出的确认框撤掉），保存流程每个 await 之后看到 seq 变了就收手。
+    try { if (OvlVisTransSaveAbort) OvlVisTransSaveAbort.abort(); } catch (e) {}
+    try { if (OvlVisTransEditCtx && OvlVisTransEditCtx.confirmOpen && typeof ovlDismissActiveModal === 'function') ovlDismissActiveModal(); } catch (e) {}
+    ovlVisTransEditRelease();
+    OvlVisTransRawResult = null;
+    ovlVisTransSyncEditBtn(null);
     const box = document.getElementById('ovlVisTransBox');
     if (box) { box.classList.remove('ovl-open'); box.hidden = true; }
 }
@@ -66394,8 +66599,11 @@ async function ovlVisTransRequest(text, selRows, promptKind) {
     const cached = ovlVisTransCacheGet(key);
     if (cached !== undefined) {
         ++OvlVisTransSeq; // 命中缓存也要让上一个还在飞的请求作废，避免它晚一步覆盖这次的显示
+        try { if (OvlVisTransSaveAbort) OvlVisTransSaveAbort.abort(); } catch (e) {} // v2 Pass P213：浮框内容被换掉，在途的「回译并保存」作废
+        ovlVisTransEditRelease();
         try { if (OvlVisTransAbort) OvlVisTransAbort.abort(); } catch (e) {}
         OvlVisTransAbort = null;
+        OvlVisTransRawResult = cached;
         body.innerHTML = renderFormattedText(cached);
         ovlVisTransPlace(box, selRows);
         return;
@@ -66403,9 +66611,12 @@ async function ovlVisTransRequest(text, selRows, promptKind) {
 
     const mySeq = ++OvlVisTransSeq;
     try { if (OvlVisTransAbort) OvlVisTransAbort.abort(); } catch (e) {}
+    try { if (OvlVisTransSaveAbort) OvlVisTransSaveAbort.abort(); } catch (e) {} // v2 Pass P213：同上
+    ovlVisTransEditRelease();
     const ctl = (typeof AbortController === 'function') ? new AbortController() : null;
     OvlVisTransAbort = ctl;
 
+    OvlVisTransRawResult = null; // 新请求在途：旧译文的原始串作废
     body.innerHTML = '<div class="ovl-vistrans-loading">翻译中…</div>';
     ovlVisTransPlace(box, selRows);
 
@@ -66434,6 +66645,7 @@ async function ovlVisTransRequest(text, selRows, promptKind) {
         if (mySeq !== OvlVisTransSeq) return; // 选区早就换了/框已经关了，陈旧响应一个字节都不写
         const result = (typeof out === 'string' && out.trim()) ? out.trim() : '（模型未返回可用译文）';
         ovlVisTransCacheSet(key, result);
+        OvlVisTransRawResult = (typeof out === 'string' && out.trim()) ? result : null; // 占位文案不是译文，不可作为编辑起种
         body.innerHTML = renderFormattedText(result);
         ovlVisTransPlace(box, selRows); // 内容变了，按新高度重新落一次位
     } catch (err) {
@@ -66456,6 +66668,15 @@ function ovlVisTransEditStart() {
             try { showToast('这段译文暂不支持编辑回译，请改用中文预览模式下选中文字直接编辑。', 'warning'); } catch (e) {}
             return;
         }
+        // v2 Pass P213（WRITEBACK-3）：Visual 来源的选区不提供「编辑 -> 回译并保存」写回。
+        // 浮框里的文本是渲染后的文字（\cite 变 [n]、公式变 KaTeX 字形），回译出来的只是选中片段的
+        // 英文，却要覆盖整个触及块的源码——同块里没选中的句子、\cite、\label、% 注释全会被删掉。
+        // Code 来源有精确字符区间 + 原文，保留。
+        if (origin.kind !== 'code') {
+            try { showToast(OVL_VISTRANS_VIS_EDIT_HINT, 'warning'); } catch (e) {}
+            return;
+        }
+        if (OvlVisTransSaveBusy || OvlVisTransEditCtx) return; // 已经在编辑/保存中，别叠第二个会话
         if (OvlInlineSrcEdit) {
             try { showToast('已经有一处在就地编辑，请先保存或取消。', 'warning'); } catch (e) {}
             return;
@@ -66463,8 +66684,24 @@ function ovlVisTransEditStart() {
         const box = document.getElementById('ovlVisTransBox');
         const body = document.getElementById('ovlVisTransBody');
         if (!box || !body) return;
-        const zhText = body.textContent || '';
-        if (!zhText.trim()) return;
+        // v2 Pass P213（WRITEBACK-4）：起种用模型返回的原始串，不再用 body.textContent。
+        const zhText = (typeof OvlVisTransRawResult === 'string') ? OvlVisTransRawResult : '';
+        if (!zhText.trim()) {
+            try { showToast('译文还没有生成好，请稍候再点编辑。', 'warning'); } catch (e) {}
+            return;
+        }
+        // v2 Pass P213（WRITEBACK-1）：EditStart 这一刻核对 origin（选区时记下的）仍然有效，然后
+        // 登记活锚点——之后无论用户在别处敲字、切文件，写回前都用锚点重新解析落笔区间。
+        const codeTa = document.getElementById('ovlCodeArea');
+        const fkNow = (typeof ovlVisualBtrCurrentFileKey === 'function') ? ovlVisualBtrCurrentFileKey() : null;
+        if (!codeTa || codeTa.disabled || (origin.fileKey !== undefined && origin.fileKey !== fkNow)
+            || codeTa.value.slice(origin.start, origin.end) !== origin.rawText) {
+            try { showToast('原文位置已失效（可能已被别处修改或切换了文件），请重新选中后再试。', 'warning'); } catch (e) {}
+            return;
+        }
+        const anchor = ovlVisualBtrMakeAnchor(origin.start, origin.end, origin.rawText);
+        const ctx = { anchor: anchor, fileKey: fkNow, confirmOpen: false };
+        OvlVisTransEditCtx = ctx;
         body.innerHTML = '';
         const ta = document.createElement('textarea');
         ta.className = 'ovl-vistrans-edit-ta';
@@ -66481,88 +66718,122 @@ function ovlVisTransEditStart() {
         body.appendChild(actions);
         ta.focus();
         try { ta.setSelectionRange(zhText.length, zhText.length); } catch (e) {}
-        saveBtn.addEventListener('click', function () { ovlVisTransEditSave(ta, origin, zhText); });
-        cancelBtn.addEventListener('click', function () { ovlVisTransEditCancel(zhText); });
-    } catch (e) { console.error('[ovl] visTransEditStart failed', e); }
+        saveBtn.addEventListener('click', function () { ovlVisTransEditSave(ta, origin, zhText, ctx); });
+        cancelBtn.addEventListener('click', function () { if (OvlVisTransSaveBusy) return; ovlVisTransEditCancel(zhText); });
+    } catch (e) { console.error('[ovl] visTransEditStart failed', e); ovlVisTransEditRelease(); }
 }
 
 // 编辑框里退回展示态——不管是用户点了「取消」还是保存流程中途失败/被拒绝，回到原来那份
 // 译文原样展示，不留一个空 textarea 卡在那。
 function ovlVisTransEditCancel(origZh) {
     try {
+        ovlVisTransEditRelease(); // v2 Pass P213（WRITEBACK-1）：编辑会话结束，释放活锚点
         const body = document.getElementById('ovlVisTransBody');
         if (body) body.innerHTML = renderFormattedText(origZh);
     } catch (e) { console.error('[ovl] visTransEditCancel failed', e); }
 }
 
-// 保存：空操作闸（一个字没改就退回展示，不回译不写源码）-> ovlBacktranslateZhToEn 回译
-// （失败直接 toast + 退回展示，源码零改动）-> ovlConfirmDialog 预览确认（取消同样零改动）
-// -> 按 origin 精确写回：Code 来源是字符区间，Visual 英文来源是 data-src-line 块区间，
-// 两条都不做任何文本匹配。
-async function ovlVisTransEditSave(ta, origin, origZh) {
+// 保存：空操作闸（一个字没改就退回展示，不回译不写源码）-> 回译（失败直接 toast + 退回展示，
+// 源码零改动）-> ovlConfirmDialog 预览确认（取消同样零改动）-> 用活锚点重新解析落笔区间、
+// 核对现场切片逐字节等于展示给用户看的原文 -> 写回。
+// v2 Pass P213：
+//   WRITEBACK-1  不再用 EditStart 时的固定偏移盲写：用 ovlVisualBtrResolveWriteRange（活锚点 +
+//                文件身份 + 切片相等校验），对不上就 toast 放弃，源码零改动；锚点在 finally 释放。
+//   WRITEBACK-2  OvlVisTransSaveBusy 互斥 + 两颗按钮置灰；每个 await 之后核对 OvlVisTransSeq
+//                （Esc/关闭/换选区会让它变化），变了就收手，含确认框那一步。
+async function ovlVisTransEditSave(ta, origin, origZh, ctx) {
+    if (OvlVisTransSaveBusy) return;
     const newZh = ta.value;
     if (newZh === origZh) { ovlVisTransEditCancel(origZh); return; }
+    const mySeq = OvlVisTransSeq;
+    const stale = function () { return mySeq !== OvlVisTransSeq; };
+    OvlVisTransSaveBusy = true;
     ta.disabled = true;
-    let newEn = null;
     try {
-        const base = getApiConfig();
-        const cfg = ovlVisTransConfig(base);
-        newEn = await ovlBacktranslateZhToEn(newZh, cfg, null);
-    } catch (e) {
-        console.error('[ovl] visTransEditSave backtranslate failed', e);
-        try { showToast('回译失败：' + (e && e.message ? e.message : String(e)) + '，原文未改动。', 'error'); } catch (e2) {}
-        ovlVisTransEditCancel(origZh);
-        return;
-    }
-    const origEn = (origin.kind === 'code') ? origin.rawText : ovlVisTransOriginEnText(origin);
-    if (origEn == null) {
-        try { showToast('原文位置已失效（可能已被别处修改），请重新选中后再试。', 'warning'); } catch (e) {}
-        ovlVisTransEditCancel(origZh);
-        return;
-    }
-    let confirmed = false;
-    await new Promise(function (resolve) {
+        const body = document.getElementById('ovlVisTransBody');
+        if (body) body.querySelectorAll('.ovl-vistrans-edit-save,.ovl-vistrans-edit-cancel').forEach(function (b) { b.disabled = true; });
+    } catch (e) {}
+    const saveCtl = (typeof AbortController === 'function') ? new AbortController() : null;
+    OvlVisTransSaveAbort = saveCtl;
+    try {
+        let newEn = null;
         try {
-            const html = ovlDiffPreviewHtml(origEn, newEn);
-            ovlConfirmDialog({
-                title: '确认用回译结果覆盖原文？',
-                html: html,
-                confirmLabel: '确认覆盖',
-                onConfirm: function () { confirmed = true; resolve(); },
-                onCancel: function () { confirmed = false; resolve(); }
-            });
-        } catch (e) { console.error('[ovl] visTransEditSave confirm dialog failed', e); confirmed = false; resolve(); }
-    });
-    if (!confirmed) {
-        try { showToast('已取消，原文未改动。', 'info'); } catch (e) {}
-        ovlVisTransEditCancel(origZh);
-        return;
-    }
-
-    try {
-        const ta2 = document.getElementById('ovlCodeArea');
-        if (!ta2 || ta2.disabled) throw new Error('编辑器未就绪');
-        let start, end;
-        if (origin.kind === 'code') {
-            start = origin.start; end = origin.end;
-        } else {
-            const chars = ovlGutterLineRangeToChars(ta2, origin.lineFrom, origin.lineTo);
-            start = chars.start; end = chars.end;
+            const base = getApiConfig();
+            const cfg = ovlVisTransConfig(base);
+            newEn = await ovlVisualBtrBacktranslateGuarded(newZh, cfg, saveCtl);
+        } catch (e) {
+            if (stale()) return; // 已被 Esc/关闭取消：框已经没了，不 toast 不写
+            console.error('[ovl] visTransEditSave backtranslate failed', e);
+            try { showToast('回译失败：' + (e && e.message ? e.message : String(e)) + '，原文未改动。', 'error'); } catch (e2) {}
+            ovlVisTransEditCancel(origZh);
+            return;
         }
-        const wasHidden = ta2.style.display === 'none';
-        if (wasHidden) ta2.style.display = '';
-        ta2.focus();
-        ta2.setSelectionRange(start, end);
-        document.execCommand('insertText', false, newEn);
-        if (wasHidden) ta2.style.display = 'none';
-        if (typeof focusNoteTexChanged === 'function') { try { focusNoteTexChanged(); } catch (e) {} }
-        if (origin.kind === 'vis-block' && typeof ovlVisualRender === 'function') ovlVisualRender();
-        try { showToast('已回译并写回原文。', 'success'); } catch (e) {}
-    } catch (e) {
-        console.error('[ovl] visTransEditSave splice failed', e);
-        try { showToast('写回失败：' + (e && e.message ? e.message : String(e)), 'error'); } catch (e2) {}
-    } finally {
+        if (stale()) return;
+        const origEn = origin.rawText;
+        const pre = ovlVisualBtrResolveWriteRange(ctx.anchor, {});
+        if (!pre) {
+            try { showToast('原文位置已失效（可能已被别处修改或切换了文件），未写入，请重新选中后再试。', 'warning'); } catch (e) {}
+            ovlVisTransEditCancel(origZh);
+            return;
+        }
+        let confirmed = false;
+        ctx.confirmOpen = true;
+        await new Promise(function (resolve) {
+            try {
+                const html = ovlDiffPreviewHtml(origEn, newEn);
+                ovlConfirmDialog({
+                    title: '确认用回译结果覆盖原文？',
+                    html: html,
+                    confirmLabel: '确认覆盖',
+                    onConfirm: function () { confirmed = true; resolve(); },
+                    onCancel: function () { confirmed = false; resolve(); }
+                });
+            } catch (e) { console.error('[ovl] visTransEditSave confirm dialog failed', e); confirmed = false; resolve(); }
+        });
+        ctx.confirmOpen = false;
+        if (stale()) return;
+        if (!confirmed) {
+            try { showToast('已取消，原文未改动。', 'info'); } catch (e) {}
+            ovlVisTransEditCancel(origZh);
+            return;
+        }
+
+        try {
+            const ta2 = document.getElementById('ovlCodeArea');
+            if (!ta2 || ta2.disabled) throw new Error('编辑器未就绪');
+            // 落笔前同步重新解析一次（确认框开着的这段时间里源码可能被改过）：区间必须此刻仍然
+            // 逐字节等于展示给用户的原文，对不上就放弃，绝不盲写。
+            let range = ovlVisualBtrResolveWriteRange(ctx.anchor, {});
+            if (!range || ta2.value.slice(range.start, range.end) !== origEn) {
+                try { showToast('原文在你确认之前已被修改，未写入，请重新选中后再试。', 'warning'); } catch (e) {}
+                ovlVisTransHide();
+                return;
+            }
+            const wasHidden = ta2.style.display === 'none';
+            if (wasHidden) ta2.style.display = '';
+            OvlInlineSrcBlurSuppress = true;
+            try {
+                ta2.focus();
+                range = ovlVisualBtrResolveWriteRange(ctx.anchor, {}); // focus 之后再解析一次
+                if (!range || ta2.value.slice(range.start, range.end) !== origEn) throw new Error('目标内容已变化');
+                ta2.setSelectionRange(range.start, range.end);
+                document.execCommand('insertText', false, newEn);
+            } finally {
+                if (wasHidden) ta2.style.display = 'none';
+                OvlInlineSrcBlurSuppress = false;
+            }
+            if (typeof focusNoteTexChanged === 'function') { try { focusNoteTexChanged(); } catch (e) {} }
+            try { showToast('已回译并写回原文。', 'success'); } catch (e) {}
+        } catch (e) {
+            console.error('[ovl] visTransEditSave splice failed', e);
+            try { showToast('写回失败：' + (e && e.message ? e.message : String(e)), 'error'); } catch (e2) {}
+        }
         ovlVisTransHide();
+    } finally {
+        OvlVisTransSaveBusy = false;
+        if (OvlVisTransSaveAbort === saveCtl) OvlVisTransSaveAbort = null;
+        if (ctx && ctx.anchor && typeof ovlLiveAnchorRelease === 'function') { try { ovlLiveAnchorRelease(ctx.anchor); } catch (e) {} }
+        if (OvlVisTransEditCtx === ctx) OvlVisTransEditCtx = null;
     }
 }
 
@@ -66640,6 +66911,7 @@ function ovlVisTransFromSelection(force) {
         // v2 Pass P63（H5）：先于请求把写回目标记下来——请求可能是缓存同步命中（下一刻
         // selRows/range 早就用不上了），必须在这一刻的选区还有效时就算好。
         OvlVisTransOrigin = ovlVisTransComputeVisOrigin(pane, range);
+        ovlVisTransSyncEditBtn(OvlVisTransOrigin); // v2 Pass P213（WRITEBACK-3）：Visual 来源「编辑」置灰 + 提示
         ovlVisTransRequest(text, selRows, 'vis');
     } catch (e) { console.error('[ovl] visTransFromSelection failed', e); }
 }
@@ -66695,7 +66967,9 @@ function ovlCodeTransFromSelection() {
         if (!ovlTransLengthOk(text)) return;
         // v2 Pass P63（H5）：Code 来源有精确字符位置，直接记住这个区间——写回时用它做
         // execCommand('insertText') 的目标区间，不做任何文本匹配。
-        OvlVisTransOrigin = { kind: 'code', start: ta.selectionStart, end: ta.selectionEnd, rawText: ta.value.slice(ta.selectionStart, ta.selectionEnd) };
+        OvlVisTransOrigin = { kind: 'code', start: ta.selectionStart, end: ta.selectionEnd, rawText: ta.value.slice(ta.selectionStart, ta.selectionEnd),
+            fileKey: (typeof ovlVisualBtrCurrentFileKey === 'function') ? ovlVisualBtrCurrentFileKey() : null }; // v2 Pass P213（WRITEBACK-1）：选区所属文件
+        ovlVisTransSyncEditBtn(OvlVisTransOrigin);
         ovlVisTransRequest(text, [ovlCodeSelectionScreenRect(ta)], 'tex');
     } catch (e) { console.error('[ovl] codeTransFromSelection failed', e); }
 }
