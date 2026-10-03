@@ -5018,7 +5018,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.42.05';        // APP_VERSION_STAMP
+const APP_VERSION = '03.42.06';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -35522,7 +35522,7 @@ function ovlSetEditorMode(mode) {
         // 新的 pending 块，ovlVisualLangSyncAfterRender() 自动把调度器重新踢起来。
         const langBtn = document.getElementById('ovlVisualLangBtn');
         if (langBtn) langBtn.disabled = (mode !== 'visual');
-        if (mode !== 'visual' && fromMode === 'visual' && OvlVisualLangState.lang === 'zh') {
+        if (mode !== 'visual' && fromMode === 'visual' && (OvlVisualLangState.lang === 'zh' || OvlVisualLangState.lang === 'compare')) { // v2 Pass P215（VISUALPERF-8）：compare 的中文半屏同样在后台花钱
             ovlVisualLangCancelInFlight();
         }
         if (mode === 'visual') {
@@ -38195,7 +38195,7 @@ function ovlVisualTransCacheDropProject(projectId) {
 let OvlVisualTransCacheScope = null; // { depth, buckets: Map, dirty: Set, card, hint, terms }
 function ovlVisualTransCacheScopeBegin() {
     if (OvlVisualTransCacheScope) { OvlVisualTransCacheScope.depth++; return; }
-    OvlVisualTransCacheScope = { depth: 1, buckets: new Map(), dirty: new Set(), card: undefined, hint: undefined, terms: undefined };
+    OvlVisualTransCacheScope = { depth: 1, buckets: new Map(), dirty: new Set(), puts: new Set(), legacy: undefined, card: undefined, hint: undefined, terms: undefined };
 }
 function ovlVisualTransCacheScopeEnd() {
     const sc = OvlVisualTransCacheScope;
@@ -38206,7 +38206,11 @@ function ovlVisualTransCacheScopeEnd() {
         sc.dirty.forEach(function (pid) {
             try {
                 const map = sc.buckets.get(pid);
-                if (map && ovlVisualTransCacheSaveBucket(pid, map)) ovlVisualTransCacheIndexTouch(pid);
+                if (map && sc.puts.has(pid)) ovlVisualTransCacheEvictToBudget(map, OVL_VISUAL_TRANS_CACHE_PROJECT_BUDGET_CHARS); // v2 Pass P215（VISUALPERF-6）
+                if (map && ovlVisualTransCacheSaveBucket(pid, map)) {
+                    ovlVisualTransCacheIndexTouch(pid);
+                    if (sc.puts.has(pid)) ovlVisualTransCacheMaintain(pid);
+                }
             } catch (e) {}
         });
     } catch (e) {}
@@ -38254,6 +38258,7 @@ function ovlVisualTransCacheEvictToBudget(map, budgetChars) {
 }
 // 配额耗尽（QuotaExceededError）时的优雅降级：先淘汰别的项目整桶腾地方（不动当前项目数据），
 // 还不够再砍当前项目桶自己最老的一半，两轮都不行就放弃并提示用户——绝不静默假装存成功。
+let OvlP215QuotaToastAt = 0;
 function ovlVisualTransCacheSaveBucket(projectId, map) {
     if (OvlVisualTransCacheScope) OvlVisualTransCacheScope.buckets.set(projectId, map); // P209：后续作用域内 Load 看到的就是这份
     const bucketKey = ovlVisualTransCacheBucketKey(projectId);
@@ -38284,8 +38289,13 @@ function ovlVisualTransCacheSaveBucket(projectId, map) {
             }
         } catch (e3) {}
         // 两轮都放弃：明确告诉用户，不静默失败。
+        // v2 Pass P215（VISUALPERF-9）：配额满时每次落地都会走到这里，toast 限速成每 60s 至多一条。
         try {
-            if (typeof showToast === 'function') showToast('翻译缓存空间已满，本次译文未能保存，下次可能需要重新翻译', 'warning');
+            const nowT = Date.now();
+            if (typeof showToast === 'function' && (nowT - OvlP215QuotaToastAt > 60000)) {
+                OvlP215QuotaToastAt = nowT;
+                showToast('翻译缓存空间已满，本次译文未能保存，下次可能需要重新翻译', 'warning');
+            }
         } catch (e4) {}
         return false;
     }
@@ -38331,6 +38341,14 @@ function ovlVisualTransCacheMaintain(currentProjectId) {
 // 命中，不需要用户经历一次强制全量重翻；旧 key 因为不再增长，占用量不会变大，也不参与上面的
 // 预算/淘汰计算。
 function ovlVisualTransCacheLegacyLoad() {
+    // v2 Pass P215（VISUALPERF-6）：v1 key 从不写入，作用域内整个 blob 只解析一次（原先每次未命中一次）。
+    const sc = OvlVisualTransCacheScope;
+    if (sc && sc.legacy) return sc.legacy;
+    const out = ovlVisualTransCacheLegacyLoadRaw();
+    if (sc) sc.legacy = out;
+    return out;
+}
+function ovlVisualTransCacheLegacyLoadRaw() {
     try {
         const raw = localStorage.getItem(OVL_VISUAL_TRANS_CACHE_KEY);
         const parsed = raw ? JSON.parse(raw) : null;
@@ -38466,13 +38484,16 @@ function ovlVisualTransCacheGateCheck(text, hit, map, key, projectId) {
         hit.gateVersion = OVL_VISUAL_CJK_GATE_VERSION;
         if (map && key) {
             map[key] = hit;
-            if (ovlVisualTransCacheSaveBucket(projectId, map)) ovlVisualTransCacheIndexTouch(projectId);
+            // v2 Pass P215（VISUALPERF-6）：作用域内只记脏，End 时每桶落盘一次（原先每块一次整桶写）。
+            if (OvlVisualTransCacheScope) OvlVisualTransCacheScope.dirty.add(projectId);
+            else if (ovlVisualTransCacheSaveBucket(projectId, map)) ovlVisualTransCacheIndexTouch(projectId);
         }
         return hit;
     }
     if (map && key && (key in map)) {
         delete map[key];
-        ovlVisualTransCacheSaveBucket(projectId, map);
+        if (OvlVisualTransCacheScope) OvlVisualTransCacheScope.dirty.add(projectId);
+        else ovlVisualTransCacheSaveBucket(projectId, map);
     }
     return null;
 }
@@ -38562,12 +38583,18 @@ function ovlVisualTransCacheGet(text, config, projectIdOverride) {
 // 前者是 JSON.parse 出来的对象天生没有这个键，后者根本不调用 Put。只有上面 GetMeta 显式确认
 // "刚刚过了闸"之后才会显式传 OVL_VISUAL_CJK_GATE_VERSION 走"提升旧版兜底缓存"这条分支，
 // 跟不传时的默认值相同，是同一个值、不是两套逻辑。
-function ovlVisualTransCachePut(text, config, tgt, projectIdOverride, skipped, forced, partial, partialReason, ladderLevel, gateVersion) {
+function ovlVisualTransCachePut(text, config, tgt, projectIdOverride, skipped, forced, partial, partialReason, ladderLevel, gateVersion, keyOverride) {
     try {
         const projectId = projectIdOverride || ovlVisualTransCacheProjectId();
-        const key = ovlVisualTransCacheKey(text, config);
+        const key = keyOverride || ovlVisualTransCacheKey(text, config); // v2 Pass P215（VISUALPERF-7）：keyOverride = 请求时算好的 key
         const map = ovlVisualTransCacheBucketLoad(projectId);
         map[key] = { tgt: tgt, ts: Date.now(), skipped: !!skipped, forced: !!forced, partial: !!partial, partialReason: partial ? (partialReason || 'unknown') : null, ladderLevel: ladderLevel || null, gateVersion: (typeof gateVersion === 'number') ? gateVersion : OVL_VISUAL_CJK_GATE_VERSION };
+        if (OvlVisualTransCacheScope) {
+            // v2 Pass P215（VISUALPERF-6）：作用域内（旧版缓存提升等）只记脏，淘汰 + 落盘 + Maintain 留到 End 一次做。
+            OvlVisualTransCacheScope.dirty.add(projectId);
+            OvlVisualTransCacheScope.puts.add(projectId);
+            return;
+        }
         ovlVisualTransCacheEvictToBudget(map, OVL_VISUAL_TRANS_CACHE_PROJECT_BUDGET_CHARS);
         if (ovlVisualTransCacheSaveBucket(projectId, map)) {
             ovlVisualTransCacheIndexTouch(projectId);
@@ -42410,6 +42437,12 @@ function ovlP208YieldToEventLoop() {
     if (!OvlP208YieldChannel) return new Promise(function (r) { setTimeout(r, 0); });
     return new Promise(function (r) { OvlP208YieldWaiters.push(r); OvlP208YieldChannel.port2.postMessage(0); });
 }
+function ovlP215RunFileKey() {
+    try {
+        const f = (typeof OvlState !== 'undefined' && OvlState) ? OvlState.currentFile : null;
+        return f ? String(f.relPath || f.name || '') : '';
+    } catch (e) { return ''; }
+}
 async function ovlVisualLangRunQueue() {
     // v2 Pass P170：'compare' 模式的中文半屏一样要真正跑翻译——否则整个后台 worker 池在
     // compare 模式下永远不启动，中文侧永久停在 pending。
@@ -42430,6 +42463,10 @@ async function ovlVisualLangRunQueue() {
     // 死数据、挤占它自己的淘汰预算。
     let fixedProjectId;
     try { fixedProjectId = ovlVisualTransCacheProjectId(); } catch (e) { fixedProjectId = null; }
+    // v2 Pass P215（VISUALPERF-2）：同时固定"这一批属于哪个文件"。切项目/开别的文件都不让 seq 失配，
+    // 旧批次的 worker 会继续从新项目的 pane 里领块，译文却写进旧项目桶（新项目再付一次钱）。
+    const fixedFileKey = ovlP215RunFileKey();
+    let p215Mismatch = false;
 
     async function worker() {
         for (;;) {
@@ -42437,6 +42474,9 @@ async function ovlVisualLangRunQueue() {
             // 一个长任务里跑完（只有微任务，中间没有输入/渲染机会）。每轮开头真让出一次事件循环。
             await ovlP208YieldToEventLoop();
             if (mySeq !== OvlVisualLangState.seq || controller.signal.aborted) return;
+            // v2 Pass P215（VISUALPERF-2）：项目或文件已不是这一批启动时的——停手，块留在 pending，
+            // 新项目/新文件自己的 SyncAfterRender / IdleAudit 会重新起队列。
+            if (ovlVisualTransCacheProjectId() !== fixedProjectId || ovlP215RunFileKey() !== fixedFileKey) { p215Mismatch = true; return; }
             const pane = document.getElementById('ovlVisualPane');
             if (!pane) return;
             const queue = ovlVisualLangCollectPendingCached(pane);
@@ -42478,6 +42518,10 @@ async function ovlVisualLangRunQueue() {
                 continue;
             }
             const meta = {}; // v2 Pass P113：接住"两层掩码后无可翻内容"这条显式豁免信号
+            // v2 Pass P215（VISUALPERF-7）：缓存 key（含术语表/论文卡片/领域提示指纹）在发请求这一刻算，
+            // 落地时用同一个 key——请求在飞期间用户改了术语表，旧术语译出来的结果不能挂到新指纹下冒充最新。
+            let p215ReqKey = null;
+            try { p215ReqKey = ovlVisualTransCacheKey(text, cfg); } catch (eK) { p215ReqKey = null; }
             try {
                 // v2 Pass P122（C2）：改调重试阶梯，取代直接调 ovlVisualTranslateBlockText——
                 // 失败后自动升级重问，不再是"同 prompt 同模型问一次就放弃"。
@@ -42494,7 +42538,7 @@ async function ovlVisualLangRunQueue() {
                     if (document.body.contains(el)) el.setAttribute('data-ovl-trans-pending', '1');
                     return;
                 }
-                try { ovlVisualTransCachePut(text, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel); } catch (e) {} // v2 Pass P113 返修（问题2）：跟着译文一起落盘 skipped 标记；partial 见 P122c BV2-2；ladderLevel 见 P128b N-4
+                try { ovlVisualTransCachePut(text, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, p215ReqKey); } catch (e) {} // v2 Pass P113 返修（问题2）：跟着译文一起落盘 skipped 标记；partial 见 P122c BV2-2；ladderLevel 见 P128b N-4
                 if (typeof ovlVisualFailLogDelete === 'function') ovlVisualFailLogDelete(text, cfg); // v2 Pass P128（C1，清除点）：这一块这次成功了，清掉旧的失败记录
                 if (document.body.contains(el)) {
                     ovlVisualApplyTranslatedHtml(el, tgt); // v2 Pass P168：异步单块补丁路径也要复算编号，见 ovlVisualRenderChunkWithEqNum 头部注释；v2 Pass P170：compare 模式只替换中文侧，见 ovlVisualApplyTranslatedHtml 头部注释
@@ -42591,10 +42635,18 @@ async function ovlVisualLangRunQueue() {
     const workers = [];
     for (let i = 0; i < OVL_VISUAL_LANG_CONCURRENCY; i++) workers.push(worker());
     try { await Promise.all(workers); } finally {
-        OvlVisualLangState.running = false;
-        // v2 Pass P208：运行结束——清掉限速尾随计时器并立刻补一次 relayout，最终状态必须马上对齐。
-        if (OvlP208RelayoutThrottleTimer !== null) { try { clearTimeout(OvlP208RelayoutThrottleTimer); } catch (eT) {} OvlP208RelayoutThrottleTimer = null; }
-        if (typeof ovlP198ScheduleRelayout === 'function') { try { ovlP198ScheduleRelayout(); } catch (eR) {} }
+        // v2 Pass P215（VISUALPERF-1）：被取消的旧批次（seq 已变）的 finally 晚于新批次启动才跑完——
+        // ovlVisualLangCancelInFlight 已经替它把 running 关掉了，新批次紧接着又同步置 true。这里无条件
+        // running=false / 清限速计时器会把新批次的 running 关掉（P208 限速失效、进度行误报"已暂停"、
+        // 再点一下起第二组 worker = 6 并发、IdleAudit 在运行中途触发）。只有"仍是当前批次"或"
+        // 没有新批次在跑"才动共享状态。
+        const p215Current = (mySeq === OvlVisualLangState.seq) || !OvlVisualLangState.running;
+        if (p215Current) {
+            OvlVisualLangState.running = false;
+            // v2 Pass P208：运行结束——清掉限速尾随计时器并立刻补一次 relayout，最终状态必须马上对齐。
+            if (OvlP208RelayoutThrottleTimer !== null) { try { clearTimeout(OvlP208RelayoutThrottleTimer); } catch (eT) {} OvlP208RelayoutThrottleTimer = null; }
+            if (typeof ovlP198ScheduleRelayout === 'function') { try { ovlP198ScheduleRelayout(); } catch (eR) {} }
+        }
         if (OvlVisualLangState.controller === controller) OvlVisualLangState.controller = null;
         // v2 Pass P128（C3，进度行"点此继续"）：这一批 worker 全部退出（正常跑完，或者被
         // ovlVisualLangCancelInFlight() 取消）——running 刚变成 false，如果这一批没有跑完
@@ -42604,7 +42656,10 @@ async function ovlVisualLangRunQueue() {
         // 再也没有跑起来）。
         if (typeof ovlVisualLangProgressUpdate === 'function') { try { ovlVisualLangProgressUpdate(); } catch (e) {} }
         // v2 Pass P128（不变量自检）：队列这一批 worker 全部退出，跑一次自愈自检。
-        if (typeof ovlVisualLangIdleAudit === 'function') { try { ovlVisualLangIdleAudit(); } catch (e) {} }
+        if (p215Current && typeof ovlVisualLangIdleAudit === 'function') { try { ovlVisualLangIdleAudit(); } catch (e) {} }
+        // v2 Pass P215（VISUALPERF-2）：因项目/文件变了而收工——新项目那一侧的 SyncAfterRender 如果在旧批次
+        // 还 running 时被调用会被 running 守卫吞掉，这里补一次重算 + 起队列，新项目的 pending 块才会被接手。
+        if (p215Current && p215Mismatch && typeof ovlVisualLangSyncAfterRender === 'function') { try { ovlVisualLangSyncAfterRender(); } catch (eS) {} }
     }
 }
 
@@ -64115,7 +64170,7 @@ const OVL_VISUAL_GUTTER_MIN_H = 1; // v2 Pass P123（D2）：渲染高度小于�
 // 渲染高度不变的状态转换，会被那条 diff 直接判定"没变"跳过，标记停在旧状态。这里单独维护一份
 // "每个块上次汇报给标记层的状态指纹" WeakMap，指纹变了就重画，完全独立于几何 diff，
 // ovlRenderVisualGutter() 每次调用都会跑一遍（见下面调用点），不管 changedIdx 是否为空。
-const OvlVisualGutterMarkFp = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+let OvlVisualGutterMarkFp = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
 // v2 Pass P157 性能返修（实测复现见 .claude/tmp/p157_impl.md）：第一版实现对每一块每次调用都
 // 直接跑 ovlQaVisualStateCompute（10 个分支的属性判定），在 P123（D3）那条"30s 内 348 次
 // 重排、550 块语料"的热路径下把 test_p123_gutter_align.js 的 A3c（单次重排均值阈值）从
@@ -64136,7 +64191,7 @@ const OvlVisualGutterMarkFp = (typeof WeakMap !== 'undefined') ? new WeakMap() :
 //      状态/label，不复制它的判断逻辑），再用现成的 key+label 指纹（OvlVisualGutterMarkFp）
 //      决定要不要真的动 DOM——这一层是原有设计，没有改变。
 let OvlVisualGutterMarkLangSeen = null;
-const OvlVisualGutterMarkRawFp = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+let OvlVisualGutterMarkRawFp = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
 function ovlVisualGutterRawAttrFp(blk) {
     const attrs = blk.attributes;
     let fp = '';
@@ -64296,6 +64351,8 @@ function ovlRenderVisualGutter(skipAlignSchedule) {
             gutter.innerHTML = '';
             OvlVisualBlockRects = [];
             OvlVisualGutterCellMap = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+            OvlVisualGutterMarkFp = (typeof WeakMap !== 'undefined') ? new WeakMap() : null; // v2 Pass P215（VISUALPERF-4）：格子全没了，标记指纹作废
+            OvlVisualGutterMarkRawFp = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
             OvlVisualGutterBlockOrder = [];
             OvlVisualGutterSpacerEl = null;
             OvlVisualGutterLastSpacerTop = -1;
@@ -64331,6 +64388,10 @@ function ovlRenderVisualGutter(skipAlignSchedule) {
             gutter.innerHTML = '';
             OvlVisualBlockRects = new Array(blocks.length);
             OvlVisualGutterCellMap = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+            // v2 Pass P215（VISUALPERF-4）：全量重建 = 全新的无标记格子，但存活的块元素还在——按块记的标记指纹
+            // 必须一起作废，否则 ApplyMarksAll 看到"指纹没变"就跳过，失败/部分/阶梯标记永远不再补画。
+            OvlVisualGutterMarkFp = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
+            OvlVisualGutterMarkRawFp = (typeof WeakMap !== 'undefined') ? new WeakMap() : null;
             const frag = document.createDocumentFragment();
             for (let i = 0; i < blocks.length; i++) {
                 const blk = blocks[i];
@@ -64385,6 +64446,9 @@ function ovlRenderVisualGutter(skipAlignSchedule) {
                     let cell = OvlVisualGutterCellMap ? OvlVisualGutterCellMap.get(rc.el) : null;
                     if (rc.visible) {
                         if (!cell) {
+                            // v2 Pass P215（VISUALPERF-4）：重新长出来的格子没有标记，清这块的指纹。
+                            if (OvlVisualGutterMarkFp) OvlVisualGutterMarkFp.delete(rc.el);
+                            if (OvlVisualGutterMarkRawFp) OvlVisualGutterMarkRawFp.delete(rc.el);
                             cell = document.createElement('div');
                             cell.className = 'ovl-ln ovl-ln-visual';
                             cell.setAttribute('data-ln', String(rc.line));
@@ -64398,6 +64462,8 @@ function ovlRenderVisualGutter(skipAlignSchedule) {
                     } else if (cell) {
                         cell.remove();
                         if (OvlVisualGutterCellMap) OvlVisualGutterCellMap.delete(rc.el);
+                        if (OvlVisualGutterMarkFp) OvlVisualGutterMarkFp.delete(rc.el); // v2 Pass P215（VISUALPERF-4）
+                        if (OvlVisualGutterMarkRawFp) OvlVisualGutterMarkRawFp.delete(rc.el);
                     }
                 }
             }
@@ -64742,6 +64808,15 @@ function ovlRenderVisualGutterMirror(skipAlignSchedule) {
 // 恰好处于 burst（比如拖分栏条途中触发了滚动定位），走外层入口只会把它重新丢进去抖计时器，
 // 读到的还是旧坐标，等于没 flush。
 function ovlFlushPendingVisualGutter() {
+    // v2 Pass P215（VISUALPERF-3）：P208 限速尾随计时器也是"待跑的重排"——只挂了计时器（Raf 为 null）时
+    // 原先什么都不做，调用方读到最多 ~1s 前的旧块矩形，滚动/标记居中落错行。清计时器、同步跑一遍。
+    if (OvlP208RelayoutThrottleTimer !== null) {
+        try { clearTimeout(OvlP208RelayoutThrottleTimer); } catch (eT) {}
+        OvlP208RelayoutThrottleTimer = null;
+        if (OvlP198RelayoutRaf !== null) { try { cancelAnimationFrame(OvlP198RelayoutRaf); } catch (eC) {} OvlP198RelayoutRaf = null; }
+        ovlP198RunRelayoutPassCore();
+        return;
+    }
     if (OvlP198RelayoutRaf !== null) {
         try { cancelAnimationFrame(OvlP198RelayoutRaf); } catch (e) {}
         OvlP198RelayoutRaf = null;
@@ -64823,10 +64898,13 @@ function ovlScheduleVisualGutterAfterFonts(depth) {
 
 // pane 滚动时 gutter 跟着滚——和 Code 模式 `gutter.scrollTop = ta.scrollTop` 同一条纪律，
 // 只是源头换成了 .ovl-visual-pane。只在 Visual 模式下才生效，Code 模式下这个监听器空转。
+// v2 Pass P215（perf #4）：scroll 每帧触发，两次 getElementById 缓存起来（失连时重取）。
+let OvlP215ScrollGutterEl = null, OvlP215ScrollPaneEl = null;
 function ovlSyncVisualGutterScroll() {
     if (OvlState.editorMode !== 'visual') return;
-    const gutter = document.getElementById('ovlGutter');
-    const pane = document.getElementById('ovlVisualPane');
+    if (!OvlP215ScrollGutterEl || !OvlP215ScrollGutterEl.isConnected) OvlP215ScrollGutterEl = document.getElementById('ovlGutter');
+    if (!OvlP215ScrollPaneEl || !OvlP215ScrollPaneEl.isConnected) OvlP215ScrollPaneEl = document.getElementById('ovlVisualPane');
+    const gutter = OvlP215ScrollGutterEl, pane = OvlP215ScrollPaneEl;
     if (gutter && pane) gutter.scrollTop = pane.scrollTop;
 }
 
@@ -66429,7 +66507,7 @@ function ovlBindPassD() {
         ovlBindGutterSelectMirror(); // v2 Pass P193：镜像 gutter 行号点选（此前右侧一个监听器都没有）
         ovlBindBilingualGutterSync(); // v2 Pass P193：左侧 gutter 点击 -> 驱动右侧跨面板高亮联动
         const visPane = document.getElementById('ovlVisualPane');
-        if (visPane) visPane.addEventListener('scroll', ovlSyncVisualGutterScroll);
+        if (visPane) visPane.addEventListener('scroll', ovlSyncVisualGutterScroll, { passive: true }); // v2 Pass P215：从不 preventDefault
         // v2 Pass P175 修复：跟上面同一条绑定纪律，补上双语对照模式右侧镜像面板缺失的
         // gutter 滚动联动（见 ovlSyncVisualGutterScrollMirror 头部注释）。
         const visPaneMirror = document.getElementById('ovlVisualPaneMirror');
