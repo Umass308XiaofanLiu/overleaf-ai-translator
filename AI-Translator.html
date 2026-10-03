@@ -5018,7 +5018,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.42.11';        // APP_VERSION_STAMP
+const APP_VERSION = '03.42.12';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-03';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -10259,6 +10259,16 @@ const CLAUDE_API_BASE = "https://api.anthropic.com/v1/messages";
 // 【硬规则 3】finish_reason 对**每一次**调用都读出来。它是 TRUNCATED 与 EMPTY 之间
 // 唯一的分辨依据（见 classifyLocalFailure）。
 function readLocalChoice(data) {
+    // v2 Pass P216（PIPELINE-7）：HTTP 200 但整个响应体是 {"error": ...} 且没有 choices——LM Studio 对
+    // 未知路由就是这么回的。以前读出一个空串，一路被当成"模型答了个空"，最终报"每一段都没通过完整性
+    // 检查"，把锅甩给模型、藏起真正的服务端报错。现在原样抛 API Error。有 choices 时一律照旧。
+    if (data && data.error && !(Array.isArray(data.choices) && data.choices.length)) {
+        const em = (typeof data.error === 'string') ? data.error
+            : (data.error && typeof data.error.message === 'string' ? data.error.message : JSON.stringify(data.error));
+        let emc = String(em).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+        if (emc.length > 300) emc = emc.slice(0, 299) + '…';
+        throw new Error('API Error: ' + emc);
+    }
     const ch = (data && data.choices && data.choices[0]) || {};
     const msg = ch.message || {};
     const content = typeof msg.content === 'string' ? msg.content : '';
@@ -10403,12 +10413,14 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
     // 构建路径各自为政留下的口子。归一后不管用户写不写尾部 /v1 都能命中真实端点。
     const endpoint = `${xportCapsOrigin(baseUrl)}/v1/chat/completions`;
 
+    // v2 Pass P216（PIPELINE-6）：总超时——Qwen（带 apiKey 的在线端点）180 秒，LM Studio 本地 600 秒。
+    const rg = (typeof xportReqGuard === 'function') ? xportReqGuard(signal, (oApiKey ? 180000 : 600000)) : { signal: signal, fail: function (e) { return e; }, done: function () {} };
     try {
         let response = await fetch(endpoint, {
             method: "POST",
             headers: headers,
             body: JSON.stringify(body),
-            signal
+            signal: rg.signal
         });
 
         // 兼容闸①（P102 新增，放在 reasoning_effort 闸门**之前**判断）：tools。跟下面
@@ -10431,7 +10443,7 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
                 method: "POST",
                 headers: headers,
                 body: JSON.stringify(body),
-                signal
+                signal: rg.signal
             });
         }
 
@@ -10447,16 +10459,16 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
                     method: "POST",
                     headers: headers,
                     body: JSON.stringify(body),
-                    signal
+                    signal: rg.signal
                 });
             } else {
-                throw new Error(`API Error: ${response.status} - ${firstErr}`);
+                throw new Error(`API Error: ${response.status} - ${(typeof xportErrText === 'function' ? xportErrText(firstErr) : String(firstErr).slice(0, 300))}`);
             }
         }
 
         if (!response.ok) {
             const errText = await response.text();
-            throw new Error(`API Error: ${response.status} - ${errText}`);
+            throw new Error(`API Error: ${response.status} - ${(typeof xportErrText === 'function' ? xportErrText(errText) : String(errText).slice(0, 300))}`);
         }
 
         const data = await response.json();
@@ -10514,8 +10526,10 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
         try { xportNoteThinking(model, choice.thinking, effortSent ? (effortSent !== 'none') : undefined); } catch (e) {}
         return choice.text;
     } catch (error) {
-        if (error.name === 'AbortError') throw error;
-        throw error;
+        if (error.name === 'AbortError' && !rg.timedOut()) throw error;
+        throw rg.fail(error);
+    } finally {
+        rg.done();
     }
 }
 
@@ -10568,6 +10582,51 @@ function fetchWithTimeout(url, options = {}, ms = MODEL_FETCH_TIMEOUT) {
     const controller = new AbortController();
     setTimeout(() => controller.abort(), ms);
     return fetch(url, { ...options, signal: controller.signal });
+}
+
+// v2 Pass P216（PIPELINE-6/12）：模型请求的总超时 + 错误体清洗。
+// 为什么不能给 callLocalLLM/callGeminiAPI/... 直接 import 这两个函数：tests/transport/phaseA|phaseB
+// 的抽取器只抽固定清单里的函数，调用点一律写成 typeof 守卫形式（见各调用点），抽取器里缺这两个
+// 函数时退化成"不加超时、不清洗"，逐字等于改动前。
+// 在线 provider（Gemini/OpenAI/Claude/Qwen）总超时 180 秒，本地（LM Studio，慢生成是正常的）600 秒。
+// 用 AbortSignal.any([用户 signal, AbortSignal.timeout(ms)])；没有 AbortSignal.any 的浏览器退回
+// AbortController + setTimeout。超时抛出的错误 name 固定为 'TimeoutError'（不是 AbortError——
+// 调用方把 AbortError 当成"用户取消"静默吞掉，超时必须是一条可见的失败），message 含 timeout，
+// 被 ovlVisualTransFailReason 归为 'timeout'。
+function xportReqGuard(userSignal, ms) {
+    const g = { signal: userSignal || null, timedOut: function () { return false; }, done: function () {},
+        fail: function (e) {
+            if (g.timedOut()) {
+                const te = new Error('请求超时（timeout）：模型服务超过 ' + Math.round(ms / 1000) + ' 秒没有响应，已中止这次请求');
+                te.name = 'TimeoutError';
+                return te;
+            }
+            return e;
+        } };
+    try {
+        if (typeof AbortSignal !== 'undefined' && typeof AbortSignal.timeout === 'function' && typeof AbortSignal.any === 'function') {
+            const t = AbortSignal.timeout(ms);
+            g.signal = userSignal ? AbortSignal.any([userSignal, t]) : t;
+            g.timedOut = function () { return t.aborted && !(userSignal && userSignal.aborted); };
+            return g;
+        }
+        const c = new AbortController();
+        let fired = false;
+        const timer = setTimeout(function () { fired = true; try { c.abort(); } catch (e) {} }, ms);
+        if (userSignal) {
+            if (userSignal.aborted) { try { c.abort(); } catch (e) {} }
+            else userSignal.addEventListener('abort', function () { try { c.abort(); } catch (e) {} }, { once: true });
+        }
+        g.signal = c.signal;
+        g.timedOut = function () { return fired && !(userSignal && userSignal.aborted); };
+        g.done = function () { clearTimeout(timer); };
+    } catch (e) {}
+    return g;
+}
+// 错误响应体清洗：去标签、折叠空白、截到 300 字符以内（代理返回的整页 502 HTML 不该原样进 toast/failLog）。
+function xportErrText(t) {
+    const x = String(t == null ? '' : t).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim();
+    return x.length > 300 ? x.slice(0, 299) + '…' : x;
 }
 
 // 带错误码的 Error（错误码 → MODEL_ERROR_TEXT 里的中文人话）
@@ -11129,19 +11188,24 @@ async function callGeminiAPI(model, contents, config = {}, apiKey = null, signal
         body.generationConfig.responseSchema = config.responseSchema;
     }
 
-    const response = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-        signal
-    });
+    // v2 Pass P216（PIPELINE-6/12）：总超时 180 秒；错误体清洗。
+    const rg = (typeof xportReqGuard === 'function') ? xportReqGuard(signal, 180000) : { signal: signal, fail: function (e) { return e; }, done: function () {} };
+    let response, data;
+    try {
+        response = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: rg.signal
+        });
 
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Gemini API Error: ${response.status} - ${errText}`);
-    }
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`Gemini API Error: ${response.status} - ${(typeof xportErrText === 'function' ? xportErrText(errText) : String(errText).slice(0, 300))}`);
+        }
 
-    const data = await response.json();
+        data = await response.json();
+    } catch (e) { throw rg.fail(e); } finally { rg.done(); }
     // ---- A2 / §3.3：绝不再读 parts[0] ----
     // 【实测，用户的真实 Key，gemini-2.5-flash-lite】开了 thinkingConfig.includeThoughts 之后
     // parts[0] 就是**思维链**（[THOUGHT:2296, text:369]），旧代码会把
@@ -11244,22 +11308,27 @@ async function callOpenAIAPI(model, messages, config = {}, apiKey = null, signal
         body.web_search_options = {};
     }
 
-    const response = await fetch(OPENAI_API_BASE, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${apiKey}`
-        },
-        body: JSON.stringify(body),
-        signal
-    });
+    // v2 Pass P216（PIPELINE-6/12）：总超时 180 秒；错误体清洗。
+    const rg = (typeof xportReqGuard === 'function') ? xportReqGuard(signal, 180000) : { signal: signal, fail: function (e) { return e; }, done: function () {} };
+    let response, data;
+    try {
+        response = await fetch(OPENAI_API_BASE, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": `Bearer ${apiKey}`
+            },
+            body: JSON.stringify(body),
+            signal: rg.signal
+        });
 
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`OpenAI API Error: ${response.status} - ${errText}`);
-    }
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`OpenAI API Error: ${response.status} - ${(typeof xportErrText === 'function' ? xportErrText(errText) : String(errText).slice(0, 300))}`);
+        }
 
-    const data = await response.json();
+        data = await response.json();
+    } catch (e) { throw rg.fail(e); } finally { rg.done(); }
     // OpenAI 的响应形状与 LM Studio 的 OpenAI 兼容层同形，所以复用同一个读取口
     // （A2：「模型说了什么」全文件只判定一次）。取值与改动前逐字等价：
     // content 不是字符串时两边都得到 ""。
@@ -11339,23 +11408,34 @@ async function callClaudeAPI(model, messages, config = {}, apiKey = null, signal
     // 使用代理 URL 而不是直接调用 Claude API
     const endpoint = proxyUrl.replace(/\/$/, "");
 
-    const response = await fetch(endpoint, {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/json",
-            "x-api-key": apiKey,
-            "anthropic-version": "2023-06-01"
-        },
-        body: JSON.stringify(body),
-        signal
-    });
+    // v2 Pass P216（PIPELINE-6/12）：总超时 180 秒（经 proxyUrl 的请求照旧，只是 signal 换成带超时的）；错误体清洗。
+    const rg = (typeof xportReqGuard === 'function') ? xportReqGuard(signal, 180000) : { signal: signal, fail: function (e) { return e; }, done: function () {} };
+    let response, data;
+    try {
+        response = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "x-api-key": apiKey,
+                "anthropic-version": "2023-06-01"
+            },
+            body: JSON.stringify(body),
+            signal: rg.signal
+        });
 
-    if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(`Claude API Error: ${response.status} - ${errText}`);
+        if (!response.ok) {
+            const errText = await response.text();
+            throw new Error(`Claude API Error: ${response.status} - ${(typeof xportErrText === 'function' ? xportErrText(errText) : String(errText).slice(0, 300))}`);
+        }
+
+        data = await response.json();
+    } catch (e) { throw rg.fail(e); } finally { rg.done(); }
+    // v2 Pass P216（PIPELINE-7）：HTTP 200 + {"error": ...} 且没有 content——原样抛出，不当成空回复。
+    if (data && data.error && !(Array.isArray(data.content) && data.content.length)) {
+        const em = (typeof data.error === 'string') ? data.error
+            : (data.error && typeof data.error.message === 'string' ? data.error.message : JSON.stringify(data.error));
+        throw new Error('API Error: ' + (typeof xportErrText === 'function' ? xportErrText(em) : String(em).slice(0, 300)));
     }
-
-    const data = await response.json();
     // Claude 返回格式: { content: [{ type: "text", text: "..." }] }
     return data.content?.[0]?.text || "";
 }
@@ -12304,7 +12384,7 @@ async function xportLocalContext(baseUrl, model) {
     if (hit && Date.now() - hit.at < 60000) return hit.ctx;
     let ctx = 0;
     try {
-        const url = String(baseUrl).replace(/\/$/, '') + '/api/v0/models';
+        const url = xportCapsOrigin(baseUrl) + '/api/v0/models'; // v2 Pass P216（PIPELINE-8）：用户常配成 http://host:1235/v1，不归一会拼成 /v1/api/v0/models
         const resp = await fetchWithTimeout(url, {}, 4000);
         if (resp.ok) {
             const data = await resp.json();
@@ -13120,6 +13200,24 @@ function xportAttachRawSrc(translations, pristine, stripped) {
             const from = (i === 0) ? 0 : idx[ends[i - 1] - 1] + 1;
             const to = (i === translations.length - 1) ? pristine.length : idx[ends[i] - 1] + 1;
             translations[i].srcRaw = pristine.slice(from, to);
+        }
+        // v2 Pass P216 (PIPELINE-5)：行尾若还有没闭合的 `{`（被删宏头在本行里开了、宏尾 `}` 落在了
+        // 下一行开头），把下一行开头那几个 `}` 挪回本行。拼接结果不变（仍无损），但每行都是
+        // 括号平衡的片段，之后单行删除/重生成/xportRawEditMerge 不会留下孤立的 `}`。
+        for (let i = 0; i + 1 < translations.length; i++) {
+            const a = translations[i].srcRaw, b = translations[i + 1].srcRaw;
+            let open = 0;
+            for (let k = 0; k < a.length; k++) {
+                const ch = a[k];
+                if (ch === '\\') { k++; continue; }
+                if (ch === '{') open++; else if (ch === '}' && open > 0) open--;
+            }
+            let take = 0;
+            while (take < open && take < b.length && b[take] === '}') take++;
+            if (take > 0) {
+                translations[i].srcRaw = a + b.slice(0, take);
+                translations[i + 1].srcRaw = b.slice(take);
+            }
         }
     } catch (e) { /* 对不上就当没有这份信息 */ }
 }
@@ -15832,7 +15930,19 @@ function xportPersistOpen() {
             } catch (e) {}
         };
         // 赋值放在 done 之外：就算是超时之后才迟到的那次成功，也要把连接留下来给下一次写用。
-        req.onsuccess = function () { xportPersistDb = req.result; done(resolve, xportPersistDb); };
+        req.onsuccess = function () {
+            xportPersistDb = req.result;
+            // v2 Pass P216（PIPELINE-11）：浏览器关掉连接（清站点数据/存储驱逐）或别处要升级库时，
+            // 旧连接再 transaction() 会一直抛 InvalidStateError，之后每次写都失败直到刷新页面。
+            // 丢掉缓存的连接，下一次写会重新 open。
+            try {
+                const thisDb = req.result;
+                const drop = function () { if (xportPersistDb === thisDb) xportPersistDb = null; try { thisDb.close(); } catch (e) {} };
+                thisDb.onclose = drop;
+                thisDb.onversionchange = drop;
+            } catch (e) {}
+            done(resolve, xportPersistDb);
+        };
         req.onerror = function () { done(reject, req.error || new Error('indexedDB.open 失败')); };
         req.onblocked = function () { done(reject, new Error('另一个标签页占住了数据库升级')); };
         try {
@@ -15872,10 +15982,13 @@ function xportPersistSnapshot() {
         targetLang: AppState.targetLang,
         isAutoDetect: AppState.isAutoDetect,
         srcEditedSinceTranslate: AppState.srcEditedSinceTranslate === true,
-        // 结构化克隆存不了函数/DOM，但 pairs 和 history 都是纯数据。深拷贝一次，
-        // 免得写的过程中用户继续编辑导致克隆到半路的状态。
-        translationPairs: JSON.parse(JSON.stringify(AppState.translationPairs || [])),
-        globalHistory: JSON.parse(JSON.stringify(AppState.globalHistory || []))
+        // v2 Pass P216（PIPELINE-9）：不再手动 JSON 深拷贝——IDB put() 本身就是同步结构化克隆，
+        // 手动再拷一次是对整份归档（Keep-Last 20 × ~1 MB 含撤销栈）的 20+ MB 双倍克隆，每次防抖落盘/
+        // 自动存档/切标签都在主线程上白做一次。"写的过程中用户继续编辑"的担心靠调用顺序解决：
+        // xportPersistNow 在 store.put() 同一个同步任务里现取这份快照（见那里），快照函数返回到
+        // put 克隆完成之间没有任何其它代码能跑，所以引用的是此刻的状态。
+        translationPairs: AppState.translationPairs || [],
+        globalHistory: AppState.globalHistory || []
     };
 }
 
@@ -15952,7 +16065,16 @@ function xportPersistNow() {
                     const foreign = !!cur && Number(cur.savedAt) > xportPersistSeenAt
                                     && cur.owner !== XPORT_TAB_ID;
                     if (foreign) { verdict = mine ? 'yield' : 'skip-empty'; return; }
-                    store.put(rec);
+                    // v2 Pass P216（PIPELINE-9）：put 的同一个同步任务里现取快照（见 xportPersistSnapshot 注释）。
+                    rec = xportPersistSnapshot();
+                    try { store.put(rec); }
+                    catch (ePut) {
+                        // 结构化克隆拒绝（pairs/history 里混进了函数/DOM 之类不可克隆的值）时，退回旧的 JSON 深拷贝
+                        // 路径再写一次——那条路对不可克隆的值是静默丢弃，行为等同改动前。
+                        rec.translationPairs = JSON.parse(JSON.stringify(rec.translationPairs || []));
+                        rec.globalHistory = JSON.parse(JSON.stringify(rec.globalHistory || []));
+                        store.put(rec);
+                    }
                 } catch (e) { reject(e); }
             };
         });
@@ -23056,7 +23178,7 @@ async function chatGeminiFetchOnce(url, bodyObj, signal) {
     });
     if (!resp.ok) {
         const errText = await resp.text();
-        throw new Error(`Gemini API Error: ${resp.status} - ${errText}`);
+        throw new Error(`Gemini API Error: ${resp.status} - ${(typeof xportErrText === 'function' ? xportErrText(errText) : String(errText).slice(0, 300))}`);
     }
     return await resp.json();
 }
@@ -38812,7 +38934,7 @@ function ovlVisualCodeMask(text) {
 // map 为空时还要求 body 里一个我方哨兵都不能凭空出现（模型不该自己编出这种记号）。
 function ovlVisualCodeCheck(body, map) {
     const t = String(body == null ? '' : body);
-    if (!map.length) return !OVL_VISUAL_CODE_TOKEN_RE.test(t);
+    if (!map.length) return !(new RegExp(OVL_VISUAL_CODE_TOKEN_RE.source)).test(t); // v2 Pass P216（PIPELINE-10）：全局 /g 正则的 .test 带 lastIndex 状态，必须用新实例
     const seen = new Array(map.length).fill(0);
     const re = new RegExp(OVL_VISUAL_CODE_TOKEN_RE.source, 'g');
     let m, total = 0;
@@ -39297,6 +39419,7 @@ function ovlVisualTransFailReason(err, meta) {
     const msg = String((err && err.message) || err || '');
     if (/回显/.test(msg)) return 'echo';
     if (/代码\/逐字环境哨兵/.test(msg)) return 'code-sentinel';
+    if (/散文哨兵/.test(msg)) return 'tp-sentinel'; // v2 Pass P216（PIPELINE-1）
     // v2 Pass P122b（B2）：ovlVisualCiteCheck 抛出的错误固定含"引用编号哨兵"，判定依据仍然
     // 只用已经存在的信号（throw 出来的 message 固定文案），跟上面 code-sentinel 同一条纪律。
     if (/引用编号哨兵/.test(msg)) return 'cite-sentinel';
@@ -39339,6 +39462,35 @@ function ovlVisualTransFailReason(err, meta) {
     if (/Failed to fetch|NetworkError|ENOTFOUND|ECONNREFUSED|ECONNRESET|network|网络|连接被重置|连接被拒绝|连接失败/i.test(msg)) return 'network';
     if (/provider|Cannot read propert|is not a function|config/i.test(msg)) return 'config';
     return 'unknown';
+}
+// v2 Pass P216（PIPELINE-2）：失败分类里"再问也没用"的两档。
+//   hard：401/402/403/404/config——key/权限/地址/配置错了，换 prompt 重问一千遍结果相同，L0 失败就收手。
+//   transient：429/5xx/network/timeout——服务当下不可用，允许阶梯里已有的 L2 再试一次（一次瞬断
+//     不该让整块直接失败），但 L2 也失败就收手，不再往下烧 L4/L3 逐句/L-raw 的请求。
+// 以前每块 L0+L2+每句一发 L3，550 块 × 3 worker 在一个坏 key 下烧出几千次必败请求，用户要等好几分钟
+// 才看到第一个失败标记。
+function ovlVisualTransIsHardFatal(reason) {
+    return /^http-(401|402|403|404)$/.test(String(reason)) || reason === 'config';
+}
+function ovlVisualTransIsTransient(reason) {
+    return /^http-(429|5\d\d)$/.test(String(reason)) || reason === 'network' || reason === 'timeout';
+}
+function ovlVisualTransIsTransportFatal(reason) {
+    return ovlVisualTransIsHardFatal(reason) || ovlVisualTransIsTransient(reason);
+}
+// 队列熔断用的中文原因名。
+function ovlVisualTransFatalLabel(reason) {
+    const r = String(reason);
+    if (r === 'http-401') return '401 未授权（API Key 无效或缺失）';
+    if (r === 'http-402') return '402 余额或额度不足';
+    if (r === 'http-403') return '403 无权访问（Key 权限或地区限制）';
+    if (r === 'http-404') return '404 地址或模型不存在';
+    if (r === 'http-429') return '429 请求过于频繁或额度用尽';
+    if (/^http-5\d\d$/.test(r)) return 'HTTP ' + r.slice(5) + ' 模型服务端故障';
+    if (r === 'network') return '网络连接失败';
+    if (r === 'timeout') return '请求超时';
+    if (r === 'config') return '配置错误（服务商/Key/代理地址未配置）';
+    return r;
 }
 // 并发 worker（最多 3 个）同时踩雷时不刷屏：同一批失败只弹一条 toast。
 let ovlVisualEchoToastAt = 0;
@@ -39540,6 +39692,15 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
                 + '直接嵌进对应的译文位置。');
             priorPlaceholderRule = true;
         }
+        // v2 Pass P216（PIPELINE-1）：块里抽出了 \text/\textrm/\mbox 散文时，哨兵 〖〖OVLTPk〗〗 会以明文
+        // 出现在送给模型的文本里（数学环境里的那些被 xportMask 整体吞进 [[k]]，不在此列），必须有一条
+        // 明文规则，否则模型会当成普通文字丢掉/改写/复制。没有这类哨兵时这条规则不出现（prompt 字节不变）。
+        if (textProseMasked.items.length > 0) {
+            rules.push('文本中所有形如 〖〖OVLTP数字〗〗 的记号' + (priorPlaceholderRule ? '同样' : '') + '必须原样保留在译文里、恰好出现一次、'
+                + '不得翻译、不得增删、不得改动括号或数字——它们代表被抽走的 \\text{}/\\mbox{} 文字，请把每一个都当成一个不可拆分的'
+                + '单词对待，直接嵌进对应的译文位置。');
+            priorPlaceholderRule = true;
+        }
         rules.push('只输出翻译结果本身，不要添加任何解释、前后缀、引号或 Markdown 代码块标记。');
         rules.push('保持原文的意思和语气，译成通顺准确的简体中文学术书面语。');
         rules.push('必须真正翻译成中文——禁止原样照抄或复述英文原文，译文里的自然语言部分不应包含未翻译的'
@@ -39643,7 +39804,7 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
         // 于是残缺内容被当"翻译成功"静默落地、写进缓存。截断信号（finish_reason==='length'）
         // 本身就是一条独立、已经存在的信号，不该被其它校验的"平凡通过"盖过去——直接在这里判
         // 失败，让重试阶梯 L4（提高 max_tokens）/L3（按句切分）真正有机会介入。
-        if (callMeta && callMeta.finish === 'length') {
+        if (callMeta && (callMeta.finish === 'length' || callMeta.truncated === true)) { // v2 Pass P216（PIPELINE-3）：Gemini 的 MAX_TOKENS 只设 truncated，不设 finish==='length'
             throw new Error('翻译结果被截断（模型输出配额用尽，finish_reason=length）');
         }
         let body = (typeof raw === 'string') ? raw.trim() : '';
@@ -39713,6 +39874,18 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
             throw new Error('翻译结果未通过完整性校验（代码/逐字环境哨兵残留或数量不匹配）');
         }
         afterCodeUnmask = ovlVisualCodeUnmask(afterXport, codeMasked.map);
+        // v2 Pass P216（PIPELINE-1）：\text/\textrm/\mbox 散文哨兵往返校验——每个哨兵必须在最终文本里
+        // 恰好出现一次，且不得多出别的 OVLTP 记号。以前这个哨兵没人数：模型丢了它，\mbox{...} 的内容悄悄
+        // 消失；写坏了，译文里残留一个可见的 〖〖OVLTP1〗〗；复制了，散文被插入两次——全都当"翻译成功"落地并入缓存。
+        // 抛错交给上层阶梯（L2 换纠正 prompt 重问，之后 L3 按句切分）。
+        if (textProseMasked.items.length) {
+            const tpAll = afterCodeUnmask.match(/〖〖OVLTP\d+〗〗/g) || [];
+            let tpOk = tpAll.length === textProseMasked.items.length;
+            for (const item of textProseMasked.items) {
+                if (afterCodeUnmask.split(item.sentinel).length - 1 !== 1) { tpOk = false; break; }
+            }
+            if (!tpOk) throw new Error('翻译结果未通过完整性校验（\\text/\\mbox 散文哨兵丢失、重复或残留）');
+        }
         // v2 Pass P122b（B2，核验 .claude/tmp/p122_verify.md 阻断2）：引用哨兵往返校验，只在
         // 真正过了模型这一趟里做（mainNothing 分支的 afterCodeUnmask 来自没被 citeMask 处理过
         // 的 textProseMasked.text，天然不含 OVLCITE 哨兵，套用这个 check 会假阳性，那条分支
@@ -39854,6 +40027,10 @@ function ovlVisualLadderCorrectionText(reason) {
             + '合并了 [[数字]]、〔〔OVLCODE数字〕〕、〘〘OVLCITE数字〙〙 这几类占位符。这次必须让原文里出现过的'
             + '每一个占位符原样一字不改地在译文里出现恰好一次，绝不改变它的方括号层数或数字。';
     }
+    if (reason === 'tp-sentinel') {
+        return '上一次你的回复丢失、改动或重复了 〖〖OVLTP数字〗〗 记号。这次必须让原文里出现过的每一个 〖〖OVLTP数字〗〗 '
+            + '原样一字不改地在译文里出现恰好一次，不得翻译、不得删除、不得重复。';
+    }
     if (reason === 'code-sentinel') {
         return '上一次你的回复丢失、改动或重复了代码占位符 〔〔OVLCODEk〕〕。这次必须让每一个 OVLCODE 占位符'
             + '原样保留、数量与顺序和上一次完全一致。';
@@ -39984,6 +40161,12 @@ async function ovlVisualTranslateBlockWithLadder(text, cfg, signal, meta, opts) 
 
     // L2：换 prompt 重问 + temperature:0（禁止原样重问）
     const reason0 = ovlVisualTransFailReason(lastErr, m);
+    // v2 Pass P216（PIPELINE-2）：key/权限/地址/配置类失败，再问没用，直接收手。
+    if (ovlVisualTransIsHardFatal(reason0)) {
+        m.failReason = reason0;
+        m.ladderLevel = 'failed';
+        throw lastErr;
+    }
     const correction = ovlVisualLadderCorrectionText(reason0);
     // v2 Pass P122 返修（单测发现的两处 bug，一并修）：
     //   1) m2/m4 必须声明在 try 外面——const 声明在 try 块内部，catch 块访问不到（不同块作用域），
@@ -40003,6 +40186,15 @@ async function ovlVisualTranslateBlockWithLadder(text, cfg, signal, meta, opts) 
         if (e && e.name === 'AbortError') throw e;
         Object.assign(m, m2);
         lastErr = e;
+    }
+    // v2 Pass P216（PIPELINE-2）：L2 之后仍是传输类失败（或 L2 暴露出硬错误）——不再往下烧 L4/L3/L-raw。
+    {
+        const reasonL2 = ovlVisualTransFailReason(lastErr, m);
+        if (ovlVisualTransIsTransportFatal(reasonL2)) {
+            m.failReason = reasonL2;
+            m.ladderLevel = 'failed';
+            throw lastErr;
+        }
     }
 
     // L4：命中截断信号——提高 max_tokens 重跑（不消耗 L3 的"整块失败"判定）
@@ -40045,13 +40237,21 @@ async function ovlVisualTranslateBlockWithLadder(text, cfg, signal, meta, opts) 
                 anyFail = true;
                 lastSegErr = es;
                 lastSegMeta = segMeta;
+                // v2 Pass P216（PIPELINE-2）：服务当场不可用（401/429/5xx/断网/超时…）——剩下的句子保留原文，
+                // 不再每句各发一次必败请求。
+                if (ovlVisualTransIsTransportFatal(ovlVisualTransFailReason(es, segMeta))) {
+                    for (let r = i + 1; r < ex.segs.length; r++) outSegs.push(ex.segs[r]);
+                    break;
+                }
             }
         }
         if (anySuccess) {
             let joined = '';
             for (let i = 0; i < outSegs.length; i++) {
                 joined += outSegs[i];
-                if (i < outSegs.length - 1) joined += (ex.breaks[i] ? '\n\n' : ' ');
+                // v2 Pass P216（PIPELINE-4）：这一句里有没被转义的 % 时用换行连接——% 会吞到行尾，
+                // 用空格连接会把下一句也变成注释（跟 xportRecoverSegment 的 L2 拼接同一条纪律）。
+                if (i < outSegs.length - 1) joined += (ex.breaks[i] ? '\n\n' : (xportBareComments(outSegs[i]) > 0 ? '\n' : ' '));
             }
             m.ladderLevel = 'L3';
             m.partial = anyFail;
@@ -42355,7 +42555,7 @@ function ovlVisualLangProgressUpdate() {
             byReason[r] = (byReason[r] || 0) + 1;
         });
         const reasonLabel = { echo: '回显', placeholder: '占位符', 'cite-bracket': '引用括号', 'cite-sentinel': '引用哨兵',
-            'code-sentinel': '代码哨兵', truncated: '截断', timeout: '超时', network: '网络',
+            'code-sentinel': '代码哨兵', 'tp-sentinel': '文字片段哨兵', truncated: '截断', timeout: '超时', network: '网络',
             config: '配置', 'low-cjk': '中文占比过低', 'no-cjk': '零中文', 'cite-mismatch': '引用不符',
             'raw-integrity': '兜底路径公式/命令被吞', 'english-body': '不该有的英文正文',
             'audit-loop': '自检重入队已达上限', unknown: '未知' };
@@ -42566,12 +42766,17 @@ async function ovlVisualLangRunQueue() {
     const fixedFileKey = ovlP215RunFileKey();
     let p215Mismatch = false;
 
+    // v2 Pass P216（PIPELINE-2）：队列熔断——连续 3 个块都因同一类"服务不可用"（401/429/5xx/断网/超时/配置）
+    // 失败，说明后面的块只会白白再失败一遍：停止本次运行（剩余块保持待翻，进度行显示"已暂停，点此继续"），
+    // 只弹一条中文提示点名原因。任何一个块成功，或者出现非传输类失败（模型答得不对），计数清零。
+    let fatalStreak = 0, fatalTripped = false, fatalLastReason = '';
     async function worker() {
         for (;;) {
+            if (fatalTripped) return;
             // v2 Pass P208（C）：纯数学/取不到源码的块不走网络，同步 skipped/continue——连续一串这样的块会在
             // 一个长任务里跑完（只有微任务，中间没有输入/渲染机会）。每轮开头真让出一次事件循环。
             await ovlP208YieldToEventLoop();
-            if (mySeq !== OvlVisualLangState.seq || controller.signal.aborted) return;
+            if (mySeq !== OvlVisualLangState.seq || controller.signal.aborted || fatalTripped) return;
             // v2 Pass P215（VISUALPERF-2）：项目或文件已不是这一批启动时的——停手，块留在 pending，
             // 新项目/新文件自己的 SyncAfterRender / IdleAudit 会重新起队列。
             if (ovlVisualTransCacheProjectId() !== fixedProjectId || ovlP215RunFileKey() !== fixedFileKey) { p215Mismatch = true; return; }
@@ -42681,6 +42886,7 @@ async function ovlVisualLangRunQueue() {
                     }
                 }
                 OvlVisualLangState.done = Math.min(OvlVisualLangState.total, OvlVisualLangState.done + 1); // 钳制：双保险，见下方 inflight 才是根治
+                fatalStreak = 0; // v2 Pass P216：成功清零熔断计数
             } catch (err) {
                 el.removeAttribute('data-ovl-trans-inflight');
                 if (err && err.name === 'AbortError') {
@@ -42695,6 +42901,25 @@ async function ovlVisualLangRunQueue() {
                 }
                 console.error('[ovl] visual block translate failed', err);
                 OvlVisualLangState.done = Math.min(OvlVisualLangState.total, OvlVisualLangState.done + 1);
+                // v2 Pass P216（PIPELINE-2）：熔断计数。
+                {
+                    const frReason = meta.failReason || ovlVisualTransFailReason(err, meta);
+                    if (ovlVisualTransIsTransportFatal(frReason)) {
+                        fatalStreak++;
+                        fatalLastReason = frReason;
+                        if (fatalStreak >= 3 && !fatalTripped) {
+                            fatalTripped = true;
+                            try {
+                                if (typeof showToast === 'function') {
+                                    showToast('连续 3 个块都翻译失败，原因：' + ovlVisualTransFatalLabel(fatalLastReason)
+                                        + '。已停止本次翻译（其余块保持待翻）。请检查 API Key / 网络 / 服务状态，修好后点进度行"继续"或块上的"重试"。', 'error');
+                                }
+                            } catch (eT) {}
+                        }
+                    } else {
+                        fatalStreak = 0;
+                    }
+                }
                 if (document.body.contains(el)) {
                     el.setAttribute('data-ovl-trans-failed', '1');
                     // v2 Pass P122（C5）：分类改读阶梯落在 meta.failReason 上的最终原因，退化到
@@ -42886,6 +43111,7 @@ const OVL_VISUAL_FAIL_TIP = {
     'cite-sentinel': '模型改动了引用哨兵的编号，或者把它丢了/重复了（不是写成了 [[1]] 这种可自动修复的形状）。点击重试（会换一套指令重问）。',
     placeholder: '模型改动了占位符（公式/命令记号）的数量或形状。点击重试（会换一套指令重问）。',
     'code-sentinel': '模型丢失或改动了代码/伪代码占位符。点击重试（会换一套指令重问）。',
+    'tp-sentinel': '模型丢失、重复或改动了 \\text{}/\\mbox{} 文字片段的占位记号。点击重试（会换一套指令重问）。',
     echo: '模型几乎原样照抄了原文，判定为未翻译成功。点击重试（会换一套指令重问）；仍失败可以点"仍然采用这次结果"强制使用。',
     truncated: '模型回复被截断（配额用尽）。重试会自动加大配额并按句拆分。',
     timeout: '请求超时。点击重试。',
