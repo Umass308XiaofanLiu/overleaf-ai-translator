@@ -5018,7 +5018,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.42.05';        // APP_VERSION_STAMP
+const APP_VERSION = '03.42.06';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -47766,6 +47766,48 @@ async function ovlEntryExists(parentHandle, name, isDir) {
     } catch (e) { return false; }
 }
 
+// v2 Pass P211（FILEIO-3）：新建/改名的名字校验 + 大小写不敏感的"完整目标路径"存在性检查。
+// 旧 ovlEntryExists 只看父目录里的一层名字、且大小写敏感：'chapters/intro.tex' 永远查不到
+// （远程 getFileHandle(create) 随后 POST /fs/write content:'' 把已有文件截成空文件），
+// Windows 桥上 'Main.tex'→'main.tex' 两个名字指向同一个文件（NTFS 大小写不敏感），改名的"写新→删旧"
+// 把唯一的一份删掉。allowSub=false 时名字里不许有 /（改名只在同一目录内发生）；allowSub=true
+// 只给远程模式新建用（OvlRemoteDirHandle 本来就支持带 / 的相对路径并由桥建父目录，本地 FSA 不支持）。
+function ovlValidateEntryName(raw, allowSub) {
+    const name = String(raw == null ? '' : raw).trim();
+    if (!name) throw new Error('名字不能为空');
+    if (name.indexOf('\\') !== -1) throw new Error('名字不能包含反斜杠 \\');
+    const segs = name.split('/');
+    if (!allowSub && segs.length > 1) throw new Error('名字不能包含 /');
+    for (let i = 0; i < segs.length; i++) {
+        if (!segs[i]) throw new Error('名字里不能有空的路径段（// 或首尾的 /）');
+        if (segs[i] === '.' || segs[i] === '..') throw new Error('名字里不能包含 . 或 .. 路径段');
+    }
+    return segs;
+}
+// 在 dirHandle 这一层找与 name 同名（大小写不敏感）的条目；精确同名优先。返回 {name, kind} 或 null。
+async function ovlFindEntryCI(dirHandle, name) {
+    const want = String(name).toLowerCase();
+    let ci = null;
+    for await (const pair of dirHandle.entries()) {
+        if (pair[0] === name) return { name: pair[0], kind: pair[1].kind };
+        if (!ci && String(pair[0]).toLowerCase() === want) ci = { name: pair[0], kind: pair[1].kind };
+    }
+    return ci;
+}
+// 沿 segs 逐段下钻（大小写不敏感），返回已存在的那个条目 {path, kind}（最后一段或路径上被文件挡住的那一段），不存在返回 null。
+async function ovlFindExistingPathCI(parentHandle, segs) {
+    let cur = parentHandle;
+    const walked = [];
+    for (let i = 0; i < segs.length; i++) {
+        const hit = await ovlFindEntryCI(cur, segs[i]);
+        if (!hit) return null;
+        walked.push(hit.name);
+        if (i === segs.length - 1 || hit.kind !== 'directory') return { path: walked.join('/'), kind: hit.kind };
+        cur = await cur.getDirectoryHandle(hit.name);
+    }
+    return null;
+}
+
 // FSA 没有"移动/改名"这个原语，文件夹改名只能整棵子树复制一份再删旧的。
 async function ovlCopyDirRecursive(srcDirHandle, destParentHandle, destName) {
     const destDir = await destParentHandle.getDirectoryHandle(destName, { create: true });
@@ -47794,41 +47836,99 @@ async function ovlPerformRename(parentHandle, oldName, isDir, newName, oldRelPat
     oldRelPath = oldRelPath || oldName;
     const rwOk = await ovlEnsureRW(parentHandle);
     if (!rwOk) throw new Error('没有写入权限');
-    newName = String(newName || '').trim();
-    if (!newName) throw new Error('名字不能为空');
+    // v2 Pass P211（FILEIO-3）：名字校验（无 / \ .. 空段）+ 大小写不敏感的重名检查；纯大小写改名
+    // （Main.tex→main.tex）在 NTFS 上新旧名指向同一个文件，直接"写新→删旧"会把唯一的一份删掉，
+    // 所以绕一个临时名：旧名→临时名→新名，每一步都是不会撞自己的普通改名。
+    newName = ovlValidateEntryName(newName, false)[0];
     if (newName === oldName) return;
-    const clash = await ovlEntryExists(parentHandle, newName, isDir);
-    if (clash) throw new Error('目标名称已存在：' + newName);
+    const hit = await ovlFindEntryCI(parentHandle, newName);
+    if (hit) {
+        const selfAlias = hit.name === oldName && newName.toLowerCase() === oldName.toLowerCase();
+        if (!selfAlias) throw new Error('目标名称已存在：' + hit.name);
+        const tmpName = '.ovl-rename-' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+        const baseRel = oldRelPath.slice(0, oldRelPath.length - oldName.length);
+        await ovlPerformRename(parentHandle, oldName, isDir, tmpName, oldRelPath);
+        try {
+            await ovlPerformRename(parentHandle, tmpName, isDir, newName, baseRel + tmpName);
+        } catch (e2) {
+            throw new Error('大小写改名的第二步失败，「' + oldName + '」目前暂存为「' + tmpName + '」，请手动改回：' + (e2 && e2.message ? e2.message : String(e2)));
+        }
+        return;
+    }
     // 改名只在同一个父目录内发生，子目录前缀不变——把 oldRelPath 最后一段换成 newName。
     const relPrefixMatch = /^(.*\/)?[^/]*$/.exec(oldRelPath);
     const newRelPath = (relPrefixMatch && relPrefixMatch[1] ? relPrefixMatch[1] : '') + newName;
-    if (isDir) {
+    const cf0 = OvlState.currentFile;
+    const cfRel0 = cf0 ? (cf0.relPath || cf0.name) : null;
+    let newHandle = null;
+    if (parentHandle.__ovlRemote && typeof parentHandle.__childRel === 'function') {
+        // v2 Pass P211（FILEIO-7）：远程模式用桥的 /fs/move（fs.renameSync，原子、字节无损、不重新编码、
+        // 不丢 .git/列表里没有的条目、目标已存在则拒绝覆盖、落盘自检），不再"读→写新→递归删旧"。
+        const fromRel = parentHandle.__childRel(oldName), toRel = parentHandle.__childRel(newName);
+        const mv = await ovlRemoteFsJson(ovlBridgeUrl('/fs/move'), { projectDir: parentHandle.__projectDir || ovlRemoteProjectRoot(), from: fromRel, to: toRel });
+        if (!mv || mv.ok !== true) throw new Error((mv && mv.error) || '重命名失败');
+        newHandle = isDir ? new OvlRemoteDirHandle(toRel, newName) : new OvlRemoteFileHandle(toRel, newName);
+        if (!isDir && cf0 && cf0.handle && cf0.handle.__ovlRemote && cfRel0 === oldRelPath && typeof cf0.handle.__lastKnownMtimeMs === 'number') {
+            newHandle.__lastKnownMtimeMs = cf0.handle.__lastKnownMtimeMs; // 改名不改 mtime，乐观锁继续有效
+        }
+    } else if (isDir) {
         const srcDir = await parentHandle.getDirectoryHandle(oldName);
-        await ovlCopyDirRecursive(srcDir, parentHandle, newName);
+        newHandle = await ovlCopyDirRecursive(srcDir, parentHandle, newName);
         await parentHandle.removeEntry(oldName, { recursive: true });
     } else {
         const oldHandle = await parentHandle.getFileHandle(oldName);
         const file = await oldHandle.getFile();
         const buf = await file.arrayBuffer(); // 二进制安全
-        const newHandle = await parentHandle.getFileHandle(newName, { create: true });
+        newHandle = await parentHandle.getFileHandle(newName, { create: true });
         const w = await newHandle.createWritable();
         await w.write(buf);
         await w.close();
         await parentHandle.removeEntry(oldName); // 写新的成功之后才删旧的
-        // 如果正在编辑的就是这份文件，把 currentFile 指向新 handle/新名字 —— 否则接下来的
-        // Ctrl+S 会往一个已经不存在的旧文件柄上写，静默失败。按 relPath 比对（不是裸 name），
-        // 避免不同子目录下同名文件互相认错。
-        if (OvlState.currentFile && (OvlState.currentFile.relPath || OvlState.currentFile.name) === oldRelPath && OvlState.currentFile.parentHandle) {
+    }
+    // 如果正在编辑的就是这份文件（或它所在的文件夹被改名），把 currentFile 指向新 handle/新名字 —— 否则
+    // 接下来的 Ctrl+S / 自动落盘会往一个已经不存在的旧路径上写（远程会把旧文件夹/文件重新建出来）。
+    // 按 relPath 比对（不是裸 name），避免不同子目录下同名文件互相认错。
+    let cfChanged = false;
+    if (!isDir) {
+        if (cf0 && cfRel0 === oldRelPath && cf0.parentHandle) {
             try {
-                const same = await OvlState.currentFile.parentHandle.isSameEntry(parentHandle);
+                const same = await cf0.parentHandle.isSameEntry(parentHandle);
                 if (same) {
-                    OvlState.currentFile.name = newName;
-                    OvlState.currentFile.relPath = newRelPath;
-                    OvlState.currentFile.handle = newHandle;
-                    ovlUpdateTabUI();
+                    cf0.name = newName;
+                    cf0.relPath = newRelPath;
+                    cf0.handle = newHandle;
+                    cfChanged = true;
                 }
             } catch (e) {}
         }
+    } else if (cf0 && cfRel0 && cfRel0.indexOf(oldRelPath + '/') === 0) {
+        // v2 Pass P211（FILEIO-6）：文件夹改名，当前文件在这个文件夹里面——按 relPath 前缀判断，沿新目录下钻拿新 handle。
+        try {
+            const restSegs = cfRel0.slice(oldRelPath.length + 1).split('/');
+            let dirH = newHandle;
+            for (let i = 0; i < restSegs.length - 1; i++) dirH = await dirH.getDirectoryHandle(restSegs[i]);
+            const fh = await dirH.getFileHandle(restSegs[restSegs.length - 1]);
+            if (cf0.handle && cf0.handle.__ovlRemote && typeof cf0.handle.__lastKnownMtimeMs === 'number') fh.__lastKnownMtimeMs = cf0.handle.__lastKnownMtimeMs;
+            cf0.relPath = newRelPath + '/' + restSegs.join('/');
+            cf0.handle = fh;
+            cf0.parentHandle = dirH;
+            cfChanged = true;
+        } catch (e) {
+            // 拿不到新 handle：绝不留着指向旧路径的 currentFile（下次落盘会把旧文件夹重新建出来）
+            if (typeof ovlAutoSaveTimer !== 'undefined' && ovlAutoSaveTimer) { clearTimeout(ovlAutoSaveTimer); ovlAutoSaveTimer = null; }
+            OvlState.currentFile = null;
+            OvlState.dirty = false;
+            const taX = document.getElementById('ovlCodeArea');
+            if (taX) { taX.value = ''; taX.disabled = true; }
+            try { showToast('文件夹已改名，但没能重新定位正在编辑的文件，已关闭它，请从文件树重新打开。', 'warning'); } catch (e3) {}
+            cfChanged = true;
+        }
+    }
+    if (cfChanged) {
+        if (OvlState.currentFile) OvlState.lastLoadedRelPath = OvlState.currentFile.relPath || OvlState.currentFile.name;
+        ovlUpdateTabUI();
+        // 外部改动监听（WS）还订在旧路径上——改名之后必须重订，否则新路径的外部改动收不到。
+        try { if (typeof ovlBridgeUpdateWatch === 'function') ovlBridgeUpdateWatch(); } catch (e) {}
     }
     if (isDir) {
         // 文件夹改名：mainDocFile 若落在这个文件夹里面（前缀匹配），路径前缀跟着换。
@@ -47856,7 +47956,14 @@ async function ovlPerformDelete(parentHandle, name, isDir, relPath) {
     // 不可逆，必须在真的调用 removeEntry() 之前就把这次操作整个拒绝掉，不能先删了盘上的文件再
     // 回头后悔。用抛错让调用方既有的 catch+flash 报错通道展示，不额外弹 toast（跟上面
     // "没有写入权限" 那条走的是同一套既有约定）。
-    if (!isDir && OvlState.currentFile && (OvlState.currentFile.relPath || OvlState.currentFile.name) === relPath) {
+    // v2 Pass P211（FILEIO-6）：删的是文件夹且当前文件在它里面——同样按 relPath 前缀判断（以前 !isDir 守卫把文件夹整个排除了）。
+    const cfInDeleted = function () {
+        const c = OvlState.currentFile;
+        if (!c) return false;
+        const r = c.relPath || c.name;
+        return isDir ? (typeof r === 'string' && r.indexOf(relPath + '/') === 0) : (r === relPath);
+    };
+    if (cfInDeleted()) {
         if (typeof ovlVisualBtrInFlightActive === 'function' && ovlVisualBtrInFlightActive()) {
             throw new Error('有段落正在后台回译，请稍候再删除这个文件');
         }
@@ -47864,10 +47971,13 @@ async function ovlPerformDelete(parentHandle, name, isDir, relPath) {
     const rwOk = await ovlEnsureRW(parentHandle);
     if (!rwOk) throw new Error('没有写入权限');
     await parentHandle.removeEntry(name, { recursive: true });
-    if (!isDir && OvlState.currentFile && (OvlState.currentFile.relPath || OvlState.currentFile.name) === relPath && OvlState.currentFile.parentHandle) {
+    if (cfInDeleted() && (isDir || OvlState.currentFile.parentHandle)) {
         try {
-            const same = await OvlState.currentFile.parentHandle.isSameEntry(parentHandle);
+            // 文件：父目录必须是同一个；文件夹：前缀已经确认在被删子树里，不再比较父目录。
+            const same = isDir ? true : await OvlState.currentFile.parentHandle.isSameEntry(parentHandle);
             if (same) {
+                // 先取消这份文件挂着的自动落盘定时器——否则 1.5s 后它会往已删除的路径写，远程会把文件夹+文件重新建出来。
+                if (typeof ovlAutoSaveTimer !== 'undefined' && ovlAutoSaveTimer) { clearTimeout(ovlAutoSaveTimer); ovlAutoSaveTimer = null; }
                 OvlState.currentFile = null;
                 OvlState.dirty = false;
                 const ta = document.getElementById('ovlCodeArea');
@@ -47875,6 +47985,7 @@ async function ovlPerformDelete(parentHandle, name, isDir, relPath) {
                 ovlUpdateTabUI();
                 ovlRenderGutter(true);
                 ovlBuildOutline();
+                try { if (typeof ovlBridgeUpdateWatch === 'function') ovlBridgeUpdateWatch(); } catch (e) {}
             }
         } catch (e) {}
     }
@@ -47888,34 +47999,59 @@ async function ovlPerformDelete(parentHandle, name, isDir, relPath) {
 async function ovlPerformNewFile(parentHandle, name) {
     const rwOk = await ovlEnsureRW(parentHandle);
     if (!rwOk) throw new Error('没有写入权限');
-    name = String(name || '').trim();
-    if (!name) throw new Error('名字不能为空');
-    const exists = await ovlEntryExists(parentHandle, name, false);
-    if (exists) throw new Error('已存在同名文件：' + name);
-    return await parentHandle.getFileHandle(name, { create: true });
+    // v2 Pass P211（FILEIO-3）：校验名字 + 检查【完整目标路径】是否已存在（大小写不敏感）——远程
+    // getFileHandle(create) 对"父目录列表里没有的名字"会 POST /fs/write content:''，等于把已有的
+    // sub/dir/file.tex 截成空文件。带 / 的多段名字只有远程模式支持（本地 FSA 本来就不支持）。
+    const segs = ovlValidateEntryName(name, !!parentHandle.__ovlRemote);
+    const hit = await ovlFindExistingPathCI(parentHandle, segs);
+    if (hit) throw new Error('已存在同名' + (hit.kind === 'directory' ? '文件夹' : '文件') + '：' + hit.path);
+    return await parentHandle.getFileHandle(segs.join('/'), { create: true });
 }
 
 async function ovlPerformNewFolder(parentHandle, name) {
     const rwOk = await ovlEnsureRW(parentHandle);
     if (!rwOk) throw new Error('没有写入权限');
-    name = String(name || '').trim();
-    if (!name) throw new Error('名字不能为空');
-    const exists = await ovlEntryExists(parentHandle, name, true);
-    if (exists) throw new Error('已存在同名文件夹：' + name);
-    return await parentHandle.getDirectoryHandle(name, { create: true });
+    const segs = ovlValidateEntryName(name, !!parentHandle.__ovlRemote);
+    const hit = await ovlFindExistingPathCI(parentHandle, segs);
+    if (hit) throw new Error('已存在同名' + (hit.kind === 'directory' ? '文件夹' : '文件') + '：' + hit.path);
+    return await parentHandle.getDirectoryHandle(segs.join('/'), { create: true });
 }
 
 async function ovlPerformUpload(parentHandle, files) {
     const rwOk = await ovlEnsureRW(parentHandle);
     if (!rwOk) throw new Error('没有写入权限');
+    // v2 Pass P211：上传会静默覆盖同名文件（无确认、无乐观锁）。先找出会被覆盖的同名文件（大小写不敏感），
+    // 弹一次确认框，默认选项=取消（Enter 也是取消）；取消=跳过这些同名文件，其余照常上传。返回实际上传数。
+    const conflicts = [];
     for (let i = 0; i < files.length; i++) {
+        const hit = await ovlFindEntryCI(parentHandle, files[i].name);
+        if (hit) conflicts.push({ idx: i, existing: hit.name });
+    }
+    let skip = {};
+    if (conflicts.length) {
+        const okOverwrite = await new Promise(function (resolve) {
+            ovlConfirmDialog({
+                title: '覆盖同名文件？',
+                message: '目标文件夹里已经有同名文件：\n\n' + conflicts.map(function (c) { return '· ' + c.existing; }).join('\n') + '\n\n上传会直接覆盖它们（不进回收站）。要覆盖吗？选「取消」则跳过这些同名文件。',
+                confirmLabel: '覆盖', danger: true, defaultCancel: true,
+                onConfirm: function () { resolve(true); },
+                onCancel: function () { resolve(false); }
+            });
+        });
+        if (!okOverwrite) conflicts.forEach(function (c) { skip[c.idx] = true; });
+    }
+    let uploaded = 0;
+    for (let i = 0; i < files.length; i++) {
+        if (skip[i]) continue;
         const f = files[i];
         const buf = await f.arrayBuffer(); // 二进制安全
         const h = await parentHandle.getFileHandle(f.name, { create: true });
         const w = await h.createWritable();
         await w.write(buf);
         await w.close();
+        uploaded++;
     }
+    return uploaded;
 }
 
 // 下载不需要 readwrite 授权，只读句柄也能做（§M9 明文豁免的两件事之一）。
@@ -48074,7 +48210,8 @@ function ovlConfirmDialog(opts) {
     // （17916 行附近 ChatState.pendingConfirms 的处理）跟 ovlConfirmDialog 是两套独立的
     // document keydown 监听器，先注册的（聊天面板绑定更早）先执行，这里只加 Enter 分支，
     // 完全不碰 Escape 的判断逻辑，那套既有顺序不受影响。
-    function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); close(); fireCancelOnce(); } else if (e.key === 'Enter') { e.preventDefault(); doConfirm(); } }
+    // v2 Pass P211：opts.defaultCancel（可选）——覆盖/删除类确认框里 Enter 不该等于"确认"：Enter=取消，且焦点落在取消按钮上。
+    function onKey(e) { if (e.key === 'Escape') { e.preventDefault(); close(); fireCancelOnce(); } else if (e.key === 'Enter') { e.preventDefault(); if (opts.defaultCancel) { close(); fireCancelOnce(); } else doConfirm(); } }
     if (input) input.addEventListener('input', function () { okBtn.disabled = (input.value !== opts.requireTyped); });
     cancelBtn.addEventListener('click', function () { close(); fireCancelOnce(); });
     okBtn.addEventListener('click', doConfirm);
@@ -48083,6 +48220,7 @@ function ovlConfirmDialog(opts) {
     document.addEventListener('keydown', onKey);
     __ovlActiveModalDismiss = dismissSelf;
     if (input) setTimeout(function () { input.focus(); }, 0);
+    else if (opts.defaultCancel) setTimeout(function () { try { cancelBtn.focus(); } catch (e) {} }, 0);
 }
 
 // v2 Pass P63：回译预览用的极简单词级 diff（LCS，非语义、非行级）——够用来在确认框里
@@ -51163,6 +51301,16 @@ async function ovlAiMergeApplyFile(fileIdx) {
                 : '已取消：目标文件没能打开，合并结果未写入', 'error');
             return;
         }
+        // v2 Pass P211（FILEIO-8）：mergedText 是从弹窗建好时读到的 file.originalText 算出来的；ovlOpenFile
+        // 刚刚重新读盘并刷新了乐观锁的 mtime，所以如果弹窗建好之后磁盘上的文件又被改过，下面的保存会静默
+        // 覆盖那次改动。重读到的内容（lastLoadedText）与合并基线不一致就中止，不写盘。
+        {
+            const normEol = function (x) { return String(x == null ? '' : x).replace(/\r\n/g, '\n'); };
+            if (normEol(OvlState.lastLoadedText) !== normEol(file.originalText)) {
+                showToast('已取消：磁盘上的这个文件在生成合并方案之后又被改过，直接应用会覆盖那次改动。请重新进入 AI 合并。', 'error');
+                return;
+            }
+        }
         const ta = document.getElementById('ovlCodeArea');
         if (!ta) throw new Error('编辑器未就绪');
         ta.value = mergedText;
@@ -51349,28 +51497,49 @@ function ovlP2TEscapeLatexLite(s) {
 }
 
 // ---- §4.9 二进制/文本写入统一出口：唯一分流点是 ovlP2TWriteBinary。----
-async function ovlP2TMkdirp(relFromProjectRoot) {
+// v2 Pass P211（FILEIO-10）：转换任务启动时钉住项目（job.pin = {dirHandle, projectDir}），这份任务之后每一次
+// 页面/main/bib/资源写入都带着 job 走这里，写进【任务启动时的那个项目】，不管用户中途切到了别的项目。
+// 不传 job（构建缓存等与转换任务无关的写入）=沿用实时的 OvlState.dirHandle，行为不变。
+// 远程句柄的 projectDir 是 I/O 时才读输入框的（OvlRemoteDirHandle 内部），所以句柄钉住还不够：
+// 当输入框已不是钉住时的值，改为直接用钉住的 projectDir 调桥的 /fs/mkdir、/fs/write。
+function ovlP2TPinOf(job) { return (job && job.pin && job.pin.dirHandle) ? job.pin : null; }
+function ovlP2TPinDiverged(pin) { return !!(pin && pin.dirHandle && pin.dirHandle.__ovlRemote && pin.projectDir && pin.projectDir !== ovlRemoteProjectRoot()); }
+async function ovlP2TMkdirp(relFromProjectRoot, job) {
     const parts = String(relFromProjectRoot).replace(/\\/g, '/').split('/').filter(function (p) { return p && p !== '.'; });
-    let dir = OvlState.dirHandle;
+    const pin = ovlP2TPinOf(job);
+    if (ovlP2TPinDiverged(pin)) {
+        const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/mkdir'), { projectDir: pin.projectDir, path: parts.join('/') });
+        if (!data || data.ok !== true) throw new Error((data && data.error) || '创建远程目录失败');
+        return pin.dirHandle;
+    }
+    let dir = pin ? pin.dirHandle : OvlState.dirHandle;
     for (let i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i], { create: true });
     return dir;
 }
-async function ovlP2TWriteText(relFromProjectRoot, text) {
+async function ovlP2TWriteText(relFromProjectRoot, text, job) {
     const parts = String(relFromProjectRoot).replace(/\\/g, '/').split('/').filter(function (p) { return p && p !== '.'; });
+    const pin = ovlP2TPinOf(job);
+    if (ovlP2TPinDiverged(pin)) {
+        const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/write'), { projectDir: pin.projectDir, path: parts.join('/'), content: String(text) });
+        if (!data || data.ok !== true) throw new Error((data && data.error) || '写入远程文件失败');
+        return;
+    }
     const name = parts.pop();
-    let dir = OvlState.dirHandle;
+    let dir = pin ? pin.dirHandle : OvlState.dirHandle;
     for (let i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i], { create: true });
     const fh = await dir.getFileHandle(name, { create: true });
     const w = await fh.createWritable();
     await w.write(text);
     await w.close();
 }
-async function ovlP2TWriteBinary(relFromProjectRoot, uint8) {
+async function ovlP2TWriteBinary(relFromProjectRoot, uint8, job) {
     const rel = String(relFromProjectRoot).replace(/\\/g, '/').replace(/^\.\//, '');
-    if (OvlState.dirHandle && !OvlState.dirHandle.__ovlRemote) {
+    const pin = ovlP2TPinOf(job);
+    const baseDir = pin ? pin.dirHandle : OvlState.dirHandle;
+    if (baseDir && !baseDir.__ovlRemote) {
         const parts = rel.split('/').filter(function (p) { return p && p !== '.'; });
         const name = parts.pop();
-        let dir = OvlState.dirHandle;
+        let dir = baseDir;
         for (let i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i], { create: true });
         const fh = await dir.getFileHandle(name, { create: true });
         const w = await fh.createWritable();
@@ -51378,7 +51547,7 @@ async function ovlP2TWriteBinary(relFromProjectRoot, uint8) {
         await w.close();
         return;
     }
-    const projectDir = ovlRemoteProjectRoot();
+    const projectDir = (pin && pin.projectDir) ? pin.projectDir : ovlRemoteProjectRoot();
     const b64 = ovlP2TUint8ToBase64(uint8);
     const data = await ovlRemoteFsJson(ovlBridgeUrl('/fs/write-binary'), { projectDir: projectDir, path: rel, contentBase64: b64, skipCheckpoint: true });
     if (!data || data.ok !== true) throw new Error((data && data.error) || '写入二进制文件失败');
@@ -51957,7 +52126,7 @@ async function ovlP2TApplyFigureCrops(page, text, job, num, maxPx) {
         if (!blob) continue;
         k++;
         const rel = 'assets/img/page-' + ovlP2TPad2(num) + '-crop-' + k + '.png';
-        await ovlP2TWriteBinary(job.outRel + '/' + rel, new Uint8Array(await blob.arrayBuffer()));
+        await ovlP2TWriteBinary(job.outRel + '/' + rel, new Uint8Array(await blob.arrayBuffer()), job);
         // 只替换 \includegraphics 里的文件名，BBOX 注释行整行删除（裁剪已完成，留着无意义、
         // 且会被 §2 的参考文献正则误当成别的标记——保持输出里注释行"只有一种用途"）
         let fixed = full.replace(/^% BBOX:.*\r?\n/, '').replace(imgName, rel);
@@ -52939,7 +53108,7 @@ async function ovlP2TApplyFigurePageCropFallback(job, text) {
             }
             perPageFallbackCounter[pageNum] = (perPageFallbackCounter[pageNum] || 0) + 1;
             const rel = 'assets/img/page-' + ovlP2TPad2(pageNum) + '-fallback-' + perPageFallbackCounter[pageNum] + '.png';
-            await ovlP2TWriteBinary(job.outRel + '/' + rel, new Uint8Array(await blob.arrayBuffer()));
+            await ovlP2TWriteBinary(job.outRel + '/' + rel, new Uint8Array(await blob.arrayBuffer()), job);
             const newBlockText = blockTextNow.split(imgPath).join(rel);
             const curStart = b.start + offsetShift, curEnd = b.end + offsetShift;
             out = out.slice(0, curStart) + newBlockText + out.slice(curEnd);
@@ -53164,7 +53333,7 @@ async function ovlP2TConvertOnePage(job, num) {
         if (!stillCurrent()) return;
         const pngBytes = new Uint8Array(await rendered.pngBlob.arrayBuffer());
         if (OvlSettings.pdf2texSavePageImages !== false) {
-            await ovlP2TWriteBinary(job.outRel + '/assets/pages/page-' + ovlP2TPad2(num) + '.png', pngBytes);
+            await ovlP2TWriteBinary(job.outRel + '/assets/pages/page-' + ovlP2TPad2(num) + '.png', pngBytes, job);
         }
         if (!stillCurrent()) return;
         if (rendered.sentAsJpeg) pageState.flags.sentAsJpeg = true;
@@ -53186,7 +53355,7 @@ async function ovlP2TConvertOnePage(job, num) {
                         const fetched = await ovlP2TFetchImageBytes(page, scanned[k].objId);
                         if (!fetched) continue;
                         const rel = 'assets/img/page-' + ovlP2TPad2(num) + '-img-' + (k + 1) + '.png';
-                        await ovlP2TWriteBinary(job.outRel + '/' + rel, fetched.bytes);
+                        await ovlP2TWriteBinary(job.outRel + '/' + rel, fetched.bytes, job);
                         extractedLines.push('- ' + rel + '   (' + fetched.width + 'x' + fetched.height + ' px, ' + scanned[k].vertDesc + ' of the page)');
                     }
                     if (extractedLines.length) { images = extractedLines; pageState.flags.imagesExtracted = extractedLines.length; }
@@ -53224,7 +53393,7 @@ async function ovlP2TConvertOnePage(job, num) {
             pageState.reason = visionResult.error;
             pageState.ms = failMs;
             pageState.fragment = ovlP2TFailurePlaceholder(num, visionResult.error);
-            await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment);
+            await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment, job);
             return;
         }
         if (!extracted.ok) {
@@ -53232,7 +53401,7 @@ async function ovlP2TConvertOnePage(job, num) {
             pageState.reason = extracted.reason;
             pageState.ms = failMs;
             pageState.fragment = ovlP2TFailurePlaceholder(num, extracted.reason);
-            await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment);
+            await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment, job);
             return;
         }
         pageState.state = extracted.flags.suspect ? 'suspect' : 'ok';
@@ -53263,7 +53432,7 @@ async function ovlP2TConvertOnePage(job, num) {
         // \begin{} 独占一行——见该函数上方注释（Visual 分块正确性依赖这条不变量）。
         try { finalText = ovlP2TEnsureAtomicEnvOwnLine(finalText); } catch (e) { console.error('[ovl] p2t ensure atomic env own line failed', num, e); }
         pageState.fragment = finalText;
-        await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment);
+        await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment, job);
         pageState.ms = Date.now() - startedAt; // v2 Pass P127：真墙钟——含 bbox 裁剪重渲 + 写盘
     } catch (e) {
         console.error('[ovl] p2t convert page failed', num, e);
@@ -53271,7 +53440,7 @@ async function ovlP2TConvertOnePage(job, num) {
         pageState.reason = '内部错误：' + (e && e.message ? e.message : String(e));
         pageState.ms = Date.now() - startedAt;
         pageState.fragment = ovlP2TFailurePlaceholder(num, pageState.reason);
-        try { await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment); } catch (e2) {}
+        try { await ovlP2TWriteText(job.outRel + '/pages/page-' + ovlP2TPad2(num) + '.tex', pageState.fragment, job); } catch (e2) {}
     } finally {
         if (page && typeof page.cleanup === 'function') { try { page.cleanup(); } catch (e) {} }
         ovlP2TPanelRender();
@@ -53870,7 +54039,7 @@ async function ovlP2TRunVerify(job) {
                 .concat(['', ''])
                 .concat(lines.slice(loc.nextMarkerIdx));
             curMainText = rebuilt.join('\n');
-            await ovlP2TWriteText(job.outRel + '/main.tex', curMainText);
+            await ovlP2TWriteText(job.outRel + '/main.tex', curMainText, job);
             job.verify.fixApplied = true;
             job.verify.state = 'recompiling';
             ovlP2TPanelRender();
@@ -53923,7 +54092,7 @@ async function ovlP2TRunVerify(job) {
                     .concat(['', ''])
                     .concat(lines2.slice(loc2.nextMarkerIdx));
                 mainText = rebuilt2.join('\n');
-                await ovlP2TWriteText(job.outRel + '/main.tex', mainText);
+                await ovlP2TWriteText(job.outRel + '/main.tex', mainText, job);
                 job.verify.fixApplied = true;
                 job.verify.state = 'recompiling';
                 ovlP2TPanelRender();
@@ -53955,7 +54124,7 @@ async function ovlP2TRunVerify(job) {
             job.verify.structuralIssues = struct.issues.map(function (x) { return Object.assign({}, x, { autoFixed: false }); });
             if (issue.type === 'abstract-after-introduction') {
                 const withTodo = ovlP2TInsertStructTodoText(mainText);
-                if (withTodo !== mainText) { mainText = withTodo; await ovlP2TWriteText(job.outRel + '/main.tex', mainText); }
+                if (withTodo !== mainText) { mainText = withTodo; await ovlP2TWriteText(job.outRel + '/main.tex', mainText, job); }
             }
         }
     }
@@ -53979,6 +54148,8 @@ let _ovlP2TWatchdogTimer = null;
 async function ovlP2TRunPipeline(job) {
     OvlP2TState.job = job;
     OvlP2TState.running = true;
+    // v2 Pass P211（FILEIO-10）：任务启动时钉住项目；重试（ovlP2TRetryPages）复用同一个 job，沿用最初钉住的项目。
+    if (!job.pin) job.pin = { dirHandle: OvlState.dirHandle, projectDir: ovlRemoteProjectRoot() };
     job.cancelled = false;
     job.pages.forEach(function (p) { if (p.state === 'running') p.state = 'pending'; });
     ovlP2TPanelShow();
@@ -53986,10 +54157,10 @@ async function ovlP2TRunPipeline(job) {
     if (_ovlP2TWatchdogTimer) { clearInterval(_ovlP2TWatchdogTimer); }
     _ovlP2TWatchdogTimer = setInterval(function () { if (OvlP2TState.running) ovlP2TPanelRender(); }, 20000);
     try {
-        await ovlP2TMkdirp(job.outRel);
-        await ovlP2TWriteText(job.outRel + '/.gitignore', '*'); // 写入顺序硬性：mkdir 后立刻写 .gitignore
-        await ovlP2TMkdirp(job.outRel + '/pages');
-        await ovlP2TMkdirp(job.outRel + '/assets/pages');
+        await ovlP2TMkdirp(job.outRel, job);
+        await ovlP2TWriteText(job.outRel + '/.gitignore', '*', job); // 写入顺序硬性：mkdir 后立刻写 .gitignore
+        await ovlP2TMkdirp(job.outRel + '/pages', job);
+        await ovlP2TMkdirp(job.outRel + '/assets/pages', job);
 
         // §4.5 步骤5：续跑判定——pages/page-NN.tex 已存在且非空就沿用，不重新请求
         for (let i = 1; i <= job.total; i++) {
@@ -54055,9 +54226,9 @@ async function ovlP2TRunPipeline(job) {
         // 找不到引用的图保留原位，不强搬。
         try { assembledText = ovlP2TPlaceFiguresAtFirstMention(assembledText); }
         catch (e) { console.error('[ovl] p2t place figures at first mention failed', e); }
-        await ovlP2TWriteText(job.outRel + '/main.tex', assembledText);
-        if (refsOutcome.bibText) await ovlP2TWriteText(job.outRel + '/refs.bib', refsOutcome.bibText);
-        await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job, assembledText));
+        await ovlP2TWriteText(job.outRel + '/main.tex', assembledText, job);
+        if (refsOutcome.bibText) await ovlP2TWriteText(job.outRel + '/refs.bib', refsOutcome.bibText, job);
+        await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job, assembledText), job);
 
         // v2 Pass P85：转换后整体核验（默认开，设置项关闭则整段跳过——job.verify 不存在，
         // 面板/后续逻辑等同于 P85 之前）。异常兜底成明确的 failed 状态，绝不让核验本身的
@@ -54173,9 +54344,9 @@ async function ovlP2TRetryPages(nums) {
                 const rawRetryText = ovlP2TAssembleMain(job);
                 const refsOutcomeRetry = await ovlP2TApplyReferencesPipeline(job, rawRetryText);
                 job.refs = refsOutcomeRetry;
-                await ovlP2TWriteText(job.outRel + '/main.tex', refsOutcomeRetry.text);
-                if (refsOutcomeRetry.bibText) await ovlP2TWriteText(job.outRel + '/refs.bib', refsOutcomeRetry.bibText);
-                await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job, refsOutcomeRetry.text));
+                await ovlP2TWriteText(job.outRel + '/main.tex', refsOutcomeRetry.text, job);
+                if (refsOutcomeRetry.bibText) await ovlP2TWriteText(job.outRel + '/refs.bib', refsOutcomeRetry.bibText, job);
+                await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job, refsOutcomeRetry.text), job);
                 // v2 Pass P85：重试失败页也会重新拼装 main.tex，同样触发核验（跟主管线同一
                 // 开关/同一函数，不重复实现）。
                 if (OvlSettings.pdf2texAutoVerify) {
@@ -55865,10 +56036,12 @@ let OvlBridgeWs = null;
 let OvlBridgeWsPath = null;      // 当前这条连接订阅的绝对路径（null = 没在订阅）
 let OvlBridgeWsReconnectTimer = null;
 let OvlBridgeWsReconnectDelay = 1000; // 简单指数退避，封顶 15s——桥离线/重启不是错误，安静重试
+let OvlBridgeWsGen = 0; // v2 Pass P211（FILEIO-11）：连接代号。每次 ovlBridgeConnectWs / ovlBridgeCloseWatch 递增，在途的换票/已建的旧 socket 一发现代号过期就自己放弃/关掉
 
 function ovlBridgeWsUrl() { return ovlBridgeOrigin().replace(/^http/, 'ws'); }
 
 function ovlBridgeCloseWatch() {
+    OvlBridgeWsGen++;
     if (OvlBridgeWsReconnectTimer) { clearTimeout(OvlBridgeWsReconnectTimer); OvlBridgeWsReconnectTimer = null; }
     if (OvlBridgeWs) {
         try {
@@ -55894,29 +56067,55 @@ function ovlBridgeFetchWsTicket() {
         .catch(function () { return null; });
 }
 
+// v2 Pass P211（FILEIO-11）：退避重连的排队逻辑抽出来，onclose 和"换票失败"两处共用。
+function ovlBridgeWsScheduleReconnect(absPath) {
+    if (OvlBridgeWsPath !== absPath) return;
+    if (OvlBridgeWsReconnectTimer) { clearTimeout(OvlBridgeWsReconnectTimer); OvlBridgeWsReconnectTimer = null; }
+    const delay = Math.min(OvlBridgeWsReconnectDelay, 15000);
+    OvlBridgeWsReconnectDelay = Math.min(OvlBridgeWsReconnectDelay * 2, 15000);
+    OvlBridgeWsReconnectTimer = setTimeout(function () {
+        OvlBridgeWsReconnectTimer = null;
+        if (OvlBridgeWsPath === absPath) ovlBridgeConnectWs(absPath);
+    }, delay);
+}
+
 function ovlBridgeConnectWs(absPath) {
+    const gen = ++OvlBridgeWsGen;
     if (ovlIsRemoteBridge()) {
         ovlBridgeFetchWsTicket().then(function (ticket) {
+            if (gen !== OvlBridgeWsGen) return; // 换票这段时间又有新的连接请求/关闭了订阅——别再开第二条 socket
             if (OvlBridgeWsPath !== absPath) return; // 换票这段时间订阅目标已经变了，不连旧的
-            if (!ticket) return; // 换票失败（令牌不对/桥离线）——安静放弃，不影响核心编辑
-            ovlBridgeOpenWs(absPath, ticket);
+            if (!ticket) {
+                // 换票失败（令牌不对/桥离线/网络抖动）。以前这里直接放弃，退避重连链条就此断掉（WS 一直死到下次
+                // 开文件，只剩 8s 轮询兜底）——重新排一次退避重连。
+                ovlBridgeWsScheduleReconnect(absPath);
+                return;
+            }
+            ovlBridgeOpenWs(absPath, ticket, gen);
         });
         return;
     }
-    ovlBridgeOpenWs(absPath, null);
+    ovlBridgeOpenWs(absPath, null, gen);
 }
 
-function ovlBridgeOpenWs(absPath, ticket) {
+function ovlBridgeOpenWs(absPath, ticket, gen) {
+    if (gen == null) gen = OvlBridgeWsGen;
     let wsUrl = ovlBridgeWsUrl();
     if (ticket) wsUrl += (wsUrl.indexOf('?') === -1 ? '?' : '&') + 'ticket=' + encodeURIComponent(ticket);
     let ws;
     try { ws = new WebSocket(wsUrl); } catch (e) { return; } // 浏览器层面建不出来——安静放弃，不影响核心编辑
+    if (gen !== OvlBridgeWsGen) { try { ws.close(); } catch (e) {} return; } // 建 socket 的同步间隙里已被取代
+    if (OvlBridgeWs && OvlBridgeWs !== ws) { // 不允许同时存在两条：先把旧的摘掉监听并关闭
+        try { OvlBridgeWs.onopen = OvlBridgeWs.onmessage = OvlBridgeWs.onclose = OvlBridgeWs.onerror = null; OvlBridgeWs.close(); } catch (e) {}
+    }
     OvlBridgeWs = ws;
     ws.onopen = function () {
+        if (gen !== OvlBridgeWsGen || OvlBridgeWs !== ws) { try { ws.onmessage = ws.onclose = ws.onerror = null; ws.close(); } catch (e) {} return; } // 已被取代
         OvlBridgeWsReconnectDelay = 1000; // 连上了，退避计时器归零
         try { ws.send(JSON.stringify({ type: 'watch', path: absPath })); } catch (e) {}
     };
     ws.onmessage = function (ev) {
+        if (gen !== OvlBridgeWsGen || OvlBridgeWs !== ws) return; // 被取代的旧 socket 的消息一律丢弃
         let msg;
         try { msg = JSON.parse(ev.data); } catch (e) { return; }
         if (msg && msg.type === 'changed') {
@@ -55927,12 +56126,7 @@ function ovlBridgeOpenWs(absPath, ticket) {
         if (OvlBridgeWs !== ws) return; // 已经被 ovlBridgeUpdateWatch 换成新连接了，这是旧连接的收尾事件，不重复处理
         OvlBridgeWs = null;
         if (OvlBridgeWsPath === absPath) { // 还是同一个订阅目标——桥可能只是重启了一下，退避重连
-            const delay = Math.min(OvlBridgeWsReconnectDelay, 15000);
-            OvlBridgeWsReconnectDelay = Math.min(OvlBridgeWsReconnectDelay * 2, 15000);
-            OvlBridgeWsReconnectTimer = setTimeout(function () {
-                OvlBridgeWsReconnectTimer = null;
-                if (OvlBridgeWsPath === absPath) ovlBridgeConnectWs(absPath);
-            }, delay);
+            ovlBridgeWsScheduleReconnect(absPath);
         }
     };
     ws.onerror = function () { /* onclose 紧跟着会触发，退避重连逻辑都在那边，这里不用重复处理 */ };
@@ -57197,9 +57391,10 @@ function ovlBindShell() {
                 const target = OvlState.uploadTargetHandle || OvlState.dirHandle;
                 uploadInput.value = ''; // 清空，允许连续上传同名文件也能重新触发 change
                 if (!files || !files.length || !target) return;
+                let uploadedN = files.length;
                 ovlPerformUpload(target, files)
-                    .then(function () { return ovlRenderTree(OvlState.dirHandle); })
-                    .then(function () { ovlFlashSaveStatus('已上传 ' + files.length + ' 个文件', false); })
+                    .then(function (n) { if (typeof n === 'number') uploadedN = n; return ovlRenderTree(OvlState.dirHandle); })
+                    .then(function () { ovlFlashSaveStatus(uploadedN ? ('已上传 ' + uploadedN + ' 个文件') : '已取消上传（同名文件未覆盖）', false); })
                     .catch(function (e2) { ovlFlashSaveStatus('上传失败：' + (e2 && e2.message ? e2.message : String(e2)), true); });
             });
         }
