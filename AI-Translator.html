@@ -5018,7 +5018,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.42.06';        // APP_VERSION_STAMP
+const APP_VERSION = '03.42.07';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -47454,6 +47454,7 @@ function ovlProjectHistoryOpenEntry(entry, onClosed, __guarded) {
         if (!__guarded && typeof ovlProjectSwitchGuardNeeded === 'function' && ovlProjectSwitchGuardNeeded()) {
             ovlProjectSwitchGuard().then(function (proceed) {
                 if (proceed) ovlProjectHistoryOpenEntry(entry, null, true);
+                else { try { showToast('已取消切换：路径框仍是当前项目。要打开的路径：' + entry.path, 'info'); } catch (eT) {} }
             });
             return;
         }
@@ -47503,7 +47504,7 @@ function ovlProjectHistoryOpenEntry(entry, onClosed, __guarded) {
             // P131d 注释）。在改任何状态之前先问一次，两处调用点（isRemoteEntry 的远程分支、
             // 本地桥分支）共用这一个闭包，一并覆盖。
             if (typeof ovlVisualBtrInFlightActive === 'function' && ovlVisualBtrInFlightActive()) {
-                try { showToast('有段落正在后台回译，请稍候再切换项目文件夹。', 'warning'); } catch (e) {}
+                try { showToast('有段落正在后台回译，请稍候再切换项目文件夹，没有打开。路径框仍是当前项目；要打开的路径：' + entry.path, 'warning'); } catch (e) {}
                 return Promise.resolve();
             }
             // 顺序照抄 ovlRemotePickFolder()：先换 OvlState.dirHandle/usingWebkitFallback 再渲染
@@ -47526,6 +47527,7 @@ function ovlProjectHistoryOpenEntry(entry, onClosed, __guarded) {
                 // v2 Pass P210：兜底拒绝（回译在跑）——把刚刚换上的句柄和路径框原样滚回去
                 OvlState.dirHandle = beforeHandle || null;
                 rollbackEntryPath();
+                try { showToast('没有切换：路径框仍是当前项目。要打开的路径：' + entry.path, 'warning'); } catch (eT) {}
                 return Promise.resolve();
             }
             ovlUpdateTreeToolbtnsVisibility();
@@ -47547,7 +47549,7 @@ function ovlProjectHistoryOpenEntry(entry, onClosed, __guarded) {
             if (OvlState.bridgeOnline === true && looksAbsolute) {
                 openViaBridge().catch(function (e) {
                     console.error('[ovl] open from history via bridge (remote entry) failed', e);
-                    try { showToast('打开失败：' + (e && e.message ? e.message : String(e)), 'error'); } catch (e2) {}
+                    try { showToast('打开失败：' + (e && e.message ? e.message : String(e)) + '（路径框仍是当前项目；要打开的路径：' + entry.path + '）', 'error'); } catch (e2) {}
                 });
                 return;
             }
@@ -47571,7 +47573,7 @@ function ovlProjectHistoryOpenEntry(entry, onClosed, __guarded) {
         function fallbackToPicker(reason) {
             try {
                 showToast(
-                    (reason ? reason + '，' : '') + '请在弹出的系统文件夹选择框中选择「' + expectedBasename + '」文件夹，用于重新授权访问',
+                    (reason ? reason + '，' : '') + '请在弹出的系统文件夹选择框中选择「' + expectedBasename + '」文件夹（' + entry.path + '），用于重新授权访问',
                     'info'
                 );
             } catch (e) {}
@@ -47602,7 +47604,7 @@ function ovlProjectHistoryOpenEntry(entry, onClosed, __guarded) {
                     }
                     // v2 Pass P210（FILEIO-4）：路径框在提交点之前从不改，这条失败路径同样没动过它——仍是旧项目。
                     try {
-                        showToast('你选择的是「' + pickedName + '」文件夹，跟历史记录里的「' + expectedBasename + '」不一致，没有打开——请重新点击这条历史记录，在弹出的选择框里选对文件夹', 'error');
+                        showToast('你选择的是「' + pickedName + '」文件夹，跟历史记录里的「' + expectedBasename + '」不一致，没有打开（路径框仍是当前项目；要打开的路径：' + entry.path + '）——请重新点击这条历史记录，在弹出的选择框里选对文件夹', 'error');
                     } catch (e) {}
                 }
             }).catch(function (e) { console.warn('[ovl] open from history failed', e); });
@@ -47611,7 +47613,7 @@ function ovlProjectHistoryOpenEntry(entry, onClosed, __guarded) {
         if (OvlState.bridgeOnline === true && looksAbsolute) {
             openViaBridge().catch(function (e) {
                 console.error('[ovl] open from history via bridge failed', e);
-                try { showToast('打开失败：' + (e && e.message ? e.message : String(e)), 'error'); } catch (e2) {}
+                try { showToast('打开失败：' + (e && e.message ? e.message : String(e)) + '（路径框仍是当前项目；要打开的路径：' + entry.path + '）', 'error'); } catch (e2) {}
             });
             return;
         }
@@ -57577,13 +57579,14 @@ function ovlBindShell() {
                     const oldDir = (rootH && rootH.__ovlRemote && rootH.__proj) ? rootH.__proj.dir : '';
                     if (oldDir && newPath && ovlNormalizeProjectPath(newPath) !== ovlNormalizeProjectPath(oldDir)) {
                         if (typeof ovlVisualBtrInFlightActive === 'function' && ovlVisualBtrInFlightActive()) {
-                            try { showToast('有段落正在后台回译，请稍候再切换项目。', 'warning'); } catch (e0) {}
+                            try { showToast('有段落正在后台回译，请稍候再切换项目；没有切换，路径框已改回当前项目。要打开的路径：' + newPath, 'warning'); } catch (e0) {}
                             projectPathInput.value = oldDir;
                             try { localStorage.setItem(ovlProjectPathLsKey(), oldDir); } catch (e0) {}
                             return;
                         }
                         const okSwitch = await ovlProjectSwitchGuard();
                         if (!okSwitch) {
+                            try { showToast('已取消切换：路径框改回当前项目。要打开的路径：' + newPath, 'info'); } catch (e0) {}
                             projectPathInput.value = oldDir;
                             try { localStorage.setItem(ovlProjectPathLsKey(), oldDir); } catch (e0) {}
                             return;
