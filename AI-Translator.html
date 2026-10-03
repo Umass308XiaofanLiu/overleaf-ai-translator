@@ -5018,7 +5018,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.42.12';        // APP_VERSION_STAMP
+const APP_VERSION = '03.43.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-03';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -24468,6 +24468,19 @@ function chatAppendToolRow(summaryText, detailText) {
 // 实际执行一次工具调用，返回 { ok, uiSummary, uiDetail, textForModel, bytes }。
 // bytes 是按字符数估的近似值（跟文件里别处 chatEstTokens 同一口径），只用来跟
 // CHAT_AGENT_TOTAL_READ_BUDGET 比大小，不追求逐字节精确。
+// v2 Pass P217（CHAT-1）：记住模型最近一次 read_file / list_dir 看到的文件 mtime，write_file 确认卡
+// 生成时拿它当 expectedMtimeMs 发给桥，磁盘上的文件在这期间被改过就拒绝覆盖。
+const ChatAgentMtimeCache = {};
+function chatAgentMtimeKey(projectDir, relPath) {
+    return String(projectDir) + '\u0000' + String(relPath == null ? '' : relPath).replace(/\\/g, '/').replace(/^(\.\/)+/, '').replace(/^\/+/, '').replace(/\/+$/, '');
+}
+function chatAgentMtimeRecord(projectDir, relPath, mtimeMs) {
+    if (typeof mtimeMs === 'number' && isFinite(mtimeMs)) ChatAgentMtimeCache[chatAgentMtimeKey(projectDir, relPath)] = mtimeMs;
+}
+function chatAgentMtimeForget(projectDir) {
+    const pre = String(projectDir) + '\u0000';
+    Object.keys(ChatAgentMtimeCache).forEach(function (k) { if (k.indexOf(pre) === 0) delete ChatAgentMtimeCache[k]; });
+}
 async function chatAgentExecTool(toolName, args, projectDir, signal) {
     const label = (toolName === 'list_dir') ? '列出目录' : '读取文件';
     if (!projectDir) {
@@ -24504,6 +24517,9 @@ async function chatAgentExecTool(toolName, args, projectDir, signal) {
     }
     if (toolName === 'list_dir') {
         const entries = Array.isArray(data.entries) ? data.entries : [];
+        entries.forEach(function (e) {
+            if (e && !e.isDir) chatAgentMtimeRecord(projectDir, (data.path && data.path !== '.' ? data.path + '/' : '') + e.name, e.mtimeMs);
+        });
         const lines = entries.map(function (e) {
             return (e.isDir ? '[目录] ' : '[文件] ') + e.name + (e.isDir ? '' : '（' + e.size + ' 字节）');
         });
@@ -24511,6 +24527,7 @@ async function chatAgentExecTool(toolName, args, projectDir, signal) {
         return { ok: true, uiSummary: '列出目录：' + data.path + '（' + entries.length + ' 项）', uiDetail: text, textForModel: text, bytes: text.length };
     }
     // read_file
+    chatAgentMtimeRecord(projectDir, data.path || args.path, data.mtimeMs);
     if (data.binary) {
         const msg = '文件「' + data.path + '」是二进制文件，无法按文本读取。';
         return { ok: true, uiSummary: '读取文件：' + data.path + '（二进制，已跳过）', uiDetail: msg, textForModel: msg, bytes: 0 };
@@ -24644,7 +24661,7 @@ async function chatAgentPreviewAffected(projectDir, relPath, signal) {
         if (!pd || pd.ok !== true) return { ok: false, error: (pd && pd.error) || '查询失败' };
         const entry = (pd.entries || []).find(function (e) { return e.name === filename; });
         if (!entry) return { ok: true, exists: false, isDir: false, paths: [], truncated: false };
-        if (!entry.isDir) return { ok: true, exists: true, isDir: false, paths: [norm], truncated: false, existingSize: entry.size };
+        if (!entry.isDir) return { ok: true, exists: true, isDir: false, paths: [norm], truncated: false, existingSize: entry.size, existingMtimeMs: entry.mtimeMs };
         const paths = [];
         let truncated = false;
         const queue = [norm];
@@ -24747,6 +24764,14 @@ function chatAgentBuildConfirmMessage(toolName, args, projectDir, extra) {
         lines.push('完整路径：' + abs(args.path));
         if (extra.exists) lines.push('⚠ 目标文件已存在（现有 ' + (extra.existingSize == null ? '?' : extra.existingSize) + ' 字节），确认后原内容会被整体覆盖，不会合并。');
         lines.push('新内容长度：约 ' + (args.content ? args.content.length : 0) + ' 字符。');
+        // v2 Pass P217（CHAT-1）：卡片里直接给出新内容前 40 行 + 新旧行数，用户不再盲批。
+        const newText = (typeof args.content === 'string') ? args.content : '';
+        const newLines = newText.split(/\r\n|\r|\n/);
+        if (newLines.length > 1 && newLines[newLines.length - 1] === '') newLines.pop();
+        lines.push('行数：' + (extra.exists ? ('原 ' + (extra.oldLineCount == null ? '?' : extra.oldLineCount) + ' 行 → ') : '') + '新 ' + newLines.length + ' 行。');
+        lines.push('新内容前 ' + Math.min(40, newLines.length) + ' 行：');
+        lines.push(newLines.slice(0, 40).map(function (l) { return '  | ' + (l.length > 200 ? l.slice(0, 200) + '…' : l); }).join('\n'));
+        if (newLines.length > 40) lines.push('  …（其余 ' + (newLines.length - 40) + ' 行省略）');
     } else if (toolName === 'mkdir') {
         title = '新建目录？';
         lines.push('操作：新建目录（含中间目录）');
@@ -24895,8 +24920,13 @@ function chatUpdatePendingConfirmHint() {
         const el = document.getElementById('aiChatPendingHint');
         if (!el) return;
         const n = (ChatState.pendingConfirms || []).length;
+        // v2 Pass P217：这条提示显示/隐藏会改变对话流的可视高度；原本贴底的话要保持贴底，
+        // 否则刚出现的确认卡按钮会被挤到输入区下面够不着。
+        const lg = document.getElementById('aiChatLog');
+        const wasAtBottom = !!lg && (lg.scrollHeight - lg.scrollTop - lg.clientHeight) < 80;
         el.hidden = n === 0;
         if (n > 0) el.textContent = '⏳ 有 ' + n + ' 项待确认——请在上面的卡片里点「确认执行」或「取消」';
+        if (wasAtBottom) chatScrollToBottom();
     } catch (e) {}
 }
 
@@ -25029,6 +25059,34 @@ async function chatAgentDoRollback(projectDir, checkpoint, opLabel) {
 // 写工具的执行主入口：探测检查点可用性 → 探测受影响路径/是否会覆盖 → 弹确认框 → 用户拒绝就
 // 原样把"用户拒绝了该操作"当工具结果返回（ok:false，但 chatAgentRunLoop 仍然会把它当成一次
 // 正常的工具往返继续对话，不会中断整个会话）→ 确认就真的调用对应的 /fs/* 端点。
+// 行数口径：末尾换行不算多一行；空串是 0 行。
+function chatAgentCountLines(text) {
+    const t = String(text == null ? '' : text);
+    if (!t) return 0;
+    const parts = t.split(/\r\n|\r|\n/);
+    if (parts.length > 1 && parts[parts.length - 1] === '') parts.pop();
+    return parts.length;
+}
+
+// v2 Pass P217（CHAT-1）：write_file 覆盖已有文件前，读一次旧内容拿行数和 mtime（尽力而为，失败返回 null）。
+async function chatAgentWritePrecheck(projectDir, relPath, signal) {
+    try {
+        const r = await ovlBridgeFetch(ovlBridgeUrl('/fs/read'), {
+            method: 'POST', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ projectDir: projectDir, path: relPath }), signal: signal || undefined
+        });
+        const d = await r.json();
+        if (!d || d.ok !== true) return null;
+        return {
+            mtimeMs: (typeof d.mtimeMs === 'number') ? d.mtimeMs : null,
+            lineCount: (d.binary || d.content == null) ? null : chatAgentCountLines(d.content)
+        };
+    } catch (e) {
+        if (e && e.name === 'AbortError') throw e;
+        return null;
+    }
+}
+
 async function chatAgentExecWriteTool(toolName, args, projectDir, signal, pending) {
     const setLabel = function (t) { try { if (pending && pending.labelEl) pending.labelEl.textContent = t; } catch (e) {} };
     if (!projectDir) {
@@ -25048,6 +25106,14 @@ async function chatAgentExecWriteTool(toolName, args, projectDir, signal, pendin
             const preview = await chatAgentPreviewAffected(projectDir, args.path, signal);
             extra.exists = !!(preview && preview.exists && !preview.isDir);
             extra.existingSize = preview && preview.existingSize;
+            // v2 Pass P217（CHAT-1）：expectedMtimeMs 基线 = 模型最近一次读到的 mtime；没读过就取此刻的磁盘 mtime。
+            const recorded = ChatAgentMtimeCache[chatAgentMtimeKey(projectDir, args.path)];
+            let fresh = null;
+            if (extra.exists) fresh = await chatAgentWritePrecheck(projectDir, args.path, signal);
+            extra.oldLineCount = fresh ? fresh.lineCount : null;
+            if (typeof recorded === 'number') extra.expectedMtimeMs = recorded;
+            else if (fresh && typeof fresh.mtimeMs === 'number') extra.expectedMtimeMs = fresh.mtimeMs;
+            else if (preview && typeof preview.existingMtimeMs === 'number') extra.expectedMtimeMs = preview.existingMtimeMs;
         } else if (toolName === 'move' || toolName === 'copy' || toolName === 'delete') {
             const sourceRel = toolName === 'delete' ? args.path : args.from;
             const preview = await chatAgentPreviewAffected(projectDir, sourceRel, signal);
@@ -25076,7 +25142,10 @@ async function chatAgentExecWriteTool(toolName, args, projectDir, signal, pendin
 
     setLabel('正在执行「' + built.title + '」…');
     const endpointMap = { write_file: '/fs/write', mkdir: '/fs/mkdir', move: '/fs/move', copy: '/fs/copy', delete: '/fs/delete' };
-    const body = (toolName === 'write_file') ? { projectDir: projectDir, path: args.path, content: args.content }
+    const body = (toolName === 'write_file')
+        ? (typeof extra.expectedMtimeMs === 'number'
+            ? { projectDir: projectDir, path: args.path, content: args.content, expectedMtimeMs: extra.expectedMtimeMs }
+            : { projectDir: projectDir, path: args.path, content: args.content })
         : (toolName === 'mkdir') ? { projectDir: projectDir, path: args.path }
         : (toolName === 'move' || toolName === 'copy') ? { projectDir: projectDir, from: args.from, to: args.to }
         : { projectDir: projectDir, path: args.path };
@@ -25084,7 +25153,9 @@ async function chatAgentExecWriteTool(toolName, args, projectDir, signal, pendin
     try {
         resp = await ovlBridgeFetch(ovlBridgeUrl(endpointMap[toolName]), {
             method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body), signal: signal || undefined
+            // v2 Pass P217（CHAT-5）：用户已确认——这一发写请求不再挂 turn 的 signal，
+            // 否则 Stop 会让桥那边照样写完而聊天里一行记录都没有。
+            body: JSON.stringify(body)
         });
         const text = await resp.text();
         try { data = JSON.parse(text); } catch (e) { data = null; }
@@ -25098,10 +25169,19 @@ async function chatAgentExecWriteTool(toolName, args, projectDir, signal, pendin
     if (ovlBridgeIsNoSuchRouteError(data)) {
         return { ok: false, uiSummary: '操作失败：桥版本过旧', uiDetail: OVL_BRIDGE_STALE_MSG, textForModel: OVL_BRIDGE_STALE_MSG, bytes: 0 };
     }
+    if (data && data.conflict === true) {
+        // v2 Pass P217（CHAT-1）：磁盘上的文件在模型读取/卡片生成之后被改过——没有写入，回报模型并留一行记录。
+        const cmsg = '写入已取消：文件「' + (args.path || '') + '」在你读取之后被改动过（磁盘上的修改时间已变），为避免覆盖对方的修改没有写入。请重新 read_file 后再决定是否写。';
+        chatAppendToolRow('⚠ write_file（' + (args.path || '') + '）· 写入冲突，未写入', cmsg);
+        chatAgentMtimeForget(projectDir);
+        return { ok: false, conflict: true, uiSummary: '写入冲突，未写入', uiDetail: cmsg, textForModel: '失败：' + cmsg, bytes: 0 };
+    }
     if (!data || !resp.ok || data.ok !== true) {
         const err = (data && data.error) || ('HTTP ' + (resp ? resp.status : '?'));
         return { ok: false, uiSummary: '操作失败', uiDetail: err, textForModel: '失败：' + err, bytes: 0 };
     }
+    if (toolName === 'write_file') chatAgentMtimeRecord(projectDir, args.path, data.mtimeMs);
+    else chatAgentMtimeForget(projectDir);
 
     chatAppendWriteResultRow(toolName, args, data, projectDir);
 
@@ -26118,7 +26198,28 @@ async function chatAgentP2TReloadEditorIfCurrent(outRel, newMainText) {
     } catch (e) { console.error('[chat-agent] reload editor after reconvert failed', e); }
 }
 
-async function chatAgentP2TReconvertOnePage(readiness, pageNum) {
+// v2 Pass P217（CHAT-6）：重转前把现有文件原样拷成同目录的 <name>.bak-<stamp>。文件不存在返回 null；
+// 读/写失败直接抛错——备份不成功就不许往下覆盖原文件。
+function chatAgentBackupStamp() {
+    const d = new Date();
+    const z = function (n) { return (n < 10 ? '0' : '') + n; };
+    return d.getFullYear() + z(d.getMonth() + 1) + z(d.getDate()) + '-' + z(d.getHours()) + z(d.getMinutes()) + z(d.getSeconds());
+}
+async function chatAgentP2TBackupText(relFromProjectRoot, stamp) {
+    const parts = String(relFromProjectRoot).replace(/\\/g, '/').split('/').filter(function (p) { return p && p !== '.'; });
+    const name = parts.pop();
+    let dir = OvlState.dirHandle;
+    for (let i = 0; i < parts.length; i++) dir = await dir.getDirectoryHandle(parts[i]);
+    let file;
+    try { file = await (await dir.getFileHandle(name)).getFile(); }
+    catch (e) { if (e && e.name === 'NotFoundError') return null; throw e; }
+    const text = await file.text();
+    const bakName = name + '.bak-' + stamp;
+    await ovlP2TWriteText(parts.concat([bakName]).join('/'), text);
+    return bakName;
+}
+
+async function chatAgentP2TReconvertOnePage(readiness, pageNum, stamp) {
     try {
         const job = await chatAgentP2TEnsureJobForReconvert(readiness);
         if (pageNum < 1 || pageNum > job.total) return { ok: false, error: '页码超出范围：这份 PDF 共 ' + job.total + ' 页。' };
@@ -26126,13 +26227,24 @@ async function chatAgentP2TReconvertOnePage(readiness, pageNum) {
         const rawText = ovlP2TAssembleMain(job);
         const refsOutcome = await ovlP2TApplyReferencesPipeline(job, rawText);
         job.refs = refsOutcome;
+        // v2 Pass P217（CHAT-6）：覆盖之前先备份 main.tex / refs.bib（手改过的内容否则永久丢失）。
+        const bakStamp = stamp || chatAgentBackupStamp();
+        const backups = [];
+        try {
+            const b1 = await chatAgentP2TBackupText(job.outRel + '/main.tex', bakStamp);
+            if (b1) backups.push(b1);
+            const b2 = await chatAgentP2TBackupText(job.outRel + '/refs.bib', bakStamp);
+            if (b2) backups.push(b2);
+        } catch (eBak) {
+            return { ok: false, error: '备份 main.tex / refs.bib 失败（' + ((eBak && eBak.message) || eBak) + '），为避免丢失手改内容，没有覆盖任何文件。' };
+        }
         await ovlP2TWriteText(job.outRel + '/main.tex', refsOutcome.text);
         if (refsOutcome.bibText) await ovlP2TWriteText(job.outRel + '/refs.bib', refsOutcome.bibText);
         await ovlP2TWriteText(job.outRel + '/README-pdf2tex.md', ovlP2TBuildReadme(job, refsOutcome.text));
         await ovlP2TUpdateMapAfterRun(job);
         job.finishedAt = Date.now();
         await chatAgentP2TReloadEditorIfCurrent(job.outRel, refsOutcome.text);
-        return { ok: true, pageState: job.pages[pageNum - 1] };
+        return { ok: true, pageState: job.pages[pageNum - 1], backups: backups };
     } catch (e) {
         return { ok: false, error: '重新转换出错：' + (e && e.message ? e.message : String(e)) };
     }
@@ -26158,8 +26270,11 @@ async function chatAgentExecReconvertPage(args, signal, pending) {
     }
 
     setLabel('等待你确认「重新转换第 ' + pageNum + ' 页」…');
+    const bakStamp = chatAgentBackupStamp();
     const confirmMsg = '操作：重新转换 PDF 第 ' + pageNum + ' 页（沿用既有的单页转换 + 阶梯重试机制），'
         + '完成后会重新拼装 main.tex（整体覆盖当前内容）并刷新编辑器。\n'
+        + '⚠ main.tex 和 refs.bib 是由各页转换结果重新拼出来的：你在转换之后对它们做的手工修改会被替换掉。\n'
+        + '覆盖之前会先在同一目录备份为 main.tex.bak-' + bakStamp + ' 和 refs.bib.bak-' + bakStamp + '（refs.bib 不存在则不备份），需要时可从备份取回。\n'
         + '关联源 PDF：' + readiness.rec.pdf + '\n转换产物目录：' + readiness.outRel;
     const confirmed = await chatAgentConfirm({ title: '重新转换第 ' + pageNum + ' 页？', message: confirmMsg, confirmLabel: '确认重转' }, signal);
     if (!confirmed) {
@@ -26169,14 +26284,15 @@ async function chatAgentExecReconvertPage(args, signal, pending) {
     }
 
     setLabel('正在重新转换第 ' + pageNum + ' 页…（可能需要几十秒）');
-    const runResult = await chatAgentP2TReconvertOnePage(readiness, pageNum);
+    const runResult = await chatAgentP2TReconvertOnePage(readiness, pageNum, bakStamp);
     if (!runResult.ok) {
         chatAppendToolRow('🔧 reconvert_page（第 ' + pageNum + ' 页）· 失败', runResult.error);
         return { ok: false, uiSummary: '重新转换失败', uiDetail: runResult.error, textForModel: runResult.error, bytes: 0 };
     }
     const stateLabel = runResult.pageState ? runResult.pageState.state : '未知';
     const text = '第 ' + pageNum + ' 页已重新转换完成（状态：' + stateLabel + '），main.tex 已重新拼装并刷新到编辑器'
-        + '（如果你当时有未保存的改动，编辑器不会被覆盖，见上面单独的提示）。';
+        + '（如果你当时有未保存的改动，编辑器不会被覆盖，见上面单独的提示）。'
+        + ((runResult.backups && runResult.backups.length) ? ('原文件已备份为：' + runResult.backups.join('、') + '。') : '');
     chatAppendToolRow('🔧 reconvert_page（第 ' + pageNum + ' 页）· 完成', text);
     return { ok: true, uiSummary: '重新转换第 ' + pageNum + ' 页完成', uiDetail: text, textForModel: text, bytes: text.length };
 }
@@ -26390,6 +26506,8 @@ function chatAgentSearchToolsSystemBlock() {
         + (native ? '' : '调用格式：\n==TOOL name=project_search==\n{"query":"关键词"}\n==TOOLEND==\n');
 }
 
+const CHAT_AGENT_SEARCH_LINE_CAP = 300;
+const CHAT_AGENT_SEARCH_TOTAL_CAP = 50 * 1024;
 async function chatAgentProjectSearchWalk(handle, relDir, needle, caseSensitive, state) {
     if (state.results.length >= CHAT_AGENT_SEARCH_MAX_RESULTS) return;
     let iter;
@@ -26418,7 +26536,9 @@ async function chatAgentProjectSearchWalk(handle, relDir, needle, caseSensitive,
         for (let i = 0; i < lines.length; i++) {
             const hay = caseSensitive ? lines[i] : lines[i].toLowerCase();
             if (hay.indexOf(needle) === -1) continue;
-            state.results.push({ file: childRel, line: i + 1, before: i > 0 ? lines[i - 1] : null, match: lines[i], after: i < lines.length - 1 ? lines[i + 1] : null });
+            // v2 Pass P217（CHAT-9）：每行最多 300 字符，超长行（tikz 数据 / 粘贴的表格）不会把工具结果撑到 MB 级。
+            const cap = function (t) { return t.length > CHAT_AGENT_SEARCH_LINE_CAP ? t.slice(0, CHAT_AGENT_SEARCH_LINE_CAP) + '…（行过长已截断，原长 ' + t.length + ' 字符）' : t; };
+            state.results.push({ file: childRel, line: i + 1, before: i > 0 ? cap(lines[i - 1]) : null, match: cap(lines[i]), after: i < lines.length - 1 ? cap(lines[i + 1]) : null });
             if (state.results.length >= CHAT_AGENT_SEARCH_MAX_RESULTS) return;
         }
     }
@@ -26455,9 +26575,18 @@ async function chatAgentExecProjectSearch(args) {
         if (r.after != null) ctx.push('  ' + (r.line + 1) + '\t' + r.after);
         return r.file + '（第 ' + r.line + ' 行' + (isCur ? '，属于当前打开文档，可直接把匹配行文本作为 doc_highlight 的 snippet 使用' : '') + '）：\n' + ctx.join('\n');
     });
+    // v2 Pass P217（CHAT-9）：结果文本总量封顶 50 KB，超出的命中整条丢弃并说明。
+    let shown = lines.length, acc = 0;
+    for (let li = 0; li < lines.length; li++) {
+        acc += lines[li].length + 2;
+        if (acc > CHAT_AGENT_SEARCH_TOTAL_CAP) { shown = li; break; }
+    }
+    const cutByTotal = shown < lines.length;
+    if (cutByTotal) lines.length = shown;
     const header = '在项目内搜索「' + query + '」，共命中 ' + state.results.length + (truncated ? '+' : '') + ' 处'
         + '（已扫描 ' + state.filesScanned + ' 个文本文件' + (state.capped ? '，已达到扫描安全上限，结果可能不完整' : '') + '）。';
     const text = header + (lines.length ? ('\n\n' + lines.join('\n\n')) : '\n（没有找到匹配。）')
+        + (cutByTotal ? ('\n\n（⚠ 结果文本超过 ' + Math.round(CHAT_AGENT_SEARCH_TOTAL_CAP / 1024) + ' KB 上限，只显示了前 ' + shown + ' 处命中，其余已省略——请缩小关键词范围再搜。）') : '')
         + (truncated ? ('\n\n（⚠ 已达到单次搜索 ' + CHAT_AGENT_SEARCH_MAX_RESULTS + ' 条结果上限，已截断——如需更多，请缩小关键词范围再搜。）') : '');
     return {
         ok: true,
@@ -28582,6 +28711,7 @@ async function chatSend() {
         // 光有 abort 不够：两条消息挨得很近时，旧请求可能已经拿到响应正在解析。
         // 所以还要 seq 守卫（照抄 scheduleCrossHighlight）：mySeq 对不上的响应一律丢弃。
         chatStop();
+        chatAgentInvalidateContinue();   // v2 Pass P217（CHAT-11）
         // P69 决策 2：保持串行语义——新一轮开始时自动取消上一张仍挂起的确认卡（原地改写
         // 成"已取消"并 resolve(false)），不让两张卡并存。写工具确认那张多半已经被上面
         // chatStop() 的 abort signal 顺带结算掉了，这里兜底结算任何不挂 signal 的（比如
@@ -28591,6 +28721,7 @@ async function chatSend() {
 
         // 换文档了就先把上一份文档的对话归档、从空白开始（行号对不上，继续沿用只会误导）。
         chatSyncSession();
+        mySeq = ChatState.seq;   // v2 Pass P217（CHAT-4）：chatSyncSession→chatResetConversation 可能刚 ++seq 掐掉了上一轮
 
         if (ta) { ta.value = ''; chatAutoGrowInput(); }
         chatPushUser(draft);
@@ -28879,6 +29010,19 @@ async function chatAgentContinueRun() {
 
 // 撞上轮数上限时，在对话流里追加一条带“继续执行”按钮的行——点一下用同一份 wire/sys 接着跑，
 // 不重开会话、不丢历史。按钮点过一次就地禁用，避免手快连点出并发的两条 continue 争用同一个 seq。
+// v2 Pass P217（CHAT-11）：新的一轮提问 / 对话被重置之后，旧的「继续执行」上下文作废，
+// 聊天流里所有还没点过的旧按钮一并置灰——否则点它会拿旧 wire 续跑，把答案接到新消息后面。
+function chatAgentInvalidateContinue() {
+    try {
+        ChatState.agentPendingContinue = null;
+        const log = document.getElementById('aiChatLog');
+        if (!log) return;
+        Array.prototype.forEach.call(log.querySelectorAll('button[data-continue-btn]'), function (b) {
+            if (!b.disabled) { b.disabled = true; b.textContent = '继续执行（已过期）'; }
+        });
+    } catch (e) {}
+}
+
 function chatAppendContinueRow() {
     try {
         const row = chatAppendRow('system', '');
@@ -28889,6 +29033,7 @@ function chatAppendContinueRow() {
         btn.type = 'button';
         btn.className = 'aichat-minibtn';
         btn.textContent = '继续执行';
+        btn.setAttribute('data-continue-btn', '1');
         btn.addEventListener('click', function () {
             btn.disabled = true;
             btn.textContent = '继续执行中…';
@@ -29923,7 +30068,10 @@ function chatMoreBoxHtml(choice) {
         + '<select class="aichat-psel" id="aiChatMaxSel" style="max-width:96px">' + mtOpts + '</select></span>');
 
     // —— 流式（只有本地实测过）——
-    if (choice.provider === 'local') {
+    // v2 Pass P217（CHAT-10）：agent 循环永远走非流式（chatAgentRunLoop 传 sink=null），这个开关什么都不控制，
+    // 先隐藏；ChatState.stream 的存取保留（无害），以后真接上流式再把常量改回 true。
+    const CHAT_SHOW_STREAM_TOGGLE = false;
+    if (CHAT_SHOW_STREAM_TOGGLE && choice.provider === 'local') {
         rows.push('<span class="aichat-pgroup" data-tip="'
             + escapeAttr('边生成边显示。实测本地 SSE 里 delta.reasoning_content 和 delta.content 是「两个独立字段」、'
                 + '不会交错，所以思考区和答案气泡各自流各自的，不需要任何猜测式解析。'
@@ -30739,6 +30887,7 @@ function chatRenderProposalCard(p) {
             return x.length >= 16 && p.replacement.indexOf(x.slice(0, 32)) !== -1;
         };
         if (echoed(headKeep) || echoed(tailKeep)) {
+            p.echoWarned = true;   // v2 Pass P217（CHAT-2）：带警告的提案绝不自动应用
             const warn2 = document.createElement('div');
             warn2.className = 'aichat-card-warn';
             warn2.textContent = '⚠ 替换文本里含有这一行选区之外的文字（模型很可能把整行还了回来，'
@@ -30818,7 +30967,9 @@ function chatRenderProposalCard(p) {
 
     // 「跳过审批」开着：卡片一画出来就自动点一次「应用」。chatApplyProposal 内部的四道闸门
     // 一条都不会因为这个开关而放松——这里只是替用户按了那颗按钮，不是绕过按钮背后的核对。
-    if (ChatState.autoApprove) chatApplyProposal(p.id);
+    // v2 Pass P217（CHAT-2）：卡片上亮了「LaTeX 记号丢失」或「整行回显/重复」警告时不自动应用——
+    // 警告的意思就是「请你先看」，自动点掉等于没显示过。
+    if (ChatState.autoApprove && !(lost.length || p.echoWarned)) chatApplyProposal(p.id);
     try { chatRenderBatchBar(); } catch (e) {}
 }
 
@@ -31071,6 +31222,10 @@ const CHAT_TOK_BASE = 7;        // chat template 本身的固定头
 // 所有旧调用点（永远传字符串）落到 else 分支，跟 P163 之前完全等价，这就是本任务书要求的
 // 「纯文本零回归」在估算这一侧的来源。
 function chatEstTokensText(s) {
+    return Math.round(chatEstTokensRaw(s));
+}
+// v2 Pass P217（CHAT-8）：未取整的估算值——按字符累加，对字符串拼接是可加的，窗口收窄用它做前缀和。
+function chatEstTokensRaw(s) {
     const str = String(s == null ? '' : s);
     let cjk = 0, dense = 0;
     for (let i = 0; i < str.length; i++) {
@@ -31083,8 +31238,8 @@ function chatEstTokensText(s) {
             || c === 0x26 || c === 0x25 || c === 0x23  // & % #
             || c === 0x7E || c === 0x5B || c === 0x5D) { dense++; }  // ~ [ ]
     }
-    return Math.round(cjk * CHAT_TOK_CJK + dense * CHAT_TOK_DENSE
-        + (str.length - cjk - dense) * CHAT_TOK_OTHER);
+    return cjk * CHAT_TOK_CJK + dense * CHAT_TOK_DENSE
+        + (str.length - cjk - dense) * CHAT_TOK_OTHER;
 }
 
 // v2 Pass P163：content 贴图之后可能是数组（OpenAI 风格
@@ -31274,6 +31429,15 @@ function chatCtxWindow() {
                 }
             }
         }
+        else {
+            // v2 Pass P217（CHAT-7）：在线 provider 用内置模型能力表里的 contextWindow；表里没有就保持「不知道」。
+            const mc = getModelCaps(c.provider, c.model);
+            if (mc && Number(mc.contextWindow) > 0) {
+                out.ctx = Number(mc.contextWindow);
+                out.known = true;
+                out.source = '内置模型能力表 MODEL_CAPS.' + c.provider + '.contextWindow';
+            }
+        }
         out.denom = out.known ? Math.max(0, out.ctx - out.reserve) : 0;
     } catch (e) {}
     return out;
@@ -31283,6 +31447,30 @@ function chatCtxWindow() {
 // v2 Pass P100：只在这段对话是从「AI 翻译器」窗口打开的（ChatState.contextOrigin ===
 // 'translator'）才生成——旧的「文档」开关删掉了，判据从 ChatState.autoContext 换成了
 // contextOrigin，函数体本身（截窗/token 保险丝/指纹）一个字节没动，逐字复用。
+// v2 Pass P217（CHAT-8）：每行原文的未取整 token 估算按「pair 对象 + src 字符串」memo；
+// 前缀和 + 二分/双指针让窗口收窄从 O(n²) 降到 O(n)，且不再为每个候选窗口重建整段文本。
+const ChatDocRowMemo = new WeakMap();
+function chatDocRowSrcRaw(p) {
+    const src = String(p.src == null ? '' : p.src);
+    const hit = (typeof p === 'object') ? ChatDocRowMemo.get(p) : null;
+    if (hit && hit.src === src) return hit.raw;
+    const raw = chatEstTokensRaw(chatEscapeDelims(src));
+    if (typeof p === 'object') ChatDocRowMemo.set(p, { src: src, raw: raw });
+    return raw;
+}
+function chatDocPrefixTable(pairs) {
+    const n = pairs.length;
+    const pre = new Float64Array(n + 1);
+    const headByDigits = {};
+    for (let i = 1; i <= n; i++) {
+        const key = String(i).length;
+        let h = headByDigits[key];
+        if (h === undefined) h = headByDigits[key] = chatEstTokensRaw('[' + i + '] 原文：');
+        pre[i] = pre[i - 1] + h + chatDocRowSrcRaw(pairs[i - 1] || {});
+    }
+    return pre;
+}
+
 function chatBuildDocContext() {
     const out = { on: false, text: '', from: 0, to: 0, total: 0, windowed: false,
                   tokens: 0, hashes: null, why: '' };
@@ -31293,7 +31481,7 @@ function chatBuildDocContext() {
         if (!pairs.length) { out.why = '还没有已翻译的内容'; return out; }
 
         let from = 1, to = pairs.length;
-        let body = chatDocBody(pairs, from, to);
+        let body = null;
 
         // —— 保险丝：整篇真的塞不下时才收窄，围绕焦点行取一个**连续**区间 ——
         const w = chatCtxWindow();
@@ -31303,7 +31491,14 @@ function chatBuildDocContext() {
             // 【按**装好帧**的文本量，不是按裸正文量】帧头那句「本轮上下文：第 x–y 行…」
             // 加上 ==DOCEND== 有几十个 token。只量裸正文的话，窗口刚好卡在预算上时，
             // 真正发出去的那一份必然超预算 —— 第一版就超了 23 tok。
+            const pre = chatDocPrefixTable(pairs);
+            const nlRaw = chatEstTokensRaw('\n');
             const framed = function (lo, hi) {
+                return Math.round(chatEstTokensRaw(chatDocFrame('', lo, hi, out.total, true))
+                    + (pre[hi] - pre[lo - 1]) + (hi - lo) * nlRaw);
+            };
+            // 前缀和是浮点累加，边界上可能和真实估算差 1 个 token：最终窗口再用真实函数复核一次。
+            const framedReal = function (lo, hi) {
                 return chatEstTokens(chatDocFrame(chatDocBody(pairs, lo, hi), lo, hi, out.total, true));
             };
             if (framed(from, to) > budget) {
@@ -31319,10 +31514,12 @@ function chatBuildDocContext() {
                     if (lo > 1 && framed(lo - 1, hi) <= budget) { lo--; grew = true; }
                     if (!grew) break;
                 }
-                from = lo; to = hi; body = chatDocBody(pairs, lo, hi);
+                while (hi > lo && framedReal(lo, hi) > budget) { if (hi - focus >= focus - lo) hi--; else lo++; }
+                from = lo; to = hi;
                 out.windowed = true;
             }
         }
+        if (body === null) body = chatDocBody(pairs, from, to);
 
         out.on = true;
         out.from = from;
@@ -31967,13 +32164,28 @@ function chatWireCostOf(msgs) {
     return t;
 }
 
+// v2 Pass P217（CHAT-3）：贴图后 user 消息的 content 是数组（见 chatWireContent），归档 / 标题 /
+// 压缩摘要不能 String() 它（会变成 "[object Object]"）——文本段拼起来，图片换成 [图片]。
+function chatFlattenContent(c) {
+    if (c == null) return '';
+    if (!Array.isArray(c)) return String(c);
+    const out = [];
+    c.forEach(function (part) {
+        if (part == null) return;
+        if (typeof part === 'string') { out.push(part); return; }
+        if (part.type === 'text') out.push(String(part.text == null ? '' : part.text));
+        else if (part.type === 'image_url' || part.type === 'image') out.push('[图片]');
+    });
+    return out.join('\n');
+}
+
 function chatCompactDigest(msgs) {
     const lines = ['[系统] 以下是更早对话的**机械摘要**：由本工具按「每条截取开头」生成，'
         + '没有调用任何模型，因此不会编造，但也确实丢掉了被截掉的部分。'];
     for (let i = 0; i < msgs.length; i++) {
         const m = msgs[i] || {};
         const who = m.role === 'assistant' ? '助手' : '用户';
-        const raw = String((m.role === 'assistant' ? (m.prose || m.content) : m.content) || '')
+        const raw = chatFlattenContent((m.role === 'assistant' ? (m.prose || m.content) : m.content) || '')
             .replace(/\s+/g, ' ').trim();
         const cut = raw.length > CHAT_COMPACT_HEAD ? raw.slice(0, CHAT_COMPACT_HEAD) + '…（已截断）' : raw;
         lines.push('· ' + who + '：' + cut);
@@ -32073,7 +32285,16 @@ function chatResetConversation() {
     // ChatState.busy 永远回不到 false，SEND 按钮永久卡死在 STOP。三个调用点（chatSend 里
     // 换文档时的 chatSyncSession、chatOpen、restoreGlobalHistory 尾部）都经过这里，
     // 集中在这一处结算，不需要每个调用点各自记得处理。
+    // v2 Pass P217（CHAT-4）：在飞的一轮必须在这里当场了结，做法和 chatClearConversation 逐字一致——
+    // 否则切文档 / 取回历史后旧循环还在跑，会往新对话里塞孤儿助手消息。
+    if (ChatState.busy) {
+        chatStop();
+        ChatState.seq = (Number(ChatState.seq) || 0) + 1;
+        ChatState.abort = null;
+        chatSetBusy(false);
+    }
     chatAgentSettlePendingConfirms('对话已清空');
+    chatAgentInvalidateContinue();   // v2 Pass P217（CHAT-11）
     ChatState.messages = [];
     ChatState.proposals = [];
     ChatState.target = null;
@@ -32205,7 +32426,7 @@ function chatArchiveWrite(list) {
 function chatArchiveTitle(msgs) {
     for (let i = 0; i < msgs.length; i++) {
         if (msgs[i] && msgs[i].role === 'user') {
-            const s = String(msgs[i].content || '').replace(/\s+/g, ' ').trim();
+            const s = chatFlattenContent(msgs[i].content || '').replace(/\s+/g, ' ').trim();
             if (s) return s.length > 40 ? s.slice(0, 40) + '…' : s;
         }
     }
@@ -32250,7 +32471,7 @@ function chatArchivePush(reason, opts) {
             title: chatArchiveTitle(msgs),
             // 只留 wire 需要的字段：content / prose / reasoning 全带上会把配额烧光。
             messages: msgs.map(function (m) {
-                return { role: m.role, content: String(m.content == null ? '' : m.content),
+                return { role: m.role, content: chatFlattenContent(m.content),
                          prose: String(m.prose == null ? '' : m.prose),
                          editBody: m.editBody ? String(m.editBody) : null,
                          compacted: !!m.compacted };
