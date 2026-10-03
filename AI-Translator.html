@@ -5018,7 +5018,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.43.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.43.03';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-03';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -26181,7 +26181,17 @@ async function chatAgentP2TReloadEditorIfCurrent(outRel, newMainText) {
         }
         const ta = document.getElementById('ovlCodeArea');
         if (ta) {
-            ta.value = newMainText;
+            // v2 Pass P219：跟 P210 的打开/保存/外部重载路径一致——编辑器与 lastLoadedText 都存 LF、无 BOM 的文本，
+            // 原来的 BOM / CRLF 记到 currentFile.eol / .bom，保存时由 ovlEncodeForDisk 还原。
+            const rawMain = String(newMainText == null ? '' : newMainText);
+            const mainBom = rawMain.charCodeAt(0) === 0xFEFF;
+            const mainBody = mainBom ? rawMain.slice(1) : rawMain;
+            const mainCrlf = (mainBody.match(/\r\n/g) || []).length;
+            const mainBareLf = (mainBody.replace(/\r\n/g, '').match(/\n/g) || []).length;
+            const mainText = ovlNormEditorText(mainBody);
+            cf.eol = (mainCrlf > mainBareLf) ? '\r\n' : '\n';
+            cf.bom = mainBom;
+            ta.value = mainText;
             OvlState.lineOffsets = null;
             if (typeof ovlRecomputeLineOffsets === 'function') ovlRecomputeLineOffsets();
             if (typeof ovlRenderGutter === 'function') ovlRenderGutter(true);
@@ -26190,7 +26200,7 @@ async function chatAgentP2TReloadEditorIfCurrent(outRel, newMainText) {
             // 改 ta.value——必须同步更新快照，否则下一次外部改动探测会拿"重转前的旧内容"当
             // 基准误判冲突。mtime 不精确已知（拿不到这次落盘的真实值），交给下一次 mtime 探测
             // 自然收敛（探测到不一致时会走完整内容比对，不会误覆盖）。
-            OvlState.lastLoadedText = newMainText;
+            OvlState.lastLoadedText = mainText;
         }
         if (OvlState.editorMode === 'visual' && typeof ovlVisualRender === 'function') ovlVisualRender();
         if (OvlState.dirHandle && !OvlState.usingWebkitFallback && typeof ovlRenderTree === 'function') ovlRenderTree(OvlState.dirHandle);
