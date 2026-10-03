@@ -5018,7 +5018,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.42.05';        // APP_VERSION_STAMP
+const APP_VERSION = '03.42.06';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-02';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -45519,6 +45519,8 @@ async function ovlOpenPdfDirect(fileHandle, name, parentHandle, relPath) {
 
 // tab 名 + 脏点 + 保存提示的 title：唯一入口，打开文件/敲字/保存都调它，不许各处自己拼字符串。
 function ovlUpdateTabUI() {
+    // v2 Pass P212（EDITOR-2）：查找栏开着时，文本/文件变了就排一次静默重算（打开文件会走到这里）。
+    try { if (typeof ovlFindSyncIfStale === 'function') ovlFindSyncIfStale(); } catch (e) {}
     const tabName = document.getElementById('ovlEditorTabName');
     if (!tabName) return;
     if (!OvlState.currentFile) {
@@ -48567,8 +48569,38 @@ const OvlFindState = {
     // 改用这一套（不是 matches），跟"整块" bug 的根因一致——命中的字符区间没法用源码坐标表达。
     zhMatches: [], // [{line, lineEnd, text, occurrenceIndex}, ...]，见 ovlFindCollectZhMatches
     usingZh: false, // true=当前导航/计数/高亮的是 zhMatches，false=matches（含中文模式回落源码搜索）
-    idx: -1
+    idx: -1,
+    // v2 Pass P212（EDITOR-5）：「在选区内」的范围必须存在查找状态里——原来每次重算都现读
+    // ta.selectionStart/End，而 ovlFindSelectCurrent 会把选区改成当前命中，于是第一次重算后
+    // 范围就坍缩成单个命中。开关打开 / 查找栏打开时捕获一次，之后匹配与 Replace All 都读这份。
+    scope: null,        // [start, end] 或 null（null=整篇）
+    textSnap: null,     // 上次重算时的 ta.value（EDITOR-2：判断文本是不是被换/被改了）
+    snapLen: null,      // 上次重算/输入时的 ta.value.length（用户输入时粗略平移 scope）
+    fileRef: null,      // 上次重算时的 OvlState.currentFile（换文件就作废 scope）
+    suppressInput: false, // 替换自己触发的 input 事件不再排重算
+    recomputeTimer: null
 };
+
+function ovlFindIsOpen() {
+    const p = document.getElementById('ovlEditorPanel');
+    return !!p && p.getAttribute('data-find') === 'open';
+}
+// 返回钳位后的有效 scope（仅 inSelection 开着且 scope 非空时），否则 null=整篇。
+function ovlFindActiveScope(ta) {
+    if (!OvlFindState.inSelection || !OvlFindState.scope || !ta) return null;
+    const len = ta.value.length;
+    const a = Math.max(0, Math.min(len, OvlFindState.scope[0]));
+    const b = Math.max(a, Math.min(len, OvlFindState.scope[1]));
+    return b > a ? [a, b] : null;
+}
+function ovlFindCaptureScope() {
+    const ta = document.getElementById('ovlCodeArea');
+    if (OvlFindState.inSelection && ta && ta.selectionStart !== ta.selectionEnd) {
+        OvlFindState.scope = [ta.selectionStart, ta.selectionEnd];
+    } else {
+        OvlFindState.scope = null;
+    }
+}
 
 // P68：matches 和 zhMatches 互斥使用，两处都要判断"当前是哪一套"的地方（计数、Next/Prev）
 // 收口到这一个函数，不重复写三遍同样的三元判断。
@@ -48591,7 +48623,9 @@ function ovlFindBuildRegex(query) {
             return new RegExp(query, 'g' + (OvlFindState.caseSensitive ? '' : 'i'));
         }
         let esc = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        if (OvlFindState.wholeWord) esc = '\\b' + esc + '\\b';
+        // v2 Pass P212（EDITOR-12）：只在查询词该端本身是单词字符时才加 \b——否则 \cite 这类以
+        // 非单词字符开头/结尾的查询词两侧永远凑不出边界，整个词永远搜不到。
+        if (OvlFindState.wholeWord) esc = (/^\w/.test(query) ? '\\b' : '') + esc + (/\w$/.test(query) ? '\\b' : '');
         return new RegExp(esc, 'g' + (OvlFindState.caseSensitive ? '' : 'i'));
     } catch (e) {
         // 用户敲了个孤零零的 [ 之类的非法正则，不许让面板炸掉（§4.0 M8a 明文要求）。
@@ -48611,11 +48645,19 @@ function ovlFindUpdateCount(hadQuery) {
 
 // preserveIdx=false：从当前光标位置起找最近一个命中当"当前项"（典型于新查询/切换开关）。
 // preserveIdx=true：尽量保留原 idx（用于 Replace 之后重扫，光标已经移到刚替换的位置）。
-function ovlFindRecompute(preserveIdx) {
+// quiet=true（P212）：只重算命中与计数，不 setSelectionRange / 不滚动 / 不抢选区——给用户在编辑器里
+// 打字、换文件触发的后台重算用，绝不能在用户打字时把光标挪走。
+function ovlFindRecompute(preserveIdx, quiet) {
     try {
         const ta = document.getElementById('ovlCodeArea');
         const input = document.getElementById('ovlFindInput');
         if (!ta || !input) return;
+        OvlFindState.textSnap = ta.value;
+        OvlFindState.snapLen = ta.value.length;
+        if (OvlFindState.fileRef !== OvlState.currentFile) {
+            OvlFindState.fileRef = OvlState.currentFile;
+            if (OvlFindState.scope && quiet) OvlFindState.scope = null; // 换了文件，旧范围没有意义
+        }
         const query = input.value;
         input.classList.remove('ovl-find-bad');
         OvlFindState.matches = [];
@@ -48643,9 +48685,10 @@ function ovlFindRecompute(preserveIdx) {
         } else {
             let scanText = ta.value;
             let scanOffset = 0;
-            if (OvlFindState.inSelection && ta.selectionStart !== ta.selectionEnd) {
-                scanOffset = ta.selectionStart;
-                scanText = ta.value.slice(ta.selectionStart, ta.selectionEnd);
+            const sc = ovlFindActiveScope(ta);
+            if (sc) {
+                scanOffset = sc[0];
+                scanText = ta.value.slice(sc[0], sc[1]);
             }
             let m, guard = 0;
             while ((m = re.exec(scanText)) !== null) {
@@ -48662,7 +48705,7 @@ function ovlFindRecompute(preserveIdx) {
                 // 从文档顺序里的第一个开始，比强行找一个不存在的"最近"更诚实。
                 OvlFindState.idx = total ? 0 : -1;
             } else {
-                const cur = ta.selectionEnd;
+                const cur = quiet ? ta.selectionStart : ta.selectionEnd;
                 const idx = OvlFindState.matches.findIndex((r) => r[0] >= cur);
                 OvlFindState.idx = idx === -1 ? (OvlFindState.matches.length ? 0 : -1) : idx;
             }
@@ -48670,7 +48713,7 @@ function ovlFindRecompute(preserveIdx) {
             OvlFindState.idx = total ? 0 : -1;
         }
         ovlFindUpdateCount(true);
-        if (OvlFindState.idx >= 0) ovlFindSelectCurrent();
+        if (OvlFindState.idx >= 0 && !quiet) ovlFindSelectCurrent();
     } catch (e) {
         console.error('[ovl] findRecompute failed', e);
     }
@@ -48745,7 +48788,11 @@ function ovlFindOpen() {
         const ta = document.getElementById('ovlCodeArea');
         const input = document.getElementById('ovlFindInput');
         if (!panel) return;
+        const wasOpen = panel.getAttribute('data-find') === 'open';
         panel.setAttribute('data-find', 'open');
+        // v2 Pass P212（EDITOR-5）：栏刚打开且「在选区内」已经开着——此刻的选区就是用户要限定的
+        // 范围，捕获下来（栏已开时再按 Ctrl+F 不重捕：那时的选区多半只是当前命中）。
+        if (!wasOpen) ovlFindCaptureScope();
         if (input) {
             if (ta && !ta.disabled && ta.selectionStart !== ta.selectionEnd) {
                 input.value = ta.value.slice(ta.selectionStart, ta.selectionEnd);
@@ -48765,6 +48812,8 @@ function ovlFindClose() {
         OvlFindState.zhMatches = [];
         OvlFindState.usingZh = false;
         OvlFindState.idx = -1;
+        OvlFindState.scope = null;
+        if (OvlFindState.recomputeTimer) { clearTimeout(OvlFindState.recomputeTimer); OvlFindState.recomputeTimer = null; }
         ovlFindSetHint('');
         const ta = document.getElementById('ovlCodeArea');
         if (ta && !ta.disabled) { try { ta.focus(); } catch (e) {} }
@@ -48802,6 +48851,17 @@ function ovlFindUpdateReplaceUI() {
     } catch (e) { console.error('[ovl] findUpdateReplaceUI failed', e); }
 }
 
+// v2 Pass P212：替换完成后把焦点还给替换前持有它的元素（EDITOR-3）。ta.focus() 是 execCommand
+// 的前提，但不能把用户留在编辑器里——否则在替换框里连按两次 Enter，第二次 Enter 会落进
+// textarea，把已选中的下一个命中替换成换行符。
+function ovlFindRestoreFocus(prev, ta) {
+    try {
+        if (prev && prev !== ta && prev !== document.body && typeof prev.focus === 'function' && document.contains(prev)) {
+            prev.focus({ preventScroll: true });
+        }
+    } catch (e) {}
+}
+
 // 替换走 insertText（保住撤销栈），一次只处理"当前项"。
 function ovlReplaceCurrent() {
     try {
@@ -48810,26 +48870,76 @@ function ovlReplaceCurrent() {
         if (ovlIsZhVisualMode()) { showToast(OVL_REPLACE_ZH_TIP, 'info'); return; }
         const ta = document.getElementById('ovlCodeArea');
         const replaceInput = document.getElementById('ovlReplaceInput');
-        if (!ta || ta.disabled || !replaceInput) return;
+        const findInput = document.getElementById('ovlFindInput');
+        if (!ta || ta.disabled || !replaceInput || !findInput) return;
         if (OvlFindState.idx < 0 || !OvlFindState.matches[OvlFindState.idx]) { ovlFindNext(); return; }
         const r = OvlFindState.matches[OvlFindState.idx];
+
+        // v2 Pass P212（EDITOR-2/4）：存下来的命中偏移可能已经过期（用户在编辑器里改过字、
+        // 换了文件）。替换前在 r[0] 处用同一个正则（sticky）重新验证一次：不再命中就重算、
+        // 什么都不替换。同时用 sticky 单次 replace 取得"这一处"的替换文本——regex 模式下
+        // $1/$& 照常展开（与 Replace All 一致），字面量模式用函数替换器，$ 永不展开。
+        const re = ovlFindBuildRegex(findInput.value);
+        const sc = ovlFindActiveScope(ta);
+        const base = sc ? ta.value.slice(sc[0], sc[1]) : ta.value;
+        const off = sc ? sc[0] : 0;
+        let ins = null;
+        if (re && r[0] >= off && r[1] - off <= base.length) {
+            const sre = new RegExp(re.source, re.flags.replace(/[gy]/g, '') + 'y');
+            sre.lastIndex = r[0] - off;
+            const m = sre.exec(base);
+            if (m && m.index === r[0] - off && m.index + m[0].length === r[1] - off) {
+                sre.lastIndex = r[0] - off;
+                const rv = replaceInput.value;
+                const replaced = OvlFindState.regex ? base.replace(sre, rv) : base.replace(sre, function () { return rv; });
+                ins = replaced.slice(r[0] - off, replaced.length - (base.length - (r[1] - off)));
+            }
+        }
+        if (ins === null) {
+            ovlFindRecompute(false);
+            showToast('文本已变化，已重新查找，请再点一次替换', 'info');
+            return;
+        }
+
         // v2 Pass P46：Visual 模式下 #ovlCodeArea 是 display:none，focus() 在隐藏元素上是
         // no-op，紧跟着的 execCommand('insertText') 因为没有真正的焦点元素同样悄悄什么都不做——
         // 查找能跳转/高亮（只用 setSelectionRange，不需要可见）,但替换会静默失效。跟
         // ovlEditorApplyReplace（约 33547 行）同一个套路：写之前临时摘掉 display:none，写完立刻
         // 盖回去，全程同步执行不过渲染帧，用户看不到闪烁。
+        const prevFocus = document.activeElement;
         const wasHidden = ta.style.display === 'none';
         if (wasHidden) ta.style.display = '';
-        ta.focus();
-        ta.setSelectionRange(r[0], r[1]);
-        document.execCommand('insertText', false, replaceInput.value);
-        if (wasHidden) ta.style.display = 'none';
+        const lenBefore = ta.value.length;
+        OvlFindState.suppressInput = true;
+        try {
+            ta.focus();
+            ta.setSelectionRange(r[0], r[1]);
+            document.execCommand('insertText', false, ins);
+        } finally {
+            OvlFindState.suppressInput = false;
+            if (wasHidden) ta.style.display = 'none';
+        }
+        const delta = ta.value.length - lenBefore;
+        // EDITOR-5：替换发生在范围内部，范围末端跟着平移。
+        if (sc && OvlFindState.scope) OvlFindState.scope = [sc[0], Math.max(sc[0], sc[1] + delta)];
         ovlRenderGutter(false);
-        ovlFindRecompute(true);
+        // 光标已在替换文本之后：下一个当前项取"替换文本之后的第一个命中"（替换文本本身又命中查询词
+        // 时，不会停在刚替换的那一处原地打转）。quiet 重算不动选区，下面显式选中下一个命中。
+        ovlFindRecompute(true, true);
+        if (!OvlFindState.usingZh && OvlFindState.matches.length) {
+            const after = r[0] + ins.length;
+            const ni = OvlFindState.matches.findIndex(function (x) { return x[0] >= after; });
+            OvlFindState.idx = ni === -1 ? 0 : ni;
+        } else if (!OvlFindState.matches.length) {
+            OvlFindState.idx = -1;
+        }
+        ovlFindUpdateCount(true);
+        if (OvlFindState.idx >= 0) ovlFindSelectCurrent();
         // Visual 面板是从 ta.value 整体重渲的只读预览，替换只改了底层 textarea，这里补一次
         // 重渲染，不然用户在 Visual 模式下点"替换"看不到任何变化（跟 P46 的报错现象是同一类：
         // 数据其实改了，但可见的地方没跟着动）。
         if (OvlState.editorMode === 'visual' && typeof ovlVisualRender === 'function') ovlVisualRender();
+        ovlFindRestoreFocus(prevFocus, ta);
     } catch (e) { console.error('[ovl] replaceCurrent failed', e); }
 }
 
@@ -48852,26 +48962,76 @@ function ovlReplaceAll() {
         const repl = replaceInput.value;
         const text = ta.value;
         let rangeStart = 0, rangeEnd = text.length;
-        if (OvlFindState.inSelection && ta.selectionStart !== ta.selectionEnd) {
-            rangeStart = ta.selectionStart; rangeEnd = ta.selectionEnd;
-        }
+        const sc = ovlFindActiveScope(ta);
+        if (sc) { rangeStart = sc[0]; rangeEnd = sc[1]; }
         const before = text.slice(0, rangeStart);
         const mid = text.slice(rangeStart, rangeEnd);
         const after = text.slice(rangeEnd);
-        const newMid = mid.replace(re, repl);
+        // v2 Pass P212（EDITOR-4）：字面量模式用函数替换器，$$ / $& / $` 不会被展开；
+        // regex 模式 $1 / $& 照常展开（与 Replace 当前项一致）。
+        const newMid = OvlFindState.regex ? mid.replace(re, repl) : mid.replace(re, function () { return repl; });
         const newText = before + newMid + after;
         if (newText === text) { ovlFindRecompute(false); return; }
         // v2 Pass P46：同 ovlReplaceCurrent 的理由，Visual 模式下 ta 是 display:none 不可聚焦。
+        const prevFocus = document.activeElement;
         const wasHidden = ta.style.display === 'none';
         if (wasHidden) ta.style.display = '';
-        ta.focus();
-        ta.setSelectionRange(0, ta.value.length);
-        document.execCommand('insertText', false, newText);
-        if (wasHidden) ta.style.display = 'none';
+        OvlFindState.suppressInput = true;
+        try {
+            ta.focus();
+            ta.setSelectionRange(0, ta.value.length);
+            document.execCommand('insertText', false, newText);
+        } finally {
+            OvlFindState.suppressInput = false;
+            if (wasHidden) ta.style.display = 'none';
+        }
+        if (sc && OvlFindState.scope) OvlFindState.scope = [rangeStart, rangeStart + newMid.length];
         ovlRenderGutter(true);
         ovlFindRecompute(false);
         if (OvlState.editorMode === 'visual' && typeof ovlVisualRender === 'function') ovlVisualRender();
+        ovlFindRestoreFocus(prevFocus, ta);
     } catch (e) { console.error('[ovl] replaceAll failed', e); }
+}
+
+// v2 Pass P212（EDITOR-2/5）：查找栏打开期间，编辑器文本变了（用户打字 / 换文件）就防抖
+// ~150ms 静默重算命中，不再让 Replace 拿着过期偏移去改别处。
+function ovlFindScheduleRecompute() {
+    if (OvlFindState.recomputeTimer) clearTimeout(OvlFindState.recomputeTimer);
+    OvlFindState.recomputeTimer = setTimeout(function () {
+        OvlFindState.recomputeTimer = null;
+        if (ovlFindIsOpen()) ovlFindRecompute(false, true);
+    }, 150);
+}
+function ovlFindOnEditorInput() {
+    try {
+        if (OvlFindState.suppressInput || !ovlFindIsOpen()) return;
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta) return;
+        // 用户在范围附近打字：按长度差粗略平移 scope（范围前面的编辑整体平移，范围里面的编辑
+        // 只动末端）。这是启发式——输入事件不带编辑位置——只为让范围不至于明显漂移。
+        const sc = OvlFindState.scope;
+        if (sc && OvlFindState.snapLen != null) {
+            const delta = ta.value.length - OvlFindState.snapLen;
+            if (delta) {
+                const p = ta.selectionStart;
+                const editStart = delta > 0 ? p - delta : p;
+                if (editStart <= sc[0]) { sc[0] = Math.max(0, sc[0] + delta); sc[1] = Math.max(sc[0], sc[1] + delta); }
+                else if (editStart <= sc[1]) { sc[1] = Math.max(sc[0], sc[1] + delta); }
+            }
+            OvlFindState.snapLen = ta.value.length;
+        }
+        ovlFindScheduleRecompute();
+    } catch (e) { console.error('[ovl] findOnEditorInput failed', e); }
+}
+// 由 ovlUpdateTabUI（打开文件 / 保存 / 脏标记变化都会走）调用：文本和上次重算时不一样就排一次重算。
+function ovlFindSyncIfStale() {
+    try {
+        if (!ovlFindIsOpen()) return;
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta) return;
+        if (ta.value === OvlFindState.textSnap && OvlFindState.fileRef === OvlState.currentFile) return;
+        ovlFindScheduleRecompute();
+    } catch (e) {}
 }
 
 function ovlBindFindBar() {
@@ -48903,9 +49063,12 @@ function ovlBindFindBar() {
             btn.addEventListener('click', function () {
                 OvlFindState[pair[1]] = !OvlFindState[pair[1]];
                 btn.classList.toggle('ovl-active', OvlFindState[pair[1]]);
+                if (pair[1] === 'inSelection') ovlFindCaptureScope(); // P212 EDITOR-5：开=捕获此刻选区，关=清空
                 ovlFindRecompute(false);
             });
         });
+        const taForFind = document.getElementById('ovlCodeArea');
+        if (taForFind) taForFind.addEventListener('input', ovlFindOnEditorInput);
         const prevBtn = document.getElementById('ovlFindPrevBtn');
         if (prevBtn) prevBtn.addEventListener('click', ovlFindPrev);
         const nextBtn = document.getElementById('ovlFindNextBtn');
@@ -49375,11 +49538,19 @@ async function ovlBuildCacheEnsureGitignore() {
 async function ovlBuildCacheSave(mainFile, pdfBuf, synctexBuf, extra) {
     try {
         if (!OvlState.dirHandle) return;
+        const stale = function () { return !!(extra && typeof extra.isStale === 'function' && extra.isStale()); };
+        if (stale()) return; // P212 EDITOR-6
         const key = ovlBuildCacheKey(mainFile);
         // 现读磁盘上 mainFile 的真实内容算哈希——不能信任内存里可能跟磁盘不同步的编辑器
         // 缓冲区（mainFile 未必是当前打开的文件，见 ovlBuildCacheMaybeRestore 同一处理由）。
         let sourceHash = null, sourceMtimeMs = null, sourceSize = null;
-        try {
+        // v2 Pass P212（EDITOR-9）：调用方给了"编译开始时"抓的主文档内容哈希就用它——保存时再读盘会
+        // 读到编译期间自动保存写入的新内容，把旧 PDF 标成"源文件未变"。抓取失败（srcCapture===null）
+        // 就放弃这次缓存，宁可不缓存也不写不可信的哈希。
+        if (extra && Object.prototype.hasOwnProperty.call(extra, 'srcCapture')) {
+            if (!extra.srcCapture) return;
+            sourceHash = extra.srcCapture.hash; sourceMtimeMs = extra.srcCapture.mtimeMs; sourceSize = extra.srcCapture.size;
+        } else try {
             const resolved = await ovlResolveHandleForPath(OvlState.dirHandle, mainFile);
             const f = await resolved.handle.getFile();
             const text = await f.text();
@@ -49389,10 +49560,12 @@ async function ovlBuildCacheSave(mainFile, pdfBuf, synctexBuf, extra) {
         } catch (e) { return; } // 读不到源文件就没法建立"内容没变"的判据，放弃这次缓存写入
         if (!sourceHash) return;
 
+        if (stale()) return;
         await ovlBuildCacheEnsureGitignore();
+        if (stale()) return;
         await ovlP2TWriteBinary(OVL_BUILD_CACHE_DIR + '/' + key + '.pdf', new Uint8Array(pdfBuf));
         let synctexCached = false;
-        if (synctexBuf) {
+        if (synctexBuf && !stale()) {
             try {
                 await ovlP2TWriteBinary(OVL_BUILD_CACHE_DIR + '/' + key + '.synctex.gz', new Uint8Array(synctexBuf));
                 synctexCached = true;
@@ -49408,7 +49581,11 @@ async function ovlBuildCacheSave(mainFile, pdfBuf, synctexBuf, extra) {
             synctexCached: synctexCached,
             at: new Date().toISOString()
         };
+        if (stale()) return;
         await ovlP2TWriteText(OVL_BUILD_CACHE_DIR + '/' + key + '.meta.json', JSON.stringify(meta));
+        // v2 Pass P212（EDITOR-12）：这个 key 现在确实有缓存了——清掉"问过、没有"的记忆，否则同一会话里
+        // 直显 PDF 来回切换后的恢复会被旧记忆挡住。
+        try { OvlBuildCacheNoCacheKeys.delete(key); } catch (e2) {}
     } catch (e) {
         console.warn('[ovl] build cache save failed', e);
     }
@@ -49531,7 +49708,27 @@ async function ovlBuildCacheMaybeRestore() {
     }
 }
 
+// v2 Pass P212（EDITOR-7）：同步重入闸门。原来的 `if (OvlState.compiling) return` 只在函数中段
+// （await 语法检查弹窗 / await 保存之后）才置 true，双击 Recompile、或自动编译与手动编译前后脚，
+// 两次调用都能穿过去，向同一项目发两个 /compile。闸门在入口同步置位，整次编译（含所有 await）
+// 结束才释放；自动编译入口也先看它。
+let OvlRecompileGuard = false;
 async function ovlDoRecompile(opts) {
+    if (OvlState.compiling || OvlRecompileGuard) return;
+    OvlRecompileGuard = true;
+    try { return await ovlDoRecompileInner(opts); }
+    finally { OvlRecompileGuard = false; }
+}
+// v2 Pass P212（FILEIO-9 编译侧）：等正在进行的保存结束（最多 maxMs），避免编译请求抢在写盘确认
+// 之前发出，让桥编出"少一次编辑"的旧版本。
+async function ovlWaitSaveIdle(maxMs) {
+    const t0 = Date.now();
+    while (OvlSaveInFlight && Date.now() - t0 < maxMs) {
+        await new Promise(function (r) { setTimeout(r, 50); });
+    }
+    return !OvlSaveInFlight;
+}
+async function ovlDoRecompileInner(opts) {
     opts = opts || {};
     if (OvlState.compiling) return;
     // v2 Pass P96：direct 模式（PDF 阅读模式，文件树直显源 PDF，未编译）下明确禁止编译——
@@ -49573,14 +49770,41 @@ async function ovlDoRecompile(opts) {
     // 主文档），只是它自己现在存的也是完整相对路径了（见 setmain 分支）。
     const mainFile = OvlState.mainDocFile || (OvlState.currentFile && OvlState.currentFile.relPath) || 'main.tex';
 
+    // v2 Pass P212（EDITOR-6）：编译开始时记下项目 epoch / 目录句柄 / 主文档。编译期间用户切了
+    // 项目（或换了主文档），这次的结果、PDF 展示和构建缓存写入都属于"别的项目"，一律丢弃。
+    // （"file" 取主文档 mainDocFile：编译期间在编辑器里切换打开的文件是正常操作，不算换项目。）
+    const __ovlEpoch0 = __ovlProjectEpoch;
+    const __ovlDir0 = OvlState.dirHandle;
+    const __ovlMain0 = OvlState.mainDocFile || null;
+    const ovlCompileStale = function () {
+        return __ovlProjectEpoch !== __ovlEpoch0 || OvlState.dirHandle !== __ovlDir0 || (OvlState.mainDocFile || null) !== __ovlMain0;
+    };
+
     // v2 Pass P14：桥接服务是直接读磁盘上的文件去编译的，请求体里压根没带编辑器内容
     // （见下面 fetch body，只有 projectDir/mainFile）——编辑框里的改动如果还没落盘，编译出来
     // 就是没改之前的旧版本。这里补一道保险：真有未落盘的改动就先存一次再编译，Autocompile
     // （敲字防抖后自动触发这个函数）和手动点 Recompile 都走这一条，不用各自记一遍。
+    // v2 Pass P212（FILEIO-9 编译侧）：先等进行中的保存落定（≤30s），再看是否仍有未落盘改动，有就
+    // 再存一次——编译只在写盘确认之后才发。ovlSaveCurrentFile 在已有保存进行时会静默 return，
+    // 以前编译就此带着"上一版磁盘内容"往下走。
+    await ovlWaitSaveIdle(30000);
     if (OvlState.dirty && OvlState.currentFile && OvlState.currentFile.handle && !OvlState.usingWebkitFallback) {
         if (ovlAutoSaveTimer) { clearTimeout(ovlAutoSaveTimer); ovlAutoSaveTimer = null; }
         await ovlSaveCurrentFile({ silent: true });
+        await ovlWaitSaveIdle(30000);
     }
+    // v2 Pass P212（EDITOR-9）：构建缓存的"源文件哈希"必须是编译开始时磁盘上主文档的内容，不能等
+    // 编译完才去读（编译期间自动保存可能已经写了新内容，缓存会把旧 PDF 标成"源文件未变"）。
+    let __ovlSrcCapture = null;
+    try {
+        if (OvlState.dirHandle) {
+            const __cr = await ovlResolveHandleForPath(OvlState.dirHandle, mainFile);
+            const __cf = await __cr.handle.getFile();
+            const __ct = await __cf.text();
+            const __ch = ovlVisualHashSrc(__ct);
+            if (__ch) __ovlSrcCapture = { hash: __ch, mtimeMs: __cf.lastModified, size: __cf.size };
+        }
+    } catch (e) { __ovlSrcCapture = null; }
 
     // v2 Pass P158（§2.2）：必须在发出编译请求前拍这个哈希快照，不能等 resp.json() 返回
     // 之后再拍——编译是异步的（桥端最长可跑到 COMPILE_TIMEOUT_MAX_MS），这期间用户完全
@@ -49592,7 +49816,10 @@ async function ovlDoRecompile(opts) {
     const __ovlXrefPreCompileHash = __ovlXrefTa ? ovlVisualHashSrc(__ovlXrefTa.value) : null;
 
     OvlState.compiling = true;
-    if (OvlState.pdfObjectUrl) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} OvlState.pdfObjectUrl = null; }
+    // v2 Pass P212（EDITOR-10）：编译开始不再撕掉上一份"好"PDF——保留它（连同页码），拿到新 PDF 后才
+    // 替换；编译失败 / 取回失败就继续显示它。只有 direct 模式的 blob（不是编译产物）仍按原样清掉。
+    const __ovlPrevView = (OvlState.pdfObjectUrl && OvlState.pdfSourceMode !== 'direct') ? OvlState.pdfView : null;
+    if (OvlState.pdfObjectUrl && !__ovlPrevView) { try { URL.revokeObjectURL(OvlState.pdfObjectUrl); } catch (e) {} OvlState.pdfObjectUrl = null; }
     // v2 Pass P72：真的走编译了，无条件退出直显模式（编译永远是权威动作，见
     // spec_viewmodes.md §5 风险清单 #1）——不管刚才是不是在直显一份文件树点开的 PDF。
     // v2 Pass P96 注：本函数顶部现在会在 pdfSourceMode==='direct' 时直接拒绝执行（见上方
@@ -49623,6 +49850,7 @@ async function ovlDoRecompile(opts) {
         data = await resp.json();
     } catch (e) {
         OvlState.compiling = false;
+        if (ovlCompileStale()) { ovlUpdatePdfToolbarUI(); return; }
         OvlState.bridgeOnline = false;
         ovlSetPdfStatus('连不上桥接服务 —— 见 tools/latex-bridge/README.md', true);
         ovlUpdatePdfToolbarUI();
@@ -49631,6 +49859,7 @@ async function ovlDoRecompile(opts) {
     }
 
     OvlState.compiling = false;
+    if (ovlCompileStale()) { ovlUpdatePdfToolbarUI(); return; } // P212 EDITOR-6：编译期间换了项目，结果不属于现在的项目
     OvlState.bridgeOnline = true;
     OvlState.lastCompile = data;
     // v2 Pass P158（§2.2/§6.2）：响应落地时把发编译请求前拍的哈希挂上去，供 ovlXrefBuild 做
@@ -49679,16 +49908,30 @@ async function ovlDoRecompile(opts) {
             data.xrefAux = { parsedOk: false };
         }
     }
-    // M4：每次新编译，翻页/缩放状态重置——旧 PDF 的页码对新 PDF 没有意义。
+    // v2 Pass P212（EDITOR-6）：上面的 aux 拉取是 await，期间可能换了项目——丢弃，不碰任何展示状态。
+    if (ovlCompileStale()) {
+        if (OvlState.lastCompile === data) OvlState.lastCompile = null;
+        ovlUpdatePdfToolbarUI();
+        return;
+    }
+    // M4：每次新编译，缩放状态重置到默认。
     // v2 Pass P35：缩放模式的默认值走 ovlPdfResolveDefaultZoomMode()——用户没存过偏好时是
     // 'fitwidth'，存过（OvlSettings.pdfDefaultZoomMode，见 ovlPdfSetZoomMode 等写入点）就用
     // 存的那个，不强制覆盖成 fit-width。
-    OvlState.pdfView = { page: 1, totalPages: 1, zoomMode: ovlPdfResolveDefaultZoomMode(), zoomPct: 100 };
-
+    // v2 Pass P212（EDITOR-10）：pdfView 改到"成功拿到新 PDF 之后"才换，并保留当前页码；失败不动旧视图。
+    let __ovlPdfFetchErr = null;
     if (data && data.ok && data.pdfExists) {
         try {
             const pdfResp = await ovlBridgeFetch(ovlBridgeUrl('/output/' + data.id + '/output.pdf'));
+            // v2 Pass P212（EDITOR-8）：401/404 等是作为普通响应返回的——不查 ok 就会把错误页的字节
+            // 当 PDF 展示、还写进 .ovl-cache，之后每次恢复都是坏 PDF。
+            if (!pdfResp.ok) throw new Error('HTTP ' + pdfResp.status);
             const buf = await pdfResp.arrayBuffer();
+            if (ovlCompileStale()) {
+                if (OvlState.lastCompile === data) OvlState.lastCompile = null;
+                ovlUpdatePdfToolbarUI();
+                return;
+            }
             // v2 Pass P80 W2（viewmodes-synctex confirmed high）：这两次 await（POST /compile +
             // 这次 GET output.pdf）之间用户完全可能点开文件树里的另一个 PDF——ovlOpenPdfDirect
             // 会新建一份 blob URL 赋给 OvlState.pdfObjectUrl。下面这行原来是裸赋值，没有配套
@@ -49700,9 +49943,11 @@ async function ovlDoRecompile(opts) {
             // 桥没给（比如老版本桥/draft 单趟没走到这一行）才退化到明文对象扫描——
             // ⚠️ TeX Live 2020+ 默认压缩对象流，扫描法在这种 PDF 上会失败（见函数注释），
             // 只当兜底，不当主路径。
-            OvlState.pdfView.totalPages = (typeof data.pageCount === 'number' && data.pageCount > 0)
+            const __ovlTotalPages = (typeof data.pageCount === 'number' && data.pageCount > 0)
                 ? data.pageCount
                 : ovlEstimatePdfPageCount(buf);
+            const __ovlKeepPage = (__ovlPrevView && __ovlPrevView.page > 0) ? __ovlPrevView.page : 1;
+            OvlState.pdfView = { page: Math.max(1, Math.min(__ovlKeepPage, __ovlTotalPages || 1)), totalPages: __ovlTotalPages, zoomMode: ovlPdfResolveDefaultZoomMode(), zoomPct: 100 };
             // v2 Pass P107：编译成功，异步把这份 PDF（+ 若有 synctex.gz）落一份持久缓存到
             // .ovl-cache/，供下次刷新/切回这个 tex 时直接恢复显示（见 ovlBuildCacheSave 头部
             // 注释）。不 await——缓存写入是磁盘 IO，不该拖慢"编译成功，用户马上要看到 PDF"
@@ -49716,20 +49961,27 @@ async function ovlDoRecompile(opts) {
                         if (stResp.ok) synctexBuf = await stResp.arrayBuffer();
                     } catch (e) { /* 没有 synctex 字节就存不带 synctex 的缓存，不算错误 */ }
                 }
+                if (ovlCompileStale()) return; // P212 EDITOR-6：项目已换，不往新项目的 .ovl-cache 写旧 PDF
                 if (typeof ovlBuildCacheSave === 'function') {
-                    await ovlBuildCacheSave(mainFile, buf, synctexBuf, { pageCount: OvlState.pdfView.totalPages });
+                    await ovlBuildCacheSave(mainFile, buf, synctexBuf, { pageCount: OvlState.pdfView.totalPages, srcCapture: __ovlSrcCapture, isStale: ovlCompileStale });
                 }
             })().catch(function (e) { console.warn('[ovl] build cache pipeline failed', e); });
         } catch (e) {
             console.error('[ovl] fetch compiled pdf failed', e);
+            __ovlPdfFetchErr = (e && e.message) ? e.message : String(e);
         }
-        const kb = Math.round((data.pdfSize || 0) / 1024);
-        const secs = ((data.durationMs || 0) / 1000).toFixed(1);
-        const compilerLabel = (data.mode === 'draft' ? (data.engine + ' 单趟') : 'latexmk');
-        const exitNote = (data.exitCode !== 0 && data.exitCode !== null)
-            ? '（' + compilerLabel + ' 退出码 ' + data.exitCode + '，但 PDF 已产出 —— 按 §1.5 判定为成功）'
-            : '';
-        ovlSetPdfStatus('编译成功 · ' + kb + ' KB · ' + secs + 's' + exitNote, false);
+        if (__ovlPdfFetchErr) {
+            ovlSetPdfStatus('编译已完成，但取回 PDF 失败（' + __ovlPdfFetchErr + '）—— '
+                + (OvlState.pdfObjectUrl ? '仍显示上一次的预览' : '暂无可显示的预览'), true);
+        } else {
+            const kb = Math.round((data.pdfSize || 0) / 1024);
+            const secs = ((data.durationMs || 0) / 1000).toFixed(1);
+            const compilerLabel = (data.mode === 'draft' ? (data.engine + ' 单趟') : 'latexmk');
+            const exitNote = (data.exitCode !== 0 && data.exitCode !== null)
+                ? '（' + compilerLabel + ' 退出码 ' + data.exitCode + '，但 PDF 已产出 —— 按 §1.5 判定为成功）'
+                : '';
+            ovlSetPdfStatus('编译成功 · ' + kb + ' KB · ' + secs + 's' + exitNote, false);
+        }
     } else {
         const reason = (data && data.error) ? data.error : '编译未产出 PDF，点右上角查看日志确认原因。';
         ovlSetPdfStatus('编译失败：' + reason, true);
@@ -57782,7 +58034,7 @@ function ovlScheduleAutoCompile() {
     if (!OvlCompileSettings.autoCompile) return;
     if (ovlAutoCompileTimer) clearTimeout(ovlAutoCompileTimer);
     ovlAutoCompileTimer = setTimeout(function () {
-        if (OvlState.bridgeOnline === true && !OvlState.compiling) {
+        if (OvlState.bridgeOnline === true && !OvlState.compiling && !OvlRecompileGuard) {
             ovlDoRecompile({ skipSyntaxCheck: false }).catch(function (e) { console.error('[ovl] auto compile failed', e); });
         }
     }, 2500);
@@ -58534,7 +58786,12 @@ function ovlBindSettingsModal() {
         else { ovlSaveSettings(); ovlApplySettings(); }
     });
     document.addEventListener('keydown', function (e) {
-        if (e.key === 'Escape' && !overlay.hidden) ovlCloseSettings();
+        if (e.key === 'Escape' && !overlay.hidden) {
+            // v2 Pass P212（EDITOR-12）：设置页上面还压着确认/输入弹窗时，Esc 只该关弹窗。
+            const modalOv = document.getElementById('ovlModalOverlay');
+            if (e.defaultPrevented || (modalOv && !modalOv.hidden)) return;
+            ovlCloseSettings();
+        }
     });
 }
 
