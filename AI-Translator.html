@@ -5018,8 +5018,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.42.06';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-10-02';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.42.07';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-10-03';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -38149,6 +38149,47 @@ function ovlVisualTransCacheProjectId() {
 }
 function ovlVisualTransCacheBucketKey(projectId) { return OVL_VISUAL_TRANS_CACHE_V2_PREFIX + projectId; }
 
+// v2 Pass P215（VISUALPERF-5）：队列 worker 每块落地一次 Put = 整桶 stringify x2 + 整桶 setItem + 索引读写 +
+// Maintain（8 次 getItem），400 块 x ~250K 字符桶实测 jump 上每次 ~3.6ms、255 次合计 ~0.9s+ 纯主线程。
+// 回写缓存：worker 的 Put 只改内存里的桶并记脏，每 OVL_P215_WB_FLUSH_MS 至多落盘一次（不是每次重置的去抖，
+// 持续落地也不会饿死），队列 finally / 切项目 / 作用域开始 / pagehide / visibilitychange(hidden) 立即落盘。
+// 内存桶是权威：BucketLoad 先看这里，所以 Get/Delete/PurgeStale 看到的永远是含未落盘条目的完整桶；
+// 任何整桶 SaveBucket 成功后顺带清掉这个桶的脏标记（写穿）。
+const OVL_P215_WB_FLUSH_MS = 1500;
+const OvlP215WB = { buckets: new Map(), dirty: new Set(), timer: null };
+function ovlVisualTransCacheWbMark(projectId, map) {
+    const wb = OvlP215WB;
+    if (wb.dirty.size && !wb.dirty.has(projectId)) ovlVisualTransCacheWbFlush(); // 切了项目：先把上一个项目的落盘
+    wb.buckets.set(projectId, map);
+    wb.dirty.add(projectId);
+    if (wb.timer === null && typeof setTimeout === 'function') wb.timer = setTimeout(ovlVisualTransCacheWbFlush, OVL_P215_WB_FLUSH_MS);
+}
+function ovlVisualTransCacheWbFlush() {
+    const wb = OvlP215WB;
+    if (wb.timer !== null) { try { clearTimeout(wb.timer); } catch (e) {} wb.timer = null; }
+    if (!wb.dirty.size) return;
+    const pids = Array.from(wb.dirty);
+    wb.dirty.clear();
+    pids.forEach(function (pid) {
+        const map = wb.buckets.get(pid);
+        wb.buckets.delete(pid);
+        if (!map) return;
+        try {
+            ovlVisualTransCacheEvictToBudget(map, OVL_VISUAL_TRANS_CACHE_PROJECT_BUDGET_CHARS);
+            if (ovlVisualTransCacheSaveBucketCore(pid, map)) {
+                ovlVisualTransCacheIndexTouch(pid);
+                ovlVisualTransCacheMaintain(pid);
+            }
+        } catch (e) {}
+    });
+}
+try {
+    if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('pagehide', ovlVisualTransCacheWbFlush);
+    if (typeof document !== 'undefined' && document.addEventListener) {
+        document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'hidden') ovlVisualTransCacheWbFlush(); });
+    }
+} catch (eP215) {}
+
 function ovlVisualTransCacheIndexLoad() {
     try {
         const raw = localStorage.getItem(OVL_VISUAL_TRANS_CACHE_INDEX_KEY);
@@ -38178,6 +38219,7 @@ function ovlVisualTransCacheOldestProject(exceptId) {
 }
 function ovlVisualTransCacheDropProject(projectId) {
     if (OvlVisualTransCacheScope) { OvlVisualTransCacheScope.buckets.delete(projectId); OvlVisualTransCacheScope.dirty.delete(projectId); }
+    OvlP215WB.buckets.delete(projectId); OvlP215WB.dirty.delete(projectId); // v2 Pass P215（VISUALPERF-5）
     try {
         localStorage.removeItem(ovlVisualTransCacheBucketKey(projectId));
         const idx = ovlVisualTransCacheIndexLoad();
@@ -38195,6 +38237,7 @@ function ovlVisualTransCacheDropProject(projectId) {
 let OvlVisualTransCacheScope = null; // { depth, buckets: Map, dirty: Set, card, hint, terms }
 function ovlVisualTransCacheScopeBegin() {
     if (OvlVisualTransCacheScope) { OvlVisualTransCacheScope.depth++; return; }
+    if (OvlP215WB.dirty.size) ovlVisualTransCacheWbFlush(); // v2 Pass P215（VISUALPERF-5）：作用域边界 = 落盘点
     OvlVisualTransCacheScope = { depth: 1, buckets: new Map(), dirty: new Set(), puts: new Set(), legacy: undefined, card: undefined, hint: undefined, terms: undefined };
 }
 function ovlVisualTransCacheScopeEnd() {
@@ -38231,6 +38274,9 @@ function ovlVisualTransCacheScopedHint() {
 function ovlVisualTransCacheBucketLoad(projectId) {
     const sc = OvlVisualTransCacheScope;
     if (sc && sc.buckets.has(projectId)) return sc.buckets.get(projectId);
+    const wbMap = OvlP215WB.buckets.get(projectId); // v2 Pass P215（VISUALPERF-5）：含未落盘条目的权威内存桶
+    if (wbMap) { if (sc) sc.buckets.set(projectId, wbMap); return wbMap; }
+    if (!sc && OvlP215WB.dirty.size) ovlVisualTransCacheWbFlush(); // 读了别的项目 = 项目切换，先把脏桶落盘
     const loaded = ovlVisualTransCacheBucketLoadRaw(projectId);
     if (sc) sc.buckets.set(projectId, loaded);
     return loaded;
@@ -38260,6 +38306,12 @@ function ovlVisualTransCacheEvictToBudget(map, budgetChars) {
 // 还不够再砍当前项目桶自己最老的一半，两轮都不行就放弃并提示用户——绝不静默假装存成功。
 let OvlP215QuotaToastAt = 0;
 function ovlVisualTransCacheSaveBucket(projectId, map) {
+    const ok = ovlVisualTransCacheSaveBucketCore(projectId, map);
+    // v2 Pass P215（VISUALPERF-5）：整桶写穿成功 = 内存里这个桶已经全部落盘（BucketLoad 保证传进来的就是 WB 里同一个对象）。
+    if (ok && OvlP215WB.dirty.has(projectId) && OvlP215WB.buckets.get(projectId) === map) { OvlP215WB.dirty.delete(projectId); OvlP215WB.buckets.delete(projectId); }
+    return ok;
+}
+function ovlVisualTransCacheSaveBucketCore(projectId, map) {
     if (OvlVisualTransCacheScope) OvlVisualTransCacheScope.buckets.set(projectId, map); // P209：后续作用域内 Load 看到的就是这份
     const bucketKey = ovlVisualTransCacheBucketKey(projectId);
     let payload;
@@ -38583,7 +38635,7 @@ function ovlVisualTransCacheGet(text, config, projectIdOverride) {
 // 前者是 JSON.parse 出来的对象天生没有这个键，后者根本不调用 Put。只有上面 GetMeta 显式确认
 // "刚刚过了闸"之后才会显式传 OVL_VISUAL_CJK_GATE_VERSION 走"提升旧版兜底缓存"这条分支，
 // 跟不传时的默认值相同，是同一个值、不是两套逻辑。
-function ovlVisualTransCachePut(text, config, tgt, projectIdOverride, skipped, forced, partial, partialReason, ladderLevel, gateVersion, keyOverride) {
+function ovlVisualTransCachePut(text, config, tgt, projectIdOverride, skipped, forced, partial, partialReason, ladderLevel, gateVersion, keyOverride, deferWrite) {
     try {
         const projectId = projectIdOverride || ovlVisualTransCacheProjectId();
         const key = keyOverride || ovlVisualTransCacheKey(text, config); // v2 Pass P215（VISUALPERF-7）：keyOverride = 请求时算好的 key
@@ -38595,6 +38647,7 @@ function ovlVisualTransCachePut(text, config, tgt, projectIdOverride, skipped, f
             OvlVisualTransCacheScope.puts.add(projectId);
             return;
         }
+        if (deferWrite) { ovlVisualTransCacheWbMark(projectId, map); return; } // v2 Pass P215（VISUALPERF-5）：队列 worker 回写，见 OvlP215WB 头部注释
         ovlVisualTransCacheEvictToBudget(map, OVL_VISUAL_TRANS_CACHE_PROJECT_BUDGET_CHARS);
         if (ovlVisualTransCacheSaveBucket(projectId, map)) {
             ovlVisualTransCacheIndexTouch(projectId);
@@ -42538,7 +42591,7 @@ async function ovlVisualLangRunQueue() {
                     if (document.body.contains(el)) el.setAttribute('data-ovl-trans-pending', '1');
                     return;
                 }
-                try { ovlVisualTransCachePut(text, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, p215ReqKey); } catch (e) {} // v2 Pass P113 返修（问题2）：跟着译文一起落盘 skipped 标记；partial 见 P122c BV2-2；ladderLevel 见 P128b N-4
+                try { ovlVisualTransCachePut(text, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, p215ReqKey, true); } catch (e) {} // v2 Pass P113 返修（问题2）：跟着译文一起落盘 skipped 标记；partial 见 P122c BV2-2；ladderLevel 见 P128b N-4
                 if (typeof ovlVisualFailLogDelete === 'function') ovlVisualFailLogDelete(text, cfg); // v2 Pass P128（C1，清除点）：这一块这次成功了，清掉旧的失败记录
                 if (document.body.contains(el)) {
                     ovlVisualApplyTranslatedHtml(el, tgt); // v2 Pass P168：异步单块补丁路径也要复算编号，见 ovlVisualRenderChunkWithEqNum 头部注释；v2 Pass P170：compare 模式只替换中文侧，见 ovlVisualApplyTranslatedHtml 头部注释
@@ -42641,6 +42694,7 @@ async function ovlVisualLangRunQueue() {
         // 再点一下起第二组 worker = 6 并发、IdleAudit 在运行中途触发）。只有"仍是当前批次"或"
         // 没有新批次在跑"才动共享状态。
         const p215Current = (mySeq === OvlVisualLangState.seq) || !OvlVisualLangState.running;
+        try { ovlVisualTransCacheWbFlush(); } catch (eW) {} // v2 Pass P215（VISUALPERF-5）：这一批收工（含取消/换项目），回写缓存立刻落盘
         if (p215Current) {
             OvlVisualLangState.running = false;
             // v2 Pass P208：运行结束——清掉限速尾随计时器并立刻补一次 relayout，最终状态必须马上对齐。
