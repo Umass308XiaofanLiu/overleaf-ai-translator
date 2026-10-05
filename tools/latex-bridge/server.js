@@ -50,7 +50,7 @@ try { WebSocket = require('ws'); } catch (e) { /* 见文件末尾 wss 初始化�
 // v2 Pass P45：/health 里带的能力/版本自报——见该端点注释。每次给桥新增一个"前端需要能
 // 判断有没有"的能力（新端点、既有端点的行为变化），就在 BRIDGE_CAPABILITIES 里加一个字符串，
 // 版本号也提一位。已经上线的能力不会被撤销，这个数组只做加法。
-const BRIDGE_API_VERSION = 59;
+const BRIDGE_API_VERSION = 60;
 const BRIDGE_CAPABILITIES = [
     'overleaf-clone',          // POST /overleaf/clone
     'overleaf-pull-strategy',  // POST /overleaf/pull 认识 body.strategy（abort/stash/discard）
@@ -89,6 +89,9 @@ const BRIDGE_CAPABILITIES = [
                                 // /health 的 fsRootAllowlist.enabled 播报是否启用（不回显具体
                                 // 根路径——/health 在 TOKEN_EXEMPT_PATHS 里免令牌，不该顺带
                                 // 泄露服务器磁盘上的敏感目录结构）。
+    ,'config-sync'             // v2 Pass P222：GET /sync/snapshot、GET /sync/changes、POST /sync/put，
+                                // 把术语库/论文卡/最近项目/设置等 localStorage 配置存到桥自己的
+                                // data/config-sync.json，多台电脑打开同一个桥时共享；WS 广播 sync-changed。
 ];
 
 // v2 Pass P49：监听地址可配（LATEX_BRIDGE_HOST），默认仍是 127.0.0.1——不传就跟以前
@@ -3421,6 +3424,118 @@ const ORIGIN_GATED_POST_PATHS = new Set([
     '/synctex/forward', '/synctex/edit', '/synctex/rehydrate'
 ]);
 
+
+// ---------------------------------------------------------------------------
+// v2 Pass P222：配置同步存储（多台电脑共享同一份"在线版"配置）。
+//
+// 存的是前端 localStorage 的原始字符串，键名走服务器端白名单（精确名 + 文档化的一个族），
+// 其余一律 400。数据文件：<DATA_DIR>/config-sync.json，DATA_DIR 默认 <serve 根>/data
+// （deploy-jump.sh 只覆盖它清单里的 8 个文件，不碰兄弟目录 data/），可用 LATEX_BRIDGE_DATA_DIR 覆盖。
+// 没有任何路由会把 data/ 下的文件当静态文件吐出去（路由全是写死的），GET /data/... 恒为 404。
+// 写盘：tmp + fsync + rename（原子）；覆盖前把旧文件复制成 config-sync.prev.json；每天第一次写入
+// 前把"当天开始时的状态"存进 snapshots/YYYYMMDD.json，只留最近 14 份。加载失败（缺失/损坏）依次
+// 退回 .prev、空仓，并打日志。
+// ---------------------------------------------------------------------------
+const SYNC_DATA_DIR = process.env.LATEX_BRIDGE_DATA_DIR
+    ? path.resolve(process.env.LATEX_BRIDGE_DATA_DIR)
+    : path.join(__dirname, '..', '..', 'data');
+const SYNC_FILE = path.join(SYNC_DATA_DIR, 'config-sync.json');
+const SYNC_PREV_FILE = path.join(SYNC_DATA_DIR, 'config-sync.prev.json');
+const SYNC_SNAP_DIR = path.join(SYNC_DATA_DIR, 'snapshots');
+const SYNC_KEY_MAX_BYTES = 1024 * 1024;
+const SYNC_STORE_MAX_BYTES = 8 * 1024 * 1024;
+const SYNC_SNAP_KEEP = 14;
+const SYNC_KEYS_EXACT = new Set([
+    'ovl.termDbByPathRemote', 'ovl.termDbGlobal', 'ovl.termDbGlossaryMigratedRemote',
+    'ovl.paperCardByPathRemote', 'ovl.projectDomainHintByPathRemote', 'ovl.projectGlossaryByPathRemote',
+    'ovl.overleafAddrByPathRemote', 'ovl.pdf2texMapRemote', 'ovlProjectHistoryRemote',
+    'chatArchive', 'ovl.settings', 'ovl.compileSettings',
+    'apiProvider', 'selectedModel', 'modelVisibility', 'reasoningByModel', 'showDatedSnapshots',
+    'ovl.builderModel', 'chatParams', 'chatSurfaceDefaults', 'customPrompts', 'synonymDefaultMode',
+    'historyLimit', 'autoSaveInterval', 'localBaseUrl', 'qwenBaseUrl', 'claudeProxyUrl',
+    'geminiApiKey', 'openaiApiKey', 'claudeApiKey', 'qwenApiKey'
+]);
+const SYNC_KEY_FAMILY_RE = /^qwen[A-Za-z0-9_]{0,40}ByModel$/;
+function syncKeyAllowed(k) {
+    return typeof k === 'string' && (SYNC_KEYS_EXACT.has(k) || SYNC_KEY_FAMILY_RE.test(k));
+}
+
+let syncStore = { version: 0, keys: {} };
+let syncWss = null; // 由文件末尾 WebSocket.Server 初始化后赋值；没装 ws 时保持 null，广播静默跳过
+
+function syncValidShape(o) {
+    return !!(o && typeof o === 'object' && o.keys && typeof o.keys === 'object' && !Array.isArray(o.keys)
+        && Number.isFinite(o.version));
+}
+function syncLoadFile(f) {
+    const raw = fs.readFileSync(f, 'utf8');
+    const o = JSON.parse(raw);
+    if (!syncValidShape(o)) throw new Error('bad shape');
+    return o;
+}
+function syncLoadStore() {
+    let st = null;
+    const cands = [[SYNC_FILE, 'config-sync.json'], [SYNC_PREV_FILE, 'config-sync.prev.json']];
+    for (let i = 0; i < cands.length; i++) {
+        const f = cands[i][0], label = cands[i][1];
+        if (!fs.existsSync(f)) continue;
+        try {
+            st = syncLoadFile(f);
+            if (i > 0) console.warn('[latex-bridge] config-sync.json 缺失/损坏，已从 ' + label + ' 恢复');
+            break;
+        } catch (e) { console.warn('[latex-bridge] 读取 ' + label + ' 失败：' + (e && e.message)); }
+    }
+    if (!st) {
+        st = { version: 0, keys: {} };
+        if (fs.existsSync(SYNC_FILE)) console.warn('[latex-bridge] config-sync 无可用备份，按空仓启动');
+    }
+    let maxV = st.version;
+    for (const k of Object.keys(st.keys)) {
+        const e = st.keys[k];
+        if (!syncKeyAllowed(k) || !e || typeof e !== 'object' || !Number.isFinite(e.v)) { delete st.keys[k]; continue; }
+        if (e.v > maxV) maxV = e.v;
+    }
+    st.version = maxV;
+    syncStore = st;
+}
+function syncWriteAtomic(file, text) {
+    const tmp = file + '.tmp-' + process.pid;
+    const fd = fs.openSync(tmp, 'w');
+    try { fs.writeSync(fd, text, 0, 'utf8'); fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
+    fs.renameSync(tmp, file);
+}
+function syncDayStamp() {
+    const d = new Date();
+    const p2 = (n) => String(n).padStart(2, '0');
+    return d.getFullYear() + p2(d.getMonth() + 1) + p2(d.getDate());
+}
+function syncPersist() {
+    fs.mkdirSync(SYNC_DATA_DIR, { recursive: true });
+    if (fs.existsSync(SYNC_FILE)) {
+        try {
+            fs.mkdirSync(SYNC_SNAP_DIR, { recursive: true });
+            const snap = path.join(SYNC_SNAP_DIR, syncDayStamp() + '.json');
+            if (!fs.existsSync(snap)) fs.copyFileSync(SYNC_FILE, snap);
+            const names = fs.readdirSync(SYNC_SNAP_DIR).filter((n) => /^\d{8}\.json$/.test(n)).sort();
+            while (names.length > SYNC_SNAP_KEEP) { try { fs.unlinkSync(path.join(SYNC_SNAP_DIR, names.shift())); } catch (e) { break; } }
+        } catch (e) { console.warn('[latex-bridge] config-sync 日快照失败：' + (e && e.message)); }
+        try { fs.copyFileSync(SYNC_FILE, SYNC_PREV_FILE); } catch (e) { console.warn('[latex-bridge] config-sync.prev 备份失败：' + (e && e.message)); }
+    }
+    syncWriteAtomic(SYNC_FILE, JSON.stringify(syncStore));
+}
+function syncStoreBytes(st) {
+    let n = 0;
+    for (const k of Object.keys(st.keys)) { const v = st.keys[k].value; if (typeof v === 'string') n += Buffer.byteLength(v, 'utf8'); }
+    return n;
+}
+function syncBroadcast(msg) {
+    if (!syncWss) return;
+    const text = JSON.stringify(msg);
+    syncWss.clients.forEach(function (c) { try { if (c.readyState === 1) c.send(text); } catch (e) {} });
+}
+function syncPick(entry) { return { v: entry.v, updatedAt: entry.updatedAt, by: entry.by, value: entry.value }; }
+try { syncLoadStore(); } catch (e) { console.warn('[latex-bridge] config-sync 初始化失败，按空仓运行：' + (e && e.message)); }
+
 // ---------------------------------------------------------------------------
 // HTTP 路由
 // ---------------------------------------------------------------------------
@@ -4099,6 +4214,74 @@ const server = http.createServer(async (req, res) => {
             return;
         }
 
+        // v2 Pass P222：配置同步。三条都过上面统一的令牌闸门（不在 TOKEN_EXEMPT_PATHS）；再过
+        // ovlOriginAllowed（本地模式令牌恒放行，GET 也挡一下跨站读取）。
+        if (pathname === '/sync/snapshot' || pathname === '/sync/changes' || pathname === '/sync/put') {
+            if (!ovlOriginAllowed(req)) {
+                sendJson(res, 403, { ok: false, error: '拒绝来自外部网页的同步请求。' });
+                return;
+            }
+            if (req.method === 'GET' && pathname === '/sync/snapshot') {
+                const keys = {};
+                for (const k of Object.keys(syncStore.keys)) keys[k] = syncPick(syncStore.keys[k]);
+                sendJson(res, 200, { ok: true, version: syncStore.version, keys });
+                return;
+            }
+            if (req.method === 'GET' && pathname === '/sync/changes') {
+                const since = Number(u.searchParams.get('since'));
+                if (!Number.isFinite(since) || since < 0) { sendJson(res, 400, { ok: false, error: 'since 必须是非负整数' }); return; }
+                const keys = {};
+                for (const k of Object.keys(syncStore.keys)) { if (syncStore.keys[k].v > since) keys[k] = syncPick(syncStore.keys[k]); }
+                sendJson(res, 200, { ok: true, version: syncStore.version, keys });
+                return;
+            }
+            if (req.method === 'POST' && pathname === '/sync/put') {
+                let raw;
+                try { raw = await readBody(req); } catch (e) { sendJson(res, 413, { ok: false, error: '请求体过大' }); return; }
+                let body;
+                try { body = JSON.parse(raw); } catch (e) { sendJson(res, 400, { ok: false, error: '请求体不是合法 JSON' }); return; }
+                if (!body || typeof body !== 'object' || !Array.isArray(body.changes)) { sendJson(res, 400, { ok: false, error: '缺少 changes 数组' }); return; }
+                const clientId = (typeof body.clientId === 'string' ? body.clientId : '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 64);
+                // 先整体校验再落任何一条：白名单违规 400，超限 413，都不产生部分写入。
+                for (const c of body.changes) {
+                    if (!c || typeof c !== 'object' || !syncKeyAllowed(c.key)) { sendJson(res, 400, { ok: false, error: '不允许同步的键：' + (c && typeof c.key === 'string' ? c.key.slice(0, 80) : '(无效)') }); return; }
+                    if (!Number.isInteger(c.baseV) || c.baseV < 0) { sendJson(res, 400, { ok: false, error: 'baseV 必须是非负整数：' + c.key }); return; }
+                    if (c.value !== null && typeof c.value !== 'string') { sendJson(res, 400, { ok: false, error: 'value 必须是字符串或 null：' + c.key }); return; }
+                    if (typeof c.value === 'string' && Buffer.byteLength(c.value, 'utf8') > SYNC_KEY_MAX_BYTES) { sendJson(res, 413, { ok: false, error: '单个键超过 1MB：' + c.key }); return; }
+                }
+                // 在副本上演算，超出总上限就整体 413 且不改动真实仓。
+                const trial = { version: syncStore.version, keys: Object.assign({}, syncStore.keys) };
+                const results = [];
+                const accepted = [];
+                const now = Date.now();
+                for (const c of body.changes) {
+                    const cur = trial.keys[c.key];
+                    const curV = cur ? cur.v : 0;
+                    const curVal = cur ? cur.value : null;
+                    if (cur && curVal === c.value) { results.push({ key: c.key, status: 'ok', v: curV }); continue; } // 内容相同：不涨版本
+                    if (c.baseV === curV) {
+                        if (!cur && c.value === null) { results.push({ key: c.key, status: 'ok', v: 0 }); continue; }
+                        trial.version += 1;
+                        trial.keys[c.key] = { v: trial.version, updatedAt: now, by: clientId, value: c.value };
+                        results.push({ key: c.key, status: 'ok', v: trial.version });
+                        accepted.push(c.key);
+                    } else {
+                        results.push({ key: c.key, status: 'conflict', v: curV, value: curVal });
+                    }
+                }
+                if (accepted.length) {
+                    if (syncStoreBytes(trial) > SYNC_STORE_MAX_BYTES) { sendJson(res, 413, { ok: false, error: '同步仓总量超过 8MB' }); return; }
+                    const prevStore = syncStore;
+                    syncStore = trial;
+                    try { syncPersist(); }
+                    catch (e) { syncStore = prevStore; sendJson(res, 500, { ok: false, error: '同步仓写盘失败：' + (e && e.message) }); return; }
+                    syncBroadcast({ type: 'sync-changed', version: syncStore.version, keys: accepted, by: clientId });
+                }
+                sendJson(res, 200, { ok: true, version: syncStore.version, results });
+                return;
+            }
+        }
+
         // v2 Pass P50：WebSocket 一次性短时票据——磁盘变更推送这条 WS 连接，浏览器原生 WebSocket
         // API 加不了自定义请求头，没法带令牌，REMOTE_MODE 下之前是完全没鉴权的（tailnet 上任何人
         // 连上去都能实时看到项目里哪些文件在变、路径是什么）。这个端点本身走上面统一的令牌闸门
@@ -4215,6 +4398,7 @@ function attachWatcher(ws, filePath) {
 
 if (WebSocket && WebSocket.Server) {
     const wss = new WebSocket.Server({ server: server });
+    syncWss = wss; // v2 Pass P222：sync-changed 广播复用这条 WS 服务器
     wss.on('connection', function (ws, req) {
         // v2 Pass P50：REMOTE_MODE 下握手时校验一次性票据（见上面 wsTickets 那段注释）——票据从
         // 连接 URL 的查询串里取，绝不是长期令牌本身。本地模式（REMOTE_MODE=false）完全不检查，

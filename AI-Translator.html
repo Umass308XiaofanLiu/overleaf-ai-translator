@@ -5018,7 +5018,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.44.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.45.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-05';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -33388,7 +33388,7 @@ document.addEventListener('DOMContentLoaded', function() {
 });
 
 // 加载所有保存的设置
-function loadSavedSettings() {
+function loadSavedSettings(opts) {
     try {
         // 加载 Gemini API Key
         const savedKey = localStorage.getItem('geminiApiKey');
@@ -33614,7 +33614,8 @@ function loadSavedSettings() {
         loadOnlineCatalog();
 
         // 只要有保存的本地地址，就自动尝试连接（获取模型列表）
-        if (savedLocalUrl) {
+        // v2 Pass P222：由配置同步重新装载时（opts.fromSync）不重复发起本地模型连接。
+        if (savedLocalUrl && !(opts && opts.fromSync)) {
             autoConnectLocal();
         }
     } catch (e) {
@@ -50643,6 +50644,8 @@ async function ovlBridgeCheckHealth() {
     const wasOnline = OvlState.bridgeOnline;
     OvlState.bridgeOnline = online;
     OvlState.bridgeCapabilities = online ? bridgeCapabilities : null;
+    // v2 Pass P222：在线版配置同步的启停/补推挂在探活之后（file:// 与回环页面在函数内立即返回，不碰任何东西）。
+    if (typeof ovlSyncOnHealth === 'function') ovlSyncOnHealth(online);
     // v2 Pass P154：桥离线时清掉陈旧的白名单快照，跟 bridgeCapabilities 同一条口径——
     // 不让"上次在线时探到的根列表"在桥离线/换了个不同配置的桥之后继续误导选择器。
     if (!online) OvlState.fsRootAllowlist = null;
@@ -57428,6 +57431,9 @@ function ovlBridgeOpenWs(absPath, ticket, gen) {
         try { msg = JSON.parse(ev.data); } catch (e) { return; }
         if (msg && msg.type === 'changed') {
             ovlBridgeHandleExternalChange(msg).catch(function (e) { console.error('[ovl] external change reload failed', e); });
+        } else if (msg && msg.type === 'sync-changed') {
+            // v2 Pass P222：别的电脑改了同步键——复用这条已有的 WebSocket，不另开第二条。
+            if (typeof ovlSyncOnWsMessage === 'function') ovlSyncOnWsMessage(msg);
         }
     };
     ws.onclose = function () {
@@ -59814,6 +59820,8 @@ function ovlSettingsBridgeHtml() {
     html += ovlSetRow('连接测试', '<button type="button" class="ovl-modal-btn" onclick="ovlBridgeTestConnection()">测试连接</button>'
         + '<span id="ovlBridgeTestResult" style="margin-left:8px;font-size:11px;"></span>',
         '按当前输入框里的地址和令牌真的打一次 /health，不需要先保存。');
+    // v2 Pass P222：在线版配置同步的状态行 / 立即同步 / 密钥开关（非远程页面返回空串，分类内容一字不变）。
+    if (typeof ovlSyncSettingsRowsHtml === 'function') html += ovlSyncSettingsRowsHtml();
     return html;
 }
 // 三种结果：成功（✓ 绿色）、连不上（✗ 红色，网络层失败/超时/地址错误）、令牌无效
@@ -59997,6 +60005,8 @@ function ovlCloseSettings() {
     if (typeof OvlTermDbUiState !== 'undefined') OvlTermDbUiState.touched = Object.create(null);
     const overlay = document.getElementById('ovlSettingsOverlay');
     if (overlay) { overlay.hidden = true; overlay.innerHTML = ''; }
+    // v2 Pass P222：设置面板打开期间排队的远端更新，在关闭后合并应用。
+    if (typeof ovlSyncAfterSettingsClose === 'function') { try { ovlSyncAfterSettingsClose(); } catch (e) { console.warn('[sync] afterClose failed', e); } }
 }
 function ovlBindSettingsModal() {
     const overlay = document.getElementById('ovlSettingsOverlay');
@@ -68325,6 +68335,612 @@ function ovlBoot() {
     //   if (!OvlState.dirHandle) { try { ovlOfferReopenLastProject(); } catch (e) { console.warn('[ovl] offer reopen failed', e); } }
 }
 
+// ==================== v2 Pass P222：在线版配置同步（多台电脑共享同一份配置）====================
+// 目标：用 http://<jump>:8181/ 打开在线版时，术语库/论文卡/最近项目/设置/模型选择/提示词/聊天历史
+// 在所有电脑上是同一份，不用手动导出导入。数据存在桥（jump）的 data/config-sync.json（见 server.js
+// 的 config-sync 能力），浏览器 localStorage 仍然是本机的工作副本。
+//
+// 只在「页面是远程桥提供的(ovlIsRemoteBridge()) 且 /health 自报 config-sync 能力」时启用；file:// 与
+// 回环地址页面完全不碰这套东西：不发 /sync 请求、不写 ovl.sync.* 键、Storage 钩子对它们是空操作。
+//
+// 合并是三方合并：本机当前值 L、上次同步成功时服务器的值 B（ovl.sync.base::<key>）、服务器现值 S。
+//   L==B → 取 S；S==B → 保留 L；两边都改了：术语条目按 updatedAt 新者胜，其余服务器胜且把本机落败值存进
+//   ovl.sync.conflicts（最近 20 条，永不同步）。删除靠"B 有、某一侧没了"这种三方判断；删除与编辑撞车时保留编辑。
+// 同步是"扫描式"的：每个周期把所有已登记键的 L/B/S 比一遍，不依赖脏集合是否完整（脏集合只是触发器 +
+// 离线待同步计数），所以启动前就写下的、或页面崩溃漏记的改动也会在下一次周期里被推上去。
+// 不同步：布局/UI 键、ovlBridgeAddr/ovlBridgeToken、per-machine 路径键、onlineModelCatalog、focusEntries、
+// Visual 翻译缓存、两个 IndexedDB。API 密钥只有本机勾选 ovl.sync.secrets 才同步（默认关，且该开关自己不同步）。
+const OVL_SYNC_SECRET_SETTING_FIELDS = ['overleafToken', 'ovlAiMergeApiKey', 'pdf2texVisionApiKey'];
+// ovl.settings 的字段白名单（不在白名单里的字段——ovlBridgeAddr/ovlBridgeToken、darkModePdf、pdfDefaultZoomMode、
+// overleafProjectAddr 等每台机器自己的东西——永远不进服务器，也永远不会被远端值覆盖）。
+const OVL_SYNC_SETTING_FIELDS = [
+    'fontSize', 'fontFamily', 'lineHeight', 'editorTheme', 'showLineNumbers', 'tabSize', 'autoCloseBrackets',
+    'nonBlinkingCursor', 'quickActions', 'breadcrumbs', 'equationPreview', 'spellcheck', 'spellLang',
+    'transSimpleMode', 'visualTranslate', 'visualTransModel', 'ovlVisualLineBreaks', 'ovlVisualOutlineSelection',
+    'ovlVisualBtrConfirmFirst', 'overleafAutoPullMinutes', 'ovlRestoreLastProject', 'ovlAiMergeEndpoint',
+    'ovlAiMergeModel', 'pdf2texDefaultOutDir', 'pdf2texVisionEndpoint', 'pdf2texVisionModel', 'pdf2texConcurrency',
+    'pdf2texDisableThinking', 'pdf2texMaxPx', 'pdf2texSavePageImages', 'pdf2texAutoOpenResult',
+    'pdf2texExtractImages', 'pdf2texAutoVerify', 'ovlHighlightExpirySec'
+];
+const OVL_SYNC_REG = Object.create(null);
+(function () {
+    function add(k, mode, o) { OVL_SYNC_REG[k] = Object.assign({ mode: mode }, o || {}); }
+    add('ovl.termDbByPathRemote', 'termmap');
+    add('ovl.termDbGlobal', 'termbucket');
+    add('ovl.termDbGlossaryMigratedRemote', 'raw');
+    add('ovl.paperCardByPathRemote', 'fieldmap');
+    add('ovl.projectDomainHintByPathRemote', 'fieldmap');
+    add('ovl.projectGlossaryByPathRemote', 'fieldmap');
+    add('ovl.overleafAddrByPathRemote', 'fieldmap', { cap: 50 });
+    add('ovl.pdf2texMapRemote', 'fieldmap', { cap: 200 });
+    add('ovlProjectHistoryRemote', 'history', { slow: true });
+    add('chatArchive', 'chat', { slow: true });
+    add('ovl.settings', 'settings');
+    ['ovl.compileSettings', 'apiProvider', 'selectedModel', 'modelVisibility', 'reasoningByModel', 'showDatedSnapshots',
+        'ovl.builderModel', 'chatParams', 'chatSurfaceDefaults', 'customPrompts', 'synonymDefaultMode', 'historyLimit',
+        'autoSaveInterval', 'localBaseUrl', 'qwenBaseUrl', 'claudeProxyUrl'].forEach(function (k) { add(k, 'raw'); });
+    ['geminiApiKey', 'openaiApiKey', 'claudeApiKey', 'qwenApiKey'].forEach(function (k) { add(k, 'raw', { secret: true }); });
+})();
+const OVL_SYNC_FAMILY_RE = /^qwen[A-Za-z0-9_]{0,40}ByModel$/;
+const OVL_SYNC_HAS_STORAGE = typeof Storage !== 'undefined' && !!Storage.prototype;
+const OVL_SYNC_RAW_SET = OVL_SYNC_HAS_STORAGE ? Storage.prototype.setItem : null;
+const OVL_SYNC_RAW_REMOVE = OVL_SYNC_HAS_STORAGE ? Storage.prototype.removeItem : null;
+const OvlSync = {
+    clientId: 'c' + Math.random().toString(36).slice(2, 10) + Date.now().toString(36),
+    active: false, started: false, busy: false, rerun: false, offline: false,
+    needSnapshot: true, forceScan: false, version: 0, lastSyncAt: 0, lastError: '', pendingRemote: false,
+    applying: false, secretsOn: false, dirty: new Set(), writeTimer: null, pollTimer: null, lastCycleAt: 0,
+    baseMem: Object.create(null), renderPending: false
+};
+function ovlSyncRegFor(k) {
+    if (typeof k !== 'string') return null;
+    const r = OVL_SYNC_REG[k];
+    if (r) return r;
+    if (OVL_SYNC_FAMILY_RE.test(k)) return OVL_SYNC_REG[k] = { mode: 'raw' }; // qwen*ByModel 族
+    return null;
+}
+function ovlSyncLsGet(k) { try { return localStorage.getItem(k); } catch (e) { return null; } }
+function ovlSyncLsSet(k, v) { try { OVL_SYNC_RAW_SET.call(localStorage, k, v); return true; } catch (e) { return false; } }
+function ovlSyncLsRemove(k) { try { OVL_SYNC_RAW_REMOVE.call(localStorage, k); } catch (e) {} }
+// ---- 写入捕获：必须改 Storage.prototype，不能给 localStorage.setItem 赋值（命名属性 setter 会把它存成名叫 "setItem" 的条目）----
+if (OVL_SYNC_HAS_STORAGE) Storage.prototype.setItem = function (k, v) {
+    const r = OVL_SYNC_RAW_SET.apply(this, arguments);
+    try { if (OvlSync.active && this === localStorage) ovlSyncNoteWrite(k); } catch (e) {}
+    return r;
+};
+if (OVL_SYNC_HAS_STORAGE) Storage.prototype.removeItem = function (k) {
+    const r = OVL_SYNC_RAW_REMOVE.apply(this, arguments);
+    try { if (OvlSync.active && this === localStorage) ovlSyncNoteWrite(k); } catch (e) {}
+    return r;
+};
+function ovlSyncKeyEnabled(k) {
+    const reg = ovlSyncRegFor(k);
+    if (!reg) return null;
+    if (reg.secret && !OvlSync.secretsOn) return null;
+    return reg;
+}
+function ovlSyncPersistDirty() { ovlSyncLsSet('ovl.sync.dirty', JSON.stringify(Array.from(OvlSync.dirty))); }
+function ovlSyncNoteWrite(k) {
+    if (OvlSync.applying) return;
+    const reg = ovlSyncKeyEnabled(k);
+    if (!reg) return;
+    OvlSync.dirty.add(k);
+    ovlSyncPersistDirty();
+    ovlSyncRefreshUi();
+    ovlSyncScheduleWritePush();
+}
+function ovlSyncScheduleWritePush() {
+    if (OvlSync.writeTimer) clearTimeout(OvlSync.writeTimer);
+    let allSlow = true;
+    OvlSync.dirty.forEach(function (k) { const r = ovlSyncRegFor(k); if (!r || !r.slow) allSlow = false; });
+    OvlSync.writeTimer = setTimeout(function () { OvlSync.writeTimer = null; ovlSyncCycle('write'); }, allSlow ? 5000 : 800);
+}
+// ---- 基础工具 ----
+function ovlSyncParse(s) { if (typeof s !== 'string') return undefined; try { return JSON.parse(s); } catch (e) { return undefined; } }
+function ovlSyncStable(v) {
+    if (v === undefined) return 'undefined';
+    if (v === null || typeof v !== 'object') return JSON.stringify(v);
+    if (Array.isArray(v)) return '[' + v.map(ovlSyncStable).join(',') + ']';
+    return '{' + Object.keys(v).sort().map(function (k) { return JSON.stringify(k) + ':' + ovlSyncStable(v[k]); }).join(',') + '}';
+}
+function ovlSyncEq(a, b) { return a === b || ovlSyncStable(a) === ovlSyncStable(b); }
+function ovlSyncIsObj(o) { return !!o && typeof o === 'object' && !Array.isArray(o); }
+function ovlSyncSecretFieldsOn() { return OvlSync.secretsOn; }
+// ---- 已登记键 → 同步用的"表示"(rep)：字符串或 null ----
+// 所有 JSON 型键的 rep 一律规范化成"键排序"的稳定串：不同机器/不同写入路径序列化出的同一份数据，
+// 比较时必须相等，否则会在两台电脑之间无限互推。raw 型键（字符串/开关）原样比较。
+function ovlSyncCanon(reg, s) {
+    if (s == null) return null;
+    if (reg.mode === 'raw') return s;
+    const o = ovlSyncParse(s);
+    return o === undefined ? s : ovlSyncStable(o);
+}
+function ovlSyncToRep(reg, raw) {
+    if (raw == null) return null;
+    if (reg.mode !== 'settings') return ovlSyncCanon(reg, raw);
+    const obj = ovlSyncParse(raw);
+    if (!ovlSyncIsObj(obj)) return null;
+    const out = {};
+    OVL_SYNC_SETTING_FIELDS.concat(OvlSync.secretsOn ? OVL_SYNC_SECRET_SETTING_FIELDS : []).forEach(function (f) {
+        if (Object.prototype.hasOwnProperty.call(obj, f)) out[f] = obj[f];
+    });
+    return ovlSyncStable(out);
+}
+function ovlSyncFromRep(reg, rep, localRaw) {
+    if (reg.mode !== 'settings') return rep;
+    const M = ovlSyncParse(rep);
+    const obj = ovlSyncIsObj(ovlSyncParse(localRaw)) ? ovlSyncParse(localRaw) : {};
+    if (!ovlSyncIsObj(M)) return localRaw;
+    OVL_SYNC_SETTING_FIELDS.forEach(function (f) {
+        if (Object.prototype.hasOwnProperty.call(M, f)) obj[f] = M[f]; else delete obj[f];
+    });
+    if (OvlSync.secretsOn) OVL_SYNC_SECRET_SETTING_FIELDS.forEach(function (f) { if (Object.prototype.hasOwnProperty.call(M, f)) obj[f] = M[f]; });
+    return JSON.stringify(obj);
+}
+// ---- 合并 ----
+function ovlSyncMergeFields(l, b, s, conf, label, valueMerge) {
+    const out = {};
+    const order = Object.keys(s).concat(Object.keys(l).filter(function (k) { return !Object.prototype.hasOwnProperty.call(s, k); }));
+    order.forEach(function (k) {
+        const vl = l[k], vb = b[k], vs = s[k];
+        let r;
+        if (ovlSyncEq(vl, vb)) r = vs;
+        else if (ovlSyncEq(vs, vb)) r = vl;
+        else if (ovlSyncEq(vl, vs)) r = vl;
+        else if (valueMerge) r = valueMerge(k, vl, vb, vs);
+        else { r = vs; conf.push({ key: label, field: k, local: vl }); }
+        if (r !== undefined) out[k] = r;
+    });
+    return out;
+}
+function ovlSyncMergeBucket(l, b, s, conf, label) {
+    function idx(bk) {
+        const m = new Map();
+        (bk && Array.isArray(bk.entries) ? bk.entries : []).forEach(function (e) { if (e && typeof e === 'object' && typeof e.en === 'string') m.set(e.en, e); });
+        return m;
+    }
+    const L = idx(l), B = idx(b), S = idx(s);
+    const order = Array.from(S.keys()).concat(Array.from(L.keys()).filter(function (en) { return !S.has(en); }));
+    const entries = [];
+    order.forEach(function (en) {
+        const el = L.get(en), eb = B.get(en), es = S.get(en);
+        let r;
+        if (ovlSyncEq(el, eb)) r = es;
+        else if (ovlSyncEq(es, eb)) r = el;
+        else if (ovlSyncEq(el, es)) r = el;
+        else if (el === undefined) r = es;      // 一边删、一边改：保留被改的那份
+        else if (es === undefined) r = el;
+        else {
+            r = ((Number(el.updatedAt) || 0) > (Number(es.updatedAt) || 0)) ? el : es; // 同一术语两边都改：updatedAt 新者胜，平局服务器胜
+            if (r === es) conf.push({ key: label, field: en, local: el });
+        }
+        if (r !== undefined) entries.push(r);
+    });
+    return Object.assign({}, ovlSyncIsObj(s) ? s : {}, {
+        entries: entries.slice(0, 500),
+        updatedAt: Math.max(Number(l && l.updatedAt) || 0, Number(s && s.updatedAt) || 0)
+    });
+}
+function ovlSyncMergeRaw(key, L, S, conf) {
+    conf.push({ key: key, field: '', local: L });
+    return S;
+}
+function ovlSyncMergeById(items, keyFn) {
+    const o = {};
+    (Array.isArray(items) ? items : []).forEach(function (it) { if (it && typeof it === 'object') { const k = keyFn(it); if (typeof k === 'string' && k) o[k] = it; } });
+    return o;
+}
+// 返回合并后的 rep（字符串或 null）。
+function ovlSyncMerge(key, reg, L, B, S, conf) {
+    if (L === S) return L;
+    if (L === B) return S;
+    if (S === B) return L;
+    const secrets = OvlSync.secretsOn;
+    let merged;
+    const lo = ovlSyncParse(L), bo = ovlSyncParse(B), so = ovlSyncParse(S);
+    const parsable = (L == null || lo !== undefined) && (B == null || bo !== undefined) && (S == null || so !== undefined);
+    const mode = reg.mode;
+    if (mode === 'raw' || !parsable) {
+        if (reg.secret && S == null) return L;  // 密钥永远不接受服务器端的"删除"
+        return ovlSyncMergeRaw(key, L, S, conf);
+    }
+    if (mode === 'settings') {
+        const l = ovlSyncIsObj(lo) ? lo : {}, b = ovlSyncIsObj(bo) ? Object.assign({}, bo) : {}, s = ovlSyncIsObj(so) ? Object.assign({}, so) : {};
+        const carry = {};
+        if (!secrets) OVL_SYNC_SECRET_SETTING_FIELDS.forEach(function (f) { if (f in s) { carry[f] = s[f]; delete s[f]; } delete b[f]; });
+        const out = ovlSyncMergeFields(l, b, s, conf, key);
+        if (secrets) OVL_SYNC_SECRET_SETTING_FIELDS.forEach(function (f) { if (!(f in s) && (f in l)) out[f] = l[f]; }); // 不接受服务器端删除密钥字段
+        else Object.assign(out, carry);
+        merged = out;
+    } else if (mode === 'fieldmap') {
+        const l = ovlSyncIsObj(lo) ? lo : {}, b = ovlSyncIsObj(bo) ? bo : {}, s = ovlSyncIsObj(so) ? so : {};
+        let out = ovlSyncMergeFields(l, b, s, conf, key);
+        if (reg.cap) { const ks = Object.keys(out); if (ks.length > reg.cap) { const o2 = {}; ks.slice(ks.length - reg.cap).forEach(function (k) { o2[k] = out[k]; }); out = o2; } }
+        merged = out;
+    } else if (mode === 'termmap') {
+        const l = ovlSyncIsObj(lo) ? lo : {}, b = ovlSyncIsObj(bo) ? bo : {}, s = ovlSyncIsObj(so) ? so : {};
+        merged = ovlSyncMergeFields(l, b, s, conf, key, function (k, vl, vb, vs) {
+            if (vl === undefined) return vs;
+            if (vs === undefined) return vl;
+            return ovlSyncMergeBucket(vl, vb, vs, conf, key + '#' + k);
+        });
+    } else if (mode === 'termbucket') {
+        merged = ovlSyncMergeBucket(ovlSyncIsObj(lo) ? lo : {}, ovlSyncIsObj(bo) ? bo : {}, ovlSyncIsObj(so) ? so : {}, conf, key);
+    } else if (mode === 'history' || mode === 'chat') {
+        const isChat = mode === 'chat';
+        const keyFn = function (it) { return it.id; };
+        const stampOf = function (it) { return isChat ? (Number(it.at) || 0) : String(it.lastOpened || ''); };
+        const l = ovlSyncMergeById(isChat ? (lo && lo.items) : lo, keyFn), b = ovlSyncMergeById(isChat ? (bo && bo.items) : bo, keyFn), s = ovlSyncMergeById(isChat ? (so && so.items) : so, keyFn);
+        const byId = ovlSyncMergeFields(l, b, s, conf, key, function (k, vl, vb, vs) {
+            if (vl === undefined) return vs;
+            if (vs === undefined) return vl;
+            const r = stampOf(vl) > stampOf(vs) ? vl : vs;
+            if (r === vs) conf.push({ key: key, field: k, local: vl });
+            return r;
+        });
+        let arr = Object.keys(byId).map(function (k) { return byId[k]; });
+        arr.sort(function (x, y) { const a = stampOf(x), c = stampOf(y); return a < c ? 1 : (a > c ? -1 : 0); });
+        if (isChat) {
+            arr = arr.slice(0, 20);
+            const shell = ovlSyncIsObj(so) ? so : (ovlSyncIsObj(lo) ? lo : { v: 1 });
+            const wrap = function (items) { return Object.assign({}, shell, { items: items }); };
+            while (arr.length > 1 && JSON.stringify(wrap(arr)).length > 262144) arr = arr.slice(0, arr.length - 1); // 同 CHAT_ARCHIVE_BYTES：最老的先丢
+            merged = wrap(arr);
+        } else {
+            merged = arr.slice(0, 30);
+        }
+    } else {
+        return ovlSyncMergeRaw(key, L, S, conf);
+    }
+    const ms = ovlSyncStable(merged);
+    if (S != null && ovlSyncStable(so) === ms) return S;   // 语义上等于服务器值：原样返回服务器串，避免无谓回推
+    if (L != null && ovlSyncStable(lo) === ms) return L;
+    return ms;
+}
+// ---- base 副本 ----
+function ovlSyncBaseGet(k) {
+    if (Object.prototype.hasOwnProperty.call(OvlSync.baseMem, k)) return OvlSync.baseMem[k];
+    const raw = ovlSyncLsGet('ovl.sync.base::' + k);
+    let rec = null;
+    if (raw) { const o = ovlSyncParse(raw); if (ovlSyncIsObj(o) && Number.isFinite(o.v)) rec = { v: o.v, value: typeof o.value === 'string' ? o.value : null }; }
+    OvlSync.baseMem[k] = rec;
+    return rec;
+}
+function ovlSyncBaseSet(k, v, value) {
+    if (v <= 0 && value == null) { OvlSync.baseMem[k] = null; ovlSyncLsRemove('ovl.sync.base::' + k); return; }
+    const rec = { v: v, value: value };
+    const cur = Object.prototype.hasOwnProperty.call(OvlSync.baseMem, k) ? OvlSync.baseMem[k] : undefined;
+    if (cur && cur.v === v && cur.value === value) return;
+    OvlSync.baseMem[k] = rec;
+    ovlSyncLsSet('ovl.sync.base::' + k, JSON.stringify(rec)); // 配额满时静默失败：内存里仍有，下次启动视同首次同步，三方合并本身是安全的
+}
+function ovlSyncLogConflicts(conf) {
+    if (!conf || !conf.length) return;
+    let list = ovlSyncParse(ovlSyncLsGet('ovl.sync.conflicts'));
+    if (!Array.isArray(list)) list = [];
+    conf.forEach(function (c) {
+        let lv = '';
+        try { lv = JSON.stringify(c.local); } catch (e) {}
+        if (lv && lv.length > 20000) lv = lv.slice(0, 20000);
+        list.push({ t: Date.now(), key: c.key, field: c.field, local: lv });
+        console.info('[sync] 冲突：' + c.key + (c.field ? ' / ' + c.field : '') + ' 已采用服务器值，本机落败值存入 ovl.sync.conflicts');
+    });
+    list = list.slice(-20);
+    ovlSyncLsSet('ovl.sync.conflicts', JSON.stringify(list));
+}
+// ---- 网络 ----
+function ovlSyncHttp(method, p, body) {
+    const opts = { method: method, headers: ovlBridgeAuthHeaders(body ? { 'Content-Type': 'application/json' } : {}) };
+    if (body) opts.body = body;
+    return fetch(ovlBridgeUrl(p), opts);   // 不走 ovlBridgeFetch：它在没有令牌时会弹令牌框，同步不该主动打扰用户
+}
+function ovlSyncSettingsOpen() {
+    try { const ov = document.getElementById('ovlSettingsOverlay'); return !!(ov && !ov.hidden); } catch (e) { return false; }
+}
+// ---- 周期 ----
+function ovlSyncRequest(reason) {
+    if (!OvlSync.active) return;
+    const now = Date.now();
+    if (reason !== 'manual' && reason !== 'after-close' && reason !== 'secrets' && now - OvlSync.lastCycleAt < 800) return;
+    ovlSyncCycle(reason);
+}
+async function ovlSyncCycle(reason) {
+    if (!OvlSync.active) return;
+    if (OvlSync.busy) { OvlSync.rerun = true; return; }
+    OvlSync.busy = true;
+    try { await ovlSyncCycleInner(reason, 0); }
+    catch (e) { OvlSync.lastError = '同步出错：' + (e && e.message ? e.message : String(e)); console.warn('[sync] cycle failed', e); }
+    finally {
+        OvlSync.busy = false;
+        OvlSync.lastCycleAt = Date.now();
+        ovlSyncRefreshUi();
+        if (OvlSync.rerun) { OvlSync.rerun = false; setTimeout(function () { ovlSyncCycle('rerun'); }, 50); }
+    }
+}
+function ovlSyncDecide(k, reg, S, sv, B) {
+    S = ovlSyncCanon(reg, S);
+    B = ovlSyncCanon(reg, B);
+    const L = ovlSyncToRep(reg, ovlSyncLsGet(k));
+    const conf = [];
+    const merged = ovlSyncMerge(k, reg, L, B, S, conf);
+    return { key: k, reg: reg, L: L, S: S, sv: sv, B: B, merged: merged, applyLocal: merged !== L, push: merged !== S, conf: conf };
+}
+function ovlSyncWriteLocal(p) {
+    const reg = p.reg, k = p.key;
+    OvlSync.applying = true;
+    try {
+        if (p.merged == null) {
+            if (reg.mode === 'settings' || reg.secret) return true; // 设置/密钥永远不因服务器"空"而整体清掉
+            localStorage.removeItem(k);
+        } else {
+            localStorage.setItem(k, ovlSyncFromRep(reg, p.merged, ovlSyncLsGet(k)));
+        }
+        return true;
+    } catch (e) { return false; }
+    finally { OvlSync.applying = false; }
+}
+async function ovlSyncCycleInner(reason, depth) {
+    const modalOpen = ovlSyncSettingsOpen();
+    const snapshotMode = OvlSync.needSnapshot || OvlSync.version <= 0;
+    let resp;
+    try { resp = await ovlSyncHttp('GET', snapshotMode ? '/sync/snapshot' : '/sync/changes?since=' + OvlSync.version); }
+    catch (e) { OvlSync.offline = true; return; }
+    if (resp.status === 401 || resp.status === 403) { OvlSync.offline = false; OvlSync.lastError = '同步失败：访问令牌无效或缺失（设置 → 远程桥接）'; return; }
+    let data = null;
+    try { data = await resp.json(); } catch (e) { data = null; }
+    if (!resp.ok || !data || !data.ok || !ovlSyncIsObj(data.keys)) { OvlSync.offline = false; OvlSync.lastError = '同步失败：服务器响应异常（HTTP ' + resp.status + '）'; return; }
+    OvlSync.offline = false;
+    OvlSync.lastError = '';
+    if (!snapshotMode && data.version < OvlSync.version && depth < 1) { OvlSync.needSnapshot = true; return ovlSyncCycleInner(reason, depth + 1); } // 服务器数据被重置：回退到整仓快照
+    const server = data.keys;
+    const doScan = snapshotMode || OvlSync.forceScan || OvlSync.dirty.size > 0 || reason === 'manual' || reason === 'after-close' || reason === 'secrets';
+    const cand = new Set();
+    Object.keys(server).forEach(function (k) { if (ovlSyncKeyEnabled(k)) cand.add(k); });
+    if (doScan) {
+        Object.keys(OVL_SYNC_REG).forEach(function (k) { if (ovlSyncKeyEnabled(k)) cand.add(k); });
+        try { for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (OVL_SYNC_FAMILY_RE.test(k)) cand.add(k); } } catch (e) {}
+    }
+    Array.from(OvlSync.dirty).forEach(function (k) { if (!ovlSyncKeyEnabled(k)) OvlSync.dirty.delete(k); }); // 密钥开关关掉后遗留的脏键不再计数
+    const plans = [];
+    cand.forEach(function (k) {
+        const reg = ovlSyncKeyEnabled(k);
+        if (!reg) return;
+        const e = server[k];
+        const rec = ovlSyncBaseGet(k);
+        let B = rec ? rec.value : null, S, sv;
+        if (e) { S = typeof e.value === 'string' ? e.value : null; sv = Number(e.v) || 0; }
+        else if (snapshotMode) { S = null; sv = 0; B = null; }
+        else { S = B; sv = rec ? rec.v : 0; }
+        if (reg.secret && !OvlSync.secretsOn) return;
+        plans.push(ovlSyncDecide(k, reg, S, sv, B));
+    });
+    if (modalOpen) {
+        // 设置面板打开：绝不改本机值、不重渲输入框。只把"本机独有的改动、且服务器上这个键没变"推上去；
+        // 其余（远端有更新 / 两边都改）排队，等面板关闭后统一合并应用。
+        const pushOnly = [];
+        plans.forEach(function (p) {
+            if (p.S !== p.B) { OvlSync.pendingRemote = true; return; }
+            if (p.push && !p.applyLocal) pushOnly.push(p);
+        });
+        if (pushOnly.length) await ovlSyncPushPlans(pushOnly, true);
+        OvlSync.lastSyncAt = Date.now();
+        return;
+    }
+    // 1) 先把合并结果写回本机，并立刻重新装载内存状态——必须在任何后续的本机保存之前，否则旧内存会把远端值盖回去。
+    const changedKeys = [];
+    plans.forEach(function (p) {
+        if (!p.applyLocal) return;
+        if (ovlSyncWriteLocal(p)) { changedKeys.push(p.key); ovlSyncLogConflicts(p.conf); }
+        else { p.push = false; OvlSync.lastError = '本机存储写入失败（可能已满），未能应用远端的 ' + p.key; }
+    });
+    plans.forEach(function (p) { if (!p.applyLocal) ovlSyncLogConflicts(p.conf); });
+    if (changedKeys.length) ovlSyncRehydrate(changedKeys);
+    // 2) 不需要推的：base 追平服务器值，并从脏集合移除
+    plans.forEach(function (p) {
+        if (!p.push) { ovlSyncBaseSet(p.key, p.sv, p.S); OvlSync.dirty.delete(p.key); }
+    });
+    // 3) 需要推的
+    let todo = plans.filter(function (p) { return p.push; });
+    for (let attempt = 0; attempt < 3 && todo.length; attempt++) {
+        const res = await ovlSyncPushPlans(todo, false);
+        if (res.network) break;
+        const next = [];
+        res.conflicts.forEach(function (c) {
+            const reg = ovlSyncKeyEnabled(c.key);
+            if (!reg) return;
+            const rec = ovlSyncBaseGet(c.key);
+            const p2 = ovlSyncDecide(c.key, reg, typeof c.value === 'string' ? c.value : null, Number(c.v) || 0, rec ? rec.value : null);
+            if (p2.applyLocal) {
+                if (ovlSyncWriteLocal(p2)) { ovlSyncLogConflicts(p2.conf); ovlSyncRehydrate([p2.key]); } else { return; }
+            } else { ovlSyncLogConflicts(p2.conf); }
+            if (p2.push) next.push(p2); else { ovlSyncBaseSet(p2.key, p2.sv, p2.S); OvlSync.dirty.delete(p2.key); }
+        });
+        todo = next;
+    }
+    if (todo.length) OvlSync.lastError = '有 ' + todo.length + ' 项冲突重试 3 次仍未成功，稍后自动重试';
+    OvlSync.version = Math.max(OvlSync.version, Number(data.version) || 0);
+    OvlSync.needSnapshot = false;
+    OvlSync.forceScan = false;
+    ovlSyncLsSet('ovl.sync.version', String(OvlSync.version));
+    OvlSync.lastSyncAt = Date.now();
+    ovlSyncPersistDirty();
+}
+// 推送一批；返回 { conflicts:[{key,v,value}], network:bool }。成功的键在这里直接追平 base/脏集合。
+async function ovlSyncPushPlans(plans, skipConflicts) {
+    const out = { conflicts: [], network: false };
+    async function send(list) {
+        const body = JSON.stringify({ clientId: OvlSync.clientId, changes: list.map(function (p) { return { key: p.key, baseV: p.sv, value: p.merged }; }) });
+        let resp;
+        try { resp = await ovlSyncHttp('POST', '/sync/put', body); }
+        catch (e) { OvlSync.offline = true; out.network = true; return; }
+        let data = null;
+        try { data = await resp.json(); } catch (e) { data = null; }
+        if (resp.status === 401 || resp.status === 403) { OvlSync.lastError = '同步失败：访问令牌无效或缺失（设置 → 远程桥接）'; return; }
+        if (!resp.ok || !data || !data.ok || !Array.isArray(data.results)) {
+            if (list.length > 1) { for (const p of list) { await send([p]); if (out.network) return; } return; } // 批量被拒：逐键重试，定位出问题的那一个
+            OvlSync.lastError = '键 ' + list[0].key + ' 无法同步：' + ((data && data.error) || ('HTTP ' + resp.status));
+            return;
+        }
+        data.results.forEach(function (r) {
+            const p = list.filter(function (x) { return x.key === r.key; })[0];
+            if (!p) return;
+            if (r.status === 'ok') { ovlSyncBaseSet(p.key, Number(r.v) || 0, p.merged); OvlSync.dirty.delete(p.key); }
+            else if (r.status === 'conflict' && !skipConflicts) out.conflicts.push({ key: r.key, v: r.v, value: r.value });
+            else if (r.status === 'conflict') OvlSync.pendingRemote = true;
+        });
+    }
+    await send(plans);
+    ovlSyncPersistDirty();
+    return out;
+}
+// ---- 应用远端变更后重新装载内存状态并重渲 ----
+function ovlSyncUserTypingInRoot() {
+    try {
+        const ae = document.activeElement, root = document.getElementById('root');
+        return !!(ae && root && root.contains(ae) && (ae.tagName === 'TEXTAREA' || ae.tagName === 'INPUT' || ae.isContentEditable));
+    } catch (e) { return false; }
+}
+function ovlSyncRehydrate(keys) {
+    const has = function (k) { return keys.indexOf(k) !== -1; };
+    let prefs = false, chat = false, render = false;
+    keys.forEach(function (k) {
+        if (['apiProvider', 'selectedModel', 'modelVisibility', 'reasoningByModel', 'showDatedSnapshots', 'customPrompts',
+            'synonymDefaultMode', 'historyLimit', 'autoSaveInterval', 'localBaseUrl', 'qwenBaseUrl', 'claudeProxyUrl',
+            'geminiApiKey', 'openaiApiKey', 'claudeApiKey', 'qwenApiKey'].indexOf(k) !== -1 || OVL_SYNC_FAMILY_RE.test(k)) prefs = true;
+    });
+    try { if (has('ovl.settings')) { ovlLoadSettings(); ovlApplySettings(); } } catch (e) { console.warn('[sync] rehydrate settings failed', e); }
+    try { if (has('ovl.compileSettings')) { ovlLoadCompileSettings(); if (typeof ovlUpdatePdfToolbarUI === 'function') ovlUpdatePdfToolbarUI(); } } catch (e) {}
+    try { if (prefs) { loadSavedSettings({ fromSync: true }); render = true; } } catch (e) { console.warn('[sync] rehydrate prefs failed', e); }
+    try { if (has('ovl.builderModel')) builderModelLoad(); } catch (e) {}
+    try { if (has('chatParams')) { chatParamsLoad(); chat = true; } } catch (e) {}
+    try { if (has('chatSurfaceDefaults')) { chatDefaultsLoad(); chat = true; } } catch (e) {}
+    try { if (has('chatArchive')) chat = true; } catch (e) {}
+    try { if (chat && typeof chatUpdateBar === 'function') chatUpdateBar(); } catch (e) {}
+    try {
+        if (keys.some(function (k) { return k === 'ovl.overleafAddrByPathRemote' || k === 'ovl.settings'; }) && typeof ovlOverleafUpdateButtonsUI === 'function') ovlOverleafUpdateButtonsUI();
+    } catch (e) {}
+    if (render || OvlSync.renderPending) {
+        if (ovlSyncUserTypingInRoot()) { OvlSync.renderPending = true; }
+        else { OvlSync.renderPending = false; try { renderApp(true); } catch (e) { console.warn('[sync] renderApp failed', e); } }
+    }
+}
+// ---- 启停 / 触发器 ----
+function ovlSyncStart() {
+    if (OvlSync.active) return;
+    OvlSync.active = true;
+    OvlSync.secretsOn = ovlSyncLsGet('ovl.sync.secrets') === '1';
+    if (!OvlSync.started) {
+        OvlSync.started = true;
+        // 桥地址变了（换了一台服务器）：旧 base/版本号对新服务器没有意义，整体清掉，按"首次同步"处理（三方合并本身是安全的）。
+        const origin = ovlBridgeOrigin();
+        if (ovlSyncLsGet('ovl.sync.origin') !== origin) {
+            try {
+                const rm = [];
+                for (let i = 0; i < localStorage.length; i++) { const k = localStorage.key(i); if (k && k.indexOf('ovl.sync.base::') === 0) rm.push(k); }
+                rm.forEach(ovlSyncLsRemove);
+            } catch (e) {}
+            ovlSyncLsRemove('ovl.sync.version');
+            ovlSyncLsSet('ovl.sync.origin', origin);
+            OvlSync.baseMem = Object.create(null);
+        }
+        OvlSync.version = parseInt(ovlSyncLsGet('ovl.sync.version') || '0', 10) || 0;
+        const d = ovlSyncParse(ovlSyncLsGet('ovl.sync.dirty'));
+        if (Array.isArray(d)) d.forEach(function (k) { if (typeof k === 'string') OvlSync.dirty.add(k); });
+        OvlSync.needSnapshot = true;
+        OvlSync.forceScan = true;
+        document.addEventListener('visibilitychange', function () { if (document.visibilityState === 'visible') ovlSyncRequest('visible'); });
+        window.addEventListener('focus', function () { ovlSyncRequest('focus'); });
+        OvlSync.pollTimer = setInterval(function () {
+            if (document.visibilityState !== 'visible') return;
+            ovlSyncRequest('poll');
+            if (OvlSync.renderPending) ovlSyncRehydrate([]);
+        }, 60000);
+    }
+    ovlSyncCycle('start');
+}
+function ovlSyncStop() { OvlSync.active = false; OvlSync.offline = false; ovlSyncRefreshUi(); }
+// ovlBridgeCheckHealth 每次探活后调用：决定同步是否启用，以及"离线→在线"时补推。
+function ovlSyncOnHealth(online) {
+    try {
+        if (!OvlSync.active && !ovlIsRemoteBridge()) return; // file:// / 回环页面：完全不碰
+        const remote = ovlIsRemoteBridge();
+        const cap = !!(online && ovlBridgeHasCapability('config-sync'));
+        OvlSync.remote = remote;
+        OvlSync.capMissing = !!(remote && online && !cap);
+        OvlSync.bridgeOnline = !!online;
+        if (remote && cap) {
+            if (!OvlSync.active) ovlSyncStart();
+            else if (OvlSync.offline) ovlSyncRequest('online');
+        } else if (OvlSync.active) {
+            if (remote && !online) OvlSync.offline = true;   // 桥暂时离线：保持启用，继续记脏，恢复后补推
+            else ovlSyncStop();                                // 换成了回环地址 / 桥降级：停掉
+        }
+        ovlSyncRefreshUi();
+    } catch (e) { console.warn('[sync] onHealth failed', e); }
+}
+function ovlSyncOnWsMessage(msg) {
+    if (!OvlSync.active || !msg) return;
+    if (msg.by && msg.by === OvlSync.clientId) return;
+    if (ovlSyncSettingsOpen()) { OvlSync.pendingRemote = true; ovlSyncRefreshUi(); return; }
+    ovlSyncRequest('ws');
+}
+function ovlSyncAfterSettingsClose() {
+    if (!OvlSync.active) return;
+    const hadPending = OvlSync.pendingRemote;
+    OvlSync.pendingRemote = false;
+    ovlSyncRefreshUi();
+    if (hadPending || OvlSync.dirty.size) ovlSyncCycle('after-close');
+    else if (OvlSync.renderPending) ovlSyncRehydrate([]);
+}
+function ovlSyncNow() {
+    if (!OvlSync.active) { try { showToast('配置同步未启用（需要远程桥且桥支持 config-sync）', 'error'); } catch (e) {} return; }
+    ovlSyncCycle('manual').then(function () {
+        try {
+            if (OvlSync.lastError) showToast(OvlSync.lastError, 'error');
+            else if (OvlSync.pendingRemote) showToast('其他电脑有更新，关闭设置后应用', 'info');
+            else showToast('已同步', 'info');
+        } catch (e) {}
+    });
+}
+function ovlSyncSetSecrets(on) {
+    ovlSyncLsSet('ovl.sync.secrets', on ? '1' : '0');
+    OvlSync.secretsOn = !!on;
+    OvlSync.forceScan = true;
+    ovlSyncRefreshUi();
+    if (OvlSync.active) ovlSyncCycle('secrets');
+}
+function ovlSyncStatusText() {
+    if (!OvlSync.remote && !OvlSync.active) return '';
+    const n = OvlSync.dirty.size;
+    if (!OvlSync.active) return OvlSync.capMissing ? '未启用：这个桥还不支持配置同步（请更新并重启桥）' : '未启用：桥未连接';
+    if (OvlSync.lastError) return OvlSync.lastError + (n ? '（' + n + ' 项待同步）' : '');
+    if (OvlSync.offline) return '离线，' + n + ' 项待同步';
+    if (!OvlSync.lastSyncAt) return '同步中…';
+    const d = new Date(OvlSync.lastSyncAt);
+    const hm = String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+    return '已同步 ' + hm + ' · 版本 ' + OvlSync.version + (n ? ' · ' + n + ' 项待同步' : '');
+}
+function ovlSyncRefreshUi() {
+    try {
+        const el = document.getElementById('ovlSyncStatus');
+        if (el) el.textContent = ovlSyncStatusText();
+        const note = document.getElementById('ovlSyncPendingNote');
+        if (note) note.hidden = !(OvlSync.pendingRemote && ovlSyncSettingsOpen());
+    } catch (e) {}
+}
+function ovlSyncSettingsRowsHtml() {
+    // 仅在线版（远程桥）显示；file:// 与回环页面的「远程桥接」分类保持原样。
+    if (!ovlIsRemoteBridge()) return '';
+    let html = ovlSetRow('配置同步', '<span id="ovlSyncStatus" style="font-size:12px;">' + escapeAttr(ovlSyncStatusText()) + '</span>'
+        + '<button type="button" class="ovl-modal-btn" id="ovlSyncNowBtn" style="margin-left:8px;" onclick="ovlSyncNow()">立即同步</button>'
+        + '<div id="ovlSyncPendingNote" hidden style="font-size:12px;margin-top:4px;">其他电脑有更新，关闭设置后应用</div>',
+        '术语库、论文卡、最近项目、设置、模型选择、提示词和聊天历史会在所有打开同一个桥的电脑之间自动同步。桥地址/访问令牌和界面布局不同步。');
+    html += ovlSetRow('同步 API 密钥', '<label style="display:flex;align-items:center;gap:6px;"><input type="checkbox" id="ovlSyncSecretsChk"'
+        + (OvlSync.secretsOn || ovlSyncLsGet('ovl.sync.secrets') === '1' ? ' checked' : '') + ' onchange="ovlSyncSetSecrets(this.checked)">'
+        + '同步 API 密钥到 jump（明文保存在 jump，受访问令牌保护）</label>',
+        '这个开关只对本机生效（默认关闭）；要在几台电脑之间共享密钥，请在每台电脑上各自勾选。关闭后不会删除已经存到 jump 上的密钥。');
+    return html;
+}
 </script>
 </body>
 </html>
