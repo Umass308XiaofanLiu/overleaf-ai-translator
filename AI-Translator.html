@@ -5018,8 +5018,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.43.03';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-10-03';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.44.00';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-10-05';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -12368,8 +12368,15 @@ Rules:
         const domainHintLine = (!card && typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
         if (domainHintLine) sys += '\n\n' + domainHintLine;
     }
-    const matched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(matchText || '', { cap: 60 }) : [];
-    const termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(matched) : '';
+    // v2 Pass P221：源语言是中文（zh→en）时改走 zh 侧匹配 + "Chinese -> English" 块——原先这里
+    // 拿 en 侧匹配器去匹配中文原文，几乎永远不命中，命中了标签方向也是反的。en→zh 分支逐字不变。
+    let termsBlock;
+    if (srcName === 'Chinese' && typeof ovlTermDbMatchZh === 'function') {
+        termsBlock = ovlTermDbBuildPromptBlockZhEn(ovlTermDbMatchZh(matchText || '', { cap: 60 }));
+    } else {
+        const matched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(matchText || '', { cap: 60 }) : [];
+        termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(matched) : '';
+    }
     sys += termsBlock;
     if (card) sys = card + '\n\n' + sys;
     return sys;
@@ -12954,12 +12961,14 @@ async function xportRequest(items, srcName, tgtName, config, signal, outMeta) {
 // 就传一个 usageNewTask() 累加器进来；不传的调用点（本文件里除 xportRecoverSegment 外没有
 // 别的调用点）逐字不受影响。
 async function xportLegacyOne(seg, srcName, tgtName, config, signal, taskUsage) {
-    const systemPrompt = `You are a professional academic translator.
+    let systemPrompt = `You are a professional academic translator.
 1. Split input into logical sentences/segments.
 2. Translate ${srcName} to ${tgtName}.
 3. Keep LaTeX math/citations intact.
 4. You MUST return ONLY valid JSON: {"translations": [{"src": "Original 1", "tgt": "Translated 1"}]}
 5. Do NOT include any text before or after the JSON.`;
+    // v2 Pass P221：最后一级也带论文卡片 + 方向感知术语块（cap 60）；空 ⇒ 原样不变。
+    systemPrompt = (typeof ovlTermDbWrapSystem === 'function') ? ovlTermDbWrapSystem(systemPrompt, srcName === 'Chinese' ? 'zh2en' : 'en2zh', seg, 60) : systemPrompt;
     let data;
     if (config.provider === 'local') {
         // 阶梯的最后一级正是「模型已经在乱来」的时候才会跑到 —— A4 的分类必须落在这里，
@@ -13363,12 +13372,14 @@ async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
     const srcName = srcLang === 'zh' ? 'Chinese' : 'English';
     const tgtName = tgtLang === 'zh' ? 'Chinese' : 'English';
 
-    const systemPrompt = `You are a professional academic translator. 
+    let systemPrompt = `You are a professional academic translator. 
 1. Split input into logical sentences/segments.
 2. Translate ${srcName} to ${tgtName}.
 3. Keep LaTeX math/citations intact.
 4. You MUST return ONLY valid JSON: {"translations": [{"src": "Original 1", "tgt": "Translated 1"}]}
 5. Do NOT include any text before or after the JSON.`;
+    // v2 Pass P221：legacy JSON fallback also carries card + direction-aware terms (batch text, cap 60); empty => byte-identical.
+    systemPrompt = (typeof ovlTermDbWrapSystem === 'function') ? ovlTermDbWrapSystem(systemPrompt, srcName === 'Chinese' ? 'zh2en' : 'en2zh', text, 60) : systemPrompt;
 
     if (config.provider === 'local') {
         const meta = {};
@@ -13508,6 +13519,8 @@ CRITICAL RULES:
     } else if (type === "custom") {
         prompt = `Rewrite the following ${lang === 'zh' ? 'Chinese' : 'English'} sentence based on this instruction: "${instruction}". Return ONLY the rewritten sentence.\n\nText: "${text}"`;
     }
+    // v2 Pass P221：精修（含自定义指令）带上论文卡片 + 命中术语；没有则 prompt 逐字节不变。
+    if (typeof ovlTermDbRefineContext === 'function') prompt += ovlTermDbRefineContext(text, true, 20);
 
     if (config.provider === 'local') {
         return await callLocalLLM(
@@ -13680,7 +13693,7 @@ async function getSynonyms(sentence, selectedText, lang, config, avoidList = [],
         ? `IMPORTANT: Do NOT include any of the following words/phrases in your output: ${JSON.stringify(avoidList)}. Find DIFFERENT alternatives.`
         : "";
 
-    const prompt = mode === 'simplify' ? `Context Sentence: "${sentence}"
+    let prompt = mode === 'simplify' ? `Context Sentence: "${sentence}"
 Selected Text: "${selectedText}"
 Language: ${lang === 'zh' ? 'Chinese' : 'English'}
 
@@ -13703,6 +13716,8 @@ Task: Provide 4-5 distinct, academic-style alternatives for the "Selected Text".
 5. ${avoidInstruction}
 
 Return JSON: { "alternatives": ["option1", "option2", "option3", "option4"] }`;
+    // v2 Pass P221：近义词只带命中术语（不带卡片）；没有命中则 prompt 逐字节不变。
+    if (typeof ovlTermDbRefineContext === 'function') prompt += ovlTermDbRefineContext(String(sentence == null ? '' : sentence) + '\n' + String(selectedText == null ? '' : selectedText), false, 20);
 
     if (config.provider === 'local') {
         const meta = {};
@@ -22886,7 +22901,50 @@ function chatDocLang() {
 // C7（对话上下文收窄）：docLang 是左栏原文此刻的语言（chatDocLang()）。EDIT 块里的改写正文
 // **必须**用这个语言写，和「用什么语言回答用户」是两回事——那句话回什么语言跟着用户的问题走，
 // 这里的改写文本只跟着原文的语言走，两条规则互不干扰。
+// v2 Pass P221：聊天窗口的系统提示词末尾追加"本论文术语与背景"小节（论文卡片 + 术语表，项目条目在前、
+// 全局条目在后；各自 user 来源优先、其次按 en 字母序；最多 150 条 / 6000 字符，超出给一行截断说明）。
+// 小节只取决于当前项目存的数据，不随每条消息变——这样各 provider 的 prompt 缓存前缀保持稳定。
+// 没有卡片、也没有可用条目 → 返回 ''，系统提示词与 P221 之前逐字节相同。
+const CHAT_TERM_MAX_ENTRIES = 150;
+const CHAT_TERM_MAX_CHARS = 6000;
+function chatTermSection() {
+    try {
+        const card = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+        const usable = function (e) { return e && e.en && e.enabled !== false && (e.kind === 'keep' || (typeof e.zh === 'string' && e.zh.trim())); };
+        const order = function (a, b) {
+            const ua = a.source === 'user' ? 0 : 1, ub = b.source === 'user' ? 0 : 1;
+            if (ua !== ub) return ua - ub;
+            return a.en < b.en ? -1 : (a.en > b.en ? 1 : 0);
+        };
+        const projAll = ovlTermDbList();
+        const projEn = Object.create(null);
+        projAll.forEach(function (e) { if (e && e.en) projEn[e.en] = true; });
+        const proj = projAll.filter(usable).sort(order);
+        const glob = ovlTermDbGlobalLoad().entries.filter(function (e) { return usable(e) && !projEn[e.en]; }).sort(order);
+        const all = proj.concat(glob);
+        if (!card && !all.length) return '';
+        let out = '\n## This paper\'s terminology and context\n';
+        if (card) out += card + '\n\n';
+        if (all.length) {
+            out += 'Glossary (English = Chinese). Use these exact equivalents whenever you translate, explain, or write text for this paper, in either direction:\n';
+            let shown = 0, chars = 0;
+            const lines = [];
+            for (let i = 0; i < all.length && shown < CHAT_TERM_MAX_ENTRIES; i++) {
+                const e = all[i];
+                const line = e.en + ' = ' + (e.kind === 'keep' ? '(keep in English)' : String(e.zh).trim());
+                if (chars + line.length + 1 > CHAT_TERM_MAX_CHARS) break;
+                lines.push(line); chars += line.length + 1; shown++;
+            }
+            out += lines.join('\n') + '\n';
+            if (shown < all.length) out += '(' + (all.length - shown) + ' more entries not shown; call glossary_list to see all.)\n';
+        }
+        return out;
+    } catch (e) { return ''; }
+}
 function chatSystemPrompt(hasTarget, hasDoc, hasFocus, docLang, hasTree, hasFileWatch) {
+    return chatSystemPromptBase(hasTarget, hasDoc, hasFocus, docLang, hasTree, hasFileWatch) + chatTermSection();
+}
+function chatSystemPromptBase(hasTarget, hasDoc, hasFocus, docLang, hasTree, hasFileWatch) {
     const lang = docLang || chatDocLang();
     const focusRule = hasFocus
         ? '\n用户这一轮还标了若干「额外关注」，装在 ==FOCUS …== 与 ==FOCUSEND== 之间。\n'
@@ -27304,6 +27362,122 @@ function ovlTermDbBuildPromptBlock(entries) {
 }
 
 // ============================================================================
+// v2 Pass P221：术语库 / 论文卡片的 zh→en 方向 + 统一的"方向感知"取数入口。
+// 此前只有 en→zh 方向会匹配/注入（上面的 ovlTermDbMatch 只看 en 侧）；回译、哨兵 zh→en、
+// 精修/近义词、聊天窗口都拿不到术语。这里加：
+//   · ovlTermDbMatchZh：按 zh 侧匹配（受保护区域先挡掉；最长 zh 优先；命中后把该 zh 的所有
+//     出现处用私有区字符 U+E000 同长度覆盖，"链路"就不会在"星间链路"已命中后再命中；cap
+//     按"组"计）；
+//   · ovlTermDbBuildPromptBlockZhEn：同一 zh 的多个 en 条目合并成一行；
+//   · ovlTermDbContextFor：{card, terms}，en2zh 分支原样复用上面的 en 匹配器/渲染器。
+// 没有卡片也没有命中时 card==='' 且 terms==='' —— 调用方据此保持请求体逐字节不变。
+// ============================================================================
+const OVL_TERMDB_ZH_MASK_CH = '\uE000';
+function ovlTermDbMatchZh(rawText, opts) {
+    try {
+        const cap = (opts && typeof opts.cap === 'number' && opts.cap > 0) ? Math.floor(opts.cap) : 30;
+        let text = ovlTermDbBlankProtected(rawText);
+        const all = (typeof ovlTermDbEffectiveList === 'function') ? ovlTermDbEffectiveList() : [];
+        const byZh = Object.create(null);
+        all.forEach(function (e) {
+            if (!e || !e.en || e.enabled === false || e.kind === 'keep') return;
+            const z = (typeof e.zh === 'string') ? e.zh.trim() : '';
+            if (Array.from(z).length < 2) return;
+            (byZh[z] = byZh[z] || []).push(e);
+        });
+        const zhs = Object.keys(byZh).sort(function (a, b) {
+            return (b.length - a.length) || (a < b ? -1 : (a > b ? 1 : 0));
+        });
+        const out = [];
+        let groups = 0;
+        for (let i = 0; i < zhs.length && groups < cap; i++) {
+            const z = zhs[i];
+            if (text.indexOf(z) === -1) continue;
+            groups++;
+            Array.prototype.push.apply(out, byZh[z]);
+            text = text.split(z).join(new Array(z.length + 1).join(OVL_TERMDB_ZH_MASK_CH));
+        }
+        return out;
+    } catch (e) { return []; }
+}
+// 同一 zh 的多个条目合并：1 条 → "zh -> en"；恰好 1 条缩写 + 其它 → "zh -> 全称 (abbr. ACR)"
+// （全称取 user 来源优先、其次最长 en）；否则 "zh -> en1 / en2 (choose by context)"。空返回 ''。
+function ovlTermDbBuildPromptBlockZhEn(entries) {
+    try {
+        if (!entries || !entries.length) return '';
+        const order = [];
+        const groups = Object.create(null);
+        entries.forEach(function (e) {
+            const z = String(e.zh).trim();
+            if (!groups[z]) { groups[z] = []; order.push(z); }
+            groups[z].push(e);
+        });
+        const rank = function (a, b) {
+            const ua = a.source === 'user' ? 0 : 1, ub = b.source === 'user' ? 0 : 1;
+            if (ua !== ub) return ua - ub;
+            if (a.en.length !== b.en.length) return b.en.length - a.en.length;
+            return a.en < b.en ? -1 : (a.en > b.en ? 1 : 0);
+        };
+        const lines = order.map(function (z) {
+            const g = groups[z].slice().sort(rank);
+            if (g.length === 1) return z + ' -> ' + g[0].en;
+            const acrs = g.filter(function (e) { return e.kind === 'acronym'; });
+            if (acrs.length === 1) {
+                const others = g.filter(function (e) { return e.kind !== 'acronym'; });
+                return z + ' -> ' + others[0].en + ' (abbr. ' + acrs[0].en + ')';
+            }
+            return z + ' -> ' + g.map(function (e) { return e.en; }).join(' / ') + ' (choose by context)';
+        });
+        return '\n\n' + 'Terminology (Chinese -> English; use these English terms exactly):\n' + lines.join('\n');
+    } catch (e) { return ''; }
+}
+// dir: 'en2zh' | 'zh2en'。opts.cap 缺省 30；opts.card===false 时不取卡片（\text{} 碎片用）。
+// terms 带前导 "\n\n"（跟 ovlTermDbBuildPromptBlock 同一约定）。
+function ovlTermDbContextFor(dir, text, opts) {
+    try {
+        const cap = (opts && typeof opts.cap === 'number' && opts.cap > 0) ? opts.cap : 30;
+        const card = (opts && opts.card === false) ? '' : ((typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '');
+        let terms;
+        if (dir === 'zh2en') terms = ovlTermDbBuildPromptBlockZhEn(ovlTermDbMatchZh(text, { cap: cap }));
+        else terms = ovlTermDbBuildPromptBlock(ovlTermDbMatch(text, { cap: cap }));
+        return { card: card, terms: terms };
+    } catch (e) { return { card: '', terms: '' }; }
+}
+// 给一条已有的 system 提示词包上"论文卡片 + 方向感知术语块"，布局与哨兵路径一致：
+// 术语块接在末尾、卡片放最前面。没有卡片也没有命中 → 原样返回同一个字符串（逐字节不变）。
+function ovlTermDbWrapSystem(sys, dir, text, cap) {
+    try {
+        const ctx = ovlTermDbContextFor(dir, text, { cap: cap || 30 });
+        if (!ctx.card && !ctx.terms) return sys;
+        let out = sys + ctx.terms;
+        if (ctx.card) out = ctx.card + '\n\n' + out;
+        return out;
+    } catch (e) { return sys; }
+}
+// 精修/近义词这类"只有 user 消息"的调用：把卡片（可选）+ 命中术语拼成一小段追加在 prompt 末尾的
+// 参考上下文。方向按输入文本的汉字占比判定。没有卡片也没有命中 → 返回 ''（prompt 逐字节不变）。
+function ovlTermDbRefineContext(text, withCard, cap) {
+    try {
+        const dir = ovlTermDbTextDir(text);
+        const ctx = ovlTermDbContextFor(dir, text, { cap: cap || 20, card: withCard === true });
+        if (!ctx.card && !ctx.terms) return '';
+        let out = '\n\nReference context for this paper (do NOT change the task above; use it only to keep terminology consistent, and never quote it in your answer):';
+        if (ctx.card) out += '\n' + ctx.card;
+        if (ctx.terms) out += ctx.terms;
+        return out;
+    } catch (e) { return ''; }
+}
+// 文本方向探测（精修/近义词用）：汉字占 汉字+拉丁字母 的 ≥30% 视为 zh。
+function ovlTermDbTextDir(text) {
+    try {
+        const s = String(text == null ? '' : text);
+        const cjk = (s.match(/[\u4e00-\u9fff]/g) || []).length;
+        const lat = (s.match(/[A-Za-z]/g) || []).length;
+        return (cjk > 0 && cjk / (cjk + lat) >= 0.3) ? 'zh2en' : 'en2zh';
+    } catch (e) { return 'en2zh'; }
+}
+
+// ============================================================================
 // v2 Pass P202b：术语库 / 论文背景卡设置面板 UI —— 表格视图、.tex 缩写扫描、"AI 补全"、
 // "AI 生成背景卡"、导入导出、关闭面板时按需重翻。
 //
@@ -28145,11 +28319,18 @@ async function chatAgentExecGlossaryList(args) {
         const msg = '无法读取项目术语表：还没有填写项目绝对路径。';
         return { ok: false, uiSummary: '读取术语表失败', uiDetail: msg, textForModel: msg, bytes: 0 };
     }
-    const list = ovlTermDbList().filter(function (t) { return t && t.zh; });
+    // v2 Pass P221：同时返回全局条目，每条带 scope（'project' | 'global'）；en 冲突时项目条目赢。
+    const projList = ovlTermDbList().filter(function (t) { return t && t.zh; });
+    const projEn = Object.create(null);
+    projList.forEach(function (t) { projEn[t.en] = true; });
+    const globList = ovlTermDbGlobalLoad().entries.filter(function (t) { return t && t.en && t.zh && !projEn[t.en]; });
+    const list = projList.map(function (t) { return { en: t.en, zh: t.zh, scope: 'project' }; })
+        .concat(globList.map(function (t) { return { en: t.en, zh: t.zh, scope: 'global' }; }));
     const text = list.length
-        ? ('当前项目术语表共 ' + list.length + ' 条：\n' + list.map(function (t) { return '  · ' + t.en + ' → ' + t.zh; }).join('\n'))
+        ? ('当前项目术语表共 ' + list.length + ' 条（项目 ' + projList.length + ' + 全局 ' + globList.length + '）：\n'
+            + list.map(function (t) { return '  · ' + t.en + ' → ' + t.zh + '  [' + t.scope + ']'; }).join('\n'))
         : '当前项目术语表是空的。';
-    return { ok: true, uiSummary: '项目术语表（' + list.length + ' 条）', uiDetail: text, textForModel: text, bytes: text.length };
+    return { ok: true, uiSummary: '项目术语表（' + list.length + ' 条）', uiDetail: text, textForModel: text, bytes: text.length, entries: list };
 }
 
 async function chatAgentExecGlossarySet(args, signal, pending) {
@@ -39805,8 +39986,16 @@ async function ovlVisualTranslateTextProseFragment(prose, config, signal, outMet
         + '2) 只输出翻译结果本身，不要添加任何解释、前后缀、引号或 Markdown 代码块标记。\n'
         + '3) 必须真正翻译成中文——禁止原样照抄或复述英文原文。\n\n'
         + '原文：\n' + masked.text;
+    // v2 Pass P221：\text{} 碎片又小又多，只经 system 槽带命中术语（cap 10），不带论文卡片；
+    // 没有命中时不传第 6 参，请求体逐字节不变。
+    const fragCtx = (typeof ovlTermDbContextFor === 'function') ? ovlTermDbContextFor('en2zh', src, { cap: 10, card: false }) : { terms: '' };
+    const fragSys = String(fragCtx.terms || '').replace(/^\n+/, '');
     let raw;
-    try { raw = await callModelPlainText(prompt, config, signal); } catch (e) { if (outMeta) outMeta.failed = true; return src; }
+    try {
+        raw = fragSys
+            ? await callModelPlainText(prompt, config, signal, null, null, fragSys)
+            : await callModelPlainText(prompt, config, signal);
+    } catch (e) { if (outMeta) outMeta.failed = true; return src; }
     const body = (typeof raw === 'string') ? raw.trim() : '';
     if (!body) { if (outMeta) outMeta.failed = true; return src; }
     if (ovlVisualIsEchoFailure(masked.text, body)) { if (outMeta) outMeta.failed = true; return src; }
@@ -40316,7 +40505,13 @@ async function ovlVisualTranslateBlockRaw(text, cfg, signal, meta) {
         + '所有 LaTeX 命令、环境、数学公式（\\cite{}、\\ref{}、$...$、\\begin{}…\\end{} 等）'
         + '一律原样保留，不要翻译也不要改写；形如 [12] 这样的方括号引用编号必须原样保留、'
         + '不得改动数字、不得加倍成 [[12]]；以 % 开头的注释行原样保留。\n\n' + src;
-    const raw = await callModelPlainText(prompt, cfg, signal);
+    // v2 Pass P221：L-raw 这一级此前不带任何上下文；现在经 system 槽补上论文卡片 + 命中术语
+    // （en→zh）。prompt 本身一个字不动；两者都空时不传第 6 参，逐字节不变。
+    const rawCtx = (typeof ovlTermDbContextFor === 'function') ? ovlTermDbContextFor('en2zh', src, { cap: 30 }) : { card: '', terms: '' };
+    const rawSys = ((rawCtx.card ? rawCtx.card + '\n\n' : '') + rawCtx.terms).replace(/^\n+/, '');
+    const raw = rawSys
+        ? await callModelPlainText(prompt, cfg, signal, null, null, rawSys)
+        : await callModelPlainText(prompt, cfg, signal);
     let body = (typeof raw === 'string') ? raw.trim() : '';
     if (ovlVisualIsEchoFailure(src, body)) {
         if (meta) meta.echoCandidate = body; // 跟 L0 同一条纪律：抓住候选，供 C3b 逃生门使用
@@ -40548,7 +40743,15 @@ async function ovlBacktranslateZhToEn(zhText, config, signal) {
         + '3) 只输出回译结果本身，不要添加任何解释、前后缀、引号或 Markdown 代码块标记。\n'
         + '4) 忠实还原原意，译成准确通顺的英文学术书面语。\n\n'
         + '中文原文：\n' + masked.text;
-    const raw = await callModelPlainText(prompt, config, signal);
+    // v2 Pass P221：回译也要吃论文卡片 + zh→en 术语块（按这段中文匹配）。走 callModelPlainText 的
+    // system 槽，所有 provider 同一条路（local/qwen/openai/claude = system 消息，gemini =
+    // systemInstruction），跟 Visual en→zh 路径同一布局。卡片和命中术语都为空时不传第 6 参，
+    // 请求体与 P221 之前逐字节相同。
+    const btCtx = (typeof ovlTermDbContextFor === 'function') ? ovlTermDbContextFor('zh2en', src, { cap: 30 }) : { card: '', terms: '' };
+    const btSys = ((btCtx.card ? btCtx.card + '\n\n' : '') + btCtx.terms).replace(/^\n+/, '');
+    const raw = btSys
+        ? await callModelPlainText(prompt, config, signal, null, null, btSys)
+        : await callModelPlainText(prompt, config, signal);
     const body = (typeof raw === 'string') ? raw.trim() : '';
     if (!xportBlockOk(body, masked.map)) {
         throw new Error('回译结果未通过完整性校验（占位符或公式被改动）');
