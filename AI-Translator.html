@@ -2720,6 +2720,7 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
     background: #fafafa;
 }
 .ovl-math-unsupported-note { font-size: 12px; color: #6b7280; margin-bottom: 6px; }
+.ovl-math-unsupported details > summary { font-size: 12px; color: #6b7280; cursor: pointer; margin-bottom: 4px; }
 .ovl-math-unsupported-src {
     font: 12.5px/1.5 "SFMono-Regular", Consolas, monospace; color: #1f2937;
     white-space: pre-wrap; word-break: break-word; margin: 0;
@@ -5022,7 +5023,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.46.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.47.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-07';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -9964,6 +9965,43 @@ let OvlEqNumCounter = null;
 // "2.1" 这种带节号形式（见该函数与 ovlEqNumSyncSection 头部注释）。hasOwnTag 判据改用
 // ovlEqNumLineHasOwnTag 共用函数——跟 ovlXrefApproxScan 里 ovlXrefEachCountableLine 判断
 // "这行占不占计数器"用的是同一个函数、同一条正则，不允许两处各自维护一份可能分叉的判据。
+// v2 Pass P228：按【顶层】\\ 切物理行。旧实现用 split(/\\\\/) 把嵌套在 cases/aligned/array/
+// matrix 等内层环境（或花括号组）里的 \\ 也当成行分隔——align/gather 行内只要套一个带换行的
+// cases，就会被切成多段、每段各插一个 \tag{N}，KaTeX 抛 "Multiple \tag" 整条公式变红色源码，
+// 而且计数器还多吃了号（后面所有公式编号错位、\eqref 近似号也跟着错）。这里只在 \begin/\end
+// 与花括号深度都为 0 时才认 \\；扁平（无嵌套）公式切出来的分段与旧 split 逐字节相同。
+function ovlEqNumSplitTopRows(body) {
+    const s = String(body == null ? '' : body);
+    const out = [];
+    let last = 0, depth = 0;
+    const envRe = /\\(begin|end)\s*\{[^{}]*\}/y;
+    for (let i = 0; i < s.length; i++) {
+        const c = s[i];
+        if (c === '\\') {
+            const nx = s[i + 1];
+            if (nx === '\\') {
+                if (depth === 0) { out.push(s.slice(last, i)); last = i + 2; }
+                i++;
+                continue;
+            }
+            envRe.lastIndex = i;
+            const m = envRe.exec(s);
+            if (m) {
+                depth += (m[1] === 'begin') ? 1 : -1;
+                if (depth < 0) depth = 0;
+                i += m[0].length - 1;
+            } else {
+                i++;
+            }
+            continue;
+        }
+        if (c === '{') depth++;
+        else if (c === '}') { depth--; if (depth < 0) depth = 0; }
+    }
+    out.push(s.slice(last));
+    return out;
+}
+
 function ovlEqNumAssign(env, body, counterState) {
     const numbers = [];
     if (env === 'multline') {
@@ -9971,11 +10009,11 @@ function ovlEqNumAssign(env, body, counterState) {
         counterState.n++;
         const disp = ovlEqNumFormatDisplay(counterState);
         numbers.push(disp);
-        const mlLines = body.split(/\\\\/);
+        const mlLines = ovlEqNumSplitTopRows(body);
         mlLines[mlLines.length - 1] = mlLines[mlLines.length - 1] + '\\tag{' + disp + '}';
         return { numbers: numbers, taggedBody: mlLines.join('\\\\') };
     }
-    const rowLines = (env === 'equation') ? [body] : body.split(/\\\\/);
+    const rowLines = (env === 'equation') ? [body] : ovlEqNumSplitTopRows(body);
     for (let ri = 0; ri < rowLines.length; ri++) {
         const line = rowLines[ri];
         if (!line.trim()) continue;
@@ -9986,6 +10024,160 @@ function ovlEqNumAssign(env, body, counterState) {
         rowLines[ri] = line + '\\tag{' + disp + '}';
     }
     return { numbers: numbers, taggedBody: (env === 'equation') ? rowLines[0] : rowLines.join('\\\\') };
+}
+
+// ==================== v2 Pass P228：KaTeX 兼容层（仅显示副本，且只在首次渲染失败后才介入）====================
+// 背景（jump 上真实 KaTeX 0.16.9 实测）：
+//   1. array 列格式里的 @{...}/!{...}/>{...}/<{...}、p{..}/m{..}/b{..}、*{n}{..} KaTeX 不认，
+//      "Unknown column alignment: @" 整条公式变红色源码——LaTeX 里 \begin{array}{@{}l@{}} 是极常见写法。
+//   2. cleanLatex 把 \\[4pt] 误改成 \\\[4pt]（原意是修 \[4pt]），KaTeX 把 \[ 当未定义命令，
+//      该处出现红色的 \[（不是 .katex-error，是 errorColor 行内着色，所以要认 cc0000）。
+//   3. 少数 LaTeX 常见但 KaTeX 没有的命令（\mathbbm、\vspace、\intertext 等）有明确的近似等价。
+//   4. 重复 \tag（用户源码本身写了两个）→ "Multiple \tag"。
+// 铁律：只改"送去 KaTeX 的这一份副本"；源文本、发给模型的副本、历史归档一个字节都不动。
+// 渲染成功的公式永远不进入这里，输出与改动前逐字节相同。
+function ovlKatexCompatColSpec(spec) {
+    let out = '';
+    for (let i = 0; i < spec.length; i++) {
+        const c = spec[i];
+        if (c === '@' || c === '!' || c === '>' || c === '<') {
+            let j = i + 1;
+            while (j < spec.length && /\s/.test(spec[j])) j++;
+            if (spec[j] === '{') { const e = ovlFindMatchingBrace(spec, j); if (e !== -1) i = e; }
+            continue;
+        }
+        if (c === 'p' || c === 'm' || c === 'b' || c === 'X') {
+            let j = i + 1;
+            while (j < spec.length && /\s/.test(spec[j])) j++;
+            if (c === 'X' || spec[j] === '{') {
+                if (spec[j] === '{') { const e = ovlFindMatchingBrace(spec, j); if (e !== -1) i = e; }
+                out += 'l';
+                continue;
+            }
+        }
+        if (c === '*') {
+            let j = i + 1;
+            while (j < spec.length && /\s/.test(spec[j])) j++;
+            if (spec[j] === '{') {
+                const e1 = ovlFindMatchingBrace(spec, j);
+                let k = e1 + 1;
+                while (k < spec.length && /\s/.test(spec[k])) k++;
+                if (e1 !== -1 && spec[k] === '{') {
+                    const e2 = ovlFindMatchingBrace(spec, k);
+                    const n = parseInt(spec.slice(j + 1, e1), 10);
+                    if (e2 !== -1 && Number.isFinite(n) && n >= 0 && n <= 64) {
+                        out += ovlKatexCompatColSpec(spec.slice(k + 1, e2)).repeat(n);
+                        i = e2;
+                        continue;
+                    }
+                }
+            }
+        }
+        out += c;
+    }
+    return out;
+}
+
+function ovlKatexCompatNormalize(f) {
+    let s = String(f == null ? '' : f);
+    // (1) cleanLatex 误伤：三个反斜杠 + [长度] → \\[长度]
+    s = s.replace(/\\\\\\\[\s*(-?\d*\.?\d+(?:pt|em|ex|cm|mm|in|pc|px|bp|mu))\s*\]/g, '\\\\[$1]');
+    // (2) array 列格式
+    const arrRe = /\\begin\{array\*?\}\s*(?:\[[a-z]\])?\s*\{/g;
+    let m, out = '', last = 0;
+    while ((m = arrRe.exec(s))) {
+        const open = m.index + m[0].length - 1;
+        const close = ovlFindMatchingBrace(s, open);
+        if (close === -1) break;
+        const spec = s.slice(open + 1, close);
+        out += s.slice(last, m.index) + '\\begin{array}{' + ovlKatexCompatColSpec(spec) + '}';
+        last = close + 1;
+        arrRe.lastIndex = close + 1;
+    }
+    s = out + s.slice(last);
+    // (3) 有明确近似等价的命令
+    s = s.replace(/\\(?:mathbbm|mathbbmss|mathds)(?![A-Za-z])/g, '\\mathbb');
+    s = s.replace(/\\intertext(?![A-Za-z])/g, '\\text');
+    s = s.replace(/\\(?:toprule|midrule|bottomrule)(?![A-Za-z])/g, '\\hline');
+    s = s.replace(/\\(?:hfill|allowbreak|nobreak|leavevmode|noindent|protect|ensuremath)(?![A-Za-z])/g, '');
+    const vsRe = /\\vspace\*?\s*\{/g;
+    out = ''; last = 0;
+    while ((m = vsRe.exec(s))) {
+        const open = m.index + m[0].length - 1;
+        const close = ovlFindMatchingBrace(s, open);
+        if (close === -1) break;
+        out += s.slice(last, m.index);
+        last = close + 1;
+        vsRe.lastIndex = close + 1;
+    }
+    s = out + s.slice(last);
+    return s;
+}
+
+// 只保留第一个 \tag{..}/\tag*{..}，其余删除（用户源码自己写了重复 \tag 时）。
+function ovlKatexCompatKeepFirstTag(s) {
+    const re = /\\tag\*?\s*\{/g;
+    let seen = false, out = '', last = 0, m;
+    while ((m = re.exec(s))) {
+        const open = m.index + m[0].length - 1;
+        const close = ovlFindMatchingBrace(s, open);
+        if (close === -1) break;
+        re.lastIndex = close + 1;
+        if (!seen) { seen = true; continue; }
+        out += s.slice(last, m.index);
+        last = close + 1;
+    }
+    return out + s.slice(last);
+}
+
+// 从 KaTeX 红色错误输出里取"错误信息"（title 属性），去掉 " at position N: …上下文" 尾巴
+// ——上下文是公式原文片段，不外显；只留信息本身（如 Unknown column alignment: @）。
+function ovlKatexErrorMessage(html) {
+    const m = /class="katex-error"\s+title="([^"]*)"/.exec(html);
+    if (!m) return '';
+    let t = m[1].replace(/&quot;/g, '"').replace(/&#x27;|&#39;/g, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&amp;/g, '&');
+    t = t.replace(/^ParseError:\s*/, '').replace(/^KaTeX parse error:\s*/, '').replace(/\s+at position[\s\S]*$/, '').replace(/\s+/g, ' ').trim();
+    return t.length > 80 ? t.slice(0, 80) + '…' : t;
+}
+
+function ovlKatexCountRed(html) {
+    const m = String(html).match(/cc0000/g);
+    return m ? m.length : 0;
+}
+
+// 首次渲染含红色（rendered 已含 cc0000）后调用：依次试 ①归一化副本 ②"不含自动编号"的归一化副本
+// （用户自带 \tag 优先于自动号）③去重 \tag 后的副本；谁先把红色消掉/减少就用谁。全部失败：
+// 原样保留首次输出（行内红色命令，其余部分仍可读）；整条 .katex-error 则换成灰色说明框，
+// 默认不展示源码（点开才看），不再是一整面红色源码墙。
+function ovlKatexCompatRetry(formula, untaggedFormula, first, opts, rawMatch) {
+    try {
+        const hard0 = first.indexOf('katex-error') !== -1;
+        const red0 = ovlKatexCountRed(first);
+        const tried = new Set([formula]);
+        const cands = [];
+        const push = (c) => { if (c != null && !tried.has(c)) { tried.add(c); cands.push(c); } };
+        const n1 = ovlKatexCompatNormalize(formula);
+        push(n1);
+        if (untaggedFormula != null) push(ovlKatexCompatNormalize(untaggedFormula));
+        push(ovlKatexCompatKeepFirstTag(n1));
+        for (let i = 0; i < cands.length; i++) {
+            let r;
+            try { r = window.katex.renderToString(cands[i], opts); } catch (e) { continue; }
+            const hard = r.indexOf('katex-error') !== -1;
+            if (hard) continue;
+            if (hard0 || ovlKatexCountRed(r) < red0) return r;
+        }
+        if (hard0) {
+            const msg = ovlKatexErrorMessage(first) || 'KaTeX 报错';
+            const esc = (x) => String(x).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            return '<div class="ovl-math-unsupported ovl-math-error-note"><div class="ovl-math-unsupported-note">公式无法渲染：'
+                + esc(msg) + '</div><details><summary>查看 LaTeX 源码</summary><pre class="ovl-math-unsupported-src">'
+                + esc(rawMatch) + '</pre></details></div>';
+        }
+        return first;
+    } catch (e) {
+        return first;
+    }
 }
 
 // 渲染格式化文本（支持Markdown和LaTeX）
@@ -10026,10 +10218,14 @@ function renderFormattedText(text, xrefCtx, tagFormulas) {
     // 还是（走不到这里，因为已经保留）额外插入 \tag{N}。
 
     const placeholders = [];
+    // v2 Pass P228：环境回调在自动插入 \tag{N} 之前把"未插号"的整段环境文本记在这里，
+    // 仅供首次渲染失败后的兼容重试使用（用户自己写的 \tag 优先于自动号）；成功路径不读它。
+    let compatUntagged = null;
 
     const pushPlaceholder = (regex, type, getFormula) => {
         content = content.replace(regex, (...args) => {
             const match = args[0];
+            compatUntagged = null;
             // v2 Pass P180：先记下这是第几个占位符（ordinal）——id 字符串里嵌的数字跟这个值
             // 恒相等，只是取值时机提前一步，供下面 tagFormulas 分支生成 data-ovl-latex-ph
             // 属性值时直接用，不用反解析 id 字符串。
@@ -10053,7 +10249,7 @@ function renderFormattedText(text, xrefCtx, tagFormulas) {
             // 未传 xrefCtx 时 ovlXrefStripOrNumberFormula 逐字节回退到原来的三次 stripCommand。
             formula = ovlXrefStripOrNumberFormula(formula, xrefCtx);
             try {
-                const rendered = window.katex.renderToString(formula, {
+                const katexOpts = {
                     displayMode: type === 'display',
                     throwOnError: false,
                     trust: true,
@@ -10064,7 +10260,18 @@ function renderFormattedText(text, xrefCtx, tagFormulas) {
                     // 未调用过 ovlXrefBuild 的既有调用点（未传 xrefCtx 的聊天气泡等）读到的是
                     // OvlXrefState 初始值 false，逐字节维持改动前行为。
                     leqno: (typeof OvlXrefState !== 'undefined' && OvlXrefState && OvlXrefState.leqno) || false
-                });
+                };
+                let rendered = window.katex.renderToString(formula, katexOpts);
+                // v2 Pass P228：首次渲染失败（整条红色源码 .katex-error，或行内红色未定义命令）才进入
+                // 兼容层——能渲染的公式一个字节都不变。兼容层只改这份送给 KaTeX 的副本，源文本、
+                // 发给模型的副本、历史归档不受影响（CLAUDE.md §5.3 第3条）。
+                if (rendered.indexOf('cc0000') !== -1) {
+                    let untaggedPrepared = null;
+                    if (compatUntagged != null) {
+                        untaggedPrepared = ovlXrefStripOrNumberFormula(stripCommand(cleanLatex(compatUntagged), 'label'), xrefCtx);
+                    }
+                    rendered = ovlKatexCompatRetry(formula, untaggedPrepared, rendered, katexOpts, match);
+                }
                 // v2 Pass P180：tagFormulas 为真时（仅 Visual 主渲染路径的少数调用点传入，见
                 // ovlVisualRenderChunk/ovlVisualRenderChunkWithEqNum 调用处的注释）在 KaTeX
                 // 输出外面包一层可寻址的 <span data-ovl-latex-ph="ORD">——ORD 是纯数字字面量
@@ -10132,6 +10339,7 @@ function renderFormattedText(text, xrefCtx, tagFormulas) {
         // 调用点，见该模块级变量顶部注释）时完全不插 \tag，逐字节维持这些调用点改动前的
         // 观感（不显示编号）。
         if (!isCasesFamily && !star && OvlEqNumCounter) {
+            compatUntagged = '\\begin{' + env + (star || '') + '}' + body + '\\end{' + env + (star || '') + '}'; // v2 Pass P228
             body = ovlEqNumAssign(env, body, OvlEqNumCounter).taggedBody;
         }
         const outEnv = env + (star || '');
@@ -37753,7 +37961,7 @@ function ovlXrefDetectLeqno(fullSrc) {
 // （真实渲染路径）本来就有的"自带 \tag 不占计数器"规则，是近似档号跟真实 \tag{N} 分叉的
 // 真实根因之一（见本节顶部大注释）。
 function ovlXrefEachCountableLine(body, cb) {
-    const lines = String(body == null ? '' : body).split(/\\\\/);
+    const lines = ovlEqNumSplitTopRows(body); // v2 Pass P228：与 ovlEqNumAssign 同一个顶层切行函数，渲染号与近似号不分叉
     for (let li = 0; li < lines.length; li++) {
         const line = lines[li];
         if (!line.trim()) continue;
