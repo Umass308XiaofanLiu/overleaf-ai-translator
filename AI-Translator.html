@@ -5022,8 +5022,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.46.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-10-05';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.46.01';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-10-07';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -67577,6 +67577,36 @@ function ovlVisTransHide() {
     if (box) { box.classList.remove('ovl-open'); box.hidden = true; }
 }
 
+// v2 Pass P227：防御性剥除。术语块已经搬进 system 槽，正常情况下模型不会再回显它；但弱模型仍可能
+// 把 system 里的术语表抄到译文开头。只在「以术语块表头开头（英文表头，或形如 术语（…）： 的中文渲染）、
+// 并且表头之后紧跟的是本次命中术语逐字生成的 "en → zh" / "en → en (keep in English)" 行」时才剥；
+// 一行命中术语都没吃到就原样返回，绝不碰正常译文。剥完是空串也原样返回（不把译文剥没）。
+function ovlVisTransStripTermEcho(result, matched) {
+    try {
+        if (typeof result !== 'string' || !result || !matched || !matched.length) return result;
+        const hm = /^(?:Terminology \(use exactly\):|术语[（(][^）)\n]{0,24}[）)][:：])[ \t]*\n?/.exec(result);
+        if (!hm) return result;
+        const lines = matched.map(function (e) {
+            return (e.kind === 'keep') ? (e.en + ' → ' + e.en + ' (keep in English)') : (e.en + ' → ' + e.zh);
+        });
+        let rest = result.slice(hm[0].length);
+        let consumed = 0;
+        for (;;) {
+            rest = rest.replace(/^[ \t]+/, '');
+            let best = '';
+            for (let i = 0; i < lines.length; i++) {
+                if (lines[i].length > best.length && rest.startsWith(lines[i])) best = lines[i];
+            }
+            if (!best) break;
+            rest = rest.slice(best.length).replace(/^[ \t]*\n/, '');
+            consumed++;
+        }
+        if (!consumed) return result;
+        rest = rest.replace(/^\s+/, '');
+        return rest ? rest : result;
+    } catch (e) { return result; }
+}
+
 // v2 Pass P7：加第 3 参 promptKind（'tex' | 未传/其它 = 'vis'）。函数体内其余部分——缓存 /
 // 竞态 / 中断 / 四候选定位——一个字节不 fork，Visual 分支的行为逐字节保持原样。
 async function ovlVisTransRequest(text, selRows, promptKind) {
@@ -67590,7 +67620,7 @@ async function ovlVisTransRequest(text, selRows, promptKind) {
     const p202aMatched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(text, { cap: 30 }) : [];
     const p202aCtxFp = (typeof ovlVisualHashSrc === 'function')
         ? ovlVisualHashSrc(p202aCard + '\u0001' + JSON.stringify(p202aMatched)) : '';
-    const key = (promptKind === 'tex' ? 'tex ' : 'vis ') + text + '|' + p202aCtxFp;
+    const key = (promptKind === 'tex' ? 'tex2 ' : 'vis2 ') + text + '|' + p202aCtxFp; // v2 Pass P227：前缀升级，P227 之前产生的串味缓存条目不再可达
 
     const cached = ovlVisTransCacheGet(key);
     if (cached !== undefined) {
@@ -67626,20 +67656,23 @@ async function ovlVisTransRequest(text, selRows, promptKind) {
         // localExtra 的位置一致）。两者都空时 prompt 逐字节等于 P202a 之前。
         const domainHintLine = (cfg && cfg.provider === 'local' && typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
         const termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(p202aMatched) : '';
-        let contextExtra = '';
-        if (domainHintLine) contextExtra += domainHintLine + '\n\n';
-        contextExtra += termsBlock;
-        const cardPrefix = p202aCard ? (p202aCard + '\n\n') : '';
-        // else 那一支必须与原来逐字节相同——Visual 路径不许变。
-        const prompt = cardPrefix + ((promptKind === 'tex')
+        // v2 Pass P227：卡片 / 领域提示 / 命中术语块一律走 system 槽，不再拼进带原文的 user 消息。
+        // 根因：ovlTermDbBuildPromptBlock 的输出末尾没有分隔符，旧代码把它直接接在 text 前面
+        // （"…ISL → ISL" + 原文），模型分不清术语表和原文，连术语表一起翻译并回显进弹框。
+        // 三者都为空时不传第 6 参，请求体与 P227 之前逐字节相同。
+        const popupSys = [p202aCard, domainHintLine, String(termsBlock || '').replace(/^\n+/, '')]
+            .filter(function (x) { return !!x; }).join('\n\n');
+        const prompt = (promptKind === 'tex')
             ? '把下面这段 LaTeX 源码里的正文翻译成中文。只输出译文本身，不要解释，不要重复原文。'
-              + '所有 LaTeX 命令、环境、数学公式（\\cite{}、\\ref{}、$...$、\\begin{}…\\end{} 等）'
-              + '一律原样保留，不要翻译也不要改写；以 % 开头的注释行原样保留。\n\n' + contextExtra + text
+              + '所有 LaTeX 命令、环境、数学公式（\cite{}、\ref{}、$...$、\begin{}…\end{} 等）'
+              + '一律原样保留，不要翻译也不要改写；以 % 开头的注释行原样保留。\n\n' + text
             : '把下面这段学术英文翻译成中文。只输出译文本身，不要解释，不要重复原文。'
-              + '保留其中的 LaTeX 数学公式（$...$）原样不译。\n\n' + contextExtra + text);
-        const out = await callModelPlainText(prompt, cfg, ctl ? ctl.signal : null);
+              + '保留其中的 LaTeX 数学公式（$...$）原样不译。\n\n' + text;
+        const out = popupSys
+            ? await callModelPlainText(prompt, cfg, ctl ? ctl.signal : null, null, null, popupSys)
+            : await callModelPlainText(prompt, cfg, ctl ? ctl.signal : null);
         if (mySeq !== OvlVisTransSeq) return; // 选区早就换了/框已经关了，陈旧响应一个字节都不写
-        const result = (typeof out === 'string' && out.trim()) ? out.trim() : '（模型未返回可用译文）';
+        const result = (typeof out === 'string' && out.trim()) ? ovlVisTransStripTermEcho(out.trim(), p202aMatched) : '（模型未返回可用译文）';
         ovlVisTransCacheSet(key, result);
         OvlVisTransRawResult = (typeof out === 'string' && out.trim()) ? result : null; // 占位文案不是译文，不可作为编辑起种
         body.innerHTML = renderFormattedText(result);
