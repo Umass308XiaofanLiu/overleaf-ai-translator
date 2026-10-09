@@ -2394,6 +2394,9 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 .ovl-visual-block > *:last-child { margin-bottom: 0; }
 .ovl-visual-block[data-para-start="1"] { margin-top: 0.6em; }
 .ovl-visual-block[data-para-start="0"] { margin-top: 0; }
+/* v2 Pass P229：\hfil 段尾右浮（"(N)" 靠右）与 \quad 等间距 */
+.ovl-visual-block p:has(> .ovl-hfil-r) { display: flow-root; }
+.ovl-hfil-r { float: right; margin-left: 1.5em; }
 /* v2 Pass P170：'compare' 英中对照模式——同一个 .ovl-visual-block 内纵向堆两行，英文在上、
    中文译文在下，共享同一个外层块（同一对 data-src-line/-line-end），因此天然共享同一格
    gutter 行号（N4，ovlRenderVisualGutter 按元素实际渲染高度取值，对内部堆几行完全无感，见
@@ -4482,6 +4485,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
     }
 
     function lookupMacro(name, ctx) {
+        if (ctx.keep && hasOwn(ctx.keep, name)) { return null; }   /* options.keepMacros (display-only callers): leave untouched */
         if (hasOwn(MACRO_TABLE, name)) { return MACRO_TABLE[name]; }
         if (ctx.structure && hasOwn(STRUCTURE_TABLE, name)) { return STRUCTURE_TABLE[name]; }
         return null;
@@ -4950,8 +4954,15 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
                 ops: 0,
                 opCap: 4 * src.length + 1000000,
                 comments: comments,
-                structure: opts.structure !== false
+                structure: opts.structure !== false,
+                keep: null
             };
+            /* options.keepMacros: names to leave as CLASS 3 (untouched). Only display callers pass it;
+             * the translation path never does, so its output is unchanged. */
+            if (opts.keepMacros && opts.keepMacros.length) {
+                ctx.keep = {};
+                for (var ki = 0; ki < opts.keepMacros.length; ki++) { ctx.keep[String(opts.keepMacros[ki])] = 1; }
+            }
 
             /* Run to a FIXPOINT. Every pass is strictly non-lengthening in macro count, so
              * this terminates. It is what makes filter(filter(x)) === filter(x) hold even
@@ -5023,8 +5034,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.47.00';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-10-07';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.47.01';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-10-09';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -9940,6 +9951,381 @@ function ovlRenderTextColor(str, placeholders) {
     return out;
 }
 
+// ==================== v2 Pass P229：Visual 文本模式命令（仅显示层）====================
+// 背景：Visual 散文经 LatexFilter 之后，\quad/\par/\nobreak/\hfil 这类文本模式命令不在宏表里（CLASS 3，
+// 原样保留），marked 又把它们当字面文字；导言区 \newcommand 定义从不进入渲染器，\eqtag{1} 之类用户宏也
+// 原样漏出；\textbf/\textit/\emph 被 LatexFilter UNWRAP 掉，粗体斜体丢失。
+// 铁律：只改 Visual 显示路径。LatexFilter 对翻译链路的输出、发给模型的副本、源文本、历史、聊天气泡渲染一个
+// 字节都不动：本段所有逻辑只在 OvlVisualTextCmdsOn 为真时执行，而它只由 ovlVisualRenderChunk 在调用
+// renderFormattedText 期间置真。不含新构造的块输出与改动前逐字节相同。
+let OvlVisualTextCmdsOn = false;
+// 交给 LatexFilter 的"保留这些宏"名单（Visual 专用选项 keepMacros）：格式宏要到 renderFormattedText 里渲染。
+const OVL_P229_KEEP_MACROS = ['textbf', 'textit', 'emph'];
+const OVL_P229_HFIL = '';
+// 只当作 TeX 参数赋值吃掉的名单（\parfillskip=0pt 这类）；不在名单里的 \name=... 不动。
+const OVL_P229_TEX_PARAMS = new Set(['parfillskip', 'finalhyphendemerits', 'hyphenpenalty', 'exhyphenpenalty',
+    'tolerance', 'pretolerance', 'emergencystretch', 'parindent', 'parskip', 'baselineskip', 'lineskip',
+    'lineskiplimit', 'leftskip', 'rightskip', 'hsize', 'vsize', 'looseness', 'clubpenalty', 'widowpenalty',
+    'brokenpenalty', 'interlinepenalty', 'hbadness', 'vbadness', 'hfuzz', 'vfuzz', 'linepenalty', 'adjdemerits',
+    'doublehyphendemerits', 'spaceskip', 'xspaceskip', 'hangindent', 'hangafter', 'predisplaypenalty',
+    'postdisplaypenalty', 'displaywidowpenalty', 'binoppenalty', 'relpenalty']);
+// 文本命令里"直接删掉、不留痕迹"的无参命令。
+const OVL_P229_DROP_CMDS = new Set(['nobreak', 'allowbreak', 'leavevmode', 'relax', 'null', 'ignorespaces',
+    'protect', 'strut', 'xspace', 'noindent']);
+const OVL_P229_MATH_ENVS = new Set(['equation', 'align', 'gather', 'alignat', 'multline', 'flalign', 'eqnarray',
+    'displaymath', 'math', 'cases', 'dcases', 'rcases', 'split', 'aligned', 'gathered', 'alignedat', 'array',
+    'matrix', 'pmatrix', 'bmatrix', 'Bmatrix', 'vmatrix', 'Vmatrix', 'smallmatrix', 'IEEEeqnarray', 'subequations']);
+const OVL_P229_UNEXPANDABLE_RE = /\\(?:expandafter|csname|endcsname|if[A-Za-z]*|else|fi|futurelet|let|edef|xdef|gdef|def|newcommand|renewcommand|providecommand|DeclareRobustCommand|makeatletter|makeatother|ifthenelse)(?![A-Za-z])|\\@/;
+const OVL_P229_MATH_DENY_RE = /\\(?:par|parfillskip|finalhyphendemerits|hfil|hfill|penalty|nobreak|unskip|hskip|vskip|kern|leavevmode|newline|noindent|vspace|break|linebreak|pagebreak|raggedleft|raggedright|centering|xspace|expandafter|csname|if[A-Za-z]*|else|fi)(?![A-Za-z])|\\@/;
+
+// 解析导言区（或全文）里的宏定义。src 必须已剥注释。返回 null 表示没有任何定义。
+// 条目：{ n: 参数个数(0..9), opt: 第一个可选参数的默认值或 null, body, math: 是否 DeclareMathOperator,
+//         text: 文本模式可展开 }
+function ovlP229ParseMacros(src) {
+    const s = String(src == null ? '' : src);
+    if (s.indexOf('\\') === -1) return null;
+    const defs = Object.create(null);
+    let count = 0;
+    const re = /\\(newcommand|renewcommand|providecommand|DeclareRobustCommand|DeclareMathOperator|def|gdef)(\*?)(?![A-Za-z])/g;
+    let m;
+    const skipWs = function (p) { while (p < s.length && /\s/.test(s[p])) p++; return p; };
+    while ((m = re.exec(s)) && count < 400) {
+        const kind = m[1];
+        let p = skipWs(m.index + m[0].length);
+        let name = null;
+        if (s[p] === '{') {
+            const close = ovlFindMatchingBrace(s, p);
+            if (close === -1) continue;
+            const inner = s.slice(p + 1, close).trim();
+            const nm = /^\\([A-Za-z]+)$/.exec(inner);
+            if (!nm) continue;
+            name = nm[1];
+            p = close + 1;
+        } else {
+            const nm = /^\\([A-Za-z]+)/.exec(s.slice(p, p + 64));
+            if (!nm) continue;
+            name = nm[1];
+            p += nm[0].length;
+        }
+        let n = 0, opt = null, body = null, isMath = false;
+        if (kind === 'def' || kind === 'gdef') {
+            const pm = /^(?:#[1-9])*/.exec(s.slice(p, p + 40));
+            const params = pm ? pm[0] : '';
+            n = params.length / 2;
+            p = skipWs(p + params.length);
+            if (s[p] !== '{') continue;           // 带分隔符的 \def 不支持：不登记
+            const close = ovlFindMatchingBrace(s, p);
+            if (close === -1) continue;
+            body = s.slice(p + 1, close);
+            re.lastIndex = close + 1;
+        } else if (kind === 'DeclareMathOperator') {
+            p = skipWs(p);
+            if (s[p] !== '{') continue;
+            const close = ovlFindMatchingBrace(s, p);
+            if (close === -1) continue;
+            body = '\\operatorname' + (m[2] === '*' ? '*' : '') + '{' + s.slice(p + 1, close) + '}';
+            isMath = true;
+            re.lastIndex = close + 1;
+        } else {
+            p = skipWs(p);
+            if (s[p] === '[') {
+                const e = s.indexOf(']', p);
+                const nd = e === -1 ? null : /^\s*([0-9])\s*$/.exec(s.slice(p + 1, e));
+                if (!nd) continue;
+                n = parseInt(nd[1], 10);
+                p = skipWs(e + 1);
+                if (s[p] === '[') {
+                    // 第一个参数的默认值：到配平的 ] 为止（允许里面有花括号）
+                    let depth = 0, e2 = -1;
+                    for (let k = p + 1; k < s.length; k++) {
+                        const ch = s[k];
+                        if (ch === '{') depth++;
+                        else if (ch === '}') depth--;
+                        else if (ch === ']' && depth === 0) { e2 = k; break; }
+                        if (depth < 0) break;
+                    }
+                    if (e2 === -1) continue;
+                    opt = s.slice(p + 1, e2);
+                    p = skipWs(e2 + 1);
+                }
+            }
+            if (s[p] !== '{') continue;
+            const close = ovlFindMatchingBrace(s, p);
+            if (close === -1) continue;          // 定义里花括号不配平：不登记
+            body = s.slice(p + 1, close);
+            re.lastIndex = close + 1;
+        }
+        if (body == null || body.length > 4000) continue;
+        if (opt !== null && n < 1) continue;
+        if (kind === 'providecommand' && defs[name]) continue;
+        if (!defs[name]) count++;
+        defs[name] = { n: n, opt: opt, body: body, math: isMath, text: !isMath && !OVL_P229_UNEXPANDABLE_RE.test(body) };
+    }
+    return count ? defs : null;
+}
+
+// 文本模式宏展开。返回展开后的字符串；没有任何已定义宏的用法时返回 null（调用方保持原文不动）；
+// 任何失败（递归超过 10 层、产出过大、参数缺失）抛异常，由调用方整体放弃（按改动前渲染）。
+function ovlMacroExpandText(text, defs) {
+    const s0 = String(text == null ? '' : text);
+    if (!defs || s0.indexOf('\\') === -1) return null;
+    const useRe = /\\([A-Za-z]+)/g;
+    let any = false, um;
+    while ((um = useRe.exec(s0))) {
+        const d = defs[um[1]];
+        if (d && d.text) { any = true; break; }
+    }
+    if (!any) return null;
+    const cap = Math.max(20000, s0.length * 8);
+    let produced = 0;
+    function exp(s, depth) {
+        if (depth > 10) throw new Error('macro depth');
+        const n = s.length;
+        let out = '', i = 0;
+        while (i < n) {
+            let k = i;
+            while (k < n && s[k] !== '\\' && s[k] !== '$') k++;
+            if (k > i) { out += s.slice(i, k); i = k; if (i >= n) break; }
+            const c = s[i];
+            if (c === '$') {
+                if (s[i + 1] === '$') {
+                    const e = s.indexOf('$$', i + 2);
+                    if (e === -1) { out += '$$'; i += 2; } else { out += s.slice(i, e + 2); i = e + 2; }
+                } else {
+                    const e = s.indexOf('$', i + 1);
+                    if (e === -1) { out += '$'; i += 1; } else { out += s.slice(i, e + 1); i = e + 1; }
+                }
+                continue;
+            }
+            // c === '\\'
+            const c1 = s[i + 1];
+            if (c1 === undefined) { out += '\\'; i++; continue; }
+            if (c1 === '(' || c1 === '[') {
+                const closer = c1 === '(' ? '\\)' : '\\]';
+                const e = s.indexOf(closer, i + 2);
+                if (e === -1) { out += s.slice(i, i + 2); i += 2; } else { out += s.slice(i, e + 2); i = e + 2; }
+                continue;
+            }
+            if (!/[A-Za-z]/.test(c1)) { out += s.slice(i, i + 2); i += 2; continue; }
+            let j = i + 1;
+            while (j < n && /[A-Za-z]/.test(s[j])) j++;
+            const name = s.slice(i + 1, j);
+            if (name === 'begin') {
+                const em = /^\s*\{([^{}]*)\}/.exec(s.slice(j, j + 80));
+                if (em) {
+                    const env = em[1].replace(/\*$/, '');
+                    if (OVL_P229_MATH_ENVS.has(env)) {
+                        const endTag = '\\end{' + em[1] + '}';
+                        const e = s.indexOf(endTag, j + em[0].length);
+                        if (e !== -1) { out += s.slice(i, e + endTag.length); i = e + endTag.length; continue; }
+                    }
+                }
+                out += s.slice(i, j); i = j; continue;
+            }
+            const def = defs[name];
+            if (!def || !def.text) { out += s.slice(i, j); i = j; continue; }
+            // ---- 取参数 ----
+            let p = j;
+            const args = [];
+            const fromOpt = def.opt !== null;
+            if (fromOpt) {
+                const q = (function () { let t = p; while (t < n && /[ \t]/.test(s[t])) t++; return t; })();
+                if (s[q] === '[') {
+                    let depth = 0, e2 = -1;
+                    for (let t = q + 1; t < n; t++) {
+                        const ch = s[t];
+                        if (ch === '{') depth++;
+                        else if (ch === '}') depth--;
+                        else if (ch === ']' && depth === 0) { e2 = t; break; }
+                        if (depth < 0) break;
+                    }
+                    if (e2 === -1) throw new Error('macro opt');
+                    args.push(s.slice(q + 1, e2));
+                    p = e2 + 1;
+                } else {
+                    args.push(def.opt);
+                }
+            }
+            const need = def.n - (fromOpt ? 1 : 0);
+            for (let a = 0; a < need; a++) {
+                let q = p;
+                while (q < n && /\s/.test(s[q])) q++;
+                if (q >= n) throw new Error('macro args');
+                if (s[q] === '{') {
+                    const close = ovlFindMatchingBrace(s, q);
+                    if (close === -1) throw new Error('macro brace');
+                    args.push(s.slice(q + 1, close));
+                    p = close + 1;
+                } else if (s[q] === '\\') {
+                    const tm = /^\\(?:[A-Za-z]+|.)/.exec(s.slice(q, q + 64));
+                    if (!tm) throw new Error('macro tok');
+                    args.push(tm[0]);
+                    p = q + tm[0].length;
+                } else if (s[q] === '}' || s[q] === '$') {
+                    throw new Error('macro tok');
+                } else {
+                    args.push(s[q]);
+                    p = q + 1;
+                }
+            }
+            if (def.n === 0) {
+                if (s[p] === '{' && s[p + 1] === '}') p += 2;                 // \name{} 吃掉空组
+                else if (def.body.indexOf('\\xspace') === -1) { while (p < n && /[ \t]/.test(s[p])) p++; }   // 控制字后的空格被 TeX 吞掉
+            }
+            let body = def.body.replace(/##|#([1-9])/g, function (mm, d) {
+                if (mm === '##') return '#';
+                return (+d <= args.length) ? args[+d - 1] : mm;
+            });
+            let res = exp(body, depth + 1);
+            produced += res.length;
+            if (produced > cap) throw new Error('macro size');
+            const tr = res.trim();
+            if (tr.length >= 2 && tr[0] === '{' && ovlFindMatchingBrace(tr, 0) === tr.length - 1) res = tr.slice(1, -1);   // 去掉整体多余的一层分组
+            out += res;
+            i = p;
+        }
+        return out;
+    }
+    return exp(s0, 0);
+}
+
+// 文本模式命令渲染（对已经抽走数学占位符的 content 操作，所以数学内部一个字都碰不到）。
+function ovlVisualTextCmdPass(content, placeholders) {
+    const s = String(content);
+    if (s.indexOf('\\') === -1) return content;
+    const n = s.length;
+    const ph = function (html) {
+        const id = '%%LATEX_' + placeholders.length + '%%';
+        placeholders.push({ id: id, html: html });
+        return id;
+    };
+    const sp = function (em) { return ph('<span class="ovl-hs" style="display:inline-block;width:' + em + 'em"></span>'); };
+    let out = '', i = 0;
+    const closers = [];
+    let changed = false;
+    while (i < n) {
+        while (closers.length && closers[closers.length - 1].at < i) out += closers.pop().id;   // 被转义的 \} 吃掉了收尾位置：补收尾，不丢标签
+        const nextClose = closers.length ? closers[closers.length - 1].at : n;
+        if (i === nextClose && closers.length) { out += closers.pop().id; i++; continue; }
+        let bs = s.indexOf('\\', i);
+        if (bs === -1) bs = n;
+        const stop = Math.min(bs, nextClose);
+        if (stop > i) { out += s.slice(i, stop); i = stop; continue; }
+        // s[i] === '\\'
+        const c1 = s[i + 1];
+        if (c1 === undefined) { out += '\\'; i++; continue; }
+        if (!/[A-Za-z]/.test(c1)) {
+            if (c1 === ',') { out += sp(0.17); i += 2; changed = true; continue; }
+            if (c1 === ';') { out += sp(0.28); i += 2; changed = true; continue; }
+            if (c1 === ':') { out += sp(0.22); i += 2; changed = true; continue; }
+            if (c1 === ' ') { out += ' '; i += 2; changed = true; continue; }
+            if (c1 === '!' || c1 === '/') { i += 2; changed = true; continue; }
+            out += '\\' + c1; i += 2; continue;
+        }
+        let j = i + 1;
+        while (j < n && /[A-Za-z]/.test(s[j])) j++;
+        const name = s.slice(i + 1, j);
+        const skipSp = function (p) { while (p < n && /[ \t]/.test(s[p])) p++; return p; };
+        if (name === 'quad' || name === 'qquad' || name === 'enspace' || name === 'enskip') {
+            out += sp(name === 'quad' ? 1 : (name === 'qquad' ? 2 : 0.5));
+            i = skipSp(j); changed = true; continue;
+        }
+        if (name === 'par') { out += '\n\n'; i = skipSp(j); changed = true; continue; }
+        if (name === 'unskip') { out = out.replace(/[ \t]+$/, ''); i = skipSp(j); changed = true; continue; }
+        if (name === 'hfil' || name === 'hfill') { out += OVL_P229_HFIL; i = skipSp(j); changed = true; continue; }
+        if (OVL_P229_DROP_CMDS.has(name)) { i = (name === 'xspace') ? j : skipSp(j); changed = true; continue; }
+        if (name === 'penalty') {
+            const pm = /^\s*[+-]?\d+/.exec(s.slice(j, j + 24));
+            if (pm) { i = skipSp(j + pm[0].length); changed = true; continue; }
+        }
+        if (name === 'hskip' || name === 'kern' || name === 'vskip' || name === 'mskip') {
+            const p2 = ovlBibConsumeGlue(s, j);
+            i = skipSp(p2); changed = true; continue;
+        }
+        if (OVL_P229_TEX_PARAMS.has(name)) {
+            const em = /^\s*=?/.exec(s.slice(j, j + 24));
+            const start = j + (em ? em[0].length : 0);
+            const p2 = ovlBibConsumeGlue(s, start);
+            if (p2 > start) { i = skipSp(p2); changed = true; continue; }
+        }
+        if (name === 'hbox') {
+            let q = j;
+            while (q < n && /\s/.test(s[q])) q++;
+            if (s[q] === '{') {
+                const close = ovlFindMatchingBrace(s, q);
+                if (close !== -1) { closers.push({ at: close, id: '' }); i = q + 1; changed = true; continue; }
+            }
+        }
+        if (name === 'textbf' || name === 'textit' || name === 'emph') {
+            let q = j;
+            while (q < n && /[ \t]/.test(s[q])) q++;
+            if (s[q] === '{') {
+                const close = ovlFindMatchingBrace(s, q);
+                if (close !== -1) {
+                    const inner = s.slice(q + 1, close);
+                    if (/\\par(?![A-Za-z])|\n[ \t]*\n/.test(inner)) {
+                        closers.push({ at: close, id: '' });            // 跨段：不加粗，只去壳
+                    } else {
+                        const tag = name === 'textbf' ? 'strong' : 'em';
+                        out += ph('<' + tag + '>');
+                        closers.push({ at: close, id: ph('</' + tag + '>') });
+                    }
+                    i = q + 1; changed = true; continue;
+                }
+            }
+        }
+        out += s.slice(i, j); i = j;
+    }
+    if (!changed) return content;
+    // \hfil ... 段尾：把 \hfil 之后到段末的短文本右浮（\eqtag 这类"(N) 靠右"的习惯用法）
+    if (out.indexOf(OVL_P229_HFIL) !== -1) {
+        out = out.replace(/[ \t]*(?:[ \t\n]*)*[ \t]*([^\n]*?)[ \t]*(?=\n[ \t]*\n|\n*$)/g, function (all, b) {
+            if (!b.trim() || b.length > 160) return b.length > 160 ? ' ' + b : '';
+            return ph('<span class="ovl-hfil-r">') + b + ph('</span>');
+        });
+        out = out.split(OVL_P229_HFIL).join('');
+    }
+    return out;
+}
+
+// KaTeX 宏表：只给 P228 兼容重试用（首次渲染已经出现 cc0000 的公式才会走到）。
+// 只带上公式里实际引用到的宏（含宏体里再引用的宏）；跳过带可选默认参数的、宏体含非数学原语的、
+// 参数个数与 #n 用法对不上的。返回 { '\\name': body } 或 null。
+function ovlP229KatexMacrosFor(formula) {
+    let defs = null;
+    try { defs = (typeof OvlXrefState !== 'undefined' && OvlXrefState) ? OvlXrefState.userMacros : null; } catch (e) { defs = null; }
+    if (!defs) return null;
+    const found = {};
+    let any = false;
+    const queue = [String(formula == null ? '' : formula)];
+    let guard = 0;
+    while (queue.length && guard++ < 200) {
+        const txt = queue.pop();
+        const re = /\\([A-Za-z]+)/g;
+        let m;
+        while ((m = re.exec(txt))) {
+            const nm = m[1];
+            if (found[nm] !== undefined) continue;
+            const d = defs[nm];
+            found[nm] = null;
+            if (!d || d.opt !== null) continue;
+            let body = d.body;
+            if (OVL_P229_MATH_DENY_RE.test(body)) continue;
+            let maxArg = 0;
+            body.replace(/##|#([1-9])/g, function (mm, dd) { if (dd) maxArg = Math.max(maxArg, +dd); return mm; });
+            if (maxArg !== d.n) continue;
+            try { body = ovlKatexCompatNormalize(body); } catch (e) { /* 保持原样 */ }
+            found[nm] = body;
+            any = true;
+            queue.push(body);
+        }
+    }
+    if (!any) return null;
+    const macros = {};
+    Object.keys(found).forEach(function (k) { if (found[k] != null) macros['\\' + k] = found[k]; });
+    return macros;
+}
+
 // v2 Pass P168：公式编号模块级开关——只在 ovlVisualRenderBodyWithLines 处理"整份内容"
 // （全文渲染 or 已排除编号环境的局部 patch，见该函数与 ovlInlineSrcRerenderLocal 内注释）期间
 // 被置成一个 {n:0} 计数器对象，渲染完（含异常路径）立刻在 finally 里清回 null。仿照
@@ -10160,6 +10546,22 @@ function ovlKatexCompatRetry(formula, untaggedFormula, first, opts, rawMatch) {
         push(n1);
         if (untaggedFormula != null) push(ovlKatexCompatNormalize(untaggedFormula));
         push(ovlKatexCompatKeepFirstTag(n1));
+        // v2 Pass P229：导言区宏（\newcommand 等）只在这条重试里通过 KaTeX macros 选项带入——首次渲染已经出现
+        // 红色（常见原因就是未定义的用户宏）才会走到这里；能渲染的公式永远不进来，输出不变。
+        // 每次渲染给一份新的 macros 拷贝（KaTeX 会就地改它）。
+        if (typeof ovlP229KatexMacrosFor === 'function') {
+            let p229macros = null;
+            try { p229macros = ovlP229KatexMacrosFor(formula); } catch (e) { p229macros = null; }
+            if (p229macros) {
+                const all = [formula].concat(cands);
+                for (let i = 0; i < all.length; i++) {
+                    let r;
+                    try { r = window.katex.renderToString(all[i], Object.assign({}, opts, { macros: Object.assign({}, p229macros) })); } catch (e) { continue; }
+                    if (r.indexOf('katex-error') !== -1) continue;
+                    if (hard0 || ovlKatexCountRed(r) < red0) return r;
+                }
+            }
+        }
         for (let i = 0; i < cands.length; i++) {
             let r;
             try { r = window.katex.renderToString(cands[i], opts); } catch (e) { continue; }
@@ -10213,6 +10615,14 @@ function renderFormattedText(text, xrefCtx, tagFormulas) {
     // \u4E0B\u9762 pushPlaceholder \u5185\u90E8\u5BF9 formula \u53D8\u91CF\u7684\u540C\u540D stripCommand \u8C03\u7528\u5BF9\u5DF2\u7ECF\u5E72\u51C0\u7684\u6587\u672C\u662F\u7A7A\u64CD\u4F5C\uFF0C
     // \u4E0D\u4F1A\u4E8C\u6B21\u8BEF\u4F24\u6216\u4EA7\u751F\u526F\u4F5C\u7528\u3002
     content = stripCommand(content, 'label');
+    // v2 Pass P229：Visual 专用——导言区用户宏在文本模式展开（数学部分此时还没抽出，展开器自己跳过数学区）。
+    // 任何失败整体放弃，按改动前渲染；非 Visual 调用点 OvlVisualTextCmdsOn 恒为 false，逐字节不变。
+    if (OvlVisualTextCmdsOn) {
+        try {
+            const p229defs = (xrefCtx && xrefCtx.userMacros) || null;
+            if (p229defs) { const p229ex = ovlMacroExpandText(content, p229defs); if (p229ex != null) content = p229ex; }
+        } catch (e) { /* 递归过深/产出过大/参数缺失：保持原文 */ }
+    }
     // v2 Pass P168：不再无条件 strip tag——见函数顶部注释，编号环境里的 \tag{X}/\tag*{X}
     // 要留到 pushPlaceholder 里判断"这一行占不占计数器"，再决定是保留（用户自己的 tag）
     // 还是（走不到这里，因为已经保留）额外插入 \tag{N}。
@@ -10407,6 +10817,11 @@ function renderFormattedText(text, xrefCtx, tagFormulas) {
     // %%LATEX_N%% token，ovlRenderTextColor 原样带走这个 token 不认识它，等它整个被包进
     // 新的颜色 span 占位符之后，还得靠下面 placeholders 数组"倒序"回填才能被正确解开，
     // 见下面 for 循环的注释）。
+    // v2 Pass P229：Visual 专用文本模式命令（\quad/\par/\nobreak/\hfil、\textbf/\textit/\emph 等）。
+    // 放在 \textcolor 摘取之前，这样颜色壳里面的命令也被处理；数学已是占位符，碰不到。
+    if (OvlVisualTextCmdsOn) {
+        try { content = ovlVisualTextCmdPass(content, placeholders); } catch (e) { /* 保持原文 */ }
+    }
     content = ovlRenderTextColor(content, placeholders);
 
     // 【波浪号必须先藏起来】marked 默认开着 GFM 的单波浪号删除线，而 LaTeX 里
@@ -36652,12 +37067,19 @@ function ovlVisualRenderChunk(tex, tagFormulas) {
     // tex，是已经确定就是 tex，改成 'always' 跳过这层猜测，直接剥注释——不改 LatexFilter
     // 内部 'auto' 启发式本身（那是给聊天框粘贴文本这类真的需要猜测的场景用的，改了影响面
     // 太大），只改这一个调用点传的参数。
-    const filtered = LatexFilter.filterLatexForTranslation(protectedFig.text, { comments: 'always', structure: true });
+    // v2 Pass P229：keepMacros 是 Visual 专用的显示选项（翻译链路的调用点从不传）——让 \textbf/\textit/\emph
+    // 留到渲染阶段变成粗体/斜体，而不是被 UNWRAP 掉。
+    const filtered = LatexFilter.filterLatexForTranslation(protectedFig.text, { comments: 'always', structure: true, keepMacros: OVL_P229_KEEP_MACROS });
     const restored = ovlRestoreTextColorAfterFilter(filtered.text, protectedInput.tokens);
     // v2 Pass P158：Visual 渲染管线主路径，显式传入 OvlXrefState 启用引用编号解析
     // （真编号/过期/近似/查不到四档）。这是唯一的模块级单例，不需要逐层传参——
     // ovlVisualRender() 在渲染前已经按三重失效条件维护好它（§6.1）。
-    const html = renderFormattedText(restored, OvlXrefState, tagFormulas);
+    // v2 Pass P229：渲染期间打开 Visual 文本模式命令开关（含 ovlRenderTextColor 的递归调用）；try/finally 还原，
+    // 嵌套的 ovlVisualRenderChunk（表格单元格、题注）各自保存/恢复。
+    const p229prev = OvlVisualTextCmdsOn;
+    OvlVisualTextCmdsOn = true;
+    let html;
+    try { html = renderFormattedText(restored, OvlXrefState, tagFormulas); } finally { OvlVisualTextCmdsOn = p229prev; }
     // v2 Pass P172：跟 \textcolor 不同，裸图片/todo/marginpar 的 token 都必须在
     // renderFormattedText 产出 HTML 之后才能还原——换回的是一段占位框/徽标 HTML，不是能
     // 再喂给渲染器的 LaTeX 源码。
@@ -37720,7 +38142,11 @@ let OvlXrefState = {
     // 传给 renderToString 的 leqno 选项（真实 amsmath 语义就是纯排版位置，不改变计数值本身），
     // 检测函数见 ovlXrefDetectLeqno；桥接读取点在 renderFormattedText 内 katex.renderToString
     // 调用处，跟 withinSection 桥接同一种模式（渲染路径拿不到导言区，靠这个模块级单例读一次）。
-    leqno: false
+    leqno: false,
+    // v2 Pass P229：导言区（或当前文件全文）里的 \newcommand 等宏定义表，Visual 文本模式展开与 KaTeX 兼容重试共用；
+    // 来源与失效条件跟本对象其它字段完全相同（ovlXrefBuild 三重失效条件）。多文件项目里若导言区在另一个文件
+    // （Visual 打开的是被 \input 的子文件），这里读不到——跟 leqno 同一个已知边界。
+    userMacros: null
 };
 
 // ---- §4A/4B 共用：从一段 blob（形如 "{1}{1}{Intro}{equation.1}{}"）里依次切出配平的
@@ -38171,6 +38597,7 @@ function ovlXrefBuild(src) {
         // v2 Pass P177（尽力项5）：leqno 探测。
         // v2 Pass P184：扫描对象换成 preambleScanSrc（剥过注释），跟上面 numberwithin 同款修法。
         OvlXrefState.leqno = ovlXrefDetectLeqno(preambleScanSrc);
+        try { OvlXrefState.userMacros = ovlP229ParseMacros(preambleScanSrc); } catch (e) { OvlXrefState.userMacros = null; }
 
         // 近似兜底：全文档一次预扫描（§6.2：跟 LatexFilter 全文转换、P116 按块扫描同一数量级）。
         const approx = ovlXrefApproxScan(src);
