@@ -5034,7 +5034,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.47.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.48.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-09';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -13140,6 +13140,9 @@ function xportNormalizeCaps(m) {
         vision: !!(c && c.vision),
         tools: !!(c && c.trained_for_tool_use),
         ctx: Number(cfg && cfg.context_length) || 0,
+        // v2 Pass P230：LM Studio 加载该模型时设的「并行请求数」（loaded_instances[0].config.parallel）。
+        // 没加载 / 字段缺失 ⇒ 0（= 不知道），Visual 翻译并发数据此退回默认 3，绝不猜。
+        parallel: Number(cfg && cfg.parallel) || 0,
         maxCtx: Number(src.max_context_length) || 0,
         loaded: inst.length > 0,
         // capabilities 缺失 ⇒ reasoning 恒为 null ⇒ 上层**隐藏控件**，绝不猜。
@@ -43899,6 +43902,90 @@ function ovlP215RunFileKey() {
         return f ? String(f.relPath || f.name || '') : '';
     } catch (e) { return ''; }
 }
+// ---- v2 Pass P230：Visual 中文翻译并发数 = 用户设置 OvlSettings.visualTransConcurrency ----
+// 'auto'（默认）：本地 LM Studio 模型 → 跟随它加载时设的 parallel（读 /api/v1/models，读不到 / 没加载 / 超时 → 3）；
+//                 在线模型 → 3（与改动前完全一致）。整数 1–16：手动，任何 provider 都按它来。
+// 批次开始时解析一次；批次进行中改设置立即生效（ovlVisualLangConcurrencyChanged）：调大立刻补 worker，调小让多出来的
+// worker 在「两个块之间」退场——从不打断在飞的请求。
+const OVL_VISUAL_LANG_CONC_MAX = 16;
+let OvlVisualLangRunCtx = null;   // 当前批次的并发控制句柄（批次结束置空）
+function ovlVisualLangManualConcurrency() {
+    try {
+        const v = OvlSettings.visualTransConcurrency;
+        if (v === 'auto' || v == null || v === '') return 0;
+        const n = Number(v);
+        if (!isFinite(n)) return 0;
+        return Math.max(1, Math.min(OVL_VISUAL_LANG_CONC_MAX, Math.round(n)));
+    } catch (e) { return 0; }
+}
+// caps 条目 → 可用的 parallel（1–16）；没加载 / 字段缺失 / 非法 → 0。
+function ovlVisualLangParallelOf(caps) {
+    try {
+        const p = caps ? Math.round(Number(caps.parallel)) : 0;
+        return (caps && caps.loaded && isFinite(p) && p >= 1) ? Math.min(OVL_VISUAL_LANG_CONC_MAX, p) : 0;
+    } catch (e) { return 0; }
+}
+// auto 的解析：返回 { n }（同步就知道）或 { promise }（要先问一次 /api/v1/models，最多等 4 秒，永不 reject）。
+// 缓存新鲜（60 秒内）就同步返回，所以暖缓存时批次起跑与改动前一样是同步的。
+function ovlVisualLangAutoPlan(cfg) {
+    const dflt = OVL_VISUAL_LANG_CONCURRENCY;
+    try {
+        if (!cfg || cfg.provider !== 'local') return { n: dflt };
+        const base = String(cfg.localBaseUrl == null ? '' : cfg.localBaseUrl).trim();
+        if (!/^https?:\/\//i.test(base)) return { n: dflt };
+        const model = String(cfg.model == null ? '' : cfg.model);
+        const hit = xportCapsCache.get(xportCapsOrigin(base));
+        if (hit && Date.now() - hit.at < XPORT_CAPS_TTL) return { n: ovlVisualLangParallelOf(hit.byKey[model]) || dflt };
+        let timer = null;
+        const cap = new Promise(function (resolve) { timer = setTimeout(function () { resolve(dflt); }, 4500); });
+        const asked = xportFetchCaps(base).then(
+            function (byKey) { return ovlVisualLangParallelOf(byKey && byKey[model]) || dflt; },
+            function () { return dflt; }
+        ).then(function (v) { if (timer) clearTimeout(timer); return v; });
+        return { promise: Promise.race([asked, cap]) };
+    } catch (e) { return { n: dflt }; }
+}
+// 设置面板「自动（当前：N）」用：只看缓存，不发请求；取不到 → 0。
+function ovlVisualLangDetectedParallel() {
+    try {
+        const cfg = getApiConfig();
+        if (!cfg || cfg.provider !== 'local') return 0;
+        return ovlVisualLangParallelOf(xportCapsPeek(cfg.localBaseUrl, cfg.model));
+    } catch (e) { return 0; }
+}
+function ovlVisualLangConcAutoLabel() {
+    const n = ovlVisualLangDetectedParallel();
+    return n ? ('自动（当前：' + n + '）') : '自动（推荐）';
+}
+function ovlVisualLangConcPaintAutoLabel() {
+    try {
+        const opt = document.querySelector('select[data-setpath="settings.visualTransConcurrency"] option[value="auto"]');
+        if (opt) opt.textContent = ovlVisualLangConcAutoLabel();
+    } catch (e) {}
+}
+// 设置面板打开时顺手问一次 caps（60 秒缓存，重复调用不会重复发请求），回来后把「自动」那一项的文字刷新成当前值。
+function ovlVisualLangConcWarmLabel() {
+    try {
+        const cfg = getApiConfig();
+        if (!cfg || cfg.provider !== 'local' || !/^https?:\/\//i.test(String(cfg.localBaseUrl || '').trim())) return;
+        xportFetchCaps(cfg.localBaseUrl).then(ovlVisualLangConcPaintAutoLabel, function () {});
+    } catch (e) {}
+}
+// 设置被改（设置面板 change / 同步合并后 ovlApplySettings）时调用：正在跑的批次立刻按新值调整 worker 数。
+function ovlVisualLangConcurrencyChanged() {
+    const ctx = OvlVisualLangRunCtx;
+    if (!ctx || ctx.stopped) return;
+    try {
+        // 批次起跑时是手动值、没解析过 auto；现在切回「自动」→ 补解析一次（解析期间先按默认 3 算）。
+        if (ctx.started && !ovlVisualLangManualConcurrency() && ctx.autoN == null && !ctx.autoPending) {
+            ctx.autoPending = true;
+            const plan = ovlVisualLangAutoPlan(ctx.cfg);
+            if (plan.n != null) { ctx.autoN = plan.n; ctx.autoPending = false; }
+            else plan.promise.then(function (n) { ctx.autoN = n; ctx.autoPending = false; ctx.grow(); });
+        }
+        ctx.grow();
+    } catch (e) {}
+}
 async function ovlVisualLangRunQueue() {
     // v2 Pass P170：'compare' 模式的中文半屏一样要真正跑翻译——否则整个后台 worker 池在
     // compare 模式下永远不启动，中文侧永久停在 pending。
@@ -43928,7 +44015,23 @@ async function ovlVisualLangRunQueue() {
     // 失败，说明后面的块只会白白再失败一遍：停止本次运行（剩余块保持待翻，进度行显示"已暂停，点此继续"），
     // 只弹一条中文提示点名原因。任何一个块成功，或者出现非传输类失败（模型答得不对），计数清零。
     let fatalStreak = 0, fatalTripped = false, fatalLastReason = '';
-    async function worker() {
+    // v2 Pass P230：并发控制句柄。active = 活着的 worker 数；target() = 现在应该有几个（手动值优先，auto 用批次开始时解析的值）。
+    const workers = [];
+    const ctx = { seq: mySeq, cfg: cfg, active: 0, autoN: null, autoPending: false, started: false, stopped: false };
+    ctx.target = function () { return ovlVisualLangManualConcurrency() || ctx.autoN || OVL_VISUAL_LANG_CONCURRENCY; };
+    ctx.live = function () {
+        return ctx.started && !ctx.stopped && !fatalTripped && !controller.signal.aborted
+            && mySeq === OvlVisualLangState.seq && OvlVisualLangState.running === true;
+    };
+    ctx.spawn = function () {
+        ctx.active++;
+        const slot = { done: false };
+        slot.release = function () { if (!slot.done) { slot.done = true; ctx.active--; } };
+        workers.push((async function () { try { await worker(slot); } finally { slot.release(); } })());
+    };
+    ctx.grow = function () { if (!ctx.live()) return; while (ctx.active < ctx.target()) ctx.spawn(); };
+    OvlVisualLangRunCtx = ctx;
+    async function worker(slot) {
         for (;;) {
             if (fatalTripped) return;
             // v2 Pass P208（C）：纯数学/取不到源码的块不走网络，同步 skipped/continue——连续一串这样的块会在
@@ -43938,6 +44041,9 @@ async function ovlVisualLangRunQueue() {
             // v2 Pass P215（VISUALPERF-2）：项目或文件已不是这一批启动时的——停手，块留在 pending，
             // 新项目/新文件自己的 SyncAfterRender / IdleAudit 会重新起队列。
             if (ovlVisualTransCacheProjectId() !== fixedProjectId || ovlP215RunFileKey() !== fixedFileKey) { p215Mismatch = true; return; }
+            // v2 Pass P230：并发数被调小——多出来的 worker 在这里（两个块之间、还没领块）退场。
+            // 此处到下面摘掉 pending 之间没有 await，不会和别的 worker 抢块；在飞的请求从不因此被打断。
+            if (ctx.active > ctx.target()) { slot.release(); return; }
             const pane = document.getElementById('ovlVisualPane');
             if (!pane) return;
             const queue = ovlVisualLangCollectPendingCached(pane);
@@ -44113,9 +44219,19 @@ async function ovlVisualLangRunQueue() {
             ovlVisualLangProgressUpdate();
         }
     }
-    const workers = [];
-    for (let i = 0; i < OVL_VISUAL_LANG_CONCURRENCY; i++) workers.push(worker());
-    try { await Promise.all(workers); } finally {
+    try {
+        // v2 Pass P230：起跑并发数。手动值 / 在线模型 / 缓存新鲜 → 同步（与改动前一样）；本地 + auto + 缓存过期 → 先问一次
+        // /api/v1/models（最多等 4 秒，失败 / 超时 / 没加载一律 3）。
+        if (!ovlVisualLangManualConcurrency()) {
+            const plan = ovlVisualLangAutoPlan(cfg);
+            ctx.autoN = (plan.n != null) ? plan.n : await plan.promise;
+        }
+        if (mySeq === OvlVisualLangState.seq && !controller.signal.aborted) { ctx.started = true; ctx.grow(); }
+        // 等所有 worker（含批次中途因调大并发而新补的）退出。
+        for (let n = 0; n < workers.length;) { const cur = workers.slice(n); n = workers.length; await Promise.all(cur); }
+    } finally {
+        ctx.stopped = true;
+        if (OvlVisualLangRunCtx === ctx) OvlVisualLangRunCtx = null;
         // v2 Pass P215（VISUALPERF-1）：被取消的旧批次（seq 已变）的 finally 晚于新批次启动才跑完——
         // ovlVisualLangCancelInFlight 已经替它把 running 关掉了，新批次紧接着又同步置 true。这里无条件
         // running=false / 清限速计时器会把新批次的 running 关掉（P208 限速失效、进度行误报"已暂停"、
@@ -59852,6 +59968,7 @@ const OVL_SETTINGS_DEFAULTS = {
     transSimpleMode: false,     // P2 消费：翻译器窗口简化模式（只留左右两个框）
     visualTranslate: 'auto',    // P4 消费：'auto' | 'button' | 'off'
     visualTransModel: '',       // P4 消费：''=跟随翻译器当前选中的模型
+    visualTransConcurrency: 'auto', // v2 Pass P230：Visual 中文翻译同时在飞的请求数。'auto'=本地模型跟随 LM Studio 的 parallel（读不到/在线模型=3）；整数 1–16=手动
     visualRetranslateModel: '', // v2 Pass P223：块「重译」旁下拉的上次选择，'provider::model'，''=跟随当前模型
     ovlVisualLineBreaks: true,  // Visual 断行 Pass 消费：true=按源码行切细渲染，false=退回整段渲染
     ovlVisualOutlineSelection: true, // Pass Sel-Outline 消费：true=方框描边选区，false=退回浏览器原生高亮
@@ -60096,6 +60213,8 @@ function ovlApplySettings() {
                 OvlHighlightExpiry.rearmAll();
             }
         }
+        // v2 Pass P230：同步合并 / 恢复默认等路径改了并发数，正在跑的批次也要跟着调整（幂等，值没变就什么都不做）。
+        if (typeof ovlVisualLangConcurrencyChanged === 'function') ovlVisualLangConcurrencyChanged();
     } catch (e) { console.error('[ovl] applySettings failed', e); }
 }
 
@@ -60463,6 +60582,18 @@ function ovlSettingsTranslatorHtml() {
         + (Array.isArray(AppState.localModels) ? AppState.localModels : []).map(function (lm) { return ovlOptTag(lm.id, localModelDisplayName(lm.id), s.visualTransModel); }).join('')
         + '</select>',
         'Visual 或 Code 模式里选中文字后，用哪个模型翻译。留空就跟着翻译器上方选的模型走。');
+    // v2 Pass P230：Visual 中文翻译同时发几个请求。走通用 data-setpath 处理（change 委托里对本项专门处理：存盘 + 立刻调整正在跑的批次，不重渲 Visual）。
+    (function () {
+        const cur = s.visualTransConcurrency;
+        const list = [1, 2, 3, 4, 6, 8, 12, 16];
+        const curN = (cur === 'auto' || cur == null || cur === '') ? 0 : Math.round(Number(cur));
+        if (curN >= 1 && curN <= OVL_VISUAL_LANG_CONC_MAX && list.indexOf(curN) === -1) { list.push(curN); list.sort(function (a, b) { return a - b; }); }
+        html += ovlSetRow('Visual 中文翻译并发数', '<select data-setpath="settings.visualTransConcurrency">'
+            + ovlOptTag('auto', ovlVisualLangConcAutoLabel(), (curN >= 1 ? curN : 'auto'))
+            + list.map(function (n) { return ovlOptTag(n, String(n), (curN >= 1 ? curN : 'auto')); }).join('') + '</select>',
+            '自动 = 本地 LM Studio 模型跟随它加载时设置的「并行请求数」，读不到时用 3；在线模型固定 3。手动设置比模型实际能并行的数大，多出的请求只会在模型那边排队，不会更快。');
+        ovlVisualLangConcWarmLabel();
+    })();
     // v2 Pass P197（A）：领域提示只影响本地模型（LM Studio）路径的 prompt 内容，不改变
     // 任何 UI 控件的 data-setpath 通用绑定套路——因为这条不是全局设置，是按项目持久化的
     // （跟项目术语表一样用单独的 localStorage 映射表），所以走专用的 onchange 处理函数，
@@ -60873,6 +61004,7 @@ function ovlBindSettingsModal() {
         if (path === 'settings.fontSize' || path === 'settings.tabSize' || path === 'settings.overleafAutoPullMinutes'
             || path === 'settings.pdf2texConcurrency' || path === 'settings.pdf2texMaxPx'
             || path === 'settings.ovlHighlightExpirySec') val = Number(val);
+        if (path === 'settings.visualTransConcurrency') val = (val === 'auto') ? 'auto' : Number(val); // v2 Pass P230
         // v2 Pass P133d（T0 追加）：桥令牌走统一归一化（见 ovlBridgeTokenNormalize 上方注释）——
         // 去掉换行/制表符 + 首尾空白后再落盘；字符集不合法（把终端提示符/路径一起粘进来了）时
         // **不写盘**、把输入框恢复成已存值、出一条中文提示。只作用于 settings.ovlBridgeToken。
@@ -60905,6 +61037,8 @@ function ovlBindSettingsModal() {
             }
         }
         store[parts[1]] = val;
+        // v2 Pass P230：并发数只影响翻译队列，不需要 ovlApplySettings（它在 Visual 模式下会整篇重渲，正在飞的块会被重复翻译）。
+        if (path === 'settings.visualTransConcurrency') { ovlSaveSettings(); ovlVisualLangConcurrencyChanged(); return; }
         if (parts[0] === 'compile') { ovlSaveCompileSettings(); ovlUpdatePdfToolbarUI(); }
         else { ovlSaveSettings(); ovlApplySettings(); }
     });
@@ -69219,7 +69353,7 @@ const OVL_SYNC_SECRET_SETTING_FIELDS = ['overleafToken', 'ovlAiMergeApiKey', 'pd
 const OVL_SYNC_SETTING_FIELDS = [
     'fontSize', 'fontFamily', 'lineHeight', 'editorTheme', 'showLineNumbers', 'tabSize', 'autoCloseBrackets',
     'nonBlinkingCursor', 'quickActions', 'breadcrumbs', 'equationPreview', 'spellcheck', 'spellLang',
-    'transSimpleMode', 'visualTranslate', 'visualTransModel', 'visualRetranslateModel', 'ovlVisualLineBreaks', 'ovlVisualOutlineSelection',
+    'transSimpleMode', 'visualTranslate', 'visualTransModel', 'visualTransConcurrency', 'visualRetranslateModel', 'ovlVisualLineBreaks', 'ovlVisualOutlineSelection',
     'ovlVisualBtrConfirmFirst', 'overleafAutoPullMinutes', 'ovlRestoreLastProject', 'ovlAiMergeEndpoint',
     'ovlAiMergeModel', 'pdf2texDefaultOutDir', 'pdf2texVisionEndpoint', 'pdf2texVisionModel', 'pdf2texConcurrency',
     'pdf2texDisableThinking', 'pdf2texMaxPx', 'pdf2texSavePageImages', 'pdf2texAutoOpenResult',
