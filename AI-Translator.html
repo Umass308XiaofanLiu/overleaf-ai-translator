@@ -5034,7 +5034,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.48.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.48.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-09';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -13177,6 +13177,17 @@ async function xportFetchCaps(baseUrl) {
                 ok = true;
             }
         } catch (e) { ok = false; }
+        // v2 Pass P230（评审 concurrency-1）：刷新失败（超时 / 503）不许把上一份好数据冲掉——批次占满 Chrome 的 6 个连接时
+        // 这次 GET 会排在后面、4 秒超时，旧逻辑会写入空表，于是「自动（当前：N）」掉回「自动（推荐）」，
+        // 紧接着新起的批次也只能按 3 跑。失败时沿用旧表，并把 at 回拨到 10 秒后重试。
+        if (!ok) {
+            const prev = xportCapsCache.get(origin);
+            if (prev && prev.ok && prev.byKey && Object.keys(prev.byKey).length) {
+                xportCapsCache.set(origin, { at: Date.now() - XPORT_CAPS_TTL + 10000, ok: true, byKey: prev.byKey });
+                xportCapsInFlight.delete(origin);
+                return prev.byKey;
+            }
+        }
         xportCapsCache.set(origin, { at: Date.now(), ok: ok, byKey: byKey });
         xportCapsInFlight.delete(origin);
         return byKey;
@@ -43913,9 +43924,10 @@ function ovlVisualLangManualConcurrency() {
     try {
         const v = OvlSettings.visualTransConcurrency;
         if (v === 'auto' || v == null || v === '') return 0;
-        const n = Number(v);
-        if (!isFinite(n)) return 0;
-        return Math.max(1, Math.min(OVL_VISUAL_LANG_CONC_MAX, Math.round(n)));
+        const n = Math.round(Number(v));
+        // v2 Pass P230（评审 settings-3）：0 / 负数 / 非数字 = 自动（与设置面板下拉的映射一致），不是「手动 1」。
+        if (!isFinite(n) || n < 1) return 0;
+        return Math.min(OVL_VISUAL_LANG_CONC_MAX, n);
     } catch (e) { return 0; }
 }
 // caps 条目 → 可用的 parallel（1–16）；没加载 / 字段缺失 / 非法 → 0。
@@ -43927,7 +43939,7 @@ function ovlVisualLangParallelOf(caps) {
 }
 // auto 的解析：返回 { n }（同步就知道）或 { promise }（要先问一次 /api/v1/models，最多等 4 秒，永不 reject）。
 // 缓存新鲜（60 秒内）就同步返回，所以暖缓存时批次起跑与改动前一样是同步的。
-function ovlVisualLangAutoPlan(cfg) {
+function ovlVisualLangAutoPlan(cfg, allowStale) {
     const dflt = OVL_VISUAL_LANG_CONCURRENCY;
     try {
         if (!cfg || cfg.provider !== 'local') return { n: dflt };
@@ -43936,6 +43948,9 @@ function ovlVisualLangAutoPlan(cfg) {
         const model = String(cfg.model == null ? '' : cfg.model);
         const hit = xportCapsCache.get(xportCapsOrigin(base));
         if (hit && Date.now() - hit.at < XPORT_CAPS_TTL) return { n: ovlVisualLangParallelOf(hit.byKey[model]) || dflt };
+        // v2 Pass P230（评审 settings-2 / concurrency-2）：批次进行中切回「自动」时，过期的旧缓存也比重新问强——
+        // 批次占满连接时新 GET 会排队到超时，白白让目标掉到 3。旧表里有这个模型的 parallel 就直接用。
+        if (allowStale && hit) { const sn = ovlVisualLangParallelOf(hit.byKey[model]); if (sn) return { n: sn }; }
         let timer = null;
         const cap = new Promise(function (resolve) { timer = setTimeout(function () { resolve(dflt); }, 4500); });
         const asked = xportFetchCaps(base).then(
@@ -43966,6 +43981,8 @@ function ovlVisualLangConcPaintAutoLabel() {
 // 设置面板打开时顺手问一次 caps（60 秒缓存，重复调用不会重复发请求），回来后把「自动」那一项的文字刷新成当前值。
 function ovlVisualLangConcWarmLabel() {
     try {
+        // v2 Pass P230（评审 concurrency-1）：批次在跑时不发这次刷新——它会排在占满的连接后面，只会超时。
+        if (OvlVisualLangState.running) return;
         const cfg = getApiConfig();
         if (!cfg || cfg.provider !== 'local' || !/^https?:\/\//i.test(String(cfg.localBaseUrl || '').trim())) return;
         xportFetchCaps(cfg.localBaseUrl).then(ovlVisualLangConcPaintAutoLabel, function () {});
@@ -43979,7 +43996,7 @@ function ovlVisualLangConcurrencyChanged() {
         // 批次起跑时是手动值、没解析过 auto；现在切回「自动」→ 补解析一次（解析期间先按默认 3 算）。
         if (ctx.started && !ovlVisualLangManualConcurrency() && ctx.autoN == null && !ctx.autoPending) {
             ctx.autoPending = true;
-            const plan = ovlVisualLangAutoPlan(ctx.cfg);
+            const plan = ovlVisualLangAutoPlan(ctx.cfg, true);
             if (plan.n != null) { ctx.autoN = plan.n; ctx.autoPending = false; }
             else plan.promise.then(function (n) { ctx.autoN = n; ctx.autoPending = false; ctx.grow(); });
         }
@@ -44018,7 +44035,13 @@ async function ovlVisualLangRunQueue() {
     // v2 Pass P230：并发控制句柄。active = 活着的 worker 数；target() = 现在应该有几个（手动值优先，auto 用批次开始时解析的值）。
     const workers = [];
     const ctx = { seq: mySeq, cfg: cfg, active: 0, autoN: null, autoPending: false, started: false, stopped: false };
-    ctx.target = function () { return ovlVisualLangManualConcurrency() || ctx.autoN || OVL_VISUAL_LANG_CONCURRENCY; };
+    ctx.target = function () {
+        const m = ovlVisualLangManualConcurrency();
+        // v2 Pass P230（评审 concurrency-2）：从手动切回自动、auto 还在解析时，沿用上一个目标，别临时掉回 3 让多出的 worker 提前退场。
+        const t = m || ((ctx.autoPending && ctx.lastTarget) ? ctx.lastTarget : (ctx.autoN || OVL_VISUAL_LANG_CONCURRENCY));
+        ctx.lastTarget = t;
+        return t;
+    };
     ctx.live = function () {
         return ctx.started && !ctx.stopped && !fatalTripped && !controller.signal.aborted
             && mySeq === OvlVisualLangState.seq && OvlVisualLangState.running === true;
@@ -60591,7 +60614,7 @@ function ovlSettingsTranslatorHtml() {
         html += ovlSetRow('Visual 中文翻译并发数', '<select data-setpath="settings.visualTransConcurrency">'
             + ovlOptTag('auto', ovlVisualLangConcAutoLabel(), (curN >= 1 ? curN : 'auto'))
             + list.map(function (n) { return ovlOptTag(n, String(n), (curN >= 1 ? curN : 'auto')); }).join('') + '</select>',
-            '自动 = 本地 LM Studio 模型跟随它加载时设置的「并行请求数」，读不到时用 3；在线模型固定 3。手动设置比模型实际能并行的数大，多出的请求只会在模型那边排队，不会更快。');
+            '自动 = 本地 LM Studio 模型跟随它加载时设置的「并行请求数」，读不到时用 3；在线模型固定 3。注意：浏览器对同一个地址（同一个 host:port）最多同时保持约 6 个连接，所以设成 6 以上不会更快——多出的请求在浏览器里排队，排队的时间还会算进每个请求的超时。');
         ovlVisualLangConcWarmLabel();
     })();
     // v2 Pass P197（A）：领域提示只影响本地模型（LM Studio）路径的 prompt 内容，不改变
