@@ -2092,6 +2092,27 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
     color: #9AA4B2;
     white-space: nowrap;
 }
+/* v2 Pass P232b：「N 块译文来自别的模型」一行提示——工具条下面独立一行，11px 灰字，不是块级角标。 */
+.ovl-visual-model-notice {
+    display: flex; align-items: center; gap: 6px;
+    min-width: 0;
+    padding: 3px 10px;
+    background: #F8FAFC;
+    border-bottom: 1px solid #E2E8F0;
+    font-size: 11px; line-height: 1.5;
+    color: #64748B;
+}
+.ovl-visual-model-notice[hidden] { display: none; }
+.ovl-visual-model-notice-text { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ovl-visual-model-notice-sep { flex: 0 0 auto; color: #94A3B8; }
+.ovl-visual-model-notice-act { flex: 0 0 auto; color: #3730A3; cursor: pointer; text-decoration: underline; white-space: nowrap; }
+.ovl-visual-model-notice-act:hover { color: #1E1B4B; }
+.ovl-visual-model-notice-x {
+    flex: 0 0 auto; margin-left: auto;
+    border: none; background: transparent; color: #94A3B8;
+    font-size: 14px; line-height: 1; padding: 0 5px; border-radius: 3px; cursor: pointer;
+}
+.ovl-visual-model-notice-x:hover { background: #E2E8F0; color: #475569; }
 
 .ovl-editor-body {
     flex: 1 1 auto; min-height: 0; display: flex; overflow: hidden;
@@ -5036,7 +5057,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.50.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.50.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -20390,6 +20411,7 @@ function setTranslateDefaultModel(value) {
             localStorage.setItem('selectedModel', id);
         } catch (e) {}
         surfaceDefaultsPaint();
+        try { if (typeof ovlVisualModelNoticeOnMainChange === 'function') ovlVisualModelNoticeOnMainChange(); } catch (eP232b) {} // v2 Pass P232b：同 selectModel
         try { xportCapsPaint(); } catch (e) {}
         // 顶栏那颗模型按钮的文字也得跟上，否则设置里改完、顶栏还写着旧模型 —— 两处不一致就是撒谎。
         // **定点改一个文字节点**，不走 renderApp：整页重渲染会把还没点「保存」的 API Key 输入框冲掉
@@ -22036,6 +22058,8 @@ function selectModel(provider, modelId) {
     } catch (e) {}
 
     renderApp();
+    // v2 Pass P232b：主模型换了——Visual 里已显示的块的「来自 X」标记按新主模型重打，「N 块译文来自别的模型」提示立刻跟上（放在 renderApp 之后，自带 try/catch）。
+    try { if (typeof ovlVisualModelNoticeOnMainChange === 'function') ovlVisualModelNoticeOnMainChange(); } catch (eP232b) {}
 
     // A3：选完模型顺手问一句「你现在推理吗」。**必须放在 renderApp 之后**，而且
     // 不 await —— 渲染路径没有 try/catch，任何在它之前抛的东西都会把页面永久冻住。
@@ -34624,6 +34648,14 @@ function ovlShellHtml() {
         +     '</div>'
         // 查找/替换面板（§2.6.4，M8a）：默认隐藏（.ovl-editor-panel 没有 data-find 属性），
         // ovlFindOpen/ovlFindClose 只切一个属性，CSS 负责显隐（987 行往下那套写法的同一纪律）。
+        // v2 Pass P232b：「N 块译文来自别的模型，不是当前模型 · 用当前模型重译全文」一行安静的提示（hidden 默认隐藏，由 ovlVisualModelNoticeRefresh 控制显隐；
+        // 放在工具条下面独立一行而不是塞进 nowrap 的工具条，窄窗口下不挤 Code/Visual/查找）。不给每个块加角标。
+        +     '<div class="ovl-visual-model-notice" id="ovlVisualModelNotice" role="status" hidden>'
+        +       '<span class="ovl-visual-model-notice-text" id="ovlVisualModelNoticeText"></span>'
+        +       '<span class="ovl-visual-model-notice-sep" aria-hidden="true">&middot;</span>'
+        +       '<span class="ovl-visual-model-notice-act" id="ovlVisualModelNoticeAct" role="button" tabindex="0">用当前模型重译全文</span>'
+        +       '<button type="button" class="ovl-visual-model-notice-x" id="ovlVisualModelNoticeX" aria-label="关闭提示" title="关闭（换主模型后会再出现）">&times;</button>'
+        +     '</div>'
         +     '<div class="ovl-findbar" id="ovlFindBar">'
         +       '<div class="ovl-findbar-row">'
         +         '<input type="text" id="ovlFindInput" placeholder="Search" autocomplete="off">'
@@ -36789,6 +36821,8 @@ function ovlSetEditorMode(mode) {
             // 没有对应的统一收口点，这里单独补一次。
             if (typeof ovlScheduleMarkOverlay === 'function') setTimeout(ovlScheduleMarkOverlay, 70);
         }
+        // v2 Pass P232b：「N 块译文来自别的模型」提示只在 Visual 的 zh / compare 下出现；切到 Code 要立刻收起（切进 Visual 由 ovlVisualRender 末尾的进度刷新带出）。
+        if (typeof ovlVisualModelNoticeRefresh === 'function') { try { ovlVisualModelNoticeRefresh(); } catch (eP232bNotice) {} }
         // v2 Pass P80 W2（find-mark confirmed high）：查找态（尤其 usingZh/zhMatches）是照着
         // 切模式前那个模式的渲染文字算出来的，跨模式切换后完全失效——不重算的话，Enter/
         // "查找下一个"（含"替换"内部的兜底转发）会用陈旧的 zh 命中态落进 ovlMarkRangeZhVisual
@@ -39932,7 +39966,7 @@ function ovlVisualTransCacheGetMeta(text, config, projectIdOverride) {
             // forced/partial 同一条纪律——旧缓存条目（本 Pass 之前写入的、或没传这个字段的
             // 调用点）没有这个字段，hit.ladderLevel 是 undefined，`|| null` 让老数据照常读出
             // null，不报错、不需要迁移。
-            return { tgt: hit.tgt, skipped: !!hit.skipped, forced: !!hit.forced, partial: !!hit.partial, partialReason: hit.partialReason || null, ladderLevel: hit.ladderLevel || null, model: producer };
+            return { tgt: hit.tgt, skipped: !!hit.skipped, forced: !!hit.forced, partial: !!hit.partial, partialReason: hit.partialReason || null, ladderLevel: hit.ladderLevel || null, model: producer, override: !!producer }; // v2 Pass P232b：override = 这条译文是「重译/重试」下拉里手动选了别的模型产出的（整篇重译的确认框要点明它们也会被覆盖）
         }
         // 新桶未命中（含"闸没过被当场删掉"这种情形）——查一次旧版全局缓存兜底，命中就先过闸
         // 再决定要不要提升进新桶（不删旧的、旧的不再增长；不过闸就不提升，直接当未命中）。
@@ -39963,7 +39997,7 @@ function ovlVisualTransCacheGetMeta(text, config, projectIdOverride) {
                     if (OvlVisualTransCacheScope) OvlVisualTransCacheScope.dirty.add(projectId);
                     else if (ovlVisualTransCacheSaveBucket(projectId, map)) ovlVisualTransCacheIndexTouch(projectId);
                 }
-                return { tgt: fh.tgt, skipped: !!fh.skipped, forced: !!fh.forced, partial: !!fh.partial, partialReason: fh.partialReason || null, ladderLevel: fh.ladderLevel || null, model: fb.model };
+                return { tgt: fh.tgt, skipped: !!fh.skipped, forced: !!fh.forced, partial: !!fh.partial, partialReason: fh.partialReason || null, ladderLevel: fh.ladderLevel || null, model: fb.model, override: !!(typeof fh.model === 'string' && fh.model) };
             }
         }
     } catch (e) {}
@@ -43360,6 +43394,8 @@ function ovlP198ScheduleRelayout() {
     if (OvlP198RelayoutRaf !== null) return; // 已经排了一帧要跑，本次调用只是去重；标志位（图片 pending/对齐熔断状态）不会因为去重而丢
     let p208Running = false;
     try { p208Running = OvlVisualLangState.running === true; } catch (eP208) {}
+    // v2 Pass P232b：「用当前模型重译全文」从不置 OvlVisualLangState.running，上面的节流对它完全失效（评审实测 300 块 251 次 pass / 779ms，常规队列只有 10 次 / 44ms）。整篇重译进行中同样按 running 节流，run 结束的 finally 再补一次 pass。let 在更靠后声明，TDZ 期间抛的 ReferenceError 被 try 吃掉。
+    if (!p208Running) { try { p208Running = !!OvlP232RetransAll; } catch (eP232b) {} }
     if (p208Running) {
         const wait = OVL_P208_RELAYOUT_MIN_INTERVAL_MS - (ovlP198Now() - OvlP208LastRelayoutPassAt);
         if (wait > 0) {
@@ -43746,12 +43782,18 @@ function ovlVisualModelAttrHtml(rc) {
 function ovlVisualApplyModelMark(el, tag) {
     if (!el) return;
     const mine = (tag && ovlVisualModelDiffers(tag)) ? ('译文来自：' + ovlVisualModelTagName(tag)) : '';
+    // v2 Pass P232b：title 是不是「自己的」改按文案前缀认（渲染期 ovlVisualModelAttrHtml 拼出来的 title 没有 -title 标记属性，旧判据清不掉它；
+    // 反过来 ovlVisualApplyPartialMark 会覆盖 title 却不动 -title 属性，旧判据又会把别人的 title 删掉）
+    const curTitle = el.getAttribute('title') || '';
+    const ownTitle = curTitle.indexOf('译文来自：') === 0;
     if (mine) {
         el.setAttribute('data-ovl-trans-model', tag);
-        if (!el.title || el.getAttribute('data-ovl-trans-model-title') === '1') { el.title = mine; el.setAttribute('data-ovl-trans-model-title', '1'); }
+        if (!curTitle || ownTitle) { el.title = mine; el.setAttribute('data-ovl-trans-model-title', '1'); }
+        else el.removeAttribute('data-ovl-trans-model-title');
     } else {
         el.removeAttribute('data-ovl-trans-model');
-        if (el.getAttribute('data-ovl-trans-model-title') === '1') { el.removeAttribute('title'); el.removeAttribute('data-ovl-trans-model-title'); }
+        if (ownTitle) el.removeAttribute('title');
+        el.removeAttribute('data-ovl-trans-model-title');
     }
 }
 const OVL_VISUAL_LADDER_RAW_TITLE = '这段译文经不校验公式的兜底路径（L-raw）译出，若发现公式/命令被吞可以点击重试。';
@@ -43785,6 +43827,8 @@ function ovlVisualLadderAttrHtml(ladderLevel) {
 // 分不清中途进度条数的到底是哪一种。跑到一半这行改成"已尝试"，不再用"已翻"这个有歧义的词。
 function ovlVisualLangProgressUpdate() {
     const el = document.getElementById('ovlVisualLangProgress');
+    // v2 Pass P232b：每次进度刷新顺手刷新「N 块译文来自别的模型」那行提示（整篇重译 / 队列 / 切语言 / 重渲染都会走到这里；函数内部先做廉价的早退）。
+    if (typeof ovlVisualModelNoticeRefresh === 'function') { try { ovlVisualModelNoticeRefresh(); } catch (eP232bN) {} }
     if (!el) return;
     // v2 Pass P232：「用当前模型重译全文」进行中——进度行显示它自己的进度，点一下停止。
     if (OvlP232RetransAll) {
@@ -44155,6 +44199,9 @@ async function ovlVisualLangRunQueue() {
     // v2 Pass P170：'compare' 模式的中文半屏一样要真正跑翻译——否则整个后台 worker 池在
     // compare 模式下永远不启动，中文侧永久停在 pending。
     if (OvlVisualLangState.running || (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare')) return;
+    // v2 Pass P232b（3d）：「用当前模型重译全文」进行中不起批量队列——两边各开一组 worker 会把并发翻倍（visualTransConcurrency 被绕过）。
+    // 整篇重译收工时会调 ovlVisualLangSyncAfterRender，期间重渲染出来的待翻块由那时的队列接手。
+    if (OvlP232RetransAll) return;
     const pane0 = document.getElementById('ovlVisualPane');
     if (!pane0) return;
     OvlVisualLangState.running = true;
@@ -44285,6 +44332,8 @@ async function ovlVisualLangRunQueue() {
                     el.removeAttribute('data-ovl-trans-fail-detail');
                     el.removeAttribute('data-ovl-trans-attempts');
                     if (typeof ovlVisualRemoveRetryBadge === 'function') ovlVisualRemoveRetryBadge(el);
+                    // v2 Pass P232b：队列 worker 译的是当前模型，块上若残留「来自 X」（回退显示过别的模型）一律清掉；必须在 skipped/partial/raw 标记之前清，否则会连带抹掉它们的 title
+                    if (typeof ovlVisualApplyModelMark === 'function') ovlVisualApplyModelMark(el, '');
                     if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; } // v2 Pass P113：跟"翻译成功"区分开，供进度提示如实报告；title 见 v2 Pass P128（C2）
                     // v2 Pass P122（C7，A8）+ P122b（B1）：L3 按句切分后仍有句子失败、或块内
                     // \text{} 散文子片段回落英文——块整体算"成功"落地（其余内容已是中文），
@@ -44440,6 +44489,8 @@ function ovlVisualLangSyncAfterRender() {
     // 判据跟上面两处（ovlVisualLangProgressUpdate / ovlVisualLangRunQueue）保持一致，否则
     // compare 模式下 pending 块永远不会被送进翻译队列。
     if (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare') { ovlVisualLangProgressUpdate(); return; }
+    // v2 Pass P232b：整篇渲染 / 局部重渲染之后，块上的「来自 X」标记都是按当前主模型算的；记下来，之后主模型变了才需要重打。
+    try { OvlP232MarkedFor = ovlVisualMainModelTag(); } catch (eP232bM) {}
     const pane = document.getElementById('ovlVisualPane');
     if (!pane) return;
     // v2 Pass P129：参考文献块（data-ovl-trans-notrans）不入翻译分母——它们从不会有
@@ -44479,6 +44530,12 @@ function ovlToggleVisualLangMenu() {
     if (!menu || !btn) return;
     const willOpen = menu.hasAttribute('hidden');
     if (!willOpen) { ovlCloseVisualLangMenu(); return; }
+    // v2 Pass P232b：菜单打开的这一刻现算「现在显示的译文有多少块不是当前模型产出的」，写进「用当前模型重译全文」的文案（读缓存，只在打开时算一次）。
+    OvlP232MenuCount = 0;
+    try {
+        if (!OvlP232RetransAll && (OvlVisualLangState.lang === 'zh' || OvlVisualLangState.lang === 'compare')) OvlP232MenuCount = ovlVisualRetransAllCollect().items.length;
+    } catch (eP232bMenu) { OvlP232MenuCount = 0; }
+    ovlVisualLangUpdateMenuUI();
     const r = btn.getBoundingClientRect();
     // v2 Pass P117：贴按钮左下角展开的菜单，按钮太靠视口右/下边缘时原来会直接出界——
     // 借统一钳制助手补上溢出保护。测量真实尺寸前先解除 hidden（visibility 挡住闪烁）。
@@ -44494,31 +44551,59 @@ function ovlToggleVisualLangMenu() {
 // 用户想让整篇改用当前模型时走这个显式动作：只重译「现在显示的译文不是当前模型产出的」那些块。
 // 纪律（对齐 P223 的「不比默认路径更糟」）：旧译文在新译文成功之前一直显示、一直在缓存里（不预删）；某块失败 = 保留旧译文、
 // 不打失败角标；走队列同款并发（visualTransConcurrency / auto）；可停止；用户手动采用/手改的块（forced 条目）与「无可译内容」块不碰。
-let OvlP232RetransAll = null; // { total, done, ok, fail, stopped, seq, controllers:Set, next, fatal, tripped } 进行中才非空
+let OvlP232RetransAll = null; // { total, done, ok, fail, gone, unseen, stopped, seq, controllers:Set, next, fatal, tripped, flagged:Set, idx } 进行中才非空
+// v2 Pass P232b：一次性取一批块的源码文本（共用一份行首表）。ovlVisualBlockSrcText 每次调用都重建全文行首表，批量场景（收集 / 找回活块 / 重打标记）用这个。
+function ovlVisualBlocksSrcTexts(blocks) {
+    const out = new Array(blocks.length);
+    for (let i = 0; i < out.length; i++) out[i] = null;
+    try {
+        const ta = document.getElementById('ovlCodeArea');
+        if (!ta) return out;
+        const val = ta.value;
+        const starts = ovlBuildLineStarts(val);
+        for (let i = 0; i < blocks.length; i++) {
+            const lo = parseInt(blocks[i].getAttribute('data-src-line'), 10);
+            const hi = parseInt(blocks[i].getAttribute('data-src-line-end'), 10);
+            if (!isFinite(lo) || !isFinite(hi)) continue;
+            out[i] = ovlVisualSliceByLineStarts(val, starts, lo, hi).text;
+        }
+    } catch (e) {}
+    return out;
+}
+// 一块现在能不能被整篇重译动：在页面上、不是跳过/无可译内容/失败/待翻/在飞、没有别的重试在跑。ownFlagged = 本次整篇重译自己打过忙态标记的块（它们不算「别人在跑」）。
+function ovlVisualRetransAllBlockEligible(el, ownFlagged) {
+    if (!el || !el.isConnected) return false;
+    if (el.hasAttribute('data-ovl-trans-notrans') || el.hasAttribute('data-ovl-trans-noprose') || el.hasAttribute('data-ovl-trans-skipped')) return false;
+    if (el.hasAttribute('data-ovl-trans-failed') || el.getAttribute('data-ovl-trans-pending') === '1' || el.getAttribute('data-ovl-trans-inflight') === '1') return false;
+    if (el.getAttribute('data-ovl-trans-retrying') === '1') return false;
+    if (el.getAttribute('data-ovl-trans-retranslating') === '1' && !(ownFlagged && ownFlagged.has(el))) return false;
+    return true;
+}
 function ovlVisualRetransAllCollect() {
-    const out = { items: [], keptForced: 0 };
+    const out = { items: [], keptForced: 0, overridden: 0 };
     const pane = document.getElementById('ovlVisualPane');
     let cfg = null;
     try { cfg = getApiConfig(); } catch (e) { cfg = null; }
     if (!pane || !cfg) return out;
     const blocks = pane.querySelectorAll('.ovl-visual-block');
+    const srcs = ovlVisualBlocksSrcTexts(blocks);
     ovlVisualTransCacheScopeBegin(); // 同步循环，不跨 await
     try {
         for (let i = 0; i < blocks.length; i++) {
             const el = blocks[i];
-            if (el.hasAttribute('data-ovl-trans-notrans') || el.hasAttribute('data-ovl-trans-noprose') || el.hasAttribute('data-ovl-trans-skipped')) continue;
-            if (el.hasAttribute('data-ovl-trans-failed') || el.getAttribute('data-ovl-trans-pending') === '1' || el.getAttribute('data-ovl-trans-inflight') === '1') continue;
-            if (el.getAttribute('data-ovl-trans-retranslating') === '1' || el.getAttribute('data-ovl-trans-retrying') === '1') continue;
-            const src = (typeof ovlVisualBlockSrcText === 'function') ? ovlVisualBlockSrcText(el) : null;
+            if (!ovlVisualRetransAllBlockEligible(el, null)) continue;
+            const src = srcs[i];
             if (src == null || !src.trim()) continue;
             const meta = ovlVisualTransCacheGetMeta(src, cfg);
             if (!meta || meta.skipped || !meta.model || !ovlVisualModelDiffers(meta.model)) continue;
             if (meta.forced) { out.keptForced++; continue; }
+            if (meta.override) out.overridden++; // v2 Pass P232b：这块是用户在「重译/重试」下拉里单独选了别的模型译的，整篇重译同样会覆盖它
             out.items.push({ el: el, src: src });
         }
     } finally { ovlVisualTransCacheScopeEnd(); }
     return out;
 }
+let OvlP232MenuCount = 0; // v2 Pass P232b：语言菜单打开那一刻算出的「N 块来自其他模型」，菜单项文案用
 function ovlVisualRetransAllMenuClick() {
     ovlCloseVisualLangMenu();
     if (OvlP232RetransAll) { ovlVisualRetransAllStop(); return; }
@@ -44537,9 +44622,11 @@ function ovlVisualRetransAllMenuClick() {
     }
     const n = col.items.length;
     const extra = col.keptForced ? ('\n另有 ' + col.keptForced + ' 块是你手动采用/手改的译文，会保留不动。') : '';
+    // v2 Pass P232b：点明其中有几块是用户之前单独选了别的模型重译/重试出来的——它们也会被覆盖，不能只在确认之后才发现。
+    const extraOv = col.overridden ? ('\n其中 ' + col.overridden + ' 块是你之前在「重译/重试」下拉里单独选了别的模型译的，它们也会被当前模型的译文覆盖。') : '';
     ovlConfirmDialog({
         title: '用当前模型重译全文？',
-        message: '将用当前模型重新翻译 ' + n + ' 块（这些块现在显示的是别的模型的译文）。旧译文在新译文成功之前一直保留；某块失败就保留旧译文。可随时点进度行停止。' + extra,
+        message: '将用当前模型重新翻译 ' + n + ' 块（这些块现在显示的是别的模型的译文）。旧译文在新译文成功之前一直保留；某块失败就保留旧译文。可随时点进度行停止。' + extraOv + extra,
         confirmLabel: '重译 ' + n + ' 块',
         onConfirm: function () { ovlVisualRetransAllRun(col.items, cfg); }
     });
@@ -44551,64 +44638,145 @@ function ovlVisualRetransAllStop() {
     st.controllers.forEach(function (c) { try { c.abort(); } catch (e) {} });
     try { ovlVisualLangProgressUpdate(); } catch (e) {}
 }
+// v2 Pass P232b：开跑后页面被重渲染（块 DOM 整批换新）时，按源码文本找回当前页面上的活块。一次性建 源码文本 → 块[] 的索引，
+// 签名（面板 / 首块 / 块数 / 源码长度）不变就复用；候选在使用前仍逐个核对「现在的源码文本 === 要译的文本」，索引陈旧也不会把译文挂错块。
+function ovlVisualRetransAllIndex(st) {
+    const pane = document.getElementById('ovlVisualPane');
+    const ta = document.getElementById('ovlCodeArea');
+    if (!pane || !ta) return null;
+    const blocks = pane.querySelectorAll('.ovl-visual-block');
+    const first = blocks.length ? blocks[0] : null;
+    const c = st.idx;
+    if (c && c.pane === pane && c.first === first && c.n === blocks.length && c.len === ta.value.length) return c.map;
+    const srcs = ovlVisualBlocksSrcTexts(blocks);
+    const map = new Map();
+    for (let i = 0; i < blocks.length; i++) {
+        const s = srcs[i];
+        if (s == null || !s.trim()) continue;
+        let a = map.get(s);
+        if (!a) { a = []; map.set(s, a); }
+        a.push(blocks[i]);
+    }
+    st.idx = { pane: pane, first: first, n: blocks.length, len: ta.value.length, map: map };
+    return map;
+}
+// 取这个任务（同一段源码文本）现在页面上的活块。forLanding=false：发请求前，还要确认它现在显示的仍是别的模型的译文；
+// forLanding=true：新译文已写进缓存，只需要找到该落到哪些块上。
+function ovlVisualRetransAllResolve(st, job, cfg, forLanding) {
+    const keep = function (el) {
+        return ovlVisualRetransAllBlockEligible(el, st.flagged) && !el.hasAttribute('data-ovl-trans-forced') && ovlVisualBlockSrcText(el) === job.src;
+    };
+    // 快路径：原来的块都还在、文本没变（绝大多数情况，没有重渲染）。
+    let allOk = job.els.length > 0;
+    const direct = [];
+    for (let i = 0; i < job.els.length; i++) {
+        if (keep(job.els[i])) direct.push(job.els[i]); else { allOk = false; break; }
+    }
+    if (allOk) return direct;
+    // 慢路径：页面被重渲染过 / 文本变了——按文本重新找。
+    const map = ovlVisualRetransAllIndex(st);
+    const cand = (map && map.get(job.src)) || [];
+    const out = [];
+    for (let i = 0; i < cand.length; i++) { if (keep(cand[i])) out.push(cand[i]); }
+    if (out.length && !forLanding) {
+        // 重渲染后命中的可能已经是当前模型的译文（或用户期间手动采用/手改了）：不再重复付费。
+        let m = null;
+        ovlVisualTransCacheScopeBegin();
+        try { m = ovlVisualTransCacheGetMeta(job.src, cfg); } finally { ovlVisualTransCacheScopeEnd(); }
+        if (!m || m.skipped || m.forced || !m.model || !ovlVisualModelDiffers(m.model)) return [];
+    }
+    return out;
+}
 async function ovlVisualRetransAllRun(items, cfg) {
     if (OvlP232RetransAll || !items || !items.length) return;
+    if (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare') return;
+    // v2 Pass P232b（3d）：批量翻译队列正在跑就不再并行起第二组请求（会把并发翻倍）；队列反过来在本动作进行中不启动（见 ovlVisualLangRunQueue 开头）。
+    if (OvlVisualLangState.running) {
+        try { showToast('后台还在翻译尚未翻译的块，等它结束后再点「用当前模型重译全文」。', 'warning'); } catch (e) {}
+        return;
+    }
     const mySeq = OvlVisualLangState.seq;
     let fixedProjectId;
     try { fixedProjectId = ovlVisualTransCacheProjectId(); } catch (e) { fixedProjectId = null; }
-    const st = { total: items.length, done: 0, ok: 0, fail: 0, stopped: false, seq: mySeq, controllers: new Set(), next: 0, fatal: 0, tripped: false, lastFatal: '' };
+    // 同一段源码文本的多个块（孪生段落）合成一个任务：只请求、只付费一次，译文落到所有活块上；进度仍按块数算。
+    const jobMap = new Map();
+    const jobs = [];
+    for (let i = 0; i < items.length; i++) {
+        let j = jobMap.get(items[i].src);
+        if (!j) { j = { src: items[i].src, els: [], n: 0 }; jobMap.set(items[i].src, j); jobs.push(j); }
+        j.els.push(items[i].el);
+        j.n++;
+    }
+    const st = { total: items.length, done: 0, ok: 0, fail: 0, gone: 0, unseen: 0, stopped: false, seq: mySeq, controllers: new Set(), next: 0, fatal: 0, tripped: false, lastFatal: '', flagged: new Set(), idx: null };
     OvlP232RetransAll = st;
     try { ovlVisualLangUpdateMenuUI(); ovlVisualLangProgressUpdate(); } catch (e) {}
     const live = function () { return !st.stopped && !st.tripped && mySeq === OvlVisualLangState.seq; };
+    // 新译文能不能显示到页面上：还在 Visual 的中文 / 对照模式、且没换项目。（停止 / 熔断之后在途请求陆续回来的结果也走这里：已经付过钱，缓存必写，页面上有活块就一并落。）
+    const canLand = function () {
+        try {
+            if (OvlState.editorMode !== 'visual') return false;
+            if (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare') return false;
+            return ovlVisualTransCacheProjectId() === fixedProjectId;
+        } catch (e) { return false; }
+    };
     async function worker() {
         for (;;) {
             if (!live()) return;
             const i = st.next++;
-            if (i >= items.length) return;
-            const it = items[i];
-            const el = it.el;
-            if (!el || !el.isConnected) { st.done++; try { ovlVisualLangProgressUpdate(); } catch (e) {} continue; } // 期间被重渲染掉了
+            if (i >= jobs.length) return;
+            const job = jobs[i];
+            // v2 Pass P232b（3a）：期间页面被重渲染掉的块不再静默算「已完成」——按源码文本找回活块；找不到才计入 gone（结束提示里如实说）。
+            const targets = ovlVisualRetransAllResolve(st, job, cfg, false);
+            if (!targets.length) { st.gone += job.n; st.done += job.n; try { ovlVisualLangProgressUpdate(); } catch (e) {} continue; }
             const controller = new AbortController();
             st.controllers.add(controller);
             OvlVisualLangState.adhocControllers.push(controller);
-            el.setAttribute('data-ovl-trans-retranslating', '1');
+            for (let t = 0; t < targets.length; t++) { targets[t].setAttribute('data-ovl-trans-retranslating', '1'); st.flagged.add(targets[t]); }
             const meta = {};
             let reqKey = null;
-            try { reqKey = ovlVisualTransCacheKey(it.src, cfg); } catch (e) { reqKey = null; } // 同 P215-7：请求时的 key，落地用同一个
+            try { reqKey = ovlVisualTransCacheKey(job.src, cfg); } catch (e) { reqKey = null; } // 同 P215-7：请求时的 key，落地用同一个
             let settled = false;
             try {
-                const tgt = await ovlVisualTranslateBlockWithLadder(it.src, cfg, controller.signal, meta);
-                if (!live()) return; // 已停止/语言切走：丢弃，旧译文原样保留
-                try { ovlVisualTransCachePut(it.src, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, reqKey, true); } catch (e) {}
-                try { ovlVisualFailLogDelete(it.src, cfg); } catch (e) {}
+                const tgt = await ovlVisualTranslateBlockWithLadder(job.src, cfg, controller.signal, meta);
+                // v2 Pass P232b（3c）：结果回来了就是已经付过钱的——不管此时已停止 / 熔断 / 语言切走，先写进缓存；页面上有活块再落。
+                try { ovlVisualTransCachePut(job.src, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, reqKey, true); } catch (e) {}
+                try { ovlVisualFailLogDelete(job.src, cfg); } catch (e) {}
                 settled = true;
-                st.ok++;
+                st.ok += job.n;
                 st.fatal = 0;
-                if (el.isConnected) {
-                    if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta); else if (meta.partial) el.setAttribute('data-ovl-trans-partial', '1'); else el.removeAttribute('data-ovl-trans-partial');
-                    if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta);
-                    ovlVisualApplyTranslatedHtml(el, tgt);
-                    if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; } else el.removeAttribute('data-ovl-trans-skipped');
-                    ovlVisualApplyModelMark(el, ''); // 新译文是当前模型的：清掉「来自 X」
-                    if (typeof ovlVisualLoadFigureThumbnails === 'function') { try { ovlVisualLoadFigureThumbnails(el); } catch (e) {} }
-                    if (typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') ovlScheduleVisualGutterAfterImage();
+                let landed = 0;
+                if (canLand()) {
+                    // v2 Pass P232b（3b）：落到【现在】页面上的活块（可能已不是开跑时收集的那批 DOM 节点）。
+                    const live2 = ovlVisualRetransAllResolve(st, job, cfg, true);
+                    for (let t = 0; t < live2.length; t++) {
+                        const el = live2[t];
+                        ovlVisualApplyModelMark(el, ''); // 新译文是当前模型的：先清掉「来自 X」（先于下面几个会写 title 的标记）
+                        if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta); else if (meta.partial) el.setAttribute('data-ovl-trans-partial', '1'); else el.removeAttribute('data-ovl-trans-partial');
+                        if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta);
+                        ovlVisualApplyTranslatedHtml(el, tgt);
+                        if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; } else el.removeAttribute('data-ovl-trans-skipped');
+                        if (typeof ovlVisualLoadFigureThumbnails === 'function') { try { ovlVisualLoadFigureThumbnails(el); } catch (e) {} }
+                        landed++;
+                    }
+                    if (landed && typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') ovlScheduleVisualGutterAfterImage();
                 }
+                if (landed < job.n) st.unseen += (job.n - landed); // 新译文已在缓存里，只是页面上暂时没有对应的块显示它
             } catch (err) {
                 if (err && err.name === 'AbortError') return;
-                if (!live()) return;
+                if (!live()) return; // 已停止 / 熔断 / 语言切走之后到达的失败：不计入
                 settled = true;
-                st.fail++; // 保留旧译文，不打失败角标、不写 failLog（块并没有变成「未翻译」）
+                st.fail += job.n; // 保留旧译文，不打失败角标、不写 failLog（块并没有变成「未翻译」）
                 const fr = meta.failReason || ovlVisualTransFailReason(err, meta);
                 if (ovlVisualTransIsTransportFatal(fr)) {
                     st.fatal++; st.lastFatal = fr;
-                    if (st.fatal >= 3) st.tripped = true; // 连续 3 个服务不可用类失败：别再白白发剩下的块
+                    if (st.fatal >= 3) st.tripped = true; // 连续 3 个服务不可用类失败：别再白白发剩下的块（已经在途的请求不掐，回来成功的照样入缓存、落页面）
                 } else st.fatal = 0;
             } finally {
                 st.controllers.delete(controller);
                 const ix = OvlVisualLangState.adhocControllers.indexOf(controller);
                 if (ix !== -1) OvlVisualLangState.adhocControllers.splice(ix, 1);
-                el.removeAttribute('data-ovl-trans-retranslating');
-                if (settled) st.done++;
+                for (let t = 0; t < targets.length; t++) targets[t].removeAttribute('data-ovl-trans-retranslating');
+                if (settled) st.done += job.n;
                 try { ovlVisualLangProgressUpdate(); } catch (e) {}
             }
         }
@@ -44619,13 +44787,17 @@ async function ovlVisualRetransAllRun(items, cfg) {
             const plan = ovlVisualLangAutoPlan(cfg);
             conc = (plan.n != null) ? plan.n : await plan.promise;
         }
-        conc = Math.max(1, Math.min(conc || OVL_VISUAL_LANG_CONCURRENCY, items.length));
+        conc = Math.max(1, Math.min(conc || OVL_VISUAL_LANG_CONCURRENCY, jobs.length));
         const ws = [];
         for (let k = 0; k < conc; k++) ws.push(worker());
         await Promise.all(ws);
     } finally {
         try { ovlVisualTransCacheWbFlush(); } catch (e) {}
         if (OvlP232RetransAll === st) OvlP232RetransAll = null;
+        st.flagged.forEach(function (fe) { try { fe.removeAttribute('data-ovl-trans-retranslating'); } catch (e) {} });
+        // v2 Pass P232b（1）：整篇重译期间 relayout 被限速（见 ovlP198ScheduleRelayout），收工时清掉尾随计时器并补一次，最终几何必须马上对齐。
+        if (OvlP208RelayoutThrottleTimer !== null) { try { clearTimeout(OvlP208RelayoutThrottleTimer); } catch (e) {} OvlP208RelayoutThrottleTimer = null; }
+        if (typeof ovlP198ScheduleRelayout === 'function') { try { ovlP198ScheduleRelayout(); } catch (e) {} }
         try { ovlVisualLangUpdateMenuUI(); ovlVisualLangProgressUpdate(); } catch (e) {}
         try {
             let msg;
@@ -44634,9 +44806,110 @@ async function ovlVisualRetransAllRun(items, cfg) {
             else if (st.stopped || mySeq !== OvlVisualLangState.seq) { msg = '已停止「用当前模型重译全文」：已重译 ' + st.ok + ' 块，其余保留原译文。'; kind = 'info'; }
             else if (st.fail > 0) { msg = '「用当前模型重译全文」完成：成功 ' + st.ok + ' 块，' + st.fail + ' 块失败（已保留原译文，可再点一次重试这些块）。'; kind = 'warning'; }
             else msg = '「用当前模型重译全文」完成：共重译 ' + st.ok + ' 块。';
+            // v2 Pass P232b：期间页面被重渲染导致的两类差异如实说出来，不静默。
+            if (st.gone > 0) { msg += ' 另有 ' + st.gone + ' 块因页面重新渲染或内容已变化，找不到对应的块（或已交给后台翻译接手），本次已跳过。'; if (kind === 'success') kind = 'warning'; }
+            if (st.unseen > 0) { msg += ' ' + st.unseen + ' 块的新译文已存入缓存，但页面上对应的块已变化，暂未显示（下次渲染会显示）。'; if (kind === 'success') kind = 'warning'; }
             showToast(msg, kind);
         } catch (e) {}
+        // v2 Pass P232b（3d）：本动作进行中队列不启动；期间重渲染出来的待翻块在这里交给队列接手。
+        try { ovlVisualLangSyncAfterRender(); } catch (e) {}
+        try { ovlVisualModelNoticeRefresh(); } catch (e) {}
     }
+}
+// ==================== v2 Pass P232b：「N 块译文来自别的模型」一行提示 ====================
+// 换主模型后旧译文继续显示（P232），但页面上除了鼠标悬停的 title 没有任何线索告诉用户：全文里有多少块还是旧模型的。
+// Visual 的中文 / 对照模式下，只要有这类块，就在工具条下面显示一行安静的提示（不给每个块加角标），带「用当前模型重译全文」入口。
+// 可关闭：关闭后在本次页面会话里对【当前这个主模型】保持隐藏（不落盘），主模型一换就重新出现。
+let OvlP232NoticeTag = null;        // 上一次刷新时看到的主模型 provider/model；变了就重置「已关闭」
+let OvlP232NoticeDismissed = false; // 对 OvlP232NoticeTag 这个主模型，用户是否点了 ×
+let OvlP232MarkedFor = null;        // 页面上现有「来自 X」标记是按哪个主模型算的
+function ovlVisualMainModelTag() {
+    try {
+        const c = getApiConfig();
+        return c ? (String(c.provider) + '/' + String(c.model)) : '';
+    } catch (e) { return ''; }
+}
+// 主模型换了之后，页面上已经显示的块的「来自 X」标记要按新主模型重算（渲染期打的标记是按当时的主模型算的）。
+// 精确：读缓存 meta.model（跟重渲染会显示的结果一致），只动 Visual 面板里已译完、没在忙的块；整个循环在一个缓存作用域内，只解析一次桶。
+function ovlVisualModelRemarkDisplayed() {
+    const pane = document.getElementById('ovlVisualPane');
+    let cfg = null;
+    try { cfg = getApiConfig(); } catch (e) { cfg = null; }
+    if (!pane || !cfg) return;
+    const blocks = pane.querySelectorAll('.ovl-visual-block');
+    if (!blocks.length) return;
+    const srcs = ovlVisualBlocksSrcTexts(blocks);
+    ovlVisualTransCacheScopeBegin(); // 同步循环，不跨 await
+    try {
+        for (let i = 0; i < blocks.length; i++) {
+            const el = blocks[i];
+            if (!ovlVisualRetransAllBlockEligible(el, null)) continue;
+            const src = srcs[i];
+            if (src == null || !src.trim()) continue;
+            const meta = ovlVisualTransCacheGetMeta(src, cfg);
+            if (!meta || meta.skipped) continue;
+            ovlVisualApplyModelMark(el, meta.model || '');
+        }
+    } finally { ovlVisualTransCacheScopeEnd(); }
+}
+function ovlVisualModelNoticeRefresh() {
+    const box = document.getElementById('ovlVisualModelNotice');
+    if (!box) return;
+    let show = false;
+    let text = '';
+    try {
+        const pane = document.getElementById('ovlVisualPane');
+        const inMode = !!pane && OvlState.editorMode === 'visual' && (OvlVisualLangState.lang === 'zh' || OvlVisualLangState.lang === 'compare');
+        if (inMode) {
+            const tag = ovlVisualMainModelTag();
+            if (tag !== OvlP232NoticeTag) { OvlP232NoticeTag = tag; OvlP232NoticeDismissed = false; } // 主模型变了：之前的「关闭」作废
+            if (tag && !OvlP232NoticeDismissed && !OvlVisualLangState.running && !OvlP232RetransAll) {
+                if (OvlP232MarkedFor !== tag) { ovlVisualModelRemarkDisplayed(); OvlP232MarkedFor = tag; }
+                const marked = pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-model]');
+                let n = 0;
+                const by = Object.create(null);
+                for (let i = 0; i < marked.length; i++) {
+                    const el = marked[i];
+                    const t = el.getAttribute('data-ovl-trans-model');
+                    if (!t || !ovlVisualModelDiffers(t)) continue;
+                    if (el.hasAttribute('data-ovl-trans-failed') || el.hasAttribute('data-ovl-trans-skipped') || el.hasAttribute('data-ovl-trans-forced')) continue;
+                    n++;
+                    by[t] = (by[t] || 0) + 1;
+                }
+                if (n > 0) {
+                    const tags = Object.keys(by).sort(function (a, b2) { return by[b2] - by[a]; });
+                    const top = ovlVisualModelTagName(tags[0]);
+                    text = (tags.length === 1)
+                        ? (n + ' 块译文来自 ' + top + '，不是当前模型')
+                        : (n + ' 块译文来自 ' + top + ' 等 ' + tags.length + ' 个其他模型，不是当前模型');
+                    show = true;
+                }
+            }
+        }
+    } catch (e) { show = false; }
+    if (show) {
+        const tx = document.getElementById('ovlVisualModelNoticeText');
+        if (tx && tx.textContent !== text) tx.textContent = text;
+        if (box.hasAttribute('hidden')) box.removeAttribute('hidden');
+    } else if (!box.hasAttribute('hidden')) {
+        box.setAttribute('hidden', '');
+    }
+}
+function ovlVisualModelNoticeDismiss() {
+    OvlP232NoticeTag = ovlVisualMainModelTag();
+    OvlP232NoticeDismissed = true;
+    const box = document.getElementById('ovlVisualModelNotice');
+    if (box) box.setAttribute('hidden', '');
+}
+// 顶栏换模型（selectModel）/ 设置里改默认翻译模型（setTranslateDefaultModel）之后调用：已显示的块重打标记，提示立刻跟上。
+function ovlVisualModelNoticeOnMainChange() {
+    try {
+        if (OvlState.editorMode === 'visual' && (OvlVisualLangState.lang === 'zh' || OvlVisualLangState.lang === 'compare')) {
+            ovlVisualModelRemarkDisplayed();
+            OvlP232MarkedFor = ovlVisualMainModelTag();
+        }
+        ovlVisualModelNoticeRefresh();
+    } catch (e) {}
 }
 function ovlVisualLangUpdateMenuUI() {
     const menu = document.getElementById('ovlVisualLangMenu');
@@ -44652,7 +44925,8 @@ function ovlVisualLangUpdateMenuUI() {
         const reItem = menu.querySelector('.ovl-layout-menu-item[data-vact="retrans-all"]');
         if (reItem) {
             reItem.hidden = !showRe;
-            reItem.textContent = OvlP232RetransAll ? '停止「用当前模型重译全文」' : '用当前模型重译全文';
+            // v2 Pass P232b：菜单打开时算好的「N 块来自其他模型」（OvlP232MenuCount）写进文案；N=0 保持原文案。
+            reItem.textContent = OvlP232RetransAll ? '停止「用当前模型重译全文」' : (OvlP232MenuCount > 0 ? ('用当前模型重译全文（' + OvlP232MenuCount + ' 块来自其他模型）') : '用当前模型重译全文');
         }
         const only = menu.querySelectorAll('[data-p232-only]');
         for (let i = 0; i < only.length; i++) only[i].hidden = !showRe;
@@ -44693,6 +44967,14 @@ function ovlVisualLangSetMode(lang) {
 function ovlBindVisualLangMenu() {
     const btn = document.getElementById('ovlVisualLangBtn');
     if (btn) btn.addEventListener('click', function (e) { e.stopPropagation(); ovlToggleVisualLangMenu(); });
+    // v2 Pass P232b：「N 块译文来自别的模型」那行提示——点「用当前模型重译全文」走跟菜单项同一条确认流程；× 在本次页面会话里对当前主模型关掉它。
+    const noticeAct = document.getElementById('ovlVisualModelNoticeAct');
+    if (noticeAct) {
+        noticeAct.addEventListener('click', function (e) { e.stopPropagation(); ovlVisualRetransAllMenuClick(); });
+        noticeAct.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); ovlVisualRetransAllMenuClick(); } });
+    }
+    const noticeX = document.getElementById('ovlVisualModelNoticeX');
+    if (noticeX) noticeX.addEventListener('click', function (e) { e.stopPropagation(); ovlVisualModelNoticeDismiss(); });
     const menu = document.getElementById('ovlVisualLangMenu');
     if (menu) menu.addEventListener('click', function (e) {
         const act = e.target.closest('.ovl-layout-menu-item[data-vact]'); // v2 Pass P232
@@ -45002,7 +45284,7 @@ async function ovlVisualBlockRetryClick(el, override) {
             if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta); // v2 Pass P128b（N-4）：打/清"经兜底档译出"标记
             ovlVisualApplyTranslatedHtml(el, tgt); // 整个块子节点被冲掉，角标自然一并消失；v2 Pass P168：手动重试同样要复算编号；v2 Pass P170：compare 模式只替换中文侧
             if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; } // title 见 v2 Pass P128（C2）
-            if (!meta.skipped && !meta.partial && meta.ladderLevel !== 'raw') ovlVisualApplyModelMark(el, modelTag); // v2 Pass P231：条件同「重译」；跟随成功（modelTag=''）会清掉块上残留的来源标记
+            if (!modelTag || (!meta.skipped && !meta.partial && meta.ladderLevel !== 'raw')) ovlVisualApplyModelMark(el, modelTag); // v2 Pass P231：条件同「重译」；跟随成功（modelTag=''）会清掉块上残留的来源标记；v2 Pass P232b：跟随路径无条件清（结果是 partial/skipped/raw 时旧版漏清，块带着已不真的「来自 X」）
             if (typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(el);
             if (typeof ovlRenderVisualGutter === 'function' && OvlState.editorMode === 'visual') ovlRenderVisualGutter();
         }
@@ -45109,7 +45391,7 @@ async function ovlVisualBlockRetranslateClick(el, override) {
             if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta);
             ovlVisualApplyTranslatedHtml(el, tgt);
             if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; }
-            if (!meta.skipped && !meta.partial && meta.ladderLevel !== 'raw') ovlVisualApplyModelMark(el, modelTag); // v2 Pass P223
+            if (!modelTag || (!meta.skipped && !meta.partial && meta.ladderLevel !== 'raw')) ovlVisualApplyModelMark(el, modelTag); // v2 Pass P223；v2 Pass P232b：跟随路径（modelTag=''）无条件清残留的「来自 X」，partial/skipped/raw 结果也一样
             if (typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(el);
             if (typeof ovlRenderVisualGutter === 'function' && OvlState.editorMode === 'visual') ovlRenderVisualGutter();
         }
