@@ -2784,6 +2784,8 @@ body[data-ovl-splitdrag] * { user-select: none !important; }
 .ovl-layout-menu-item:hover { background: #2F3A4C; }
 .ovl-layout-menu-item.ovl-active { color: #4ade80; }
 .ovl-layout-menu-item.ovl-active::before { content: "\2713  "; }
+/* v2 Pass P232：Visual 语言菜单里「用当前模型重译全文」下面的一句说明 */
+.ovl-layout-menu-note { padding: 2px 12px 6px; max-width: 250px; font-size: 11px; line-height: 1.45; color: #9AA4B2; white-space: normal; }
 
 /* ==================== #ovlTransWin（v2 M1.5：翻译器浮动窗口的窗框）====================
    机制照抄 #aiChatRoot（335–347 行那段解释同样适用：动态插进 body 的节点，Tailwind JIT
@@ -5034,7 +5036,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.49.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.50.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -21068,7 +21070,7 @@ function renderModelSelector() {
 
     return `
         <div class="relative">
-            <button data-ovl-onclick="toggleModelMenu()" class="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-2xl border border-slate-200 transition-all text-xs font-bold text-slate-700 active:scale-95" data-tip="当前用来翻译的模型。点开可在 Gemini / OpenAI / Claude / 本地 LM Studio 之间切换；列表里没有的模型去「设置 → 模型」勾选。" data-tip-pos="bottom-start">
+            <button data-ovl-onclick="toggleModelMenu()" class="flex items-center gap-2 bg-slate-100 hover:bg-slate-200 px-4 py-2 rounded-2xl border border-slate-200 transition-all text-xs font-bold text-slate-700 active:scale-95" data-tip="当前用来翻译的模型。点开可在 Gemini / OpenAI / Claude / 本地 LM Studio 之间切换；列表里没有的模型去「设置 → 模型」勾选。换模型不会清掉已有的 Visual 译文；想让整篇改用新模型，在 Visual 显示语言菜单里点「用当前模型重译全文」，单块用「重译」/「重试」。" data-tip-pos="bottom-start">
                 <span class="${currentIconClass}">${currentIcon}</span>
                 <!-- id 是给「设置 → 模型 → 默认模型」的翻译行用的：那里改了模型不能走 renderApp
                      （会冲掉还没点保存的 API Key 输入框），所以它定点改这一个文字节点。
@@ -26171,6 +26173,7 @@ async function chatAgentExecRetranslateBlock(args, signal, pending) {
     // v2 Pass P122（C7/A8）+ P122b（B1）：打/清 partial 标记 + 悬停说明，见 ovlVisualApplyPartialMark。
     if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta); else if (meta.partial) el.setAttribute('data-ovl-trans-partial', '1'); else el.removeAttribute('data-ovl-trans-partial');
     if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta); // v2 Pass P128b（N-4）：打/清"经兜底档译出"标记
+    if (typeof ovlVisualApplyModelMark === 'function') ovlVisualApplyModelMark(el, ''); // v2 Pass P232：这块刚才可能是回退显示的别的模型译文（带「来自 X」标记），现在是当前模型译的，清掉残留标记
     if (document.body.contains(el) && typeof ovlVisualRenderChunk === 'function') el.innerHTML = ovlVisualRenderChunk(newTgt, true); // v2 Pass P180：聊天工具 retranslate_block 同样是块的最终落地内容，纳入点击展开范围
     if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; } // v2 Pass P113：跟"翻译成功"区分开，供进度提示如实报告；title 见 v2 Pass P128（C2）
     if (typeof ovlVisualRemoveForceAcceptBadge === 'function') ovlVisualRemoveForceAcceptBadge(el);
@@ -34791,6 +34794,11 @@ function ovlPortalHtml() {
         // v2 Pass P170：第三个 Visual 显示语言子模式——英中交错对照。跟前两项走同一套
         // ovlBindVisualLangMenu() 委派（读 data-lang，天然兼容新值），不新起绑定逻辑。
         +   '<div class="ovl-layout-menu-item" data-lang="compare">Compare 对照</div>'
+        // v2 Pass P232：换主模型不再重翻整篇——旧译文继续显示；要整篇改用当前模型走这一项。只在 zh/compare 下显示
+        // （ovlVisualLangUpdateMenuUI 切 hidden 与文案），不带 data-lang，不会被上面的语言切换委派吃掉。
+        +   '<div class="ovl-menu-sep" data-p232-only="1" hidden></div>'
+        +   '<div class="ovl-layout-menu-item" data-vact="retrans-all" hidden>用当前模型重译全文</div>'
+        +   '<div class="ovl-layout-menu-note" data-p232-only="1" hidden>换模型不会清掉已有译文；想让整篇改用当前模型点上面这项，单块用「重译」/「重试」。</div>'
         + '</div>'
         // 项目菜单（§2.6.1 项目标题 ▾）：内容固定，ovlBindProjectMenu 绑定。
         // 项目历史已挪到文件树头部「打开项目文件夹…」下面的独立按钮（#ovlProjectHistoryBtn），
@@ -39532,6 +39540,7 @@ function ovlVisualTransCacheEvictToBudget(map, budgetChars) {
             delete map[keys[i]];
             i++;
         }
+        if (i > 0) OvlP232Index.delete(map); // v2 Pass P232：批量淘汰 = 二级索引作废（下次惰性重建）
     } catch (e) {}
     return map;
 }
@@ -39568,6 +39577,7 @@ function ovlVisualTransCacheSaveBucketCore(projectId, map) {
                 keys.sort(function (a, b) { return (map[a].ts || 0) - (map[b].ts || 0); });
                 const drop = Math.ceil(keys.length / 2);
                 for (let i = 0; i < drop; i++) delete map[keys[i]];
+                OvlP232Index.delete(map); // v2 Pass P232：配额减半 = 二级索引作废
                 payload = JSON.stringify(map);
                 localStorage.setItem(bucketKey, payload);
                 return true;
@@ -39720,6 +39730,7 @@ function ovlVisualTransCachePurgeStaleOnce() {
                 if (!ovlVisualTransCacheIsCurrentVersionKey(keys[j])) { delete map[keys[j]]; changed = true; }
             }
             if (changed) {
+                OvlP232Index.delete(map); // v2 Pass P232：批量清理 = 二级索引作废
                 if (ovlVisualTransCacheSaveBucket(projectId, map)) ovlVisualTransCacheIndexTouch(projectId);
             }
         }
@@ -39782,6 +39793,107 @@ function ovlVisualTransCacheGateCheck(text, hit, map, key, projectId) {
     }
     return null;
 }
+// ==================== v2 Pass P232：换主模型不丢旧译文（跨模型回退查询） ====================
+// 用户实测：Visual 中文模式切换顶栏翻译模型 → 整篇被重新翻译。根因：缓存 key 带 provider|model，
+// 换模型后所有自己的 key 都未命中，整篇排队重翻；旧模型的条目没被删，但会被每项目预算 LRU 慢慢挤掉。
+// 现在：自己的 key 未命中时，回退到「同一段源文 + 同一 prompt 版本 + 同一上下文」下任一其他模型最近（ts）
+// 的条目，当作正常译文显示（不排队），model 字段 = 条目自带的 model（P223 重译覆盖写的真实产出者）或 key 里的 provider/model，
+// 于是既有的 P223 「译文来自」标记 / 浮层 provenance 原样生效。自己的条目永远优先于回退。
+// 「同一上下文」的判据：用该条目自己的 provider/model 在【当前】卡片/术语/领域提示下重算 key，必须与存的 key 逐字相等
+// ——术语表/卡片/领域提示变了，受影响的块回退自然失败、照旧重译（跟换模型之前的行为一致）。
+// 性能：不逐块扫整桶。对桶对象惰性建一份 源文哈希 → key 集合 的二级索引（WeakMap，与桶对象同生共死：
+// P209 的 scope 内同一个桶对象 / P215 的 OvlP215WB 内存桶对象在落盘前身份不变；落盘后下次 Load 是新对象 → 新索引）。
+// Put 增量加入；条目被批量淘汰/清理（EvictToBudget/PurgeStale/配额减半）时丢弃索引；零散删除（Gate/Delete）增量移除。
+// 即使索引里残留已不在桶里的 key，命中前也会对 map[key] 复核，所以陈旧索引项无害；漏记则最坏只是多重译一次（不会显示错译文）。
+// 强制重译路径（P78 聊天代理失效重译 / P122 失败块重试 follow 路径 / P223 follow 路径重译 / CJK 闸删掉自己的条目）：
+// 这些路径的语义是「马上用当前模型重新翻一遍，别再给我看旧结果」，所以对被它们删掉的【自己的 key】登记「禁用回退」
+// （ovlVisualTransCacheFallbackSuppress，仅内存、本次页面加载有效）：渲染时不再回退到别的模型的译文，失败就如实
+// 显示失败 / 待翻译。不删其他模型的条目——否则「切回模型 A 仍是 A 的译文」会被一次重译抹掉。自己的 key 被 Put 时解除登记。
+const OvlP232Index = new WeakMap(); // 桶对象 → Map<源文哈希, Set<key>>
+const OvlP232Suppress = new Set();  // 禁用回退的「自己的 key」
+const OVL_P232_SUPPRESS_MAX = 4000;
+function ovlP232IndexBuild(map) {
+    const idx = new Map();
+    const keys = Object.keys(map);
+    for (let i = 0; i < keys.length; i++) {
+        const k = keys[i];
+        const p = k.indexOf('|');
+        if (p <= 0) continue;
+        const h = k.slice(0, p);
+        let set = idx.get(h);
+        if (!set) { set = new Set(); idx.set(h, set); }
+        set.add(k);
+    }
+    return idx;
+}
+function ovlP232IndexFor(map) {
+    let idx = OvlP232Index.get(map);
+    if (!idx) { idx = ovlP232IndexBuild(map); OvlP232Index.set(map, idx); }
+    return idx;
+}
+function ovlP232IndexAdd(map, key) {
+    const idx = OvlP232Index.get(map);
+    if (!idx) return; // 还没人建过索引：下次惰性建时一并扫到
+    const p = key.indexOf('|');
+    if (p <= 0) return;
+    const h = key.slice(0, p);
+    let set = idx.get(h);
+    if (!set) { set = new Set(); idx.set(h, set); }
+    set.add(key);
+}
+function ovlP232IndexRemove(map, key) {
+    const idx = OvlP232Index.get(map);
+    if (!idx) return;
+    const p = key.indexOf('|');
+    if (p <= 0) return;
+    const set = idx.get(key.slice(0, p));
+    if (set) set.delete(key);
+}
+function ovlVisualTransCacheFallbackSuppress(key) {
+    if (!key) return;
+    OvlP232Suppress.add(key);
+    if (OvlP232Suppress.size > OVL_P232_SUPPRESS_MAX) {
+        const first = OvlP232Suppress.values().next();
+        if (!first.done) OvlP232Suppress.delete(first.value);
+    }
+}
+// key 形如 H|zh|provider|model|v3[|fp]；解析失败无害（后面还有重算 key 的严格校验）。
+function ovlP232KeyProviderModel(key) {
+    const m = /^[^|]+\|zh\|([^|]*)\|(.*)\|v\d+(?:\|[^|]*)?$/.exec(String(key));
+    return m ? { provider: m[1], model: m[2] } : null;
+}
+// 返回 { hit, key, model } 或 null。hit 是桶里那个条目对象本身（跟正常命中一样，后面由 GetMeta 刷新 ts）。
+function ovlVisualTransCacheFallbackLookup(text, ownKey, map, projectId) {
+    const p = ownKey.indexOf('|');
+    if (p <= 0) return null;
+    const set = ovlP232IndexFor(map).get(ownKey.slice(0, p));
+    if (!set || !set.size) return null;
+    const cands = [];
+    set.forEach(function (k) {
+        if (k === ownKey) return;
+        const e = map[k];
+        if (!e || typeof e.tgt !== 'string') return; // 索引里的陈旧项
+        cands.push(k);
+    });
+    if (!cands.length) return null;
+    if (cands.length > 1) cands.sort(function (a, b) { return ((map[b] && map[b].ts) || 0) - ((map[a] && map[a].ts) || 0); });
+    for (let i = 0; i < cands.length; i++) {
+        const k = cands[i];
+        if (!ovlVisualTransCacheIsCurrentVersionKey(k)) continue;
+        const pm = ovlP232KeyProviderModel(k);
+        if (!pm) continue;
+        let again;
+        try { again = ovlVisualTransCacheKey(text, { provider: pm.provider, model: pm.model }); } catch (e) { continue; }
+        if (again !== k) continue; // 上下文（卡片/命中术语/领域提示）变了：这条回退作废
+        let hit = map[k];
+        if (!hit || typeof hit.tgt !== 'string') continue;
+        hit = ovlVisualTransCacheGateCheck(text, hit, map, k, projectId);
+        if (!hit) { ovlP232IndexRemove(map, k); continue; }
+        const model = (typeof hit.model === 'string' && hit.model) ? hit.model : (pm.provider + '/' + pm.model);
+        return { hit: hit, key: k, model: model };
+    }
+    return null;
+}
 function ovlVisualTransCacheGetMeta(text, config, projectIdOverride) {
     // v2 Pass P197（D）：缓存第一次被真正读取时顺手做一次性清理——内部有模块级标志短路，
     // 同一次页面加载只会真正扫描一遍，这里每次调用只是多一次函数调用开销。
@@ -39791,11 +39903,16 @@ function ovlVisualTransCacheGetMeta(text, config, projectIdOverride) {
         const key = ovlVisualTransCacheKey(text, config);
         const map = ovlVisualTransCacheBucketLoad(projectId);
         let hit = map[key];
+        let producer = null; // v2 Pass P232：这条译文的真实产出者 provider/model（own 条目：仅 P223 重译覆盖才有；回退条目：必有）
+        let ownGateDropped = false;
         if (hit && typeof hit.tgt === 'string') {
             hit = ovlVisualTransCacheGateCheck(text, hit, map, key, projectId);
+            if (!hit) ownGateDropped = true;
+            else if (typeof hit.model === 'string' && hit.model) producer = hit.model;
         } else {
             hit = null;
         }
+        if (ownGateDropped) ovlVisualTransCacheFallbackSuppress(key); // v2 Pass P232：自己的条目没过 CJK 闸被删 = 这块要用当前模型重译，不能回退成别的模型的译文
         if (hit) {
             const now = Date.now();
             if (!hit.ts || now - hit.ts > 60000) {
@@ -39815,7 +39932,7 @@ function ovlVisualTransCacheGetMeta(text, config, projectIdOverride) {
             // forced/partial 同一条纪律——旧缓存条目（本 Pass 之前写入的、或没传这个字段的
             // 调用点）没有这个字段，hit.ladderLevel 是 undefined，`|| null` 让老数据照常读出
             // null，不报错、不需要迁移。
-            return { tgt: hit.tgt, skipped: !!hit.skipped, forced: !!hit.forced, partial: !!hit.partial, partialReason: hit.partialReason || null, ladderLevel: hit.ladderLevel || null, model: (typeof hit.model === 'string' && hit.model) ? hit.model : null };
+            return { tgt: hit.tgt, skipped: !!hit.skipped, forced: !!hit.forced, partial: !!hit.partial, partialReason: hit.partialReason || null, ladderLevel: hit.ladderLevel || null, model: producer };
         }
         // 新桶未命中（含"闸没过被当场删掉"这种情形）——查一次旧版全局缓存兜底，命中就先过闸
         // 再决定要不要提升进新桶（不删旧的、旧的不再增长；不过闸就不提升，直接当未命中）。
@@ -39830,9 +39947,24 @@ function ovlVisualTransCacheGetMeta(text, config, projectIdOverride) {
                 const gate = (typeof ovlVisualCjkGateEval === 'function') ? ovlVisualCjkGateEval(text, legacyHit.tgt) : { ok: true };
                 passed = !!gate.ok;
             }
-            if (!passed) return null; // 旧版兜底同样不豁免——不达标不提升、直接当未命中
+            if (!passed) { ovlVisualTransCacheFallbackSuppress(key); return null; } // 旧版兜底同样不豁免——不达标不提升、直接当未命中（v2 Pass P232：同样不许回退成别的模型的译文）
             ovlVisualTransCachePut(text, config, legacyHit.tgt, projectId, legacyHit.skipped, legacyHit.forced, legacyHit.partial, legacyHit.partialReason, legacyHit.ladderLevel, OVL_VISUAL_CJK_GATE_VERSION);
             return { tgt: legacyHit.tgt, skipped: !!legacyHit.skipped, forced: !!legacyHit.forced, partial: !!legacyHit.partial, partialReason: legacyHit.partialReason || null, ladderLevel: legacyHit.ladderLevel || null };
+        }
+        // v2 Pass P232：自己（当前模型）的 key 在新桶/旧版缓存都没有 → 回退到别的模型同源文同上下文的最近条目（见上方 P232 注释）。
+        // 被强制重译路径登记过「禁用回退」的 key 不回退。作为普通命中返回：同样刷新 ts（否则正在显示的回退条目会先被预算淘汰）。
+        if (!ownGateDropped && !OvlP232Suppress.has(key)) {
+            const fb = ovlVisualTransCacheFallbackLookup(text, key, map, projectId);
+            if (fb) {
+                const fh = fb.hit;
+                const now2 = Date.now();
+                if (!fh.ts || now2 - fh.ts > 60000) {
+                    fh.ts = now2;
+                    if (OvlVisualTransCacheScope) OvlVisualTransCacheScope.dirty.add(projectId);
+                    else if (ovlVisualTransCacheSaveBucket(projectId, map)) ovlVisualTransCacheIndexTouch(projectId);
+                }
+                return { tgt: fh.tgt, skipped: !!fh.skipped, forced: !!fh.forced, partial: !!fh.partial, partialReason: fh.partialReason || null, ladderLevel: fh.ladderLevel || null, model: fb.model };
+            }
         }
     } catch (e) {}
     return null;
@@ -39874,6 +40006,8 @@ function ovlVisualTransCachePut(text, config, tgt, projectIdOverride, skipped, f
         const key = keyOverride || ovlVisualTransCacheKey(text, config); // v2 Pass P215（VISUALPERF-7）：keyOverride = 请求时算好的 key
         const map = ovlVisualTransCacheBucketLoad(projectId);
         map[key] = { tgt: tgt, ts: Date.now(), skipped: !!skipped, forced: !!forced, partial: !!partial, partialReason: partial ? (partialReason || 'unknown') : null, ladderLevel: ladderLevel || null, gateVersion: (typeof gateVersion === 'number') ? gateVersion : OVL_VISUAL_CJK_GATE_VERSION };
+        ovlP232IndexAdd(map, key); // v2 Pass P232：跨模型回退二级索引增量维护
+        OvlP232Suppress.delete(key); // v2 Pass P232：自己的 key 又有了新译文，「禁用回退」登记作废
         if (model) map[key].model = String(model); // v2 Pass P223：仅用户在重译下拉里换了模型时才带（provider/model）；旧条目读出为 undefined
         if (OvlVisualTransCacheScope) {
             // v2 Pass P215（VISUALPERF-6）：作用域内（旧版缓存提升等）只记脏，淘汰 + 落盘 + Maintain 留到 End 一次做。
@@ -39900,9 +40034,13 @@ function ovlVisualTransCacheDelete(text, config) {
         if (typeof ovlVisualFailLogDelete === 'function') ovlVisualFailLogDelete(text, config);
         const projectId = ovlVisualTransCacheProjectId();
         const key = ovlVisualTransCacheKey(text, config);
+        // v2 Pass P232：所有「删了就是要马上用当前模型重译」的强制路径（P78 聊天代理 / P122 follow 重试 / P223 follow 重译）都经过这里：
+        // 登记「禁用回退」——否则这块会立刻回退显示别的模型的旧译文，重译失败时用户也看不到失败。只动自己的 key，不删其他模型条目。
+        ovlVisualTransCacheFallbackSuppress(key);
         const map = ovlVisualTransCacheBucketLoad(projectId);
         if (!(key in map)) return false;
         delete map[key];
+        ovlP232IndexRemove(map, key);
         return ovlVisualTransCacheSaveBucket(projectId, map);
     } catch (e) { return false; }
 }
@@ -43648,6 +43786,15 @@ function ovlVisualLadderAttrHtml(ladderLevel) {
 function ovlVisualLangProgressUpdate() {
     const el = document.getElementById('ovlVisualLangProgress');
     if (!el) return;
+    // v2 Pass P232：「用当前模型重译全文」进行中——进度行显示它自己的进度，点一下停止。
+    if (OvlP232RetransAll) {
+        const ra = OvlP232RetransAll;
+        el.textContent = '用当前模型重译全文 ' + ra.done + '/' + ra.total + (ra.fail > 0 ? '，' + ra.fail + ' 块失败（保留原译文）' : '') + '（点此停止）';
+        el.onclick = ovlVisualRetransAllStop;
+        el.classList.add('ovl-visual-lang-progress--clickable');
+        el.removeAttribute('hidden');
+        return;
+    }
     // v2 Pass P170：'compare' 模式的英中交错同样需要中文译文，进度条判据跟 'zh' 一视同仁——
     // 否则切到 compare 后进度行会一直被这里隐藏，用户看不到翻译还在跑。
     if ((OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare') || OvlVisualLangState.total <= 0) {
@@ -43749,6 +43896,7 @@ function ovlVisualLangProgressUpdate() {
 // 也不该继续算钱）。不清 lang/total/done——那些由调用方（ovlVisualLangSetMode）决定要不要清。
 function ovlVisualLangCancelInFlight() {
     OvlVisualLangState.seq++;
+    if (OvlP232RetransAll) OvlP232RetransAll.stopped = true; // v2 Pass P232：语言切换/离开 Visual 同样叫停整篇重译（在飞请求随下面 adhocControllers 一起 abort）
     if (OvlVisualLangState.controller) {
         try { OvlVisualLangState.controller.abort(); } catch (e) {}
         OvlVisualLangState.controller = null;
@@ -44341,6 +44489,155 @@ function ovlToggleVisualLangMenu() {
     menu.style.top = cl.top + 'px';
     menu.style.visibility = '';
 }
+// ==================== v2 Pass P232：「用当前模型重译全文」 ====================
+// 换主模型不再重翻整篇（见 ovlVisualTransCacheFallbackLookup）：别的模型的旧译文继续显示、带「来自 X」标记。
+// 用户想让整篇改用当前模型时走这个显式动作：只重译「现在显示的译文不是当前模型产出的」那些块。
+// 纪律（对齐 P223 的「不比默认路径更糟」）：旧译文在新译文成功之前一直显示、一直在缓存里（不预删）；某块失败 = 保留旧译文、
+// 不打失败角标；走队列同款并发（visualTransConcurrency / auto）；可停止；用户手动采用/手改的块（forced 条目）与「无可译内容」块不碰。
+let OvlP232RetransAll = null; // { total, done, ok, fail, stopped, seq, controllers:Set, next, fatal, tripped } 进行中才非空
+function ovlVisualRetransAllCollect() {
+    const out = { items: [], keptForced: 0 };
+    const pane = document.getElementById('ovlVisualPane');
+    let cfg = null;
+    try { cfg = getApiConfig(); } catch (e) { cfg = null; }
+    if (!pane || !cfg) return out;
+    const blocks = pane.querySelectorAll('.ovl-visual-block');
+    ovlVisualTransCacheScopeBegin(); // 同步循环，不跨 await
+    try {
+        for (let i = 0; i < blocks.length; i++) {
+            const el = blocks[i];
+            if (el.hasAttribute('data-ovl-trans-notrans') || el.hasAttribute('data-ovl-trans-noprose') || el.hasAttribute('data-ovl-trans-skipped')) continue;
+            if (el.hasAttribute('data-ovl-trans-failed') || el.getAttribute('data-ovl-trans-pending') === '1' || el.getAttribute('data-ovl-trans-inflight') === '1') continue;
+            if (el.getAttribute('data-ovl-trans-retranslating') === '1' || el.getAttribute('data-ovl-trans-retrying') === '1') continue;
+            const src = (typeof ovlVisualBlockSrcText === 'function') ? ovlVisualBlockSrcText(el) : null;
+            if (src == null || !src.trim()) continue;
+            const meta = ovlVisualTransCacheGetMeta(src, cfg);
+            if (!meta || meta.skipped || !meta.model || !ovlVisualModelDiffers(meta.model)) continue;
+            if (meta.forced) { out.keptForced++; continue; }
+            out.items.push({ el: el, src: src });
+        }
+    } finally { ovlVisualTransCacheScopeEnd(); }
+    return out;
+}
+function ovlVisualRetransAllMenuClick() {
+    ovlCloseVisualLangMenu();
+    if (OvlP232RetransAll) { ovlVisualRetransAllStop(); return; }
+    if (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare') return;
+    if (OvlVisualLangState.running) {
+        try { showToast('后台还在翻译尚未翻译的块，等它结束后再点「用当前模型重译全文」。', 'warning'); } catch (e) {}
+        return;
+    }
+    let cfg = null;
+    try { cfg = getApiConfig(); } catch (e) { cfg = null; }
+    if (!cfg) return;
+    const col = ovlVisualRetransAllCollect();
+    if (!col.items.length) {
+        try { showToast('当前显示的译文已经全部来自当前模型，不需要重译。', 'info'); } catch (e) {}
+        return;
+    }
+    const n = col.items.length;
+    const extra = col.keptForced ? ('\n另有 ' + col.keptForced + ' 块是你手动采用/手改的译文，会保留不动。') : '';
+    ovlConfirmDialog({
+        title: '用当前模型重译全文？',
+        message: '将用当前模型重新翻译 ' + n + ' 块（这些块现在显示的是别的模型的译文）。旧译文在新译文成功之前一直保留；某块失败就保留旧译文。可随时点进度行停止。' + extra,
+        confirmLabel: '重译 ' + n + ' 块',
+        onConfirm: function () { ovlVisualRetransAllRun(col.items, cfg); }
+    });
+}
+function ovlVisualRetransAllStop() {
+    const st = OvlP232RetransAll;
+    if (!st || st.stopped) return;
+    st.stopped = true;
+    st.controllers.forEach(function (c) { try { c.abort(); } catch (e) {} });
+    try { ovlVisualLangProgressUpdate(); } catch (e) {}
+}
+async function ovlVisualRetransAllRun(items, cfg) {
+    if (OvlP232RetransAll || !items || !items.length) return;
+    const mySeq = OvlVisualLangState.seq;
+    let fixedProjectId;
+    try { fixedProjectId = ovlVisualTransCacheProjectId(); } catch (e) { fixedProjectId = null; }
+    const st = { total: items.length, done: 0, ok: 0, fail: 0, stopped: false, seq: mySeq, controllers: new Set(), next: 0, fatal: 0, tripped: false, lastFatal: '' };
+    OvlP232RetransAll = st;
+    try { ovlVisualLangUpdateMenuUI(); ovlVisualLangProgressUpdate(); } catch (e) {}
+    const live = function () { return !st.stopped && !st.tripped && mySeq === OvlVisualLangState.seq; };
+    async function worker() {
+        for (;;) {
+            if (!live()) return;
+            const i = st.next++;
+            if (i >= items.length) return;
+            const it = items[i];
+            const el = it.el;
+            if (!el || !el.isConnected) { st.done++; try { ovlVisualLangProgressUpdate(); } catch (e) {} continue; } // 期间被重渲染掉了
+            const controller = new AbortController();
+            st.controllers.add(controller);
+            OvlVisualLangState.adhocControllers.push(controller);
+            el.setAttribute('data-ovl-trans-retranslating', '1');
+            const meta = {};
+            let reqKey = null;
+            try { reqKey = ovlVisualTransCacheKey(it.src, cfg); } catch (e) { reqKey = null; } // 同 P215-7：请求时的 key，落地用同一个
+            let settled = false;
+            try {
+                const tgt = await ovlVisualTranslateBlockWithLadder(it.src, cfg, controller.signal, meta);
+                if (!live()) return; // 已停止/语言切走：丢弃，旧译文原样保留
+                try { ovlVisualTransCachePut(it.src, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, reqKey, true); } catch (e) {}
+                try { ovlVisualFailLogDelete(it.src, cfg); } catch (e) {}
+                settled = true;
+                st.ok++;
+                st.fatal = 0;
+                if (el.isConnected) {
+                    if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta); else if (meta.partial) el.setAttribute('data-ovl-trans-partial', '1'); else el.removeAttribute('data-ovl-trans-partial');
+                    if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta);
+                    ovlVisualApplyTranslatedHtml(el, tgt);
+                    if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; } else el.removeAttribute('data-ovl-trans-skipped');
+                    ovlVisualApplyModelMark(el, ''); // 新译文是当前模型的：清掉「来自 X」
+                    if (typeof ovlVisualLoadFigureThumbnails === 'function') { try { ovlVisualLoadFigureThumbnails(el); } catch (e) {} }
+                    if (typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') ovlScheduleVisualGutterAfterImage();
+                }
+            } catch (err) {
+                if (err && err.name === 'AbortError') return;
+                if (!live()) return;
+                settled = true;
+                st.fail++; // 保留旧译文，不打失败角标、不写 failLog（块并没有变成「未翻译」）
+                const fr = meta.failReason || ovlVisualTransFailReason(err, meta);
+                if (ovlVisualTransIsTransportFatal(fr)) {
+                    st.fatal++; st.lastFatal = fr;
+                    if (st.fatal >= 3) st.tripped = true; // 连续 3 个服务不可用类失败：别再白白发剩下的块
+                } else st.fatal = 0;
+            } finally {
+                st.controllers.delete(controller);
+                const ix = OvlVisualLangState.adhocControllers.indexOf(controller);
+                if (ix !== -1) OvlVisualLangState.adhocControllers.splice(ix, 1);
+                el.removeAttribute('data-ovl-trans-retranslating');
+                if (settled) st.done++;
+                try { ovlVisualLangProgressUpdate(); } catch (e) {}
+            }
+        }
+    }
+    try {
+        let conc = ovlVisualLangManualConcurrency();
+        if (!conc) {
+            const plan = ovlVisualLangAutoPlan(cfg);
+            conc = (plan.n != null) ? plan.n : await plan.promise;
+        }
+        conc = Math.max(1, Math.min(conc || OVL_VISUAL_LANG_CONCURRENCY, items.length));
+        const ws = [];
+        for (let k = 0; k < conc; k++) ws.push(worker());
+        await Promise.all(ws);
+    } finally {
+        try { ovlVisualTransCacheWbFlush(); } catch (e) {}
+        if (OvlP232RetransAll === st) OvlP232RetransAll = null;
+        try { ovlVisualLangUpdateMenuUI(); ovlVisualLangProgressUpdate(); } catch (e) {}
+        try {
+            let msg;
+            let kind = 'success';
+            if (st.tripped) { msg = '连续 3 个块失败，已停止「用当前模型重译全文」（原因：' + ovlVisualTransFatalLabel(st.lastFatal) + '）。已重译 ' + st.ok + ' 块，其余保留原译文。'; kind = 'error'; }
+            else if (st.stopped || mySeq !== OvlVisualLangState.seq) { msg = '已停止「用当前模型重译全文」：已重译 ' + st.ok + ' 块，其余保留原译文。'; kind = 'info'; }
+            else if (st.fail > 0) { msg = '「用当前模型重译全文」完成：成功 ' + st.ok + ' 块，' + st.fail + ' 块失败（已保留原译文，可再点一次重试这些块）。'; kind = 'warning'; }
+            else msg = '「用当前模型重译全文」完成：共重译 ' + st.ok + ' 块。';
+            showToast(msg, kind);
+        } catch (e) {}
+    }
+}
 function ovlVisualLangUpdateMenuUI() {
     const menu = document.getElementById('ovlVisualLangMenu');
     if (menu) {
@@ -44348,6 +44645,17 @@ function ovlVisualLangUpdateMenuUI() {
         for (let i = 0; i < items.length; i++) {
             items[i].classList.toggle('ovl-active', items[i].getAttribute('data-lang') === OvlVisualLangState.lang);
         }
+    }
+    // v2 Pass P232：「用当前模型重译全文」只在 zh / compare 下出现；整篇重译进行中改成「停止…」。
+    if (menu) {
+        const showRe = (OvlVisualLangState.lang === 'zh' || OvlVisualLangState.lang === 'compare');
+        const reItem = menu.querySelector('.ovl-layout-menu-item[data-vact="retrans-all"]');
+        if (reItem) {
+            reItem.hidden = !showRe;
+            reItem.textContent = OvlP232RetransAll ? '停止「用当前模型重译全文」' : '用当前模型重译全文';
+        }
+        const only = menu.querySelectorAll('[data-p232-only]');
+        for (let i = 0; i < only.length; i++) only[i].hidden = !showRe;
     }
     const btn = document.getElementById('ovlVisualLangBtn');
     // v2 Pass P170：'compare' 模式也显示中文译文（半屏），按钮高亮沿用跟 'zh' 一样的判据。
@@ -44387,6 +44695,8 @@ function ovlBindVisualLangMenu() {
     if (btn) btn.addEventListener('click', function (e) { e.stopPropagation(); ovlToggleVisualLangMenu(); });
     const menu = document.getElementById('ovlVisualLangMenu');
     if (menu) menu.addEventListener('click', function (e) {
+        const act = e.target.closest('.ovl-layout-menu-item[data-vact]'); // v2 Pass P232
+        if (act) { if (act.getAttribute('data-vact') === 'retrans-all') ovlVisualRetransAllMenuClick(); return; }
         const item = e.target.closest('.ovl-layout-menu-item[data-lang]');
         if (!item) return;
         ovlVisualLangSetMode(item.getAttribute('data-lang'));
