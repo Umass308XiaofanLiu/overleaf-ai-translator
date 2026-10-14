@@ -5034,8 +5034,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.48.01';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-10-09';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.49.00';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-10-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -44605,19 +44605,53 @@ function ovlVisualRetryBadgeRestore(badgeEl) {
     badgeEl.classList.remove('ovl-visual-retry-badge--busy');
     badgeEl.removeAttribute('aria-busy');
 }
-async function ovlVisualBlockRetryClick(el) {
+// v2 Pass P231：「重译」「重试」共用的 override 解析（原为 P223 在 ovlVisualBlockRetranslateClick 里的内联写法，逐字搬出）。
+// override = {provider, model} 或 undefined；cfg = 主模型 getApiConfig()。返回 { ok, transCfg, modelTag }：
+//   - 无 override / 与主模型相同 -> transCfg = cfg、modelTag = ''（跟随路径，调用方行为与改动前完全一致）；
+//   - 换了模型 -> 先查服务商密钥（builderProviderUsable，不可用弹错误 toast 并 ok=false 让调用方直接 return，
+//     verb 只是 toast 里的动词），再给本地未加载模型弹提示 toast；transCfg 只用于发请求，缓存/failLog 的 key 仍按 cfg。
+function ovlRetransApplyOverride(cfg, override, verb) {
+    const out = { ok: true, transCfg: cfg, modelTag: '' };
+    if (override && override.provider && override.model && cfg
+        && !(override.provider === cfg.provider && override.model === cfg.model)) {
+        if (!builderProviderUsable(override.provider)) {
+            if (typeof showToast === 'function') showToast('所选模型的服务商还没有配置可用的密钥，已取消这次' + verb, 'error');
+            out.ok = false;
+            return out;
+        }
+        out.transCfg = Object.assign({}, cfg, { provider: override.provider, model: override.model });
+        out.modelTag = override.provider + '/' + override.model;
+        try {
+            const mm = (override.provider === 'local') ? OvlLocalModelMeta.map[String(override.model)] : null;
+            if (mm && mm.state && mm.state !== 'loaded' && typeof showToast === 'function') {
+                showToast(localModelDisplayName(override.model, true) + ' 未加载，LM Studio 将临时加载，首次可能需要较长时间', 'info');
+            }
+        } catch (e) {}
+    }
+    return out;
+}
+async function ovlVisualBlockRetryClick(el, override) {
     if (!el || el.getAttribute('data-ovl-trans-retrying') === '1') return;
     const srcLatex = (typeof ovlVisualBlockSrcText === 'function') ? ovlVisualBlockSrcText(el) : null;
     if (srcLatex == null || !srcLatex.trim()) return;
     let cfg = null;
     try { cfg = getApiConfig(); } catch (e) { cfg = null; }
+    // v2 Pass P231：只有「重试」旁下拉点出来的调用才带 override（{provider, model}），规则与 P223「重译」逐条相同：
+    // cfg 仍是主模型——缓存 Delete/Put 与 failLog 的 key 永远按它算（换模型的重试结果因此能撑过重渲染/刷新，
+    // 失败也仍按主模型的 key 记 failLog）；只有请求用 transCfg。与主模型相同的选择当作没有 override。
+    const ov = ovlRetransApplyOverride(cfg, override, '重试');
+    if (!ov.ok) return;
+    const transCfg = ov.transCfg;
+    const modelTag = ov.modelTag;
     const mySeq = OvlVisualLangState.seq;
     let fixedProjectId;
     try { fixedProjectId = ovlVisualTransCacheProjectId(); } catch (e) { fixedProjectId = null; }
     // v2 Pass P122（C3.1，强制重跑）：先删掉这块的旧缓存条目，保证不会残留旧值——现状只有
     // 成功才 Put，理论上不该有"失败残留旧值"这回事，但用户点重试本身就是不信任当前结果，
     // 保险起见先清空，确保这一轮无论成功与否都不会被更旧的缓存条目短路。
-    try { ovlVisualTransCacheDelete(srcLatex, cfg); } catch (e) {}
+    // v2 Pass P231：换模型重试时不预删——「可能漏译」(partial) 块本来就有一条缓存译文，换模型失败不能让它比默认路径更糟；
+    // 成功才由下面的 Put 覆盖（并清 failLog），失败则旧译文仍在缓存里，整篇重渲染后照旧显示。跟随路径保持预删。
+    if (!modelTag) { try { ovlVisualTransCacheDelete(srcLatex, cfg); } catch (e) {} }
     const controller = new AbortController();
     OvlVisualLangState.adhocControllers.push(controller);
     el.setAttribute('data-ovl-trans-retrying', '1');
@@ -44636,13 +44670,16 @@ async function ovlVisualBlockRetryClick(el) {
         // v2 Pass P122（C2）：改调重试阶梯（从 L0/L1 重新开始，允许再跑一遍全阶梯），取代
         // 直接调 ovlVisualTranslateBlockText——这正是"点重试真的有效"的根治：以前是同一个
         // prompt 问同一个模型，现在失败会自动换纠正 prompt/温度/切句/加大配额。
-        const tgt = await ovlVisualTranslateBlockWithLadder(srcLatex, cfg, controller.signal, meta, { userForced: true });
+        const tgt = await ovlVisualTranslateBlockWithLadder(srcLatex, transCfg, controller.signal, meta, { userForced: true });
         // v2 Pass P128b（N-2 收口）：陈旧响应丢弃不落地，但角标复原成可再点的"重试"——以前
         // 直接 return，按钮永久卡在"重试中…"+pointer-events:none 到下一次整篇重渲染为止
         // （复现见阻断报告 N-2）。块本身该是什么状态不变（这一路径进来时块本来就是 failed，
         // 这里没有清掉 data-ovl-trans-failed，只是角标视觉复原，用户能再点一次）。
         if (mySeq !== OvlVisualLangState.seq) { ovlVisualRetryBadgeRestore(badgeEl); return; } // 陈旧响应（语言已切走/已取消），丢弃不落地
-        try { ovlVisualTransCachePut(srcLatex, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel); } catch (e) {} // partial 见 P122c BV2-2；ladderLevel 见 P128b N-4
+        try { ovlVisualTransCachePut(srcLatex, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, undefined, undefined, modelTag); } catch (e) {} // partial 见 P122c BV2-2；ladderLevel 见 P128b N-4；modelTag 见 P231（跟随时为 ''，Put 不写 model 字段，与改动前同）
+        // v2 Pass P231：换模型重试成功没有预删（见上），failLog 里此前失败留下的记录要在这里清掉——否则缓存条目日后被淘汰/删除后，
+        // 旧失败记录会让这块复活成失败态（跟随路径由预删里的 ovlVisualTransCacheDelete 顺带清了）。
+        if (modelTag) { try { if (typeof ovlVisualFailLogDelete === 'function') ovlVisualFailLogDelete(srcLatex, cfg); } catch (e) {} }
         if (document.body.contains(el)) {
             el.removeAttribute('data-ovl-trans-failed');
             el.removeAttribute('data-ovl-trans-fail-reason');
@@ -44655,6 +44692,7 @@ async function ovlVisualBlockRetryClick(el) {
             if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta); // v2 Pass P128b（N-4）：打/清"经兜底档译出"标记
             ovlVisualApplyTranslatedHtml(el, tgt); // 整个块子节点被冲掉，角标自然一并消失；v2 Pass P168：手动重试同样要复算编号；v2 Pass P170：compare 模式只替换中文侧
             if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; } // title 见 v2 Pass P128（C2）
+            if (!meta.skipped && !meta.partial && meta.ladderLevel !== 'raw') ovlVisualApplyModelMark(el, modelTag); // v2 Pass P231：条件同「重译」；跟随成功（modelTag=''）会清掉块上残留的来源标记
             if (typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(el);
             if (typeof ovlRenderVisualGutter === 'function' && OvlState.editorMode === 'visual') ovlRenderVisualGutter();
         }
@@ -44737,23 +44775,11 @@ async function ovlVisualBlockRetranslateClick(el, override) {
     // v2 Pass P223：只有「重译」旁下拉点出来的调用才带 override（{provider, model}）。cfg 仍是主模型的
     // baseCfg——缓存 Delete/Put 的 key 永远按它算（重译结果因此能撑过重渲染/刷新）；只有请求用 transCfg。
     // 与主模型相同的选择当作没有 override。
-    let transCfg = cfg;
-    let modelTag = '';
-    if (override && override.provider && override.model && cfg
-        && !(override.provider === cfg.provider && override.model === cfg.model)) {
-        if (!builderProviderUsable(override.provider)) {
-            if (typeof showToast === 'function') showToast('所选模型的服务商还没有配置可用的密钥，已取消这次重译', 'error');
-            return;
-        }
-        transCfg = Object.assign({}, cfg, { provider: override.provider, model: override.model });
-        modelTag = override.provider + '/' + override.model;
-        try {
-            const mm = (override.provider === 'local') ? OvlLocalModelMeta.map[String(override.model)] : null;
-            if (mm && mm.state && mm.state !== 'loaded' && typeof showToast === 'function') {
-                showToast(localModelDisplayName(override.model, true) + ' 未加载，LM Studio 将临时加载，首次可能需要较长时间', 'info');
-            }
-        } catch (e) {}
-    }
+    // v2 Pass P231：这段解析抽成 ovlRetransApplyOverride，「重试」(ovlVisualBlockRetryClick) 共用。
+    const ov = ovlRetransApplyOverride(cfg, override, '重译');
+    if (!ov.ok) return;
+    const transCfg = ov.transCfg;
+    const modelTag = ov.modelTag;
     const mySeq = OvlVisualLangState.seq;
     let fixedProjectId;
     try { fixedProjectId = ovlVisualTransCacheProjectId(); } catch (e) { fixedProjectId = null; }
@@ -45000,6 +45026,15 @@ function ovlQaRenderVisualState() {
         html += '<button type="button" class="ovl-qa-state-btn" data-qas="' + escapeAttr(b.key) + '" data-tip="'
             + escapeAttr(b.title || '') + '" data-tip-pos="top">' + escapeHtml(b.text) + '</button>';
     });
+    // v2 Pass P231：凡是提供「重试」按钮的状态（failed / partial=可能漏译）在按钮之后挂与「重译」同一份的模型下拉；
+    // 重试进行中（busy「重试中…」）挂禁用态的同一个下拉。只读 state.buttons 与块自身的 retrying 属性，
+    // 不改 ovlQaVisualStateCompute（它的返回形状与 gutter 指纹不变量不动）。
+    if (state.buttons.some(function (b) { return b.key === 'retry'; })) {
+        html += ovlRetransPickerHtml(false, '重试');
+        ovlLocalModelMetaMaybeRefresh(); // 同「重译」：节流刷新加载状态，供下次打开使用
+    } else if (el.getAttribute('data-ovl-trans-retrying') === '1') {
+        html += ovlRetransPickerHtml(true, '重试');
+    }
     box.innerHTML = html;
 }
 
@@ -45059,19 +45094,37 @@ function ovlRetransPickerResolve(value) {
     if (!found) return null;
     return { provider: v.slice(0, i), model: v.slice(i + 2) };
 }
-function ovlRetransPickerHtml(disabled) {
+// v2 Pass P231：verb 只影响悬浮提示里的动词（'重译' 默认 / 失败块与「可能漏译」块旁的 '重试'）；选项、记忆值、
+// 回落规则全部同一份，「重试」与「重译」共用 OvlSettings.visualRetranslateModel。
+function ovlRetransPickerHtml(disabled, verb) {
     let followName = '';
     try {
         const cfg = getApiConfig();
         followName = (cfg.provider === 'local') ? localModelDisplayName(cfg.model) : ovlRetransModelName(cfg.provider, cfg.model);
     } catch (e) {}
     const cur = ovlRetransPickerResolve(OvlSettings.visualRetranslateModel) ? String(OvlSettings.visualRetranslateModel) : '';
-    let html = '<select class="ovl-qa-retrans-sel" data-qar-model="1" data-tip="' + escapeAttr('选择这次重译用哪个模型；选「跟随」就用顶栏当前模型') + '" data-tip-pos="top"' + (disabled ? ' disabled' : '') + '>'
+    let html = '<select class="ovl-qa-retrans-sel" data-qar-model="1" data-tip="' + escapeAttr('选择这次' + (verb || '重译') + '用哪个模型；选「跟随」就用顶栏当前模型') + '" data-tip-pos="top"' + (disabled ? ' disabled' : '') + '>'
         + ovlOptTag('', '跟随当前模型（' + followName + '）', cur);
     ovlRetransPickerGroups().forEach(function (g) {
         html += '<optgroup label="' + escapeAttr(g.label) + '">' + g.items.map(function (it) { return ovlOptTag(it.value, it.label, cur); }).join('') + '</optgroup>';
     });
     return html + '</select>';
+}
+// v2 Pass P231：下拉当前选择 -> override（{provider, model}）或 null（跟随 / 记忆值已失效）。「重译」与「重试」
+// 两处点击委托共用，行为与 P223 内联写法逐字相同。
+function ovlRetransPickerOverrideFrom(box) {
+    const selEl = box ? box.querySelector('select[data-qar-model]') : null;
+    return selEl ? ovlRetransPickerResolve(selEl.value) : null;
+}
+// v2 Pass P231：下拉 change -> 只存记忆值（OvlSettings.visualRetranslateModel，随 ovl.settings 同步）。绝不触发请求；
+// 「重译」盒与「重试」所在的状态盒各绑一次，共用这一份。
+function ovlRetransPickerBindChange(box) {
+    box.addEventListener('change', function (e) {
+        const sel = e.target && e.target.closest ? e.target.closest('select[data-qar-model]') : null;
+        if (!sel) return;
+        OvlSettings.visualRetranslateModel = String(sel.value || '');
+        try { ovlSaveSettings(); } catch (err) {}
+    });
 }
 // 选中块当前译文的来源提示：缓存条目带 model 且不同于当前主模型才出现。
 function ovlRetransProvenanceHtml(el) {
@@ -45115,6 +45168,9 @@ function ovlQaRenderRetranslate() {
 function ovlBindQaVisualState() {
     const box = document.getElementById('ovlQaVisualState');
     if (!box) return;
+    // v2 Pass P231：失败 / 可能漏译块的「重试」旁的模型下拉（与「重译」同一份）——change 只存记忆值，
+    // 下拉没有 data-qas，不进下面的点击委托，选模型不会触发重试也不会关弹窗。
+    ovlRetransPickerBindChange(box);
     box.addEventListener('click', function (e) {
         const btn = e.target.closest('[data-qas]');
         if (!btn || btn.disabled) return;
@@ -45127,7 +45183,9 @@ function ovlBindQaVisualState() {
             ovlQaRenderVisualState();
             Promise.resolve(p).then(ovlQaRenderVisualState).catch(function () { ovlQaRenderVisualState(); });
         } else if (key === 'retry' && typeof ovlVisualBlockRetryClick === 'function') {
-            const p = ovlVisualBlockRetryClick(el);
+            // v2 Pass P231：下拉选了别的模型才带 override；跟随（含已失效的记忆值）= 与改动前同一调用
+            const ov = ovlRetransPickerOverrideFrom(box);
+            const p = ov ? ovlVisualBlockRetryClick(el, ov) : ovlVisualBlockRetryClick(el);
             ovlQaRenderVisualState();
             Promise.resolve(p).then(ovlQaRenderVisualState).catch(function () { ovlQaRenderVisualState(); });
         } else if (key === 'detail' && typeof ovlVisualShowFailDetail === 'function') {
@@ -45152,12 +45210,7 @@ function ovlBindQaVisualState() {
 function ovlBindQaRetranslate() {
     const box = document.getElementById('ovlQaRetranslate');
     if (!box) return;
-    box.addEventListener('change', function (e) {
-        const sel = e.target && e.target.closest ? e.target.closest('select[data-qar-model]') : null;
-        if (!sel) return;
-        OvlSettings.visualRetranslateModel = String(sel.value || '');
-        try { ovlSaveSettings(); } catch (err) {}
-    });
+    ovlRetransPickerBindChange(box); // v2 Pass P231：原内联 change 监听抽成共用函数（逻辑不变）
     box.addEventListener('click', function (e) {
         const btn = e.target.closest('[data-qar]');
         if (!btn || btn.disabled) return;
@@ -45167,8 +45220,7 @@ function ovlBindQaRetranslate() {
         if (!el || !document.body.contains(el)) { ovlQaRenderVisualState(); return; }
         if (key === 'retranslate' && typeof ovlVisualBlockRetranslateClick === 'function') {
             // v2 Pass P223：下拉选了别的模型才带 override；跟随（含已失效的记忆值）= 与改动前同一调用
-            const selEl = box.querySelector('select[data-qar-model]');
-            const ov = selEl ? ovlRetransPickerResolve(selEl.value) : null;
+            const ov = ovlRetransPickerOverrideFrom(box);
             const p = ov ? ovlVisualBlockRetranslateClick(el, ov) : ovlVisualBlockRetranslateClick(el);
             ovlQaRenderVisualState();
             Promise.resolve(p).then(ovlQaRenderVisualState).catch(function () { ovlQaRenderVisualState(); });
