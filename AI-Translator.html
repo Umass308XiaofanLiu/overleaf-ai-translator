@@ -5067,7 +5067,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.51.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.51.03';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -39917,7 +39917,8 @@ function ovlP232KeyProviderModel(key) {
     return m ? { provider: m[1], model: m[2] } : null;
 }
 // 返回 { hit, key, model } 或 null。hit 是桶里那个条目对象本身（跟正常命中一样，后面由 GetMeta 刷新 ts）。
-function ovlVisualTransCacheFallbackLookup(text, ownKey, map, projectId) {
+// readOnly（v2 Pass P233，只给翻译上下文的只读查询用）：判据与 GateCheck 相同，但不盖章、不删条目、不存桶（GateCheck 在作用域外会整桶落盘）；缺省 = 原行为。
+function ovlVisualTransCacheFallbackLookup(text, ownKey, map, projectId, readOnly) {
     const p = ownKey.indexOf('|');
     if (p <= 0) return null;
     const set = ovlP232IndexFor(map).get(ownKey.slice(0, p));
@@ -39941,8 +39942,14 @@ function ovlVisualTransCacheFallbackLookup(text, ownKey, map, projectId) {
         if (again !== k) continue; // 上下文（卡片/命中术语/领域提示）变了：这条回退作废
         let hit = map[k];
         if (!hit || typeof hit.tgt !== 'string') continue;
-        hit = ovlVisualTransCacheGateCheck(text, hit, map, k, projectId);
-        if (!hit) { ovlP232IndexRemove(map, k); continue; }
+        if (readOnly) {
+            let okGate = hit.gateVersion === OVL_VISUAL_CJK_GATE_VERSION || !!(hit.skipped || hit.forced);
+            if (!okGate) okGate = (typeof ovlVisualCjkGateEval === 'function') ? !!ovlVisualCjkGateEval(text, hit.tgt).ok : true;
+            if (!okGate) continue; // 没过闸的回退条目这里只是不用它；真正的清理留给显示路径
+        } else {
+            hit = ovlVisualTransCacheGateCheck(text, hit, map, k, projectId);
+            if (!hit) { ovlP232IndexRemove(map, k); continue; }
+        }
         const model = (typeof hit.model === 'string' && hit.model) ? hit.model : (pm.provider + '/' + pm.model);
         return { hit: hit, key: k, model: model };
     }
@@ -41521,14 +41528,21 @@ async function ovlVisualTranslateBlockWithLadder(text, cfg, signal, meta, opts) 
     let ladderCtx = (opts && opts.ctx) ? opts.ctx : null;
     const callBT = async function (srcText, metaObj, extra) {
         if (!ladderCtx) return await ovlVisualTranslateBlockText(srcText, cfg, signal, metaObj, extra);
+        const before = Object.assign({}, metaObj); // 串味重问要回到这次尝试【之前】的 meta
         try {
             return await ovlVisualTranslateBlockText(srcText, cfg, signal, metaObj, Object.assign({}, extra || null, { ctx: ladderCtx }));
         } catch (e) {
             if (e && e.ovlCtxContaminated) {
                 ladderCtx = null;
+                // 被丢弃的那次尝试已经把 partial / partialReason / repairs 等写进了 metaObj（ovlVisualBlockFinish 只置不清）：
+                // 它们不能带进干净重问的结果里把块误标成 partial。与 L2/L4 同一手法——回到尝试前的状态，用全新的 meta 重问，再并回来。
+                Object.keys(metaObj).forEach(function (k) { delete metaObj[k]; });
+                Object.assign(metaObj, before);
                 m.attempts++;
                 m.ctxDropped = true;
-                return await ovlVisualTranslateBlockText(srcText, cfg, signal, metaObj, extra);
+                const fresh = {};
+                try { return await ovlVisualTranslateBlockText(srcText, cfg, signal, fresh, extra); }
+                finally { Object.assign(metaObj, fresh); }
             }
             throw e;
         }
@@ -41771,7 +41785,7 @@ function ovlP233ZhLookup(cfg, newZh) {
                 if (!ok) ok = (typeof ovlVisualCjkGateEval === 'function') ? !!ovlVisualCjkGateEval(src, hit.tgt).ok : true;
                 if (ok && !hit.skipped) tgt = hit.tgt;
             } else if (!OvlP232Suppress.has(key)) {
-                const fb = ovlVisualTransCacheFallbackLookup(src, key, map, pid);
+                const fb = ovlVisualTransCacheFallbackLookup(src, key, map, pid, true); // 只读：不经 GateCheck（它会在作用域外整桶落盘）
                 if (fb && fb.hit && !fb.hit.skipped) tgt = fb.hit.tgt;
             }
             return (tgt && ovlP233HasCjk(tgt)) ? tgt : '';
@@ -42075,11 +42089,14 @@ function ovlP233RoundCorrection(jobs) {
     return parts.join('\n');
 }
 // 一组 jobs 的完整流程（联合 -> 缩小重试 -> 逐块阶梯），结果写进 job.result = { ok, tgt, meta, via:'joint'|'single' } 或 { ok:false, err, meta, via:'kept' }。
-// env = { reqCfg, baseCfg, signal, newZh, makeCtx(jobs)->ctx|null, fatal }
+// env = { reqCfg, baseCfg, signal, newZh, makeCtx(jobs)->ctx|null, fatal, retryTransient?, deferWrite? }
+//   env.retryTransient：整组联合请求遇到「瞬时」传输类失败（429/5xx/断网/超时）时，同一组再试一次（对应单块阶梯的 L2：一次瞬断不该让整组直接失败）。
+//   只有没有「还回待翻队列再试」这条自然重试路径的调用方（联合重译选区 / 整篇重译）才开；批量队列失败后块回到待翻，下一圈自然重发。
 async function ovlP233RunGroup(env, group) {
     if (group.length >= 2) {
         const ctx1 = env.makeCtx(group);
-        const r1 = await ovlP233JointRound(env, group, ctx1, '', false);
+        let r1 = await ovlP233JointRound(env, group, ctx1, '', false);
+        if (r1.fatal && env.retryTransient && ovlVisualTransIsTransient(r1.fatal)) r1 = await ovlP233JointRound(env, group, ctx1, '', true);
         ovlP233SettleRound(group);
         if (r1.fatal) {
             env.fatal = r1.fatal;
@@ -42264,7 +42281,8 @@ async function ovlP233RunSelection(els, override) {
     try { ovlVisualLangProgressUpdate(); } catch (e) {}
     try { ovlQaRenderJoint(); } catch (e) {}
     const newZh = new Map();
-    const env = { reqCfg: ov.transCfg, baseCfg: cfg, modelTag: ov.modelTag, signal: controller.signal, newZh: newZh, fatal: '',
+    // deferWrite：一组落地多块 = 多次 Put，走 P215 回写缓存（收工 finally 的 ovlVisualTransCacheWbFlush 一次落盘），不每块整桶写一次；retryTransient 见 ovlP233RunGroup 头部注释。
+    const env = { reqCfg: ov.transCfg, baseCfg: cfg, modelTag: ov.modelTag, signal: controller.signal, newZh: newZh, fatal: '', deferWrite: true, retryTransient: true,
         canLand: function () {
             try {
                 if (OvlState.editorMode !== 'visual') return false;
@@ -42577,6 +42595,25 @@ function ovlP233PinToggle(input) {
         if (want && tooLong) { try { showToast('有 ' + tooLong + ' 块原文太长（超过 ' + OVL_P233_PIN_SRC_MAX + ' 字符），没有固定。', 'info'); } catch (e) {} }
     } catch (e) { console.error('[ovl] pin toggle failed', e); }
 }
+// 设置里的「清空翻译参考」：按钮文字里带当前项目的条数。参考按源码文本存；源码被改过的块留下的旧参考在页面上没有任何可见标记、也没法逐条取消，
+// 但只要缓存里还有它旧源码的译文，就会继续被带进每个请求——所以需要一个总的清空入口。
+function ovlP233PinsClearLabel() { const n = ovlP233PinsGet().length; return n ? ('清空本项目的翻译参考（' + n + ' 条）') : '本项目没有翻译参考'; }
+function ovlP233PinsClearAll() {
+    const n = ovlP233PinsGet().length;
+    if (!n) { try { showToast('这个项目里没有翻译参考。', 'info'); } catch (e) {} return; }
+    ovlConfirmDialog({
+        title: '清空翻译参考？',
+        message: '将清空当前项目的 ' + n + ' 条翻译参考（原文 + 译文对照）。之后的翻译请求不再带它们；已有译文和其它项目的翻译参考都不受影响。',
+        confirmLabel: '清空 ' + n + ' 条',
+        onConfirm: function () {
+            if (!ovlP233PinsPut([])) { try { showToast('清空翻译参考失败（浏览器存储不可用）。', 'error'); } catch (e) {} return; }
+            try { ovlP233PinMarkAll(); } catch (e) {}
+            const btn = document.getElementById('ovlP233PinsClearBtn');
+            if (btn) { btn.textContent = ovlP233PinsClearLabel(); btn.disabled = true; }
+            try { showToast('已清空本项目的 ' + n + ' 条翻译参考。', 'success'); } catch (e) {}
+        }
+    });
+}
 function ovlP233Squeeze(s) { return String(s == null ? '' : s).replace(/\s*\n\s*/g, ' ').replace(/[ \t]{2,}/g, ' ').trim(); }
 // 翻译参考 -> 只读上下文片段：{ text, zh:[...], matchText, trimmed } 或 null。
 // excludeSrcs = 本次正在翻译的块的源码（自己不当自己的参考）。总量 <= OVL_P233_PIN_CAP_CHARS（原文 + 译文），最新的优先、最早的先丢。
@@ -42793,10 +42830,23 @@ async function ovlP233RetransAllGroup(st, jobsIn, cfg, fixedProjectId, mySeq, ca
         try { job.reqKey = ovlVisualTransCacheKey(job.src, cfg); } catch (e) { job.reqKey = null; }
     });
     const newZh = new Map();
-    const env = { reqCfg: cfg, baseCfg: cfg, modelTag: '', signal: controller.signal, newZh: newZh, fatal: '', canLand: canLand };
+    // deferWrite：与整篇重译的单块路径一致走 P215 回写缓存（ovlVisualRetransAllRun 的 finally 一次落盘）。不带它，一组 N 块 = N 次整桶 stringify+setItem，
+    // 且回写缓存里什么都没有，后面每组的上下文查询还要重新解析整桶（P209/P215 已知的卡死形态）。retryTransient 见 ovlP233RunGroup 头部注释。
+    const env = { reqCfg: cfg, baseCfg: cfg, modelTag: '', signal: controller.signal, newZh: newZh, fatal: '', canLand: canLand, deferWrite: true, retryTransient: true };
     env.makeCtx = function (js) {
         return ovlP233Ctx({ pane: document.getElementById('ovlVisualPane'), firstEl: ovlP233LiveEl(st, js[0], false), lastEl: ovlP233LiveEl(st, js[js.length - 1], true),
             cfg: cfg, newZh: newZh, neighbours: true, excludeSrcs: js.map(function (j) { return j.src; }) });
+    };
+    // 已经付过钱的结果（本组里已成功的段）不管后面是否被停止，先写缓存、页面上有活块就落（与单块路径同一纪律，P232b 3c）。
+    const landPaid = function (chunk) {
+        chunk.forEach(function (job) {
+            if (!(job.result && job.result.ok)) return;
+            try {
+                const landed = ovlP233LandJob(st, env, job);
+                st.ok += job.n;
+                if (landed < job.n) st.unseen += (job.n - landed);
+            } catch (e) {}
+        });
     };
     st.fixedProjectId = fixedProjectId;
     try {
@@ -42807,27 +42857,32 @@ async function ovlP233RetransAllGroup(st, jobsIn, cfg, fixedProjectId, mySeq, ca
             try {
                 await ovlP233RunGroup(env, chunk);
             } catch (err) {
-                if (err && err.name === 'AbortError') return;
-                if (!live()) return;
+                if (err && err.name === 'AbortError') { landPaid(chunk); return; } // 停止 / 切走时组里前几轮已成功的段照样入缓存
+                if (!live()) { landPaid(chunk); return; }
                 chunk.forEach(function (j) { if (!j.result) j.result = { ok: false, via: 'kept', err: err, meta: { attempts: j.attempts } }; });
             }
             // 结果回来了就是已经付过钱的：不管此时是否已停止，先写缓存、页面上有活块就落（与单块路径同一纪律）；失败的块保留旧译文。
+            // 熔断计数按【请求】算，不按块：一次失败的组请求只算 1 次（与队列的 p233NoteGroup 同一纪律，否则一个 12 块的组一次 429 就一下子熔断）；
+            // 组里只要有一块成功就清零；传输类失败累加；其余失败（模型答得不对）清零。
+            let chunkOk = 0, chunkFatal = '';
             chunk.forEach(function (job) {
                 if (job.result && job.result.ok) {
                     const landed = ovlP233LandJob(st, env, job);
-                    st.ok += job.n; st.fatal = 0;
+                    st.ok += job.n; chunkOk++;
                     if (landed < job.n) st.unseen += (job.n - landed);
                 } else {
                     st.fail += job.n;
                     const fr = (job.result && job.result.meta && job.result.meta.failReason) || ovlVisualTransFailReason(job.result && job.result.err, (job.result && job.result.meta) || {});
-                    if (ovlVisualTransIsTransportFatal(fr)) {
-                        st.fatal++; st.lastFatal = fr;
-                        if (st.fatal >= 3) st.tripped = true;
-                    } else st.fatal = 0;
+                    if (!chunkFatal && ovlVisualTransIsTransportFatal(fr)) chunkFatal = fr;
                 }
                 st.done += job.n;
                 job.els.forEach(function (b) { b.removeAttribute('data-ovl-trans-retranslating'); });
             });
+            if (chunkOk > 0 || !chunkFatal) st.fatal = 0;
+            else {
+                st.fatal++; st.lastFatal = chunkFatal;
+                if (st.fatal >= 3) st.tripped = true;
+            }
             try { ovlVisualLangProgressUpdate(); } catch (e) {}
         }
     } finally {
@@ -62595,6 +62650,9 @@ function ovlSettingsTranslatorHtml() {
     // v2 Pass P233：翻译时自动联系上下文。普通复选框，走通用 data-setpath（change 委托里对本项专门处理：只存盘，不重渲 Visual）。
     html += ovlSetRow('翻译时自动联系上下文', '<input type="checkbox" data-setpath="settings.visualAutoContext"' + (s.visualAutoContext !== false ? ' checked' : '') + '>',
         '开着时，同一段落里连续的几行会合成一次请求翻译、单独翻一块时也参考前后已有的中文译文和章节标题，让术语和语气前后一致；选中多块后工具条里的「重译选中 N 块（联系上下文）」和「翻译参考」（把选中的块固定为原文+译文对照，之后本项目每次翻译都会带上）不受这个开关影响；关掉后其余翻译请求与以前逐字节一致。');
+    // v2 Pass P233：翻译参考没有逐条的列表界面（块上只有安静的左缘标记），这里给一个总的清空入口（见 ovlP233PinsClearAll）。
+    html += ovlSetRow('翻译参考', '<button type="button" class="ovl-modal-btn" id="ovlP233PinsClearBtn"' + (ovlP233PinsGet().length ? '' : ' disabled') + ' onclick="ovlP233PinsClearAll()">' + escapeHtml(ovlP233PinsClearLabel()) + '</button>',
+        '在 Visual 工具条里勾选「翻译参考」的块，会按原文+译文对照附在本项目之后的每个翻译请求里。块上的标记可以逐个取消；这里一次清空当前项目的全部翻译参考（例如原文被改过、旧参考已经没有对应的块时）。');
     // v2 Pass P197（A）：领域提示只影响本地模型（LM Studio）路径的 prompt 内容，不改变
     // 任何 UI 控件的 data-setpath 通用绑定套路——因为这条不是全局设置，是按项目持久化的
     // （跟项目术语表一样用单独的 localStorage 映射表），所以走专用的 onchange 处理函数，
