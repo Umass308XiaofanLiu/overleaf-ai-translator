@@ -5067,7 +5067,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.51.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.51.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -41752,13 +41752,31 @@ function ovlP233AtomicKind(src) {
 function ovlP233ClipTail(s, n) { const t = String(s).replace(/\s*\n\s*/g, ' ').trim(); return t.length > n ? ('…' + t.slice(t.length - n)) : t; }
 function ovlP233ClipHead(s, n) { const t = String(s).replace(/\s*\n\s*/g, ' ').trim(); return t.length > n ? (t.slice(0, n) + '…') : t; }
 // 上下文里要用的「已有中文译文」：本次运行刚译出的新译文（newZh: Map 源码->译文）优先，其次缓存（显示的就是缓存里的）。
-function ovlP233ZhFor(src, cfg, newZh) {
-    if (newZh && newZh.has(src)) return newZh.get(src);
-    try {
-        const m = ovlVisualTransCacheGetMeta(src, cfg);
-        if (m && !m.skipped && m.tgt && ovlP233HasCjk(m.tgt)) return m.tgt;
-    } catch (e) {}
-    return '';
+// 只读查询（Stage B 返修）：不用 ScopeBegin（它会把 P215 回写缓存强制落盘，队列每发一个请求就整桶写一次），
+// 也不走 GetMeta（未命中会解析旧版 v1 全局大缓存、命中会刷 ts / 提升闸门标记而写桶）。
+// 每次构造上下文只取一次桶（回写缓存里有就是同一个内存对象，没有就解析一次）；自己的 key 命中即用，
+// 未命中再按 P232 的跨模型回退查（与屏幕上显示的译文一致）；旧版 v1 缓存的条目在渲染时早已被提升进桶，这里不再去读。
+function ovlP233ZhLookup(cfg, newZh) {
+    let map = null, pid = null;
+    return function (src) {
+        if (newZh && newZh.has(src)) return newZh.get(src);
+        try {
+            if (map === null) { pid = ovlVisualTransCacheProjectId(); map = ovlVisualTransCacheBucketLoad(pid) || {}; }
+            const key = ovlVisualTransCacheKey(src, cfg);
+            const hit = map[key];
+            let tgt = '';
+            if (hit && typeof hit.tgt === 'string') {
+                // 与 GateCheck 同一判据，但只读：不盖章、不删条目（真正的清理留给显示路径）。
+                let ok = hit.gateVersion === OVL_VISUAL_CJK_GATE_VERSION || !!(hit.skipped || hit.forced);
+                if (!ok) ok = (typeof ovlVisualCjkGateEval === 'function') ? !!ovlVisualCjkGateEval(src, hit.tgt).ok : true;
+                if (ok && !hit.skipped) tgt = hit.tgt;
+            } else if (!OvlP232Suppress.has(key)) {
+                const fb = ovlVisualTransCacheFallbackLookup(src, key, map, pid);
+                if (fb && fb.hit && !fb.hit.skipped) tgt = fb.hit.tgt;
+            }
+            return (tgt && ovlP233HasCjk(tgt)) ? tgt : '';
+        } catch (e) { return ''; }
+    };
 }
 // 只读上下文：返回 null（没有任何可给的上下文）或 { text, zh:[送出的中文译文], matchText }。
 // o = { pane, firstEl, lastEl, cfg（主模型 cfg，用于缓存 key）, newZh }
@@ -41777,8 +41795,8 @@ function ovlP233BuildContext(o) {
         const skipEl = function (b) { return b.hasAttribute('data-ovl-trans-notrans') || b.hasAttribute('data-ovl-trans-noprose'); };
         let title = '';
         const before = [], beforeSrc = [], after = [], afterSrc = [];
-        ovlVisualTransCacheScopeBegin(); // 同步循环，不跨 await
-        try {
+        const zhOf = ovlP233ZhLookup(o.cfg, o.newZh);
+        {
             let collecting = true;
             for (let k = back.length - 1; k >= 0; k--) {
                 const s = backSrc[k];
@@ -41788,7 +41806,7 @@ function ovlP233BuildContext(o) {
                 if (!collecting) continue;            // 已经收满 / 遇到未译邻块：只继续往回找章节标题
                 if (skipEl(back[k]) || ovlP233AtomicKind(s)) continue;
                 if (before.length >= OVL_P233_CTX_BEFORE) { collecting = false; continue; }
-                const zh = ovlP233ZhFor(s, o.cfg, o.newZh);
+                const zh = zhOf(s);
                 if (!zh) { collecting = false; continue; } // 紧邻的正文块还没有译文：不跨过它取更远的块（上下文必须连续）
                 before.unshift(zh); beforeSrc.unshift(s);
             }
@@ -41797,11 +41815,11 @@ function ovlP233BuildContext(o) {
                 if (s == null || !s.trim()) continue;
                 if (ovlP233HeadingTitle(s) !== null) break;
                 if (skipEl(fwd[k]) || ovlP233AtomicKind(s)) continue;
-                const zh = ovlP233ZhFor(s, o.cfg, o.newZh);
+                const zh = zhOf(s);
                 if (!zh) break;
                 after.push(zh); afterSrc.push(s);
             }
-        } finally { ovlVisualTransCacheScopeEnd(); }
+        }
         const bClips = before.map(function (z) { return ovlP233ClipTail(z, OVL_P233_CTX_BLOCK_CHARS); });
         const aClips = after.map(function (z) { return ovlP233ClipHead(z, OVL_P233_CTX_BLOCK_CHARS); });
         let total = 0;
@@ -42569,12 +42587,12 @@ function ovlP233PinsContext(cfg, excludeSrcs, newZh) {
         const ex = new Set(excludeSrcs || []);
         const kept = [];
         let total = 0, trimmed = 0, full = false;
-        ovlVisualTransCacheScopeBegin();
-        try {
+        const zhOf = ovlP233ZhLookup(cfg, newZh);
+        {
             for (let i = pins.length - 1; i >= 0; i--) {
                 const p = pins[i];
                 if (ex.has(p.src)) continue;
-                const zh = ovlP233ZhFor(p.src, cfg, newZh);
+                const zh = zhOf(p.src);
                 if (!zh) continue; // 还没有译文的参考没有对照可给
                 const s1 = ovlP233Squeeze(p.src), z1 = ovlP233Squeeze(zh);
                 const len = s1.length + z1.length;
@@ -42583,7 +42601,7 @@ function ovlP233PinsContext(cfg, excludeSrcs, newZh) {
                 total += len;
                 kept.unshift({ src: s1, zh: z1, zhFull: zh, srcRaw: p.src });
             }
-        } finally { ovlVisualTransCacheScopeEnd(); }
+        }
         if (!kept.length) return null;
         const lines = [];
         lines.push('【参考对照】下面是用户指定的「翻译参考」：同一篇论文里已经确认的英文原文与中文译文对照，只用来让你的术语、措辞和风格与之保持一致。它们不是待翻译的内容：不要翻译它们、不要复述它们、不要把其中任何文字写进你的译文。');
