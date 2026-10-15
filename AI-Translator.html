@@ -5067,7 +5067,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.51.03';        // APP_VERSION_STAMP
+const APP_VERSION = '03.51.04';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -8569,7 +8569,13 @@ function focusPopupRowHtml() {
 // 复选框显示的状态和点下去会发生的事永远是同一次判定的结果（和 focusIndexOfSpan 那条
 // "用解出来的位置而不是存下来的 offset"同一条纪律）。
 // 返回 { ok, start, end, quote, lineFrom, lineTo, why }
-function focusOvlSelectionRange() {
+//
+// v2 Pass P235：选区→源码行范围的解析拆成两层。这一层（ovlSelectionSourceRange）**没有长度
+// 上限**，只负责把 Code/Visual 选区解出整行对齐的源码范围；「关注」仍然走下面的
+// focusOvlSelectionRange()，它在这一层之上加 FOCUS_TEX_QUOTE_MAX 的上限。「复制」也用这一层
+// 求所在块的范围（见 ovlCopyLatexSource），所以 Visual 里选很长一段再点「复制」不再被 2000 字
+// 的「关注」上限拦下（那个上限是为了让发给模型的引文别太大，跟「复制到剪贴板」无关）。
+function ovlSelectionSourceRange() {
     const out = { ok: false, start: 0, end: 0, quote: '', lineFrom: 0, lineTo: 0, why: '' };
     try {
         const ta = document.getElementById('ovlCodeArea');
@@ -8619,15 +8625,22 @@ function focusOvlSelectionRange() {
         if (le < ls) le = ls;
         const quote = base.slice(ls, le);
         if (!quote.trim()) { out.why = '选中的都是空行，没有可关注的内容。'; return out; }
-        if (quote.length > FOCUS_TEX_QUOTE_MAX) {
-            out.why = '选中的内容太长（超过 ' + FOCUS_TEX_QUOTE_MAX + ' 字），关注请少选几行。';
-            return out;
-        }
         out.ok = true; out.start = ls; out.end = le; out.quote = quote;
         out.lineFrom = focusTexLineIndexAt(base, ls);
         out.lineTo = focusTexLineIndexAt(base, le);
         return out;
     } catch (err) { out.why = '读取编辑器选区时出错。'; return out; }
+}
+
+// 「关注」用的入口：同一份解析结果，超过 FOCUS_TEX_QUOTE_MAX 就拒绝（失败对象的形状与 P235 之前
+// 逐字段一致：ok:false，start/end/quote/lineFrom/lineTo 全为零值，why 是原来那句中文）。
+function focusOvlSelectionRange() {
+    const r = ovlSelectionSourceRange();
+    if (r.ok && r.quote.length > FOCUS_TEX_QUOTE_MAX) {
+        return { ok: false, start: 0, end: 0, quote: '', lineFrom: 0, lineTo: 0,
+            why: '选中的内容太长（超过 ' + FOCUS_TEX_QUOTE_MAX + ' 字），关注请少选几行。' };
+    }
+    return r;
 }
 
 // 「就是这一条」：用解出来的位置比对，行被改过之后复选框才不会显示成没勾。
@@ -15609,15 +15622,70 @@ function ovlToastShow(message, kind) {
     }
 }
 
+// v2 Pass P236：带一个动作按钮的 toast（「自动接受磁盘版本」之后的「恢复我的修改」）。
+// 跟 ovlToastShow 同一个堆叠容器与配色；它是备份文字唯一的恢复入口，所以比普通 toast 难关得多
+// （评审返修）：点 toast 正文不再关闭（普通 toast 是整条可点关闭，这里误点一下就等于丢了入口），
+// 只有「恢复我的修改」按钮（执行后关闭）或右侧 ✕ 才关；停留时间默认 60 秒；切到 v1 时
+// ovlToastClearAll(true) 也会留着它（见该函数）。
+function ovlToastShowAction(message, kind, actionLabel, onAction, durationMs) {
+    try {
+        const stack = ovlToastStack();
+        const kindStyle = OVL_TOAST_KIND_STYLE[kind] || OVL_TOAST_KIND_STYLE_DEFAULT;
+        const el = document.createElement('div');
+        el.setAttribute('data-ovl-shell-toast', '1');
+        el.setAttribute('data-ovl-toast-action', '1');
+        el.style.cssText = kindStyle
+            + 'pointer-events:auto;border:1px solid;padding:10px 12px 10px 20px;border-radius:12px;'
+            + 'box-shadow:0 10px 30px -8px rgba(0,0,0,0.25);font-size:13px;font-weight:500;'
+            + 'max-width:70vw;word-break:break-word;cursor:default;display:flex;align-items:center;gap:14px;';
+        const span = document.createElement('span');
+        span.textContent = (message === null || message === undefined) ? '' : String(message);
+        el.appendChild(span);
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.setAttribute('data-ovl-toast-action-btn', '1');
+        btn.textContent = String(actionLabel || '');
+        btn.style.cssText = 'pointer-events:auto;cursor:pointer;flex:none;font-size:12px;font-weight:600;'
+            + 'padding:4px 12px;border-radius:8px;border:1px solid currentColor;background:#fff;color:inherit;';
+        btn.addEventListener('click', function (ev) {
+            ev.stopPropagation();
+            ovlToastRemoveEl(el);
+            try { if (typeof onAction === 'function') onAction(); } catch (e) { console.error('[ovl] toast action failed', e); }
+        });
+        el.appendChild(btn);
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.setAttribute('data-ovl-toast-close', '1');
+        closeBtn.setAttribute('aria-label', '关闭');
+        closeBtn.title = '关闭（不恢复）';
+        closeBtn.textContent = '✕';
+        closeBtn.style.cssText = 'pointer-events:auto;cursor:pointer;flex:none;font-size:13px;line-height:1;'
+            + 'padding:4px 6px;border:0;background:transparent;color:inherit;opacity:.7;';
+        closeBtn.addEventListener('click', function (ev) { ev.stopPropagation(); ovlToastRemoveEl(el); });
+        el.appendChild(closeBtn);
+        stack.appendChild(el);
+        el.__ovlToastTimer = setTimeout(function () { ovlToastRemoveEl(el); }, durationMs > 0 ? durationMs : 60000);
+        return el;
+    } catch (e) {
+        console.error('[ovl] ovlToastShowAction failed', e);
+        return null;
+    }
+}
+
 // 需求：外壳模式切回 v1（打开翻译器悬浮窗）时，把还没自然过期的门户 toast 全部清掉，
 // 不残留（v1 打开后 #root 可见，两套反馈通道同屏叠加会让人困惑；且门户 toast 的存在
 // 意义就是"v1 不可见时的替身"，v1 一旦可见就没有继续占屏的理由）。调用点见
 // ovlOpenTranslator（约 27860 行附近，加了 class 'ovl-translator-open' 之后）。
-function ovlToastClearAll() {
+// keepActions=true（切到 v1 的那个调用点传）：带动作按钮的 toast（P236「恢复我的修改」）不清——它是用户
+// 未保存文字备份唯一的恢复入口，不该因为顺手点了一下 v1 就没了；它自己 60 秒后过期、也可点 ✕ 关。
+function ovlToastClearAll(keepActions) {
     try {
         const stack = document.getElementById('ovlToastStack');
         if (!stack) return;
-        Array.prototype.slice.call(stack.children).forEach(ovlToastRemoveEl);
+        Array.prototype.slice.call(stack.children).forEach(function (el) {
+            if (keepActions === true && el && el.hasAttribute && el.hasAttribute('data-ovl-toast-action')) return;
+            ovlToastRemoveEl(el);
+        });
     } catch (e) {}
 }
 
@@ -36237,7 +36305,7 @@ function ovlOpenTranslator() {
         // v2 Pass P125（C4）：切回 v1 之后 #root 可见，不能让外壳模式下还没自然过期的门户
         // toast（P125b 起挂 document.body，不再是 #ovlPortal）继续叠在屏幕上——见
         // ovlToastClearAll 定义处注释。
-        try { if (typeof ovlToastClearAll === 'function') ovlToastClearAll(); } catch (e0) {}
+        try { if (typeof ovlToastClearAll === 'function') ovlToastClearAll(true); } catch (e0) {}
         ovlTransSyncSimpleUI();   // P2：按存的值恢复一次简化模式态（§2.2.3）
         // 用户没碰过窗口（mode 'auto'）时，每次打开都按当前视口重新居中一次；
         // 碰过了（mode 'free'）就尊重存下来的几何，只把它拉回视口内。
@@ -54681,7 +54749,18 @@ function ovlOverleafHandlePullResult(data, ctx) {
         // 首次拉取（strategy==='abort'）收到 skipped-dirty 是完全正常、符合预期的结果（就是
         // 真的有本地改动），不管桥新旧都要弹这个三选一框——没有办法、也不需要在这一步区分
         // 新旧桥。
-        if (ctx.strategy === 'abort') {
+        if (ctx.strategy === 'abort' && ovlPullDirtyMode() === 'stash' && !silent) {
+            // v2 Pass P236：设置「拉取时本地有未提交改动」选了「自动暂存后拉取」——不弹三选一框，
+            // 直接走用户在对话框里会点的那个「暂存改动后拉取」（同一条 ovlOverleafPullRun(...,'stash')，
+            // 暂存恢复冲突照旧弹 stash-pop-conflict 对话框；P45 的旧桥探测也照旧走下面 else 分支）。
+            // 评审返修：只对用户手动点「拉取」生效（!silent）。定时自动拉取（ovlOverleafSetupAutoPullTimer，
+            // silent:true）无人值守，不能每隔 N 分钟悄悄跑一遍 暂存→拉取→恢复（恢复冲突会在后台把冲突标记写进工作区文件），
+            // 它遇到本地改动仍按以前的行为跳过并提示。
+            // 推迟到下一个宏任务：当前这次 ovlOverleafPullRun 的 finally 要先把 ovlSyncBusy 清掉、
+            // 把按钮恢复，再起第二次请求，否则第二次结束时的状态会被第一次的收尾覆盖。
+            ovlOverleafSetSyncStatus('本地有未提交改动，按设置自动暂存后拉取…', false);
+            setTimeout(function () { ovlOverleafPullRun(ctx.projectDir, ctx.gitUrl, 'stash', { silent: silent }); }, 0);
+        } else if (ctx.strategy === 'abort') {
             ovlOverleafSetSyncStatus('本地有未提交改动，已跳过', true);
             ovlOverleafShowDirtyDialog(data.dirtyFiles, ctx.projectDir, ctx.gitUrl);
         } else {
@@ -60654,7 +60733,18 @@ async function ovlExternalCheckNowImpl(reason, opts) {
             mtimeMs = (typeof freshKnownMtime === 'number') ? freshKnownMtime
                 : ((typeof file.lastModified === 'number') ? file.lastModified : Date.now());
         }
-        if (text === OvlState.lastLoadedText) {
+        // v2 Pass P236（评审返修）：「恢复我的修改」之后编辑器里是用户的旧版本 U，lastLoadedText 却是
+        // 自动接受时采纳的磁盘版本 D，磁盘此刻也正是 D——"磁盘内容跟快照一致"在这个状态下不再意味着
+        // "编辑器里的东西是基于这份磁盘写的"。下面 same-content 分支会把乐观锁推进到磁盘 mtime，
+        // 等于悄悄打开 P50 的锁：随后第二次自动落盘就会把 U 静默写到刚拉下来的 D 上（评审实测）。
+        // 所以恢复态（OvlExtConflict.restored，且编辑器文字确实不同于磁盘）一律不走 same-content：
+        //   - 普通检查（WS/轮询/save-conflict 的强制检查）→ 落到下面的冲突分支，锁保持旧值、横幅照旧；
+        //   - 横幅「重新加载（丢弃我的改动）」(overwriteDirty) → 落到下面的重载分支，真的把磁盘版本载回来。
+        // 只有 .restored 才会走到这里——其它所有路径（包括默认的「每次询问」）与基线逐字节同一判据。
+        const ovlTaForSame = document.getElementById('ovlCodeArea');
+        const ovlUserRestored = !!(OvlExtConflict && OvlExtConflict.restored && OvlExtConflict.path === (cf.relPath || cf.name));
+        const ovlRestoredDiffers = ovlUserRestored && !!ovlTaForSame && ovlTaForSame.value !== text;
+        if (text === OvlState.lastLoadedText && !ovlRestoredDiffers) {
             // 内容没变（mtime 心跳/touch），只更新快照——绝不动编辑器、绝不弹提示。内容确实
             // 跟我们手上这份一致，安全前进到新 mtime。
             OvlState.lastLoadedMtimeMs = mtimeMs;
@@ -60674,6 +60764,15 @@ async function ovlExternalCheckNowImpl(reason, opts) {
             ovlApplyFileMeta(cf, extMeta);
             return 'reloaded';
         }
+        // v2 Pass P236：设置「打开的文件在外部被修改时」选了「自动接受磁盘版本」——不弹横幅，先备份
+        // 用户未保存的文字再载入磁盘版本。备份写不进去（存储满/被禁）就退回下面的横幅，绝不丢字。
+        // 用户刚点过「恢复我的修改」(OvlExtConflict.restored，上面已算出 ovlUserRestored) 之后的冲突是用户
+        // 明确摆出来要自己处理的——这时即使设置是「自动接受」也不再自动采纳，否则恢复出来的文字
+        // 第一次自动落盘被桥端拒绝就又被收走。
+        if (ta && ovlExtChangeMode() === 'accept' && !ovlUserRestored) {
+            const autoRes = ovlExtAutoAcceptDiskVersion(cf, ta, text, mtimeMs, extMeta, savedKnownMtime);
+            if (autoRes) return autoRes;
+        }
         ovlExtChangeBannerShow({ text: text, mtimeMs: mtimeMs, missing: false, knownMtimeMs: savedKnownMtime });
         return 'conflict';
     } catch (e) {
@@ -60685,6 +60784,158 @@ async function ovlExternalCheckNowImpl(reason, opts) {
 function ovlExternalHandleMissing() {
     ovlExtChangeBannerShow({ text: null, mtimeMs: null, missing: true });
     return 'missing';
+}
+
+// ---- v2 Pass P236：「自动接受磁盘版本」——备份 → 载入磁盘版本 → toast 带「恢复我的修改」----
+// 设置 ovlExtChangeMode==='accept' 时，编辑器有未保存修改而磁盘上同一个文件变了（典型：拉取），
+// 不再弹 #ovlExtChangeBanner，而是：
+//   1. 先把用户未保存的编辑器文字存进备份（localStorage 'ovl.extChangeBackups'，按 项目+文件路径 分组，
+//      每个文件留最近 5 份；仅本机，不进云同步注册表）。读回校验通过才继续——存不进去就返回 null，
+//      调用方退回既有横幅，用户的文字一个字都不会丢。
+//   2. 采纳磁盘版本（跟横幅「重新加载」同一套收尾：乐观锁前进、静默重载、EOL/BOM 元数据跟随）。
+//   3. 弹一条带「恢复我的修改」的 toast。
+// 缺失文件横幅（ovlExternalHandleMissing）与编辑器干净时的静默重载都不经过这里，行为不变。
+const OVL_EXT_BACKUP_LS_KEY = 'ovl.extChangeBackups';
+const OVL_EXT_BACKUP_PER_FILE = 5;
+const OVL_EXT_BACKUP_MAX_FILES = 30;
+const OVL_EXT_BACKUP_MAX_CHARS = 1000000; // 全部备份文字总量上限（评审返修：2M→1M；localStorage 总共约 5M 字符且设置/对话/术语库共用，别让备份把它们挤到 QuotaExceeded）
+function ovlExtChangeMode() {
+    return (typeof OvlSettings === 'object' && OvlSettings && OvlSettings.ovlExtChangeMode === 'accept') ? 'accept' : 'ask';
+}
+function ovlPullDirtyMode() {
+    return (typeof OvlSettings === 'object' && OvlSettings && OvlSettings.ovlPullDirtyMode === 'stash') ? 'stash' : 'ask';
+}
+function ovlExtBackupKeyFor(cf) {
+    let pk = '';
+    try { pk = fileWatchProjectKey() || ''; } catch (e) {}
+    return pk + '\u0001' + ((cf && (cf.relPath || cf.name)) || '');
+}
+function ovlExtBackupLoad() {
+    try {
+        const o = JSON.parse(localStorage.getItem(OVL_EXT_BACKUP_LS_KEY) || '{}');
+        return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {};
+    } catch (e) { return {}; }
+}
+// 丢掉全表里最老的一条（排除 protectId）；没有可丢的返回 false。
+function ovlExtBackupDropOldest(map, protectId) {
+    let bestKey = null, bestIdx = -1, bestT = Infinity;
+    Object.keys(map).forEach(function (k) {
+        (map[k] || []).forEach(function (e, i) {
+            if (e && e.id !== protectId && (e.t || 0) < bestT) { bestT = e.t || 0; bestKey = k; bestIdx = i; }
+        });
+    });
+    if (bestKey === null) return false;
+    map[bestKey].splice(bestIdx, 1);
+    if (!map[bestKey].length) delete map[bestKey];
+    return true;
+}
+function ovlExtBackupTotalChars(map) {
+    let n = 0;
+    Object.keys(map).forEach(function (k) { (map[k] || []).forEach(function (e) { n += (e && typeof e.text === 'string') ? e.text.length : 0; }); });
+    return n;
+}
+// 新增一条备份；成功返回条目（已读回校验），失败返回 null。
+function ovlExtBackupAdd(cf, text, meta) {
+    try {
+        const map = ovlExtBackupLoad();
+        const key = ovlExtBackupKeyFor(cf);
+        let list = Array.isArray(map[key]) ? map[key].filter(function (e) { return e && typeof e.text === 'string'; }) : [];
+        list = list.filter(function (e) { return e.text !== text; }); // 同样的文字只留最新一份，别把 5 个名额挤满重复项
+        const entry = {
+            id: 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7),
+            t: Date.now(), text: text,
+            knownMtimeMs: (meta && typeof meta.knownMtimeMs === 'number') ? meta.knownMtimeMs : null,
+            diskMtimeMs: (meta && typeof meta.diskMtimeMs === 'number') ? meta.diskMtimeMs : null
+        };
+        list.push(entry);
+        while (list.length > OVL_EXT_BACKUP_PER_FILE) list.shift();
+        map[key] = list;
+        while (Object.keys(map).length > OVL_EXT_BACKUP_MAX_FILES && ovlExtBackupDropOldest(map, entry.id)) { /* 文件数封顶 */ }
+        while (ovlExtBackupTotalChars(map) > OVL_EXT_BACKUP_MAX_CHARS && ovlExtBackupDropOldest(map, entry.id)) { /* 总量封顶 */ }
+        let stored = false;
+        for (let attempt = 0; attempt < 60 && !stored; attempt++) {
+            try { localStorage.setItem(OVL_EXT_BACKUP_LS_KEY, JSON.stringify(map)); stored = true; }
+            catch (eQuota) { if (!ovlExtBackupDropOldest(map, entry.id)) break; }
+        }
+        if (!stored) return null;
+        const back = ovlExtBackupLoad()[key];
+        const ok = Array.isArray(back) && back.some(function (e) { return e && e.id === entry.id && e.text === text; });
+        return ok ? entry : null;
+    } catch (e) {
+        console.warn('[ovl] ext-change backup failed', e);
+        return null;
+    }
+}
+function ovlExtBackupFind(cf, id) {
+    const list = ovlExtBackupLoad()[ovlExtBackupKeyFor(cf)];
+    if (!Array.isArray(list)) return null;
+    for (let i = 0; i < list.length; i++) if (list[i] && list[i].id === id && typeof list[i].text === 'string') return list[i];
+    return null;
+}
+// 返回 'reloaded'（已自动采纳）或 null（没能备份，调用方必须退回横幅）。
+function ovlExtAutoAcceptDiskVersion(cf, ta, text, mtimeMs, extMeta, savedKnownMtime) {
+    const userText = ta.value;
+    let entry = null;
+    if (userText !== OvlState.lastLoadedText) {
+        // 真有未保存的文字——先备份，备份不成功就不动编辑器。
+        entry = ovlExtBackupAdd(cf, userText, { knownMtimeMs: savedKnownMtime, diskMtimeMs: mtimeMs });
+        if (!entry) return null;
+    }
+    // userText===lastLoadedText 只是脏标记残留（没有任何真实改动），直接静默重载，不备份、不弹 toast。
+    OvlState.dirty = false;
+    if (savedKnownMtime !== undefined) cf.handle.__lastKnownMtimeMs = mtimeMs; // 采纳磁盘版本——乐观锁前进到新 mtime
+    ovlExternalSilentReload(ta, text, mtimeMs);
+    ovlApplyFileMeta(cf, extMeta);
+    ovlExtConflictClear();
+    try { ovlUpdateTabUI(); } catch (e) {}
+    if (entry) {
+        const path = cf.relPath || cf.name;
+        ovlToastShowAction('已载入磁盘上的新版本；你未保存的修改已备份', 'info', '恢复我的修改', function () {
+            ovlExtRestoreBackup(path, entry.id);
+        }, 60000);
+    }
+    return 'reloaded';
+}
+// 「恢复我的修改」：把备份文字放回编辑器作为未保存修改，进入既有的冲突状态（横幅 + P50 乐观锁），
+// 不直接写盘——是否用它覆盖磁盘上刚拉下来的版本，由用户在横幅里选。
+function ovlExtRestoreBackup(path, entryId) {
+    const cf = OvlState.currentFile;
+    const ta = document.getElementById('ovlCodeArea');
+    if (!cf || !ta || (cf.relPath || cf.name) !== path) {
+        showToast('请先重新打开 ' + path + ' 再恢复你的修改', 'error');
+        return false;
+    }
+    if (OvlInlineSrcEdit) {
+        showToast('正在就地编辑源码，请先保存或取消后再恢复', 'error');
+        return false;
+    }
+    const entry = ovlExtBackupFind(cf, entryId);
+    if (!entry) { showToast('找不到这份备份（可能已被清理）', 'error'); return false; }
+    const backupText = entry.text;
+    if (backupText === ta.value) { showToast('备份内容与当前编辑器一致，无需恢复', 'info'); return false; }
+    // 载入磁盘版本之后用户又打了字——恢复会盖掉它，所以先把它也备份下来。
+    if (ta.value !== OvlState.lastLoadedText) {
+        const extra = ovlExtBackupAdd(cf, ta.value, { knownMtimeMs: entry.knownMtimeMs, diskMtimeMs: OvlState.lastLoadedMtimeMs });
+        if (!extra) { showToast('没能备份编辑器里的新修改，已取消恢复', 'error'); return false; }
+    }
+    ta.value = backupText;
+    OvlState.lineOffsets = null;
+    ovlRecomputeLineOffsets();
+    ovlRenderGutter(true);
+    ovlBuildOutline();
+    if (OvlState.editorMode === 'visual') ovlVisualRender();
+    OvlState.dirty = true;
+    // 乐观锁退回到"采纳磁盘版本之前"的值：磁盘已经是别的版本，之后任何落盘都会被桥端 P50 拒绝，
+    // 不会悄悄用旧文字覆盖刚拉下来的内容（跟横幅「稍后决定」同一套保护）。
+    if (typeof entry.knownMtimeMs === 'number' && cf.handle && ('__lastKnownMtimeMs' in cf.handle)) {
+        cf.handle.__lastKnownMtimeMs = entry.knownMtimeMs;
+    }
+    try { ovlUpdateTabUI(); } catch (e) {}
+    ovlExtChangeBannerShow({ text: OvlState.lastLoadedText, mtimeMs: OvlState.lastLoadedMtimeMs, missing: false,
+        knownMtimeMs: (typeof entry.knownMtimeMs === 'number') ? entry.knownMtimeMs : undefined });
+    if (OvlExtConflict) OvlExtConflict.restored = true; // 见 ovlExternalCheckNowImpl：此后到冲突解决前不再自动采纳
+    showToast('已恢复你的修改（还没写入磁盘）——请在编辑器上方的横幅里选择重新加载或用你的版本覆盖磁盘', 'info');
+    return true;
 }
 
 // 静默重载要保住的连带（4.4）：光标/滚动位置（按 line,col 语义还原）、Visual 面板滚动、
@@ -62098,7 +62349,18 @@ const OVL_SETTINGS_DEFAULTS = {
     pdf2texAutoVerify: true,
     // ---- v2 Pass P124：定位高亮自动过期（PDF + LaTeX 通用，见 OvlHighlightExpiry）----
     // 单位秒；0 = 永不消失（见 ovlHighlightExpiryMs 的特判）。默认 60 秒是用户明确指定的值。
-    ovlHighlightExpirySec: 60
+    ovlHighlightExpirySec: 60,
+    // ---- v2 Pass P235：划词翻译（「译」按钮）一次最多翻多少字 ----
+    // 3000（默认，与 P6 定的上限一致）| 6000 | 12000 | 0=无限制（完全不检查）。
+    // 只管「译」；「复制」没有长度上限；「关注」另有自己的 2000 字上限（发给模型的引文要小）。
+    ovlTransMaxChars: 3000,
+    // ---- v2 Pass P236：拉取 / 外部改动时的两个确认弹出，各给一个"每次询问 / 自动"开关 ----
+    // ovlPullDirtyMode：拉取时本地有未提交改动——'ask'（默认，弹三选一对话框）| 'stash'（不弹，直接走「暂存后拉取」）。
+    // ovlExtChangeMode：打开的文件在磁盘上被外部改动（如拉取）而编辑器里有未保存修改——
+    //   'ask'（默认，编辑器上方弹横幅）| 'accept'（不弹横幅，先备份你未保存的文字再载入磁盘版本，并给「恢复我的修改」）。
+    // 只有恰好等于 'stash' / 'accept' 才启用自动行为，任何别的值（含被同步坏的值）一律当作 'ask'。
+    ovlPullDirtyMode: 'ask',
+    ovlExtChangeMode: 'ask'
 };
 // ---- v2 Pass P133d：凭证类设置项白名单（诊断 .claude/tmp/p133_token_prompt_diag.md §1.2）----
 // 这两个字段是「同一个 data-setpath 通用 change 处理」下仅有的两个凭证（都是 type="password"）：
@@ -62652,6 +62914,11 @@ function ovlSettingsTranslatorHtml() {
         + (Array.isArray(AppState.localModels) ? AppState.localModels : []).map(function (lm) { return ovlOptTag(lm.id, localModelDisplayName(lm.id), s.visualTransModel); }).join('')
         + '</select>',
         'Visual 或 Code 模式里选中文字后，用哪个模型翻译。留空就跟着翻译器上方选的模型走。');
+    // v2 Pass P235：「译」一次最多翻多少字。走通用 data-setpath 处理（change 委托里按数字存）；0=无限制。
+    html += ovlSetRow('划词翻译（译）最大长度', '<select data-setpath="settings.ovlTransMaxChars">'
+        + [3000, 6000, 12000].map(function (n) { return ovlOptTag(n, n + ' 字', ovlTransMaxChars() === Infinity ? 0 : ovlTransMaxChars()); }).join('')
+        + ovlOptTag(0, '无限制', ovlTransMaxChars() === Infinity ? 0 : ovlTransMaxChars()) + '</select>',
+        '选中的文字超过这个字数时，「译」按钮不可用（Code 模式）或提示「选中的文字太长」。限制只是为了避免一次发给模型太长的内容（又慢又贵，本地模型上下文也有限），不是技术上做不到；选「无限制」就完全不检查。「复制」没有长度限制；「关注」另有 2000 字的上限（它要把引文发给对话模型）。');
     // v2 Pass P230：Visual 中文翻译同时发几个请求。走通用 data-setpath 处理（change 委托里对本项专门处理：存盘 + 立刻调整正在跑的批次，不重渲 Visual）。
     (function () {
         const cur = s.visualTransConcurrency;
@@ -62823,6 +63090,16 @@ function ovlSettingsOverleafHtml() {
         '每隔多久自动从 Overleaf 拉取一次最新版本。只在「本地没有未提交改动、当前打开的文件也没有未保存的编辑」时才会真的执行，遇到冲突会自动跳过并在下方状态栏提示，不会自动覆盖你的本地修改。');
     html += ovlSetRow('启动时自动打开上次的项目', '<input type="checkbox" data-setpath="settings.ovlRestoreLastProject"' + (s.ovlRestoreLastProject ? ' checked' : '') + '>',
         '「项目历史」（项目菜单 → 项目历史）里最近一次打开的项目，页面加载、桥接服务确认在线后会尝试自动恢复；FSA 浏览器安全限制下没法免用户操作直接重开文件树，实际做的是把项目路径填好、方便编译/同步立刻可用。桥离线或路径已经不存在都会静默跳过，不会打断你。');
+    // v2 Pass P236：拉取与外部改动时的两个确认弹出，各一个开关（默认「每次询问」＝行为与以前完全一样）。
+    html += '<div class="ovl-set-category-title" style="margin-top:18px">拉取与外部改动</div>';
+    html += ovlSetRow('拉取时本地有未提交改动', '<select data-setpath="settings.ovlPullDirtyMode">'
+        + ovlOptTag('ask', '每次询问', ovlPullDirtyMode()) + ovlOptTag('stash', '自动暂存后拉取', ovlPullDirtyMode())
+        + '</select>',
+        '点「拉取」时，本地工作区里有还没提交的改动：「每次询问」会弹出三选一对话框；「自动暂存后拉取」不再弹窗，直接先暂存你的改动、拉取、再自动恢复（恢复时真有冲突仍会提示你处理）。只对你手动点「拉取」生效——上面的「自动拉取间隔」定时拉取无人值守，遇到本地改动仍会跳过。');
+    html += ovlSetRow('打开的文件在外部被修改时（如拉取）', '<select data-setpath="settings.ovlExtChangeMode">'
+        + ovlOptTag('ask', '每次询问', ovlExtChangeMode()) + ovlOptTag('accept', '自动接受磁盘版本', ovlExtChangeMode())
+        + '</select>',
+        '当前打开的文件在磁盘上被改动（比如拉取到了新版本），而编辑器里还有未保存的修改：「每次询问」会在编辑器上方弹出确认横幅；「自动接受磁盘版本」不弹横幅，直接载入磁盘上的新版本，你未保存的修改会先备份，并给出「恢复我的修改」。编辑器里没有未保存修改时本来就是静默刷新，不受此项影响。');
     return html;
 }
 
@@ -63079,7 +63356,7 @@ function ovlBindSettingsModal() {
         let val = el.type === 'checkbox' ? el.checked : el.value;
         if (path === 'settings.fontSize' || path === 'settings.tabSize' || path === 'settings.overleafAutoPullMinutes'
             || path === 'settings.pdf2texConcurrency' || path === 'settings.pdf2texMaxPx'
-            || path === 'settings.ovlHighlightExpirySec') val = Number(val);
+            || path === 'settings.ovlHighlightExpirySec' || path === 'settings.ovlTransMaxChars') val = Number(val);
         if (path === 'settings.visualTransConcurrency') val = (val === 'auto') ? 'auto' : Number(val); // v2 Pass P230
         // v2 Pass P133d（T0 追加）：桥令牌走统一归一化（见 ovlBridgeTokenNormalize 上方注释）——
         // 去掉换行/制表符 + 首尾空白后再落盘；字符集不合法（把终端提示符/路径一起粘进来了）时
@@ -66125,7 +66402,8 @@ function ovlCopyLatexSource() {
             }
             const pickedText = String(sel).replace(/\s+/g, ' ').trim();
             if (!pickedText) { try { showToast('没有选中内容。', 'warning'); } catch (e) {} return; }
-            const scopeR = focusOvlSelectionRange();
+            // v2 Pass P235：用不带长度上限的解析（「关注」的 2000 字上限不适用于复制）。
+            const scopeR = ovlSelectionSourceRange();
             if (!scopeR.ok) { try { showToast(scopeR.why || '没有选中内容。', 'warning'); } catch (e) {} return; }
             const loc = ovlLocateVisualPick({ originalText: pickedText, visualScope: { start: scopeR.start, end: scopeR.end } });
             if (loc.n === 1) {
@@ -68254,15 +68532,17 @@ function ovlShowQuickActionsAt(x, y, source, visualBlockEl, visualBlockEls) {
         if (taQ && taQ.selectionEnd > taQ.selectionStart) {
             // 先用字符跨度短路，别对一个几十万字的选区做 slice+regex：归一化只会让长度变短，
             // 跨度 <= 上限 x4 时才值得真算一次（最坏切 12000 字，很便宜）。
-            tooLong = (taQ.selectionEnd - taQ.selectionStart > OVL_TRANS_MAX_CHARS * 4)
-                   || (ovlCodeTransText(taQ).length > OVL_TRANS_MAX_CHARS);
+            // v2 Pass P235：上限来自设置「划词翻译（译）最大长度」；无限制（Infinity）时完全不检查。
+            const maxQ = ovlTransMaxChars();
+            tooLong = isFinite(maxQ) && ((taQ.selectionEnd - taQ.selectionStart > maxQ * 4)
+                   || (ovlCodeTransText(taQ).length > maxQ));
         }
     }
     const tBtn = qa.querySelector('.ovl-qa-translate');
     if (tBtn) {
         tBtn.classList.toggle('ovl-qa-off', tooLong);
         tBtn.setAttribute('data-tip', tooLong
-            ? ('选中超过 ' + OVL_TRANS_MAX_CHARS + ' 字，翻译不可用；选少几行再试')
+            ? ('选中超过 ' + ovlTransMaxChars() + ' 字，翻译不可用；选少几行再试')
             : '翻译成中文');
     }
     // v2 Pass P38：Visual 中文预览模式下，渲染文字跟源码不再逐字对应，ovlLocateVisualPick 的
@@ -70807,12 +71087,24 @@ function ovlVisTransFromSelection(force) {
 // DOM 和 selRect 的 4 个数字，没有一行是 Visual 专属的（缓存/竞态/中断/四候选定位/复制/
 // Esc/点外面关闭全部原样复用）。
 
-const OVL_TRANS_MAX_CHARS = 3000;   // P6 定的策略上限，现在 Visual/Code 两个入口共用
+const OVL_TRANS_MAX_CHARS = 3000;   // P6 定的策略上限（默认值），现在 Visual/Code 两个入口共用
 
-// P6 的长度封顶收口成一处。toast 文案一个字都不许改——它已经进了 fd53b09 那次提交。
+// v2 Pass P235：当前生效的上限，来自设置「划词翻译（译）最大长度」（OvlSettings.ovlTransMaxChars）。
+// 0 = 无限制 → 返回 Infinity（调用方据此完全跳过检查）；其余合法的正数照用；缺省/脏值（比如
+// 从别的机器同步来了个怪值）退回默认 3000。
+function ovlTransMaxChars() {
+    const v = (typeof OvlSettings === 'object' && OvlSettings) ? OvlSettings.ovlTransMaxChars : undefined;
+    if (v === 0 || v === '0' || v === 'unlimited') return Infinity;
+    const n = Number(v);
+    return (isFinite(n) && n > 0) ? Math.round(n) : OVL_TRANS_MAX_CHARS;
+}
+
+// P6 的长度封顶收口成一处。toast 文案沿用 fd53b09 那次提交的原话，只是数字改成设置里的当前值
+// （默认仍是 3000，所以默认行为与之前逐字一致）；无限制时不检查。
 function ovlTransLengthOk(text) {
-    if (text.length > OVL_TRANS_MAX_CHARS) {
-        showToast('选中的文字太长（超过 ' + OVL_TRANS_MAX_CHARS + ' 字），请选短一点再试。', 'warning');
+    const max = ovlTransMaxChars();
+    if (isFinite(max) && text.length > max) {
+        showToast('选中的文字太长（超过 ' + max + ' 字），请选短一点再试。', 'warning');
         return false;
     }
     return true;
@@ -71444,7 +71736,8 @@ const OVL_SYNC_SETTING_FIELDS = [
     'ovlVisualBtrConfirmFirst', 'overleafAutoPullMinutes', 'ovlRestoreLastProject', 'ovlAiMergeEndpoint',
     'ovlAiMergeModel', 'pdf2texDefaultOutDir', 'pdf2texVisionEndpoint', 'pdf2texVisionModel', 'pdf2texConcurrency',
     'pdf2texDisableThinking', 'pdf2texMaxPx', 'pdf2texSavePageImages', 'pdf2texAutoOpenResult',
-    'pdf2texExtractImages', 'pdf2texAutoVerify', 'ovlHighlightExpirySec'
+    'pdf2texExtractImages', 'pdf2texAutoVerify', 'ovlHighlightExpirySec', 'ovlTransMaxChars',
+    'ovlPullDirtyMode', 'ovlExtChangeMode'
 ];
 const OVL_SYNC_REG = Object.create(null);
 (function () {
