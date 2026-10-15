@@ -5077,7 +5077,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.53.05';        // APP_VERSION_STAMP
+const APP_VERSION = '03.53.06';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -47475,7 +47475,9 @@ function ovlRetransThinkingSpec(provider, model) {
                 return { values: [], tip: '正在读取模型能力…', loading: true };
             }
             // v2 Pass P238（b）：整份 /api/v1/models 都没读到（LM Studio 不可达 / 端点没有）时，不能说「这个模型不能调思考」——那是把「不知道」说成「不行」；如实说读不到。
-            if (!caps) { try { if (xportCapsOk(base) === false) return { values: [], tip: OVL_P238_TIP_UNREADABLE }; } catch (e0) {} return none; }
+            // v2 Pass P239（P238 评审遗留）：读不到这条分支也要重新发起读取——否则提示里「LM Studio 恢复可达后重开弹窗即可」不成立（失败的缓存条目不会自己重读）。
+            // Warm 自带 10 秒节流，xportFetchCaps 在失败条目超过 XPORT_CAPS_TTL（60 秒）后才真正重发 GET，所以不会刷请求；读到后会原地重画。
+            if (!caps) { try { if (xportCapsOk(base) === false) { ovlRetransThinkingWarm(base); return { values: [], tip: OVL_P238_TIP_UNREADABLE }; } } catch (e0) {} return none; }
             if (!caps.reasoning) return none;
             const ctl = xportReasoningControl(caps.reasoning.allowed);
             if (ctl.kind === 'toggle') return { values: ['off', 'on'], tip: '' };
