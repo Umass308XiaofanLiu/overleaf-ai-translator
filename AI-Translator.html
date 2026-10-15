@@ -5057,7 +5057,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.51.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.51.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -15613,8 +15613,10 @@ function ovlToastShow(message, kind) {
 }
 
 // v2 Pass P236：带一个动作按钮的 toast（「自动接受磁盘版本」之后的「恢复我的修改」）。
-// 跟 ovlToastShow 同一个堆叠容器与配色；停留时间更长（默认 30 秒，用户要来得及点），点按钮执行
-// onAction 并关闭，点其它地方只关闭。按钮 stopPropagation，避免被整条 toast 的"点击关闭"抢先吃掉。
+// 跟 ovlToastShow 同一个堆叠容器与配色；它是备份文字唯一的恢复入口，所以比普通 toast 难关得多
+// （评审返修）：点 toast 正文不再关闭（普通 toast 是整条可点关闭，这里误点一下就等于丢了入口），
+// 只有「恢复我的修改」按钮（执行后关闭）或右侧 ✕ 才关；停留时间默认 60 秒；切到 v1 时
+// ovlToastClearAll(true) 也会留着它（见该函数）。
 function ovlToastShowAction(message, kind, actionLabel, onAction, durationMs) {
     try {
         const stack = ovlToastStack();
@@ -15623,9 +15625,9 @@ function ovlToastShowAction(message, kind, actionLabel, onAction, durationMs) {
         el.setAttribute('data-ovl-shell-toast', '1');
         el.setAttribute('data-ovl-toast-action', '1');
         el.style.cssText = kindStyle
-            + 'pointer-events:auto;border:1px solid;padding:10px 16px 10px 20px;border-radius:12px;'
+            + 'pointer-events:auto;border:1px solid;padding:10px 12px 10px 20px;border-radius:12px;'
             + 'box-shadow:0 10px 30px -8px rgba(0,0,0,0.25);font-size:13px;font-weight:500;'
-            + 'max-width:70vw;word-break:break-word;cursor:pointer;display:flex;align-items:center;gap:14px;';
+            + 'max-width:70vw;word-break:break-word;cursor:default;display:flex;align-items:center;gap:14px;';
         const span = document.createElement('span');
         span.textContent = (message === null || message === undefined) ? '' : String(message);
         el.appendChild(span);
@@ -15641,9 +15643,18 @@ function ovlToastShowAction(message, kind, actionLabel, onAction, durationMs) {
             try { if (typeof onAction === 'function') onAction(); } catch (e) { console.error('[ovl] toast action failed', e); }
         });
         el.appendChild(btn);
-        el.addEventListener('click', function () { ovlToastRemoveEl(el); });
+        const closeBtn = document.createElement('button');
+        closeBtn.type = 'button';
+        closeBtn.setAttribute('data-ovl-toast-close', '1');
+        closeBtn.setAttribute('aria-label', '关闭');
+        closeBtn.title = '关闭（不恢复）';
+        closeBtn.textContent = '✕';
+        closeBtn.style.cssText = 'pointer-events:auto;cursor:pointer;flex:none;font-size:13px;line-height:1;'
+            + 'padding:4px 6px;border:0;background:transparent;color:inherit;opacity:.7;';
+        closeBtn.addEventListener('click', function (ev) { ev.stopPropagation(); ovlToastRemoveEl(el); });
+        el.appendChild(closeBtn);
         stack.appendChild(el);
-        el.__ovlToastTimer = setTimeout(function () { ovlToastRemoveEl(el); }, durationMs > 0 ? durationMs : 30000);
+        el.__ovlToastTimer = setTimeout(function () { ovlToastRemoveEl(el); }, durationMs > 0 ? durationMs : 60000);
         return el;
     } catch (e) {
         console.error('[ovl] ovlToastShowAction failed', e);
@@ -15655,11 +15666,16 @@ function ovlToastShowAction(message, kind, actionLabel, onAction, durationMs) {
 // 不残留（v1 打开后 #root 可见，两套反馈通道同屏叠加会让人困惑；且门户 toast 的存在
 // 意义就是"v1 不可见时的替身"，v1 一旦可见就没有继续占屏的理由）。调用点见
 // ovlOpenTranslator（约 27860 行附近，加了 class 'ovl-translator-open' 之后）。
-function ovlToastClearAll() {
+// keepActions=true（切到 v1 的那个调用点传）：带动作按钮的 toast（P236「恢复我的修改」）不清——它是用户
+// 未保存文字备份唯一的恢复入口，不该因为顺手点了一下 v1 就没了；它自己 60 秒后过期、也可点 ✕ 关。
+function ovlToastClearAll(keepActions) {
     try {
         const stack = document.getElementById('ovlToastStack');
         if (!stack) return;
-        Array.prototype.slice.call(stack.children).forEach(ovlToastRemoveEl);
+        Array.prototype.slice.call(stack.children).forEach(function (el) {
+            if (keepActions === true && el && el.hasAttribute && el.hasAttribute('data-ovl-toast-action')) return;
+            ovlToastRemoveEl(el);
+        });
     } catch (e) {}
 }
 
@@ -36269,7 +36285,7 @@ function ovlOpenTranslator() {
         // v2 Pass P125（C4）：切回 v1 之后 #root 可见，不能让外壳模式下还没自然过期的门户
         // toast（P125b 起挂 document.body，不再是 #ovlPortal）继续叠在屏幕上——见
         // ovlToastClearAll 定义处注释。
-        try { if (typeof ovlToastClearAll === 'function') ovlToastClearAll(); } catch (e0) {}
+        try { if (typeof ovlToastClearAll === 'function') ovlToastClearAll(true); } catch (e0) {}
         ovlTransSyncSimpleUI();   // P2：按存的值恢复一次简化模式态（§2.2.3）
         // 用户没碰过窗口（mode 'auto'）时，每次打开都按当前视口重新居中一次；
         // 碰过了（mode 'free'）就尊重存下来的几何，只把它拉回视口内。
@@ -53367,10 +53383,13 @@ function ovlOverleafHandlePullResult(data, ctx) {
         // 首次拉取（strategy==='abort'）收到 skipped-dirty 是完全正常、符合预期的结果（就是
         // 真的有本地改动），不管桥新旧都要弹这个三选一框——没有办法、也不需要在这一步区分
         // 新旧桥。
-        if (ctx.strategy === 'abort' && ovlPullDirtyMode() === 'stash') {
+        if (ctx.strategy === 'abort' && ovlPullDirtyMode() === 'stash' && !silent) {
             // v2 Pass P236：设置「拉取时本地有未提交改动」选了「自动暂存后拉取」——不弹三选一框，
             // 直接走用户在对话框里会点的那个「暂存改动后拉取」（同一条 ovlOverleafPullRun(...,'stash')，
             // 暂存恢复冲突照旧弹 stash-pop-conflict 对话框；P45 的旧桥探测也照旧走下面 else 分支）。
+            // 评审返修：只对用户手动点「拉取」生效（!silent）。定时自动拉取（ovlOverleafSetupAutoPullTimer，
+            // silent:true）无人值守，不能每隔 N 分钟悄悄跑一遍 暂存→拉取→恢复（恢复冲突会在后台把冲突标记写进工作区文件），
+            // 它遇到本地改动仍按以前的行为跳过并提示。
             // 推迟到下一个宏任务：当前这次 ovlOverleafPullRun 的 finally 要先把 ovlSyncBusy 清掉、
             // 把按钮恢复，再起第二次请求，否则第二次结束时的状态会被第一次的收尾覆盖。
             ovlOverleafSetSyncStatus('本地有未提交改动，按设置自动暂存后拉取…', false);
@@ -59348,11 +59367,18 @@ async function ovlExternalCheckNowImpl(reason, opts) {
             mtimeMs = (typeof freshKnownMtime === 'number') ? freshKnownMtime
                 : ((typeof file.lastModified === 'number') ? file.lastModified : Date.now());
         }
-        // v2 Pass P236：「恢复我的修改」之后编辑器里是用户的版本、lastLoadedText 是磁盘版本，两者不同；
-        // 此时用户在横幅上点「重新加载（丢弃我的改动）」(overwriteDirty) 必须真的把磁盘版本载回来，
-        // 不能因为"磁盘内容跟快照一致"就判 same-content 空转（那会清掉冲突态却保留了用户要丢弃的文字）。
+        // v2 Pass P236（评审返修）：「恢复我的修改」之后编辑器里是用户的旧版本 U，lastLoadedText 却是
+        // 自动接受时采纳的磁盘版本 D，磁盘此刻也正是 D——"磁盘内容跟快照一致"在这个状态下不再意味着
+        // "编辑器里的东西是基于这份磁盘写的"。下面 same-content 分支会把乐观锁推进到磁盘 mtime，
+        // 等于悄悄打开 P50 的锁：随后第二次自动落盘就会把 U 静默写到刚拉下来的 D 上（评审实测）。
+        // 所以恢复态（OvlExtConflict.restored，且编辑器文字确实不同于磁盘）一律不走 same-content：
+        //   - 普通检查（WS/轮询/save-conflict 的强制检查）→ 落到下面的冲突分支，锁保持旧值、横幅照旧；
+        //   - 横幅「重新加载（丢弃我的改动）」(overwriteDirty) → 落到下面的重载分支，真的把磁盘版本载回来。
+        // 只有 .restored 才会走到这里——其它所有路径（包括默认的「每次询问」）与基线逐字节同一判据。
         const ovlTaForSame = document.getElementById('ovlCodeArea');
-        if (text === OvlState.lastLoadedText && !(opts.overwriteDirty && ovlTaForSame && ovlTaForSame.value !== text)) {
+        const ovlUserRestored = !!(OvlExtConflict && OvlExtConflict.restored && OvlExtConflict.path === (cf.relPath || cf.name));
+        const ovlRestoredDiffers = ovlUserRestored && !!ovlTaForSame && ovlTaForSame.value !== text;
+        if (text === OvlState.lastLoadedText && !ovlRestoredDiffers) {
             // 内容没变（mtime 心跳/touch），只更新快照——绝不动编辑器、绝不弹提示。内容确实
             // 跟我们手上这份一致，安全前进到新 mtime。
             OvlState.lastLoadedMtimeMs = mtimeMs;
@@ -59374,9 +59400,9 @@ async function ovlExternalCheckNowImpl(reason, opts) {
         }
         // v2 Pass P236：设置「打开的文件在外部被修改时」选了「自动接受磁盘版本」——不弹横幅，先备份
         // 用户未保存的文字再载入磁盘版本。备份写不进去（存储满/被禁）就退回下面的横幅，绝不丢字。
-        // 用户刚点过「恢复我的修改」(OvlExtConflict.restored) 之后的冲突是用户明确摆出来要自己处理的——
-        // 这时即使设置是「自动接受」也不再自动采纳，否则恢复出来的文字第一次自动落盘被桥端拒绝就又被收走。
-        const ovlUserRestored = !!(OvlExtConflict && OvlExtConflict.restored && OvlExtConflict.path === (cf.relPath || cf.name));
+        // 用户刚点过「恢复我的修改」(OvlExtConflict.restored，上面已算出 ovlUserRestored) 之后的冲突是用户
+        // 明确摆出来要自己处理的——这时即使设置是「自动接受」也不再自动采纳，否则恢复出来的文字
+        // 第一次自动落盘被桥端拒绝就又被收走。
         if (ta && ovlExtChangeMode() === 'accept' && !ovlUserRestored) {
             const autoRes = ovlExtAutoAcceptDiskVersion(cf, ta, text, mtimeMs, extMeta, savedKnownMtime);
             if (autoRes) return autoRes;
@@ -59406,7 +59432,7 @@ function ovlExternalHandleMissing() {
 const OVL_EXT_BACKUP_LS_KEY = 'ovl.extChangeBackups';
 const OVL_EXT_BACKUP_PER_FILE = 5;
 const OVL_EXT_BACKUP_MAX_FILES = 30;
-const OVL_EXT_BACKUP_MAX_CHARS = 2000000; // 全部备份文字总量上限（localStorage 约 5M 字符，留余量给别的键）
+const OVL_EXT_BACKUP_MAX_CHARS = 1000000; // 全部备份文字总量上限（评审返修：2M→1M；localStorage 总共约 5M 字符且设置/对话/术语库共用，别让备份把它们挤到 QuotaExceeded）
 function ovlExtChangeMode() {
     return (typeof OvlSettings === 'object' && OvlSettings && OvlSettings.ovlExtChangeMode === 'accept') ? 'accept' : 'ask';
 }
@@ -59500,7 +59526,7 @@ function ovlExtAutoAcceptDiskVersion(cf, ta, text, mtimeMs, extMeta, savedKnownM
         const path = cf.relPath || cf.name;
         ovlToastShowAction('已载入磁盘上的新版本；你未保存的修改已备份', 'info', '恢复我的修改', function () {
             ovlExtRestoreBackup(path, entry.id);
-        }, 30000);
+        }, 60000);
     }
     return 'reloaded';
 }
@@ -61696,7 +61722,7 @@ function ovlSettingsOverleafHtml() {
     html += ovlSetRow('拉取时本地有未提交改动', '<select data-setpath="settings.ovlPullDirtyMode">'
         + ovlOptTag('ask', '每次询问', ovlPullDirtyMode()) + ovlOptTag('stash', '自动暂存后拉取', ovlPullDirtyMode())
         + '</select>',
-        '点「拉取」时，本地工作区里有还没提交的改动：「每次询问」会弹出三选一对话框；「自动暂存后拉取」不再弹窗，直接先暂存你的改动、拉取、再自动恢复（恢复时真有冲突仍会提示你处理）。');
+        '点「拉取」时，本地工作区里有还没提交的改动：「每次询问」会弹出三选一对话框；「自动暂存后拉取」不再弹窗，直接先暂存你的改动、拉取、再自动恢复（恢复时真有冲突仍会提示你处理）。只对你手动点「拉取」生效——上面的「自动拉取间隔」定时拉取无人值守，遇到本地改动仍会跳过。');
     html += ovlSetRow('打开的文件在外部被修改时（如拉取）', '<select data-setpath="settings.ovlExtChangeMode">'
         + ovlOptTag('ask', '每次询问', ovlExtChangeMode()) + ovlOptTag('accept', '自动接受磁盘版本', ovlExtChangeMode())
         + '</select>',
