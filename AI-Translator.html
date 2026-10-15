@@ -5057,7 +5057,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.50.04';        // APP_VERSION_STAMP
+const APP_VERSION = '03.50.05';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -8559,7 +8559,13 @@ function focusPopupRowHtml() {
 // 复选框显示的状态和点下去会发生的事永远是同一次判定的结果（和 focusIndexOfSpan 那条
 // "用解出来的位置而不是存下来的 offset"同一条纪律）。
 // 返回 { ok, start, end, quote, lineFrom, lineTo, why }
-function focusOvlSelectionRange() {
+//
+// v2 Pass P235：选区→源码行范围的解析拆成两层。这一层（ovlSelectionSourceRange）**没有长度
+// 上限**，只负责把 Code/Visual 选区解出整行对齐的源码范围；「关注」仍然走下面的
+// focusOvlSelectionRange()，它在这一层之上加 FOCUS_TEX_QUOTE_MAX 的上限。「复制」也用这一层
+// 求所在块的范围（见 ovlCopyLatexSource），所以 Visual 里选很长一段再点「复制」不再被 2000 字
+// 的「关注」上限拦下（那个上限是为了让发给模型的引文别太大，跟「复制到剪贴板」无关）。
+function ovlSelectionSourceRange() {
     const out = { ok: false, start: 0, end: 0, quote: '', lineFrom: 0, lineTo: 0, why: '' };
     try {
         const ta = document.getElementById('ovlCodeArea');
@@ -8609,15 +8615,22 @@ function focusOvlSelectionRange() {
         if (le < ls) le = ls;
         const quote = base.slice(ls, le);
         if (!quote.trim()) { out.why = '选中的都是空行，没有可关注的内容。'; return out; }
-        if (quote.length > FOCUS_TEX_QUOTE_MAX) {
-            out.why = '选中的内容太长（超过 ' + FOCUS_TEX_QUOTE_MAX + ' 字），关注请少选几行。';
-            return out;
-        }
         out.ok = true; out.start = ls; out.end = le; out.quote = quote;
         out.lineFrom = focusTexLineIndexAt(base, ls);
         out.lineTo = focusTexLineIndexAt(base, le);
         return out;
     } catch (err) { out.why = '读取编辑器选区时出错。'; return out; }
+}
+
+// 「关注」用的入口：同一份解析结果，超过 FOCUS_TEX_QUOTE_MAX 就拒绝（失败对象的形状与 P235 之前
+// 逐字段一致：ok:false，start/end/quote/lineFrom/lineTo 全为零值，why 是原来那句中文）。
+function focusOvlSelectionRange() {
+    const r = ovlSelectionSourceRange();
+    if (r.ok && r.quote.length > FOCUS_TEX_QUOTE_MAX) {
+        return { ok: false, start: 0, end: 0, quote: '', lineFrom: 0, lineTo: 0,
+            why: '选中的内容太长（超过 ' + FOCUS_TEX_QUOTE_MAX + ' 字），关注请少选几行。' };
+    }
+    return r;
 }
 
 // 「就是这一条」：用解出来的位置比对，行被改过之后复选框才不会显示成没勾。
@@ -60731,7 +60744,11 @@ const OVL_SETTINGS_DEFAULTS = {
     pdf2texAutoVerify: true,
     // ---- v2 Pass P124：定位高亮自动过期（PDF + LaTeX 通用，见 OvlHighlightExpiry）----
     // 单位秒；0 = 永不消失（见 ovlHighlightExpiryMs 的特判）。默认 60 秒是用户明确指定的值。
-    ovlHighlightExpirySec: 60
+    ovlHighlightExpirySec: 60,
+    // ---- v2 Pass P235：划词翻译（「译」按钮）一次最多翻多少字 ----
+    // 3000（默认，与 P6 定的上限一致）| 6000 | 12000 | 0=无限制（完全不检查）。
+    // 只管「译」；「复制」没有长度上限；「关注」另有自己的 2000 字上限（发给模型的引文要小）。
+    ovlTransMaxChars: 3000
 };
 // ---- v2 Pass P133d：凭证类设置项白名单（诊断 .claude/tmp/p133_token_prompt_diag.md §1.2）----
 // 这两个字段是「同一个 data-setpath 通用 change 处理」下仅有的两个凭证（都是 type="password"）：
@@ -61285,6 +61302,11 @@ function ovlSettingsTranslatorHtml() {
         + (Array.isArray(AppState.localModels) ? AppState.localModels : []).map(function (lm) { return ovlOptTag(lm.id, localModelDisplayName(lm.id), s.visualTransModel); }).join('')
         + '</select>',
         'Visual 或 Code 模式里选中文字后，用哪个模型翻译。留空就跟着翻译器上方选的模型走。');
+    // v2 Pass P235：「译」一次最多翻多少字。走通用 data-setpath 处理（change 委托里按数字存）；0=无限制。
+    html += ovlSetRow('划词翻译（译）最大长度', '<select data-setpath="settings.ovlTransMaxChars">'
+        + [3000, 6000, 12000].map(function (n) { return ovlOptTag(n, n + ' 字', ovlTransMaxChars() === Infinity ? 0 : ovlTransMaxChars()); }).join('')
+        + ovlOptTag(0, '无限制', ovlTransMaxChars() === Infinity ? 0 : ovlTransMaxChars()) + '</select>',
+        '选中的文字超过这个字数时，「译」按钮不可用（Code 模式）或提示「选中的文字太长」。限制只是为了避免一次发给模型太长的内容（又慢又贵，本地模型上下文也有限），不是技术上做不到；选「无限制」就完全不检查。「复制」没有长度限制；「关注」另有 2000 字的上限（它要把引文发给对话模型）。');
     // v2 Pass P230：Visual 中文翻译同时发几个请求。走通用 data-setpath 处理（change 委托里对本项专门处理：存盘 + 立刻调整正在跑的批次，不重渲 Visual）。
     (function () {
         const cur = s.visualTransConcurrency;
@@ -61706,7 +61728,7 @@ function ovlBindSettingsModal() {
         let val = el.type === 'checkbox' ? el.checked : el.value;
         if (path === 'settings.fontSize' || path === 'settings.tabSize' || path === 'settings.overleafAutoPullMinutes'
             || path === 'settings.pdf2texConcurrency' || path === 'settings.pdf2texMaxPx'
-            || path === 'settings.ovlHighlightExpirySec') val = Number(val);
+            || path === 'settings.ovlHighlightExpirySec' || path === 'settings.ovlTransMaxChars') val = Number(val);
         if (path === 'settings.visualTransConcurrency') val = (val === 'auto') ? 'auto' : Number(val); // v2 Pass P230
         // v2 Pass P133d（T0 追加）：桥令牌走统一归一化（见 ovlBridgeTokenNormalize 上方注释）——
         // 去掉换行/制表符 + 首尾空白后再落盘；字符集不合法（把终端提示符/路径一起粘进来了）时
@@ -64751,7 +64773,8 @@ function ovlCopyLatexSource() {
             }
             const pickedText = String(sel).replace(/\s+/g, ' ').trim();
             if (!pickedText) { try { showToast('没有选中内容。', 'warning'); } catch (e) {} return; }
-            const scopeR = focusOvlSelectionRange();
+            // v2 Pass P235：用不带长度上限的解析（「关注」的 2000 字上限不适用于复制）。
+            const scopeR = ovlSelectionSourceRange();
             if (!scopeR.ok) { try { showToast(scopeR.why || '没有选中内容。', 'warning'); } catch (e) {} return; }
             const loc = ovlLocateVisualPick({ originalText: pickedText, visualScope: { start: scopeR.start, end: scopeR.end } });
             if (loc.n === 1) {
@@ -66879,15 +66902,17 @@ function ovlShowQuickActionsAt(x, y, source, visualBlockEl) {
         if (taQ && taQ.selectionEnd > taQ.selectionStart) {
             // 先用字符跨度短路，别对一个几十万字的选区做 slice+regex：归一化只会让长度变短，
             // 跨度 <= 上限 x4 时才值得真算一次（最坏切 12000 字，很便宜）。
-            tooLong = (taQ.selectionEnd - taQ.selectionStart > OVL_TRANS_MAX_CHARS * 4)
-                   || (ovlCodeTransText(taQ).length > OVL_TRANS_MAX_CHARS);
+            // v2 Pass P235：上限来自设置「划词翻译（译）最大长度」；无限制（Infinity）时完全不检查。
+            const maxQ = ovlTransMaxChars();
+            tooLong = isFinite(maxQ) && ((taQ.selectionEnd - taQ.selectionStart > maxQ * 4)
+                   || (ovlCodeTransText(taQ).length > maxQ));
         }
     }
     const tBtn = qa.querySelector('.ovl-qa-translate');
     if (tBtn) {
         tBtn.classList.toggle('ovl-qa-off', tooLong);
         tBtn.setAttribute('data-tip', tooLong
-            ? ('选中超过 ' + OVL_TRANS_MAX_CHARS + ' 字，翻译不可用；选少几行再试')
+            ? ('选中超过 ' + ovlTransMaxChars() + ' 字，翻译不可用；选少几行再试')
             : '翻译成中文');
     }
     // v2 Pass P38：Visual 中文预览模式下，渲染文字跟源码不再逐字对应，ovlLocateVisualPick 的
@@ -69423,12 +69448,24 @@ function ovlVisTransFromSelection(force) {
 // DOM 和 selRect 的 4 个数字，没有一行是 Visual 专属的（缓存/竞态/中断/四候选定位/复制/
 // Esc/点外面关闭全部原样复用）。
 
-const OVL_TRANS_MAX_CHARS = 3000;   // P6 定的策略上限，现在 Visual/Code 两个入口共用
+const OVL_TRANS_MAX_CHARS = 3000;   // P6 定的策略上限（默认值），现在 Visual/Code 两个入口共用
 
-// P6 的长度封顶收口成一处。toast 文案一个字都不许改——它已经进了 fd53b09 那次提交。
+// v2 Pass P235：当前生效的上限，来自设置「划词翻译（译）最大长度」（OvlSettings.ovlTransMaxChars）。
+// 0 = 无限制 → 返回 Infinity（调用方据此完全跳过检查）；其余合法的正数照用；缺省/脏值（比如
+// 从别的机器同步来了个怪值）退回默认 3000。
+function ovlTransMaxChars() {
+    const v = (typeof OvlSettings === 'object' && OvlSettings) ? OvlSettings.ovlTransMaxChars : undefined;
+    if (v === 0 || v === '0' || v === 'unlimited') return Infinity;
+    const n = Number(v);
+    return (isFinite(n) && n > 0) ? Math.round(n) : OVL_TRANS_MAX_CHARS;
+}
+
+// P6 的长度封顶收口成一处。toast 文案沿用 fd53b09 那次提交的原话，只是数字改成设置里的当前值
+// （默认仍是 3000，所以默认行为与之前逐字一致）；无限制时不检查。
 function ovlTransLengthOk(text) {
-    if (text.length > OVL_TRANS_MAX_CHARS) {
-        showToast('选中的文字太长（超过 ' + OVL_TRANS_MAX_CHARS + ' 字），请选短一点再试。', 'warning');
+    const max = ovlTransMaxChars();
+    if (isFinite(max) && text.length > max) {
+        showToast('选中的文字太长（超过 ' + max + ' 字），请选短一点再试。', 'warning');
         return false;
     }
     return true;
@@ -70060,7 +70097,7 @@ const OVL_SYNC_SETTING_FIELDS = [
     'ovlVisualBtrConfirmFirst', 'overleafAutoPullMinutes', 'ovlRestoreLastProject', 'ovlAiMergeEndpoint',
     'ovlAiMergeModel', 'pdf2texDefaultOutDir', 'pdf2texVisionEndpoint', 'pdf2texVisionModel', 'pdf2texConcurrency',
     'pdf2texDisableThinking', 'pdf2texMaxPx', 'pdf2texSavePageImages', 'pdf2texAutoOpenResult',
-    'pdf2texExtractImages', 'pdf2texAutoVerify', 'ovlHighlightExpirySec'
+    'pdf2texExtractImages', 'pdf2texAutoVerify', 'ovlHighlightExpirySec', 'ovlTransMaxChars'
 ];
 const OVL_SYNC_REG = Object.create(null);
 (function () {
