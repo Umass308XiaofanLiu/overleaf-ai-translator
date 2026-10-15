@@ -5077,7 +5077,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.53.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.53.03';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -54989,11 +54989,16 @@ function ovlOverleafHandlePullResult(data, ctx) {
             // 暂存恢复冲突照旧弹 stash-pop-conflict 对话框；P45 的旧桥探测也照旧走下面 else 分支）。
             // 评审返修：只对用户手动点「拉取」生效（!silent）。定时自动拉取（ovlOverleafSetupAutoPullTimer，
             // silent:true）无人值守，不能每隔 N 分钟悄悄跑一遍 暂存→拉取→恢复（恢复冲突会在后台把冲突标记写进工作区文件），
-            // 它遇到本地改动仍按以前的行为跳过并提示。
+            // 它遇到本地改动一律跳过（INT-A 起安静跳过、只在状态栏留一句，见下面的 silent 分支；以前这里会每隔 N 分钟弹一次三选一框）。
             // 推迟到下一个宏任务：当前这次 ovlOverleafPullRun 的 finally 要先把 ovlSyncBusy 清掉、
             // 把按钮恢复，再起第二次请求，否则第二次结束时的状态会被第一次的收尾覆盖。
             ovlOverleafSetSyncStatus('本地有未提交改动，按设置自动暂存后拉取…', false);
             setTimeout(function () { ovlOverleafPullRun(ctx.projectDir, ctx.gitUrl, 'stash', { silent: silent }); }, 0);
+        } else if (ctx.strategy === 'abort' && ovlPullDirtyMode() === 'stash' && silent) {
+            // v2 INT-A（P236 评审遗留 c）：「自动暂存后拉取」档下，定时自动拉取（silent）遇到本地改动——设置说明写的是「定时拉取遇到本地改动仍会跳过」，
+            // 不该每隔 N 分钟弹一次三选一框（用户选这一档就是不想被这个弹窗打扰）：安静跳过，只在状态栏留一句，不弹窗、不弹 toast。
+            // 用户手动点「拉取」走上面的分支，照旧自动暂存；「每次询问」档（默认）的定时拉取行为不变（仍弹三选一框）。
+            ovlOverleafSetSyncStatus('本地有未提交改动，定时拉取已跳过（手动点「拉取」会按设置自动暂存后拉取）', false);
         } else if (ctx.strategy === 'abort') {
             ovlOverleafSetSyncStatus('本地有未提交改动，已跳过', true);
             ovlOverleafShowDirtyDialog(data.dirtyFiles, ctx.projectDir, ctx.gitUrl);
