@@ -3868,6 +3868,9 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-qa-retrans-sel { background: #1B222C; color: #E7E9EE; border: 1px solid #495365; border-radius: 4px; font-size: 11px; height: 22px; max-width: 150px; flex-shrink: 0; }
 .ovl-qa-retrans-sel:disabled { opacity: .5; cursor: not-allowed; }
 .ovl-qa-retrans-prov { max-width: 190px; overflow: hidden; text-overflow: ellipsis; }
+/* v2 Pass P237：模型下拉右边的「思考」下拉（同一个 .ovl-qa-retrans-sel 外观，窄一点；外面包一层 span 是为了禁用态也能挂悬浮提示） */
+.ovl-qa-think { display: inline-flex; flex-shrink: 0; }
+.ovl-qa-think .ovl-qa-think-sel { max-width: 96px; }
 .ovl-breadcrumb {
     font-size: 10.5px; color: #9AA4B2; padding: 2px 10px; background: #1B222C;
     border-bottom: 1px solid #2F3A4C; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; display: none;
@@ -5067,7 +5070,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.51.02';        // APP_VERSION_STAMP
+const APP_VERSION = '03.52.00';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -9519,17 +9522,40 @@ function parseCrossFragments(raw) {
 // callOpenAIAPI/callGeminiAPI 函数体一行不动——它们本来就支持 system 角色/systemInstruction
 // （xportRequest 早就在用，见该函数）。systemPrompt 为空/非字符串时，messages 形状跟
 // P202a 之前逐字节相同。
+// v2 Pass P237：把「重译/重试/联系上下文重译」弹窗里选的「思考」单次覆盖（config.ovlThinking，
+// 由 ovlRetransApplyOverride 挂在这一次请求的 cfg 副本上）翻译成 callLocalLLM 的 opts 追加字段：
+//   · local（LM Studio）→ { reasoningEffort: <线上词表 none/low/medium/xhigh> }（callLocalLLM 早就
+//     接受这个字段，对话窗在用）；开思考档位另带 timeoutMs（见 ovlRetransThinkingFor 的注释）。
+//   · qwen（DashScope）→ { enableThinking: true|false }（+ 开思考时的 timeoutMs）。
+//   · 其余 provider（openai/claude/gemini）、没有 ovlThinking（= 跟随设置）、provider 对不上 → 返回
+//     null，调用方原样使用 opts，请求体与 P237 之前逐字节相同。
+function ovlP237ThinkingOpts(config) {
+    const th = (config && config.ovlThinking && typeof config.ovlThinking === 'object') ? config.ovlThinking : null;
+    if (!th || th.provider !== config.provider) return null;
+    if (config.provider === 'local' && typeof th.wire === 'string' && th.wire) {
+        const r = { reasoningEffort: th.wire };
+        if (th.timeoutMs > 0) r.timeoutMs = th.timeoutMs;
+        return r;
+    }
+    if (config.provider === 'qwen' && typeof th.enable === 'boolean') {
+        const r = { enableThinking: th.enable };
+        if (th.timeoutMs > 0) r.timeoutMs = th.timeoutMs;
+        return r;
+    }
+    return null;
+}
 async function callModelPlainText(prompt, config, signal, meta, opts, systemPrompt) {
     const hasSys = (typeof systemPrompt === 'string' && !!systemPrompt);
     if (config.provider === 'local') {
         const localMessages = hasSys
             ? [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }]
             : [{ role: 'user', content: prompt }];
-        return await callLocalLLM(config.localBaseUrl, config.model, localMessages, false, signal, meta || null, opts || null);
+        const thLocal = ovlP237ThinkingOpts(config);
+        return await callLocalLLM(config.localBaseUrl, config.model, localMessages, false, signal, meta || null, thLocal ? Object.assign({}, opts || null, thLocal) : (opts || null));
     }
     // v2 Pass P134：Qwen(DashScope) 复用 callLocalLLM 传输层，只是换 baseUrl 并带上 apiKey。
     if (config.provider === 'qwen') {
-        const qwenOpts = Object.assign({}, opts || null, { apiKey: config.qwenApiKey });
+        const qwenOpts = Object.assign({}, opts || null, { apiKey: config.qwenApiKey }, ovlP237ThinkingOpts(config));
         const qwenMessages = hasSys
             ? [{ role: 'system', content: systemPrompt }, { role: 'user', content: prompt }]
             : [{ role: 'user', content: prompt }];
@@ -11041,7 +11067,18 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
     // 命中「有覆盖值」这条老路径，新默认完全不介入——控件状态永远优先于这条安全默认。
     try {
         if (isQwenReq) {
-            if (AppState.qwenReasoningByModel && Object.prototype.hasOwnProperty.call(AppState.qwenReasoningByModel, model)) {
+            // v2 Pass P237：「重译/重试/联系上下文重译」弹窗里的「思考」单次覆盖（opts.enableThinking，
+            // 布尔，只有那三个入口经 callModelPlainText 传入；其余所有调用点不传，下面逐字走原分支）。
+            // true → 本次请求开思考（预算沿用设置里存的 budget，没有就不发 thinking_budget）；
+            // false → 本次请求关思考（只发 enable_thinking:false，不发预算）。绝不写
+            // AppState.qwenReasoningByModel——覆盖只活在这一次请求体里。
+            if (o && typeof o.enableThinking === 'boolean') {
+                body.enable_thinking = o.enableThinking;
+                if (o.enableThinking && AppState.qwenReasoningByModel && Object.prototype.hasOwnProperty.call(AppState.qwenReasoningByModel, model)) {
+                    const prefOv = AppState.qwenReasoningByModel[model];
+                    if (prefOv && typeof prefOv.budget === 'number' && prefOv.budget > 0) body.thinking_budget = Math.round(prefOv.budget);
+                }
+            } else if (AppState.qwenReasoningByModel && Object.prototype.hasOwnProperty.call(AppState.qwenReasoningByModel, model)) {
                 const pref = AppState.qwenReasoningByModel[model];
                 body.enable_thinking = true;
                 if (pref && typeof pref.budget === 'number' && pref.budget > 0) body.thinking_budget = Math.round(pref.budget);
@@ -11075,7 +11112,11 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
     const endpoint = `${xportCapsOrigin(baseUrl)}/v1/chat/completions`;
 
     // v2 Pass P216（PIPELINE-6）：总超时——Qwen（带 apiKey 的在线端点）180 秒，LM Studio 本地 600 秒。
-    const rg = (typeof xportReqGuard === 'function') ? xportReqGuard(signal, (oApiKey ? 180000 : 600000)) : { signal: signal, fail: function (e) { return e; }, done: function () {} };
+    // v2 Pass P237：opts.timeoutMs（可选正数）——只有「思考」单次覆盖开着思考时 callModelPlainText 才会传
+    // （思考会让一次翻译从几十秒拉到几分钟，固定的 180/600 秒会把正常的思考误杀成超时）；
+    // 不传 = 原来的 180000 / 600000，逐字不变。
+    const oTimeout = (o && typeof o.timeoutMs === 'number' && isFinite(o.timeoutMs) && o.timeoutMs > 0) ? Math.round(o.timeoutMs) : 0;
+    const rg = (typeof xportReqGuard === 'function') ? xportReqGuard(signal, (oTimeout || (oApiKey ? 180000 : 600000))) : { signal: signal, fail: function (e) { return e; }, done: function () {} };
     try {
         let response = await fetch(endpoint, {
             method: "POST",
@@ -11184,7 +11225,9 @@ async function callLocalLLM(baseUrl, model, messages, jsonMode = false, signal =
         }
         // A3：被动探测。每一次真实响应都顺手判一次「这个模型在推理吗」，
         // 不额外花任何一次调用。判到了就把横幅弹出来（见 xportNoteThinking）。
-        try { xportNoteThinking(model, choice.thinking, effortSent ? (effortSent !== 'none') : undefined); } catch (e) {}
+        // v2 Pass P237：Qwen 单次覆盖时，「这一次是否要求了思考」就是 opts.enableThinking 本身——
+        // 否则设置里是关、用户在弹窗里明确选了「开」，横幅会反过来说「没人要求它却在推理」。
+        try { xportNoteThinking(model, choice.thinking, effortSent ? (effortSent !== 'none') : ((o && typeof o.enableThinking === 'boolean') ? o.enableThinking : undefined)); } catch (e) {}
         return choice.text;
     } catch (error) {
         if (error.name === 'AbortError' && !rg.timedOut()) throw error;
@@ -39986,7 +40029,7 @@ function ovlVisualTransCacheGetMeta(text, config, projectIdOverride) {
             // forced/partial 同一条纪律——旧缓存条目（本 Pass 之前写入的、或没传这个字段的
             // 调用点）没有这个字段，hit.ladderLevel 是 undefined，`|| null` 让老数据照常读出
             // null，不报错、不需要迁移。
-            return { tgt: hit.tgt, skipped: !!hit.skipped, forced: !!hit.forced, partial: !!hit.partial, partialReason: hit.partialReason || null, ladderLevel: hit.ladderLevel || null, model: producer, override: !!producer }; // v2 Pass P232b：override = 这条译文是「重译/重试」下拉里手动选了别的模型产出的（整篇重译的确认框要点明它们也会被覆盖）
+            return { tgt: hit.tgt, skipped: !!hit.skipped, forced: !!hit.forced, partial: !!hit.partial, partialReason: hit.partialReason || null, ladderLevel: hit.ladderLevel || null, model: producer, override: !!producer, effort: (typeof hit.effort === 'string' && hit.effort) ? hit.effort : '' }; // v2 Pass P237：effort = 这条译文是用「思考」单次覆盖产出的档位（UI 词表；没有覆盖就是空串）；v2 Pass P232b：override = 这条译文是「重译/重试」下拉里手动选了别的模型产出的（整篇重译的确认框要点明它们也会被覆盖）
         }
         // 新桶未命中（含"闸没过被当场删掉"这种情形）——查一次旧版全局缓存兜底，命中就先过闸
         // 再决定要不要提升进新桶（不删旧的、旧的不再增长；不过闸就不提升，直接当未命中）。
@@ -40017,7 +40060,7 @@ function ovlVisualTransCacheGetMeta(text, config, projectIdOverride) {
                     if (OvlVisualTransCacheScope) OvlVisualTransCacheScope.dirty.add(projectId);
                     else if (ovlVisualTransCacheSaveBucket(projectId, map)) ovlVisualTransCacheIndexTouch(projectId);
                 }
-                return { tgt: fh.tgt, skipped: !!fh.skipped, forced: !!fh.forced, partial: !!fh.partial, partialReason: fh.partialReason || null, ladderLevel: fh.ladderLevel || null, model: fb.model, override: !!(typeof fh.model === 'string' && fh.model) };
+                return { tgt: fh.tgt, skipped: !!fh.skipped, forced: !!fh.forced, partial: !!fh.partial, partialReason: fh.partialReason || null, ladderLevel: fh.ladderLevel || null, model: fb.model, override: !!(typeof fh.model === 'string' && fh.model), effort: (typeof fh.effort === 'string' && fh.effort) ? fh.effort : '' };
             }
         }
     } catch (e) {}
@@ -40054,7 +40097,7 @@ function ovlVisualTransCacheGet(text, config, projectIdOverride) {
 // 前者是 JSON.parse 出来的对象天生没有这个键，后者根本不调用 Put。只有上面 GetMeta 显式确认
 // "刚刚过了闸"之后才会显式传 OVL_VISUAL_CJK_GATE_VERSION 走"提升旧版兜底缓存"这条分支，
 // 跟不传时的默认值相同，是同一个值、不是两套逻辑。
-function ovlVisualTransCachePut(text, config, tgt, projectIdOverride, skipped, forced, partial, partialReason, ladderLevel, gateVersion, keyOverride, deferWrite, model) {
+function ovlVisualTransCachePut(text, config, tgt, projectIdOverride, skipped, forced, partial, partialReason, ladderLevel, gateVersion, keyOverride, deferWrite, model, effort) {
     try {
         const projectId = projectIdOverride || ovlVisualTransCacheProjectId();
         const key = keyOverride || ovlVisualTransCacheKey(text, config); // v2 Pass P215（VISUALPERF-7）：keyOverride = 请求时算好的 key
@@ -40063,6 +40106,7 @@ function ovlVisualTransCachePut(text, config, tgt, projectIdOverride, skipped, f
         ovlP232IndexAdd(map, key); // v2 Pass P232：跨模型回退二级索引增量维护
         OvlP232Suppress.delete(key); // v2 Pass P232：自己的 key 又有了新译文，「禁用回退」登记作废
         if (model) map[key].model = String(model); // v2 Pass P223：仅用户在重译下拉里换了模型时才带（provider/model）；旧条目读出为 undefined
+        if (effort) map[key].effort = String(effort); // v2 Pass P237：仅用户在弹窗「思考」下拉里选了具体档位（非「跟随设置」）时才带，UI 词表 off/on/low/medium/xhigh；缓存 key 不变
         if (OvlVisualTransCacheScope) {
             // v2 Pass P215（VISUALPERF-6）：作用域内（旧版缓存提升等）只记脏，淘汰 + 落盘 + Maintain 留到 End 一次做。
             OvlVisualTransCacheScope.dirty.add(projectId);
@@ -40888,6 +40932,7 @@ async function ovlVisualTranslateTextProseFragment(prose, config, signal, outMet
             ? await callModelPlainText(prompt, config, signal, null, null, fragSys)
             : await callModelPlainText(prompt, config, signal);
     } catch (e) { if (outMeta) outMeta.failed = true; return src; }
+    raw = ovlP237CleanRaw(raw, config, src); // v2 Pass P237：同单块路径
     const body = (typeof raw === 'string') ? raw.trim() : '';
     if (!body) { if (outMeta) outMeta.failed = true; return src; }
     if (ovlVisualIsEchoFailure(masked.text, body)) { if (outMeta) outMeta.failed = true; return src; }
@@ -41337,6 +41382,7 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
                 ? await callModelPlainText(prompt, config, signal, callMeta, callOpts, preamble)
                 : await callModelPlainText(prompt, config, signal, callMeta, callOpts);
         }
+        raw = ovlP237CleanRaw(raw, config, src); // v2 Pass P237：只有带「思考」覆盖的请求才会动 raw（内联 <think> 不进译文），其余原样
         if (meta && callMeta) { meta.finish = callMeta.finish; meta.truncated = callMeta.truncated; }
         // v2 Pass P122（诊断 A10 缺口根治）：块内没有任何占位符时（masked.map/codeMasked.map
         // 都是空表），被截断的半句中文以前能通过全部校验——xportBlockOk 的"total===map.length"
@@ -41452,9 +41498,10 @@ async function ovlVisualTranslateBlockRaw(text, cfg, signal, meta) {
     // （en→zh）。prompt 本身一个字不动；两者都空时不传第 6 参，逐字节不变。
     const rawCtx = (typeof ovlTermDbContextFor === 'function') ? ovlTermDbContextFor('en2zh', src, { cap: 30 }) : { card: '', terms: '' };
     const rawSys = ((rawCtx.card || '') + rawCtx.terms).replace(/^\n+/, '');
-    const raw = rawSys
+    const raw0 = rawSys
         ? await callModelPlainText(prompt, cfg, signal, null, null, rawSys)
         : await callModelPlainText(prompt, cfg, signal);
+    const raw = ovlP237CleanRaw(raw0, cfg, src); // v2 Pass P237：同单块路径（只对带思考覆盖的请求生效）
     let body = (typeof raw === 'string') ? raw.trim() : '';
     if (ovlVisualIsEchoFailure(src, body)) {
         if (meta) meta.echoCandidate = body; // 跟 L0 同一条纪律：抓住候选，供 C3b 逃生门使用
@@ -41952,9 +41999,10 @@ async function ovlP233JointCall(preps, config, signal, ctx, correction, temperat
     const comp = ovlP233JointCompose(preps, config, ctx, correction);
     const callMeta = {};
     const callOpts = temperature0 ? { temperature: 0 } : null;
-    const raw = comp.systemPrompt
+    const raw0 = comp.systemPrompt
         ? await callModelPlainText(comp.prompt, config, signal, callMeta, callOpts, comp.systemPrompt)
         : await callModelPlainText(comp.prompt, config, signal, callMeta, callOpts);
+    const raw = ovlP237CleanRaw(raw0, config, preps.map(function (pp) { return pp.src; }).join('\n')); // v2 Pass P237：同单块路径（只对带思考覆盖的请求生效）
     return { raw: raw, finish: callMeta.finish, truncated: (callMeta.finish === 'length' || callMeta.truncated === true) };
 }
 
@@ -42163,7 +42211,7 @@ function ovlP233UnflagJob(st, job) {
 // 一个任务的结果落地（成功）：写缓存 + 清失败态 + 刷块。cfg 是主模型 cfg（缓存 key 永远按它），modelTag 是换模型时的来源标记。
 function ovlP233LandJob(st, env, job) {
     const r = job.result, meta = r.meta || {};
-    try { ovlVisualTransCachePut(job.src, env.baseCfg, r.tgt, st.fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, job.reqKey, env.deferWrite ? true : undefined, env.modelTag); } catch (e) {}
+    try { ovlVisualTransCachePut(job.src, env.baseCfg, r.tgt, st.fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, job.reqKey, env.deferWrite ? true : undefined, env.modelTag, env.effort); } catch (e) {}
     try { ovlVisualFailLogDelete(job.src, env.baseCfg); } catch (e) {}
     env.newZh.set(job.src, r.tgt);
     let landed = 0;
@@ -42228,7 +42276,7 @@ function ovlP233NotSentText(ns) {
     return parts.length ? ('；未发送：' + parts.join('、')) : '';
 }
 // 主入口：els = 选区覆盖的 #ovlVisualPane 里的块；override = 「重译」下拉里选的 { provider, model }（跟随主模型则为空）。
-async function ovlP233RunSelection(els, override) {
+async function ovlP233RunSelection(els, override, thinking) {
     if (OvlP233Run) return;
     if (OvlP232RetransAll) { try { showToast('「用当前模型重译全文」进行中，等它结束或先点进度行停止，再做联合重译。', 'warning'); } catch (e) {} return; }
     if (OvlState.editorMode !== 'visual' || (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare')) return;
@@ -42239,7 +42287,7 @@ async function ovlP233RunSelection(els, override) {
     const plan = ovlP233PlanSelection(els);
     if (!plan.jobs.length) { try { showToast('选中的块里没有可以联合重译的内容' + ovlP233NotSentText(plan.notSent), 'info'); } catch (e) {} return; }
     // 与 P223/P231 完全相同的 override 规则：cfg 永远是主模型（缓存/failLog 的 key 按它算），只有请求用 reqCfg；与主模型相同当作没有 override。
-    const ov = ovlRetransApplyOverride(cfg, override, '重译');
+    const ov = ovlRetransApplyOverride(cfg, override, '重译', thinking); // v2 Pass P237：第 4 参 = 「思考」单次覆盖，随 ov.transCfg 一路带进联合请求/缩小重试/逐块阶梯
     if (!ov.ok) return;
     const mySeq = OvlVisualLangState.seq;
     let fixedProjectId;
@@ -42264,7 +42312,7 @@ async function ovlP233RunSelection(els, override) {
     try { ovlVisualLangProgressUpdate(); } catch (e) {}
     try { ovlQaRenderJoint(); } catch (e) {}
     const newZh = new Map();
-    const env = { reqCfg: ov.transCfg, baseCfg: cfg, modelTag: ov.modelTag, signal: controller.signal, newZh: newZh, fatal: '',
+    const env = { reqCfg: ov.transCfg, baseCfg: cfg, modelTag: ov.modelTag, effort: ov.effort, signal: controller.signal, newZh: newZh, fatal: '',
         canLand: function () {
             try {
                 if (OvlState.editorMode !== 'visual') return false;
@@ -42380,7 +42428,8 @@ function ovlBindQaJoint() {
         if (key === 'start') {
             const els = (OvlQaState.visualBlockEls || []).filter(function (el) { return el && el.isConnected; });
             const ov = ovlRetransPickerOverrideFrom(box);
-            const p = ov ? ovlP233RunSelection(els, ov) : ovlP233RunSelection(els);
+            const th = ovlRetransThinkingFrom(box); // v2 Pass P237：同「重试」
+            const p = (ov || th) ? ovlP233RunSelection(els, ov || undefined, th || undefined) : ovlP233RunSelection(els);
             ovlQaRenderJoint();
             Promise.resolve(p).then(ovlQaRenderJoint).catch(function () { ovlQaRenderJoint(); });
         }
@@ -46511,8 +46560,10 @@ function ovlVisualRetryBadgeRestore(badgeEl) {
 //   - 无 override / 与主模型相同 -> transCfg = cfg、modelTag = ''（跟随路径，调用方行为与改动前完全一致）；
 //   - 换了模型 -> 先查服务商密钥（builderProviderUsable，不可用弹错误 toast 并 ok=false 让调用方直接 return，
 //     verb 只是 toast 里的动词），再给本地未加载模型弹提示 toast；transCfg 只用于发请求，缓存/failLog 的 key 仍按 cfg。
-function ovlRetransApplyOverride(cfg, override, verb) {
-    const out = { ok: true, transCfg: cfg, modelTag: '' };
+// v2 Pass P237：第 4 参 thinking = 「思考」下拉的 UI 值（undefined/''=跟随设置）。对【最终要用的模型】（换了就是 override 的模型）复核：
+// 支持 -> transCfg 带 ovlThinking（只活在这一次请求的 cfg 副本上）、out.effort = 该 UI 值；不支持/没选 -> out.effort = ''，cfg 不动（请求体同改动前）。
+function ovlRetransApplyOverride(cfg, override, verb, thinking) {
+    const out = { ok: true, transCfg: cfg, modelTag: '', effort: '' };
     if (override && override.provider && override.model && cfg
         && !(override.provider === cfg.provider && override.model === cfg.model)) {
         if (!builderProviderUsable(override.provider)) {
@@ -46529,9 +46580,13 @@ function ovlRetransApplyOverride(cfg, override, verb) {
             }
         } catch (e) {}
     }
+    if (thinking && cfg) {
+        const th = ovlRetransThinkingFor(out.transCfg, thinking);
+        if (th) { out.transCfg = Object.assign({}, out.transCfg, { ovlThinking: th }); out.effort = th.ui; }
+    }
     return out;
 }
-async function ovlVisualBlockRetryClick(el, override) {
+async function ovlVisualBlockRetryClick(el, override, thinking) {
     if (!el || el.getAttribute('data-ovl-trans-retrying') === '1') return;
     const srcLatex = (typeof ovlVisualBlockSrcText === 'function') ? ovlVisualBlockSrcText(el) : null;
     if (srcLatex == null || !srcLatex.trim()) return;
@@ -46540,10 +46595,11 @@ async function ovlVisualBlockRetryClick(el, override) {
     // v2 Pass P231：只有「重试」旁下拉点出来的调用才带 override（{provider, model}），规则与 P223「重译」逐条相同：
     // cfg 仍是主模型——缓存 Delete/Put 与 failLog 的 key 永远按它算（换模型的重试结果因此能撑过重渲染/刷新，
     // 失败也仍按主模型的 key 记 failLog）；只有请求用 transCfg。与主模型相同的选择当作没有 override。
-    const ov = ovlRetransApplyOverride(cfg, override, '重试');
+    const ov = ovlRetransApplyOverride(cfg, override, '重试', thinking);
     if (!ov.ok) return;
     const transCfg = ov.transCfg;
     const modelTag = ov.modelTag;
+    const effort = ov.effort; // v2 Pass P237：「思考」单次覆盖的 UI 值（''=跟随）。算「覆盖」：与换模型同一条不预删规则，失败保留旧译文
     const mySeq = OvlVisualLangState.seq;
     let fixedProjectId;
     try { fixedProjectId = ovlVisualTransCacheProjectId(); } catch (e) { fixedProjectId = null; }
@@ -46552,7 +46608,7 @@ async function ovlVisualBlockRetryClick(el, override) {
     // 保险起见先清空，确保这一轮无论成功与否都不会被更旧的缓存条目短路。
     // v2 Pass P231：换模型重试时不预删——「可能漏译」(partial) 块本来就有一条缓存译文，换模型失败不能让它比默认路径更糟；
     // 成功才由下面的 Put 覆盖（并清 failLog），失败则旧译文仍在缓存里，整篇重渲染后照旧显示。跟随路径保持预删。
-    if (!modelTag) { try { ovlVisualTransCacheDelete(srcLatex, cfg); } catch (e) {} }
+    if (!(modelTag || effort)) { try { ovlVisualTransCacheDelete(srcLatex, cfg); } catch (e) {} } // v2 Pass P237：思考覆盖同换模型，不预删
     const controller = new AbortController();
     OvlVisualLangState.adhocControllers.push(controller);
     el.setAttribute('data-ovl-trans-retrying', '1');
@@ -46577,10 +46633,10 @@ async function ovlVisualBlockRetryClick(el, override) {
         // （复现见阻断报告 N-2）。块本身该是什么状态不变（这一路径进来时块本来就是 failed，
         // 这里没有清掉 data-ovl-trans-failed，只是角标视觉复原，用户能再点一次）。
         if (mySeq !== OvlVisualLangState.seq) { ovlVisualRetryBadgeRestore(badgeEl); return; } // 陈旧响应（语言已切走/已取消），丢弃不落地
-        try { ovlVisualTransCachePut(srcLatex, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, undefined, undefined, modelTag); } catch (e) {} // partial 见 P122c BV2-2；ladderLevel 见 P128b N-4；modelTag 见 P231（跟随时为 ''，Put 不写 model 字段，与改动前同）
+        try { ovlVisualTransCachePut(srcLatex, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, undefined, undefined, modelTag, effort); } catch (e) {} // v2 Pass P237：effort 只在思考覆盖时非空 => Put 才写 effort 字段；partial 见 P122c BV2-2；ladderLevel 见 P128b N-4；modelTag 见 P231（跟随时为 ''，Put 不写 model 字段，与改动前同）
         // v2 Pass P231：换模型重试成功没有预删（见上），failLog 里此前失败留下的记录要在这里清掉——否则缓存条目日后被淘汰/删除后，
         // 旧失败记录会让这块复活成失败态（跟随路径由预删里的 ovlVisualTransCacheDelete 顺带清了）。
-        if (modelTag) { try { if (typeof ovlVisualFailLogDelete === 'function') ovlVisualFailLogDelete(srcLatex, cfg); } catch (e) {} }
+        if (modelTag || effort) { try { if (typeof ovlVisualFailLogDelete === 'function') ovlVisualFailLogDelete(srcLatex, cfg); } catch (e) {} } // v2 Pass P237：思考覆盖同样没有预删，成功后清此前失败留下的 failLog
         if (document.body.contains(el)) {
             el.removeAttribute('data-ovl-trans-failed');
             el.removeAttribute('data-ovl-trans-fail-reason');
@@ -46667,7 +46723,7 @@ async function ovlVisualBlockRetryClick(el, override) {
 // 忙态属性——不复用 data-ovl-trans-retrying，避免两条本来互斥的路径共享同一个属性名、
 // 互相踩踏彼此的忙态判断/重入守卫。任务书原话"bypasses the cache and overwrites the
 // entry"：翻译前先删旧缓存条目，成功后无条件用新结果覆盖写入。
-async function ovlVisualBlockRetranslateClick(el, override) {
+async function ovlVisualBlockRetranslateClick(el, override, thinking) {
     if (!el || el.getAttribute('data-ovl-trans-retranslating') === '1' || el.getAttribute('data-ovl-trans-retrying') === '1') return;
     const srcLatex = (typeof ovlVisualBlockSrcText === 'function') ? ovlVisualBlockSrcText(el) : null;
     if (srcLatex == null || !srcLatex.trim()) return;
@@ -46677,16 +46733,17 @@ async function ovlVisualBlockRetranslateClick(el, override) {
     // baseCfg——缓存 Delete/Put 的 key 永远按它算（重译结果因此能撑过重渲染/刷新）；只有请求用 transCfg。
     // 与主模型相同的选择当作没有 override。
     // v2 Pass P231：这段解析抽成 ovlRetransApplyOverride，「重试」(ovlVisualBlockRetryClick) 共用。
-    const ov = ovlRetransApplyOverride(cfg, override, '重译');
+    const ov = ovlRetransApplyOverride(cfg, override, '重译', thinking);
     if (!ov.ok) return;
     const transCfg = ov.transCfg;
     const modelTag = ov.modelTag;
+    const effort = ov.effort; // v2 Pass P237：「思考」单次覆盖的 UI 值（''=跟随）
     const mySeq = OvlVisualLangState.seq;
     let fixedProjectId;
     try { fixedProjectId = ovlVisualTransCacheProjectId(); } catch (e) { fixedProjectId = null; }
     // 换模型重译失败时不能比默认路径更糟：默认路径先删旧缓存再翻译；换模型时不预删——成功才由 Put 覆盖，
     // 失败则旧译文仍在缓存里，整篇重渲染后照旧显示（块上仍会打失败角标，与默认路径一致）。
-    if (!modelTag) { try { ovlVisualTransCacheDelete(srcLatex, cfg); } catch (e) {} }
+    if (!(modelTag || effort)) { try { ovlVisualTransCacheDelete(srcLatex, cfg); } catch (e) {} } // v2 Pass P237：思考覆盖同换模型，不预删
     const controller = new AbortController();
     OvlVisualLangState.adhocControllers.push(controller);
     el.setAttribute('data-ovl-trans-retranslating', '1');
@@ -46694,7 +46751,7 @@ async function ovlVisualBlockRetranslateClick(el, override) {
     try {
         const tgt = await ovlVisualTranslateBlockWithLadder(srcLatex, transCfg, controller.signal, meta, ovlP233SingleOpts(el, cfg, { userForced: true }, srcLatex)); // v2 Pass P233
         if (mySeq !== OvlVisualLangState.seq) return; // 陈旧响应（语言已切走/已取消），丢弃不落地
-        try { ovlVisualTransCachePut(srcLatex, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, undefined, undefined, modelTag); } catch (e) {}
+        try { ovlVisualTransCachePut(srcLatex, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, undefined, undefined, modelTag, effort); } catch (e) {} // v2 Pass P237：effort 见「重试」
         if (document.body.contains(el)) {
             if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta); else if (meta.partial) el.setAttribute('data-ovl-trans-partial', '1'); else el.removeAttribute('data-ovl-trans-partial');
             if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta);
@@ -47030,7 +47087,149 @@ function ovlRetransPickerHtml(disabled, verb) {
     ovlRetransPickerGroups().forEach(function (g) {
         html += '<optgroup label="' + escapeAttr(g.label) + '">' + g.items.map(function (it) { return ovlOptTag(it.value, it.label, cur); }).join('') + '</optgroup>';
     });
-    return html + '</select>';
+    // v2 Pass P237：「重译 / 重试 / 重译选中 N 块」三处共用这一个函数，所以「思考」下拉也只在这里拼一次，紧跟在模型下拉右边。
+    return html + '</select>' + ovlRetransThinkingHtml(cur, !!disabled, verb);
+}
+// ==================== v2 Pass P237：重译 / 重试 / 联合重译的「思考」单次覆盖 ====================
+// 用户需求：重新翻译时，除了换模型，还能选「是否思考」以及「思考强度（如果有）」。
+// 设计要点（全部在这一段 + ovlRetransApplyOverride + callModelPlainText 的 ovlP237ThinkingOpts 里，别处不碰）：
+//   1. 选项由「模型下拉当前解析到的模型」决定（跟随 = 顶栏主模型），与「设置 → 模型」里该模型的推理控件同一份来源：
+//      本地 = xportCapsPeek 的 allowed_options 经 xportReasoningControl 反推（二值 → 关/开；有档位 → 关 + 低/中/极高）；
+//      Qwen(DashScope) = MODEL_CAPS.qwen[model].thinking（hybrid → 关/开；always → 禁用「该模型总是思考」；其余禁用）；
+//      Claude/OpenAI/Gemini 以及没有推理能力的本地模型 = 禁用「该模型在本应用里不能调思考」（本 Pass 不给在线三家加思考控制）。
+//   2. 记忆值 OvlSettings.visualRetranslateThinking（''=跟随设置，随 ovl.settings 同步）三处共用；记忆的档位当前模型不支持时
+//      显示与发请求都静默回落成「跟随」，但【不改写】已保存的值（换回支持它的模型又会亮起来）。
+//   3. 只影响这一次请求：覆盖值只挂在这次请求的 cfg 副本上（cfg.ovlThinking），由 callModelPlainText 翻成 callLocalLLM 的 opts
+//      （local → reasoningEffort；qwen → enableThinking）。绝不写 AppState.reasoningByModel / qwenReasoningByModel，
+//      不碰批量翻译、整篇重译、聊天窗、xport。选「跟随设置」= 不挂 ovlThinking = 请求体与改动前逐字节相同。
+//   4. 超时：开思考的覆盖请求给 3 倍总超时（本地 600s -> 1800s，Qwen 180s -> 540s），见 OVL_P237_TIMEOUT_*；关思考 / 跟随不变。
+const OVL_P237_TIP_NONE = '该模型在本应用里不能调思考';
+const OVL_P237_TIP_ALWAYS = '该模型总是思考';
+const OVL_P237_TIMEOUT_LOCAL = 1800000;  // 本地(LM Studio)开思考：callLocalLLM 默认 600000 的 3 倍
+const OVL_P237_TIMEOUT_QWEN = 540000;    // Qwen(DashScope)开思考：callLocalLLM 默认 180000 的 3 倍
+const OvlP237WarmTried = Object.create(null);
+// 某个 provider/model 在「思考」下拉里能选的档位（UI 词表 off/on/low/medium/xhigh）。{ values: [], tip, loading? }；values 为空 = 控件禁用，tip 是原因。
+function ovlRetransThinkingSpec(provider, model) {
+    const none = { values: [], tip: OVL_P237_TIP_NONE };
+    try {
+        if (provider === 'local') {
+            const base = AppState.localBaseUrl;
+            let latched = false;
+            try { latched = xportEffortUnsupported.has(xportCapsOrigin(base)); } catch (e) { latched = false; }
+            if (latched) return none; // 这个地址已经用 400 拒绝过 reasoning_effort，callLocalLLM 不再发这个字段 => 本应用里确实调不了
+            const caps = xportCapsPeek(base, model);
+            if (caps === undefined) {
+                ovlRetransThinkingWarm(base);
+                return { values: [], tip: '正在读取模型能力…', loading: true };
+            }
+            if (!caps || !caps.reasoning) return none;
+            const ctl = xportReasoningControl(caps.reasoning.allowed);
+            if (ctl.kind === 'toggle') return { values: ['off', 'on'], tip: '' };
+            if (ctl.kind === 'select') return { values: ['off'].concat(ctl.levels), tip: '' };
+            return none;
+        }
+        if (provider === 'qwen') {
+            const qc = getModelCaps('qwen', model);
+            if (qc && qc.thinking === 'hybrid') return { values: ['off', 'on'], tip: '' };
+            if (qc && qc.thinking === 'always') return { values: [], tip: OVL_P237_TIP_ALWAYS };
+            return none;
+        }
+    } catch (e) {}
+    return none;
+}
+// 本地能力表还没读过时：发一次读取（同 origin 10 秒内不重复），回来后把已显示的弹窗里的「思考」下拉原地刷新。
+function ovlRetransThinkingWarm(base) {
+    try {
+        const origin = xportCapsOrigin(base);
+        const last = OvlP237WarmTried[origin] || 0;
+        if (Date.now() - last < 10000) return;
+        OvlP237WarmTried[origin] = Date.now();
+        Promise.resolve().then(function () { return xportFetchCaps(base); }).catch(function () {}).then(function () { ovlRetransThinkingRepaintAll(); });
+    } catch (e) {}
+}
+// 模型下拉的值（''=跟随）-> { provider, model }；解析不到（模型被卸/被隐藏/密钥删了）同样回落成主模型。
+function ovlRetransThinkingResolveModel(modelValue) {
+    const ov = ovlRetransPickerResolve(modelValue);
+    if (ov) return ov;
+    try { const cfg = getApiConfig(); return { provider: cfg.provider, model: cfg.model }; } catch (e) { return null; }
+}
+// 「思考」下拉的 HTML（外面包一层 span：禁用的 select 收不到鼠标事件，悬浮提示挂在 span 上）。
+function ovlRetransThinkingHtml(modelValue, disabled, verb) {
+    const m = ovlRetransThinkingResolveModel(modelValue);
+    const spec = m ? ovlRetransThinkingSpec(m.provider, m.model) : { values: [], tip: OVL_P237_TIP_NONE };
+    const stored = String(OvlSettings.visualRetranslateThinking || '');
+    const cur = spec.values.indexOf(stored) !== -1 ? stored : ''; // 不支持的记忆值：只在显示/请求上回落，不改写保存值
+    const off = !!disabled || !spec.values.length;
+    const tip = spec.values.length
+        ? ('选择这次' + (verb || '重译') + '是否思考、思考多深；选「跟随设置」就按「设置 → 模型」里该模型原有的设置。只影响这一次请求，不改设置')
+        : spec.tip;
+    const kind = spec.values.length ? 'ok' : (spec.loading ? 'loading' : (spec.tip === OVL_P237_TIP_ALWAYS ? 'always' : 'none'));
+    let h = '<span class="ovl-qa-think" data-qar-think-wrap="1" data-qar-think-kind="' + kind + '" data-tip="' + escapeAttr(tip) + '" data-tip-pos="top">'
+        + '<select class="ovl-qa-retrans-sel ovl-qa-think-sel" data-qar-think="1"' + (off ? ' disabled' : '') + '>'
+        + ovlOptTag('', '跟随设置', cur);
+    spec.values.forEach(function (v) { h += ovlOptTag(v, XPORT_EFFORT_LABEL[v] || v, cur); });
+    return h + '</select></span>';
+}
+// 某个弹窗盒子里：按模型下拉当前的值，原地重画「思考」下拉。只改这一个 span，不碰别的节点、不发请求、不关弹窗。
+function ovlRetransThinkingRefill(box) {
+    try {
+        if (!box) return;
+        const ms = box.querySelector('select[data-qar-model]');
+        const wrap = box.querySelector('[data-qar-think-wrap]');
+        if (!ms || !wrap) return;
+        const modelVal = ovlRetransPickerResolve(ms.value) ? String(ms.value) : '';
+        wrap.insertAdjacentHTML('afterend', ovlRetransThinkingHtml(modelVal, !!ms.disabled));
+        wrap.remove();
+        ovlQaFitToViewport();
+    } catch (e) {}
+}
+function ovlRetransThinkingRepaintAll() {
+    ['ovlQaRetranslate', 'ovlQaVisualState', 'ovlQaJoint'].forEach(function (id) {
+        const b = document.getElementById(id);
+        if (b && !b.hidden) ovlRetransThinkingRefill(b);
+    });
+}
+// 弹窗里「思考」下拉当前的值（UI 词表；''=跟随设置 / 控件被禁用 / 记忆值已失效）。点击时再对最终模型复核一次（ovlRetransThinkingFor）。
+function ovlRetransThinkingFrom(box) {
+    const t = box ? box.querySelector('select[data-qar-think]') : null;
+    return (t && !t.disabled) ? String(t.value || '') : '';
+}
+// UI 值 + 最终请求用的 cfg -> 挂在这次请求 cfg 上的 ovlThinking；这个模型不支持这个值 => null（= 跟随）。
+// local: { provider, ui, wire: reasoning_effort 线上词表, timeoutMs? }；qwen: { provider, ui, enable: bool, timeoutMs? }。
+function ovlRetransThinkingFor(cfg, ui) {
+    const v = String(ui || '');
+    if (!v || !cfg) return null;
+    const spec = ovlRetransThinkingSpec(cfg.provider, cfg.model);
+    if (spec.values.indexOf(v) === -1) return null;
+    const out = { provider: cfg.provider, ui: v };
+    if (cfg.provider === 'local') {
+        out.wire = XPORT_EFFORT_WIRE[v];
+        if (!out.wire) return null;
+        if (out.wire !== 'none') out.timeoutMs = OVL_P237_TIMEOUT_LOCAL;
+        return out;
+    }
+    if (cfg.provider === 'qwen') {
+        out.enable = (v !== 'off');
+        if (out.enable) out.timeoutMs = OVL_P237_TIMEOUT_QWEN;
+        return out;
+    }
+    return null;
+}
+// 开了思考的覆盖请求里，模型有时把思考过程内联进 content（<think>…</think>译文）。reasoning_content 字段本来就不进 content
+// （readLocalChoice 只读 content），这里只处理内联形态，且【只在这次请求带了思考覆盖时】才动手，其余路径原样不变：
+//   1. 以 <think> 开头 => 第一个 </think> 之后才是答案；没有闭合标签 => 整段都是思考，返回空串让校验失败、走重试阶梯（绝不落半截思考）；
+//   2. 不以 <think> 开头但出现了 </think>（Qwen3 模板把开标签预填进提示词的泄漏形态）：只有【原文里没有 think> 字样】时才把
+//      最后一个 </think> 之前的都当思考丢掉——讲推理模型的论文段落里合法出现 </think> 的译文不会被误切。
+function ovlP237CleanRaw(raw, config, srcText) {
+    if (typeof raw !== 'string' || !config || !config.ovlThinking) return raw;
+    if (!/think>/i.test(raw)) return raw;
+    const cut = xportThinkCut(raw, null);
+    if (cut.cut) return cut.text;
+    if (/think>/i.test(String(srcText == null ? '' : srcText))) return raw;
+    const re = /<\/think>/ig;
+    let m, end = -1;
+    while ((m = re.exec(raw))) end = m.index + m[0].length;
+    return end === -1 ? raw : raw.slice(end);
 }
 // v2 Pass P231：下拉当前选择 -> override（{provider, model}）或 null（跟随 / 记忆值已失效）。「重译」与「重试」
 // 两处点击委托共用，行为与 P223 内联写法逐字相同。
@@ -47043,9 +47242,17 @@ function ovlRetransPickerOverrideFrom(box) {
 function ovlRetransPickerBindChange(box) {
     box.addEventListener('change', function (e) {
         const sel = e.target && e.target.closest ? e.target.closest('select[data-qar-model]') : null;
-        if (!sel) return;
+        if (!sel) {
+            // v2 Pass P237：「思考」下拉 change -> 只存记忆值（OvlSettings.visualRetranslateThinking，随 ovl.settings 同步）；同样绝不触发请求、不关弹窗。
+            const th = e.target && e.target.closest ? e.target.closest('select[data-qar-think]') : null;
+            if (!th) return;
+            OvlSettings.visualRetranslateThinking = String(th.value || '');
+            try { ovlSaveSettings(); } catch (err) {}
+            return;
+        }
         OvlSettings.visualRetranslateModel = String(sel.value || '');
         try { ovlSaveSettings(); } catch (err) {}
+        ovlRetransThinkingRefill(box); // v2 Pass P237：换了模型，「思考」下拉的选项要跟着换（原地重画，保存的思考值不改）
     });
 }
 // 选中块当前译文的来源提示：缓存条目带 model 且不同于当前主模型才出现。
@@ -47053,9 +47260,16 @@ function ovlRetransProvenanceHtml(el) {
     try {
         const src = (typeof ovlVisualBlockSrcText === 'function') ? ovlVisualBlockSrcText(el) : null;
         if (src == null) return '';
-        const meta = ovlVisualTransCacheGetMeta(src, getApiConfig());
-        if (!meta || !meta.model || !ovlVisualModelDiffers(meta.model)) return '';
-        return '<span class="ovl-qa-state-label ovl-qa-retrans-prov" data-qar-prov="1">' + escapeHtml('当前译文来自：' + ovlVisualModelTagName(meta.model)) + '</span>';
+        const cfgP = getApiConfig();
+        const meta = ovlVisualTransCacheGetMeta(src, cfgP);
+        if (!meta) return '';
+        // v2 Pass P237：除了「换了模型」，这条译文若是用「思考」单次覆盖产出的（缓存条目带 effort），也要标出来：「当前译文来自：Qwen3.8 Q4 · 思考 极高」。
+        const modelShown = !!(meta.model && ovlVisualModelDiffers(meta.model));
+        const eff = meta.effort ? String(meta.effort) : '';
+        if (!modelShown && !eff) return '';
+        const name = modelShown ? ovlVisualModelTagName(meta.model) : ovlRetransModelName(cfgP.provider, cfgP.model);
+        const txt = '当前译文来自：' + name + (eff ? (' · 思考 ' + (XPORT_EFFORT_LABEL[eff] || eff)) : '');
+        return '<span class="ovl-qa-state-label ovl-qa-retrans-prov" data-qar-prov="1">' + escapeHtml(txt) + '</span>';
     } catch (e) { return ''; }
 }
 function ovlQaRenderRetranslate() {
@@ -47107,7 +47321,8 @@ function ovlBindQaVisualState() {
         } else if (key === 'retry' && typeof ovlVisualBlockRetryClick === 'function') {
             // v2 Pass P231：下拉选了别的模型才带 override；跟随（含已失效的记忆值）= 与改动前同一调用
             const ov = ovlRetransPickerOverrideFrom(box);
-            const p = ov ? ovlVisualBlockRetryClick(el, ov) : ovlVisualBlockRetryClick(el);
+            const th = ovlRetransThinkingFrom(box); // v2 Pass P237：「思考」下拉选了具体档位才带第 3 参；都是跟随 = 与改动前同一调用
+            const p = (ov || th) ? ovlVisualBlockRetryClick(el, ov || undefined, th || undefined) : ovlVisualBlockRetryClick(el);
             ovlQaRenderVisualState();
             Promise.resolve(p).then(ovlQaRenderVisualState).catch(function () { ovlQaRenderVisualState(); });
         } else if (key === 'detail' && typeof ovlVisualShowFailDetail === 'function') {
@@ -47143,7 +47358,8 @@ function ovlBindQaRetranslate() {
         if (key === 'retranslate' && typeof ovlVisualBlockRetranslateClick === 'function') {
             // v2 Pass P223：下拉选了别的模型才带 override；跟随（含已失效的记忆值）= 与改动前同一调用
             const ov = ovlRetransPickerOverrideFrom(box);
-            const p = ov ? ovlVisualBlockRetranslateClick(el, ov) : ovlVisualBlockRetranslateClick(el);
+            const th = ovlRetransThinkingFrom(box); // v2 Pass P237：同「重试」
+            const p = (ov || th) ? ovlVisualBlockRetranslateClick(el, ov || undefined, th || undefined) : ovlVisualBlockRetranslateClick(el);
             ovlQaRenderVisualState();
             Promise.resolve(p).then(ovlQaRenderVisualState).catch(function () { ovlQaRenderVisualState(); });
         }
@@ -61968,6 +62184,7 @@ const OVL_SETTINGS_DEFAULTS = {
     visualTransConcurrency: 'auto', // v2 Pass P230：Visual 中文翻译同时在飞的请求数。'auto'=本地模型跟随 LM Studio 的 parallel（读不到/在线模型=3）；整数 1–16=手动
     visualAutoContext: true,    // v2 Pass P233：翻译时自动联系上下文（同一段落连续行合成一次请求 + 单块翻译带前后已有译文/章节标题）。false=请求内容与 P233 之前逐字节一致
     visualRetranslateModel: '', // v2 Pass P223：块「重译」旁下拉的上次选择，'provider::model'，''=跟随当前模型
+    visualRetranslateThinking: '', // v2 Pass P237：「重译/重试/重译选中 N 块」旁「思考」下拉的上次选择（UI 词表 off/on/low/medium/xhigh），''=跟随设置；三处共用，随 ovl.settings 同步
     ovlVisualLineBreaks: true,  // Visual 断行 Pass 消费：true=按源码行切细渲染，false=退回整段渲染
     ovlVisualOutlineSelection: true, // Pass Sel-Outline 消费：true=方框描边选区，false=退回浏览器原生高亮
     // v2 Pass P166：中文改写触发的回译写回，是否要求用户先确认再落笔。true（默认）=非阻塞
@@ -71365,7 +71582,7 @@ const OVL_SYNC_SECRET_SETTING_FIELDS = ['overleafToken', 'ovlAiMergeApiKey', 'pd
 const OVL_SYNC_SETTING_FIELDS = [
     'fontSize', 'fontFamily', 'lineHeight', 'editorTheme', 'showLineNumbers', 'tabSize', 'autoCloseBrackets',
     'nonBlinkingCursor', 'quickActions', 'breadcrumbs', 'equationPreview', 'spellcheck', 'spellLang',
-    'transSimpleMode', 'visualTranslate', 'visualTransModel', 'visualTransConcurrency', 'visualAutoContext', 'visualRetranslateModel', 'ovlVisualLineBreaks', 'ovlVisualOutlineSelection',
+    'transSimpleMode', 'visualTranslate', 'visualTransModel', 'visualTransConcurrency', 'visualAutoContext', 'visualRetranslateModel', 'visualRetranslateThinking', 'ovlVisualLineBreaks', 'ovlVisualOutlineSelection',
     'ovlVisualBtrConfirmFirst', 'overleafAutoPullMinutes', 'ovlRestoreLastProject', 'ovlAiMergeEndpoint',
     'ovlAiMergeModel', 'pdf2texDefaultOutDir', 'pdf2texVisionEndpoint', 'pdf2texVisionModel', 'pdf2texConcurrency',
     'pdf2texDisableThinking', 'pdf2texMaxPx', 'pdf2texSavePageImages', 'pdf2texAutoOpenResult',
