@@ -5077,7 +5077,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.53.03';        // APP_VERSION_STAMP
+const APP_VERSION = '03.53.04';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -35019,7 +35019,7 @@ function ovlPortalHtml() {
         // v2 Pass P233（Stage B）：「翻译参考」——同样是状态开关（不是动作，点了不关弹窗），但与「关注」是两回事：
         // 「关注」给聊天助手用，「翻译参考」把选中的块固定成 Visual 翻译请求里的原文+译文对照。不带 data-qa / data-focus-cb。
         +   '<label class="ovl-qa-pin" id="ovlQaPin"'
-        +     ' data-tip="' + escapeAttr('固定为翻译参考：本项目里之后每次 Visual 翻译请求都会附上选中块的原文与现有译文对照，让术语和风格保持一致（再点一次取消）') + '" data-tip-pos="top"'
+        +     ' data-tip="' + escapeAttr('固定为翻译参考：本项目里之后每次 Visual 翻译请求都会附上选中的块——正文附原文与现有译文对照，独立公式和表格附 LaTeX 原文（用来理解符号含义），让术语和风格保持一致（再点一次取消）') + '" data-tip-pos="top"'
         +     ' onclick="event.stopPropagation();">'
         +     '<input type="checkbox" onclick="event.stopPropagation();ovlP233PinToggle(this);">'
         +     '<span>翻译参考</span>'
@@ -41479,7 +41479,7 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
     // v2 Pass P233：带只读上下文的请求，译文要过串味守卫（混进了上下文译文 / 长度远超正常比例 => 抛 ovlCtxContaminated，由重试阶梯去掉上下文重问）。
     if (!(opts && opts.ctx) || mainNothing) return await ovlVisualBlockFinish(prep, raw, config, signal, meta);
     const tgtCtx = await ovlVisualBlockFinish(prep, raw, config, signal, meta);
-    const whyCtx = ovlP233ContamCheck(tgtCtx, src, opts.ctx.zh);
+    const whyCtx = ovlP233ContamCheck(tgtCtx, src, opts.ctx.zh, opts.ctx.fm);
     if (whyCtx) throw ovlP233ContamError(whyCtx);
     return tgtCtx;
 }
@@ -41986,7 +41986,29 @@ function ovlP233CjkGrams(s, n, into) {
         for (let i = 0; i + n <= run.length; i++) into.add(run.substr(i, n));
     }
 }
-function ovlP233ContamCheck(tgt, src, zhList) {
+// v2 Pass P239：fmList = 「翻译参考」里公式 / 表格类块的 LaTeX（去掉空白后的串数组，由 ovlP233PinsContext 给出）。占位符把目标块自己的数学遮掉了，
+// 所以输出里任何照抄这些参考公式的 LaTeX 都是泄漏：译文（去空白后）里有一段 >= OVL_P239_LEAK_RUN 个字符的原样重合、且这段不在目标块自己的源码里。
+// 判法是 15 字符滑窗：窗口 ∈ 公式的 15-gram 集合、且不在目标自己源码（去空白）里 => 泄漏。短于 15 个字符的公式不设防（不可能出现 15 字符的重合）。
+function ovlP239LeakCheck(tgt, src, fmList) {
+    const N = OVL_P239_LEAK_RUN;
+    if (!fmList || !fmList.length) return false;
+    if (!fmList._grams) {
+        const g = new Set();
+        fmList.forEach(function (f) { for (let i = 0; i + N <= f.length; i++) g.add(f.substr(i, N)); });
+        fmList._grams = g;
+    }
+    if (!fmList._grams.size) return false;
+    const t = ovlP239Compact(tgt);
+    let own = null;
+    for (let i = 0; i + N <= t.length; i++) {
+        const gr = t.substr(i, N);
+        if (!fmList._grams.has(gr)) continue;
+        if (own === null) own = ovlP239Compact(src);
+        if (own.indexOf(gr) === -1) return true;
+    }
+    return false;
+}
+function ovlP233ContamCheck(tgt, src, zhList, fmList) {
     if (zhList && zhList.length) {
         if (!zhList._grams) {
             const g = new Set();
@@ -42001,6 +42023,7 @@ function ovlP233ContamCheck(tgt, src, zhList) {
             if (hit) return 'verbatim';
         }
     }
+    if (fmList && fmList.length && ovlP239LeakCheck(tgt, src, fmList)) return 'formula';
     try {
         const g = ovlVisualCjkGateEval(src, tgt);
         if (g.srcWords >= OVL_P233_RATIO_MIN_WORDS && g.zhChars > OVL_P233_RATIO_MAX * g.srcWords + OVL_P233_RATIO_SLACK) return 'ratio';
@@ -42008,7 +42031,7 @@ function ovlP233ContamCheck(tgt, src, zhList) {
     return '';
 }
 function ovlP233ContamError(why) {
-    const er = new Error('翻译结果疑似混入了上下文译文（' + (why === 'ratio' ? '译文长度远超正常比例' : '出现与上下文译文相同的连续文字') + '），已判定串味');
+    const er = new Error('翻译结果疑似混入了上下文译文（' + (why === 'ratio' ? '译文长度远超正常比例' : (why === 'formula' ? '译文里出现了与「翻译参考」公式相同的 LaTeX 原文' : '出现与上下文译文相同的连续文字')) + '），已判定串味');
     er.ovlCtxContaminated = true;
     return er;
 }
@@ -42179,7 +42202,7 @@ async function ovlP233JointRound(env, jobs, ctx, correction, temperature0) {
         try {
             const tgt = await ovlVisualBlockFinish(job.prep, sp.segs[i], env.reqCfg, env.signal, jm);
             if (ctx) {
-                const why = ovlP233ContamCheck(tgt, job.src, ctx.zh);
+                const why = ovlP233ContamCheck(tgt, job.src, ctx.zh, ctx.fm);
                 if (why) throw ovlP233ContamError(why);
             }
             jm.ladderLevel = 'L0';
@@ -42600,8 +42623,11 @@ function ovlP233AutoOn() { try { return OvlSettings.visualAutoContext !== false;
 
 // ---- 翻译参考（手动固定，按项目存，按源码文本为键）----
 const OVL_P233_PINS_KEY = 'ovl.visualPinsByProject';   // { [projectId]: [{ src, ts }] }，数组顺序 = 固定的先后（最前 = 最早）
-const OVL_P233_PIN_CAP_CHARS = 1500;                   // 一次请求里翻译参考（原文 + 译文）总量上限
-const OVL_P233_PIN_SRC_MAX = 1200;                     // 单块原文超过这个长度不能固定（一块就占满预算没有意义）
+// v2 Pass P239：总量上限改成设置 OvlSettings.visualPinBudget（1500 / 3000 默认 / 6000 / 12000，见 ovlP239PinBudget）；单块上限 1200 -> 4000。
+// 原因：公式、符号表本来就是最主要的参考来源，一张 3500 字的符号表在旧的 1200 / 1500 下既不能固定、也放不进预算。
+const OVL_P233_PIN_CAP_CHARS = 3000;                   // 一次请求里翻译参考（原文 + 译文 / LaTeX 原文）总量上限的默认值
+const OVL_P239_PIN_BUDGETS = [1500, 3000, 6000, 12000]; // 设置里可选的总量上限
+const OVL_P233_PIN_SRC_MAX = 4000;                     // 单块（正文原文 / 公式表格去掉 \label 注释后的 LaTeX）超过这个长度不能固定
 const OVL_P233_PIN_MAX = 40;                           // 每个项目最多留 40 条（超出丢最早的）
 let OvlP233PinNotified = '';                           // 上一次「超上限已省略」提示的签名（同一组 pins 不重复弹）
 function ovlP233PinsAll() {
@@ -42627,13 +42653,91 @@ function ovlP233PinsPut(list) {
         return true;
     } catch (e) { return false; }
 }
-// 哪些块能当翻译参考：有源码的正文块（不是公式 / 表格图算法 / 参考文献 / 不翻译 / 无可译文字），且源码不太长。
+// ---- v2 Pass P239：公式 / 表格 / 其它非正文块也能当翻译参考 ----
+// 旧版（P233）只让「有中文译文的正文块」固定，选中独立公式点「翻译参考」只会报「没有可参考的翻译块」——可公式恰恰是最主要的参考来源
+// （它让模型看到符号怎么写、和上下文里的术语怎么对应）。现在把能固定的块按【源码文本】分两类（不看 DOM，所以固定时与请求时判得一致）：
+//   'prose'   有中文译文的正文：照旧以 en→zh 对照对（【参考对照】）发送；
+//   'formula' 公式环境 / $$ / \[ / 表格等浮动体 / tabular / 没有可译内容的纯数学块：没有译文，发 LaTeX 原文（【参考公式/符号】），
+//             只用来理解符号含义与术语。
+// 仍然不能固定：标题、参考文献、空块、源码里碰巧含分段标记字样的块。
+const OVL_P239_FORMULA_ENV_RE = /^(tabular[xy*]?|tabu|subequations|math|displaymath)\*?$/;
+const OVL_P239_LEAK_RUN = 15;   // 译文里出现 >=15 个连续（去掉空白后）的公式原文字符、且目标块自己的源码里没有 = 泄漏（见 ovlP239LeakCheck）
+const OvlP239Cache = { cls: new Map(), tex: new Map() };
+function ovlP239CacheSet(m, k, v) { if (m.size > 300) m.clear(); m.set(k, v); return v; }
+// 把 LaTeX 源码里对「看懂符号含义」没帮助、又占预算的东西去掉，再压缩空白：行内 % 注释、\label{..}、\nonumber / \notag、纯排版命令
+// （\centering \hline \toprule/\midrule/\bottomrule \cmidrule \small.. \vspace/\hspace、\arraystretch/\tabcolsep 设置、浮动体放置参数 [htbp]、\\[2pt] 行距）。
+// 只做保守的、确定不改变符号含义的删除；任何拿不准的命令（\resizebox{..}{..}{ 这类要配括号的包装、\quad、\text{..}、\tag{..}、\caption{..}）原样保留。
+function ovlP239TrimLatex(src) {
+    const s0 = String(src == null ? '' : src);
+    const hit = OvlP239Cache.tex.get(s0);
+    if (hit !== undefined) return hit;
+    const lines = s0.split(/\r?\n/).map(function (line) {
+        for (let i = 0; i < line.length; i++) { // 第一个没被反斜杠转义的 %（\% 与 \\% 都按 LaTeX 规则处理）起到行尾是注释
+            const ch = line[i];
+            if (ch === '\\') { i++; continue; }
+            if (ch === '%') return line.slice(0, i);
+        }
+        return line;
+    });
+    let s = lines.join('\n');
+    s = s.replace(/\\label\s*\{[^{}]*\}/g, '')
+        .replace(/\\(?:nonumber|notag)(?![A-Za-z])/g, '')
+        .replace(/\\(?:centering|raggedright|raggedleft|noindent|hline|toprule|midrule|bottomrule|small|footnotesize|scriptsize|tiny|normalsize|medskip|smallskip|bigskip)(?![A-Za-z@])/g, '')
+        .replace(/\\cmidrule\s*(?:\([^)]*\))?\s*\{[^{}]*\}/g, '')
+        .replace(/\\addlinespace(?:\s*\[[^\]]*\])?/g, '')
+        .replace(/\\(?:vspace|hspace)\*?\s*\{[^{}]*\}/g, '')
+        .replace(/\\(?:renewcommand|setlength)\s*\{\\(?:arraystretch|tabcolsep|extrarowheight|arrayrulewidth)\}\s*\{[^{}]*\}/g, '')
+        .replace(/(\\begin\s*\{(?:table|figure|algorithm)\*?\})\s*\[[^\]]*\]/g, '$1')
+        .replace(/\\\\\s*\[\s*[0-9.]+\s*(?:pt|em|ex|mm|cm)\s*\]/g, '\\\\');
+    const out = s.split('\n').map(function (l) { return l.replace(/[ \t]+/g, ' ').trim(); }).filter(function (l) { return l; }).join('\n');
+    return ovlP239CacheSet(OvlP239Cache.tex, s0, out);
+}
+function ovlP239Compact(s) { return String(s == null ? '' : s).replace(/\s+/g, ''); }
+// 源码 -> 'prose' | 'formula' | ''（不可固定）。
+function ovlP239PinClass(src) {
+    const s = String(src == null ? '' : src);
+    if (!s.trim()) return '';
+    const hit = OvlP239Cache.cls.get(s);
+    if (hit !== undefined) return hit;
+    let cls = 'prose';
+    try {
+        if (s.indexOf('OVLSEG') !== -1 || ovlP233HeadingTitle(s) !== null) cls = '';
+        else {
+            const kind = ovlP233AtomicKind(s);
+            const envM = /^\s*\\begin\{([A-Za-z*]+)\}/.exec(s);
+            if (kind === 'bib') cls = '';
+            else if (kind === 'math' || kind === 'float' || (envM && OVL_P239_FORMULA_ENV_RE.test(envM[1]))) cls = 'formula';
+            else {
+                const prep = ovlVisualBlockPrep(s);
+                if (!prep || prep.empty) cls = '';
+                else if ((prep.mainNothing && !(prep.textProseMasked && prep.textProseMasked.items && prep.textProseMasked.items.length)) || ovlVisualBlockNoProse(s)) cls = 'formula';
+            }
+        }
+        if (cls === 'formula' && !ovlP239TrimLatex(s)) cls = ''; // 去掉注释 / 排版命令后什么都不剩
+    } catch (e) { cls = 'prose'; }
+    return ovlP239CacheSet(OvlP239Cache.cls, s, cls);
+}
+// 固定时占的长度：公式类 = 去掉 \label 注释等之后真正会发出去的 LaTeX 的长度；正文 = 原文长度。
+function ovlP239PinTooLong(src, cls) {
+    const c = cls || ovlP239PinClass(src);
+    return (c === 'formula' ? ovlP239TrimLatex(src).length : String(src).length) > OVL_P233_PIN_SRC_MAX;
+}
+// 设置「翻译参考总长度上限」的当前值：只认 1500 / 3000 / 6000 / 12000；缺省或被同步坏的值一律退回默认 3000。
+function ovlP239PinBudget() {
+    let v = NaN;
+    try { v = Number(OvlSettings.visualPinBudget); } catch (e) {}
+    return OVL_P239_PIN_BUDGETS.indexOf(v) !== -1 ? v : OVL_P233_PIN_CAP_CHARS;
+}
+// 哪些块能当翻译参考：除标题 / 参考文献 / 空块之外都可以——正文（要有译文才会被发出，没有译文的正文固定了也只是暂时不发）、
+// 公式 / 表格 / 浮动体 / 纯数学块（发 LaTeX 原文）；源码太长（见 ovlP239PinTooLong）不行。
 function ovlP233PinEligible(el, src) {
     if (!el || src == null || !src.trim()) return false;
-    if (el.hasAttribute('data-ovl-trans-notrans') || el.hasAttribute('data-ovl-trans-noprose') || el.hasAttribute('data-ovl-trans-skipped')) return false;
-    if (ovlP233AtomicKind(src) || ovlP233HeadingTitle(src) !== null) return false;
-    if (src.length > OVL_P233_PIN_SRC_MAX || src.indexOf('OVLSEG') !== -1) return false;
-    return true;
+    if (el.hasAttribute('data-ovl-trans-notrans')) return false; // 参考文献
+    const cls = ovlP239PinClass(src);
+    if (!cls) return false;
+    // 判成正文、页面上却是「无可译文字 / 已跳过」的块：它永远不会有译文可对照，不能固定（判成 formula 的则没有这个问题）。
+    if (cls === 'prose' && (el.hasAttribute('data-ovl-trans-noprose') || el.hasAttribute('data-ovl-trans-skipped'))) return false;
+    return !ovlP239PinTooLong(src, cls);
 }
 // 弹窗打开那一刻对应的块：多块选区 > 单击行号的块 > 当前文字选区碰到的块。
 function ovlP233PinTargetsNow() {
@@ -42694,12 +42798,13 @@ function ovlP233PinToggle(input) {
         let tooLong = 0;
         for (let i = 0; i < els.length; i++) {
             const s = srcs[i];
-            if (s != null && s.length > OVL_P233_PIN_SRC_MAX) { tooLong++; continue; }
+            if (s != null && s.trim() && !els[i].hasAttribute('data-ovl-trans-notrans') && ovlP239PinClass(s) && ovlP239PinTooLong(s)) { tooLong++; continue; }
             if (ovlP233PinEligible(els[i], s) && pick.indexOf(s) === -1) pick.push(s);
         }
         if (!pick.length) {
             if (input) input.checked = false;
-            try { showToast(tooLong ? ('这块的原文超过 ' + OVL_P233_PIN_SRC_MAX + ' 字符，不能作为翻译参考。') : '选中的内容里没有可以作为翻译参考的正文块（公式、表格/图、不翻译的块不行）。', 'warning'); } catch (e) {}
+            // v2 Pass P239：只有「选区里一块能固定的都没有」才报这条（公式 / 表格 / 正文都能固定，不能的只有标题、参考文献、空块、过长的块）。
+            try { showToast(tooLong ? ('选中的块太长（超过 ' + OVL_P233_PIN_SRC_MAX + ' 字符），不能作为翻译参考。') : '选中的区域里没有可以作为翻译参考的块（标题、参考文献和空白块不能固定；正文、公式和表格可以）。', 'warning'); } catch (e) {}
             return;
         }
         let list = ovlP233PinsGet();
@@ -42739,12 +42844,16 @@ function ovlP233PinsClearAll() {
     });
 }
 function ovlP233Squeeze(s) { return String(s == null ? '' : s).replace(/\s*\n\s*/g, ' ').replace(/[ \t]{2,}/g, ' ').trim(); }
-// 翻译参考 -> 只读上下文片段：{ text, zh:[...], matchText, trimmed } 或 null。
-// excludeSrcs = 本次正在翻译的块的源码（自己不当自己的参考）。总量 <= OVL_P233_PIN_CAP_CHARS（原文 + 译文），最新的优先、最早的先丢。
+// 翻译参考 -> 只读上下文片段：{ text, zh:[...], fm:[...], matchText, trimmed } 或 null。
+// excludeSrcs = 本次正在翻译的块的源码（自己不当自己的参考）。总量 <= ovlP239PinBudget()（设置，默认 3000 字；正文对 = 原文 + 译文，公式类 = 去掉 \label/注释后的 LaTeX），
+// 最新的优先、最早的先丢；带出去的各部分里仍按用户固定的先后顺序排。
+// v2 Pass P239：有译文的正文照旧是 en→zh 对（【参考对照】，格式与 P233 逐字一致）；公式 / 表格 / 纯数学块没有译文，单独放进【参考公式/符号】（LaTeX 原文）。
+// zh = 对照对里的中文译文（串味守卫的逐字重合依据）；fm = 公式类 LaTeX 去掉空白后的串（公式泄漏守卫依据，见 ovlP239LeakCheck）。
 function ovlP233PinsContext(cfg, excludeSrcs, newZh) {
     try {
         const pins = ovlP233PinsGet();
         if (!pins.length) return null;
+        const cap = ovlP239PinBudget();
         const ex = new Set(excludeSrcs || []);
         const kept = [];
         let total = 0, trimmed = 0, full = false;
@@ -42753,31 +42862,59 @@ function ovlP233PinsContext(cfg, excludeSrcs, newZh) {
             for (let i = pins.length - 1; i >= 0; i--) {
                 const p = pins[i];
                 if (ex.has(p.src)) continue;
-                const zh = zhOf(p.src);
-                if (!zh) continue; // 还没有译文的参考没有对照可给
-                const s1 = ovlP233Squeeze(p.src), z1 = ovlP233Squeeze(zh);
-                const len = s1.length + z1.length;
-                if (full || len > OVL_P233_PIN_CAP_CHARS) { trimmed++; continue; }
-                if (total + len > OVL_P233_PIN_CAP_CHARS) { full = true; trimmed++; continue; }
-                total += len;
-                kept.unshift({ src: s1, zh: z1, zhFull: zh, srcRaw: p.src });
+                const cls = ovlP239PinClass(p.src);
+                if (!cls) continue;
+                let item;
+                if (cls === 'formula') {
+                    const tex = ovlP239TrimLatex(p.src);
+                    if (!tex) continue;
+                    item = { kind: 'f', tex: tex, len: tex.length, srcRaw: p.src };
+                } else {
+                    const zh = zhOf(p.src);
+                    if (!zh) continue; // 还没有译文的正文参考没有对照可给
+                    const s1 = ovlP233Squeeze(p.src), z1 = ovlP233Squeeze(zh);
+                    item = { kind: 'p', src: s1, zh: z1, zhFull: zh, srcRaw: p.src, len: s1.length + z1.length };
+                }
+                if (full || item.len > cap) { trimmed++; continue; }
+                if (total + item.len > cap) { full = true; trimmed++; continue; }
+                total += item.len;
+                kept.unshift(item);
             }
         }
-        if (!kept.length) return null;
+        // 超上限提示：同一组 pins + 同一个上限只弹一次（签名里带上限，调了设置会重新提示）。一条参考就比整个上限还长、于是一条都没带出去时也要说，
+        // 否则用户固定了一张大符号表却什么都没发生，也不知道该去调设置。
+        const notify = function () {
+            if (!(trimmed > 0)) return;
+            const sig = pins.length + ':' + trimmed + ':' + kept.length + ':' + cap + ':' + (pins[pins.length - 1].ts || 0);
+            if (sig === OvlP233PinNotified) return;
+            OvlP233PinNotified = sig;
+            try {
+                showToast('翻译参考超过 ' + cap + ' 字的上限：' + (kept.length
+                    ? ('本次请求只带了最近的 ' + kept.length + ' 条，较早的 ' + trimmed + ' 条被省略')
+                    : ('本次请求没有带任何翻译参考（' + trimmed + ' 条都被省略）')) + '（可在设置里调大「翻译参考总长度上限」）。', 'info');
+            } catch (e) {}
+        };
+        if (!kept.length) { notify(); return null; }
+        const pairs = kept.filter(function (k) { return k.kind === 'p'; });
+        const forms = kept.filter(function (k) { return k.kind === 'f'; });
         const lines = [];
-        lines.push('【参考对照】下面是用户指定的「翻译参考」：同一篇论文里已经确认的英文原文与中文译文对照，只用来让你的术语、措辞和风格与之保持一致。它们不是待翻译的内容：不要翻译它们、不要复述它们、不要把其中任何文字写进你的译文。');
-        kept.forEach(function (k, i) {
-            lines.push('参考' + (i + 1) + ' 原文：' + k.src);
-            lines.push('参考' + (i + 1) + ' 译文：' + k.zh);
-        });
-        if (trimmed > 0) {
-            const sig = pins.length + ':' + trimmed + ':' + kept.length + ':' + (pins[pins.length - 1].ts || 0);
-            if (sig !== OvlP233PinNotified) {
-                OvlP233PinNotified = sig;
-                try { showToast('翻译参考超过 ' + OVL_P233_PIN_CAP_CHARS + ' 字的上限：本次请求只带了最近的 ' + kept.length + ' 条，较早的 ' + trimmed + ' 条被省略。', 'info'); } catch (e) {}
-            }
+        if (pairs.length) {
+            lines.push('【参考对照】下面是用户指定的「翻译参考」：同一篇论文里已经确认的英文原文与中文译文对照，只用来让你的术语、措辞和风格与之保持一致。它们不是待翻译的内容：不要翻译它们、不要复述它们、不要把其中任何文字写进你的译文。');
+            pairs.forEach(function (k, i) {
+                lines.push('参考' + (i + 1) + ' 原文：' + k.src);
+                lines.push('参考' + (i + 1) + ' 译文：' + k.zh);
+            });
         }
-        return { text: lines.join('\n'), zh: kept.map(function (k) { return k.zhFull; }), matchText: kept.map(function (k) { return k.srcRaw; }).join('\n'), trimmed: trimmed };
+        if (forms.length) {
+            lines.push('【参考公式/符号】（LaTeX 原文，只用于理解符号含义与术语，不要翻译、不要复述、不要抄进译文。待译文本里属于它们的公式已经被 [[数字]] 之类的占位符替换，占位符照常原样保留即可）');
+            forms.forEach(function (k, i) {
+                lines.push('参考公式' + (i + 1) + '：');
+                lines.push(k.tex);
+            });
+        }
+        notify();
+        return { text: lines.join('\n'), zh: pairs.map(function (k) { return k.zhFull; }), fm: forms.map(function (k) { return ovlP239Compact(k.tex); }),
+            matchText: kept.map(function (k) { return k.kind === 'f' ? k.tex : k.srcRaw; }).join('\n'), trimmed: trimmed };
     } catch (e) { return null; }
 }
 // 统一的上下文出口：邻居译文 + 章节标题（o.neighbours 为真时）与翻译参考（始终）合并；两者都没有 => null（请求体与 P233 之前逐字节一致）。
@@ -42787,8 +42924,8 @@ function ovlP233Ctx(o) {
     const pins = ovlP233PinsContext(o.cfg, o.excludeSrcs, o.newZh);
     if (!base && !pins) return null;
     if (!pins) return base;
-    if (!base) return { text: pins.text, zh: pins.zh, matchText: pins.matchText };
-    return { text: base.text + '\n\n' + pins.text, zh: base.zh.concat(pins.zh), matchText: base.matchText + '\n' + pins.matchText };
+    if (!base) return { text: pins.text, zh: pins.zh, fm: pins.fm, matchText: pins.matchText };
+    return { text: base.text + '\n\n' + pins.text, zh: base.zh.concat(pins.zh), fm: pins.fm, matchText: base.matchText + '\n' + pins.matchText };
 }
 // 单块请求的第 5 参数（opts）：无上下文可给时原样返回 opts（调用形状与 P233 之前完全一样）。
 function ovlP233SingleOpts(el, cfg, opts, src, noNeighbours) {
@@ -62529,6 +62666,7 @@ const OVL_SETTINGS_DEFAULTS = {
     visualTransModel: '',       // P4 消费：''=跟随翻译器当前选中的模型
     visualTransConcurrency: 'auto', // v2 Pass P230：Visual 中文翻译同时在飞的请求数。'auto'=本地模型跟随 LM Studio 的 parallel（读不到/在线模型=3）；整数 1–16=手动
     visualAutoContext: true,    // v2 Pass P233：翻译时自动联系上下文（同一段落连续行合成一次请求 + 单块翻译带前后已有译文/章节标题）。false=请求内容与 P233 之前逐字节一致
+    visualPinBudget: 3000,      // v2 Pass P239：「翻译参考总长度上限」——一次请求里翻译参考（对照对 + 公式 LaTeX）的字数上限，只认 1500 | 3000 | 6000 | 12000，其它值按 3000 处理
     visualRetranslateModel: '', // v2 Pass P223：块「重译」旁下拉的上次选择，'provider::model'，''=跟随当前模型
     visualRetranslateThinking: '', // v2 Pass P237：「重译/重试/重译选中 N 块」旁「思考」下拉的上次选择（UI 词表 off/on/low/medium/xhigh），''=跟随设置；三处共用，随 ovl.settings 同步
     ovlVisualLineBreaks: true,  // Visual 断行 Pass 消费：true=按源码行切细渲染，false=退回整段渲染
@@ -63176,7 +63314,11 @@ function ovlSettingsTranslatorHtml() {
         '开着时，同一段落里连续的几行会合成一次请求翻译、单独翻一块时也参考前后已有的中文译文和章节标题，让术语和语气前后一致；选中多块后工具条里的「重译选中 N 块（联系上下文）」和「翻译参考」（把选中的块固定为原文+译文对照，之后本项目每次翻译都会带上）不受这个开关影响；关掉后其余翻译请求与以前逐字节一致。');
     // v2 Pass P233：翻译参考没有逐条的列表界面（块上只有安静的左缘标记），这里给一个总的清空入口（见 ovlP233PinsClearAll）。
     html += ovlSetRow('翻译参考', '<button type="button" class="ovl-modal-btn" id="ovlP233PinsClearBtn"' + (ovlP233PinsGet().length ? '' : ' disabled') + ' onclick="ovlP233PinsClearAll()">' + escapeHtml(ovlP233PinsClearLabel()) + '</button>',
-        '在 Visual 工具条里勾选「翻译参考」的块，会按原文+译文对照附在本项目之后的每个翻译请求里。块上的标记可以逐个取消；这里一次清空当前项目的全部翻译参考（例如原文被改过、旧参考已经没有对应的块时）。');
+        '在 Visual 工具条里勾选「翻译参考」的块（正文、独立公式、表格都可以），正文会按原文+译文对照、公式和表格会按 LaTeX 原文（只用来理解符号含义）附在本项目之后的每个翻译请求里。块上的标记可以逐个取消；这里一次清空当前项目的全部翻译参考（例如原文被改过、旧参考已经没有对应的块时）。');
+    // v2 Pass P239：翻译参考总长度上限。走通用 data-setpath（change 委托里按数字存、只存盘不重渲 Visual）。
+    html += ovlSetRow('翻译参考总长度上限', '<select data-setpath="settings.visualPinBudget">'
+        + OVL_P239_PIN_BUDGETS.map(function (n) { return ovlOptTag(n, n + ' 字', ovlP239PinBudget()); }).join('') + '</select>',
+        '每次翻译请求最多附带多少字的翻译参考（正文对照的原文+译文、公式表格的 LaTeX 原文合计）。超过时最早固定的先被省略，并弹出提示。公式、符号表较长时可以调大；调大会让每个请求变长、变慢。');
     // v2 Pass P197（A）：领域提示只影响本地模型（LM Studio）路径的 prompt 内容，不改变
     // 任何 UI 控件的 data-setpath 通用绑定套路——因为这条不是全局设置，是按项目持久化的
     // （跟项目术语表一样用单独的 localStorage 映射表），所以走专用的 onchange 处理函数，
@@ -63596,7 +63738,7 @@ function ovlBindSettingsModal() {
         let val = el.type === 'checkbox' ? el.checked : el.value;
         if (path === 'settings.fontSize' || path === 'settings.tabSize' || path === 'settings.overleafAutoPullMinutes'
             || path === 'settings.pdf2texConcurrency' || path === 'settings.pdf2texMaxPx'
-            || path === 'settings.ovlHighlightExpirySec' || path === 'settings.ovlTransMaxChars') val = Number(val);
+            || path === 'settings.ovlHighlightExpirySec' || path === 'settings.ovlTransMaxChars' || path === 'settings.visualPinBudget') val = Number(val);
         if (path === 'settings.visualTransConcurrency') val = (val === 'auto') ? 'auto' : Number(val); // v2 Pass P230
         // v2 Pass P133d（T0 追加）：桥令牌走统一归一化（见 ovlBridgeTokenNormalize 上方注释）——
         // 去掉换行/制表符 + 首尾空白后再落盘；字符集不合法（把终端提示符/路径一起粘进来了）时
@@ -63633,6 +63775,7 @@ function ovlBindSettingsModal() {
         // v2 Pass P230：并发数只影响翻译队列，不需要 ovlApplySettings（它在 Visual 模式下会整篇重渲，正在飞的块会被重复翻译）。
         if (path === 'settings.visualTransConcurrency') { ovlSaveSettings(); ovlVisualLangConcurrencyChanged(); return; }
         if (path === 'settings.visualAutoContext') { ovlSaveSettings(); return; } // v2 Pass P233：只影响之后发出的请求，不需要 ovlApplySettings（Visual 下会整篇重渲）；不动缓存
+        if (path === 'settings.visualPinBudget') { OvlP233PinNotified = ''; ovlSaveSettings(); return; } // v2 Pass P239：同上；上限换了，之前「已提示过」的截断提示作废
         if (parts[0] === 'compile') { ovlSaveCompileSettings(); ovlUpdatePdfToolbarUI(); }
         else { ovlSaveSettings(); ovlApplySettings(); }
     });
@@ -71972,7 +72115,7 @@ const OVL_SYNC_SECRET_SETTING_FIELDS = ['overleafToken', 'ovlAiMergeApiKey', 'pd
 const OVL_SYNC_SETTING_FIELDS = [
     'fontSize', 'fontFamily', 'lineHeight', 'editorTheme', 'showLineNumbers', 'tabSize', 'autoCloseBrackets',
     'nonBlinkingCursor', 'quickActions', 'breadcrumbs', 'equationPreview', 'spellcheck', 'spellLang',
-    'transSimpleMode', 'visualTranslate', 'visualTransModel', 'visualTransConcurrency', 'visualAutoContext', 'visualRetranslateModel', 'visualRetranslateThinking', 'ovlVisualLineBreaks', 'ovlVisualOutlineSelection',
+    'transSimpleMode', 'visualTranslate', 'visualTransModel', 'visualTransConcurrency', 'visualAutoContext', 'visualPinBudget', 'visualRetranslateModel', 'visualRetranslateThinking', 'ovlVisualLineBreaks', 'ovlVisualOutlineSelection',
     'ovlVisualBtrConfirmFirst', 'overleafAutoPullMinutes', 'ovlRestoreLastProject', 'ovlAiMergeEndpoint',
     'ovlAiMergeModel', 'pdf2texDefaultOutDir', 'pdf2texVisionEndpoint', 'pdf2texVisionModel', 'pdf2texConcurrency',
     'pdf2texDisableThinking', 'pdf2texMaxPx', 'pdf2texSavePageImages', 'pdf2texAutoOpenResult',
