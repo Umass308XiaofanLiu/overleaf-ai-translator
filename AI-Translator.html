@@ -5077,7 +5077,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.53.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.53.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -42978,8 +42978,12 @@ async function ovlP233RetransAllGroup(st, jobsIn, cfg, fixedProjectId, mySeq, ca
         for (let c = 0; c < chunks.length; c++) {
             if (!live()) break;
             const chunk = chunks[c];
+            // v2 INT-A（P233 评审遗留 a）：每个 chunk 用自己的失败态——env 是整个段落单元共用的，env.fatal 一旦被前一个 chunk 的传输类失败置上就再没人清：
+            // 后面的 chunk（尤其是只剩 1 块的尾巴）会跳过逐块阶梯、一个请求都不发就判失败，而且那条过期的 failReason 还会被当成本 chunk 的失败计入 3 次熔断。
+            // 派生一个只覆盖 fatal 的浅拷贝：其余字段（makeCtx / canLand / newZh / signal ...）仍是同一份，落地与上下文查询不受影响。
+            const chunkEnv = Object.assign({}, env, { fatal: '' });
             try {
-                await ovlP233RunGroup(env, chunk);
+                await ovlP233RunGroup(chunkEnv, chunk);
             } catch (err) {
                 if (err && err.name === 'AbortError') { landPaid(chunk); return; } // 停止 / 切走时组里前几轮已成功的段照样入缓存
                 if (!live()) { landPaid(chunk); return; }
