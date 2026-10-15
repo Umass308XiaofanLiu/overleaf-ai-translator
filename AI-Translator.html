@@ -5077,7 +5077,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.53.01';        // APP_VERSION_STAMP
+const APP_VERSION = '03.53.02';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -42824,7 +42824,9 @@ function ovlP233ParaBlocks(el) {
 }
 // 队列：取出 el（队列头）所在段落里、含 el 的那一段连续「待翻 + 可联合」的块，按 12 块 / 4000 字符切组，返回含 el 的那一组（>= 2 块）；
 // 取不到返回 null（el 走原来的单块路径）。成功时同步把这一组的块从 pending 改成 inflight（跟 worker 领块同一手法，中间没有 await）。
-function ovlP233QueueTake(el, cfg) {
+// v2 INT-A（P233 评审遗留 b）：singleSrcs = 本批次里「联合请求遇到过传输类失败」的块的源码文本集合，这些块本批次剩余时间一律走逐块单请求
+// （带只读上下文），不再并进联合组——否则块还回待翻队列后，下一圈 worker 会把同一组原样再联合一次，直到熔断。按源码文本记（页面重渲染换了 DOM 节点也认得）。
+function ovlP233QueueTake(el, cfg, singleSrcs) {
     try {
         const run = ovlP233ParaBlocks(el);
         if (run.length < 2) return null;
@@ -42832,6 +42834,7 @@ function ovlP233QueueTake(el, cfg) {
         const cls = run.map(function (b, i) {
             const s = srcs[i];
             if (b.getAttribute('data-ovl-trans-pending') !== '1' || s == null || !s.trim() || OVL_P233_PARA_STOP_RE.test(s) || ovlP233HeadingTitle(s) !== null) return { why: 'x' };
+            if (singleSrcs && singleSrcs.has(s)) return { why: 'x' };
             return ovlP233ClassifyBlock(b, s);
         });
         const i0 = run.indexOf(el);
@@ -42863,7 +42866,7 @@ function ovlP233QueueTake(el, cfg) {
 // 把一组队列块译完并落地。返回 { ok, fail, fatal, aborted }：aborted = 被取消 / 批次已失效（块已还回待翻队列，调用方退出 worker）。
 async function ovlP233QueueRunGroup(g, cfg, signal, mySeq, fixedProjectId) {
     const st = g.st, jobs = g.jobs;
-    const res = { ok: 0, fail: 0, fatal: '', aborted: false };
+    const res = { ok: 0, fail: 0, fatal: '', aborted: false, retrySingleSrcs: [] }; // retrySingleSrcs：因传输类失败还回待翻的块的源码文本（调用方此后让它们走逐块单请求）
     const restore = function () {
         st.taken.forEach(function (b) {
             b.removeAttribute('data-ovl-trans-inflight');
@@ -42899,6 +42902,7 @@ async function ovlP233QueueRunGroup(g, cfg, signal, mySeq, fixedProjectId) {
         // 留在待翻队列里（由下面 restore 还回），由熔断计数决定何时停队列；其余失败（回显守卫、切分失败等）照常落成可见失败态。
         const fr = job.result && job.result.meta && job.result.meta.failReason;
         if (!(env.fatal && fr === env.fatal)) ovlP233FailJob(st, env, job);
+        else res.retrySingleSrcs.push(job.src);
     });
     restore(); // 还没落地的（服务级失败 / canLand 为假）一律还回待翻，不留幽灵「处理中」块
     res.fatal = env.fatal;
@@ -45670,6 +45674,7 @@ async function ovlVisualLangRunQueue() {
     // 失败，说明后面的块只会白白再失败一遍：停止本次运行（剩余块保持待翻，进度行显示"已暂停，点此继续"），
     // 只弹一条中文提示点名原因。任何一个块成功，或者出现非传输类失败（模型答得不对），计数清零。
     let fatalStreak = 0, fatalTripped = false, fatalLastReason = '';
+    const p233SingleSrcs = new Set(); // v2 INT-A（P233 评审遗留 b）：本批次里联合请求遇到传输类失败的块，此后改走逐块单请求（见 ovlP233QueueTake）
     // v2 Pass P230：并发控制句柄。active = 活着的 worker 数；target() = 现在应该有几个（手动值优先，auto 用批次开始时解析的值）。
     const workers = [];
     const ctx = { seq: mySeq, cfg: cfg, active: 0, autoN: null, autoPending: false, started: false, stopped: false };
@@ -45731,10 +45736,12 @@ async function ovlVisualLangRunQueue() {
             // v2 Pass P233（Stage B）：自动联系上下文开着，且 el 所在段落里连着几行都待翻 -> 合成一次联合请求
             // （<=12 块 / <=4000 字符；整组失败逐级回退到缩小重试 -> 逐块阶梯），每块仍按自己的 key 入缓存、各自 failLog / 角标。
             if (ovlP233AutoOn()) {
-                const grp = ovlP233QueueTake(el, cfg);
+                const grp = ovlP233QueueTake(el, cfg, p233SingleSrcs);
                 if (grp) {
                     const gres = await ovlP233QueueRunGroup(grp, cfg, controller.signal, mySeq, fixedProjectId);
                     if (gres.aborted) return;
+                    // 联合组一次传输类失败（429/5xx/断网/超时/硬错误）：这些块还回了待翻队列，别让下一圈把同一个联合请求原样再发一遍——此后逐块发。
+                    if (gres.fatal && ovlVisualTransIsTransportFatal(gres.fatal) && gres.retrySingleSrcs) gres.retrySingleSrcs.forEach(function (x) { p233SingleSrcs.add(x); });
                     p233NoteGroup(gres);
                     ovlVisualLangProgressUpdate();
                     continue;
