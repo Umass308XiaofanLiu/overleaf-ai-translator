@@ -5057,7 +5057,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.50.03';        // APP_VERSION_STAMP
+const APP_VERSION = '03.50.04';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -44813,7 +44813,9 @@ async function ovlVisualRetransAllRun(items, cfg) {
             showToast(msg, kind);
         } catch (e) {}
         // v2 Pass P232b（3d）：本动作进行中队列不启动；期间重渲染出来的待翻块在这里交给队列接手。
-        try { ovlVisualLangSyncAfterRender(); } catch (e) {}
+        // 评审：只在还停留在 Visual 时才交接——用户中途切到 Code 会让本动作被叫停（P38：离开 Visual 即取消后台翻译），这时起队列会在 Code 模式下偷偷翻译。
+        // 切回 Visual 的整篇重渲染（ovlVisualRender 末尾的 SyncAfterRender）自会接手待翻块；不能用 seq 做条件，否则 original -> zh 快速来回会让待翻块卡住。
+        if (OvlState.editorMode === 'visual') { try { ovlVisualLangSyncAfterRender(); } catch (e) {} }
         try { ovlVisualModelNoticeRefresh(); } catch (e) {}
     }
 }
@@ -44864,7 +44866,10 @@ function ovlVisualModelNoticeRefresh() {
         if (inMode) {
             const tag = ovlVisualMainModelTag();
             if (tag !== OvlP232NoticeTag) { OvlP232NoticeTag = tag; OvlP232NoticeDismissed = false; } // 主模型变了：之前的「关闭」作废
-            if (tag && !OvlP232NoticeDismissed && !OvlVisualLangState.running && !OvlP232RetransAll) {
+            // v2 Pass P232b（评审）：批量队列 / 整篇重译进行中冻结这一行——既不显示也不隐藏、也不重数，收工那一次刷新（队列 finally / 整篇重译 finally 都会调进度刷新）再重数。
+            // 这一行是工具条下面独立的一行（占 ~24px 高度）：原来「运行中隐藏、收工再显示」会让整个 Visual 内容在每次队列运行（>= 2 个待翻块）里先上移再下移一次。
+            if (OvlVisualLangState.running || OvlP232RetransAll) return;
+            if (tag && !OvlP232NoticeDismissed) {
                 if (OvlP232MarkedFor !== tag) { ovlVisualModelRemarkDisplayed(); OvlP232MarkedFor = tag; }
                 const marked = pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-model]');
                 let n = 0;
@@ -44873,6 +44878,8 @@ function ovlVisualModelNoticeRefresh() {
                     const el = marked[i];
                     const t = el.getAttribute('data-ovl-trans-model');
                     if (!t || !ovlVisualModelDiffers(t)) continue;
+                    // 有意跟菜单 / 确认框的计数口径不同（评审 minor 6，保留）：提示数的是「页面上现在显示着多少块别的模型的译文」，所以正在单块重试 / 重译里的块仍然算（它们现在显示的确实是旧模型的译文）；
+                    // 菜单 / 确认框数的是「这个动作会重译多少块」，忙着的块动不了所以不算。两者只在有单块动作在飞的那几秒里差几块，收工后一致。
                     if (el.hasAttribute('data-ovl-trans-failed') || el.hasAttribute('data-ovl-trans-skipped') || el.hasAttribute('data-ovl-trans-forced')) continue;
                     n++;
                     by[t] = (by[t] || 0) + 1;
@@ -44895,6 +44902,14 @@ function ovlVisualModelNoticeRefresh() {
     } else if (!box.hasAttribute('hidden')) {
         box.setAttribute('hidden', '');
     }
+}
+// 提示里的动作：整篇重译进行中提示被冻结着（见 ovlVisualModelNoticeRefresh），这时点它不能走菜单项的「再点一次 = 停止」语义——停止只在进度行 / 菜单项里，这里只提示一句。
+function ovlVisualModelNoticeActClick() {
+    if (OvlP232RetransAll) {
+        try { showToast('正在用当前模型重译全文；要停止请点上面的进度行。', 'info'); } catch (e) {}
+        return;
+    }
+    ovlVisualRetransAllMenuClick();
 }
 function ovlVisualModelNoticeDismiss() {
     OvlP232NoticeTag = ovlVisualMainModelTag();
@@ -44971,8 +44986,8 @@ function ovlBindVisualLangMenu() {
     // v2 Pass P232b：「N 块译文来自别的模型」那行提示——点「用当前模型重译全文」走跟菜单项同一条确认流程；× 在本次页面会话里对当前主模型关掉它。
     const noticeAct = document.getElementById('ovlVisualModelNoticeAct');
     if (noticeAct) {
-        noticeAct.addEventListener('click', function (e) { e.stopPropagation(); ovlVisualRetransAllMenuClick(); });
-        noticeAct.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); ovlVisualRetransAllMenuClick(); } });
+        noticeAct.addEventListener('click', function (e) { e.stopPropagation(); ovlVisualModelNoticeActClick(); });
+        noticeAct.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); ovlVisualModelNoticeActClick(); } });
     }
     const noticeX = document.getElementById('ovlVisualModelNoticeX');
     if (noticeX) noticeX.addEventListener('click', function (e) { e.stopPropagation(); ovlVisualModelNoticeDismiss(); });
