@@ -3815,6 +3815,16 @@ body.ovl-translator-open #ovlTransWin { display: block; }
 .ovl-quickactions .ovl-qa-focus:hover { background: #2F3A4C; }
 .ovl-quickactions .ovl-qa-focus.is-on { background: #3A2E10; color: #FBBF24; }
 .ovl-quickactions .ovl-qa-focus input { margin: 0; accent-color: #FBBF24; }
+/* v2 Pass P233：「翻译参考」状态开关（仅 Visual 来源且没关「选中即译」时出现）；已固定的块在左缘有一条安静的蓝色细线（不是「关注」的黄色，不占布局空间）。 */
+.ovl-quickactions .ovl-qa-pin {
+    display: none; align-items: center; gap: 4px; height: 26px; padding: 0 7px;
+    margin-left: 2px; border-radius: 4px; color: #E7E9EE; font-size: 11px; cursor: pointer; user-select: none;
+}
+.ovl-quickactions.ovl-qa-src-visual:not(.ovl-qa-notranslate) .ovl-qa-pin { display: flex; }
+.ovl-quickactions .ovl-qa-pin:hover { background: #2F3A4C; }
+.ovl-quickactions .ovl-qa-pin.is-on { background: #16304A; color: #7DB8F5; }
+.ovl-quickactions .ovl-qa-pin input { margin: 0; accent-color: #60A5FA; }
+.ovl-visual-block[data-ovl-pin="1"] { box-shadow: inset 3px 0 0 rgba(96, 165, 250, 0.55); }
 /* v2 Pass P22：「复制」标签是两个汉字，通用的 26px 定宽按钮（给单字 替/简/语/译 设计的）
    会挤得很紧——单独放宽到 auto 宽度 + 固定内边距，跟 .ovl-qa-focus 的字号一致。 */
 .ovl-quickactions button[data-qa="word.copysrc"] {
@@ -5057,8 +5067,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.50.06';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-10-14';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.51.03';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-10-15';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -34888,6 +34898,14 @@ function ovlPortalHtml() {
         +     '<input type="checkbox" onclick="event.stopPropagation();focusToggleOvlSelection(this);">'
         +     '<span>关注</span>'
         +   '</label>'
+        // v2 Pass P233（Stage B）：「翻译参考」——同样是状态开关（不是动作，点了不关弹窗），但与「关注」是两回事：
+        // 「关注」给聊天助手用，「翻译参考」把选中的块固定成 Visual 翻译请求里的原文+译文对照。不带 data-qa / data-focus-cb。
+        +   '<label class="ovl-qa-pin" id="ovlQaPin"'
+        +     ' data-tip="' + escapeAttr('固定为翻译参考：本项目里之后每次 Visual 翻译请求都会附上选中块的原文与现有译文对照，让术语和风格保持一致（再点一次取消）') + '" data-tip-pos="top"'
+        +     ' onclick="event.stopPropagation();">'
+        +     '<input type="checkbox" onclick="event.stopPropagation();ovlP233PinToggle(this);">'
+        +     '<span>翻译参考</span>'
+        +   '</label>'
         // v2 Pass P22：「关注」右侧新增「复制」——把当前选区（Code/Visual 都行）对应的
         // LaTeX 原文复制到剪贴板。只读、不改正文，走 data-qa 委托即可，不需要单独绑事件。
         +   '<button type="button" data-qa="word.copysrc" data-tip="复制 LaTeX 原文" data-tip-pos="top">复制</button>'
@@ -34916,6 +34934,8 @@ function ovlPortalHtml() {
         // ovlBindQaVisualState 放在一起）。同样走独立的 data-qar 属性，不落进
         // qa.addEventListener('click', ...) 那条无条件关弹窗的委托匹配范围。
         +   '<div class="ovl-qa-state" id="ovlQaRetranslate" hidden></div>'
+        // v2 Pass P233：联合重译盒（选区覆盖 >=2 块时出现：「重译选中 N 块（联系上下文）」+ 模型下拉），独立 data-qaj 委托，点了不关弹窗。
+        +   '<div class="ovl-qa-state" id="ovlQaJoint" hidden></div>'
         + '</div>'
         // M7 Editor「Equation preview」：光标落在 $...$ 里时用既有 KaTeX 渲染一个悬浮预览。
         + '<div class="ovl-eqpreview" id="ovlEqPreview"></div>'
@@ -39897,7 +39917,8 @@ function ovlP232KeyProviderModel(key) {
     return m ? { provider: m[1], model: m[2] } : null;
 }
 // 返回 { hit, key, model } 或 null。hit 是桶里那个条目对象本身（跟正常命中一样，后面由 GetMeta 刷新 ts）。
-function ovlVisualTransCacheFallbackLookup(text, ownKey, map, projectId) {
+// readOnly（v2 Pass P233，只给翻译上下文的只读查询用）：判据与 GateCheck 相同，但不盖章、不删条目、不存桶（GateCheck 在作用域外会整桶落盘）；缺省 = 原行为。
+function ovlVisualTransCacheFallbackLookup(text, ownKey, map, projectId, readOnly) {
     const p = ownKey.indexOf('|');
     if (p <= 0) return null;
     const set = ovlP232IndexFor(map).get(ownKey.slice(0, p));
@@ -39921,8 +39942,14 @@ function ovlVisualTransCacheFallbackLookup(text, ownKey, map, projectId) {
         if (again !== k) continue; // 上下文（卡片/命中术语/领域提示）变了：这条回退作废
         let hit = map[k];
         if (!hit || typeof hit.tgt !== 'string') continue;
-        hit = ovlVisualTransCacheGateCheck(text, hit, map, k, projectId);
-        if (!hit) { ovlP232IndexRemove(map, k); continue; }
+        if (readOnly) {
+            let okGate = hit.gateVersion === OVL_VISUAL_CJK_GATE_VERSION || !!(hit.skipped || hit.forced);
+            if (!okGate) okGate = (typeof ovlVisualCjkGateEval === 'function') ? !!ovlVisualCjkGateEval(text, hit.tgt).ok : true;
+            if (!okGate) continue; // 没过闸的回退条目这里只是不用它；真正的清理留给显示路径
+        } else {
+            hit = ovlVisualTransCacheGateCheck(text, hit, map, k, projectId);
+            if (!hit) { ovlP232IndexRemove(map, k); continue; }
+        }
         const model = (typeof hit.model === 'string' && hit.model) ? hit.model : (pm.provider + '/' + pm.model);
         return { hit: hit, key: k, model: model };
     }
@@ -40892,44 +40919,16 @@ async function ovlVisualTranslateTextProseFragment(prose, config, signal, outMet
     return result;
 }
 
-// ---- 单块翻译：代码层掩码 -> 公式/引用层掩码 -> 调模型 -> 两层各自校验 -> 两层各自还原 ----
-// 契约：纯公式/纯代码块（两层掩码后没有可翻的字）原样返回，不占请求，这是本函数内**唯一**
-// 会把"没有真正翻译"当成功返回的路径（meta.skipped=true，见下）。除此之外的任何失败——
-// 回显守卫拦截、xportBlockOk 完整性校验不过、ovlVisualCodeCheck 哨兵校验不过——一律 throw
-// （调用方 ovlVisualLangRunQueue / chatAgentExecRetranslateBlock / ovlVisualBlockRetryClick
-// 统一标记这一块失败、不写入缓存、给出可见重试角标，用户能看见失败态、可以重试，不阻塞
-// 其它块）。
-// v2 Pass P113 返修（核验 p113_verify.md 问题3，阻断回归）：ovlVisualCodeCheck 这一支原来
-// 是"不 throw，回退返回原文并 console.warn"——本意是"当作没翻译过"，但调用方（worker/
-// 重译入口）并不知道这层区别，实际效果是把原样返回的英文当"翻译成功"落地：innerHTML 换成
-// 英文、ovlVisualTransCachePut 把英文永久写进缓存，跟真正的豁免路径（meta.skipped）在
-// DOM/进度/缓存上完全看不出区别（实测：adv.js MARKALGOC，stub 丢掉一个 OVLCODE 哨兵，
-// 新旧构建都 failed=false/skipped=null，缓存里存的就是英文原文）。真实小模型漏掉/改动
-// 〔〔OVLCODEk〕〕哨兵是常见事件——这是本函数曾经存在但没有被上面这段文档承认过的"第二条
-// 静默返回英文的路径"，现在跟 xportBlockOk 一样直接 throw，不再有例外。
-// v2 Pass P113（诊断机制①）：新增可选的第 4 个参数 meta——调用方（懒翻译队列 worker /
-// 块级强制重译入口）传一个空对象进来，函数会在"两层掩码后没有可翻的字"这条唯一合法的
-// 豁免路径上把 meta.skipped 置为 true 再返回。不传 meta（已有的三参数调用点，比如
-// test_p38/p39/p81/p103 里直接调用这个函数做纯函数断言）行为逐字节不变——这条豁免以前
-// 完全隐性：返回值和"翻译成功"长得一模一样，进度计数、缓存、DOM 上都看不出这块其实没有
-// 被模型翻译过。现在通过这个显式信号，调用方可以据此打 data-ovl-trans-skipped 属性，
-// 供进度提示如实报告"K 个块跳过（纯公式/代码）"，不再跟"真正翻译成功"混为一谈。选块的
-// 逻辑本身（ovlVisualLangCollectPending）不按块类型过滤，table/algorithm/figure/数学
-// 环境全部一样正常入队；两层掩码后一个字都不剩，本来就没有自然语言可译，现在才是本函数内
-// 真正唯一一条"返回值等于原文但算作成功"的路径——v2 Pass P113c 起，这条路径额外要求块里
-// 也没有抽出任何 \text{} 散文（见 meta.textProseHandled/meta.partialTextProse：块里有
-// \text{} 散文时，即使主体（数学/代码）本身两层掩码后没有可翻的字，也不再算"跳过"，见下）。
-// v2 Pass P122：新增第 5 个形参 opts（可选，纯追加——跟 P113 给 meta 加第 4 个形参、跟
-// callLocalLLM 给 opts 加第 7 个形参同一条纪律）。不传 opts（现有单测 test_p38/p39/p81/
-// p103/p113 的 3/4 参数调用点）逐字节不受影响。opts.correction——重试阶梯 L2 用来追加"上一次
-// 错在哪、这次必须怎样"的纠正段；opts.temperature/opts.maxTokens——透传给 callModelPlainText
-// ->callLocalLLM（本地 provider 才生效，见下）。
-async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
-    // v2 Pass P108：翻译也是一次"实质操作"，标记当前项目为最近（去抖，不影响本函数的返回
-    // 值/时序——发生在真正开始翻译逻辑之前，纯 fire-and-forget）。
-    if (typeof ovlProjectHistoryTouchCurrent === 'function') { try { ovlProjectHistoryTouchCurrent(); } catch (e) {} }
+// ==================== v2 Pass P233：单块翻译拆成 准备 / 调模型 / 校验解遮罩 三段 ====================
+// 目的：联合重译（ovlVisualJoint*，一次请求翻译选中的多个块）要对【每个块】各做一份跟单块完全相同的掩码，
+// 把各块的遮罩文本拼进一次请求，回来后按块拆开，再用【该块自己的】掩码表做同一套校验与解遮罩。
+// 下面四个函数的语句、判据、注释都是从 ovlVisualTranslateBlockText 原样搬出（只把依赖的局部变量换成形参），
+// 单块路径（队列 worker / 重译 / 重试 / 阶梯 L0-L4 / 聊天工具）仍然走 ovlVisualTranslateBlockText，
+// 它现在只是把这几段按原顺序串起来——请求体逐字节不变（test_p233 J10 对本地与一家在线 provider 做字节级比对）。
+// ① 准备：四层掩码，不调模型。
+function ovlVisualBlockPrep(text) {
     const src = String(text == null ? '' : text);
-    if (!src.trim()) return src;
+    if (!src.trim()) return { src: src, empty: true };
     const codeMasked = ovlVisualCodeMask(src);
     // v2 Pass P113c：先把顶层 \text/\textrm/\mbox{} 散文抽走，避免被下面 xportMask 的数学
     // 环境整体掩码吞掉、永远送不到模型面前（见本函数上方大注释）。绝大多数块没有这类命令，
@@ -40940,165 +40939,115 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
     const citeMasked = ovlVisualCiteMask(textProseMasked.text);
     const masked = xportMask(citeMasked.text);
     const mainNothing = ovlVisualNothingToTranslate(masked.text);
-    if (mainNothing && !textProseMasked.items.length) { if (meta) meta.skipped = true; return src; }
+    return { src: src, empty: false, codeMasked: codeMasked, textProseMasked: textProseMasked, citeMasked: citeMasked, masked: masked, mainNothing: mainNothing };
+}
+// ② 占位符规则（按「实际存在的占位符」按需拼装）。flags = { xport, code, cite, textProse } 四个布尔：
+// 单块路径由该块自己的四张掩码表算出；联合路径取「任一段存在」的并集。
+function ovlVisualBlockPlaceholderRules(flags) {
+    // v2 Pass P122（C0b）：占位符规则按"实际存在的占位符"按需拼装——三层掩码表都是空的
+    // 就一条占位符规则都不出现（现状最大的坑就是"没有占位符还教模型认占位符"，真实模型
+    // 观测到会顺手把无关的裸方括号也"规范化"成占位符形状）。
+    // v2 Pass P122b 修正（N5，核验 .claude/tmp/p122_verify.md 非阻断5）：第二、三条规则
+    // 原来固定写"同样必须原样保留"——"同样"指代的是第一条 [[数字]] 规则，但按需拼装意味着
+    // 第一条完全可能不出现（比如只有 OVLCITE 一条规则，真实模型 3/3 调用里就发生过，见
+    // §4）。"同样"这时没有前指，读着突兀。改成只在前面真的已经拼过至少一条占位符规则时
+    // 才用"同样"，否则去掉这个词，读作独立的祈使句，逻辑上不依赖前面是否存在别的规则。
+    // 这份 rules 数组本身两个分支共用、逐字节相同——只有 local 分支会在它的私有副本上
+    // 追加一条 P197 新规则（见下），不会动这个共享数组本身。
+    const rules = [];
+    let priorPlaceholderRule = false;
+    if (flags.xport) {
+        rules.push('文本中所有形如 [[数字]] 的占位符必须原样保留在译文里、不得翻译、不得增删、不得改动方括号或数字——'
+            + '它们代表被抽走的公式/引用/命令，请把每一个都当成一个不可拆分的单词对待，直接嵌进对应的译文位置。');
+        priorPlaceholderRule = true;
+    }
+    if (flags.code) {
+        rules.push('文本中所有形如 〔〔OVLCODE数字〕〕 的占位符' + (priorPlaceholderRule ? '同样' : '') + '必须原样保留在译文里、不得翻译、不得增删、'
+            + '不得改动括号或数字——它们代表被抽走的代码/伪代码/逐字环境，请把每一个都当成一个不可拆分的'
+            + '单词对待，直接嵌进对应的译文位置。');
+        priorPlaceholderRule = true;
+    }
+    if (flags.cite) {
+        rules.push('文本中所有形如 〘〘OVLCITE数字〙〙 的占位符' + (priorPlaceholderRule ? '同样' : '') + '必须原样保留在译文里、不得翻译、不得增删、'
+            + '不得改动括号或数字，也不要把它写成任何其它形状（比如不要写成 [[数字]] 或双层方括号）——'
+            + '它们代表被抽走的参考文献引用编号（如 [1]、[2]），请把每一个都当成一个不可拆分的单词对待，'
+            + '直接嵌进对应的译文位置。');
+        priorPlaceholderRule = true;
+    }
+    // v2 Pass P216（PIPELINE-1）：块里抽出了 \text/\textrm/\mbox 散文时，哨兵 〖〖OVLTPk〗〗 会以明文
+    // 出现在送给模型的文本里（数学环境里的那些被 xportMask 整体吞进 [[k]]，不在此列），必须有一条
+    // 明文规则，否则模型会当成普通文字丢掉/改写/复制。没有这类哨兵时这条规则不出现（prompt 字节不变）。
+    if (flags.textProse) {
+        rules.push('文本中所有形如 〖〖OVLTP数字〗〗 的记号' + (priorPlaceholderRule ? '同样' : '') + '必须原样保留在译文里、恰好出现一次、'
+            + '不得翻译、不得增删、不得改动括号或数字——它们代表被抽走的 \\text{}/\\mbox{} 文字，请把每一个都当成一个不可拆分的'
+            + '单词对待，直接嵌进对应的译文位置。');
+        priorPlaceholderRule = true;
+    }
+    rules.push('只输出翻译结果本身，不要添加任何解释、前后缀、引号或 Markdown 代码块标记。');
+    rules.push('保持原文的意思和语气，译成通顺准确的简体中文学术书面语。');
+    rules.push('必须真正翻译成中文——禁止原样照抄或复述英文原文，译文里的自然语言部分不应包含未翻译的'
+        + '英文单词或句子（专有名词、缩写、变量名等确实无法翻译的除外）。');
+    return rules;
+}
+// ③ local provider 私有的两条额外规则（P200 \textcolor 保留 / P197 引用位置），原样搬出。maskedMap / citeMap 是掩码表（联合路径传各段拼接）。
+function ovlVisualBlockSysRules(rules, maskedMap, citeMap) {
+        const sysRules = rules.slice();
+        // v2 Pass P200（回归修复，诊断见 .claude/tmp/p200_*）：\textcolor{..}{..}、\emph{..}、
+        // \textbf{..} 这类"透明"格式化命令从未被 xportMask/xportProtectedSpan 遮罩——
+        // XPORT_OPAQUE_RE 故意不收它们（该表上方注释原话："花括号里装的是人话，遮起来会
+        // 让那段话永远不被翻译"），模型看到的就是裸露的 \textcolor{black}{...}，过去完全
+        // 靠模型自己的常识把命令保留、只译花括号里的文字——这份 rules 数组里从来没有一条
+        // 把这件事写成明文规则，00af7ba 和 d05446a 两版这里的文字（含 rules 共享数组）
+        // 逐字相同。真实论文段落回归评测（p03，三次真实调用）实测：00af7ba 单段
+        // prompt（规则紧邻"原文：\n"+正文，同一条 user 消息）3/3 保留 \textcolor；P197
+        // 改成 system/user 两段式后，system 末尾又新插入了英文领域提示 + 术语表两段新
+        // 内容，user 消息变成只有裸文本——同一颗本地小模型 3/3 把 \textcolor{black}{...}
+        // 整体剥掉、只留花括号里译文。masked.text 本身逐字节相同（xportMask 未改），说明
+        // 不是掩码变了，是"模型自己的常识"这条隐性约定在新的 prompt 结构下不再可靠。改成
+        // 一条显式规则，不再依赖约定；只加进 sysRules（仅 local provider 私有副本），不碰
+        // 共享的 rules 数组，Claude/OpenAI/Gemini 的 prompt 字节不受影响。
+        sysRules.push('译文中若仍保留着未被占位符替换的 LaTeX 格式化命令（如 \\textcolor{..}{..}、'
+            + '\\emph{..}、\\textbf{..}、\\underline{..}），必须把命令名和花括号原样保留，只翻译'
+            + '命令最后一个花括号参数里的文字，不得删除、拆散或吞掉命令本身。');
+        // v2 Pass P197（C 新规则，修正）：最初把这条新规则只挂在 citeMasked.map（OVLCITE，
+        // 只覆盖散文里已经写成字面 [N] 的引用）上——但用户报告的坏例子源文本是
+        // `~\cite{leyva2021,...}`，这种 \cite{} 命令走的是 xportMask 这条通用掩码
+        // （连同它前面的 ~ 一起被 xportProtectedSpan 吞成一个整体，见该函数第 11768-
+        // 11806 行，受保护、不可改），产出的是 masked.map 里的 [[数字]] 占位符，根本不会
+        // 进 citeMasked.map——按最初的写法这条规则对用户报告的这个场景永远不会出现。
+        // 现在改成：只要 masked.map 里有任意一项看起来像引用命令（用跟显示层
+        // ovlXrefTransformProse 同一份 \cite 家族判定 OVL_XREF_CITE_CMD_RE 的正则源码，
+        // 取一份无 g 标志的独立拷贝以避免共享 lastIndex 状态），就把 [[数字]] 也纳入
+        // 这条位置规则；citeMasked.map 非空时依旧覆盖 OVLCITE 分支，两者不互斥、可以
+        // 同时触发（一段文字里既有 \cite{} 又有裸 [N] 引用的情况）。
+        const citeCmdRe = new RegExp(OVL_XREF_CITE_CMD_RE.source);
+        const generalMaskHasCite = maskedMap.some(function (spanText) {
+            try { return citeCmdRe.test(String(spanText)); } catch (e) { return false; }
+        });
+        if (citeMap.length > 0 || generalMaskHasCite) {
+            const citeTokenNames = [];
+            if (generalMaskHasCite) citeTokenNames.push('[[数字]]（对应 \\cite 等引用命令）');
+            if (citeMap.length > 0) citeTokenNames.push('〘〘OVLCITEk〙〙');
+            sysRules.push('引用占位符（' + citeTokenNames.join('、') + '）必须放在它所属分句的末尾、紧挨着那个分句的中文标点（逗号/句号/分号等）之前，'
+                + '不要把它移到分句中间或另起位置，也不要在它和标点之间插入其它文字。');
+        }
+    return sysRules;
+}
+// ④ 校验 + 解遮罩（回显守卫 / 占位符 / 代码哨兵 / \text 散文哨兵 / 引用哨兵 / \text 片段翻译 / 中文覆盖闸）。
+// raw = 模型对【这一个块】的原始回复（联合路径传按分段标记拆出来的那一段）；prep.mainNothing 为真时不看 raw。
+async function ovlVisualBlockFinish(prep, raw, config, signal, meta) {
+    const src = prep.src;
+    const codeMasked = prep.codeMasked;
+    const textProseMasked = prep.textProseMasked;
+    const citeMasked = prep.citeMasked;
+    const masked = prep.masked;
     let afterCodeUnmask;
-    if (mainNothing) {
+    if (prep.mainNothing) {
         // 主体（数学/代码/引用）确实没有可译内容，但抽出了 \text{} 散文——只翻这部分，主体
         // 原样返回（textProseMasked.text 还没经过 citeMask，本来就是字面 [N]，不需要回填）。
         afterCodeUnmask = ovlVisualCodeUnmask(textProseMasked.text, codeMasked.map);
         if (meta) meta.partialTextProse = true; // 供进度文案跟"纯跳过"区分开，见调用方
     } else {
-        // v2 Pass P197（C）：local provider 走精简的 system+user 两段式（见下方分支），
-        // 其它 provider 完全保留 P103 之前那套单字符串 prompt，逐字节不变——所以术语表/
-        // 领域提示这两段注入都只出现在 isLocalProvider 分支内部，不再有一个"非 local 时
-        // 求值成空串"的共享变量拼进非 local 的 prompt（那样虽然字节结果相同，但改一次容易
-        // 改错两次；分支彻底拆开更不容易把新东西泄漏进 Claude/OpenAI/Gemini 的请求体）。
-        const isLocalProvider = !!(config && config.provider === 'local');
-        // v2 Pass P122（C0b）：占位符规则按"实际存在的占位符"按需拼装——三层掩码表都是空的
-        // 就一条占位符规则都不出现（现状最大的坑就是"没有占位符还教模型认占位符"，真实模型
-        // 观测到会顺手把无关的裸方括号也"规范化"成占位符形状）。
-        // v2 Pass P122b 修正（N5，核验 .claude/tmp/p122_verify.md 非阻断5）：第二、三条规则
-        // 原来固定写"同样必须原样保留"——"同样"指代的是第一条 [[数字]] 规则，但按需拼装意味着
-        // 第一条完全可能不出现（比如只有 OVLCITE 一条规则，真实模型 3/3 调用里就发生过，见
-        // §4）。"同样"这时没有前指，读着突兀。改成只在前面真的已经拼过至少一条占位符规则时
-        // 才用"同样"，否则去掉这个词，读作独立的祈使句，逻辑上不依赖前面是否存在别的规则。
-        // 这份 rules 数组本身两个分支共用、逐字节相同——只有 local 分支会在它的私有副本上
-        // 追加一条 P197 新规则（见下），不会动这个共享数组本身。
-        const rules = [];
-        let priorPlaceholderRule = false;
-        if (masked.map.length > 0) {
-            rules.push('文本中所有形如 [[数字]] 的占位符必须原样保留在译文里、不得翻译、不得增删、不得改动方括号或数字——'
-                + '它们代表被抽走的公式/引用/命令，请把每一个都当成一个不可拆分的单词对待，直接嵌进对应的译文位置。');
-            priorPlaceholderRule = true;
-        }
-        if (codeMasked.map.length > 0) {
-            rules.push('文本中所有形如 〔〔OVLCODE数字〕〕 的占位符' + (priorPlaceholderRule ? '同样' : '') + '必须原样保留在译文里、不得翻译、不得增删、'
-                + '不得改动括号或数字——它们代表被抽走的代码/伪代码/逐字环境，请把每一个都当成一个不可拆分的'
-                + '单词对待，直接嵌进对应的译文位置。');
-            priorPlaceholderRule = true;
-        }
-        if (citeMasked.map.length > 0) {
-            rules.push('文本中所有形如 〘〘OVLCITE数字〙〙 的占位符' + (priorPlaceholderRule ? '同样' : '') + '必须原样保留在译文里、不得翻译、不得增删、'
-                + '不得改动括号或数字，也不要把它写成任何其它形状（比如不要写成 [[数字]] 或双层方括号）——'
-                + '它们代表被抽走的参考文献引用编号（如 [1]、[2]），请把每一个都当成一个不可拆分的单词对待，'
-                + '直接嵌进对应的译文位置。');
-            priorPlaceholderRule = true;
-        }
-        // v2 Pass P216（PIPELINE-1）：块里抽出了 \text/\textrm/\mbox 散文时，哨兵 〖〖OVLTPk〗〗 会以明文
-        // 出现在送给模型的文本里（数学环境里的那些被 xportMask 整体吞进 [[k]]，不在此列），必须有一条
-        // 明文规则，否则模型会当成普通文字丢掉/改写/复制。没有这类哨兵时这条规则不出现（prompt 字节不变）。
-        if (textProseMasked.items.length > 0) {
-            rules.push('文本中所有形如 〖〖OVLTP数字〗〗 的记号' + (priorPlaceholderRule ? '同样' : '') + '必须原样保留在译文里、恰好出现一次、'
-                + '不得翻译、不得增删、不得改动括号或数字——它们代表被抽走的 \\text{}/\\mbox{} 文字，请把每一个都当成一个不可拆分的'
-                + '单词对待，直接嵌进对应的译文位置。');
-            priorPlaceholderRule = true;
-        }
-        rules.push('只输出翻译结果本身，不要添加任何解释、前后缀、引号或 Markdown 代码块标记。');
-        rules.push('保持原文的意思和语气，译成通顺准确的简体中文学术书面语。');
-        rules.push('必须真正翻译成中文——禁止原样照抄或复述英文原文，译文里的自然语言部分不应包含未翻译的'
-            + '英文单词或句子（专有名词、缩写、变量名等确实无法翻译的除外）。');
-        // v2 Pass P122（C2/L2）：重试阶梯换 prompt 重问时追加的纠正段——禁止原样重问，同
-        // prompt 同模型必然同输出。
-        const correctionBlock = (opts && typeof opts.correction === 'string' && opts.correction) ? (opts.correction + '\n\n') : '';
-        // v2 Pass P122：callModelPlainText 新增可选 meta/callOpts 出参/入参，只在
-        // config.provider==='local' 时真正生效（callLocalLLM 早就支持，callClaudeAPI/
-        // callOpenAIAPI/callGeminiAPI 的调用点一行不改）。meta.finish/meta.truncated 供
-        // 重试阶梯 L4 判断"是不是被截断"。
-        const callMeta = meta ? {} : null;
-        const callOpts = (opts && (typeof opts.temperature === 'number' || typeof opts.maxTokens === 'number'))
-            ? { temperature: opts.temperature, maxTokens: opts.maxTokens } : null;
-        let raw;
-        if (isLocalProvider) {
-            // v2 Pass P197（A/B/C）：local-only 精简重排——诊断报告
-            // （.claude/tmp/p197_translate_quality_recon.md）指出旧的单字符串 prompt 把
-            // "你是谁/规则/原文"全揉在一条 user 消息里，本地这颗小模型对长 user 消息里
-            // 混杂的指令遵从度明显更差（跟 Path2/Path3 的表现差距是这份诊断的出发点）。
-            // 改成标准的 system（角色+规则+领域提示+术语表）/user（只放原文本身）两段式，
-            // 不改变任何占位符规则的文字或触发条件（上面 rules 数组原样复用），只是搬家
-            // 到 system 里，外加一条新规则（引用占位符位置）和两段新的上下文注入。
-            // v2 Pass P202a（T0 review 绑定决定 2/3）：论文卡片取代 \title{} 自动领域提示——
-            // 卡片存在时不再追加 domainHintLine（"supersede"）；卡片放在 system 内容最前面，
-            // 命中术语块放在最后。两者都空时 sys 逐字节等于 P202a 之前（domainHintLine 的
-            // 求值/拼接方式不变，只是把 glossaryBlock 换成按段命中的 termsBlock）。
-            const card = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
-            const domainHintLine = (!card && typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
-            const matchedTerms = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(src, { cap: 30 }) : [];
-            const termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(matchedTerms) : '';
-            const sysRules = rules.slice();
-            // v2 Pass P200（回归修复，诊断见 .claude/tmp/p200_*）：\textcolor{..}{..}、\emph{..}、
-            // \textbf{..} 这类"透明"格式化命令从未被 xportMask/xportProtectedSpan 遮罩——
-            // XPORT_OPAQUE_RE 故意不收它们（该表上方注释原话："花括号里装的是人话，遮起来会
-            // 让那段话永远不被翻译"），模型看到的就是裸露的 \textcolor{black}{...}，过去完全
-            // 靠模型自己的常识把命令保留、只译花括号里的文字——这份 rules 数组里从来没有一条
-            // 把这件事写成明文规则，00af7ba 和 d05446a 两版这里的文字（含 rules 共享数组）
-            // 逐字相同。真实论文段落回归评测（p03，三次真实调用）实测：00af7ba 单段
-            // prompt（规则紧邻"原文：\n"+正文，同一条 user 消息）3/3 保留 \textcolor；P197
-            // 改成 system/user 两段式后，system 末尾又新插入了英文领域提示 + 术语表两段新
-            // 内容，user 消息变成只有裸文本——同一颗本地小模型 3/3 把 \textcolor{black}{...}
-            // 整体剥掉、只留花括号里译文。masked.text 本身逐字节相同（xportMask 未改），说明
-            // 不是掩码变了，是"模型自己的常识"这条隐性约定在新的 prompt 结构下不再可靠。改成
-            // 一条显式规则，不再依赖约定；只加进 sysRules（仅 local provider 私有副本），不碰
-            // 共享的 rules 数组，Claude/OpenAI/Gemini 的 prompt 字节不受影响。
-            sysRules.push('译文中若仍保留着未被占位符替换的 LaTeX 格式化命令（如 \\textcolor{..}{..}、'
-                + '\\emph{..}、\\textbf{..}、\\underline{..}），必须把命令名和花括号原样保留，只翻译'
-                + '命令最后一个花括号参数里的文字，不得删除、拆散或吞掉命令本身。');
-            // v2 Pass P197（C 新规则，修正）：最初把这条新规则只挂在 citeMasked.map（OVLCITE，
-            // 只覆盖散文里已经写成字面 [N] 的引用）上——但用户报告的坏例子源文本是
-            // `~\cite{leyva2021,...}`，这种 \cite{} 命令走的是 xportMask 这条通用掩码
-            // （连同它前面的 ~ 一起被 xportProtectedSpan 吞成一个整体，见该函数第 11768-
-            // 11806 行，受保护、不可改），产出的是 masked.map 里的 [[数字]] 占位符，根本不会
-            // 进 citeMasked.map——按最初的写法这条规则对用户报告的这个场景永远不会出现。
-            // 现在改成：只要 masked.map 里有任意一项看起来像引用命令（用跟显示层
-            // ovlXrefTransformProse 同一份 \cite 家族判定 OVL_XREF_CITE_CMD_RE 的正则源码，
-            // 取一份无 g 标志的独立拷贝以避免共享 lastIndex 状态），就把 [[数字]] 也纳入
-            // 这条位置规则；citeMasked.map 非空时依旧覆盖 OVLCITE 分支，两者不互斥、可以
-            // 同时触发（一段文字里既有 \cite{} 又有裸 [N] 引用的情况）。
-            const citeCmdRe = new RegExp(OVL_XREF_CITE_CMD_RE.source);
-            const generalMaskHasCite = masked.map.some(function (spanText) {
-                try { return citeCmdRe.test(String(spanText)); } catch (e) { return false; }
-            });
-            if (citeMasked.map.length > 0 || generalMaskHasCite) {
-                const citeTokenNames = [];
-                if (generalMaskHasCite) citeTokenNames.push('[[数字]]（对应 \\cite 等引用命令）');
-                if (citeMasked.map.length > 0) citeTokenNames.push('〘〘OVLCITEk〙〙');
-                sysRules.push('引用占位符（' + citeTokenNames.join('、') + '）必须放在它所属分句的末尾、紧挨着那个分句的中文标点（逗号/句号/分号等）之前，'
-                    + '不要把它移到分句中间或另起位置，也不要在它和标点之间插入其它文字。');
-            }
-            let sys = '你是学术论文翻译助手。接下来的用户消息只包含一段待翻译的 LaTeX 片段本身，不包含任何其它内容——'
-                + '请把它翻译成简体中文学术书面语，直接给出译文，不要复述或添加任何前后缀。硬性规则：\n'
-                + sysRules.map(function (r, idx) { return (idx + 1) + ') ' + r; }).join('\n') + '\n\n'
-                + correctionBlock
-                + (domainHintLine ? (domainHintLine + '\n\n') : '')
-                + termsBlock;
-            if (card) sys = card + '\n\n' + sys;
-            raw = await callModelPlainText(masked.text, config, signal, callMeta, callOpts, sys);
-        } else {
-            const prompt = '你是学术论文翻译助手，把下面的 LaTeX 片段翻译成简体中文学术书面语。硬性规则：\n'
-                + rules.map(function (r, idx) { return (idx + 1) + ') ' + r; }).join('\n') + '\n\n'
-                + correctionBlock
-                + '原文：\n' + masked.text;
-            // v2 Pass P202a（T0 review 绑定决定 3）：非 local provider 只有在卡片/命中术语
-            // 至少有一项非空时才升级成 system+user 两段式；都为空时保持 P202a 之前的单条
-            // user 消息形状，逐字节不变（callModelPlainText 在 systemPrompt 为空/非字符串时
-            // 走的还是老的 messages 形状，见该函数上方注释）。
-            const nlCard = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
-            const nlMatched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(src, { cap: 30 }) : [];
-            const nlTermsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(nlMatched) : '';
-            const preamble = (nlCard ? nlCard + '\n\n' : '') + nlTermsBlock;
-            raw = preamble
-                ? await callModelPlainText(prompt, config, signal, callMeta, callOpts, preamble)
-                : await callModelPlainText(prompt, config, signal, callMeta, callOpts);
-        }
-        if (meta && callMeta) { meta.finish = callMeta.finish; meta.truncated = callMeta.truncated; }
-        // v2 Pass P122（诊断 A10 缺口根治）：块内没有任何占位符时（masked.map/codeMasked.map
-        // 都是空表），被截断的半句中文以前能通过全部校验——xportBlockOk 的"total===map.length"
-        // 在 0===0 时平凡为真，回显守卫看内容差异也不会拦（截断的中文跟英文原文当然不像），
-        // 于是残缺内容被当"翻译成功"静默落地、写进缓存。截断信号（finish_reason==='length'）
-        // 本身就是一条独立、已经存在的信号，不该被其它校验的"平凡通过"盖过去——直接在这里判
-        // 失败，让重试阶梯 L4（提高 max_tokens）/L3（按句切分）真正有机会介入。
-        if (callMeta && (callMeta.finish === 'length' || callMeta.truncated === true)) { // v2 Pass P216（PIPELINE-3）：Gemini 的 MAX_TOKENS 只设 truncated，不设 finish==='length'
-            throw new Error('翻译结果被截断（模型输出配额用尽，finish_reason=length）');
-        }
         let body = (typeof raw === 'string') ? raw.trim() : '';
         if (ovlVisualIsEchoFailure(masked.text, body)) {
             ovlVisualEchoToastOnce();
@@ -41285,6 +41234,135 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
     return afterCodeUnmask;
 }
 
+// ---- 单块翻译：代码层掩码 -> 公式/引用层掩码 -> 调模型 -> 两层各自校验 -> 两层各自还原 ----
+// 契约：纯公式/纯代码块（两层掩码后没有可翻的字）原样返回，不占请求，这是本函数内**唯一**
+// 会把"没有真正翻译"当成功返回的路径（meta.skipped=true，见下）。除此之外的任何失败——
+// 回显守卫拦截、xportBlockOk 完整性校验不过、ovlVisualCodeCheck 哨兵校验不过——一律 throw
+// （调用方 ovlVisualLangRunQueue / chatAgentExecRetranslateBlock / ovlVisualBlockRetryClick
+// 统一标记这一块失败、不写入缓存、给出可见重试角标，用户能看见失败态、可以重试，不阻塞
+// 其它块）。
+// v2 Pass P113 返修（核验 p113_verify.md 问题3，阻断回归）：ovlVisualCodeCheck 这一支原来
+// 是"不 throw，回退返回原文并 console.warn"——本意是"当作没翻译过"，但调用方（worker/
+// 重译入口）并不知道这层区别，实际效果是把原样返回的英文当"翻译成功"落地：innerHTML 换成
+// 英文、ovlVisualTransCachePut 把英文永久写进缓存，跟真正的豁免路径（meta.skipped）在
+// DOM/进度/缓存上完全看不出区别（实测：adv.js MARKALGOC，stub 丢掉一个 OVLCODE 哨兵，
+// 新旧构建都 failed=false/skipped=null，缓存里存的就是英文原文）。真实小模型漏掉/改动
+// 〔〔OVLCODEk〕〕哨兵是常见事件——这是本函数曾经存在但没有被上面这段文档承认过的"第二条
+// 静默返回英文的路径"，现在跟 xportBlockOk 一样直接 throw，不再有例外。
+// v2 Pass P113（诊断机制①）：新增可选的第 4 个参数 meta——调用方（懒翻译队列 worker /
+// 块级强制重译入口）传一个空对象进来，函数会在"两层掩码后没有可翻的字"这条唯一合法的
+// 豁免路径上把 meta.skipped 置为 true 再返回。不传 meta（已有的三参数调用点，比如
+// test_p38/p39/p81/p103 里直接调用这个函数做纯函数断言）行为逐字节不变——这条豁免以前
+// 完全隐性：返回值和"翻译成功"长得一模一样，进度计数、缓存、DOM 上都看不出这块其实没有
+// 被模型翻译过。现在通过这个显式信号，调用方可以据此打 data-ovl-trans-skipped 属性，
+// 供进度提示如实报告"K 个块跳过（纯公式/代码）"，不再跟"真正翻译成功"混为一谈。选块的
+// 逻辑本身（ovlVisualLangCollectPending）不按块类型过滤，table/algorithm/figure/数学
+// 环境全部一样正常入队；两层掩码后一个字都不剩，本来就没有自然语言可译，现在才是本函数内
+// 真正唯一一条"返回值等于原文但算作成功"的路径——v2 Pass P113c 起，这条路径额外要求块里
+// 也没有抽出任何 \text{} 散文（见 meta.textProseHandled/meta.partialTextProse：块里有
+// \text{} 散文时，即使主体（数学/代码）本身两层掩码后没有可翻的字，也不再算"跳过"，见下）。
+// v2 Pass P122：新增第 5 个形参 opts（可选，纯追加——跟 P113 给 meta 加第 4 个形参、跟
+// callLocalLLM 给 opts 加第 7 个形参同一条纪律）。不传 opts（现有单测 test_p38/p39/p81/
+// p103/p113 的 3/4 参数调用点）逐字节不受影响。opts.correction——重试阶梯 L2 用来追加"上一次
+// 错在哪、这次必须怎样"的纠正段；opts.temperature/opts.maxTokens——透传给 callModelPlainText
+// ->callLocalLLM（本地 provider 才生效，见下）。
+async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
+    // v2 Pass P108：翻译也是一次"实质操作"，标记当前项目为最近（去抖，不影响本函数的返回
+    // 值/时序——发生在真正开始翻译逻辑之前，纯 fire-and-forget）。
+    if (typeof ovlProjectHistoryTouchCurrent === 'function') { try { ovlProjectHistoryTouchCurrent(); } catch (e) {} }
+    const prep = ovlVisualBlockPrep(text);
+    const src = prep.src;
+    if (prep.empty) return src;
+    const codeMasked = prep.codeMasked;
+    const textProseMasked = prep.textProseMasked;
+    const citeMasked = prep.citeMasked;
+    const masked = prep.masked;
+    const mainNothing = prep.mainNothing;
+    if (mainNothing && !textProseMasked.items.length) { if (meta) meta.skipped = true; return src; }
+    let raw = null;
+    if (!mainNothing) {
+        // v2 Pass P197（C）：local provider 走精简的 system+user 两段式（见下方分支），
+        // 其它 provider 完全保留 P103 之前那套单字符串 prompt，逐字节不变——所以术语表/
+        // 领域提示这两段注入都只出现在 isLocalProvider 分支内部，不再有一个"非 local 时
+        // 求值成空串"的共享变量拼进非 local 的 prompt（那样虽然字节结果相同，但改一次容易
+        // 改错两次；分支彻底拆开更不容易把新东西泄漏进 Claude/OpenAI/Gemini 的请求体）。
+        const isLocalProvider = !!(config && config.provider === 'local');
+        // v2 Pass P233：占位符规则的拼装搬进 ovlVisualBlockPlaceholderRules（语句原样，见上）。
+        const rules = ovlVisualBlockPlaceholderRules({ xport: masked.map.length > 0, code: codeMasked.map.length > 0, cite: citeMasked.map.length > 0, textProse: textProseMasked.items.length > 0 });
+        // v2 Pass P122（C2/L2）：重试阶梯换 prompt 重问时追加的纠正段——禁止原样重问，同
+        // prompt 同模型必然同输出。
+        const correctionBlock = (opts && typeof opts.correction === 'string' && opts.correction) ? (opts.correction + '\n\n') : '';
+        // v2 Pass P122：callModelPlainText 新增可选 meta/callOpts 出参/入参，只在
+        // config.provider==='local' 时真正生效（callLocalLLM 早就支持，callClaudeAPI/
+        // callOpenAIAPI/callGeminiAPI 的调用点一行不改）。meta.finish/meta.truncated 供
+        // 重试阶梯 L4 判断"是不是被截断"。
+        const callMeta = meta ? {} : null;
+        const callOpts = (opts && (typeof opts.temperature === 'number' || typeof opts.maxTokens === 'number'))
+            ? { temperature: opts.temperature, maxTokens: opts.maxTokens } : null;
+        if (isLocalProvider) {
+            // v2 Pass P197（A/B/C）：local-only 精简重排——诊断报告
+            // （.claude/tmp/p197_translate_quality_recon.md）指出旧的单字符串 prompt 把
+            // "你是谁/规则/原文"全揉在一条 user 消息里，本地这颗小模型对长 user 消息里
+            // 混杂的指令遵从度明显更差（跟 Path2/Path3 的表现差距是这份诊断的出发点）。
+            // 改成标准的 system（角色+规则+领域提示+术语表）/user（只放原文本身）两段式，
+            // 不改变任何占位符规则的文字或触发条件（上面 rules 数组原样复用），只是搬家
+            // 到 system 里，外加一条新规则（引用占位符位置）和两段新的上下文注入。
+            // v2 Pass P202a（T0 review 绑定决定 2/3）：论文卡片取代 \title{} 自动领域提示——
+            // 卡片存在时不再追加 domainHintLine（"supersede"）；卡片放在 system 内容最前面，
+            // 命中术语块放在最后。两者都空时 sys 逐字节等于 P202a 之前（domainHintLine 的
+            // 求值/拼接方式不变，只是把 glossaryBlock 换成按段命中的 termsBlock）。
+            const card = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+            const domainHintLine = (!card && typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
+            const ctxO = (opts && opts.ctx) ? opts.ctx : null; // v2 Pass P233：只读上下文（邻居的中文译文 + 章节标题 + 术语一致性），无 ctx 时下面逐字节不变
+            const matchedTerms = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(ctxO ? (src + '\n' + ctxO.matchText) : src, { cap: 30 }) : [];
+            const termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(matchedTerms) : '';
+            const sysRules = ovlVisualBlockSysRules(rules, masked.map, citeMasked.map); // v2 Pass P233：两条 local 私有规则搬进 ovlVisualBlockSysRules（语句原样）
+            let sys = '你是学术论文翻译助手。接下来的用户消息只包含一段待翻译的 LaTeX 片段本身，不包含任何其它内容——'
+                + '请把它翻译成简体中文学术书面语，直接给出译文，不要复述或添加任何前后缀。硬性规则：\n'
+                + sysRules.map(function (r, idx) { return (idx + 1) + ') ' + r; }).join('\n') + '\n\n'
+                + correctionBlock
+                + (domainHintLine ? (domainHintLine + '\n\n') : '')
+                + (ctxO ? (ctxO.text + '\n\n') : '')
+                + termsBlock;
+            if (card) sys = card + '\n\n' + sys;
+            raw = await callModelPlainText(masked.text, config, signal, callMeta, callOpts, sys);
+        } else {
+            const prompt = '你是学术论文翻译助手，把下面的 LaTeX 片段翻译成简体中文学术书面语。硬性规则：\n'
+                + rules.map(function (r, idx) { return (idx + 1) + ') ' + r; }).join('\n') + '\n\n'
+                + correctionBlock
+                + '原文：\n' + masked.text;
+            // v2 Pass P202a（T0 review 绑定决定 3）：非 local provider 只有在卡片/命中术语
+            // 至少有一项非空时才升级成 system+user 两段式；都为空时保持 P202a 之前的单条
+            // user 消息形状，逐字节不变（callModelPlainText 在 systemPrompt 为空/非字符串时
+            // 走的还是老的 messages 形状，见该函数上方注释）。
+            const nlCard = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+            const nlCtx = (opts && opts.ctx) ? opts.ctx : null; // v2 Pass P233：同上，无 ctx 时逐字节不变
+            const nlMatched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(nlCtx ? (src + '\n' + nlCtx.matchText) : src, { cap: 30 }) : [];
+            const nlTermsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(nlMatched) : '';
+            const preamble = (nlCard ? nlCard + '\n\n' : '') + (nlCtx ? nlCtx.text : '') + nlTermsBlock;
+            raw = preamble
+                ? await callModelPlainText(prompt, config, signal, callMeta, callOpts, preamble)
+                : await callModelPlainText(prompt, config, signal, callMeta, callOpts);
+        }
+        if (meta && callMeta) { meta.finish = callMeta.finish; meta.truncated = callMeta.truncated; }
+        // v2 Pass P122（诊断 A10 缺口根治）：块内没有任何占位符时（masked.map/codeMasked.map
+        // 都是空表），被截断的半句中文以前能通过全部校验——xportBlockOk 的"total===map.length"
+        // 在 0===0 时平凡为真，回显守卫看内容差异也不会拦（截断的中文跟英文原文当然不像），
+        // 于是残缺内容被当"翻译成功"静默落地、写进缓存。截断信号（finish_reason==='length'）
+        // 本身就是一条独立、已经存在的信号，不该被其它校验的"平凡通过"盖过去——直接在这里判
+        // 失败，让重试阶梯 L4（提高 max_tokens）/L3（按句切分）真正有机会介入。
+        if (callMeta && (callMeta.finish === 'length' || callMeta.truncated === true)) { // v2 Pass P216（PIPELINE-3）：Gemini 的 MAX_TOKENS 只设 truncated，不设 finish==='length'
+            throw new Error('翻译结果被截断（模型输出配额用尽，finish_reason=length）');
+        }
+    }
+    // v2 Pass P233：带只读上下文的请求，译文要过串味守卫（混进了上下文译文 / 长度远超正常比例 => 抛 ovlCtxContaminated，由重试阶梯去掉上下文重问）。
+    if (!(opts && opts.ctx) || mainNothing) return await ovlVisualBlockFinish(prep, raw, config, signal, meta);
+    const tgtCtx = await ovlVisualBlockFinish(prep, raw, config, signal, meta);
+    const whyCtx = ovlP233ContamCheck(tgtCtx, src, opts.ctx.zh);
+    if (whyCtx) throw ovlP233ContamError(whyCtx);
+    return tgtCtx;
+}
+
 // ==================== v2 Pass P122（C2）：失败后自动升级的重试阶梯 ====================
 // 三个调用方（懒翻译队列 worker / AI 聊天工具 retranslate_block / 失败角标手动重试）统一
 // 改调本函数，取代直接调 ovlVisualTranslateBlockText——那个函数本身逐字节保持纯函数语义
@@ -41445,11 +41523,35 @@ async function ovlVisualTranslateBlockWithLadder(text, cfg, signal, meta, opts) 
     m.attempts = 0;
     const src = String(text == null ? '' : text);
     let lastErr = null;
+    // v2 Pass P233：opts.ctx（只读上下文）只给 L0/L2/L4 三个整块请求；若某一次的译文被串味守卫判为混入了上下文译文，
+    // 就在【同一级】丢掉上下文重问一次（之后各级都不再带上下文）。没有 ctx 时 callBT 就是原来的 ovlVisualTranslateBlockText 调用。
+    let ladderCtx = (opts && opts.ctx) ? opts.ctx : null;
+    const callBT = async function (srcText, metaObj, extra) {
+        if (!ladderCtx) return await ovlVisualTranslateBlockText(srcText, cfg, signal, metaObj, extra);
+        const before = Object.assign({}, metaObj); // 串味重问要回到这次尝试【之前】的 meta
+        try {
+            return await ovlVisualTranslateBlockText(srcText, cfg, signal, metaObj, Object.assign({}, extra || null, { ctx: ladderCtx }));
+        } catch (e) {
+            if (e && e.ovlCtxContaminated) {
+                ladderCtx = null;
+                // 被丢弃的那次尝试已经把 partial / partialReason / repairs 等写进了 metaObj（ovlVisualBlockFinish 只置不清）：
+                // 它们不能带进干净重问的结果里把块误标成 partial。与 L2/L4 同一手法——回到尝试前的状态，用全新的 meta 重问，再并回来。
+                Object.keys(metaObj).forEach(function (k) { delete metaObj[k]; });
+                Object.assign(metaObj, before);
+                m.attempts++;
+                m.ctxDropped = true;
+                const fresh = {};
+                try { return await ovlVisualTranslateBlockText(srcText, cfg, signal, fresh, extra); }
+                finally { Object.assign(metaObj, fresh); }
+            }
+            throw e;
+        }
+    };
 
     // L0（内含 C1 免费修复，不额外计一次模型调用）
     try {
         m.attempts++;
-        const tgt = await ovlVisualTranslateBlockText(src, cfg, signal, m);
+        const tgt = await callBT(src, m);
         m.ladderLevel = 'L0';
         return tgt;
     } catch (e) {
@@ -41476,7 +41578,7 @@ async function ovlVisualTranslateBlockWithLadder(text, cfg, signal, meta, opts) 
     try {
         m.attempts++;
         m2 = {};
-        const tgt = await ovlVisualTranslateBlockText(src, cfg, signal, m2, { correction: correction, temperature: 0 });
+        const tgt = await callBT(src, m2, { correction: correction, temperature: 0 });
         Object.assign(m, m2);
         m.ladderLevel = 'L2';
         return tgt;
@@ -41501,7 +41603,7 @@ async function ovlVisualTranslateBlockWithLadder(text, cfg, signal, meta, opts) 
         try {
             m.attempts++;
             m4 = {};
-            const tgt = await ovlVisualTranslateBlockText(src, cfg, signal, m4,
+            const tgt = await callBT(src, m4,
                 { correction: correction, temperature: 0, maxTokens: OVL_VISUAL_LADDER_MAX_TOKENS });
             Object.assign(m, m4);
             m.ladderLevel = 'L4';
@@ -41591,6 +41693,1204 @@ async function ovlVisualTranslateBlockWithLadder(text, cfg, signal, meta, opts) 
     m.failReason = ovlVisualTransFailReason(lastErr, m);
     m.ladderLevel = m.ladderLevel || 'failed';
     throw lastErr;
+}
+
+// ==================== v2 Pass P233：联合重译（重译选中多块，联系上下文）====================
+// 用户需求（P233）：①选中几行/几块后一次重译，让模型联系上下文、让同一术语在这几块里译法一致；
+// ②翻译时自动联系上下文（Settings 里可开关，Stage B）；③手动「翻译参考」把某些块钉成参考（Stage B）。
+//
+// 硬教训（P201：把邻段的【英文原文】塞进单块请求 -> 20/20 串味，评分 3.80 -> 2.05，耗时 x2）：
+//   任何路径都【绝不】把邻居段落的英文原文送给模型。只读上下文只给 邻居的【中文译文】（显示的或缓存里的）、当前章节标题、
+//   论文卡片、命中术语。英文只出现在「模型本来就该翻译的联合请求分段」里；唯一例外是用户手动钉住的「翻译参考」（en->zh 成对），
+//   且受下面的串味守卫保护（Stage B）。
+//
+// 联合请求机制（Stage A 与 Stage B 的段落分组共用）：
+//   · 每个块完全照单块路径准备（ovlVisualBlockPrep：四层掩码），各自保留自己的掩码表；
+//   · 把各块的遮罩文本用分段标记 【【OVLSEGn】】（单独一行，n=1..N）拼成一次请求。该标记用的是 【】 全角黑括号，
+//     与 [[n]] / 〔〔OVLCODEn〕〕 / 〘〘OVLCITEn〙〙 / 〖〖OVLTPn〗〗 四种占位符的括号形状都不同，不会互相误识别；
+//   · 模型按序对每个标记原样保留一次，后面紧跟该段译文；回复按标记拆开，每段用【它自己的】掩码表做与单块路径同一套校验
+//     （ovlVisualBlockFinish：回显守卫、占位符、代码/文字/引用哨兵、截断、中文覆盖闸）；
+//   · 单块请求（N=1）永远走原来的 ovlVisualTranslateBlockText，请求体与本 Pass 之前逐字节相同。
+//
+// 每次请求的上限：<=12 块 且 <=4000 个遮罩后源字符。依据：真实译文约为源词数的 1.2-2.1 倍汉字（见 ovlVisualCjkGateEval 注释），
+//   4000 个源字符 ≈ 650 词 ≈ 1100-1400 汉字 ≈ 1.7k-2.5k 输出 token；本地模型默认输出预算 16384、OpenAI 类默认 4096，
+//   都能装下整组而不被截断；块数再多，模型对标记的保真度明显下降（>12 段时漏标/并段变多）。更大的选区拆成连续的多组，
+//   按顺序一组一组跑，后一组的上下文里带前一组【刚译出的新译文】。
+const OVL_P233_MAX_BLOCKS = 12;
+const OVL_P233_MAX_CHARS = 4000;
+const OVL_P233_CTX_BEFORE = 2;          // 前文最多取 2 个正文块的译文
+const OVL_P233_CTX_AFTER = 1;           // 后文最多取 1 个
+const OVL_P233_CTX_BLOCK_CHARS = 480;   // 每个上下文块最多 480 字（前文取末尾、后文取开头）；3 块 x 480 < 1500
+const OVL_P233_CTX_TOTAL_CHARS = 1500;  // 上下文译文总量上限
+// 串味守卫阈值。
+//   · 逐字：输出里出现与任一「上下文译文」相同的 >=12 个连续汉字（只在汉字连续段内数，标点/英文会打断）。12 的依据：
+//     偶然撞上 12 个一模一样的连续汉字几乎不可能，而真正「顺手把邻段也译出来/复述」必然整句整句地重合。
+//   · 比例：译文汉字数 > 3.0 x 源可译词数 + 10（源词数 >= 8 才判）。依据：P128 记录的真实/拟真合法译文 汉字/词 约 1.2-2.1；
+//     把一个同量级邻段也译进来会让比例翻倍（≈2.4-4.2），取 3.0 约为观测上限 2.1 的 1.43 倍——宁可偶尔误判（误判的代价只是一次不带上下文的重问），
+//     也不放过「译了两段」的串味输出。
+const OVL_P233_VERBATIM_RUN = 12;
+const OVL_P233_RATIO_MAX = 3.0;
+const OVL_P233_RATIO_SLACK = 10;
+const OVL_P233_RATIO_MIN_WORDS = 8;
+const OVL_P233_HEADING_RE = /^\s*\\(?:part|chapter|section|subsection|subsubsection|paragraph|subparagraph)\*?\s*(?:\[[^\]]*\]\s*)?\{/;
+let OvlP233Run = null; // 联合重译进行中才非空：{ total, done, together, single, kept, stopped, seq, controllers, flagged, taken, idx, ... }
+
+function ovlP233Marker(i) { return '【【OVLSEG' + i + '】】'; }
+function ovlP233HasCjk(s) { return /[㐀-鿿]/.test(String(s == null ? '' : s)); }
+// 标题块：返回标题文字（可能为 ''）；不是标题块返回 null。
+function ovlP233HeadingTitle(src) {
+    const s = String(src == null ? '' : src);
+    const m = OVL_P233_HEADING_RE.exec(s);
+    if (!m) return null;
+    let depth = 1, out = '';
+    for (let i = m[0].length; i < s.length; i++) {
+        const ch = s[i];
+        if (ch === '{') depth++;
+        else if (ch === '}') { depth--; if (depth === 0) break; }
+        out += ch;
+    }
+    return out.replace(/\\label\{[^}]*\}/g, '').replace(/\s+/g, ' ').trim().slice(0, 160);
+}
+// 原子块种类：'float'（table/algorithm/figure/longtable）、'math'（公式环境 / $$ / \[）、'bib'（参考文献）；普通正文 ''。
+function ovlP233AtomicKind(src) {
+    const s = String(src == null ? '' : src);
+    const m = /^\s*\\begin\{([A-Za-z*]+)\}/.exec(s);
+    if (m) {
+        if (OVL_VISUAL_FLOAT_ATOMIC_ENV_RE.test(m[1])) return 'float';
+        if (OVL_VISUAL_MATH_ATOMIC_ENV_RE.test(m[1])) return 'math';
+        if (OVL_VISUAL_BIB_ATOMIC_ENV_RE.test(m[1])) return 'bib';
+    }
+    if (/^\s*(\$\$|\\\[)/.test(s)) return 'math';
+    return '';
+}
+function ovlP233ClipTail(s, n) { const t = String(s).replace(/\s*\n\s*/g, ' ').trim(); return t.length > n ? ('…' + t.slice(t.length - n)) : t; }
+function ovlP233ClipHead(s, n) { const t = String(s).replace(/\s*\n\s*/g, ' ').trim(); return t.length > n ? (t.slice(0, n) + '…') : t; }
+// 上下文里要用的「已有中文译文」：本次运行刚译出的新译文（newZh: Map 源码->译文）优先，其次缓存（显示的就是缓存里的）。
+// 只读查询（Stage B 返修）：不用 ScopeBegin（它会把 P215 回写缓存强制落盘，队列每发一个请求就整桶写一次），
+// 也不走 GetMeta（未命中会解析旧版 v1 全局大缓存、命中会刷 ts / 提升闸门标记而写桶）。
+// 每次构造上下文只取一次桶（回写缓存里有就是同一个内存对象，没有就解析一次）；自己的 key 命中即用，
+// 未命中再按 P232 的跨模型回退查（与屏幕上显示的译文一致）；旧版 v1 缓存的条目在渲染时早已被提升进桶，这里不再去读。
+function ovlP233ZhLookup(cfg, newZh) {
+    let map = null, pid = null;
+    return function (src) {
+        if (newZh && newZh.has(src)) return newZh.get(src);
+        try {
+            if (map === null) { pid = ovlVisualTransCacheProjectId(); map = ovlVisualTransCacheBucketLoad(pid) || {}; }
+            const key = ovlVisualTransCacheKey(src, cfg);
+            const hit = map[key];
+            let tgt = '';
+            if (hit && typeof hit.tgt === 'string') {
+                // 与 GateCheck 同一判据，但只读：不盖章、不删条目（真正的清理留给显示路径）。
+                let ok = hit.gateVersion === OVL_VISUAL_CJK_GATE_VERSION || !!(hit.skipped || hit.forced);
+                if (!ok) ok = (typeof ovlVisualCjkGateEval === 'function') ? !!ovlVisualCjkGateEval(src, hit.tgt).ok : true;
+                if (ok && !hit.skipped) tgt = hit.tgt;
+            } else if (!OvlP232Suppress.has(key)) {
+                const fb = ovlVisualTransCacheFallbackLookup(src, key, map, pid, true); // 只读：不经 GateCheck（它会在作用域外整桶落盘）
+                if (fb && fb.hit && !fb.hit.skipped) tgt = fb.hit.tgt;
+            }
+            return (tgt && ovlP233HasCjk(tgt)) ? tgt : '';
+        } catch (e) { return ''; }
+    };
+}
+// 只读上下文：返回 null（没有任何可给的上下文）或 { text, zh:[送出的中文译文], matchText }。
+// o = { pane, firstEl, lastEl, cfg（主模型 cfg，用于缓存 key）, newZh }
+//   matchText 只用来匹配术语库——【绝不】送给模型（它是邻居的英文源码）。
+function ovlP233BuildContext(o) {
+    try {
+        const pane = o.pane || document.getElementById('ovlVisualPane');
+        if (!pane || !o.firstEl || !o.lastEl) return null;
+        const list = Array.prototype.slice.call(pane.querySelectorAll('.ovl-visual-block'));
+        const iF = list.indexOf(o.firstEl), iL = list.indexOf(o.lastEl);
+        if (iF < 0 || iL < 0) return null;
+        const back = list.slice(Math.max(0, iF - 300), iF);
+        const fwd = list.slice(iL + 1, iL + 41);
+        const backSrc = ovlVisualBlocksSrcTexts(back);
+        const fwdSrc = ovlVisualBlocksSrcTexts(fwd);
+        const skipEl = function (b) { return b.hasAttribute('data-ovl-trans-notrans') || b.hasAttribute('data-ovl-trans-noprose'); };
+        let title = '';
+        const before = [], beforeSrc = [], after = [], afterSrc = [];
+        const zhOf = ovlP233ZhLookup(o.cfg, o.newZh);
+        {
+            let collecting = true;
+            for (let k = back.length - 1; k >= 0; k--) {
+                const s = backSrc[k];
+                if (s == null || !s.trim()) continue;
+                const h = ovlP233HeadingTitle(s);
+                if (h !== null) { title = h; break; } // 章节边界：前文只取同一章节内的块
+                if (!collecting) continue;            // 已经收满 / 遇到未译邻块：只继续往回找章节标题
+                if (skipEl(back[k]) || ovlP233AtomicKind(s)) continue;
+                if (before.length >= OVL_P233_CTX_BEFORE) { collecting = false; continue; }
+                const zh = zhOf(s);
+                if (!zh) { collecting = false; continue; } // 紧邻的正文块还没有译文：不跨过它取更远的块（上下文必须连续）
+                before.unshift(zh); beforeSrc.unshift(s);
+            }
+            for (let k = 0; k < fwd.length && after.length < OVL_P233_CTX_AFTER; k++) {
+                const s = fwdSrc[k];
+                if (s == null || !s.trim()) continue;
+                if (ovlP233HeadingTitle(s) !== null) break;
+                if (skipEl(fwd[k]) || ovlP233AtomicKind(s)) continue;
+                const zh = zhOf(s);
+                if (!zh) break;
+                after.push(zh); afterSrc.push(s);
+            }
+        }
+        const bClips = before.map(function (z) { return ovlP233ClipTail(z, OVL_P233_CTX_BLOCK_CHARS); });
+        const aClips = after.map(function (z) { return ovlP233ClipHead(z, OVL_P233_CTX_BLOCK_CHARS); });
+        let total = 0;
+        bClips.concat(aClips).forEach(function (c) { total += c.length; });
+        while (total > OVL_P233_CTX_TOTAL_CHARS && bClips.length > 1) { total -= bClips.shift().length; beforeSrc.shift(); } // 先丢最远的前文
+        while (total > OVL_P233_CTX_TOTAL_CHARS && aClips.length) { total -= aClips.pop().length; afterSrc.pop(); }
+        if (!title && !bClips.length && !aClips.length) return null;
+        const lines = [];
+        lines.push('【只读上下文】下面的内容只用来让你保持术语、人称和语气与已有译文一致。它们不是待翻译的内容：不要翻译它们、不要复述它们、不要把它们的任何文字写进你的译文。');
+        if (title) lines.push('当前章节：' + title);
+        if (bClips.length) {
+            lines.push('紧邻前文的已有中文译文（按顺序，仅供参考）：');
+            bClips.forEach(function (c, i) { lines.push('前文' + (i + 1) + '：' + c); });
+        }
+        if (aClips.length) {
+            lines.push('紧邻后文的已有中文译文（仅供参考）：');
+            aClips.forEach(function (c, i) { lines.push('后文' + (i + 1) + '：' + c); });
+        }
+        lines.push('一致性要求：待译文本里出现的同一术语必须使用同一种译法，并与上面的已有译文、术语表保持一致。');
+        return { text: lines.join('\n'), zh: bClips.concat(aClips), matchText: [title].concat(beforeSrc, afterSrc).join('\n') };
+    } catch (e) { return null; }
+}
+// 串味守卫（联合请求的每一段、带上下文的单块请求都过一遍）：返回 ''（干净）/ 'verbatim' / 'ratio'。
+function ovlP233CjkGrams(s, n, into) {
+    const runs = String(s == null ? '' : s).match(/[㐀-鿿]+/g) || [];
+    for (let r = 0; r < runs.length; r++) {
+        const run = runs[r];
+        for (let i = 0; i + n <= run.length; i++) into.add(run.substr(i, n));
+    }
+}
+function ovlP233ContamCheck(tgt, src, zhList) {
+    if (zhList && zhList.length) {
+        if (!zhList._grams) {
+            const g = new Set();
+            zhList.forEach(function (z) { ovlP233CjkGrams(z, OVL_P233_VERBATIM_RUN, g); });
+            zhList._grams = g;
+        }
+        if (zhList._grams.size) {
+            const mine = new Set();
+            ovlP233CjkGrams(tgt, OVL_P233_VERBATIM_RUN, mine);
+            let hit = false;
+            mine.forEach(function (gr) { if (!hit && zhList._grams.has(gr)) hit = true; });
+            if (hit) return 'verbatim';
+        }
+    }
+    try {
+        const g = ovlVisualCjkGateEval(src, tgt);
+        if (g.srcWords >= OVL_P233_RATIO_MIN_WORDS && g.zhChars > OVL_P233_RATIO_MAX * g.srcWords + OVL_P233_RATIO_SLACK) return 'ratio';
+    } catch (e) {}
+    return '';
+}
+function ovlP233ContamError(why) {
+    const er = new Error('翻译结果疑似混入了上下文译文（' + (why === 'ratio' ? '译文长度远超正常比例' : '出现与上下文译文相同的连续文字') + '），已判定串味');
+    er.ovlCtxContaminated = true;
+    return er;
+}
+// 联合请求的回复按分段标记拆开。返回 { segs:[string|null], why:[''|'missing'|'duplicate'|'merged'|'extra'|'empty'|'truncated'] }。
+// 第 i 段合法的条件：标记 i 恰好出现一次；紧跟其后的下一个标记恰好是 i+1（末段后面不能再有标记）；段内容非空；末段未被截断。
+function ovlP233JointSplit(raw, n, truncated) {
+    const text = String(raw == null ? '' : raw);
+    const re = /【【\s*OVLSEG\s*(\d{1,3})\s*】】/g;
+    const marks = [];
+    let m;
+    while ((m = re.exec(text))) marks.push({ num: parseInt(m[1], 10), start: m.index, end: m.index + m[0].length });
+    const count = {};
+    marks.forEach(function (k) { count[k.num] = (count[k.num] || 0) + 1; });
+    const segs = [], why = [];
+    for (let i = 1; i <= n; i++) {
+        segs.push(null); why.push('');
+        const pos = marks.findIndex(function (k) { return k.num === i; });
+        if (pos < 0) { why[i - 1] = 'missing'; continue; }
+        if (count[i] > 1) { why[i - 1] = 'duplicate'; continue; }
+        const next = marks[pos + 1] || null;
+        if (i < n) { if (!next || next.num !== i + 1) { why[i - 1] = 'merged'; continue; } }
+        else if (next) { why[i - 1] = 'extra'; continue; }
+        if (!next && truncated) { why[i - 1] = 'truncated'; continue; }
+        const body = text.slice(marks[pos].end, next ? next.start : text.length).trim();
+        if (!body) { why[i - 1] = 'empty'; continue; }
+        segs[i - 1] = body;
+    }
+    return { segs: segs, why: why };
+}
+// 拼装一次联合请求（不发）。preps = ovlVisualBlockPrep 的结果数组（都不是 mainNothing）；ctx = 只读上下文或 null；
+// 返回 { prompt, systemPrompt, local }：local 用 system+user 两段式，其它 provider 用单条 prompt + 第 6 参 preamble。
+function ovlP233JointCompose(preps, config, ctx, correction) {
+    const n = preps.length;
+    const flags = {
+        xport: preps.some(function (p) { return p.masked.map.length > 0; }),
+        code: preps.some(function (p) { return p.codeMasked.map.length > 0; }),
+        cite: preps.some(function (p) { return p.citeMasked.map.length > 0; }),
+        textProse: preps.some(function (p) { return p.textProseMasked.items.length > 0; })
+    };
+    const rules = ovlVisualBlockPlaceholderRules(flags);
+    rules.push('输入由 ' + n + ' 段组成，每段以单独一行的分段标记 ' + ovlP233Marker(1) + '…' + ovlP233Marker(n) + ' 开头。输出必须按原顺序对每一段恰好原样保留一次同样的标记行，标记行后面紧跟该段的译文；'
+        + '不得合并、拆分、遗漏、重复或重排各段，不要在各段之间添加任何说明；每段内部的占位符编号各自独立，不要在段与段之间移动占位符。');
+    rules.push('同一个术语在所有段里必须使用同一种译法，并与「只读上下文」中的已有译文和术语表保持一致。');
+    const joined = preps.map(function (p, i) { return ovlP233Marker(i + 1) + '\n' + p.masked.text; }).join('\n\n');
+    const corr = correction ? (correction + '\n\n') : '';
+    const card = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
+    let matchBase = preps.map(function (p) { return p.src; }).join('\n');
+    if (ctx && ctx.matchText) matchBase += '\n' + ctx.matchText;
+    const matched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(matchBase, { cap: 40 }) : [];
+    const termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(matched) : '';
+    const ctxText = ctx && ctx.text ? ctx.text : '';
+    if (config && config.provider === 'local') {
+        const domainHintLine = (!card && typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
+        const allMaps = [], allCites = [];
+        preps.forEach(function (p) { p.masked.map.forEach(function (x) { allMaps.push(x); }); p.citeMasked.map.forEach(function (x) { allCites.push(x); }); });
+        const sysRules = ovlVisualBlockSysRules(rules, allMaps, allCites);
+        let sys = '你是学术论文翻译助手。接下来的用户消息由 ' + n + ' 段待翻译的 LaTeX 片段组成（它们是同一篇论文里相邻的段落），每段以单独一行的分段标记 【【OVLSEG数字】】 开头——'
+            + '请把每一段都翻译成简体中文学术书面语，按原顺序输出并保留每个标记行，不要复述或添加任何其它前后缀。硬性规则：\n'
+            + sysRules.map(function (r, idx) { return (idx + 1) + ') ' + r; }).join('\n') + '\n\n'
+            + corr
+            + (domainHintLine ? (domainHintLine + '\n\n') : '')
+            + (ctxText ? (ctxText + '\n\n') : '')
+            + termsBlock;
+        if (card) sys = card + '\n\n' + sys;
+        return { prompt: joined, systemPrompt: sys, local: true };
+    }
+    const prompt = '你是学术论文翻译助手，下面共有 ' + n + ' 段 LaTeX 片段（它们是同一篇论文里相邻的段落，每段以单独一行的分段标记 【【OVLSEG数字】】 开头），请把每一段都翻译成简体中文学术书面语。硬性规则：\n'
+        + rules.map(function (r, idx) { return (idx + 1) + ') ' + r; }).join('\n') + '\n\n'
+        + corr
+        + '原文（共 ' + n + ' 段）：\n' + joined;
+    const preamble = (card ? card + '\n\n' : '') + ctxText + termsBlock;
+    return { prompt: prompt, systemPrompt: preamble, local: false };
+}
+// 一次联合请求。返回 { raw, finish, truncated }；网络/服务错误原样抛出（含 AbortError）。
+async function ovlP233JointCall(preps, config, signal, ctx, correction, temperature0) {
+    if (typeof ovlProjectHistoryTouchCurrent === 'function') { try { ovlProjectHistoryTouchCurrent(); } catch (e) {} }
+    const comp = ovlP233JointCompose(preps, config, ctx, correction);
+    const callMeta = {};
+    const callOpts = temperature0 ? { temperature: 0 } : null;
+    const raw = comp.systemPrompt
+        ? await callModelPlainText(comp.prompt, config, signal, callMeta, callOpts, comp.systemPrompt)
+        : await callModelPlainText(comp.prompt, config, signal, callMeta, callOpts);
+    return { raw: raw, finish: callMeta.finish, truncated: (callMeta.finish === 'length' || callMeta.truncated === true) };
+}
+
+// ---- 选区 -> 联合重译计划 ----
+// 单个块能不能进联合请求：返回 { why:'' | 'busy' | 'notrans' | 'math' | 'floats', prep }（why 为空 = 可以，prep 是 ovlVisualBlockPrep 的结果）。
+function ovlP233ClassifyBlock(el, src) {
+    // 正在被别的动作处理的块：单块重译/重试/强制翻译/就地编辑回译/本次联合重译自己的忙态，或队列正在翻（inflight）
+    if (el.getAttribute('data-ovl-trans-retrying') === '1' || el.getAttribute('data-ovl-trans-retranslating') === '1'
+        || el.getAttribute('data-ovl-trans-force-translating') === '1' || el.getAttribute('data-ovl-btr-inflight') === '1'
+        || el.getAttribute('data-ovl-trans-inflight') === '1') return { why: 'busy' };
+    // 公式环境 / 表格图等 float 先按源码本身的类别归类（公式块常带「无可译文字」属性，不能被算成「不翻译」）；再看手动/系统打的不翻译标记。
+    const kind = (src == null || !src.trim()) ? '' : ovlP233AtomicKind(src);
+    if (kind === 'float') return { why: 'floats' };
+    if (kind === 'math') return { why: 'math' };
+    if (el.hasAttribute('data-ovl-trans-notrans') || el.hasAttribute('data-ovl-trans-noprose') || el.hasAttribute('data-ovl-trans-forced')) return { why: 'notrans' };
+    if (el.hasAttribute('data-ovl-trans-skipped')) return { why: 'math' };
+    if (src == null || !src.trim()) return { why: 'notrans' };
+    if (kind === 'bib') return { why: 'notrans' };
+    let prep = null;
+    try { prep = ovlVisualBlockPrep(src); } catch (e) { prep = null; }
+    if (!prep || prep.empty) return { why: 'notrans' };
+    if (prep.mainNothing) return { why: 'math' }; // 纯公式/代码/引用（含只剩 \text 散文的）：不送
+    if (src.indexOf('OVLSEG') !== -1) return { why: 'notrans' }; // 源码里碰巧含分段标记字样：不冒险
+    return { why: '', prep: prep };
+}
+// 选区 -> 联合重译计划。返回 { jobs:[{src, prep, els[], chars, attempts, result}], notSent:{math, floats, notrans, busy}, blocks }。
+// jobs 按源码文本去重（孪生段落只请求一次，译文落到所有活块上）；N = jobs.length = 真正送去翻译的段数。
+// srcsIn / clsIn（可选）= 调用方已经算好的各块源码文本 / ovlP233ClassifyBlock 结果（段落分组用，避免重复算）。
+function ovlP233PlanSelection(els, srcsIn, clsIn) {
+    const out = { jobs: [], notSent: { math: 0, floats: 0, notrans: 0, busy: 0 }, blocks: 0 };
+    const list = (els || []).filter(function (b) { return b && b.isConnected; });
+    const srcs = (srcsIn && srcsIn.length === list.length) ? srcsIn : ovlVisualBlocksSrcTexts(list);
+    const byKey = new Map();
+    for (let i = 0; i < list.length; i++) {
+        const el = list[i];
+        out.blocks++;
+        const c = (clsIn && clsIn.length === list.length && clsIn[i]) ? clsIn[i] : ovlP233ClassifyBlock(el, srcs[i]);
+        if (c.why) { out.notSent[c.why === 'x' ? 'notrans' : c.why]++; continue; }
+        const src = srcs[i];
+        let job = byKey.get(src);
+        if (job) { job.els.push(el); continue; }
+        job = { src: src, prep: c.prep, els: [el], chars: c.prep.masked.text.length, attempts: 0, result: null };
+        byKey.set(src, job);
+        out.jobs.push(job);
+    }
+    return out;
+}
+// 连续的 jobs 按 <=12 块 / <=4000 字符切组（一个本身超过字符上限的块自成一组）。
+function ovlP233ChunkJobs(jobs) {
+    const groups = [];
+    let cur = [], chars = 0;
+    for (let i = 0; i < jobs.length; i++) {
+        const j = jobs[i];
+        if (cur.length && (cur.length >= OVL_P233_MAX_BLOCKS || chars + j.chars > OVL_P233_MAX_CHARS)) { groups.push(cur); cur = []; chars = 0; }
+        cur.push(j); chars += j.chars;
+    }
+    if (cur.length) groups.push(cur);
+    return groups;
+}
+function ovlP233AbortError() { const e = new Error('aborted'); e.name = 'AbortError'; return e; }
+function ovlP233CheckAbort(env) { if (env.signal && env.signal.aborted) throw ovlP233AbortError(); }
+// 一轮联合请求：对 jobs 发【一次】联合请求，逐段校验。结果写进 job.round = { ok, tgt, meta } 或 { ok:false, kind:'split'|'validate'|'contam'|'call', reason, err }。
+// 返回 { fatal: '' | 失败分类 }：请求本身遇到「服务不可用/配置类」硬错误时 fatal 非空，调用方不再继续往下烧请求。
+async function ovlP233JointRound(env, jobs, ctx, correction, temperature0) {
+    ovlP233CheckAbort(env);
+    const preps = jobs.map(function (j) { return j.prep; });
+    jobs.forEach(function (j) { j.attempts++; j.round = null; });
+    let res;
+    try {
+        res = await ovlP233JointCall(preps, env.reqCfg, env.signal, ctx, correction, temperature0);
+    } catch (err) {
+        if (err && err.name === 'AbortError') throw err;
+        const reason = ovlVisualTransFailReason(err, {});
+        jobs.forEach(function (j) { j.round = { ok: false, kind: 'call', reason: reason, err: err }; });
+        return { fatal: (ovlVisualTransIsHardFatal(reason) || ovlVisualTransIsTransportFatal(reason)) ? reason : '' };
+    }
+    const sp = ovlP233JointSplit(res.raw, jobs.length, res.truncated);
+    for (let i = 0; i < jobs.length; i++) {
+        const job = jobs[i];
+        if (sp.segs[i] == null) {
+            job.round = { ok: false, kind: 'split', reason: sp.why[i] || 'missing', err: new Error('联合译文按分段标记拆不出这一段（' + (sp.why[i] || 'missing') + '）') };
+            continue;
+        }
+        const jm = {};
+        try {
+            const tgt = await ovlVisualBlockFinish(job.prep, sp.segs[i], env.reqCfg, env.signal, jm);
+            if (ctx) {
+                const why = ovlP233ContamCheck(tgt, job.src, ctx.zh);
+                if (why) throw ovlP233ContamError(why);
+            }
+            jm.ladderLevel = 'L0';
+            job.round = { ok: true, tgt: tgt, meta: jm };
+        } catch (err) {
+            if (err && err.name === 'AbortError') throw err;
+            if (err && err.ovlCtxContaminated) job.round = { ok: false, kind: 'contam', reason: 'contam', err: err };
+            else job.round = { ok: false, kind: 'validate', reason: ovlVisualTransFailReason(err, jm), err: err, meta: jm };
+        }
+    }
+    return { fatal: '' };
+}
+function ovlP233SettleRound(jobs) {
+    jobs.forEach(function (j) {
+        if (j.round && j.round.ok) { j.result = { ok: true, tgt: j.round.tgt, meta: j.round.meta, via: 'joint' }; j.result.meta.attempts = j.attempts; }
+    });
+}
+function ovlP233RoundCorrection(jobs) {
+    const parts = [];
+    if (jobs.some(function (j) { return j.round && j.round.kind === 'split'; })) {
+        parts.push('上一次你的回复没有按要求逐段输出：必须按原顺序对每一段恰好原样输出一次 ' + ovlP233Marker(1) + '、' + ovlP233Marker(2) + ' … 这样的标记行，标记行后面紧跟该段的译文，不得合并、遗漏、重复或重排各段。');
+    }
+    const seen = new Set();
+    jobs.forEach(function (j) {
+        if (j.round && j.round.kind === 'validate' && j.round.reason && !seen.has(j.round.reason) && seen.size < 2) {
+            seen.add(j.round.reason);
+            parts.push(ovlVisualLadderCorrectionText(j.round.reason));
+        }
+    });
+    return parts.join('\n');
+}
+// 一组 jobs 的完整流程（联合 -> 缩小重试 -> 逐块阶梯），结果写进 job.result = { ok, tgt, meta, via:'joint'|'single' } 或 { ok:false, err, meta, via:'kept' }。
+// env = { reqCfg, baseCfg, signal, newZh, makeCtx(jobs)->ctx|null, fatal, retryTransient?, deferWrite? }
+//   env.retryTransient：整组联合请求遇到「瞬时」传输类失败（429/5xx/断网/超时）时，同一组再试一次（对应单块阶梯的 L2：一次瞬断不该让整组直接失败）。
+//   只有没有「还回待翻队列再试」这条自然重试路径的调用方（联合重译选区 / 整篇重译）才开；批量队列失败后块回到待翻，下一圈自然重发。
+async function ovlP233RunGroup(env, group) {
+    if (group.length >= 2) {
+        const ctx1 = env.makeCtx(group);
+        let r1 = await ovlP233JointRound(env, group, ctx1, '', false);
+        if (r1.fatal && env.retryTransient && ovlVisualTransIsTransient(r1.fatal)) r1 = await ovlP233JointRound(env, group, ctx1, '', true);
+        ovlP233SettleRound(group);
+        if (r1.fatal) {
+            env.fatal = r1.fatal;
+            group.forEach(function (j) { if (!j.result) j.result = { ok: false, via: 'kept', err: j.round && j.round.err, meta: { failReason: r1.fatal, attempts: j.attempts } }; });
+            return;
+        }
+        // 第二轮：失败的段缩小重试一次（仍带上下文 + 纠正说明）；串味的段不带上下文重试。
+        const failedAll = group.filter(function (j) { return !j.result; });
+        const plain = failedAll.filter(function (j) { return j.round && j.round.kind !== 'contam'; });
+        const contam = failedAll.filter(function (j) { return j.round && j.round.kind === 'contam'; });
+        const chunks = [];
+        if (plain.length >= 2) {
+            const corr = ovlP233RoundCorrection(plain);
+            if (plain.length === group.length && plain.length > 3) {
+                const half = Math.ceil(plain.length / 2);
+                chunks.push({ jobs: plain.slice(0, half), ctx: true, corr: corr });
+                chunks.push({ jobs: plain.slice(half), ctx: true, corr: corr });
+            } else chunks.push({ jobs: plain, ctx: true, corr: corr });
+        }
+        if (contam.length >= 2) chunks.push({ jobs: contam, ctx: false, corr: '' });
+        for (let c = 0; c < chunks.length; c++) {
+            const ch = chunks[c];
+            if (ch.jobs.length < 2) continue; // 半组只剩一块：直接进逐块阶梯
+            const rr = await ovlP233JointRound(env, ch.jobs, ch.ctx ? env.makeCtx(ch.jobs) : null, ch.corr, true);
+            ovlP233SettleRound(ch.jobs);
+            if (rr.fatal) {
+                env.fatal = rr.fatal;
+                group.forEach(function (j) { if (!j.result) j.result = { ok: false, via: 'kept', err: j.round && j.round.err, meta: { failReason: rr.fatal, attempts: j.attempts } }; });
+                return;
+            }
+        }
+    }
+    // 第三轮：逐块阶梯（带该块自己的上下文；串味过的块不再带上下文）。
+    for (let i = 0; i < group.length; i++) {
+        const job = group[i];
+        if (job.result) continue;
+        ovlP233CheckAbort(env);
+        if (env.fatal) { job.result = { ok: false, via: 'kept', err: job.round && job.round.err, meta: { failReason: env.fatal, attempts: job.attempts } }; continue; }
+        const meta = {};
+        const noCtx = !!(job.round && job.round.kind === 'contam');
+        const ctx = noCtx ? null : env.makeCtx([job]);
+        try {
+            const tgt = await ovlVisualTranslateBlockWithLadder(job.src, env.reqCfg, env.signal, meta, ctx ? { ctx: ctx } : undefined);
+            job.result = { ok: true, tgt: tgt, meta: meta, via: 'single' };
+        } catch (err) {
+            if (err && err.name === 'AbortError') throw err;
+            const reason = meta.failReason || ovlVisualTransFailReason(err, meta);
+            meta.failReason = reason;
+            meta.attempts = (meta.attempts || 0) + job.attempts;
+            job.result = { ok: false, via: 'kept', err: err, meta: meta };
+            if (ovlVisualTransIsHardFatal(reason) || ovlVisualTransIsTransportFatal(reason)) env.fatal = reason;
+        }
+        if (job.result.ok) { job.result.meta.attempts = (job.result.meta.attempts || 0) + job.attempts; }
+    }
+}
+
+// ---- 落地 ----
+function ovlP233ProducerTag(cfg) {
+    try { return (typeof ovlVisualCfgModelTag === 'function') ? ovlVisualCfgModelTag(cfg) : ''; } catch (e) { return ''; }
+}
+// 找回这个任务（同一段源码文本）现在页面上的活块：原来的块还在且文本没变就直接用，否则按源码文本重新找（页面被重渲染过）。
+function ovlP233ResolveLive(st, job) {
+    const ok = function (el) {
+        return el && el.isConnected && !el.hasAttribute('data-ovl-trans-forced') && !el.hasAttribute('data-ovl-trans-notrans') && !el.hasAttribute('data-ovl-trans-noprose')
+            && el.getAttribute('data-ovl-trans-retrying') !== '1' && !(el.getAttribute('data-ovl-trans-retranslating') === '1' && !st.flagged.has(el));
+    };
+    let fast = job.els.length > 0 && job.els.every(ok);
+    if (fast) {
+        const t = ovlVisualBlocksSrcTexts(job.els);
+        fast = t.every(function (s) { return s === job.src; });
+    }
+    if (fast) return job.els.slice();
+    const map = ovlVisualRetransAllIndex(st);
+    const cand = (map && map.get(job.src)) || [];
+    return cand.filter(ok);
+}
+function ovlP233UnflagJob(st, job) {
+    job.els.forEach(function (el) { try { el.removeAttribute('data-ovl-trans-retranslating'); } catch (e) {} });
+    st.flagged.forEach(function (el) { if (!el.isConnected) st.flagged.delete(el); });
+}
+// 一个任务的结果落地（成功）：写缓存 + 清失败态 + 刷块。cfg 是主模型 cfg（缓存 key 永远按它），modelTag 是换模型时的来源标记。
+function ovlP233LandJob(st, env, job) {
+    const r = job.result, meta = r.meta || {};
+    try { ovlVisualTransCachePut(job.src, env.baseCfg, r.tgt, st.fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, job.reqKey, env.deferWrite ? true : undefined, env.modelTag); } catch (e) {}
+    try { ovlVisualFailLogDelete(job.src, env.baseCfg); } catch (e) {}
+    env.newZh.set(job.src, r.tgt);
+    let landed = 0;
+    if (env.canLand()) {
+        ovlP233ResolveLive(st, job).forEach(function (el) {
+            el.removeAttribute('data-ovl-trans-pending');
+            el.removeAttribute('data-ovl-trans-inflight');
+            el.removeAttribute('data-ovl-trans-failed');
+            el.removeAttribute('data-ovl-trans-fail-reason');
+            el.removeAttribute('data-ovl-trans-fail-detail');
+            el.removeAttribute('data-ovl-trans-attempts');
+            if (typeof ovlVisualRemoveRetryBadge === 'function') ovlVisualRemoveRetryBadge(el);
+            if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta); else if (meta.partial) el.setAttribute('data-ovl-trans-partial', '1'); else el.removeAttribute('data-ovl-trans-partial');
+            if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta);
+            ovlVisualApplyTranslatedHtml(el, r.tgt);
+            if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; }
+            if (!env.modelTag || (!meta.skipped && !meta.partial && meta.ladderLevel !== 'raw')) ovlVisualApplyModelMark(el, env.modelTag || ovlP233ProducerTag(env.baseCfg));
+            if (typeof ovlVisualLoadFigureThumbnails === 'function') { try { ovlVisualLoadFigureThumbnails(el); } catch (e) {} }
+            if (st.taken && st.taken.has(el)) { st.taken.delete(el); OvlVisualLangState.done = Math.min(OvlVisualLangState.total, OvlVisualLangState.done + 1); }
+            landed++;
+        });
+        if (landed && typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') ovlScheduleVisualGutterAfterImage();
+    }
+    return landed;
+}
+// 一个任务最终没译出来：已有译文的块【保持原样】（不打失败角标、不写 failLog）；联合重译接管过的「待翻」块没有旧译文可保留，
+// 必须落成跟队列 worker 失败时一样的可见失败态（角标 + failLog），不能让英文悄无声息地留在原地。
+function ovlP233FailJob(st, env, job) {
+    const r = job.result || {}, meta = r.meta || {};
+    const reason = meta.failReason || ovlVisualTransFailReason(r.err, meta);
+    job.els.forEach(function (el) {
+        if (!st.taken.has(el)) return;
+        st.taken.delete(el);
+        el.removeAttribute('data-ovl-trans-inflight');
+        if (!el.isConnected) return;
+        OvlVisualLangState.done = Math.min(OvlVisualLangState.total, OvlVisualLangState.done + 1);
+        if (st.stopped) { el.setAttribute('data-ovl-trans-pending', '1'); return; } // 用户停止：还回待翻队列，不记失败
+        el.setAttribute('data-ovl-trans-failed', '1');
+        el.setAttribute('data-ovl-trans-fail-reason', reason);
+        const prev = parseInt(el.getAttribute('data-ovl-trans-attempts'), 10) || 0;
+        const total = prev + (meta.attempts || 1);
+        el.setAttribute('data-ovl-trans-attempts', String(total));
+        if (typeof ovlVisualFailLogSet === 'function') ovlVisualFailLogSet(job.src, env.baseCfg, { reason: reason, attempts: total, detail: (r.err && r.err.message) || String(r.err || ''), echoCandidate: meta.echoCandidate, ladderLevel: meta.ladderLevel });
+        if (typeof ovlVisualEnsureRetryBadge === 'function') ovlVisualEnsureRetryBadge(el, { reason: reason, attempts: total, detail: (r.err && r.err.message) || String(r.err || ''), echoCandidate: meta.echoCandidate });
+    });
+    if (typeof ovlScheduleVisualGutterAfterImage === 'function' && OvlState.editorMode === 'visual') ovlScheduleVisualGutterAfterImage();
+}
+function ovlP233Stop() {
+    const st = OvlP233Run;
+    if (!st || st.stopped) return;
+    st.stopped = true;
+    st.controllers.forEach(function (c) { try { c.abort(); } catch (e) {} });
+    try { ovlVisualLangProgressUpdate(); } catch (e) {}
+    try { ovlQaRenderJoint(); } catch (e) {}
+}
+function ovlP233NotSentText(ns) {
+    const parts = [];
+    if (ns.math) parts.push('纯公式 ' + ns.math);
+    if (ns.floats) parts.push('表格/图/算法 ' + ns.floats);
+    if (ns.notrans) parts.push('不翻译/无可译文字/已手动采用 ' + ns.notrans);
+    if (ns.busy) parts.push('正在处理 ' + ns.busy);
+    return parts.length ? ('；未发送：' + parts.join('、')) : '';
+}
+// 主入口：els = 选区覆盖的 #ovlVisualPane 里的块；override = 「重译」下拉里选的 { provider, model }（跟随主模型则为空）。
+async function ovlP233RunSelection(els, override) {
+    if (OvlP233Run) return;
+    if (OvlP232RetransAll) { try { showToast('「用当前模型重译全文」进行中，等它结束或先点进度行停止，再做联合重译。', 'warning'); } catch (e) {} return; }
+    if (OvlState.editorMode !== 'visual' || (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare')) return;
+    if (OvlSettings.visualTranslate === 'off') return;
+    let cfg = null;
+    try { cfg = getApiConfig(); } catch (e) { cfg = null; }
+    if (!cfg) return;
+    const plan = ovlP233PlanSelection(els);
+    if (!plan.jobs.length) { try { showToast('选中的块里没有可以联合重译的内容' + ovlP233NotSentText(plan.notSent), 'info'); } catch (e) {} return; }
+    // 与 P223/P231 完全相同的 override 规则：cfg 永远是主模型（缓存/failLog 的 key 按它算），只有请求用 reqCfg；与主模型相同当作没有 override。
+    const ov = ovlRetransApplyOverride(cfg, override, '重译');
+    if (!ov.ok) return;
+    const mySeq = OvlVisualLangState.seq;
+    let fixedProjectId;
+    try { fixedProjectId = ovlVisualTransCacheProjectId(); } catch (e) { fixedProjectId = null; }
+    const controller = new AbortController();
+    const st = { total: plan.jobs.length, done: 0, together: 0, single: 0, kept: 0, stopped: false, seq: mySeq, controllers: new Set([controller]),
+        flagged: new Set(), taken: new Set(), idx: null, fixedProjectId: fixedProjectId, notSent: plan.notSent, fatal: '' };
+    OvlP233Run = st;
+    OvlVisualLangState.adhocControllers.push(controller);
+    plan.jobs.forEach(function (job) {
+        job.els.forEach(function (el) {
+            el.setAttribute('data-ovl-trans-retranslating', '1');
+            st.flagged.add(el);
+            if (el.getAttribute('data-ovl-trans-pending') === '1') { // 待翻块：接管（跟队列 worker 领块同一手法），完成后计入进度
+                el.removeAttribute('data-ovl-trans-pending');
+                el.setAttribute('data-ovl-trans-inflight', '1');
+                st.taken.add(el);
+            }
+        });
+        try { job.reqKey = ovlVisualTransCacheKey(job.src, cfg); } catch (e) { job.reqKey = null; }
+    });
+    try { ovlVisualLangProgressUpdate(); } catch (e) {}
+    try { ovlQaRenderJoint(); } catch (e) {}
+    const newZh = new Map();
+    // deferWrite：一组落地多块 = 多次 Put，走 P215 回写缓存（收工 finally 的 ovlVisualTransCacheWbFlush 一次落盘），不每块整桶写一次；retryTransient 见 ovlP233RunGroup 头部注释。
+    const env = { reqCfg: ov.transCfg, baseCfg: cfg, modelTag: ov.modelTag, signal: controller.signal, newZh: newZh, fatal: '', deferWrite: true, retryTransient: true,
+        canLand: function () {
+            try {
+                if (OvlState.editorMode !== 'visual') return false;
+                if (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare') return false;
+                return ovlVisualTransCacheProjectId() === fixedProjectId;
+            } catch (e) { return false; }
+        } };
+    env.makeCtx = function (jobs) {
+        const first = ovlP233LiveEl(st, jobs[0], false), last = ovlP233LiveEl(st, jobs[jobs.length - 1], true);
+        return ovlP233Ctx({ pane: document.getElementById('ovlVisualPane'), firstEl: first, lastEl: last, cfg: cfg, newZh: newZh,
+            neighbours: true, excludeSrcs: jobs.map(function (j) { return j.src; }) }); // 手动联合重译：邻居上下文始终开（与自动开关无关）；翻译参考照常附上
+    };
+    const groups = ovlP233ChunkJobs(plan.jobs);
+    let aborted = false;
+    try {
+        for (let gi = 0; gi < groups.length; gi++) {
+            if (st.stopped || mySeq !== OvlVisualLangState.seq) { aborted = true; break; }
+            const group = groups[gi];
+            await ovlP233RunGroup(env, group);
+            if (st.stopped || mySeq !== OvlVisualLangState.seq) { aborted = true; break; } // 本组结果在停止后才齐：整组丢弃，保持旧译文
+            group.forEach(function (job) {
+                if (job.result && job.result.ok) { ovlP233LandJob(st, env, job); if (job.result.via === 'joint') st.together++; else st.single++; }
+                else { st.kept++; ovlP233FailJob(st, env, job); }
+                st.done++;
+                job.done = true;
+                ovlP233UnflagJob(st, job);
+            });
+            try { ovlVisualLangProgressUpdate(); ovlQaRenderJoint(); } catch (e) {}
+            if (env.fatal) break;
+        }
+    } catch (err) {
+        if (!(err && err.name === 'AbortError')) console.error('[ovl] joint retranslate failed', err);
+        aborted = true;
+    } finally {
+        // 没跑完 / 被停止的任务：保持旧译文，接管过的待翻块还回待翻队列。
+        plan.jobs.forEach(function (job) {
+            if (job.done) return;
+            if (job.els.some(function (el) { return el.getAttribute('data-ovl-trans-retranslating') === '1'; })) ovlP233UnflagJob(st, job);
+        });
+        st.taken.forEach(function (el) {
+            el.removeAttribute('data-ovl-trans-inflight');
+            if (el.isConnected) el.setAttribute('data-ovl-trans-pending', '1');
+        });
+        st.taken.clear();
+        st.flagged.forEach(function (el) { try { el.removeAttribute('data-ovl-trans-retranslating'); } catch (e) {} });
+        const ix = OvlVisualLangState.adhocControllers.indexOf(controller);
+        if (ix !== -1) OvlVisualLangState.adhocControllers.splice(ix, 1);
+        try { ovlVisualTransCacheWbFlush(); } catch (e) {}
+        if (OvlP233Run === st) OvlP233Run = null;
+        try { ovlVisualLangProgressUpdate(); ovlQaRenderJoint(); } catch (e) {}
+        try {
+            const left = st.total - st.together - st.single - st.kept;
+            const nsText = ovlP233NotSentText(st.notSent);
+            if (st.stopped || aborted) {
+                showToast('已停止联合重译：已完成 ' + (st.together + st.single) + ' 块（联合 ' + st.together + '、逐块 ' + st.single + '），其余 ' + (st.kept + left) + ' 块保留旧译文' + nsText, 'warning');
+            } else if (st.kept || env.fatal) {
+                showToast('联合重译完成：共 ' + st.total + ' 块——联合 ' + st.together + '、逐块 ' + st.single + '、保留旧译文 ' + (st.kept + left) + (env.fatal ? '（服务不可用：' + ovlVisualTransFatalLabel(env.fatal) + '）' : '') + nsText, 'warning');
+            } else {
+                showToast('联合重译完成：共 ' + st.total + ' 块——联合 ' + st.together + '、逐块 ' + st.single + '、保留旧译文 0' + nsText, 'success');
+            }
+        } catch (e) {}
+    }
+}
+// 取任务现在页面上第一个/最后一个活块（用来定位上下文）。
+function ovlP233LiveEl(st, job, last) {
+    const live = (job.els || []).filter(function (el) { return el && el.isConnected; });
+    if (live.length) return last ? live[live.length - 1] : live[0];
+    const map = ovlVisualRetransAllIndex(st);
+    const cand = ((map && map.get(job.src)) || []).filter(function (el) { return el.isConnected; });
+    return cand.length ? (last ? cand[cand.length - 1] : cand[0]) : null;
+}
+
+// ---- 弹窗 UI：「重译选中 N 块（联系上下文）」----
+// 选区覆盖 >=2 个块（gutter 拖选 / 镜像 gutter 拖选 / 文字跨块拖选）、Visual 的中文或对照模式、且没把「选中即译」关掉时，行号弹窗里多出一个独立盒子
+// #ovlQaJoint：按钮 + 与「重译/重试」同一份的模型下拉（共用 OvlSettings.visualRetranslateModel）。独立的 data-qaj 委托，点了不关弹窗。
+function ovlQaRenderJoint() {
+    const box = document.getElementById('ovlQaJoint');
+    if (!box) return;
+    const hide = function () { box.hidden = true; box.innerHTML = ''; };
+    if (OvlP233Run && OvlQaState.source === 'visual') {
+        box.hidden = false;
+        box.innerHTML = '<span class="ovl-qa-state-label">联合重译中 ' + OvlP233Run.done + '/' + OvlP233Run.total + '…</span>'
+            + '<button type="button" class="ovl-qa-state-btn" data-qaj="stop" data-tip="停止联合重译（保留旧译文）" data-tip-pos="top">停止</button>';
+        ovlQaFitToViewport();
+        return;
+    }
+    const els = OvlQaState.visualBlockEls;
+    const eligible = OvlQaState.source === 'visual' && OvlState.editorMode === 'visual'
+        && (OvlVisualLangState.lang === 'zh' || OvlVisualLangState.lang === 'compare')
+        && OvlSettings.visualTranslate !== 'off' && Array.isArray(els) && els.length >= 2
+        && !(OvlState.viewMode === 'bilingual' && OvlState.bilingualSwapped);
+    if (!eligible) { hide(); return; }
+    const plan = ovlP233PlanSelection(els);
+    if (!plan.jobs.length) { hide(); return; }
+    box.hidden = false;
+    box.innerHTML = '<button type="button" class="ovl-qa-state-btn" data-qaj="start" data-tip="'
+        + escapeAttr('把选中的 ' + plan.jobs.length + ' 块作为一次请求联合重译，让模型联系上下文、同一术语译法一致' + ovlP233NotSentText(plan.notSent).replace('；', '。')) + '" data-tip-pos="top">'
+        + escapeHtml('重译选中 ' + plan.jobs.length + ' 块（联系上下文）') + '</button>'
+        + ovlRetransPickerHtml(false);
+    ovlLocalModelMetaMaybeRefresh();
+    ovlQaFitToViewport();
+}
+function ovlBindQaJoint() {
+    const box = document.getElementById('ovlQaJoint');
+    if (!box) return;
+    ovlRetransPickerBindChange(box);
+    box.addEventListener('click', function (e) {
+        const btn = e.target.closest('[data-qaj]');
+        if (!btn || btn.disabled) return;
+        e.stopPropagation();
+        const key = btn.getAttribute('data-qaj');
+        if (key === 'stop') { ovlP233Stop(); return; }
+        if (key === 'start') {
+            const els = (OvlQaState.visualBlockEls || []).filter(function (el) { return el && el.isConnected; });
+            const ov = ovlRetransPickerOverrideFrom(box);
+            const p = ov ? ovlP233RunSelection(els, ov) : ovlP233RunSelection(els);
+            ovlQaRenderJoint();
+            Promise.resolve(p).then(ovlQaRenderJoint).catch(function () { ovlQaRenderJoint(); });
+        }
+    });
+}
+// 文字拖选跨块：返回选区里【真有文字】的块（只在边缘碰到的块不算）。
+function ovlP233BlocksInRange(pane, range) {
+    const out = [];
+    try {
+        const blocks = pane.querySelectorAll('.ovl-visual-block');
+        for (let i = 0; i < blocks.length; i++) {
+            const b = blocks[i];
+            if (!range.intersectsNode(b)) continue;
+            const br = document.createRange();
+            br.selectNodeContents(b);
+            const sCmp = range.compareBoundaryPoints(Range.START_TO_START, br);
+            const eCmp = range.compareBoundaryPoints(Range.END_TO_END, br);
+            const rr = document.createRange();
+            rr.setStart(sCmp > 0 ? range.startContainer : br.startContainer, sCmp > 0 ? range.startOffset : br.startOffset);
+            rr.setEnd(eCmp < 0 ? range.endContainer : br.endContainer, eCmp < 0 ? range.endOffset : br.endOffset);
+            if (rr.toString().trim()) out.push(b);
+        }
+    } catch (e) {}
+    return out;
+}
+// 双语视图里在镜像 gutter 上拖选了 >=2 个块：把对侧（编辑器面板，显示译文的那一侧）按 data-src-line 对应的块选中并弹出工具条。
+// 之前镜像 gutter 拖选结束不弹任何东西；只有拖成多块才弹，单击行为完全不变。交换左右（译文在镜像侧）时不做。
+let OvlP233MirrorJointAt = 0;
+function ovlP233MirrorJointArmedTake() {
+    const ok = OvlP233MirrorJointAt > 0 && (Date.now() - OvlP233MirrorJointAt) < 1500;
+    OvlP233MirrorJointAt = 0;
+    return ok;
+}
+function ovlP233MirrorShowJoint() {
+    OvlP233MirrorJointAt = 0;
+    try {
+        if (OvlState.viewMode !== 'bilingual' || OvlState.bilingualSwapped || OvlState.editorMode !== 'visual') return;
+        if (OvlSettings.visualTranslate === 'off') return;
+        const a = OvlGutterSelMirror.anchorBlock, h = OvlGutterSelMirror.headBlock;
+        if (a < 0 || h < 0 || a === h) return;
+        const lo = Math.min(a, h), hi = Math.max(a, h);
+        const right = document.getElementById('ovlVisualPaneMirror'), left = document.getElementById('ovlVisualPane');
+        if (!right || !left) return;
+        const rBlocks = right.querySelectorAll('.ovl-visual-block[data-src-line]');
+        const els = [];
+        for (let i = lo; i <= hi; i++) {
+            const rb = rBlocks[i];
+            if (!rb) continue;
+            const found = ovlBilingualBlockRangeForStart(left, parseInt(rb.getAttribute('data-src-line'), 10));
+            if (found && found.el && els.indexOf(found.el) === -1) els.push(found.el);
+        }
+        if (els.length < 2) return;
+        const range = document.createRange();
+        range.setStartBefore(els[0]);
+        range.setEndAfter(els[els.length - 1]);
+        const sel = ovlWinOf(left).getSelection();
+        sel.removeAllRanges();
+        sel.addRange(range);
+        const r = range.getBoundingClientRect();
+        const gutter = document.getElementById('ovlGutter');
+        const minX = gutter ? gutter.getBoundingClientRect().right + 8 : 8;
+        ovlShowQuickActionsAt(Math.max(r.left + 20, minX), Math.max(r.top, 36), 'visual', null, els);
+        OvlP233MirrorJointAt = Date.now();
+    } catch (e) {}
+}
+
+
+// ==================== v2 Pass P233（Stage B）：翻译时自动联系上下文 + 「翻译参考」 ====================
+// 设置 OvlSettings.visualAutoContext（默认开）：
+//   · 开：队列 / 「用当前模型重译全文」里同一个 LaTeX 段落中连续的待翻正文行合成一次联合请求（沿用 Stage A 的联合机制与上限）；
+//         单独翻一块（单块重译 / 重试、孤立的被编辑行、联合失败后的逐块兜底）带上 Stage A 的只读上下文（邻居的中文译文 + 章节标题）。
+//   · 关：所有请求体与 P233 之前逐字节一致（只有用户亲手触发的 Stage A 联合重译、「翻译参考」例外）。
+// 「翻译参考」：用户手动固定的块，之后本项目里每次 Visual 翻译请求都附上它们的「原文 + 现有译文」对照；开关无关。
+function ovlP233AutoOn() { try { return OvlSettings.visualAutoContext !== false; } catch (e) { return true; } }
+
+// ---- 翻译参考（手动固定，按项目存，按源码文本为键）----
+const OVL_P233_PINS_KEY = 'ovl.visualPinsByProject';   // { [projectId]: [{ src, ts }] }，数组顺序 = 固定的先后（最前 = 最早）
+const OVL_P233_PIN_CAP_CHARS = 1500;                   // 一次请求里翻译参考（原文 + 译文）总量上限
+const OVL_P233_PIN_SRC_MAX = 1200;                     // 单块原文超过这个长度不能固定（一块就占满预算没有意义）
+const OVL_P233_PIN_MAX = 40;                           // 每个项目最多留 40 条（超出丢最早的）
+let OvlP233PinNotified = '';                           // 上一次「超上限已省略」提示的签名（同一组 pins 不重复弹）
+function ovlP233PinsAll() {
+    try {
+        const raw = localStorage.getItem(OVL_P233_PINS_KEY);
+        const o = raw ? JSON.parse(raw) : null;
+        return (o && typeof o === 'object' && !Array.isArray(o)) ? o : {};
+    } catch (e) { return {}; }
+}
+function ovlP233PinsGet() {
+    try {
+        const l = ovlP233PinsAll()[ovlVisualTransCacheProjectId()];
+        return Array.isArray(l) ? l.filter(function (p) { return p && typeof p.src === 'string' && p.src; }) : [];
+    } catch (e) { return []; }
+}
+function ovlP233PinsPut(list) {
+    try {
+        const all = ovlP233PinsAll();
+        const pid = ovlVisualTransCacheProjectId();
+        if (list.length) all[pid] = list; else delete all[pid];
+        localStorage.setItem(OVL_P233_PINS_KEY, JSON.stringify(all));
+        OvlP233PinNotified = '';
+        return true;
+    } catch (e) { return false; }
+}
+// 哪些块能当翻译参考：有源码的正文块（不是公式 / 表格图算法 / 参考文献 / 不翻译 / 无可译文字），且源码不太长。
+function ovlP233PinEligible(el, src) {
+    if (!el || src == null || !src.trim()) return false;
+    if (el.hasAttribute('data-ovl-trans-notrans') || el.hasAttribute('data-ovl-trans-noprose') || el.hasAttribute('data-ovl-trans-skipped')) return false;
+    if (ovlP233AtomicKind(src) || ovlP233HeadingTitle(src) !== null) return false;
+    if (src.length > OVL_P233_PIN_SRC_MAX || src.indexOf('OVLSEG') !== -1) return false;
+    return true;
+}
+// 弹窗打开那一刻对应的块：多块选区 > 单击行号的块 > 当前文字选区碰到的块。
+function ovlP233PinTargetsNow() {
+    const pane = document.getElementById('ovlVisualPane');
+    if (!pane) return [];
+    let els = [];
+    if (OvlQaState.visualBlockEls && OvlQaState.visualBlockEls.length) els = OvlQaState.visualBlockEls;
+    else if (OvlQaState.visualBlockEl) els = [OvlQaState.visualBlockEl];
+    else {
+        try {
+            const sel = ovlWinOf(pane).getSelection();
+            if (sel && sel.rangeCount && !sel.isCollapsed) els = ovlP233BlocksInRange(pane, sel.getRangeAt(0));
+        } catch (e) {}
+    }
+    return els.filter(function (b) { return b && b.isConnected && pane.contains(b); });
+}
+function ovlP233PinMarkAll() {
+    const pane = document.getElementById('ovlVisualPane');
+    if (!pane) return;
+    const pins = ovlP233PinsGet();
+    const old = pane.querySelectorAll('.ovl-visual-block[data-ovl-pin]');
+    if (!pins.length) { for (let i = 0; i < old.length; i++) old[i].removeAttribute('data-ovl-pin'); return; }
+    const set = new Set(pins.map(function (p) { return p.src; }));
+    const blocks = pane.querySelectorAll('.ovl-visual-block');
+    const srcs = ovlVisualBlocksSrcTexts(blocks);
+    for (let i = 0; i < blocks.length; i++) {
+        if (srcs[i] != null && set.has(srcs[i])) blocks[i].setAttribute('data-ovl-pin', '1');
+        else blocks[i].removeAttribute('data-ovl-pin');
+    }
+}
+// 弹窗打开时同步「翻译参考」复选框：勾选 = 选区里所有可固定的块都已固定。
+function ovlP233PinSync(qa) {
+    const lab = qa ? qa.querySelector('.ovl-qa-pin') : null;
+    if (!lab) return;
+    const inp = lab.querySelector('input[type="checkbox"]');
+    OvlQaState.pinEls = null;
+    if (!inp || OvlQaState.source !== 'visual') return;
+    const els = ovlP233PinTargetsNow();
+    OvlQaState.pinEls = els;
+    const srcs = ovlVisualBlocksSrcTexts(els);
+    const set = new Set(ovlP233PinsGet().map(function (p) { return p.src; }));
+    let n = 0, pinned = 0;
+    for (let i = 0; i < els.length; i++) {
+        if (!ovlP233PinEligible(els[i], srcs[i])) continue;
+        n++;
+        if (set.has(srcs[i])) pinned++;
+    }
+    const on = n > 0 && pinned === n;
+    inp.checked = on;
+    lab.classList.toggle('is-on', on);
+}
+function ovlP233PinToggle(input) {
+    try {
+        const els = (OvlQaState.pinEls || []).filter(function (b) { return b && b.isConnected; });
+        const srcs = ovlVisualBlocksSrcTexts(els);
+        const want = !!(input && input.checked);
+        const pick = [];
+        let tooLong = 0;
+        for (let i = 0; i < els.length; i++) {
+            const s = srcs[i];
+            if (s != null && s.length > OVL_P233_PIN_SRC_MAX) { tooLong++; continue; }
+            if (ovlP233PinEligible(els[i], s) && pick.indexOf(s) === -1) pick.push(s);
+        }
+        if (!pick.length) {
+            if (input) input.checked = false;
+            try { showToast(tooLong ? ('这块的原文超过 ' + OVL_P233_PIN_SRC_MAX + ' 字符，不能作为翻译参考。') : '选中的内容里没有可以作为翻译参考的正文块（公式、表格/图、不翻译的块不行）。', 'warning'); } catch (e) {}
+            return;
+        }
+        let list = ovlP233PinsGet();
+        if (want) {
+            const have = new Set(list.map(function (p) { return p.src; }));
+            const t = Date.now();
+            pick.forEach(function (s, k) { if (!have.has(s)) list.push({ src: s, ts: t + k }); });
+            if (list.length > OVL_P233_PIN_MAX) list = list.slice(list.length - OVL_P233_PIN_MAX);
+        } else {
+            const rm = new Set(pick);
+            list = list.filter(function (p) { return !rm.has(p.src); });
+        }
+        if (!ovlP233PinsPut(list)) { if (input) input.checked = !want; try { showToast('保存翻译参考失败（浏览器存储不可用）。', 'error'); } catch (e) {} return; }
+        ovlP233PinMarkAll();
+        const lab = input ? input.closest('.ovl-qa-pin') : null;
+        if (lab) lab.classList.toggle('is-on', want);
+        if (want && tooLong) { try { showToast('有 ' + tooLong + ' 块原文太长（超过 ' + OVL_P233_PIN_SRC_MAX + ' 字符），没有固定。', 'info'); } catch (e) {} }
+    } catch (e) { console.error('[ovl] pin toggle failed', e); }
+}
+// 设置里的「清空翻译参考」：按钮文字里带当前项目的条数。参考按源码文本存；源码被改过的块留下的旧参考在页面上没有任何可见标记、也没法逐条取消，
+// 但只要缓存里还有它旧源码的译文，就会继续被带进每个请求——所以需要一个总的清空入口。
+function ovlP233PinsClearLabel() { const n = ovlP233PinsGet().length; return n ? ('清空本项目的翻译参考（' + n + ' 条）') : '本项目没有翻译参考'; }
+function ovlP233PinsClearAll() {
+    const n = ovlP233PinsGet().length;
+    if (!n) { try { showToast('这个项目里没有翻译参考。', 'info'); } catch (e) {} return; }
+    ovlConfirmDialog({
+        title: '清空翻译参考？',
+        message: '将清空当前项目的 ' + n + ' 条翻译参考（原文 + 译文对照）。之后的翻译请求不再带它们；已有译文和其它项目的翻译参考都不受影响。',
+        confirmLabel: '清空 ' + n + ' 条',
+        onConfirm: function () {
+            if (!ovlP233PinsPut([])) { try { showToast('清空翻译参考失败（浏览器存储不可用）。', 'error'); } catch (e) {} return; }
+            try { ovlP233PinMarkAll(); } catch (e) {}
+            const btn = document.getElementById('ovlP233PinsClearBtn');
+            if (btn) { btn.textContent = ovlP233PinsClearLabel(); btn.disabled = true; }
+            try { showToast('已清空本项目的 ' + n + ' 条翻译参考。', 'success'); } catch (e) {}
+        }
+    });
+}
+function ovlP233Squeeze(s) { return String(s == null ? '' : s).replace(/\s*\n\s*/g, ' ').replace(/[ \t]{2,}/g, ' ').trim(); }
+// 翻译参考 -> 只读上下文片段：{ text, zh:[...], matchText, trimmed } 或 null。
+// excludeSrcs = 本次正在翻译的块的源码（自己不当自己的参考）。总量 <= OVL_P233_PIN_CAP_CHARS（原文 + 译文），最新的优先、最早的先丢。
+function ovlP233PinsContext(cfg, excludeSrcs, newZh) {
+    try {
+        const pins = ovlP233PinsGet();
+        if (!pins.length) return null;
+        const ex = new Set(excludeSrcs || []);
+        const kept = [];
+        let total = 0, trimmed = 0, full = false;
+        const zhOf = ovlP233ZhLookup(cfg, newZh);
+        {
+            for (let i = pins.length - 1; i >= 0; i--) {
+                const p = pins[i];
+                if (ex.has(p.src)) continue;
+                const zh = zhOf(p.src);
+                if (!zh) continue; // 还没有译文的参考没有对照可给
+                const s1 = ovlP233Squeeze(p.src), z1 = ovlP233Squeeze(zh);
+                const len = s1.length + z1.length;
+                if (full || len > OVL_P233_PIN_CAP_CHARS) { trimmed++; continue; }
+                if (total + len > OVL_P233_PIN_CAP_CHARS) { full = true; trimmed++; continue; }
+                total += len;
+                kept.unshift({ src: s1, zh: z1, zhFull: zh, srcRaw: p.src });
+            }
+        }
+        if (!kept.length) return null;
+        const lines = [];
+        lines.push('【参考对照】下面是用户指定的「翻译参考」：同一篇论文里已经确认的英文原文与中文译文对照，只用来让你的术语、措辞和风格与之保持一致。它们不是待翻译的内容：不要翻译它们、不要复述它们、不要把其中任何文字写进你的译文。');
+        kept.forEach(function (k, i) {
+            lines.push('参考' + (i + 1) + ' 原文：' + k.src);
+            lines.push('参考' + (i + 1) + ' 译文：' + k.zh);
+        });
+        if (trimmed > 0) {
+            const sig = pins.length + ':' + trimmed + ':' + kept.length + ':' + (pins[pins.length - 1].ts || 0);
+            if (sig !== OvlP233PinNotified) {
+                OvlP233PinNotified = sig;
+                try { showToast('翻译参考超过 ' + OVL_P233_PIN_CAP_CHARS + ' 字的上限：本次请求只带了最近的 ' + kept.length + ' 条，较早的 ' + trimmed + ' 条被省略。', 'info'); } catch (e) {}
+            }
+        }
+        return { text: lines.join('\n'), zh: kept.map(function (k) { return k.zhFull; }), matchText: kept.map(function (k) { return k.srcRaw; }).join('\n'), trimmed: trimmed };
+    } catch (e) { return null; }
+}
+// 统一的上下文出口：邻居译文 + 章节标题（o.neighbours 为真时）与翻译参考（始终）合并；两者都没有 => null（请求体与 P233 之前逐字节一致）。
+// o = { pane, firstEl, lastEl, cfg（主模型 cfg）, newZh, neighbours, excludeSrcs }
+function ovlP233Ctx(o) {
+    const base = o.neighbours ? ovlP233BuildContext(o) : null;
+    const pins = ovlP233PinsContext(o.cfg, o.excludeSrcs, o.newZh);
+    if (!base && !pins) return null;
+    if (!pins) return base;
+    if (!base) return { text: pins.text, zh: pins.zh, matchText: pins.matchText };
+    return { text: base.text + '\n\n' + pins.text, zh: base.zh.concat(pins.zh), matchText: base.matchText + '\n' + pins.matchText };
+}
+// 单块请求的第 5 参数（opts）：无上下文可给时原样返回 opts（调用形状与 P233 之前完全一样）。
+function ovlP233SingleOpts(el, cfg, opts, src, noNeighbours) {
+    try {
+        const ctx = ovlP233Ctx({ pane: document.getElementById('ovlVisualPane'), firstEl: el, lastEl: el, cfg: cfg, newZh: null,
+            neighbours: !noNeighbours && ovlP233AutoOn(), excludeSrcs: [src] });
+        if (!ctx) return opts;
+        return Object.assign({}, opts || null, { ctx: ctx });
+    } catch (e) { return opts; }
+}
+
+// ---- 段落分组 ----
+// 同一个 LaTeX 段落 = 同一顶层块（ovlSplitVisualBlocks 已按空行 / 标题 / 环境边界切开）里按源码行细分出来的连续子块：
+// 后续行 data-para-start="0" 且源码行首尾相接。再排除以 \begin / \end / \item / \caption / \label / 分节命令等开头的行（它们是边界，不并进段落）。
+const OVL_P233_PARA_STOP_RE = /^\s*\\(?:begin|end|item|caption|label|bibitem|bibliography|bibliographystyle|input|include|newpage|clearpage|appendix|maketitle|tableofcontents|usepackage|documentclass|title|author|date|part|chapter|section|subsection|subsubsection|paragraph|subparagraph)\b/;
+function ovlP233IsBlockEl(b) { return !!(b && b.classList && b.classList.contains('ovl-visual-block')); }
+function ovlP233ParaBlocks(el) {
+    const num = function (b, k) { return parseInt(b.getAttribute(k), 10); };
+    const out = [el];
+    let cur = el;
+    while (cur.getAttribute('data-para-start') === '0') {
+        const prev = cur.previousElementSibling;
+        if (!ovlP233IsBlockEl(prev) || !(num(prev, 'data-src-line-end') + 1 === num(cur, 'data-src-line'))) break;
+        out.unshift(prev); cur = prev;
+    }
+    cur = el;
+    for (;;) {
+        const next = cur.nextElementSibling;
+        if (!ovlP233IsBlockEl(next) || next.getAttribute('data-para-start') !== '0' || !(num(next, 'data-src-line') === num(cur, 'data-src-line-end') + 1)) break;
+        out.push(next); cur = next;
+    }
+    return out;
+}
+// 队列：取出 el（队列头）所在段落里、含 el 的那一段连续「待翻 + 可联合」的块，按 12 块 / 4000 字符切组，返回含 el 的那一组（>= 2 块）；
+// 取不到返回 null（el 走原来的单块路径）。成功时同步把这一组的块从 pending 改成 inflight（跟 worker 领块同一手法，中间没有 await）。
+function ovlP233QueueTake(el, cfg) {
+    try {
+        const run = ovlP233ParaBlocks(el);
+        if (run.length < 2) return null;
+        const srcs = ovlVisualBlocksSrcTexts(run);
+        const cls = run.map(function (b, i) {
+            const s = srcs[i];
+            if (b.getAttribute('data-ovl-trans-pending') !== '1' || s == null || !s.trim() || OVL_P233_PARA_STOP_RE.test(s) || ovlP233HeadingTitle(s) !== null) return { why: 'x' };
+            return ovlP233ClassifyBlock(b, s);
+        });
+        const i0 = run.indexOf(el);
+        if (cls[i0].why) return null;
+        let lo = i0, hi = i0;
+        while (lo > 0 && !cls[lo - 1].why) lo--;
+        while (hi < run.length - 1 && !cls[hi + 1].why) hi++;
+        if (hi <= lo) return null;
+        const plan = ovlP233PlanSelection(run.slice(lo, hi + 1), srcs.slice(lo, hi + 1), cls.slice(lo, hi + 1));
+        const groups = ovlP233ChunkJobs(plan.jobs);
+        let jobs = null;
+        for (let g = 0; g < groups.length && !jobs; g++) {
+            if (groups[g].some(function (j) { return j.els.indexOf(el) !== -1; })) jobs = groups[g];
+        }
+        if (!jobs || jobs.length < 2) return null;
+        const st = { flagged: new Set(), taken: new Set(), idx: null, stopped: false, fixedProjectId: null };
+        try { st.fixedProjectId = ovlVisualTransCacheProjectId(); } catch (e) {}
+        jobs.forEach(function (job) {
+            job.els.forEach(function (b) {
+                b.removeAttribute('data-ovl-trans-pending');
+                b.setAttribute('data-ovl-trans-inflight', '1');
+                st.taken.add(b);
+            });
+            try { job.reqKey = ovlVisualTransCacheKey(job.src, cfg); } catch (e) { job.reqKey = null; }
+        });
+        return { jobs: jobs, st: st };
+    } catch (e) { return null; }
+}
+// 把一组队列块译完并落地。返回 { ok, fail, fatal, aborted }：aborted = 被取消 / 批次已失效（块已还回待翻队列，调用方退出 worker）。
+async function ovlP233QueueRunGroup(g, cfg, signal, mySeq, fixedProjectId) {
+    const st = g.st, jobs = g.jobs;
+    const res = { ok: 0, fail: 0, fatal: '', aborted: false };
+    const restore = function () {
+        st.taken.forEach(function (b) {
+            b.removeAttribute('data-ovl-trans-inflight');
+            if (b.isConnected) b.setAttribute('data-ovl-trans-pending', '1');
+        });
+        st.taken.clear();
+    };
+    const newZh = new Map();
+    const env = { reqCfg: cfg, baseCfg: cfg, modelTag: '', signal: signal, newZh: newZh, fatal: '', deferWrite: true,
+        canLand: function () {
+            try {
+                if (OvlState.editorMode !== 'visual') return false;
+                if (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare') return false;
+                return ovlVisualTransCacheProjectId() === fixedProjectId;
+            } catch (e) { return false; }
+        } };
+    env.makeCtx = function (js) {
+        return ovlP233Ctx({ pane: document.getElementById('ovlVisualPane'), firstEl: ovlP233LiveEl(st, js[0], false), lastEl: ovlP233LiveEl(st, js[js.length - 1], true),
+            cfg: cfg, newZh: newZh, neighbours: true, excludeSrcs: js.map(function (j) { return j.src; }) });
+    };
+    try {
+        await ovlP233RunGroup(env, jobs);
+    } catch (err) {
+        if (err && err.name === 'AbortError') { restore(); res.aborted = true; return res; }
+        console.error('[ovl] paragraph group translate failed', err);
+        jobs.forEach(function (j) { if (!j.result) j.result = { ok: false, via: 'kept', err: err, meta: { attempts: j.attempts } }; });
+    }
+    if (mySeq !== OvlVisualLangState.seq || (signal && signal.aborted)) { restore(); res.aborted = true; return res; }
+    jobs.forEach(function (job) {
+        if (job.result && job.result.ok) { ovlP233LandJob(st, env, job); res.ok += job.els.length; return; }
+        res.fail += job.els.length;
+        // 服务级失败（401/402/403/404/429/5xx/网络/超时/配置）：与单块 worker 的熔断一致——不给这些块打失败角标，
+        // 留在待翻队列里（由下面 restore 还回），由熔断计数决定何时停队列；其余失败（回显守卫、切分失败等）照常落成可见失败态。
+        const fr = job.result && job.result.meta && job.result.meta.failReason;
+        if (!(env.fatal && fr === env.fatal)) ovlP233FailJob(st, env, job);
+    });
+    restore(); // 还没落地的（服务级失败 / canLand 为假）一律还回待翻，不留幽灵「处理中」块
+    res.fatal = env.fatal;
+    return res;
+}
+// 「用当前模型重译全文」：把相邻（同一段落、源码行相接）的单块任务并成组。auto 关 / 没有可并的 => 原样返回 jobs（每个单块任务各自一个元素）。
+// 返回数组：元素要么是原来的 job，要么是 { group: [job, ...] }。
+function ovlP233RetransUnits(jobs) {
+    if (!ovlP233AutoOn() || jobs.length < 2) return jobs;
+    try {
+        const num = function (b, k) { return parseInt(b.getAttribute(k), 10); };
+        const okJob = function (j) {
+            if (!j.els || j.els.length !== 1) return false;
+            const s = j.src;
+            if (OVL_P233_PARA_STOP_RE.test(s) || ovlP233HeadingTitle(s) !== null || ovlP233AtomicKind(s) || s.indexOf('OVLSEG') !== -1) return false;
+            let prep = null;
+            try { prep = ovlVisualBlockPrep(s); } catch (e) { prep = null; }
+            if (!prep || prep.empty || prep.mainNothing) return false;
+            j.prep = prep; j.chars = prep.masked.text.length; j.attempts = 0; j.result = null;
+            return true;
+        };
+        const units = [];
+        let cur = null;
+        for (let i = 0; i < jobs.length; i++) {
+            const j = jobs[i];
+            if (!okJob(j)) { cur = null; units.push(j); continue; }
+            const b = j.els[0];
+            const prev = cur ? cur[cur.length - 1].els[0] : null;
+            const adj = prev && b.getAttribute('data-para-start') === '0' && b.previousElementSibling === prev && num(prev, 'data-src-line-end') + 1 === num(b, 'data-src-line');
+            if (adj) { cur.push(j); continue; }
+            cur = [j];
+            units.push({ group: cur });
+        }
+        return units.map(function (u) { return (u.group && u.group.length === 1) ? u.group[0] : u; });
+    } catch (e) { return jobs; }
+}
+// 整篇重译里的一个段落组：找回活块 -> 联合请求（切组 / 缩小重试 / 逐块兜底）-> 结果落地。失败的块保留旧译文（不打角标、不写 failLog），与单块路径一致。
+async function ovlP233RetransAllGroup(st, jobsIn, cfg, fixedProjectId, mySeq, canLand, live) {
+    const members = [];
+    for (let i = 0; i < jobsIn.length; i++) {
+        const job = jobsIn[i];
+        const targets = ovlVisualRetransAllResolve(st, job, cfg, false);
+        if (!targets.length) { st.gone += job.n; st.done += job.n; continue; }
+        job.els = targets;
+        members.push(job);
+    }
+    if (!members.length) return;
+    const controller = new AbortController();
+    st.controllers.add(controller);
+    OvlVisualLangState.adhocControllers.push(controller);
+    members.forEach(function (job) {
+        job.els.forEach(function (b) { b.setAttribute('data-ovl-trans-retranslating', '1'); st.flagged.add(b); });
+        try { job.reqKey = ovlVisualTransCacheKey(job.src, cfg); } catch (e) { job.reqKey = null; }
+    });
+    const newZh = new Map();
+    // deferWrite：与整篇重译的单块路径一致走 P215 回写缓存（ovlVisualRetransAllRun 的 finally 一次落盘）。不带它，一组 N 块 = N 次整桶 stringify+setItem，
+    // 且回写缓存里什么都没有，后面每组的上下文查询还要重新解析整桶（P209/P215 已知的卡死形态）。retryTransient 见 ovlP233RunGroup 头部注释。
+    const env = { reqCfg: cfg, baseCfg: cfg, modelTag: '', signal: controller.signal, newZh: newZh, fatal: '', canLand: canLand, deferWrite: true, retryTransient: true };
+    env.makeCtx = function (js) {
+        return ovlP233Ctx({ pane: document.getElementById('ovlVisualPane'), firstEl: ovlP233LiveEl(st, js[0], false), lastEl: ovlP233LiveEl(st, js[js.length - 1], true),
+            cfg: cfg, newZh: newZh, neighbours: true, excludeSrcs: js.map(function (j) { return j.src; }) });
+    };
+    // 已经付过钱的结果（本组里已成功的段）不管后面是否被停止，先写缓存、页面上有活块就落（与单块路径同一纪律，P232b 3c）。
+    const landPaid = function (chunk) {
+        chunk.forEach(function (job) {
+            if (!(job.result && job.result.ok)) return;
+            try {
+                const landed = ovlP233LandJob(st, env, job);
+                st.ok += job.n;
+                if (landed < job.n) st.unseen += (job.n - landed);
+            } catch (e) {}
+        });
+    };
+    st.fixedProjectId = fixedProjectId;
+    try {
+        const chunks = ovlP233ChunkJobs(members);
+        for (let c = 0; c < chunks.length; c++) {
+            if (!live()) break;
+            const chunk = chunks[c];
+            try {
+                await ovlP233RunGroup(env, chunk);
+            } catch (err) {
+                if (err && err.name === 'AbortError') { landPaid(chunk); return; } // 停止 / 切走时组里前几轮已成功的段照样入缓存
+                if (!live()) { landPaid(chunk); return; }
+                chunk.forEach(function (j) { if (!j.result) j.result = { ok: false, via: 'kept', err: err, meta: { attempts: j.attempts } }; });
+            }
+            // 结果回来了就是已经付过钱的：不管此时是否已停止，先写缓存、页面上有活块就落（与单块路径同一纪律）；失败的块保留旧译文。
+            // 熔断计数按【请求】算，不按块：一次失败的组请求只算 1 次（与队列的 p233NoteGroup 同一纪律，否则一个 12 块的组一次 429 就一下子熔断）；
+            // 组里只要有一块成功就清零；传输类失败累加；其余失败（模型答得不对）清零。
+            let chunkOk = 0, chunkFatal = '';
+            chunk.forEach(function (job) {
+                if (job.result && job.result.ok) {
+                    const landed = ovlP233LandJob(st, env, job);
+                    st.ok += job.n; chunkOk++;
+                    if (landed < job.n) st.unseen += (job.n - landed);
+                } else {
+                    st.fail += job.n;
+                    const fr = (job.result && job.result.meta && job.result.meta.failReason) || ovlVisualTransFailReason(job.result && job.result.err, (job.result && job.result.meta) || {});
+                    if (!chunkFatal && ovlVisualTransIsTransportFatal(fr)) chunkFatal = fr;
+                }
+                st.done += job.n;
+                job.els.forEach(function (b) { b.removeAttribute('data-ovl-trans-retranslating'); });
+            });
+            if (chunkOk > 0 || !chunkFatal) st.fatal = 0;
+            else {
+                st.fatal++; st.lastFatal = chunkFatal;
+                if (st.fatal >= 3) st.tripped = true;
+            }
+            try { ovlVisualLangProgressUpdate(); } catch (e) {}
+        }
+    } finally {
+        st.controllers.delete(controller);
+        const ix = OvlVisualLangState.adhocControllers.indexOf(controller);
+        if (ix !== -1) OvlVisualLangState.adhocControllers.splice(ix, 1);
+        members.forEach(function (job) { job.els.forEach(function (b) { try { b.removeAttribute('data-ovl-trans-retranslating'); } catch (e) {} }); });
+    }
 }
 
 // ==================== v2 Pass P63（H5/H6）：中文 -> 英文回译 ====================
@@ -43845,6 +45145,14 @@ function ovlVisualLangProgressUpdate() {
         el.removeAttribute('hidden');
         return;
     }
+    // v2 Pass P233：联合重译进行中——进度行显示它自己的进度，点一下停止（保留旧译文）。
+    if (OvlP233Run) {
+        el.textContent = '联合重译 ' + OvlP233Run.done + '/' + OvlP233Run.total + (OvlP233Run.kept > 0 ? '，' + OvlP233Run.kept + ' 块失败（保留旧译文）' : '') + '（点此停止）';
+        el.onclick = ovlP233Stop;
+        el.classList.add('ovl-visual-lang-progress--clickable');
+        el.removeAttribute('hidden');
+        return;
+    }
     // v2 Pass P170：'compare' 模式的英中交错同样需要中文译文，进度条判据跟 'zh' 一视同仁——
     // 否则切到 compare 后进度行会一直被这里隐藏，用户看不到翻译还在跑。
     if ((OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare') || OvlVisualLangState.total <= 0) {
@@ -43946,6 +45254,7 @@ function ovlVisualLangProgressUpdate() {
 // 也不该继续算钱）。不清 lang/total/done——那些由调用方（ovlVisualLangSetMode）决定要不要清。
 function ovlVisualLangCancelInFlight() {
     OvlVisualLangState.seq++;
+    if (OvlP233Run) OvlP233Run.stopped = true; // v2 Pass P233：语言切换/离开 Visual 同样叫停联合重译（在飞请求随下面 adhocControllers 一起 abort）
     if (OvlP232RetransAll) OvlP232RetransAll.stopped = true; // v2 Pass P232：语言切换/离开 Visual 同样叫停整篇重译（在飞请求随下面 adhocControllers 一起 abort）
     if (OvlVisualLangState.controller) {
         try { OvlVisualLangState.controller.abort(); } catch (e) {}
@@ -44255,6 +45564,24 @@ async function ovlVisualLangRunQueue() {
     };
     ctx.grow = function () { if (!ctx.live()) return; while (ctx.active < ctx.target()) ctx.spawn(); };
     OvlVisualLangRunCtx = ctx;
+    // v2 Pass P233：一组块的结果 -> 熔断计数（有成功清零；服务不可用类失败，每个失败的组请求算一次，到 3 同样停队列，块保持待翻）。
+    function p233NoteGroup(gres) {
+        if (gres.ok > 0) { fatalStreak = 0; return; }
+        if (!gres.fail) return;
+        if (gres.fatal && ovlVisualTransIsTransportFatal(gres.fatal)) {
+            fatalStreak += 1; // 一次失败的组请求算一次（不按块数累加，避免一个 12 块的组一下子就熔断）
+            fatalLastReason = gres.fatal;
+            if (fatalStreak >= 3 && !fatalTripped) {
+                fatalTripped = true;
+                try {
+                    if (typeof showToast === 'function') {
+                        showToast('连续 3 个块都翻译失败，原因：' + ovlVisualTransFatalLabel(fatalLastReason)
+                            + '。已停止本次翻译（其余块保持待翻）。请检查 API Key / 网络 / 服务状态，修好后点进度行"继续"或块上的"重试"。', 'error');
+                    }
+                } catch (eT) {}
+            }
+        } else fatalStreak = 0;
+    }
     async function worker(slot) {
         for (;;) {
             if (fatalTripped) return;
@@ -44273,6 +45600,18 @@ async function ovlVisualLangRunQueue() {
             const queue = ovlVisualLangCollectPendingCached(pane);
             if (!queue.length) return;
             const el = queue[0];
+            // v2 Pass P233（Stage B）：自动联系上下文开着，且 el 所在段落里连着几行都待翻 -> 合成一次联合请求
+            // （<=12 块 / <=4000 字符；整组失败逐级回退到缩小重试 -> 逐块阶梯），每块仍按自己的 key 入缓存、各自 failLog / 角标。
+            if (ovlP233AutoOn()) {
+                const grp = ovlP233QueueTake(el, cfg);
+                if (grp) {
+                    const gres = await ovlP233QueueRunGroup(grp, cfg, controller.signal, mySeq, fixedProjectId);
+                    if (gres.aborted) return;
+                    p233NoteGroup(gres);
+                    ovlVisualLangProgressUpdate();
+                    continue;
+                }
+            }
             el.removeAttribute('data-ovl-trans-pending');
             // v2 Pass P113c（核验 .claude/tmp/p113_verify.md 次要2）：从"摘掉 pending"到下面
             // "done++"之间要 await 一次真实网络往返，这段窗口里这块块既不再算 pending、也还
@@ -44316,7 +45655,7 @@ async function ovlVisualLangRunQueue() {
             try {
                 // v2 Pass P122（C2）：改调重试阶梯，取代直接调 ovlVisualTranslateBlockText——
                 // 失败后自动升级重问，不再是"同 prompt 同模型问一次就放弃"。
-                const tgt = await ovlVisualTranslateBlockWithLadder(text, cfg, controller.signal, meta);
+                const tgt = await ovlVisualTranslateBlockWithLadder(text, cfg, controller.signal, meta, ovlP233SingleOpts(el, cfg, undefined, text)); // v2 Pass P233：单块带只读上下文（自动开关开着 / 有翻译参考时），否则调用形状不变
                 el.removeAttribute('data-ovl-trans-inflight');
                 if (mySeq !== OvlVisualLangState.seq) {
                     // v2 Pass P128（C3，M3 根治）：这一批已经被取消/切走，译文虽然真实翻译成功
@@ -44495,6 +45834,7 @@ async function ovlVisualLangRunQueue() {
 // 刷新进度条，中文模式下且有待翻块时把调度器踢起来（ovlVisualLangRunQueue 内部有
 // running 守卫，不会因为多处调用而并发起两组 worker）。
 function ovlVisualLangSyncAfterRender() {
+    try { ovlP233PinMarkAll(); } catch (eP233Pin) {} // v2 Pass P233：「翻译参考」的块在每次（局部）重渲染后重打左缘标记（任何语言模式都要）
     // v2 Pass P170：这是渲染后真正把调度器踢起来的触发点——'compare' 模式同样需要中文译文，
     // 判据跟上面两处（ovlVisualLangProgressUpdate / ovlVisualLangRunQueue）保持一致，否则
     // compare 模式下 pending 块永远不会被送进翻译队列。
@@ -44617,6 +45957,7 @@ let OvlP232MenuCount = 0; // v2 Pass P232b：语言菜单打开那一刻算出�
 function ovlVisualRetransAllMenuClick() {
     ovlCloseVisualLangMenu();
     if (OvlP232RetransAll) { ovlVisualRetransAllStop(); return; }
+    if (OvlP233Run) { try { showToast('联合重译进行中，等它结束或先点进度行停止，再点「用当前模型重译全文」。', 'warning'); } catch (e) {} return; } // v2 Pass P233
     if (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare') return;
     if (OvlVisualLangState.running) {
         try { showToast('后台还在翻译尚未翻译的块，等它结束后再点「用当前模型重译全文」。', 'warning'); } catch (e) {}
@@ -44698,7 +46039,7 @@ function ovlVisualRetransAllResolve(st, job, cfg, forLanding) {
     return out;
 }
 async function ovlVisualRetransAllRun(items, cfg) {
-    if (OvlP232RetransAll || !items || !items.length) return;
+    if (OvlP232RetransAll || OvlP233Run || !items || !items.length) return; // v2 Pass P233：联合重译进行中不并行起整篇重译
     if (OvlVisualLangState.lang !== 'zh' && OvlVisualLangState.lang !== 'compare') return;
     // v2 Pass P232b（3d）：批量翻译队列正在跑就不再并行起第二组请求（会把并发翻倍）；队列反过来在本动作进行中不启动（见 ovlVisualLangRunQueue 开头）。
     if (OvlVisualLangState.running) {
@@ -44718,6 +46059,7 @@ async function ovlVisualRetransAllRun(items, cfg) {
         j.n++;
     }
     const st = { total: items.length, done: 0, ok: 0, fail: 0, gone: 0, unseen: 0, stopped: false, seq: mySeq, controllers: new Set(), next: 0, fatal: 0, tripped: false, lastFatal: '', flagged: new Set(), idx: null };
+    const units = ovlP233RetransUnits(jobs); // v2 Pass P233：自动联系上下文开着时，相邻（同一段落）的单块任务并成组，一组一次联合请求；关着时 units === jobs
     OvlP232RetransAll = st;
     try { ovlVisualLangUpdateMenuUI(); ovlVisualLangProgressUpdate(); } catch (e) {}
     const live = function () { return !st.stopped && !st.tripped && mySeq === OvlVisualLangState.seq; };
@@ -44733,8 +46075,14 @@ async function ovlVisualRetransAllRun(items, cfg) {
         for (;;) {
             if (!live()) return;
             const i = st.next++;
-            if (i >= jobs.length) return;
-            const job = jobs[i];
+            if (i >= units.length) return;
+            const unit = units[i];
+            if (unit.group) { // v2 Pass P233：段落组
+                await ovlP233RetransAllGroup(st, unit.group, cfg, fixedProjectId, mySeq, canLand, live);
+                try { ovlVisualLangProgressUpdate(); } catch (e) {}
+                continue;
+            }
+            const job = unit;
             // v2 Pass P232b（3a）：期间页面被重渲染掉的块不再静默算「已完成」——按源码文本找回活块；找不到才计入 gone（结束提示里如实说）。
             const targets = ovlVisualRetransAllResolve(st, job, cfg, false);
             if (!targets.length) { st.gone += job.n; st.done += job.n; try { ovlVisualLangProgressUpdate(); } catch (e) {} continue; }
@@ -44747,7 +46095,7 @@ async function ovlVisualRetransAllRun(items, cfg) {
             try { reqKey = ovlVisualTransCacheKey(job.src, cfg); } catch (e) { reqKey = null; } // 同 P215-7：请求时的 key，落地用同一个
             let settled = false;
             try {
-                const tgt = await ovlVisualTranslateBlockWithLadder(job.src, cfg, controller.signal, meta);
+                const tgt = await ovlVisualTranslateBlockWithLadder(job.src, cfg, controller.signal, meta, ovlP233SingleOpts(targets[0], cfg, undefined, job.src)); // v2 Pass P233
                 // v2 Pass P232b（3c）：结果回来了就是已经付过钱的——不管此时已停止 / 熔断 / 语言切走，先写进缓存；页面上有活块再落。
                 try { ovlVisualTransCachePut(job.src, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, reqKey, true); } catch (e) {}
                 try { ovlVisualFailLogDelete(job.src, cfg); } catch (e) {}
@@ -44799,7 +46147,7 @@ async function ovlVisualRetransAllRun(items, cfg) {
             const plan = ovlVisualLangAutoPlan(cfg);
             conc = (plan.n != null) ? plan.n : await plan.promise;
         }
-        conc = Math.max(1, Math.min(conc || OVL_VISUAL_LANG_CONCURRENCY, jobs.length));
+        conc = Math.max(1, Math.min(conc || OVL_VISUAL_LANG_CONCURRENCY, units.length)); // v2 Pass P233：并发数按「请求单元」算（一组联合请求占一个）
         const ws = [];
         for (let k = 0; k < conc; k++) ws.push(worker());
         await Promise.all(ws);
@@ -45295,7 +46643,7 @@ async function ovlVisualBlockRetryClick(el, override) {
         // v2 Pass P122（C2）：改调重试阶梯（从 L0/L1 重新开始，允许再跑一遍全阶梯），取代
         // 直接调 ovlVisualTranslateBlockText——这正是"点重试真的有效"的根治：以前是同一个
         // prompt 问同一个模型，现在失败会自动换纠正 prompt/温度/切句/加大配额。
-        const tgt = await ovlVisualTranslateBlockWithLadder(srcLatex, transCfg, controller.signal, meta, { userForced: true });
+        const tgt = await ovlVisualTranslateBlockWithLadder(srcLatex, transCfg, controller.signal, meta, ovlP233SingleOpts(el, cfg, { userForced: true }, srcLatex)); // v2 Pass P233
         // v2 Pass P128b（N-2 收口）：陈旧响应丢弃不落地，但角标复原成可再点的"重试"——以前
         // 直接 return，按钮永久卡在"重试中…"+pointer-events:none 到下一次整篇重渲染为止
         // （复现见阻断报告 N-2）。块本身该是什么状态不变（这一路径进来时块本来就是 failed，
@@ -45416,7 +46764,7 @@ async function ovlVisualBlockRetranslateClick(el, override) {
     el.setAttribute('data-ovl-trans-retranslating', '1');
     let meta = {};
     try {
-        const tgt = await ovlVisualTranslateBlockWithLadder(srcLatex, transCfg, controller.signal, meta, { userForced: true });
+        const tgt = await ovlVisualTranslateBlockWithLadder(srcLatex, transCfg, controller.signal, meta, ovlP233SingleOpts(el, cfg, { userForced: true }, srcLatex)); // v2 Pass P233
         if (mySeq !== OvlVisualLangState.seq) return; // 陈旧响应（语言已切走/已取消），丢弃不落地
         try { ovlVisualTransCachePut(srcLatex, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel, undefined, undefined, undefined, modelTag); } catch (e) {}
         if (document.body.contains(el)) {
@@ -45483,7 +46831,7 @@ async function ovlVisualBlockForceTranslateClick(el) {
     if (badge) { badge.textContent = '翻译中…'; badge.classList.add('ovl-visual-noprose-badge--busy'); }
     let meta = {};
     try {
-        const tgt = await ovlVisualTranslateBlockWithLadder(srcLatex, cfg, controller.signal, meta, { userForced: true });
+        const tgt = await ovlVisualTranslateBlockWithLadder(srcLatex, cfg, controller.signal, meta, ovlP233SingleOpts(el, cfg, { userForced: true }, srcLatex, true)); // v2 Pass P233：强制翻译只附翻译参考（不带邻居上下文）
         if (mySeq !== OvlVisualLangState.seq) return; // 陈旧响应（语言已切走/已取消），丢弃不落地
         try { ovlVisualTransCachePut(srcLatex, cfg, tgt, fixedProjectId, meta.skipped, false, meta.partial, meta.partialReason, meta.ladderLevel); } catch (e) {}
         if (document.body.contains(el)) {
@@ -45655,6 +47003,7 @@ function ovlQaRenderVisualState() {
     // 不需要各自再补一行调用，这一行本身是这次新增唯一侵入 ovlQaRenderVisualState 函数体
     // 的改动，函数原有逻辑和返回行为一个字节不变。
     if (typeof ovlQaRenderRetranslate === 'function') ovlQaRenderRetranslate();
+    if (typeof ovlQaRenderJoint === 'function') ovlQaRenderJoint(); // v2 Pass P233
     const box = document.getElementById('ovlQaVisualState');
     if (!box) return;
     const el = OvlQaState.visualBlockEl;
@@ -60689,6 +62038,7 @@ const OVL_SETTINGS_DEFAULTS = {
     visualTranslate: 'auto',    // P4 消费：'auto' | 'button' | 'off'
     visualTransModel: '',       // P4 消费：''=跟随翻译器当前选中的模型
     visualTransConcurrency: 'auto', // v2 Pass P230：Visual 中文翻译同时在飞的请求数。'auto'=本地模型跟随 LM Studio 的 parallel（读不到/在线模型=3）；整数 1–16=手动
+    visualAutoContext: true,    // v2 Pass P233：翻译时自动联系上下文（同一段落连续行合成一次请求 + 单块翻译带前后已有译文/章节标题）。false=请求内容与 P233 之前逐字节一致
     visualRetranslateModel: '', // v2 Pass P223：块「重译」旁下拉的上次选择，'provider::model'，''=跟随当前模型
     ovlVisualLineBreaks: true,  // Visual 断行 Pass 消费：true=按源码行切细渲染，false=退回整段渲染
     ovlVisualOutlineSelection: true, // Pass Sel-Outline 消费：true=方框描边选区，false=退回浏览器原生高亮
@@ -61314,6 +62664,12 @@ function ovlSettingsTranslatorHtml() {
             '自动 = 本地 LM Studio 模型跟随它加载时设置的「并行请求数」，读不到时用 3；在线模型固定 3。注意：浏览器对同一个地址（同一个 host:port）最多同时保持约 6 个连接，所以设成 6 以上不会更快——多出的请求在浏览器里排队，排队的时间还会算进每个请求的超时。');
         ovlVisualLangConcWarmLabel();
     })();
+    // v2 Pass P233：翻译时自动联系上下文。普通复选框，走通用 data-setpath（change 委托里对本项专门处理：只存盘，不重渲 Visual）。
+    html += ovlSetRow('翻译时自动联系上下文', '<input type="checkbox" data-setpath="settings.visualAutoContext"' + (s.visualAutoContext !== false ? ' checked' : '') + '>',
+        '开着时，同一段落里连续的几行会合成一次请求翻译、单独翻一块时也参考前后已有的中文译文和章节标题，让术语和语气前后一致；选中多块后工具条里的「重译选中 N 块（联系上下文）」和「翻译参考」（把选中的块固定为原文+译文对照，之后本项目每次翻译都会带上）不受这个开关影响；关掉后其余翻译请求与以前逐字节一致。');
+    // v2 Pass P233：翻译参考没有逐条的列表界面（块上只有安静的左缘标记），这里给一个总的清空入口（见 ovlP233PinsClearAll）。
+    html += ovlSetRow('翻译参考', '<button type="button" class="ovl-modal-btn" id="ovlP233PinsClearBtn"' + (ovlP233PinsGet().length ? '' : ' disabled') + ' onclick="ovlP233PinsClearAll()">' + escapeHtml(ovlP233PinsClearLabel()) + '</button>',
+        '在 Visual 工具条里勾选「翻译参考」的块，会按原文+译文对照附在本项目之后的每个翻译请求里。块上的标记可以逐个取消；这里一次清空当前项目的全部翻译参考（例如原文被改过、旧参考已经没有对应的块时）。');
     // v2 Pass P197（A）：领域提示只影响本地模型（LM Studio）路径的 prompt 内容，不改变
     // 任何 UI 控件的 data-setpath 通用绑定套路——因为这条不是全局设置，是按项目持久化的
     // （跟项目术语表一样用单独的 localStorage 映射表），所以走专用的 onchange 处理函数，
@@ -61759,6 +63115,7 @@ function ovlBindSettingsModal() {
         store[parts[1]] = val;
         // v2 Pass P230：并发数只影响翻译队列，不需要 ovlApplySettings（它在 Visual 模式下会整篇重渲，正在飞的块会被重复翻译）。
         if (path === 'settings.visualTransConcurrency') { ovlSaveSettings(); ovlVisualLangConcurrencyChanged(); return; }
+        if (path === 'settings.visualAutoContext') { ovlSaveSettings(); return; } // v2 Pass P233：只影响之后发出的请求，不需要 ovlApplySettings（Visual 下会整篇重渲）；不动缓存
         if (parts[0] === 'compile') { ovlSaveCompileSettings(); ovlUpdatePdfToolbarUI(); }
         else { ovlSaveSettings(); ovlApplySettings(); }
     });
@@ -64369,7 +65726,7 @@ function ovlBindDropMenus() {
 // 调用 ovlShowQuickActionsAt 的地方（Code 选区/Visual 正文拖选文字/Code gutter 行选/兜底分支）
 // 都不传第 4 个参数，走 undefined -> null，弹窗里的状态区因此天然保持隐藏，不需要每个调用点
 // 都显式清一遍。
-let OvlQaState = { source: 'code', visualBlockEl: null };
+let OvlQaState = { source: 'code', visualBlockEl: null, visualBlockEls: null }; // v2 Pass P233：visualBlockEls = 选区覆盖的多个块（联合重译用），每次打开都重置
 function ovlHideQuickActions() { const qa = document.getElementById('ovlQuickActions'); if (qa) qa.classList.remove('ovl-open'); }
 
 // ==================== v2 Pass P31：浮层避让选区统一布局器 ====================
@@ -66872,7 +68229,7 @@ function ovlVisualBlockEditOpenAtPoint(clientX, clientY, caretAnchorText) {
     }
 }
 
-function ovlShowQuickActionsAt(x, y, source, visualBlockEl) {
+function ovlShowQuickActionsAt(x, y, source, visualBlockEl, visualBlockEls) {
     // v2 Pass P33：就地编辑源码进行中时，工具条（含「替/简/语/译/关注/复制」六颗按钮）
     // 整体不弹出——不跟就地编辑器抢焦点/抢屏幕空间，用户要用那六颗就先保存/取消当前编辑。
     // 只在这里短路一次，不去改六颗按钮自己的任何逻辑。
@@ -66884,6 +68241,7 @@ function ovlShowQuickActionsAt(x, y, source, visualBlockEl) {
     // gutter 单击路径里才清，避免"上一次是单击行号、这一次是拖选文字/切到 Code"时把上一次
     // 解出来的块引用带过来显示成"陈旧但看着像当前的"状态。
     OvlQaState.visualBlockEl = visualBlockEl || null;
+    OvlQaState.visualBlockEls = (Array.isArray(visualBlockEls) && visualBlockEls.length) ? visualBlockEls : null; // v2 Pass P233：同样每次打开都重置
     qa.classList.toggle('ovl-qa-src-visual', OvlQaState.source === 'visual');
     qa.classList.toggle('ovl-qa-nofmt', !OvlSettings.quickActions);
     qa.classList.toggle('ovl-qa-notranslate', OvlSettings.visualTranslate === 'off');
@@ -66936,6 +68294,7 @@ function ovlShowQuickActionsAt(x, y, source, visualBlockEl) {
         if (fIn) fIn.checked = on;
         fLab.classList.toggle('is-on', on);
     }
+    if (typeof ovlP233PinSync === 'function') ovlP233PinSync(qa); // v2 Pass P233：「翻译参考」复选框的勾选态现算（同「关注」的纪律）
     // Pass P31：落点从"贴鼠标点"改成"避开选区逐行矩形 + 避开翻译框"，x/y 只在算不出选区
     // 矩形时（理论上不会发生——调用方都是在确认选区非空之后才调这个函数）当兜底锚点用，
     // 绝不让工具条不显示（规格 §5）。
@@ -66964,6 +68323,7 @@ function ovlBindQuickActions() {
     const qa = document.getElementById('ovlQuickActions');
     if (typeof ovlBindQaVisualState === 'function') ovlBindQaVisualState(); // v2 Pass P156
     if (typeof ovlBindQaRetranslate === 'function') ovlBindQaRetranslate(); // v2 Pass P197（E）
+    if (typeof ovlBindQaJoint === 'function') ovlBindQaJoint(); // v2 Pass P233
 
     if (ta) {
         ta.addEventListener('mouseup', function (e) {
@@ -66996,7 +68356,9 @@ function ovlBindQuickActions() {
                 // 需求方明确要的语义变化（双击专职"进编辑"），不是遗漏。
                 const range = sel.getRangeAt(0);
                 if (!visualPane.contains(range.commonAncestorContainer)) { ovlHideQuickActions(); return; }
-                ovlShowQuickActionsAt(e.clientX, e.clientY, 'visual');
+                // v2 Pass P233：文字拖选跨了 >=2 个块时，把这些块带给弹窗（联合重译）；单块选区行为不变。
+                const p233Blocks = ovlP233BlocksInRange(visualPane, range);
+                ovlShowQuickActionsAt(e.clientX, e.clientY, 'visual', undefined, p233Blocks.length >= 2 ? p233Blocks : undefined);
             } catch (err) { ovlHideQuickActions(); }
         });
         // v2 Pass P178（必做2）：双击进入就地编辑，取代 P159 时代的单击。
@@ -67123,6 +68485,9 @@ function ovlBindQuickActions() {
         // document 点击关闭会在同一次点击里把刚弹出的工具条立刻关掉。
         const gutterEl = document.getElementById('ovlGutter');
         if (gutterEl && gutterEl.contains(e.target)) return;
+        // v2 Pass P233：镜像 gutter 拖成多块后在 pointerup 弹出的联合重译入口，同样要豁免紧随其后的这次 click（单次、限时；普通单击镜像行号照旧关闭弹窗）。
+        const gutterMirEl = document.getElementById('ovlGutterMirror');
+        if (gutterMirEl && gutterMirEl.contains(e.target) && typeof ovlP233MirrorJointArmedTake === 'function' && ovlP233MirrorJointArmedTake()) return;
         ovlHideQuickActions();
     });
 }
@@ -68278,7 +69643,8 @@ function ovlVisualGutterCommitSelection(showQa) {
         // 弹窗——拖选多行没有单一块可对应，第 4 个参数留空，弹窗侧的状态区自然保持隐藏
         // （ovlShowQuickActionsAt 里 undefined -> null）。
         const singleBlockEl = (lo === hi && OvlVisualBlockRects[lo]) ? OvlVisualBlockRects[lo].el : null;
-        ovlShowQuickActionsAt(Math.max(r.left + 20, minX), Math.max(r.top, 36), 'visual', singleBlockEl);
+        ovlShowQuickActionsAt(Math.max(r.left + 20, minX), Math.max(r.top, 36), 'visual', singleBlockEl,
+            (lo < hi) ? OvlVisualBlockRects.slice(lo, hi + 1).map(function (rb) { return rb.el; }) : undefined); // v2 Pass P233：拖成多块时把块列表也带给弹窗（联合重译）
     }
 }
 
@@ -68592,6 +69958,7 @@ function ovlBindGutterSelectMirror() {
         OvlGutterSelMirror.dragging = false;
         OvlGutterSelMirror.pointerId = null;
         try { gutter.releasePointerCapture(e.pointerId); } catch (err) {}
+        ovlP233MirrorShowJoint(); // v2 Pass P233：镜像 gutter 拖成多块 -> 对侧译文块弹出联合重译入口（单击不变）
     }
     gutter.addEventListener('pointerup', endDrag);
     gutter.addEventListener('pointercancel', endDrag);
@@ -70073,7 +71440,7 @@ const OVL_SYNC_SECRET_SETTING_FIELDS = ['overleafToken', 'ovlAiMergeApiKey', 'pd
 const OVL_SYNC_SETTING_FIELDS = [
     'fontSize', 'fontFamily', 'lineHeight', 'editorTheme', 'showLineNumbers', 'tabSize', 'autoCloseBrackets',
     'nonBlinkingCursor', 'quickActions', 'breadcrumbs', 'equationPreview', 'spellcheck', 'spellLang',
-    'transSimpleMode', 'visualTranslate', 'visualTransModel', 'visualTransConcurrency', 'visualRetranslateModel', 'ovlVisualLineBreaks', 'ovlVisualOutlineSelection',
+    'transSimpleMode', 'visualTranslate', 'visualTransModel', 'visualTransConcurrency', 'visualAutoContext', 'visualRetranslateModel', 'ovlVisualLineBreaks', 'ovlVisualOutlineSelection',
     'ovlVisualBtrConfirmFirst', 'overleafAutoPullMinutes', 'ovlRestoreLastProject', 'ovlAiMergeEndpoint',
     'ovlAiMergeModel', 'pdf2texDefaultOutDir', 'pdf2texVisionEndpoint', 'pdf2texVisionModel', 'pdf2texConcurrency',
     'pdf2texDisableThinking', 'pdf2texMaxPx', 'pdf2texSavePageImages', 'pdf2texAutoOpenResult',
