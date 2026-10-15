@@ -5057,7 +5057,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.50.04';        // APP_VERSION_STAMP
+const APP_VERSION = '03.50.05';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-14';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -26197,7 +26197,7 @@ async function chatAgentExecRetranslateBlock(args, signal, pending) {
     // v2 Pass P122（C7/A8）+ P122b（B1）：打/清 partial 标记 + 悬停说明，见 ovlVisualApplyPartialMark。
     if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta); else if (meta.partial) el.setAttribute('data-ovl-trans-partial', '1'); else el.removeAttribute('data-ovl-trans-partial');
     if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta); // v2 Pass P128b（N-4）：打/清"经兜底档译出"标记
-    if (typeof ovlVisualApplyModelMark === 'function') ovlVisualApplyModelMark(el, ''); // v2 Pass P232：这块刚才可能是回退显示的别的模型译文（带「来自 X」标记），现在是当前模型译的，清掉残留标记
+    if (typeof ovlVisualApplyModelMark === 'function') ovlVisualApplyModelMark(el, ovlVisualCfgModelTag(cfg)); // v2 Pass P232：这块刚才可能是回退显示的别的模型译文（带「来自 X」标记），现在是当前模型译的，清掉残留标记；v2 Pass P232c：按产出者（请求前固定的 cfg）打——译的过程中主模型被换走时带「来自 X」，没换过则等于当前模型、照旧清掉
     if (document.body.contains(el) && typeof ovlVisualRenderChunk === 'function') el.innerHTML = ovlVisualRenderChunk(newTgt, true); // v2 Pass P180：聊天工具 retranslate_block 同样是块的最终落地内容，纳入点击展开范围
     if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; } // v2 Pass P113：跟"翻译成功"区分开，供进度提示如实报告；title 见 v2 Pass P128（C2）
     if (typeof ovlVisualRemoveForceAcceptBadge === 'function') ovlVisualRemoveForceAcceptBadge(el);
@@ -43770,6 +43770,11 @@ function ovlVisualModelDiffers(tag) {
         return tag !== (String(cfg.provider) + '/' + String(cfg.model));
     } catch (e) { return false; }
 }
+// v2 Pass P232c：一份 cfg 对应的「provider/model」标签，格式与 ovlVisualModelDiffers / ovlVisualMainModelTag 完全相同。
+// 批量队列 / 整篇重译 / 单块重试的 cfg 都是请求发出前就固定下来的，落地时用它给块打「产出者」标记（主模型中途被用户换掉时，块上才不会少标）。
+function ovlVisualCfgModelTag(cfg) {
+    try { return cfg ? (String(cfg.provider) + '/' + String(cfg.model)) : ''; } catch (e) { return ''; }
+}
 function ovlVisualModelTagName(tag) {
     const i = String(tag).indexOf('/');
     return i < 0 ? String(tag) : ovlRetransModelName(String(tag).slice(0, i), String(tag).slice(i + 1));
@@ -44334,7 +44339,9 @@ async function ovlVisualLangRunQueue() {
                     el.removeAttribute('data-ovl-trans-attempts');
                     if (typeof ovlVisualRemoveRetryBadge === 'function') ovlVisualRemoveRetryBadge(el);
                     // v2 Pass P232b：队列 worker 译的是当前模型，块上若残留「来自 X」（回退显示过别的模型）一律清掉；必须在 skipped/partial/raw 标记之前清，否则会连带抹掉它们的 title
-                    if (typeof ovlVisualApplyModelMark === 'function') ovlVisualApplyModelMark(el, '');
+                    // v2 Pass P232c：标记按【产出者】打——传批次 cfg（批次开始时固定）的 provider/model，不再传 ''。没换过主模型时它就等于当前主模型，ovlVisualApplyModelMark 照旧清掉标记（DOM 与改动前逐字节相同）；
+                    // 运行中用户把主模型换走了（批次仍用旧 cfg 译完），这块显示的就是旧模型的译文，必须带「来自 X」，否则提示 / 菜单 / 确认框的计数对不上。
+                    if (typeof ovlVisualApplyModelMark === 'function') ovlVisualApplyModelMark(el, ovlVisualCfgModelTag(cfg));
                     if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; } // v2 Pass P113：跟"翻译成功"区分开，供进度提示如实报告；title 见 v2 Pass P128（C2）
                     // v2 Pass P122（C7，A8）+ P122b（B1）：L3 按句切分后仍有句子失败、或块内
                     // \text{} 散文子片段回落英文——块整体算"成功"落地（其余内容已是中文），
@@ -44751,7 +44758,7 @@ async function ovlVisualRetransAllRun(items, cfg) {
                     const live2 = ovlVisualRetransAllResolve(st, job, cfg, true);
                     for (let t = 0; t < live2.length; t++) {
                         const el = live2[t];
-                        ovlVisualApplyModelMark(el, ''); // 新译文是当前模型的：先清掉「来自 X」（先于下面几个会写 title 的标记）
+                        ovlVisualApplyModelMark(el, ovlVisualCfgModelTag(cfg)); // 先于下面几个会写 title 的标记。v2 Pass P232c：按产出者（本次整篇重译固定下来的 cfg）打：没换过主模型时 = 当前模型，照旧清掉「来自 X」；运行中主模型被换走时，这块是旧 cfg 的模型译的，要带「来自 X」
                         if (typeof ovlVisualApplyPartialMark === 'function') ovlVisualApplyPartialMark(el, meta); else if (meta.partial) el.setAttribute('data-ovl-trans-partial', '1'); else el.removeAttribute('data-ovl-trans-partial');
                         if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta);
                         ovlVisualApplyTranslatedHtml(el, tgt);
@@ -44826,11 +44833,9 @@ async function ovlVisualRetransAllRun(items, cfg) {
 let OvlP232NoticeTag = null;        // 上一次刷新时看到的主模型 provider/model；变了就重置「已关闭」
 let OvlP232NoticeDismissed = false; // 对 OvlP232NoticeTag 这个主模型，用户是否点了 ×
 let OvlP232MarkedFor = null;        // 页面上现有「来自 X」标记是按哪个主模型算的
+let OvlP232CountedTag = null;       // v2 Pass P232c：提示上一次「真数」时的主模型 provider/model；null = 还没数过（或不在中文 / 对照模式）。运行中的冻结只在主模型没变时生效
 function ovlVisualMainModelTag() {
-    try {
-        const c = getApiConfig();
-        return c ? (String(c.provider) + '/' + String(c.model)) : '';
-    } catch (e) { return ''; }
+    try { return ovlVisualCfgModelTag(getApiConfig()); } catch (e) { return ''; } // v2 Pass P232c：格式抽成 ovlVisualCfgModelTag，行为不变
 }
 // 主模型换了之后，页面上已经显示的块的「来自 X」标记要按新主模型重算（渲染期打的标记是按当时的主模型算的）。
 // 精确：读缓存 meta.model（跟重渲染会显示的结果一致），只动 Visual 面板里已译完、没在忙的块；整个循环在一个缓存作用域内，只解析一次桶。
@@ -44868,7 +44873,13 @@ function ovlVisualModelNoticeRefresh() {
             if (tag !== OvlP232NoticeTag) { OvlP232NoticeTag = tag; OvlP232NoticeDismissed = false; } // 主模型变了：之前的「关闭」作废
             // v2 Pass P232b（评审）：批量队列 / 整篇重译进行中冻结这一行——既不显示也不隐藏、也不重数，收工那一次刷新（队列 finally / 整篇重译 finally 都会调进度刷新）再重数。
             // 这一行是工具条下面独立的一行（占 ~24px 高度）：原来「运行中隐藏、收工再显示」会让整个 Visual 内容在每次队列运行（>= 2 个待翻块）里先上移再下移一次。
-            if (OvlVisualLangState.running || OvlP232RetransAll) return;
+            // v2 Pass P232c：冻结只在主模型没变时有效。运行中用户把主模型换了（批次仍用开跑时固定的 cfg 译完），冻着的文案会一直说「N 块来自 X」，哪怕 X 此刻已经是当前模型；
+            // 所以主模型变了就重数【一次】（可见性因用户自己的这次切换变化一次是可以接受的），随后同一轮运行里的刷新再次冻结。还没数过（null）时只记下 tag、不重数——保持原来「运行开始不动这一行」的行为。
+            if (OvlVisualLangState.running || OvlP232RetransAll) {
+                if (OvlP232CountedTag === null) { OvlP232CountedTag = tag; return; }
+                if (tag === OvlP232CountedTag) return;
+            }
+            OvlP232CountedTag = tag;
             if (tag && !OvlP232NoticeDismissed) {
                 if (OvlP232MarkedFor !== tag) { ovlVisualModelRemarkDisplayed(); OvlP232MarkedFor = tag; }
                 const marked = pane.querySelectorAll('.ovl-visual-block[data-ovl-trans-model]');
@@ -44893,6 +44904,8 @@ function ovlVisualModelNoticeRefresh() {
                     show = true;
                 }
             }
+        } else {
+            OvlP232CountedTag = null; // v2 Pass P232c：离开中文 / 对照 / Visual 之后「上次数的是哪个主模型」作废，下次进来的运行冻结不会拿陈旧 tag 误触发重数
         }
     } catch (e) { show = false; }
     if (show) {
@@ -45300,7 +45313,7 @@ async function ovlVisualBlockRetryClick(el, override) {
             if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta); // v2 Pass P128b（N-4）：打/清"经兜底档译出"标记
             ovlVisualApplyTranslatedHtml(el, tgt); // 整个块子节点被冲掉，角标自然一并消失；v2 Pass P168：手动重试同样要复算编号；v2 Pass P170：compare 模式只替换中文侧
             if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; } // title 见 v2 Pass P128（C2）
-            if (!modelTag || (!meta.skipped && !meta.partial && meta.ladderLevel !== 'raw')) ovlVisualApplyModelMark(el, modelTag); // v2 Pass P231：条件同「重译」；跟随成功（modelTag=''）会清掉块上残留的来源标记；v2 Pass P232b：跟随路径无条件清（结果是 partial/skipped/raw 时旧版漏清，块带着已不真的「来自 X」）
+            if (!modelTag || (!meta.skipped && !meta.partial && meta.ladderLevel !== 'raw')) ovlVisualApplyModelMark(el, modelTag || ovlVisualCfgModelTag(cfg)); // v2 Pass P232c：跟随路径（modelTag=''）按产出者打——cfg 在请求前就固定了，运行中主模型被换走时这块显示的是 cfg 那个模型的译文，要带「来自 X」；没换过则等于当前模型，照旧清标记。override 路径不变。 // v2 Pass P231：条件同「重译」；跟随成功（modelTag=''）会清掉块上残留的来源标记；v2 Pass P232b：跟随路径无条件清（结果是 partial/skipped/raw 时旧版漏清，块带着已不真的「来自 X」）
             if (typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(el);
             if (typeof ovlRenderVisualGutter === 'function' && OvlState.editorMode === 'visual') ovlRenderVisualGutter();
         }
@@ -45407,7 +45420,7 @@ async function ovlVisualBlockRetranslateClick(el, override) {
             if (typeof ovlVisualApplyLadderMark === 'function') ovlVisualApplyLadderMark(el, meta);
             ovlVisualApplyTranslatedHtml(el, tgt);
             if (meta.skipped) { el.setAttribute('data-ovl-trans-skipped', '1'); el.title = OVL_VISUAL_SKIPPED_TITLE; }
-            if (!modelTag || (!meta.skipped && !meta.partial && meta.ladderLevel !== 'raw')) ovlVisualApplyModelMark(el, modelTag); // v2 Pass P223；v2 Pass P232b：跟随路径（modelTag=''）无条件清残留的「来自 X」，partial/skipped/raw 结果也一样
+            if (!modelTag || (!meta.skipped && !meta.partial && meta.ladderLevel !== 'raw')) ovlVisualApplyModelMark(el, modelTag || ovlVisualCfgModelTag(cfg)); // v2 Pass P232c：同「重试」——跟随路径按产出者（请求前固定的 cfg）打标记；override 路径不变。 // v2 Pass P223；v2 Pass P232b：跟随路径（modelTag=''）无条件清残留的「来自 X」，partial/skipped/raw 结果也一样
             if (typeof ovlVisualLoadFigureThumbnails === 'function') ovlVisualLoadFigureThumbnails(el);
             if (typeof ovlRenderVisualGutter === 'function' && OvlState.editorMode === 'visual') ovlRenderVisualGutter();
         }
