@@ -5077,8 +5077,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.53.06';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-10-15';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.54.00';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-10-19';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -13143,7 +13143,7 @@ Rules:
         termsBlock = ovlTermDbBuildPromptBlockZhEn(ovlTermDbMatchZh(matchText || '', { cap: 60 }));
     } else {
         const matched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(matchText || '', { cap: 60 }) : [];
-        termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(matched) : '';
+        termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(matched, tgtName === 'Chinese') : ''; // v2 Pass P240
     }
     sys += termsBlock;
     if (card) sys = card + '\n\n' + sys;
@@ -13784,7 +13784,7 @@ async function xportLegacyOne(seg, srcName, tgtName, config, signal, taskUsage) 
 4. You MUST return ONLY valid JSON: {"translations": [{"src": "Original 1", "tgt": "Translated 1"}]}
 5. Do NOT include any text before or after the JSON.`;
     // v2 Pass P221：最后一级也带论文卡片 + 方向感知术语块（cap 60）；空 ⇒ 原样不变。
-    systemPrompt = (typeof ovlTermDbWrapSystem === 'function') ? ovlTermDbWrapSystem(systemPrompt, srcName === 'Chinese' ? 'zh2en' : 'en2zh', seg, 60) : systemPrompt;
+    systemPrompt = (typeof ovlTermDbWrapSystem === 'function') ? ovlTermDbWrapSystem(systemPrompt, srcName === 'Chinese' ? 'zh2en' : 'en2zh', seg, 60, true) : systemPrompt; // v2 Pass P240：keep 只作用于 en2zh
     let data;
     if (config.provider === 'local') {
         // 阶梯的最后一级正是「模型已经在乱来」的时候才会跑到 —— A4 的分类必须落在这里，
@@ -14195,7 +14195,7 @@ async function translateBulk(text, srcLang, tgtLang, config, signal = null) {
 4. You MUST return ONLY valid JSON: {"translations": [{"src": "Original 1", "tgt": "Translated 1"}]}
 5. Do NOT include any text before or after the JSON.`;
     // v2 Pass P221：legacy JSON fallback also carries card + direction-aware terms (batch text, cap 60); empty => byte-identical.
-    systemPrompt = (typeof ovlTermDbWrapSystem === 'function') ? ovlTermDbWrapSystem(systemPrompt, srcName === 'Chinese' ? 'zh2en' : 'en2zh', text, 60) : systemPrompt;
+    systemPrompt = (typeof ovlTermDbWrapSystem === 'function') ? ovlTermDbWrapSystem(systemPrompt, srcName === 'Chinese' ? 'zh2en' : 'en2zh', text, 60, true) : systemPrompt; // v2 Pass P240：keep 只作用于 en2zh
 
     if (config.provider === 'local') {
         const meta = {};
@@ -28226,14 +28226,73 @@ function ovlTermDbMatch(rawText, opts) {
 // 统一的注入片段渲染——三条路径共用同一个格式（T0 review 绑定决定 3）："Terminology (use
 // exactly):\n" + 每行 "en → zh"；kind==='keep' 渲染成 "en → en (keep in English)"。空数组
 // 返回空串（调用方按需拼装，不喂模型一句空话）。
-function ovlTermDbBuildPromptBlock(entries) {
+function ovlTermDbBuildPromptBlock(entries, keepAware) {
     try {
+        if (keepAware === true && ovlKeepTermsOn()) return ovlKeepTermsPromptBlock(entries); // v2 Pass P240
         if (!entries || !entries.length) return '';
         const lines = entries.map(function (e) {
             return (e.kind === 'keep') ? (e.en + ' → ' + e.en + ' (keep in English)') : (e.en + ' → ' + e.zh);
         });
         return '\n\n' + 'Terminology (use exactly):\n' + lines.join('\n');
     } catch (e) { return ''; }
+}
+
+// ==================== v2 Pass P240：专业名词保留英文 ====================
+// 设置 OvlSettings.keepTermsEnglish（默认关）。开着时，所有"把论文翻成中文"的请求——Visual 逐块 /
+// 段落联合 / \text 片段 / raw 阶梯、文本模式批量 / 回退——在术语块的位置多一条规则：方法/模型/算法/
+// 架构名、中文论文里习惯直接写英文的专业概念、所有缩写都保持英文原样，其余照常译成中文。
+// 哪些算专业名词由模型判断；术语库是硬约束：用户自己登记的条目照旧"use exactly"（kind keep = 保留英文，
+// 填了中文 = 就用这个中文），自动抽取 / AI 补全的条目降为"如果决定翻这个词，就用这个中文"的一致性提示，
+// 不压过保留规则。「译」划词弹框（ovlVisTransRequest）、精修/近义词不带这条规则——划词就是想看中文意思。
+// 关着时：所有请求体、Visual 缓存 key 逐字节不变（调用方只多传一个 true，这里第一行就分流）。
+function ovlKeepTermsOn() { try { return !!(OvlSettings && OvlSettings.keepTermsEnglish === true); } catch (e) { return false; } }
+const OVL_KEEP_TERMS_RULE = 'Technical terms: keep domain-specific technical terms in their original English form instead of translating them. '
+    + 'This covers names of methods, models, algorithms, architectures and frameworks (e.g. Actor-Critic, Transformer, Q-learning, Kalman filter), '
+    + 'established technical concepts that Chinese researchers normally write in English, and every acronym (e.g. MIMO, RGM-AC). '
+    + 'Copy a kept term exactly as written in the source (same spelling, capitalization and hyphens) and do not add a Chinese gloss after it. '
+    + 'Translate everything else - ordinary words, descriptive modifiers such as "resource-aware", and the sentence itself - into fluent Chinese. '
+    + 'If the whole segment consists only of such terms, output it unchanged.';
+function ovlKeepTermsPromptBlock(entries) {
+    const hard = [], soft = [];
+    (Array.isArray(entries) ? entries : []).forEach(function (e) {
+        if (!e || !e.en) return;
+        if (e.kind === 'keep') hard.push(e.en + ' → ' + e.en + ' (keep in English)');
+        else if (e.source === 'user') hard.push(e.en + ' → ' + e.zh);
+        else soft.push(e.en + ' → ' + e.zh);
+    });
+    let out = '\n\n' + OVL_KEEP_TERMS_RULE;
+    if (hard.length) out += '\n\nTerminology (use exactly; overrides the rule above):\n' + hard.join('\n');
+    if (soft.length) out += '\n\nSuggested Chinese, only for terms you decide to translate (otherwise keep them in English):\n' + soft.join('\n');
+    return out;
+}
+// 校验侧（回显守卫 / 源相对中文覆盖闸）：保留下来的术语词不能被算成"没翻译的英文"。
+// · 只数译文里 ≤6 词的短拉丁串里的词（术语都短；整句没翻的英文是一长串，逗号也算连接符，不在豁免之列），
+//   且每个词必须在源文里出现过（按多重集消耗，不会凭空多出来）。
+// · "整段只有术语、原样输出"只在源文 ≤8 词且不含任何英文虚词时才算合法（\subsection{Actor-Critic} 这类）；
+//   "We propose a method." 这种短句原样回来照旧判回显。
+const OVL_KEEP_TERMS_RUN_MAX_WORDS = 6;
+const OVL_KEEP_TERMS_ALL_TERMS_MAX_WORDS = 8;
+const OVL_KEEP_TERMS_STOPWORDS = { the: 1, a: 1, an: 1, of: 1, is: 1, are: 1, was: 1, were: 1, be: 1, been: 1, we: 1, our: 1, to: 1, in: 1, for: 1,
+    with: 1, and: 1, or: 1, by: 1, on: 1, at: 1, from: 1, this: 1, that: 1, these: 1, those: 1, it: 1, its: 1, as: 1, which: 1,
+    can: 1, will: 1, not: 1, has: 1, have: 1, how: 1, what: 1, when: 1, where: 1, via: 1, into: 1, than: 1, then: 1, all: 1 };
+function ovlKeepTermsKeptWords(srcProse, tgtProse) {
+    if (!ovlKeepTermsOn()) return 0;
+    const bag = Object.create(null);
+    (String(srcProse == null ? '' : srcProse).match(/[A-Za-z]{2,}/g) || []).forEach(function (w) { w = w.toLowerCase(); bag[w] = (bag[w] || 0) + 1; });
+    let kept = 0;
+    const runs = String(tgtProse == null ? '' : tgtProse).match(/[A-Za-z0-9]+(?:[\s\-'’\/.,;:()]+[A-Za-z0-9]+)*/g) || [];
+    runs.forEach(function (run) {
+        const words = run.match(/[A-Za-z]{2,}/g) || [];
+        if (!words.length || words.length > OVL_KEEP_TERMS_RUN_MAX_WORDS) return;
+        words.forEach(function (w) { w = w.toLowerCase(); if (bag[w] > 0) { bag[w]--; kept++; } });
+    });
+    return kept;
+}
+function ovlKeepTermsTermOnlySrc(srcProse) {
+    if (!ovlKeepTermsOn()) return false;
+    const words = String(srcProse == null ? '' : srcProse).match(/[A-Za-z]{2,}/g) || [];
+    if (!words.length || words.length > OVL_KEEP_TERMS_ALL_TERMS_MAX_WORDS) return false;
+    return !words.some(function (w) { return OVL_KEEP_TERMS_STOPWORDS[w.toLowerCase()] === 1; });
 }
 
 // ============================================================================
@@ -28314,15 +28373,15 @@ function ovlTermDbContextFor(dir, text, opts) {
         const card = (opts && opts.card === false) ? '' : ((typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '');
         let terms;
         if (dir === 'zh2en') terms = ovlTermDbBuildPromptBlockZhEn(ovlTermDbMatchZh(text, { cap: cap }));
-        else terms = ovlTermDbBuildPromptBlock(ovlTermDbMatch(text, { cap: cap }));
+        else terms = ovlTermDbBuildPromptBlock(ovlTermDbMatch(text, { cap: cap }), !!(opts && opts.keep === true)); // v2 Pass P240：opts.keep 只由译论文的路径传
         return { card: card, terms: terms };
     } catch (e) { return { card: '', terms: '' }; }
 }
 // 给一条已有的 system 提示词包上"论文卡片 + 方向感知术语块"，布局与哨兵路径一致：
 // 术语块接在末尾、卡片放最前面。没有卡片也没有命中 → 原样返回同一个字符串（逐字节不变）。
-function ovlTermDbWrapSystem(sys, dir, text, cap) {
+function ovlTermDbWrapSystem(sys, dir, text, cap, keepAware) {
     try {
-        const ctx = ovlTermDbContextFor(dir, text, { cap: cap || 30 });
+        const ctx = ovlTermDbContextFor(dir, text, { cap: cap || 30, keep: keepAware === true }); // v2 Pass P240
         if (!ctx.card && !ctx.terms) return sys;
         let out = sys + ctx.terms;
         if (ctx.card) out = ctx.card + '\n\n' + out;
@@ -39877,7 +39936,8 @@ function ovlVisualTransCacheContextFingerprint(text, config) {
         const card = (typeof ovlPaperCardGet === 'function') ? ovlVisualTransCacheScopedCard() : '';
         const matched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(text, { cap: 30 }) : [];
         const matchedPart = matched.length ? ('\u0001' + JSON.stringify(matched)) : '';
-        return ovlVisualHashSrc(domainHintLine + '\u0001' + card + matchedPart);
+        const keepPart = ovlKeepTermsOn() ? '\u0001keepTermsEnglish' : ''; // v2 Pass P240：关着时指纹输入逐字节不变
+        return ovlVisualHashSrc(domainHintLine + '\u0001' + card + matchedPart + keepPart);
     } catch (e) { return '0'; }
 }
 function ovlVisualTransCacheKey(text, config) {
@@ -39896,7 +39956,7 @@ function ovlVisualTransCacheKey(text, config) {
     } else {
         const card = (typeof ovlPaperCardGet === 'function') ? ovlVisualTransCacheScopedCard() : '';
         const matched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(text, { cap: 30 }) : [];
-        if (card || matched.length) ctxFp = '|' + ovlVisualTransCacheContextFingerprint(text, config);
+        if (card || matched.length || ovlKeepTermsOn()) ctxFp = '|' + ovlVisualTransCacheContextFingerprint(text, config); // v2 Pass P240
     }
     return ovlVisualHashSrc(text) + '|zh|' + provider + '|' + model + '|v' + OVL_VISUAL_TRANS_PROMPT_VERSION + ctxFp;
 }
@@ -40786,8 +40846,18 @@ const OVL_VISUAL_CJK_GATE_VERSION = 2;
 function ovlVisualCjkGateEval(src, rawTgt) {
     const srcMasked = xportMask(ovlVisualCodeMask(String(src == null ? '' : src)).text).text;
     const tgtMasked = xportMask(ovlVisualCodeMask(String(rawTgt == null ? '' : rawTgt)).text).text;
-    const srcWords = ovlVisualGateSrcWords(srcMasked);
+    let srcWords = ovlVisualGateSrcWords(srcMasked);
     const zhChars = ovlVisualGateZhChars(tgtMasked);
+    let keptWords = 0;
+    if (srcWords > 0 && ovlKeepTermsOn()) {
+        // v2 Pass P240：保留英文模式下，原样保留的术语词从"该译的词数"里扣掉（见 ovlKeepTermsKeptWords）。
+        const srcProse = ovlVisualGateProse(srcMasked);
+        keptWords = ovlKeepTermsKeptWords(srcProse, ovlVisualGateProse(tgtMasked));
+        if (keptWords >= srcWords) {
+            if (ovlKeepTermsTermOnlySrc(srcProse)) return { ok: true, reason: null, srcWords: 0, zhChars: zhChars, need: 0, keptWords: keptWords };
+            keptWords = 0; // 不像纯术语的源文被整段原样抄回：照旧按回显 / 没翻译判
+        } else srcWords -= keptWords;
+    }
     if (srcWords === 0) {
         const tgtWords = ovlVisualGateSrcWords(tgtMasked);
         if (tgtWords > 0) {
@@ -40796,9 +40866,9 @@ function ovlVisualCjkGateEval(src, rawTgt) {
         return { ok: true, reason: null, srcWords: 0, zhChars: zhChars, need: 0 };
     }
     const need = Math.max(1, Math.ceil(OVL_VISUAL_CJK_GATE_K * srcWords));
-    if (zhChars === 0) return { ok: false, reason: 'no-cjk', srcWords: srcWords, zhChars: zhChars, need: need };
-    if (zhChars < need) return { ok: false, reason: 'low-cjk', srcWords: srcWords, zhChars: zhChars, need: need };
-    return { ok: true, reason: null, srcWords: srcWords, zhChars: zhChars, need: need };
+    if (zhChars === 0) return { ok: false, reason: 'no-cjk', srcWords: srcWords, zhChars: zhChars, need: need, keptWords: keptWords };
+    if (zhChars < need) return { ok: false, reason: 'low-cjk', srcWords: srcWords, zhChars: zhChars, need: need, keptWords: keptWords };
+    return { ok: true, reason: null, srcWords: srcWords, zhChars: zhChars, need: need, keptWords: keptWords };
 }
 // v2 Pass P128e（B3-1，任务书第 1 条"分块/入队阶段判定"无可译散文""）：判定"这一块从源头
 // 就没有任何可译散文"——用跟写入侧闸完全同一把尺子（上面 ovlVisualCjkGateEval 的
@@ -40855,6 +40925,9 @@ function ovlVisualIsEchoFailure(maskedSrc, rawBody) {
     const rawA = ovlVisualNormalizeForEcho(maskedSrc);
     const rawB = ovlVisualNormalizeForEcho(rawBody);
     if (!rawA || !rawB) return false; // 空值交给已有的其它校验路径处理，不归这个守卫管
+    // v2 Pass P240：保留英文模式下，纯术语的短源文（≤8 词、无英文虚词）原样回来是正确结果，不是回显；
+    // 译文里每个英文词是否都来自源文，由随后的中文覆盖闸（ovlVisualCjkGateEval）再把一道关。
+    if (ovlKeepTermsOn() && ovlVisualCountCjk(rawBody) === 0 && ovlKeepTermsTermOnlySrc(ovlVisualGateProse(maskedSrc))) return false;
     if (rawA === rawB) return true; // 去空白后逐字节相同——最强信号，直接判回显
     const proseIn = ovlVisualNormalizeProse(ovlVisualExtractProse(maskedSrc));
     const proseOut = ovlVisualNormalizeProse(ovlVisualExtractProse(rawBody));
@@ -41040,7 +41113,7 @@ async function ovlVisualTranslateTextProseFragment(prose, config, signal, outMet
         + '原文：\n' + masked.text;
     // v2 Pass P221：\text{} 碎片又小又多，只经 system 槽带命中术语（cap 10），不带论文卡片；
     // 没有命中时不传第 6 参，请求体逐字节不变。
-    const fragCtx = (typeof ovlTermDbContextFor === 'function') ? ovlTermDbContextFor('en2zh', src, { cap: 10, card: false }) : { terms: '' };
+    const fragCtx = (typeof ovlTermDbContextFor === 'function') ? ovlTermDbContextFor('en2zh', src, { cap: 10, card: false, keep: true }) : { terms: '' };
     const fragSys = String(fragCtx.terms || '').replace(/^\n+/, '');
     let raw;
     try {
@@ -41469,7 +41542,7 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
             const domainHintLine = (!card && typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
             const ctxO = (opts && opts.ctx) ? opts.ctx : null; // v2 Pass P233：只读上下文（邻居的中文译文 + 章节标题 + 术语一致性），无 ctx 时下面逐字节不变
             const matchedTerms = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(ctxO ? (src + '\n' + ctxO.matchText) : src, { cap: 30 }) : [];
-            const termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(matchedTerms) : '';
+            const termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(matchedTerms, true) : ''; // v2 Pass P240
             const sysRules = ovlVisualBlockSysRules(rules, masked.map, citeMasked.map); // v2 Pass P233：两条 local 私有规则搬进 ovlVisualBlockSysRules（语句原样）
             let sys = '你是学术论文翻译助手。接下来的用户消息只包含一段待翻译的 LaTeX 片段本身，不包含任何其它内容——'
                 + '请把它翻译成简体中文学术书面语，直接给出译文，不要复述或添加任何前后缀。硬性规则：\n'
@@ -41492,7 +41565,7 @@ async function ovlVisualTranslateBlockText(text, config, signal, meta, opts) {
             const nlCard = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
             const nlCtx = (opts && opts.ctx) ? opts.ctx : null; // v2 Pass P233：同上，无 ctx 时逐字节不变
             const nlMatched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(nlCtx ? (src + '\n' + nlCtx.matchText) : src, { cap: 30 }) : [];
-            const nlTermsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(nlMatched) : '';
+            const nlTermsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(nlMatched, true) : ''; // v2 Pass P240
             const preamble = (nlCard ? nlCard + '\n\n' : '') + (nlCtx ? nlCtx.text : '') + nlTermsBlock;
             raw = preamble
                 ? await callModelPlainText(prompt, config, signal, callMeta, callOpts, preamble)
@@ -41612,7 +41685,7 @@ async function ovlVisualTranslateBlockRaw(text, cfg, signal, meta) {
         + '不得改动数字、不得加倍成 [[12]]；以 % 开头的注释行原样保留。\n\n' + src;
     // v2 Pass P221：L-raw 这一级此前不带任何上下文；现在经 system 槽补上论文卡片 + 命中术语
     // （en→zh）。prompt 本身一个字不动；两者都空时不传第 6 参，逐字节不变。
-    const rawCtx = (typeof ovlTermDbContextFor === 'function') ? ovlTermDbContextFor('en2zh', src, { cap: 30 }) : { card: '', terms: '' };
+    const rawCtx = (typeof ovlTermDbContextFor === 'function') ? ovlTermDbContextFor('en2zh', src, { cap: 30, keep: true }) : { card: '', terms: '' }; // v2 Pass P240
     const rawSys = ((rawCtx.card || '') + rawCtx.terms).replace(/^\n+/, '');
     const raw0 = rawSys
         ? await callModelPlainText(prompt, cfg, signal, null, null, rawSys)
@@ -42132,7 +42205,7 @@ function ovlP233JointCompose(preps, config, ctx, correction) {
     let matchBase = preps.map(function (p) { return p.src; }).join('\n');
     if (ctx && ctx.matchText) matchBase += '\n' + ctx.matchText;
     const matched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(matchBase, { cap: 40 }) : [];
-    const termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(matched) : '';
+    const termsBlock = (typeof ovlTermDbBuildPromptBlock === 'function') ? ovlTermDbBuildPromptBlock(matched, true) : ''; // v2 Pass P240
     const ctxText = ctx && ctx.text ? ctx.text : '';
     if (config && config.provider === 'local') {
         const domainHintLine = (!card && typeof ovlDomainHintPromptLine === 'function') ? ovlDomainHintPromptLine() : '';
@@ -62727,6 +62800,7 @@ const OVL_SETTINGS_DEFAULTS = {
     visualTranslate: 'auto',    // P4 消费：'auto' | 'button' | 'off'
     visualTransModel: '',       // P4 消费：''=跟随翻译器当前选中的模型
     visualTransConcurrency: 'auto', // v2 Pass P230：Visual 中文翻译同时在飞的请求数。'auto'=本地模型跟随 LM Studio 的 parallel（读不到/在线模型=3）；整数 1–16=手动
+    keepTermsEnglish: false,    // v2 Pass P240：专业名词保留英文（方法/模型/算法名、习惯写英文的概念、缩写不翻译）。false=请求内容与 P240 之前逐字节一致
     visualAutoContext: true,    // v2 Pass P233：翻译时自动联系上下文（同一段落连续行合成一次请求 + 单块翻译带前后已有译文/章节标题）。false=请求内容与 P233 之前逐字节一致
     visualPinBudget: 3000,      // v2 Pass P239：「翻译参考总长度上限」——一次请求里翻译参考（对照对 + 公式 LaTeX）的字数上限，只认 1500 | 3000 | 6000 | 12000，其它值按 3000 处理
     visualRetranslateModel: '', // v2 Pass P223：块「重译」旁下拉的上次选择，'provider::model'，''=跟随当前模型
@@ -63374,6 +63448,9 @@ function ovlSettingsTranslatorHtml() {
     // v2 Pass P233：翻译时自动联系上下文。普通复选框，走通用 data-setpath（change 委托里对本项专门处理：只存盘，不重渲 Visual）。
     html += ovlSetRow('翻译时自动联系上下文', '<input type="checkbox" data-setpath="settings.visualAutoContext"' + (s.visualAutoContext !== false ? ' checked' : '') + '>',
         '开着时，同一段落里连续的几行会合成一次请求翻译、单独翻一块时也参考前后已有的中文译文和章节标题，让术语和语气前后一致；选中多块后工具条里的「重译选中 N 块（联系上下文）」和「翻译参考」（把选中的块固定为原文+译文对照，之后本项目每次翻译都会带上）不受这个开关影响；关掉后其余翻译请求与以前逐字节一致。');
+    // v2 Pass P240：专业名词保留英文。普通复选框，走通用 data-setpath（默认分支：存盘 + ovlApplySettings，Visual 中文视图按新规则重查缓存）。
+    html += ovlSetRow('专业名词保留英文', '<input type="checkbox" data-setpath="settings.keepTermsEnglish"' + (s.keepTermsEnglish === true ? ' checked' : '') + '>',
+        '开着时，翻译论文（Visual 中文视图、文本翻译器）会把方法/模型/算法名（如 Actor-Critic、Transformer）、中文论文里习惯直接写英文的专业概念和所有缩写原样保留为英文，其余照常译成中文；哪些算专业名词由模型根据上下文判断。术语库优先：你自己登记的条目照旧生效（标成「保留英文」的一定不译，填了中文的就用你的中文）。想知道某个词的中文意思，划选它点「译」——划词翻译不受这个开关影响。切换后已翻译的内容会按新规则重新翻译；切回来时，旧译文如果还在缓存里会直接恢复。');
     // v2 Pass P233：翻译参考没有逐条的列表界面（块上只有安静的左缘标记），这里给一个总的清空入口（见 ovlP233PinsClearAll）。
     html += ovlSetRow('翻译参考', '<button type="button" class="ovl-modal-btn" id="ovlP233PinsClearBtn"' + (ovlP233PinsGet().length ? '' : ' disabled') + ' onclick="ovlP233PinsClearAll()">' + escapeHtml(ovlP233PinsClearLabel()) + '</button>',
         '在 Visual 工具条里勾选「翻译参考」的块（正文、独立公式、表格都可以），正文会按原文+译文对照、公式和表格会按 LaTeX 原文（只用来理解符号含义）附在本项目之后的每个翻译请求里。块上的标记可以逐个取消；这里一次清空当前项目的全部翻译参考（例如原文被改过、旧参考已经没有对应的块时）。');
@@ -72177,7 +72254,7 @@ const OVL_SYNC_SECRET_SETTING_FIELDS = ['overleafToken', 'ovlAiMergeApiKey', 'pd
 const OVL_SYNC_SETTING_FIELDS = [
     'fontSize', 'fontFamily', 'lineHeight', 'editorTheme', 'showLineNumbers', 'tabSize', 'autoCloseBrackets',
     'nonBlinkingCursor', 'quickActions', 'breadcrumbs', 'equationPreview', 'spellcheck', 'spellLang',
-    'transSimpleMode', 'visualTranslate', 'visualTransModel', 'visualTransConcurrency', 'visualAutoContext', 'visualPinBudget', 'visualRetranslateModel', 'visualRetranslateThinking', 'ovlVisualLineBreaks', 'ovlVisualOutlineSelection',
+    'transSimpleMode', 'visualTranslate', 'visualTransModel', 'visualTransConcurrency', 'visualAutoContext', 'keepTermsEnglish', 'visualPinBudget', 'visualRetranslateModel', 'visualRetranslateThinking', 'ovlVisualLineBreaks', 'ovlVisualOutlineSelection',
     'ovlVisualBtrConfirmFirst', 'overleafAutoPullMinutes', 'ovlRestoreLastProject', 'ovlAiMergeEndpoint',
     'ovlAiMergeModel', 'pdf2texDefaultOutDir', 'pdf2texVisionEndpoint', 'pdf2texVisionModel', 'pdf2texConcurrency',
     'pdf2texDisableThinking', 'pdf2texMaxPx', 'pdf2texSavePageImages', 'pdf2texAutoOpenResult',
