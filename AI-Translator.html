@@ -5077,7 +5077,7 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.54.00';        // APP_VERSION_STAMP
+const APP_VERSION = '03.54.01';        // APP_VERSION_STAMP
 const APP_BUILD_DATE = '2026-10-19';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
@@ -28248,7 +28248,8 @@ function ovlTermDbBuildPromptBlock(entries, keepAware) {
 function ovlKeepTermsOn() { try { return !!(OvlSettings && OvlSettings.keepTermsEnglish === true); } catch (e) { return false; } }
 const OVL_KEEP_TERMS_RULE = 'Technical terms: keep domain-specific technical terms in their original English form instead of translating them. '
     + 'This covers names of methods, models, algorithms, architectures and frameworks (e.g. Actor-Critic, Transformer, Q-learning, Kalman filter), '
-    + 'established technical concepts that Chinese researchers normally write in English, and every acronym (e.g. MIMO, RGM-AC). '
+    + 'established multi-word technical concepts that Chinese researchers normally write in English (e.g. multi-head attention), and every acronym (e.g. MIMO, RGM-AC). '
+    + 'A single common English word used with a technical meaning (e.g. policy, state, reward, channel, network) is usually an ordinary word: translate it. '
     + 'Copy a kept term exactly as written in the source (same spelling, capitalization and hyphens) and do not add a Chinese gloss after it. '
     + 'Translate everything else - ordinary words, descriptive modifiers such as "resource-aware", and the sentence itself - into fluent Chinese. '
     + 'If the whole segment consists only of such terms, output it unchanged.';
@@ -44179,7 +44180,17 @@ function ovlVisualAuditUnmarkedEnglish(pane) {
             } catch (e) { text = el.textContent || ''; }
             const hasCjk = (typeof ovlVisualCountCjk === 'function') ? ovlVisualCountCjk(text) > 0 : /[一-鿿]/.test(text);
             const hasEnglishRun = /[A-Za-z]{4,}/.test(text); // 跟诊断 §1 的判据一致："含 ≥4 连续字母"
-            if (!hasCjk && hasEnglishRun) {
+            // v2 Pass P240：「专业名词保留英文」开着时，纯术语块（如 \subsection{Actor-Critic}）原样保留是合法结果——
+            // 用写入侧同一把尺子（ovlVisualCjkGateEval 的 keptWords 豁免）判定，不再打回重译、也不标 audit-loop。
+            let p240Kept = false;
+            if (!hasCjk && hasEnglishRun && ovlKeepTermsOn()) {
+                try {
+                    const srcK = ovlVisualBlockSrcText(el);
+                    const gK = srcK ? ovlVisualCjkGateEval(srcK, text) : null;
+                    p240Kept = !!(gK && gK.ok && gK.keptWords > 0);
+                } catch (e) { p240Kept = false; }
+            }
+            if (!hasCjk && hasEnglishRun && !p240Kept) {
                 out.push({
                     el: el,
                     line: el.getAttribute('data-src-line'),
@@ -71276,10 +71287,15 @@ async function ovlVisTransRequest(text, selRows, promptKind) {
     // 缓存键加前缀：tex/vis 两路各算各的，不会互相命中对方的缓存（纯内存 LRU 50，
     // 没有持久化，不存在迁移问题）。
     const p202aCard = (typeof ovlPaperCardGet === 'function') ? ovlPaperCardGet() : '';
-    const p202aMatched = (typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(text, { cap: 30 }) : [];
+    // v2 Pass P240：划词翻译就是想看中文意思——术语库里标「保留英文」的条目不发（否则模型会把英文原样还回来）；
+    // 填了中文的条目照旧发，保证用词一致。没有 keep 条目命中时与 P240 之前逐字节相同。
+    const p202aMatched = ((typeof ovlTermDbMatch === 'function') ? ovlTermDbMatch(text, { cap: 30 }) : []).filter(function (e) { return !e || e.kind !== 'keep'; });
+    // v2 Pass P240：「专业名词保留英文」开着时，单独划选的短英文术语（不含汉字、1-6 个词）换成"中文译名 + 必要时一句解释"的提示，缓存前缀单独一份。
+    const p240Words = String(text).match(/[A-Za-z0-9]+/g) || [];
+    const p240Term = promptKind !== 'tex' && ovlKeepTermsOn() && !/[㐀-鿿]/.test(text) && p240Words.length >= 1 && p240Words.length <= 6;
     const p202aCtxFp = (typeof ovlVisualHashSrc === 'function')
         ? ovlVisualHashSrc(p202aCard + '\u0001' + JSON.stringify(p202aMatched)) : '';
-    const key = (promptKind === 'tex' ? 'tex2 ' : 'vis2 ') + text + '|' + p202aCtxFp; // v2 Pass P227：前缀升级，P227 之前产生的串味缓存条目不再可达
+    const key = (promptKind === 'tex' ? 'tex2 ' : (p240Term ? 'vis2t ' : 'vis2 ')) + text + '|' + p202aCtxFp; // v2 Pass P227：前缀升级，P227 之前产生的串味缓存条目不再可达
 
     const cached = ovlVisTransCacheGet(key);
     if (cached !== undefined) {
@@ -71325,8 +71341,11 @@ async function ovlVisTransRequest(text, selRows, promptKind) {
             ? '把下面这段 LaTeX 源码里的正文翻译成中文。只输出译文本身，不要解释，不要重复原文。'
               + '所有 LaTeX 命令、环境、数学公式（\\cite{}、\\ref{}、$...$、\\begin{}…\\end{} 等）'
               + '一律原样保留，不要翻译也不要改写；以 % 开头的注释行原样保留。\n\n' + text
-            : '把下面这段学术英文翻译成中文。只输出译文本身，不要解释，不要重复原文。'
-              + '保留其中的 LaTeX 数学公式（$...$）原样不译。\n\n' + text;
+            : p240Term
+                ? ('下面是一篇学术论文里保留为英文的专业术语。请给出它在该领域通用的中文译名；如果只看译名仍不容易理解，再用一句话简要解释它的含义。'
+                  + '只输出这些内容，不要重复英文原文，不要加其它前后缀。\n\n' + text) // v2 Pass P240
+                : '把下面这段学术英文翻译成中文。只输出译文本身，不要解释，不要重复原文。'
+                  + '保留其中的 LaTeX 数学公式（$...$）原样不译。\n\n' + text;
         const out = popupSys
             ? await callModelPlainText(prompt, cfg, ctl ? ctl.signal : null, null, null, popupSys)
             : await callModelPlainText(prompt, cfg, ctl ? ctl.signal : null);
