@@ -5077,8 +5077,8 @@ if (typeof pdfjsLib !== 'undefined' && pdfjsLib.GlobalWorkerOptions) {
 // 用 tools/hooks/bump.sh major|minor|patch 进位；下面这两行由 .git/hooks/pre-commit 在提交时
 // 自动盖章（钩子源码在 tools/hooks/pre-commit），保证屏幕上的号码永远不会和仓库悄悄对不上。
 // ⚠️ 这两行的形状是钩子的正则锚点，改动前先看 tools/hooks/pre-commit。
-const APP_VERSION = '03.54.01';        // APP_VERSION_STAMP
-const APP_BUILD_DATE = '2026-10-19';   // APP_BUILD_DATE_STAMP
+const APP_VERSION = '03.54.02';        // APP_VERSION_STAMP
+const APP_BUILD_DATE = '2026-10-22';   // APP_BUILD_DATE_STAMP
 // 挂到 window 上，方便在控制台里 `APP_VERSION` 直接读出来写进 bug 报告
 window.APP_VERSION = APP_VERSION;
 window.APP_BUILD_DATE = APP_BUILD_DATE;
@@ -28238,7 +28238,7 @@ function ovlTermDbBuildPromptBlock(entries, keepAware) {
 }
 
 // ==================== v2 Pass P240：专业名词保留英文 ====================
-// 设置 OvlSettings.keepTermsEnglish（默认关）。开着时，所有"把论文翻成中文"的请求——Visual 逐块 /
+// 设置 OvlSettings.keepTermsEnglish（P241 起默认开；旧存档里的 false 每台机器一次性翻成 true，见 ovlLoadSettings）。开着时，所有"把论文翻成中文"的请求——Visual 逐块 /
 // 段落联合 / \text 片段 / raw 阶梯、文本模式批量 / 回退——在术语块的位置多一条规则：方法/模型/算法/
 // 架构名、中文论文里习惯直接写英文的专业概念、所有缩写都保持英文原样，其余照常译成中文。
 // 哪些算专业名词由模型判断；术语库是硬约束：用户自己登记的条目照旧"use exactly"（kind keep = 保留英文，
@@ -62811,7 +62811,7 @@ const OVL_SETTINGS_DEFAULTS = {
     visualTranslate: 'auto',    // P4 消费：'auto' | 'button' | 'off'
     visualTransModel: '',       // P4 消费：''=跟随翻译器当前选中的模型
     visualTransConcurrency: 'auto', // v2 Pass P230：Visual 中文翻译同时在飞的请求数。'auto'=本地模型跟随 LM Studio 的 parallel（读不到/在线模型=3）；整数 1–16=手动
-    keepTermsEnglish: false,    // v2 Pass P240：专业名词保留英文（方法/模型/算法名、习惯写英文的概念、缩写不翻译）。false=请求内容与 P240 之前逐字节一致
+    keepTermsEnglish: true,     // v2 Pass P240：专业名词保留英文（方法/模型/算法名、习惯写英文的概念、缩写不翻译）。false=请求内容与 P240 之前逐字节一致。P241：用户要求默认开
     visualAutoContext: true,    // v2 Pass P233：翻译时自动联系上下文（同一段落连续行合成一次请求 + 单块翻译带前后已有译文/章节标题）。false=请求内容与 P233 之前逐字节一致
     visualPinBudget: 3000,      // v2 Pass P239：「翻译参考总长度上限」——一次请求里翻译参考（对照对 + 公式 LaTeX）的字数上限，只认 1500 | 3000 | 6000 | 12000，其它值按 3000 处理
     visualRetranslateModel: '', // v2 Pass P223：块「重译」旁下拉的上次选择，'provider::model'，''=跟随当前模型
@@ -62955,6 +62955,22 @@ function ovlLoadSettings() {
             }
         }
     } catch (e) { console.warn('[ovl] loadSettings failed', e); }
+    ovlP241KeepTermsDefaultOnce();
+}
+// v2 Pass P241：「专业名词保留英文」改成默认开（用户要求）。P240 期间存过设置的存档里是显式 false（当时的默认），
+// 只改默认值对它们不生效——这里每台机器（每个 localStorage）只翻一次 false→true，翻完记标记
+// ovl.keepTermsDefaultOn=1（这个键不在同步登记表里，不上服务器）；之后用户手动关掉就一直是关，不会再被翻回来。
+// 没有存档的新环境直接取默认值 true，同样记标记。与 P89 不同：P89 每次加载都覆盖 false，这里只做一次。
+function ovlP241KeepTermsDefaultOnce() {
+    try {
+        if (localStorage.getItem('ovl.keepTermsDefaultOn') === '1') return;
+        if (OvlSettings && OvlSettings.keepTermsEnglish === false) {
+            OvlSettings.keepTermsEnglish = true;
+            console.info('[ovl] P241 一次性把「专业名词保留英文」切到默认开启');
+            ovlSaveSettings();
+        }
+        localStorage.setItem('ovl.keepTermsDefaultOn', '1');
+    } catch (e) {}
 }
 function ovlSaveSettings() {
     try { localStorage.setItem('ovl.settings', JSON.stringify(OvlSettings)); } catch (e) {}
