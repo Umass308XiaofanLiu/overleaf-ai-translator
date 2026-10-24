@@ -38,7 +38,13 @@ translation requests.
 - SyncTeX navigation between the source, Visual mode and the PDF.
 - In-place editing in Visual mode, written back to the matching range of the source.
 - Placeholder protection for mathematics and LaTeX commands, with validation and staged retries.
-- A per-project glossary and background card, sent with every translation request.
+- A per-project glossary and background card, sent with every translation request. Only the glossary entries that occur in a block are sent.
+- Glossary matching that tolerates case, hyphenation, joined spellings, plural forms and acronym/full-form pairs.
+- An optional translation memory based on retrieval-augmented generation. For each block, previously translated blocks of the same project are retrieved by hybrid search and supplied to the model as reference examples. The search combines BM25 with dense vectors from a local embedding model through reciprocal rank fusion. The memory is off by default; see [Verification](#verification).
+- Terminology tools, all read-only until the user confirms a change:
+  - a consistency check that lists blocks where a glossary term or an acronym is translated inconsistently;
+  - glossary suggestions mined from the translation memory by source/target co-occurrence;
+  - suggestions for source phrases that are semantically close to a glossary entry, found by embedding similarity and filtered by lexical and antonym guards.
 - Optional modes that keep technical terms in English and that supply a domain hint for ambiguous terms.
 - PDF-to-LaTeX conversion with a vision-language model.
 - An AI assistant with tool access to the open project.
@@ -86,6 +92,7 @@ LaTeX source
   → segmentation into text blocks
   → placeholder masking of mathematics, \cite, \ref, \label, \textcolor, …
   → prompt assembly with glossary, background card and options
+      ↳ optional: translation-memory retrieval (BM25 + embeddings, reciprocal rank fusion, relevance floor)
   → model request (local OpenAI-compatible endpoint or hosted provider)
   → placeholder validation (count and form)
       ↳ on mismatch: stricter instructions → lower placeholder density → sentence by sentence
@@ -126,7 +133,7 @@ flowchart LR
     B --> D
     B --> E
     E --> O[("Overleaf")]
-    A --> L["Local LLM<br/>OpenAI-compatible API"]
+    A --> L["Local LLM and embedding model<br/>OpenAI-compatible API"]
     A --> H["Gemini / OpenAI / Anthropic"]
 ```
 
@@ -137,6 +144,7 @@ flowchart LR
 | Compilation | TeX Live, `latexmk`, SyncTeX |
 | Synchronization | Overleaf Git integration |
 | Models | Any OpenAI-compatible API (e.g. LM Studio), Google Gemini, OpenAI, Anthropic |
+| Retrieval | BM25 and dense embeddings (Qwen3-Embedding-0.6B by default) fused by reciprocal rank fusion; vectors cached in IndexedDB |
 | Languages | Multiple languages (currently Chinese and English) |
 
 ## Verification
@@ -157,9 +165,52 @@ Most recent results:
 |---|---|---|
 | 2026-10-22 | Terminology mode and its settings migration | 48 passed, 0 failed |
 | 2026-10-24 | Interface language selection and persistence; user content never translated | 24 passed, 0 failed |
+| 2026-10-24 | Translation memory: retrieval, relevance floor, embedding fallback, byte-identical requests when off | 70 passed, 0 failed |
+| 2026-10-24 | Normalized glossary matching | 55 passed, 0 failed |
+| 2026-10-24 | Terminology consistency check, including 500 blocks × 300 entries in under 1.5 s | 30 passed, 0 failed |
+| 2026-10-24 | Glossary suggestions mined from the translation memory | 42 passed, 0 failed |
+| 2026-10-24 | Similar-term suggestions with lexical, sibling and antonym guards | 42 passed, 0 failed |
+
+Each new suite was also run against the build before the feature, where its
+feature checks fail, and mutation runs confirmed that removing a guard turns
+the corresponding checks red. With all features idle, translation requests
+were compared byte for byte against the previous build.
+
+The similar-term threshold was calibrated against a local embedding model. The
+calibration set was a held-out list of synonym, sibling and antonym term pairs,
+and the chosen threshold gives a precision of about 0.9.
 
 Local translation models were selected by blind pairwise comparison on
 real-world LaTeX documents, with accuracy and terminology judged separately.
+
+### Translation-memory evaluation
+
+**Embedding model.** Four open embedding models were compared on a retrieval
+benchmark built from real-world LaTeX documents: BGE-M3, Qwen3-Embedding-0.6B,
+multilingual-e5-large-instruct and nomic-embed-text-v1.5. The benchmark used
+Recall@4, MRR@10 and nDCG@10 for English and Chinese queries, and also measured
+throughput. Qwen3-Embedding-0.6B gave the best overall balance of quality and
+speed, and is the default.
+
+**End-to-end effect.** The translation memory was then tested on 20 blocks
+from three real-world LaTeX documents. Each block was translated with the
+memory on and off, in two settings: an empty glossary, and a glossary with a
+background card. An LLM judge received a reference translation and the two
+candidates in shuffled order. It ranked the candidates and scored accuracy
+and terminology separately on a 1–5 scale.
+
+| Setting | Memory on preferred | Memory off preferred | Accuracy (on / off) | Terminology (on / off) |
+|---|---|---|---|---|
+| Empty glossary | 9 | 11 | 4.25 / 4.40 | 3.70 / 3.90 |
+| Glossary and background card | 9 | 11 | 4.50 / 4.35 | 4.30 / 4.60 |
+
+No difference is statistically significant (two-sided sign test, p = 0.82 for
+the preference counts in each setting). Retrieval worked as designed: every
+evaluated block received retrieved examples (3.8 on average) that passed the
+relevance floor, and no example was dropped by the leak guard. However, the retrieved examples are the model's own earlier
+translations, and the judge's notes show some of their mistranslations being
+reused. The memory therefore ships disabled by default. Retrieval restricted to
+translations that the user has edited or confirmed is planned.
 
 ## Configuration
 
@@ -187,6 +238,8 @@ entered in the application's settings and stored in the browser.
 ## Limitations
 
 - Prompts are currently tuned for Chinese and English. Support for further languages is planned.
+- The translation memory retrieves earlier machine translations that no one has reviewed, and it did not measurably improve quality in the evaluation above.
+- Embedding features (the translation memory and similar-term suggestions) need a local OpenAI-compatible `/v1/embeddings` endpoint. Without one, the translation memory falls back to BM25 retrieval.
 - Compilation targets TeX Live with `latexmk`.
 - Models are called directly from the browser, so a hosted provider that blocks cross-origin requests needs a proxy.
 - The earlier multi-file version of this project is preserved at tag [`v1`](../../tree/v1) and is no longer maintained.
