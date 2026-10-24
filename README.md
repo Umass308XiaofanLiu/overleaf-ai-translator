@@ -44,6 +44,8 @@ translation requests.
 - An AI assistant with tool access to the open project.
 - An English or Chinese interface, selectable in Settings and remembered per browser.
 
+![Source editor with local compilation and the integrated PDF viewer](docs/screenshots/editor-pdf.png)
+
 ## Quick start
 
 **Translation only.** Open `AI-Translator.html` in Chrome or Edge, open
