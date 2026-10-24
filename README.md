@@ -1,8 +1,10 @@
 # Overleaf AI Translator
 
-**An English ↔ Chinese translator for LaTeX research papers, built around Overleaf.** It opens an Overleaf project, renders the paper, and shows a translation next to every paragraph. Equations, citations, labels and color macros come through intact, so the translated text still compiles.
+**A multilingual translator for LaTeX research papers, built around Overleaf.** It opens an Overleaf project, renders the paper, and shows a translation next to every paragraph. Equations, citations, labels and color macros come through intact, so the translated text still compiles.
 
-I built it for my own PhD writing. It runs on local LLMs served from a lab GPU server (LM Studio, Qwen) as well as hosted models (Gemini, OpenAI, Anthropic), and I use it every day on real papers.
+The LaTeX protection, glossary and Visual mode do not depend on the language pair, but prompts are currently tuned for Chinese. **English ↔ Chinese is fully supported today; other language pairs are planned.**
+
+I built it for my own PhD writing. It runs on local LLMs (any OpenAI-compatible server such as LM Studio) as well as hosted models (Gemini, OpenAI, Anthropic), and I use it every day.
 
 ## At a glance
 
@@ -10,6 +12,7 @@ I built it for my own PhD writing. It runs on local LLMs served from a lab GPU s
 |---|---|
 | Frontend | one HTML file, ~73k lines of vanilla JS (Tailwind CDN, KaTeX, marked), no build step |
 | Backend | Node.js bridge, ~4.5k lines (`http` + `ws`): LaTeX compilation, sandboxed file access, Overleaf Git |
+| Languages | English ↔ Chinese today; more language pairs planned (UI currently in Chinese) |
 | Models | any OpenAI-compatible endpoint (LM Studio / Qwen on 2× RTX A6000), Gemini, OpenAI, Anthropic |
 | Development | ~480 published commits (~600 in the private repo), Dec 2025 – Oct 2026, mostly Aug–Oct 2026 |
 | Tests | ~220 end-to-end test scripts: headless Chrome over CDP, run on a separate test machine |
@@ -82,7 +85,7 @@ The single-file design is deliberate: the app opens from disk or any static serv
    - local: an OpenAI-compatible endpoint, e.g. LM Studio's `http://localhost:1234/v1`;
    - hosted: paste a Gemini, OpenAI or Anthropic API key.
 
-   The default endpoints in Settings point to my own lab server, so replace them with yours.
+   Local endpoints default to `localhost` (LM Studio on port 1234, bridge on 8181); change them in Settings if your servers run elsewhere.
 
 2. **Overleaf + compilation + Visual mode:** start the bridge.
 
@@ -113,7 +116,7 @@ VERSION                   version number, stamped into the HTML by a pre-commit 
 tools/latex-bridge/       Node bridge: compilation, file access, Overleaf git
 ```
 
-The end-to-end test suite is not published, because its fixtures contain unpublished papers.
+The end-to-end test suite is not published.
 
 ## Status
 

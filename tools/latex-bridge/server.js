@@ -96,7 +96,7 @@ const BRIDGE_CAPABILITIES = [
 
 // v2 Pass P49：监听地址可配（LATEX_BRIDGE_HOST），默认仍是 127.0.0.1——不传就跟以前
 // 完全一样，不改变任何现有用户的行为。绝不要默认绑 0.0.0.0；要跨机访问请绑到具体的
-// Tailscale IP（如 100.98.164.17），绑 0.0.0.0 会把桥暴露给同一网络下的任何设备，
+// Tailscale IP（如 127.0.0.1），绑 0.0.0.0 会把桥暴露给同一网络下的任何设备，
 // 启动时会打印醒目警告（见 server.listen 回调）。
 const HOST = process.env.LATEX_BRIDGE_HOST || '127.0.0.1';
 // LATEX_BRIDGE_PORT 仅供测试用（起在别的空闲端口上，绝不占用用户真实在跑的 8181）：
