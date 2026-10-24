@@ -13,6 +13,7 @@ The application is a single HTML file and needs no build step. An optional Node.
 | | |
 |---|---|
 | Languages | Multiple languages (currently Chinese and English) |
+| Interface | English and Chinese, switchable in Settings (English by default) |
 | Models | Local LLMs via any OpenAI-compatible API (e.g. LM Studio), Google Gemini, OpenAI, Anthropic |
 | Frontend | Single-file web application in vanilla JavaScript, with Tailwind CSS, KaTeX, marked and PDF.js |
 | Backend | Node.js bridge (`http` + `ws`) for compilation, file access and Git |
