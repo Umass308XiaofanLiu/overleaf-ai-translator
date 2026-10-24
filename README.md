@@ -1,123 +1,161 @@
 # Overleaf AI Translator
 
-**A multilingual translator for LaTeX research papers, built around Overleaf.** It opens an Overleaf project, renders the paper, and shows a translation next to every paragraph. Equations, citations, labels and color macros come through intact, so the translated text still compiles.
+A multilingual translation workspace for LaTeX research papers, integrated with Overleaf.
 
-The LaTeX protection, glossary and Visual mode do not depend on the language pair, but prompts are currently tuned for Chinese. **English ↔ Chinese is fully supported today; other language pairs are planned.**
+Overleaf AI Translator opens an Overleaf project, compiles it locally, and renders each paragraph next to its translation. Mathematics, citations, cross-references, labels and color macros are preserved, so the translated source still compiles. It works with locally hosted LLMs through any OpenAI-compatible endpoint, as well as with Gemini, OpenAI and Anthropic models.
 
-I built it for my own PhD writing. It runs on local LLMs (any OpenAI-compatible server such as LM Studio) as well as hosted models (Gemini, OpenAI, Anthropic), and I use it every day.
+The application is a single HTML file and needs no build step. An optional Node.js bridge adds LaTeX compilation, file access and Overleaf Git synchronization.
 
-## At a glance
+![Visual mode: rendered paper with paragraph-level translation and the compiled PDF](docs/screenshots/visual-mode.png)
+
+## Overview
 
 | | |
 |---|---|
-| Frontend | one HTML file, ~73k lines of vanilla JS (Tailwind CDN, KaTeX, marked), no build step |
-| Backend | Node.js bridge, ~4.5k lines (`http` + `ws`): LaTeX compilation, sandboxed file access, Overleaf Git |
-| Languages | English ↔ Chinese today; more language pairs planned (UI currently in Chinese) |
-| Models | any OpenAI-compatible endpoint (LM Studio / Qwen on 2× RTX A6000), Gemini, OpenAI, Anthropic |
-| Development | ~480 published commits (~600 in the private repo), Dec 2025 – Oct 2026, mostly Aug–Oct 2026 |
-| Tests | ~220 end-to-end test scripts: headless Chrome over CDP, run on a separate test machine |
+| Languages | Multiple languages (currently Chinese and English) |
+| Models | Local LLMs via any OpenAI-compatible API (e.g. LM Studio), Google Gemini, OpenAI, Anthropic |
+| Frontend | Single-file web application in vanilla JavaScript, with Tailwind CSS, KaTeX, marked and PDF.js |
+| Backend | Node.js bridge (`http` + `ws`) for compilation, file access and Git |
+| Integrations | Overleaf Git integration, TeX Live (`latexmk` + SyncTeX) |
 
 ## Features
 
-**Translation that respects LaTeX**
-- Math, `\cite`, `\ref`, `\label`, `\textcolor` and other commands are masked before translation and restored afterwards. If the model alters a placeholder, the block is retried with stricter instructions, then sentence by sentence. Anything that still fails keeps the original text and is flagged.
-- A **glossary** and a **background card** for each paper (a short description of its field and contributions) go into every prompt, so terminology stays consistent across the whole paper.
-- Optional **keep technical terms in English** mode, for method names, model names and established acronyms.
-- A one-line **domain hint** helps the model choose the right sense of ambiguous words.
+### LaTeX-aware translation
+- Mathematics, `\cite`, `\ref`, `\label`, `\textcolor` and other commands are replaced with placeholders before translation and restored afterwards.
+- Placeholders returned by the model are validated by count and form. If they do not match, the request is retried in three stages:
+  1. with stricter instructions;
+  2. with fewer placeholders per request;
+  3. sentence by sentence.
 
-**Overleaf workflow**
+  Text that still cannot be translated safely keeps its original wording and is flagged; nothing is dropped silently.
+- A per-project glossary and a background card (the field, problem and contributions of the paper) are sent with every request, which keeps terminology consistent across the document.
+- Optional modes keep technical terms in English (method and model names, established acronyms) and add a domain hint for resolving ambiguous terms.
+
+### Overleaf workflow
 - Clone, pull and push Overleaf projects through Overleaf's Git integration.
-- LaTeX editor with local compilation and a PDF preview. SyncTeX connects source, rendered view and PDF in both directions.
-- **Visual mode** renders sections, numbered equations (following LaTeX's rules for `\tag`, `\nonumber` and starred environments), figures and tables, with the translation beside each block. You can edit text directly in the visual view, and the change is written back to its exact source location.
-- PDF → LaTeX conversion with a vision model, for papers that only exist as PDF.
-- An AI assistant panel that can read the open project and act on it.
+- Source editor with local compilation and an integrated PDF viewer.
+- **Visual mode**: rendered sections, numbered equations, figures and tables, each shown with its translation. Equation numbering follows LaTeX semantics for `\tag`, `\nonumber` and starred environments.
+- SyncTeX-based navigation between the source, Visual mode and the PDF.
+- In-place editing in Visual mode, written back to the corresponding range of the source.
+- PDF-to-LaTeX conversion with a vision-language model, for documents that exist only as PDF.
+- An AI assistant with tool access to the open project.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     subgraph Browser
-        A[AI-Translator.html<br/>editor · Visual mode · PDF viewer · settings]
+        A["AI-Translator.html<br/>editor · Visual mode · PDF viewer"]
     end
-    subgraph Bridge["Node bridge (token-authenticated)"]
-        B[HTTP + WebSocket API]
-        C[TeX Live compile + SyncTeX]
-        D[sandboxed file access<br/>allow-listed roots]
-        E[git via askpass helper]
+    subgraph Bridge["Node.js bridge"]
+        B["HTTP / WebSocket API<br/>token-authenticated"]
+        C["TeX Live<br/>latexmk + SyncTeX"]
+        D["File access<br/>allow-listed roots"]
+        E["Git<br/>askpass credential helper"]
     end
-    A -- "x-latex-bridge-token" --> B
+    A --> B
     B --> C
     B --> D
     B --> E
-    E -- "Git integration" --> O[(Overleaf)]
-    A -- "OpenAI-compatible API" --> L[Local LLM<br/>LM Studio · Qwen]
-    A -- "HTTPS" --> H[Gemini / OpenAI / Anthropic]
+    E --> O[("Overleaf")]
+    A --> L["Local LLM<br/>OpenAI-compatible API"]
+    A --> H["Gemini / OpenAI / Anthropic"]
 ```
 
-## Engineering notes
+The browser calls model endpoints directly. The bridge is needed only for compilation, project files and Overleaf synchronization; translating pasted text works without it.
 
-Some of the problems that took the most work:
+## Design
 
-- **Not breaking the paper.** LaTeX mixed into prose is fragile, and small local models lose placeholders deterministically in dense passages. Each block is masked and translated. The returned placeholders must match in number and shape; if they don't, a retry ladder kicks in: re-prompt with different instructions, then lower the placeholder density, then translate sentence by sentence. Sentences that still fail keep the original text and are reported, never silently dropped.
-- **Writing back to the right place.** The visual view is a rendering, but edits must land in the `.tex` source. Every rendered block keeps its source range. Before an in-place edit is written, the app checks that the source at that range still matches what was rendered. If the file changed in the meantime, the write is cancelled and the typed text is offered for recovery instead of landing on the wrong lines.
-- **Performance on long documents.** A long document with a warm translation cache once froze the page for many seconds. The first reproduction used an empty profile and only found a secondary cause. The real cause appeared only with production-sized cached state: the whole cache bucket was parsed on every access, and stale entries were rewritten block by block. Since then, performance bugs are always reproduced with realistic state.
-- **Security of a local bridge.** The bridge can read and write files and run git, so it is locked down: a random access token on every request, short-lived WebSocket tickets, loopback-only binding by default (or a specific VPN address, never `0.0.0.0`), and an explicit directory allow-list. The Overleaf Git token is handed to git through an askpass helper. It never appears in a remote URL or on disk in the repository.
-- **Choosing a model with evidence.** Candidate local models were compared in blind pairwise evaluations on real-world LaTeX documents, judged separately for accuracy and terminology, before switching the default model. Wins on synthetic test sentences did not always hold up on real-world documents.
-- **Testing a 73k-line single-file app.** Most bugs were state bugs: something looked right on first render and was wrong after a reload or a resize. So the end-to-end tests assert invariants across re-renders and real window resizes, not just the final state. Mutation checks confirm that each test actually fails when the code it guards is broken.
+**Placeholder integrity.** Smaller local models tend to drop or rewrite placeholders in passages dense with inline mathematics. The validate-and-retry sequence described above limits such failures to individual sentences rather than whole paragraphs, and every remaining failure is shown to the user.
 
-## How it was built
+**Safe write-back.** Each block rendered in Visual mode records its range in the source file. Before an in-place edit is applied, the application checks that the source in that range has not changed since rendering. If it has, the write is cancelled and the edited text is kept for recovery, so an edit cannot be applied to the wrong lines.
 
-I developed this project with AI coding agents (Claude Code and OpenAI Codex) doing most of the implementation. My part was the product and the engineering process:
-- defining requirements and the architecture;
-- splitting work into small, reviewable passes, each in its own git worktree;
-- designing the acceptance tests and invariants;
-- reviewing and merging changes;
-- deploying to a lab server;
-- validating results on real-world documents.
+**Performance on long documents.** Translations are cached per block. An earlier design parsed the whole cache and rewrote stale entries on every load, which stalled the page on long documents. Cache access was redesigned to avoid both. Performance issues are reproduced with production-sized cached state, because an empty profile hides this class of problem.
 
-Most commits carry a `Co-Authored-By` trailer for that reason. The commit history is the real development history, filtered down to the published files. Commit messages were originally written in Chinese and have been replaced with English summaries. Work items are numbered as passes (`P123:`).
+**Bridge security.** The bridge can read and write files and run Git, so:
+- every request must carry a random access token;
+- WebSocket connections use short-lived tickets;
+- the server binds to `127.0.0.1` by default;
+- file operations are restricted to an explicit allow-list of directories.
 
-The single-file design is deliberate: the app opens from disk or any static server with zero setup. The cost is a very large file, which the test suite and per-feature worktrees keep manageable.
+The Overleaf Git token is passed to Git through an askpass helper. It is never written into a remote URL or into the repository.
 
-## Quick start
+**Model selection.** Local translation models were selected by blind pairwise comparison on real-world LaTeX documents, with accuracy and terminology judged separately.
 
-1. **Translation only:** open `AI-Translator.html` in Chrome or Edge, open Settings, and choose a model:
-   - local: an OpenAI-compatible endpoint, e.g. LM Studio's `http://localhost:1234/v1`;
-   - hosted: paste a Gemini, OpenAI or Anthropic API key.
+## Requirements
 
-   Local endpoints default to `localhost` (LM Studio on port 1234, bridge on 8181); change them in Settings if your servers run elsewhere.
+- A Chromium-based browser (Chrome or Edge).
+- For translation: an OpenAI-compatible LLM endpoint, or an API key for Gemini, OpenAI or Anthropic.
+- For compilation and Overleaf synchronization: Node.js (LTS), TeX Live with `latexmk`, and Git.
 
-2. **Overleaf + compilation + Visual mode:** start the bridge.
+## Getting started
 
-   ```sh
-   cd tools/latex-bridge
-   npm install
-   # Windows example; adjust paths for your machine
-   set LATEX_BRIDGE_TEXBIN=C:\texlive\2025\bin\windows
-   set LATEX_BRIDGE_ALLOWED_ROOTS=C:\path\to\your\projects
-   node server.js
-   ```
+### Translation only
 
-   On first start the bridge listens on `127.0.0.1:8181` and writes a random access token to `tools/latex-bridge/.bridge-token`. Paste that token into the app's Settings. For Overleaf sync, create a Git token in Overleaf (Account Settings → Git integration) and enter it in the app.
+Open `AI-Translator.html` in the browser, open **Settings** and choose a model. The local endpoint defaults to `http://localhost:1234/v1`, the LM Studio default.
 
-   | Variable | Purpose | Default |
-   |---|---|---|
-   | `LATEX_BRIDGE_HOST` | bind address; use a VPN/Tailscale IP for multi-device use, never `0.0.0.0` | `127.0.0.1` |
-   | `LATEX_BRIDGE_PORT` | port | `8181` |
-   | `LATEX_BRIDGE_TOKEN` | access token (otherwise read from or created in `.bridge-token`) | generated |
-   | `LATEX_BRIDGE_TEXBIN` | TeX Live `bin` directory | `E:\texlive\2025\bin\windows` |
-   | `LATEX_BRIDGE_ALLOWED_ROOTS` | directories the bridge may read and write | — |
+### With the bridge
+
+```sh
+cd tools/latex-bridge
+npm install
+
+# macOS / Linux
+export LATEX_BRIDGE_TEXBIN=/usr/local/texlive/2025/bin/x86_64-linux
+export LATEX_BRIDGE_ALLOWED_ROOTS=$HOME/papers
+node server.js
+```
+
+```powershell
+# Windows (PowerShell)
+$env:LATEX_BRIDGE_TEXBIN = "C:\texlive\2025\bin\windows"
+$env:LATEX_BRIDGE_ALLOWED_ROOTS = "C:\papers"
+node server.js
+```
+
+On first start, the bridge listens on `127.0.0.1:8181` and writes a random access token to `tools/latex-bridge/.bridge-token`; enter this token in **Settings**. To synchronize with Overleaf, create a Git authentication token in Overleaf (**Account Settings → Git integration**) and enter it in the application.
+
+### Configuration
+
+| Variable | Description | Default |
+|---|---|---|
+| `LATEX_BRIDGE_TEXBIN` | TeX Live `bin` directory | required for compilation |
+| `LATEX_BRIDGE_ALLOWED_ROOTS` | Directories the bridge may access | none |
+| `LATEX_BRIDGE_HOST` | Bind address. For access from other devices, bind to a private VPN address; never use `0.0.0.0`. | `127.0.0.1` |
+| `LATEX_BRIDGE_PORT` | Port | `8181` |
+| `LATEX_BRIDGE_TOKEN` | Access token. If unset, it is read from or generated in `.bridge-token`. | generated |
 
 ## Repository layout
 
 ```
-AI-Translator.html        the whole app
-VERSION                   version number, stamped into the HTML by a pre-commit hook
-tools/latex-bridge/       Node bridge: compilation, file access, Overleaf git
+AI-Translator.html      application (single file)
+VERSION                 release version, stamped into the application at commit time
+tools/latex-bridge/     Node.js bridge: compilation, file access, Overleaf Git
+docs/screenshots/       images used in this README
 ```
 
-The end-to-end test suite is not published.
+## Development
 
-## Status
+Most of the implementation was written by AI coding agents (Claude Code and OpenAI Codex). The author:
+- defined the requirements and architecture;
+- divided the work into small, independently reviewed passes;
+- designed the acceptance tests;
+- reviewed and validated every change.
 
-This is a personal research tool under active development. The earlier multi-file version is available at the tag [`v1`](../../tree/v1).
+Commits produced this way carry a `Co-Authored-By` trailer, and commit subjects are numbered by pass (`P123:`).
+
+Each feature is developed in its own Git worktree. Changes are verified with an end-to-end suite of more than 200 scenario scripts that drive headless Chrome through the DevTools Protocol. The suite checks invariants across reloads, re-renders and window resizes, and mutation checks confirm that each test fails when the code it covers is broken. The suite is not included in this repository.
+
+The application ships as a single file so that it runs from a local disk or any static host without installation.
+
+## Limitations
+
+- Prompts are currently tuned for Chinese and English; support for further languages is planned.
+- Compilation targets TeX Live with `latexmk`.
+- Models are called directly from the browser, so a hosted provider that does not allow cross-origin requests needs a proxy.
+
+## Disclaimer
+
+This project is not affiliated with or endorsed by Overleaf or Digital Science. Overleaf is a trademark of its respective owner.
+
+The earlier multi-file version of this project is available at tag [`v1`](../../tree/v1).
