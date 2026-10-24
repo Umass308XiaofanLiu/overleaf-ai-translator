@@ -60,9 +60,9 @@ Some of the problems that took the most work:
 
 - **Not breaking the paper.** LaTeX mixed into prose is fragile, and small local models lose placeholders deterministically in dense passages. Each block is masked and translated. The returned placeholders must match in number and shape; if they don't, a retry ladder kicks in: re-prompt with different instructions, then lower the placeholder density, then translate sentence by sentence. Sentences that still fail keep the original text and are reported, never silently dropped.
 - **Writing back to the right place.** The visual view is a rendering, but edits must land in the `.tex` source. Every rendered block keeps its source range. Before an in-place edit is written, the app checks that the source at that range still matches what was rendered. If the file changed in the meantime, the write is cancelled and the typed text is offered for recovery instead of landing on the wrong lines.
-- **Performance on real papers.** A long paper with a warm translation cache once froze the page for many seconds. The first reproduction used an empty profile and only found a secondary cause. The real cause appeared only with production-sized cached state: the whole cache bucket was parsed on every access, and stale entries were rewritten block by block. Since then, performance bugs are always reproduced with realistic state.
+- **Performance on long documents.** A long document with a warm translation cache once froze the page for many seconds. The first reproduction used an empty profile and only found a secondary cause. The real cause appeared only with production-sized cached state: the whole cache bucket was parsed on every access, and stale entries were rewritten block by block. Since then, performance bugs are always reproduced with realistic state.
 - **Security of a local bridge.** The bridge can read and write files and run git, so it is locked down: a random access token on every request, short-lived WebSocket tickets, loopback-only binding by default (or a specific VPN address, never `0.0.0.0`), and an explicit directory allow-list. The Overleaf Git token is handed to git through an askpass helper. It never appears in a remote URL or on disk in the repository.
-- **Choosing a model with evidence.** Candidate local models were compared in blind pairwise evaluations on real paper paragraphs, judged separately for accuracy and terminology, before switching the default model. Wins on synthetic test sentences did not always hold up on real papers.
+- **Choosing a model with evidence.** Candidate local models were compared in blind pairwise evaluations on real-world LaTeX documents, judged separately for accuracy and terminology, before switching the default model. Wins on synthetic test sentences did not always hold up on real-world documents.
 - **Testing a 73k-line single-file app.** Most bugs were state bugs: something looked right on first render and was wrong after a reload or a resize. So the end-to-end tests assert invariants across re-renders and real window resizes, not just the final state. Mutation checks confirm that each test actually fails when the code it guards is broken.
 
 ## How it was built
@@ -73,7 +73,7 @@ I developed this project with AI coding agents (Claude Code and OpenAI Codex) do
 - designing the acceptance tests and invariants;
 - reviewing and merging changes;
 - deploying to a lab server;
-- validating results on real papers.
+- validating results on real-world documents.
 
 Most commits carry a `Co-Authored-By` trailer for that reason. The commit history is the real development history, filtered down to the published files. Commit messages were originally written in Chinese and have been replaced with English summaries. Work items are numbered as passes (`P123:`).
 
